@@ -348,8 +348,7 @@ mod credential_dispatch_parity_tests {
     /// `git-credential-sub/helper`.
     #[test]
     fn relative_slash_name_is_bare_not_path() {
-        let cmd = credential_helper_command("sub/relhelper", "get")
-            .expect("command built");
+        let cmd = credential_helper_command("sub/relhelper", "get").expect("command built");
         // git 2.54: `git credential-sub/relhelper get` -> standalone binary
         // `git-credential-sub/relhelper`. The program sley resolves must be the
         // prefixed credential binary, never the raw relative path `sub/relhelper`.
@@ -375,15 +374,12 @@ mod credential_dispatch_parity_tests {
     /// `unsafe`, so `std::env::set_var` is unavailable in tests).
     #[test]
     fn plain_bare_name_maps_to_credential_binary() {
-        let cmd = credential_helper_command("myhelper --opt val", "get")
-            .expect("command built");
+        let cmd = credential_helper_command("myhelper --opt val", "get").expect("command built");
         let argv = command_argv(&cmd);
         // First exec target must be the standalone credential binary, never a
         // bare exec of the raw token, and never `git`.
         assert!(
-            argv[0].contains("git-credential-myhelper")
-                || argv[0] == "sh"
-                || argv[0] == "/bin/sh",
+            argv[0].contains("git-credential-myhelper") || argv[0] == "sh" || argv[0] == "/bin/sh",
             "expected git-credential-<name> dispatch, got argv {argv:?}"
         );
         assert_ne!(argv[0], "git", "must not shell out to the git binary");

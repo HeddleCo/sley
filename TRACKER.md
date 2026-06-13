@@ -59,6 +59,17 @@ shallow `--depth` clone/fetch is implemented and verified byte-for-byte vs syste
 git. Transport orchestration is fully out of the `sley-cli` monolith — the first
 big slice of decomposition #19. Commits `a5e0d94`..`6c2f9f2`.
 
+### Heddle hardening pass
+The remaining sley-side Heddle replacement gaps are closed for the intended
+migration surface: public short-status and single-entry worktree state APIs share
+the racy-clean stat-cache path; raw commit/tag fidelity is documented and covered
+through `EncodedObject`; config/URL remote helper coverage includes rewrite and
+fetch/push precedence cases; `sley-remote` has hermetic fetch/push failure-mode
+tests plus opt-in live HTTPS/SSH coverage. Broader Git parity items that Heddle
+does not currently require (full partial-clone fetch-on-demand, unshallow,
+signed/atomic push, reftable) remain non-blocking unless a downstream workflow
+starts depending on them.
+
 ### zlib-ng backend (zlib half of #40)
 Opt-in `zlib-ng` feature on sley-pack/sley-odb, forwarded through sley + sley-cli;
 default stays pure-Rust (miniz_oxide). Commit `fcf2ebd`.

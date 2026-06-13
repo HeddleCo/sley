@@ -56,13 +56,10 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
     // `GIT_CONFIG_*` overrides) so `core.notesRef` honours the same config the
     // rest of the command sees.
     let effective_config = read_repo_config(&git_dir).unwrap_or_default();
-    let notes_ref = resolve_notes_ref_with_config(
-        &git_dir,
-        ref_override.as_deref(),
-        &effective_config,
-    )?
-    .as_str()
-    .to_string();
+    let notes_ref =
+        resolve_notes_ref_with_config(&git_dir, ref_override.as_deref(), &effective_config)?
+            .as_str()
+            .to_string();
 
     // git refuses to write notes outside of refs/notes/. The check uses the
     // *resolved* ref name: `--ref` is expanded (bare names → refs/notes/<name>),
@@ -783,8 +780,7 @@ fn notes_append(
     // Concatenate the new content, then run the editor when requested (or when
     // no content was supplied). For append, the editor is seeded only with the
     // new content (not the prior note); the prior note is prepended afterwards.
-    let mut appended =
-        build_note_body(&options.contents, &options.separator).unwrap_or_default();
+    let mut appended = build_note_body(&options.contents, &options.separator).unwrap_or_default();
     if options.use_editor || !has_messages {
         appended = launch_note_editor(git_dir, &appended, None)?;
     }
@@ -1058,7 +1054,10 @@ fn combine_notes(mode: CombineMode, cur: Option<&[u8]>, new: &[u8]) -> Vec<u8> {
 /// else concatenate), the enabled flag (`notes.rewrite.<cmd>`, default true),
 /// and the target notes refs (env `GIT_NOTES_REWRITE_REF` colon-list, else
 /// `notes.rewriteRef`, glob-expanded). Returns None when disabled or no refs.
-fn resolve_rewrite_config(store: &FileRefStore, cmd: &str) -> Result<Option<(CombineMode, Vec<String>)>> {
+fn resolve_rewrite_config(
+    store: &FileRefStore,
+    cmd: &str,
+) -> Result<Option<(CombineMode, Vec<String>)>> {
     let config = identity_effective_config();
 
     // Mode: env wins, then config, then concatenate.
@@ -1097,7 +1096,11 @@ fn resolve_rewrite_config(store: &FileRefStore, cmd: &str) -> Result<Option<(Com
     if let Ok(value) = env::var("GIT_NOTES_REWRITE_REF") {
         ref_globs.extend(value.split(':').filter(|s| !s.is_empty()).map(String::from));
     } else if let Some(config) = &config {
-        for value in config.get_all("notes", None, "rewriteRef").into_iter().flatten() {
+        for value in config
+            .get_all("notes", None, "rewriteRef")
+            .into_iter()
+            .flatten()
+        {
             if value.starts_with("refs/notes/") {
                 ref_globs.push(value.to_string());
             }

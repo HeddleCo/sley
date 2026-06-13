@@ -92,7 +92,11 @@ fn unpack_file_matches_upstream_git() {
             assert_status_stderr_match(&root, &args);
         }
 
-        let blob = run_output(sley_testkit::oracle_git(), &root, &["rev-parse", "HEAD:file.txt"]);
+        let blob = run_output(
+            sley_testkit::oracle_git(),
+            &root,
+            &["rev-parse", "HEAD:file.txt"],
+        );
         assert!(blob.status.success(), "git rev-parse failed");
         let blob = String::from_utf8(blob.stdout).expect("utf8 oid");
         let blob = blob.trim();
@@ -103,7 +107,8 @@ fn unpack_file_matches_upstream_git() {
             "unpacked blob contents differed"
         );
 
-        let (_git_path, git_contents) = unpack_file(sley_testkit::oracle_git(), &root, "HEAD:file.txt");
+        let (_git_path, git_contents) =
+            unpack_file(sley_testkit::oracle_git(), &root, "HEAD:file.txt");
         let (_sley_path, sley_contents) =
             unpack_file(env!("CARGO_BIN_EXE_sley"), &root, "HEAD:file.txt");
         assert_eq!(

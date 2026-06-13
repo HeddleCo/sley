@@ -338,7 +338,10 @@ fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
             ("--signoff", parsed.opts.signoff),
             ("--mainline", parsed.opts.mainline > 0),
             ("--strategy", parsed.opts.strategy.is_some()),
-            ("--strategy-option", !parsed.opts.strategy_options.is_empty()),
+            (
+                "--strategy-option",
+                !parsed.opts.strategy_options.is_empty(),
+            ),
             ("-x", parsed.opts.record_origin),
             ("--ff", parsed.opts.allow_ff),
             (
@@ -489,9 +492,9 @@ fn select_revisions(
     if has_walk_spec {
         let selection = sley_rev::RevisionSelection::from_specs(specs.iter().map(String::as_str))
             .map_err(|err| {
-                eprintln!("error: {err}");
-                fatal_failed(action)
-            })?;
+            eprintln!("error: {err}");
+            fatal_failed(action)
+        })?;
         let resolved = selection
             .resolve(&ctx.git_dir, ctx.format, &db)
             .map_err(|err| {
@@ -521,9 +524,7 @@ fn select_revisions(
     }
 
     if let Some(pattern) = &author {
-        commits.retain(|oid| {
-            commit_author_matches(&db, ctx.format, oid, pattern).unwrap_or(false)
-        });
+        commits.retain(|oid| commit_author_matches(&db, ctx.format, oid, pattern).unwrap_or(false));
     }
     if let Some(limit) = max_count {
         commits.truncate(limit);
@@ -601,8 +602,8 @@ fn sequencer_pick_revisions(ctx: &ReplayCtx, opts: &ReplayOpts, rev_args: &[Stri
     for oid in &selection.commits {
         items.push(make_todo_item(ctx, ctx.action, oid)?);
     }
-    let advise_skip = ctx.git_dir.join("CHERRY_PICK_HEAD").exists()
-        || ctx.git_dir.join("REVERT_HEAD").exists();
+    let advise_skip =
+        ctx.git_dir.join("CHERRY_PICK_HEAD").exists() || ctx.git_dir.join("REVERT_HEAD").exists();
     if let Some(in_progress) = replay::in_progress_error(&ctx.git_dir, advise_skip) {
         eprintln!("error: {}", in_progress.error);
         if config_bool(&ctx.git_dir, "advice", "sequencerInUse").unwrap_or(true) {
@@ -843,8 +844,7 @@ fn do_pick_commit(
             (base, theirs, parent_label.clone(), label.clone())
         }
     };
-    let ours_map =
-        stash_tree_entry_map(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
+    let ours_map = stash_tree_entry_map(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
     let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
         Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
@@ -878,8 +878,11 @@ fn do_pick_commit(
         let help_msg = env::var("GIT_CHERRY_PICK_HELP").ok();
         let suppress_pick_head = help_msg.is_some();
         if action == ReplayAction::Pick && !opts.no_commit && !suppress_pick_head {
-            fs::write(ctx.git_dir.join("CHERRY_PICK_HEAD"), format!("{}\n", item.oid))
-                .map_err(|err| print_fatal_error(GitError::from(err)))?;
+            fs::write(
+                ctx.git_dir.join("CHERRY_PICK_HEAD"),
+                format!("{}\n", item.oid),
+            )
+            .map_err(|err| print_fatal_error(GitError::from(err)))?;
         }
         if action == ReplayAction::Revert {
             fs::write(ctx.git_dir.join("REVERT_HEAD"), format!("{}\n", item.oid))
@@ -917,8 +920,8 @@ fn do_pick_commit(
     // Clean merge: stage the result.
     apply_merge_results_to_index_and_worktree(ctx, &db, &ours_map, &results)
         .map_err(print_fatal_error)?;
-    let new_tree =
-        sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format).map_err(print_fatal_error)?;
+    let new_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
+        .map_err(print_fatal_error)?;
 
     if opts.no_commit {
         if action == ReplayAction::Revert {
@@ -933,8 +936,11 @@ fn do_pick_commit(
 
     // CHERRY_PICK_HEAD / REVERT_HEAD ahead of the commit attempt.
     if action == ReplayAction::Pick {
-        fs::write(ctx.git_dir.join("CHERRY_PICK_HEAD"), format!("{}\n", item.oid))
-            .map_err(|err| print_fatal_error(GitError::from(err)))?;
+        fs::write(
+            ctx.git_dir.join("CHERRY_PICK_HEAD"),
+            format!("{}\n", item.oid),
+        )
+        .map_err(|err| print_fatal_error(GitError::from(err)))?;
     }
     fs::write(ctx.git_dir.join("MERGE_MSG"), &message)
         .map_err(|err| print_fatal_error(GitError::from(err)))?;
@@ -1165,13 +1171,9 @@ fn has_conforming_footer(message: &[u8]) -> bool {
         return false;
     }
     last_para.lines().all(|line| {
-        line.split_once(':')
-            .is_some_and(|(key, value)| {
-                !key.is_empty()
-                    && !key.contains(char::is_whitespace)
-                    && value.starts_with(' ')
-            })
-            || line.starts_with("(cherry picked from commit ")
+        line.split_once(':').is_some_and(|(key, value)| {
+            !key.is_empty() && !key.contains(char::is_whitespace) && value.starts_with(' ')
+        }) || line.starts_with("(cherry picked from commit ")
     })
 }
 
@@ -1334,8 +1336,8 @@ fn verify_worktree_safe(
             }
             None => {
                 // Untracked file in the way of a new path.
-                let would_write = target.is_some()
-                    || matches!(result, MergePathResult::Conflict { .. });
+                let would_write =
+                    target.is_some() || matches!(result, MergePathResult::Conflict { .. });
                 if would_write && full.exists() {
                     untracked.push(path.clone());
                 }
@@ -1343,7 +1345,9 @@ fn verify_worktree_safe(
         }
     }
     if !local_changes.is_empty() {
-        eprintln!("error: Your local changes to the following files would be overwritten by merge:");
+        eprintln!(
+            "error: Your local changes to the following files would be overwritten by merge:"
+        );
         for path in &local_changes {
             eprintln!("\t{}", String::from_utf8_lossy(path));
         }
@@ -1547,11 +1551,7 @@ fn print_empty_halt_advice(ctx: &ReplayCtx) {
     eprintln!("Otherwise, please use 'git {me} --skip'");
 }
 
-fn fast_forward_to(
-    ctx: &ReplayCtx,
-    target: &ObjectId,
-    head: Option<&ObjectId>,
-) -> Result<()> {
+fn fast_forward_to(ctx: &ReplayCtx, target: &ObjectId, head: Option<&ObjectId>) -> Result<()> {
     let refs = ctx.refs();
     let target_ref = match refs.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(branch)) => branch,

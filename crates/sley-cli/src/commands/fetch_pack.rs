@@ -82,10 +82,21 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
                 println!("{FETCH_PACK_USAGE}");
                 return Err(GitError::Exit(129));
             }
-            "--quiet" | "-q" | "--thin" | "--include-tag" | "-v" | "--no-progress"
-            | "--stateless-rpc" | "--lock-pack" | "--check-self-contained-and-connected"
-            | "--cloning" | "--update-shallow" | "--from-promisor" | "--refetch"
-            | "--no-filter" | "--deepen-relative" => {}
+            "--quiet"
+            | "-q"
+            | "--thin"
+            | "--include-tag"
+            | "-v"
+            | "--no-progress"
+            | "--stateless-rpc"
+            | "--lock-pack"
+            | "--check-self-contained-and-connected"
+            | "--cloning"
+            | "--update-shallow"
+            | "--from-promisor"
+            | "--refetch"
+            | "--no-filter"
+            | "--deepen-relative" => {}
             "--keep" | "-k" => flags.keep_pack = true,
             "--all" => flags.fetch_all = true,
             "--stdin" => flags.stdin_refs = true,
@@ -199,13 +210,17 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             .map(|advertisement| advertisement.oid)
             .collect();
         let remote_config = read_repo_config(&remote_common_git_dir)?;
-        let allow_unadvertised = ["allowtipsha1inwant", "allowreachablesha1inwant", "allowanysha1inwant"]
-            .iter()
-            .any(|key| {
-                remote_config
-                    .get_bool("uploadpack", None, key)
-                    .unwrap_or(false)
-            });
+        let allow_unadvertised = [
+            "allowtipsha1inwant",
+            "allowreachablesha1inwant",
+            "allowanysha1inwant",
+        ]
+        .iter()
+        .any(|key| {
+            remote_config
+                .get_bool("uploadpack", None, key)
+                .unwrap_or(false)
+        });
         for entry in &mut sought {
             if entry.status != MatchStatus::NotMatched {
                 continue;

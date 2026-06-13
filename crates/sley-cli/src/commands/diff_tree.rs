@@ -560,7 +560,8 @@ fn diff_tree_header_text(
         Some(DiffTreePretty::Medium) => {
             let mut text = format!("commit {oid}\n");
             if commit.parents.len() > 1 {
-                let merged: Vec<String> = commit.parents.iter().map(format_log_abbrev_oid).collect();
+                let merged: Vec<String> =
+                    commit.parents.iter().map(format_log_abbrev_oid).collect();
                 text.push_str(&format!("Merge: {}\n", merged.join(" ")));
             }
             text.push_str(&format!(

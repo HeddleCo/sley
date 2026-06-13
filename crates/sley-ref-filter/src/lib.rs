@@ -188,9 +188,9 @@ fn parse_for_each_ref_identity_atom(value: &str) -> Option<ForEachRefAtom> {
         .strip_prefix('*')
         .map(|value| (value, true))
         .unwrap_or((value, false));
-    let (atom, has_modifier) = value.split_once(':').map_or((value, false), |(atom, _)| {
-        (atom, true)
-    });
+    let (atom, has_modifier) = value
+        .split_once(':')
+        .map_or((value, false), |(atom, _)| (atom, true));
     // `name` and the bare-identity atoms take no modifier in this typed path;
     // anything with a `:` (e.g. `authorname:mailmap`, `author:foo`) falls through
     // to the string/Raw renderer which owns the full option grammar + errors.
@@ -515,13 +515,20 @@ impl ForEachRefDateSpec {
 
 /// Render a raw identity's date through the full for-each-ref date grammar.
 /// Returns `None` when the identity has no parseable date.
-pub fn for_each_ref_identity_date_spec(identity: &[u8], spec: &ForEachRefDateSpec) -> Option<String> {
+pub fn for_each_ref_identity_date_spec(
+    identity: &[u8],
+    spec: &ForEachRefDateSpec,
+) -> Option<String> {
     let timestamp = for_each_ref_identity_timestamp(identity)?;
     let raw = std::str::from_utf8(for_each_ref_identity_date_raw(identity)?).ok()?;
     let original_tz = raw.split_once(' ').map(|(_, tz)| tz).unwrap_or("+0000");
     // `-local` modes recompute the civil time in UTC (the test harness pins
     // TZ=UTC); the displayed timezone, where applicable, becomes `+0000`.
-    let tz = if spec.is_local() { "+0000" } else { original_tz };
+    let tz = if spec.is_local() {
+        "+0000"
+    } else {
+        original_tz
+    };
     let parts = for_each_ref_date_parts_from(timestamp, tz)?;
     Some(match spec {
         ForEachRefDateSpec::Default | ForEachRefDateSpec::Local => {
@@ -550,7 +557,13 @@ pub fn for_each_ref_identity_date_spec(identity: &[u8], spec: &ForEachRefDateSpe
         }
         ForEachRefDateSpec::Iso | ForEachRefDateSpec::IsoLocal => format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
-            parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second, parts.timezone,
+            parts.year,
+            parts.month,
+            parts.day,
+            parts.hour,
+            parts.minute,
+            parts.second,
+            parts.timezone,
         ),
         ForEachRefDateSpec::IsoStrict | ForEachRefDateSpec::IsoStrictLocal => format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
@@ -590,9 +603,7 @@ pub fn for_each_ref_identity_date_spec(identity: &[u8], spec: &ForEachRefDateSpe
                 parts.timezone,
             )
         }
-        ForEachRefDateSpec::Strftime { template, .. } => {
-            for_each_ref_strftime(template, &parts)
-        }
+        ForEachRefDateSpec::Strftime { template, .. } => for_each_ref_strftime(template, &parts),
     })
 }
 

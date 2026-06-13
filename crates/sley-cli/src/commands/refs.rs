@@ -1510,12 +1510,14 @@ fn update_ref_stdin_z_command<R: BufRead>(
                 Some("oid") => {
                     let _ = update_ref_stdin_z_next(reader, command, "")?;
                     let old_oid = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
-                    Some(UpdateRefStdinSymrefExpected::Oid(parse_update_ref_expected(
-                        context.git_dir,
-                        context.format,
-                        context.store,
-                        &old_oid,
-                    )?))
+                    Some(UpdateRefStdinSymrefExpected::Oid(
+                        parse_update_ref_expected(
+                            context.git_dir,
+                            context.format,
+                            context.store,
+                            &old_oid,
+                        )?,
+                    ))
                 }
                 _ => None,
             };
@@ -2369,13 +2371,14 @@ fn parse_update_ref_expected(
     store: &FileRefStore,
     value: &str,
 ) -> Result<ObjectId> {
-    parse_update_ref_oidish(git_dir, format, store, value)
-        .ok_or_else(|| GitError::InvalidObjectId(format!(
+    parse_update_ref_oidish(git_dir, format, store, value).ok_or_else(|| {
+        GitError::InvalidObjectId(format!(
             "expected {} hex digits for {}, got {}",
             format.hex_len(),
             format.name(),
             value.len()
-        )))
+        ))
+    })
 }
 
 fn check_update_ref_expected(
@@ -2993,7 +2996,9 @@ fn print_refs_usage() {
     eprintln!("                                [--include-root-refs] [--points-at=<object>]");
     eprintln!("                                [--merged[=<object>]] [--no-merged[=<object>]]");
     eprintln!("                                [--contains[=<object>]] [--no-contains[=<object>]]");
-    eprintln!("                                [(--exclude=<pattern>)...] [--start-after=<marker>]");
+    eprintln!(
+        "                                [(--exclude=<pattern>)...] [--start-after=<marker>]"
+    );
     eprintln!("                                [ --stdin | (<pattern>...)]");
     eprintln!("   or: git refs exists <ref>");
     eprintln!(

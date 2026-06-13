@@ -100,6 +100,9 @@ pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
 pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
 pub use sley_sequencer::TagCreate;
+pub use sley_worktree::{
+    IndexStatProbe, ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
+};
 
 pub use capabilities::RepositoryCapabilities;
 pub use objects::LoadedObject;
@@ -286,6 +289,51 @@ impl Repository {
     /// limit, so a `shallow` file records its grafted history boundaries.
     pub fn is_shallow(&self) -> bool {
         sley_worktree::is_shallow_repository(&self.git_dir)
+    }
+
+    /// Return short-status entries for this repository's working tree using
+    /// sley's default status options.
+    ///
+    /// Bare repositories have no working tree and return
+    /// [`GitError::Unsupported`].
+    pub fn short_status(&self) -> Result<Vec<ShortStatusEntry>> {
+        self.short_status_with_options(ShortStatusOptions::default())
+    }
+
+    /// Return short-status entries for this repository's working tree.
+    ///
+    /// This is the facade form of [`sley_worktree::short_status_with_options`].
+    pub fn short_status_with_options(
+        &self,
+        options: ShortStatusOptions,
+    ) -> Result<Vec<ShortStatusEntry>> {
+        let workdir = self.workdir().ok_or_else(|| {
+            GitError::Unsupported("short status requires a repository worktree".into())
+        })?;
+        sley_worktree::short_status_with_options(&workdir, &self.git_dir, self.format, options)
+    }
+
+    /// Compare one tracked entry to this repository's worktree, using the same
+    /// racy-clean/stat-cache rules as [`Repository::short_status_with_options`].
+    pub fn worktree_entry_state(
+        &self,
+        path: impl AsRef<Path>,
+        expected_oid: &ObjectId,
+        expected_mode: u32,
+        index_probe: Option<&IndexStatProbe>,
+    ) -> Result<WorktreeEntryState> {
+        let workdir = self.workdir().ok_or_else(|| {
+            GitError::Unsupported("worktree entry state requires a repository worktree".into())
+        })?;
+        sley_worktree::worktree_entry_state(
+            &workdir,
+            &self.git_dir,
+            self.format,
+            path,
+            expected_oid,
+            expected_mode,
+            index_probe,
+        )
     }
 
     /// The names of the configured remotes (`[remote "<name>"]` sections),
@@ -550,8 +598,18 @@ impl Repository {
     /// returning its id. The bytes are stored verbatim, so writing an object
     /// that originated from another repository preserves its id exactly.
     pub fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
-        let mut odb = self.objects_mut();
+        let odb = self.objects_mut();
         odb.write_object(object)
+    }
+
+    /// Write `body` as a raw object of `object_type`, preserving the bytes
+    /// exactly and returning the resulting object id.
+    pub fn write_raw_object(
+        &self,
+        object_type: ObjectType,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<ObjectId> {
+        self.write_object(EncodedObject::new(object_type, body))
     }
 
     /// Write `bytes` as a blob, returning its id.

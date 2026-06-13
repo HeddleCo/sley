@@ -70,10 +70,12 @@ fn prepare_diverged_upstream(upstream: &Path) {
     fs::write(upstream.join("shared.txt"), b"base\n").expect("write shared file");
     git(upstream, &["add", "shared.txt"]);
     git_with_identity(upstream, &["commit", "-m", "base", "-q"]);
-    let base = String::from_utf8(run_output(sley_testkit::oracle_git(), upstream, &["rev-parse", "HEAD"]).stdout)
-        .expect("base oid utf8")
-        .trim()
-        .to_string();
+    let base = String::from_utf8(
+        run_output(sley_testkit::oracle_git(), upstream, &["rev-parse", "HEAD"]).stdout,
+    )
+    .expect("base oid utf8")
+    .trim()
+    .to_string();
     git(upstream, &["checkout", "-b", "topic", &base, "-q"]);
     fs::write(upstream.join("topic.txt"), b"topic-only\n").expect("write topic file");
     git(upstream, &["add", "topic.txt"]);
@@ -121,7 +123,12 @@ fn pull_rebase_clean_matches_upstream_git() {
         String::from_utf8_lossy(&actual_output.stderr)
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after pull rebase"
     );
@@ -159,7 +166,12 @@ fn pull_rebase_flag_matches_upstream_git() {
         String::from_utf8_lossy(&actual_output.stderr)
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after pull --rebase"
     );

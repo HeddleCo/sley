@@ -357,6 +357,7 @@ fn rev_parse_abbrev_ref(git_dir: &Path, format: ObjectFormat, rev: &str) -> Resu
 fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bool) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
     let refs = store.list_refs()?;
+    let terms = sley_rev::read_bisect_terms(git_dir)?;
     let emit = |reference: &Ref, negate: bool| -> Result<()> {
         let rendered = if symbolic_full_name {
             reference.name.clone()
@@ -376,12 +377,12 @@ fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bo
     // `list_refs` already returns refs in name order, so a single forward pass
     // per prefix preserves git's sorted output.
     for reference in &refs {
-        if reference.name.starts_with("refs/bisect/bad") {
+        if terms.is_bad_ref(&reference.name) {
             emit(reference, false)?;
         }
     }
     for reference in &refs {
-        if reference.name.starts_with("refs/bisect/good") {
+        if terms.is_good_ref(&reference.name) {
             emit(reference, true)?;
         }
     }
@@ -673,13 +674,9 @@ fn verify_repository_format(git_dir: &Path) -> Result<()> {
     }
     let mut v1_only = Vec::new();
     let mut unknown = Vec::new();
-    for section in config
-        .sections
-        .iter()
-        .filter(|section| {
-            section.name.eq_ignore_ascii_case("extensions") && section.subsection.is_none()
-        })
-    {
+    for section in config.sections.iter().filter(|section| {
+        section.name.eq_ignore_ascii_case("extensions") && section.subsection.is_none()
+    }) {
         for entry in &section.entries {
             let ext = entry.key.to_ascii_lowercase();
             match ext.as_str() {
@@ -687,14 +684,22 @@ fn verify_repository_format(git_dir: &Path) -> Result<()> {
                 // (`handle_extension_v0`).
                 "noop" | "preciousobjects" | "partialclone" | "worktreeconfig" => {}
                 // v1-only extensions (`handle_extension`).
-                "noop-v1" | "objectformat" | "compatobjectformat" | "refstorage"
-                | "relativeworktrees" | "submodulepathconfig" => v1_only.push(ext),
+                "noop-v1"
+                | "objectformat"
+                | "compatobjectformat"
+                | "refstorage"
+                | "relativeworktrees"
+                | "submodulepathconfig" => v1_only.push(ext),
                 _ => unknown.push(ext),
             }
         }
     }
     if version >= 1 && !unknown.is_empty() {
-        let plural = if unknown.len() == 1 { "extension" } else { "extensions" };
+        let plural = if unknown.len() == 1 {
+            "extension"
+        } else {
+            "extensions"
+        };
         eprintln!(
             "fatal: unknown repository {plural} found:\n\t{}",
             unknown.join("\n\t")
@@ -702,7 +707,11 @@ fn verify_repository_format(git_dir: &Path) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if version == 0 && !v1_only.is_empty() {
-        let plural = if v1_only.len() == 1 { "extension" } else { "extensions" };
+        let plural = if v1_only.len() == 1 {
+            "extension"
+        } else {
+            "extensions"
+        };
         eprintln!(
             "fatal: repo version is 0, but v1-only {plural} found:\n\t{}",
             v1_only.join("\n\t")

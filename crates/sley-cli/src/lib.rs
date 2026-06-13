@@ -12,8 +12,7 @@ use sley_object::{
 use sley_odb::{
     FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
     build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
-    install_reachable_pack, prune_unreachable_loose, repository_object_ids,
-    repository_objects_dir,
+    install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_protocol::{
@@ -510,9 +509,7 @@ fn push_config_env(spec: &str) -> Result<GlobalConfigOverride> {
     let env_value = match env::var(env_name) {
         Ok(value) => value,
         Err(_) => {
-            eprintln!(
-                "fatal: missing environment variable '{env_name}' for configuration '{key}'"
-            );
+            eprintln!("fatal: missing environment variable '{env_name}' for configuration '{key}'");
             return Err(GitError::Exit(128));
         }
     };
@@ -550,7 +547,9 @@ fn push_split_parameter(key: &str, value: Option<&str>) {
 /// parsed for in-process reads and exported to shell-alias subprocesses so they
 /// inherit the parent's overrides.
 pub(crate) fn effective_config_parameters_env() -> Option<String> {
-    let inherited = env::var("GIT_CONFIG_PARAMETERS").ok().filter(|s| !s.is_empty());
+    let inherited = env::var("GIT_CONFIG_PARAMETERS")
+        .ok()
+        .filter(|s| !s.is_empty());
     let fragment = CMDLINE_CONFIG_PARAMETERS
         .lock()
         .ok()
@@ -581,7 +580,10 @@ fn global_config_value(key: &str) -> Result<Option<String>> {
         .iter()
         .rev()
         .find(|param| param.canonical_key.eq_ignore_ascii_case(&canonical))
-        .map(|param| param.value.clone().unwrap_or_else(|| "true".to_string())))
+        .map(|param| match &param.value {
+            Some(value) => value.clone(),
+            None => "true".to_string(),
+        }))
 }
 
 /// Parse the full config-injection stream (env-count pairs plus the effective
@@ -801,18 +803,28 @@ Disable this message with \"git config set advice.defaultBranchName false\"";
 /// overrides the `init.defaultBranch` configuration (read from the default
 /// config layers: `-c` overrides, then system/global files); the hardcoded
 /// fallback is `master`.
-fn default_initial_branch_name(global_config: &[GlobalConfigOverride]) -> Result<String> {
+fn default_initial_branch_name(
+    global_config: &[GlobalConfigOverride],
+    config_git_dir: Option<&Path>,
+) -> Result<String> {
     if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
         && !env.is_empty()
     {
         return Ok(env);
     }
-    Ok(init_config_value("init.defaultBranch", global_config)?
+    match init_config_value("init.defaultBranch", global_config, config_git_dir)?
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "master".to_string()))
+    {
+        Some(value) => Ok(value),
+        None => Ok("master".to_string()),
+    }
 }
 
-fn init_config_value(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<String>> {
+fn init_config_value(
+    key: &str,
+    global_config: &[GlobalConfigOverride],
+    config_git_dir: Option<&Path>,
+) -> Result<Option<String>> {
     if let Some(value) = global_config
         .iter()
         .rev()
@@ -824,12 +836,76 @@ fn init_config_value(key: &str, global_config: &[GlobalConfigOverride]) -> Resul
     if let Ok(Some(value)) = global_config_value(key) {
         return Ok(Some(value));
     }
-    let context = sley_config::ConfigIncludeContext::new(None, None);
-    let config = sley_config::load_pre_dispatch_config(None, &context)?;
+    let context = match config_git_dir {
+        Some(git_dir) => {
+            let git_dir_abs = match fs::canonicalize(git_dir) {
+                Ok(path) => path,
+                Err(_) => git_dir.to_path_buf(),
+            };
+            sley_config::ConfigIncludeContext::new(
+                Some(git_dir_abs),
+                sley_config::repo_current_branch_name(git_dir),
+            )
+        }
+        None => sley_config::ConfigIncludeContext::new(None, None),
+    };
+    let mut config = sley_config::load_pre_dispatch_config(config_git_dir, &context)
+        .map_err(report_config_setup_error)?;
+    let parameters = injected_config_parameters()?;
+    let base = match env::current_dir() {
+        Ok(path) => path,
+        Err(_) => PathBuf::from("."),
+    };
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        &base,
+    )
+    .map_err(report_config_setup_error)?;
     let (section, entry_key) = key
         .split_once('.')
         .ok_or_else(|| GitError::Command(format!("invalid config key {key}")))?;
     Ok(config.get(section, None, entry_key).map(str::to_owned))
+}
+
+pub(crate) fn report_config_setup_error(err: GitError) -> GitError {
+    match err {
+        GitError::InvalidFormat(message) => {
+            if message
+                == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
+            {
+                eprintln!("fatal: {message}");
+                return GitError::Exit(128);
+            }
+            if let Some((line, path)) = parse_bad_config_line_with_path(&message) {
+                eprintln!("fatal: bad config line {line} in file {path}");
+                return GitError::Exit(128);
+            }
+            if let Some(line) = parse_bad_config_line_without_path(&message) {
+                eprintln!("fatal: bad config line {line}");
+                return GitError::Exit(128);
+            }
+            GitError::InvalidFormat(message)
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn parse_bad_config_line_with_path(message: &str) -> Option<(&str, &str)> {
+    let rest = message.strip_prefix("config line ")?;
+    let (line, rest) = rest.split_once(" in file ")?;
+    let path = match rest.rsplit_once(':') {
+        Some((path, _detail)) => path,
+        None => rest,
+    };
+    Some((line, path))
+}
+
+pub(crate) fn parse_bad_config_line_without_path(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("config line ")?;
+    let (line, _detail) = rest.split_once(':')?;
+    Some(line)
 }
 
 fn parse_config_bool(value: &str) -> Option<bool> {
@@ -2089,8 +2165,7 @@ fn apply_submodule_ignore_filter(
     entries
         .into_iter()
         .filter(|entry| {
-            let gitlink =
-                entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000);
+            let gitlink = entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000);
             !(gitlink && config.effective(&entry.path) == SubmoduleIgnoreMode::All)
         })
         .collect()
@@ -2118,10 +2193,7 @@ fn collect_dirty_submodules(
         }
         let path = entry.path.as_bytes();
         let mode = config.effective(path);
-        if matches!(
-            mode,
-            SubmoduleIgnoreMode::All | SubmoduleIgnoreMode::Dirty
-        ) {
+        if matches!(mode, SubmoduleIgnoreMode::All | SubmoduleIgnoreMode::Dirty) {
             continue;
         }
         let sub_root = worktree_root.join(repo_path_to_path(path));
@@ -2483,10 +2555,6 @@ fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
     }
 }
 
-
-
-
-
 fn write_diff_numstat_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
@@ -2733,7 +2801,11 @@ fn write_diff_stat_with_widths(
             } => {
                 // "Bin XXX -> YYY bytes"; an unchanged blob renders plain "Bin"
                 // (sizes treated as 0/0, exactly like git's same-contents case).
-                let (added, deleted) = if unchanged { (0, 0) } else { (new_size, old_size) };
+                let (added, deleted) = if unchanged {
+                    (0, 0)
+                } else {
+                    (new_size, old_size)
+                };
                 let w = 14 + diff_stat_decimal_width(added) + diff_stat_decimal_width(deleted);
                 bin_width = bin_width.max(w);
                 number_width = number_width.max(3);
@@ -2941,8 +3013,7 @@ fn parse_dirstat_params(params: &str, options: &mut DirstatOptions, errors: &mut
                 let digits_end = param
                     .find(|c: char| !c.is_ascii_digit())
                     .unwrap_or(param.len());
-                let mut permille: i64 =
-                    param[..digits_end].parse::<i64>().unwrap_or(0) * 10;
+                let mut permille: i64 = param[..digits_end].parse::<i64>().unwrap_or(0) * 10;
                 let rest = &param[digits_end..];
                 let mut ok = rest.is_empty();
                 if let Some(frac) = rest.strip_prefix('.')
@@ -3032,7 +3103,10 @@ fn write_diff_dirstat(
             }
         };
         changed_total += damage;
-        files.push(DirstatFile { name, changed: damage });
+        files.push(DirstatFile {
+            name,
+            changed: damage,
+        });
     }
     if changed_total == 0 {
         return Ok(());
@@ -3225,8 +3299,16 @@ fn diff_stat_pprint_rename(a: &[u8], b: &[u8]) -> String {
     let mut ni = len_b as isize;
     let lower = pfx_length as isize - pfx_adjust_for_slash;
     while oi >= lower && ni >= lower {
-        let oc = if oi == len_a as isize { 0 } else { a[oi as usize] };
-        let nc = if ni == len_b as isize { 0 } else { b[ni as usize] };
+        let oc = if oi == len_a as isize {
+            0
+        } else {
+            a[oi as usize]
+        };
+        let nc = if ni == len_b as isize {
+            0
+        } else {
+            b[ni as usize]
+        };
         if oc != nc {
             break;
         }
@@ -3246,9 +3328,13 @@ fn diff_stat_pprint_rename(a: &[u8], b: &[u8]) -> String {
         name.push_str(&String::from_utf8_lossy(&a[..pfx_length]));
         name.push('{');
     }
-    name.push_str(&String::from_utf8_lossy(&a[pfx_length..pfx_length + a_midlen]));
+    name.push_str(&String::from_utf8_lossy(
+        &a[pfx_length..pfx_length + a_midlen],
+    ));
     name.push_str(" => ");
-    name.push_str(&String::from_utf8_lossy(&b[pfx_length..pfx_length + b_midlen]));
+    name.push_str(&String::from_utf8_lossy(
+        &b[pfx_length..pfx_length + b_midlen],
+    ));
     if pfx_length + sfx_length > 0 {
         name.push('}');
         name.push_str(&String::from_utf8_lossy(&a[len_a - sfx_length..]));
@@ -3695,7 +3781,9 @@ impl DiffPathspec {
             return true;
         }
         let magic = effective_pathspec_flags();
-        self.filters.iter().any(|filter| filter.matches(path, magic))
+        self.filters
+            .iter()
+            .any(|filter| filter.matches(path, magic))
     }
 
     fn is_empty(&self) -> bool {
@@ -4151,7 +4239,10 @@ fn for_each_ref_worktree_paths(
         && let Ok(worktree_root) = worktree_root_for_git_dir(git_dir)
     {
         let canonical = fs::canonicalize(worktree_root)?;
-        paths.insert(head_ref.to_string(), canonical.to_string_lossy().into_owned());
+        paths.insert(
+            head_ref.to_string(),
+            canonical.to_string_lossy().into_owned(),
+        );
     }
 
     let worktrees_dir = git_dir.join("worktrees");
@@ -4187,7 +4278,10 @@ fn for_each_ref_worktree_paths(
         };
         if let Some(worktree_root) = gitdir_path.parent() {
             let canonical = fs::canonicalize(worktree_root)?;
-            paths.insert(refname.to_string(), canonical.to_string_lossy().into_owned());
+            paths.insert(
+                refname.to_string(),
+                canonical.to_string_lossy().into_owned(),
+            );
         }
     }
     Ok(paths)
@@ -4513,619 +4607,632 @@ fn print_for_each_ref_format(
         context.quote,
         reset_color_at_eol,
         |stdout, atom| {
-        let placeholder = match atom {
-            ForEachRefAtom::Raw(placeholder) => placeholder.as_str(),
-            atom => {
-                write_for_each_ref_typed_atom(stdout, atom, context)?;
-                return Ok(());
-            }
-        };
-        match placeholder {
-            "HEAD" => stdout.write_all(if context.is_head { b"*" } else { b" " })?,
-            "refname" => stdout.write_all(context.refname.as_bytes())?,
-            "refname:short" => {
-                stdout.write_all(for_each_ref_short_name(context.refname).as_bytes())?
-            }
-            "objectname" => write!(stdout, "{}", context.oid)?,
-            "objectname:short" => stdout.write_all(
-                for_each_ref_abbrev_oid(
-                    context.oid,
-                    context.objectname_abbrev,
-                    context.objectname_candidates,
-                )
-                .as_bytes(),
-            )?,
-            "*objectname" => {
-                if let Some(peeled) = &context.peeled_object {
-                    write!(stdout, "{}", peeled.oid)?;
+            let placeholder = match atom {
+                ForEachRefAtom::Raw(placeholder) => placeholder.as_str(),
+                atom => {
+                    write_for_each_ref_typed_atom(stdout, atom, context)?;
+                    return Ok(());
                 }
-            }
-            "*objectname:short" => {
-                if let Some(peeled) = &context.peeled_object {
-                    stdout.write_all(
-                        for_each_ref_abbrev_oid(
-                            &peeled.oid,
-                            context.objectname_abbrev,
-                            context.objectname_candidates,
-                        )
-                        .as_bytes(),
-                    )?;
+            };
+            match placeholder {
+                "HEAD" => stdout.write_all(if context.is_head { b"*" } else { b" " })?,
+                "refname" => stdout.write_all(context.refname.as_bytes())?,
+                "refname:short" => {
+                    stdout.write_all(for_each_ref_short_name(context.refname).as_bytes())?
                 }
-            }
-            "deltabase" => write!(stdout, "{}", context.deltabase)?,
-            "*deltabase" => {
-                if context.peeled_object.is_some() {
-                    write!(stdout, "{}", context.deltabase)?;
-                }
-            }
-            "raw" => stdout.write_all(context.object_body)?,
-            "raw:size" => write!(stdout, "{}", context.object_body.len())?,
-            "*raw" => {
-                if let Some(peeled) = &context.peeled_object {
-                    stdout.write_all(&peeled.object_body)?;
-                }
-            }
-            "*raw:size" => {
-                if let Some(peeled) = &context.peeled_object {
-                    write!(stdout, "{}", peeled.object_body.len())?;
-                }
-            }
-            "objectsize" => write!(stdout, "{}", context.object_size)?,
-            "*objectsize" => {
-                if let Some(peeled) = &context.peeled_object {
-                    write!(stdout, "{}", peeled.object_size)?;
-                }
-            }
-            "objectsize:disk" => {
-                if let Some(size) = context.object_disk_size {
-                    write!(stdout, "{size}")?;
-                }
-            }
-            "*objectsize:disk" => {
-                if let Some(size) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.object_disk_size)
-                {
-                    write!(stdout, "{size}")?;
-                }
-            }
-            "objecttype" => stdout.write_all(context.object_type.as_str().as_bytes())?,
-            "*objecttype" => {
-                if let Some(peeled) = &context.peeled_object {
-                    stdout.write_all(peeled.object_type.as_str().as_bytes())?;
-                }
-            }
-            "worktreepath" => stdout.write_all(context.worktree_path.unwrap_or("").as_bytes())?,
-            "symref" => stdout.write_all(context.symref.unwrap_or("").as_bytes())?,
-            "symref:short" => stdout.write_all(
-                context
-                    .symref
-                    .map(for_each_ref_short_name)
-                    .unwrap_or("")
+                "objectname" => write!(stdout, "{}", context.oid)?,
+                "objectname:short" => stdout.write_all(
+                    for_each_ref_abbrev_oid(
+                        context.oid,
+                        context.objectname_abbrev,
+                        context.objectname_candidates,
+                    )
                     .as_bytes(),
-            )?,
-            "upstream" => stdout.write_all(
-                context
-                    .upstream
-                    .as_ref()
-                    .map(|upstream| upstream.refname.as_str())
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "upstream:short" => stdout.write_all(
-                context
-                    .upstream
-                    .as_ref()
-                    .map(|upstream| for_each_ref_short_name(&upstream.refname))
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "upstream:remotename" => stdout.write_all(
-                context
-                    .upstream
-                    .as_ref()
-                    .map(|upstream| upstream.remote.as_str())
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "upstream:remoteref" => stdout.write_all(
-                context
-                    .upstream
-                    .as_ref()
-                    .map(|upstream| upstream.merge.as_str())
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "upstream:track" => {
-                if let Some(track) = context.upstream_track {
-                    write_for_each_ref_track(stdout, track, true)?;
-                }
-            }
-            "upstream:track,nobracket" | "upstream:nobracket,track" => {
-                if let Some(track) = context.upstream_track {
-                    write_for_each_ref_track(stdout, track, false)?;
-                }
-            }
-            "upstream:trackshort" => {
-                if let Some(track) = context.upstream_track {
-                    stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
-                }
-            }
-            "push" => stdout.write_all(
-                context
-                    .push
-                    .as_ref()
-                    .and_then(|push| push.refname.as_deref())
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "push:short" => stdout.write_all(
-                context
-                    .push
-                    .as_ref()
-                    .and_then(|push| push.refname.as_deref())
-                    .map(for_each_ref_short_name)
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "push:remotename" => stdout.write_all(
-                context
-                    .push
-                    .as_ref()
-                    .map(|push| push.remote.as_str())
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "push:remoteref" => stdout.write_all(
-                context
-                    .push
-                    .as_ref()
-                    .and_then(|push| push.remote_ref.as_deref())
-                    .unwrap_or("")
-                    .as_bytes(),
-            )?,
-            "push:track" => {
-                if let Some(track) = context.push_track {
-                    write_for_each_ref_track(stdout, track, true)?;
-                }
-            }
-            "push:track,nobracket" | "push:nobracket,track" => {
-                if let Some(track) = context.push_track {
-                    write_for_each_ref_track(stdout, track, false)?;
-                }
-            }
-            "push:trackshort" => {
-                if let Some(track) = context.push_track {
-                    stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
-                }
-            }
-            "subject" | "contents:subject" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    let parts = for_each_ref_message_parts(message);
-                    stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
-                }
-            }
-            "*subject" | "*contents:subject" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    let parts = for_each_ref_message_parts(message);
-                    stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
-                }
-            }
-            "subject:sanitize" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    let parts = for_each_ref_message_parts(message);
-                    let subject = for_each_ref_copy_subject(parts.subject);
-                    stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
-                }
-            }
-            "*subject:sanitize" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    let parts = for_each_ref_message_parts(message);
-                    let subject = for_each_ref_copy_subject(parts.subject);
-                    stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
-                }
-            }
-            "contents:body" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
-                }
-            }
-            "*contents:body" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
-                }
-            }
-            "contents:signature" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    stdout.write_all(for_each_ref_message_parts(message).signature)?;
-                }
-            }
-            "*contents:signature" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    stdout.write_all(for_each_ref_message_parts(message).signature)?;
-                }
-            }
-            "body" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
-                }
-            }
-            "*body" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
-                }
-            }
-            "contents" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    stdout.write_all(for_each_ref_message_parts(message).bare)?;
-                }
-            }
-            "*contents" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    stdout.write_all(for_each_ref_message_parts(message).bare)?;
-                }
-            }
-            "contents:size" => {
-                if let Some(message) = for_each_ref_message(context, false) {
-                    write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
-                }
-            }
-            "*contents:size" => {
-                if let Some(message) = for_each_ref_message(context, true) {
-                    write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
-                }
-            }
-            "author" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*author" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "authorname" | "*authorname" => {
-                for_each_ref_try_name_atom(stdout, placeholder, context)
-                    .expect("name atom recognized")?
-            }
-            "authoremail" | "*authoremail" => {
-                for_each_ref_try_email_atom(stdout, placeholder, context)
-                    .expect("email atom recognized")?
-            }
-            "committer" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committer" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "committername" | "*committername" => {
-                for_each_ref_try_name_atom(stdout, placeholder, context)
-                    .expect("name atom recognized")?
-            }
-            "committeremail" | "*committeremail" => {
-                for_each_ref_try_email_atom(stdout, placeholder, context)
-                    .expect("email atom recognized")?
-            }
-            "tagger" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*tagger" => write_for_each_ref_identity(stdout, None)?,
-            "taggername" | "*taggername" => {
-                for_each_ref_try_name_atom(stdout, placeholder, context)
-                    .expect("name atom recognized")?
-            }
-            "taggeremail" | "*taggeremail" => {
-                for_each_ref_try_email_atom(stdout, placeholder, context)
-                    .expect("email atom recognized")?
-            }
-            "creator" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.creator.as_deref()),
-            )?,
-            "*creator" => write_for_each_ref_identity(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.creator.as_deref()),
-            )?,
-            "authordate" | "*authordate" | "committerdate" | "*committerdate" | "taggerdate"
-            | "*taggerdate" | "creatordate" | "*creatordate" => {
-                for_each_ref_try_date_atom(stdout, placeholder, context)
-                    .expect("date atom recognized")?
-            }
-            "tree" => {
-                if let Some(tree) = context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tree.as_ref())
-                {
-                    write!(stdout, "{tree}")?;
-                }
-            }
-            "parent" => {
-                if let Some(contents) = &context.contents {
-                    for (idx, parent) in contents.parents.iter().enumerate() {
-                        if idx > 0 {
-                            stdout.write_all(b" ")?;
-                        }
-                        write!(stdout, "{parent}")?;
+                )?,
+                "*objectname" => {
+                    if let Some(peeled) = &context.peeled_object {
+                        write!(stdout, "{}", peeled.oid)?;
                     }
                 }
-            }
-            "numparent" => {
-                if let Some(contents) = &context.contents
-                    && contents.tree.is_some()
-                {
-                    write!(stdout, "{}", contents.parents.len())?;
-                }
-            }
-            "*tree" => {
-                if let Some(tree) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.tree.as_ref())
-                {
-                    write!(stdout, "{tree}")?;
-                }
-            }
-            "*parent" => {
-                if let Some(peeled) = &context.peeled_object {
-                    for (idx, parent) in peeled.parents.iter().enumerate() {
-                        if idx > 0 {
-                            stdout.write_all(b" ")?;
-                        }
-                        write!(stdout, "{parent}")?;
-                    }
-                }
-            }
-            "*numparent" => {
-                if let Some(peeled) = &context.peeled_object
-                    && peeled.tree.is_some()
-                {
-                    write!(stdout, "{}", peeled.parents.len())?;
-                }
-            }
-            "tag" => {
-                if let Some(tag) = context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tag.as_ref())
-                {
-                    stdout.write_all(tag)?;
-                }
-            }
-            "type" => {
-                if let Some(object_type) = context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tag_object_type)
-                {
-                    stdout.write_all(object_type.as_str().as_bytes())?;
-                }
-            }
-            "object" => {
-                if let Some(object) = context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tag_object.as_ref())
-                {
-                    write!(stdout, "{object}")?;
-                }
-            }
-            other => {
-                if let Some(value) = other.strip_prefix("color:") {
-                    let color = for_each_ref_color_escape(value)?;
-                    if context.color {
-                        stdout.write_all(color.as_bytes())?;
-                    }
-                } else if let Some(value) = other
-                    .strip_prefix("refname:lstrip=")
-                    .or_else(|| other.strip_prefix("refname:strip="))
-                {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    stdout
-                        .write_all(for_each_ref_lstrip_name(context.refname, count).as_bytes())?;
-                } else if let Some(value) = other.strip_prefix("refname:rstrip=") {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    stdout
-                        .write_all(for_each_ref_rstrip_name(context.refname, count).as_bytes())?;
-                } else if let Some(value) = other
-                    .strip_prefix("upstream:lstrip=")
-                    .or_else(|| other.strip_prefix("upstream:strip="))
-                {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    let upstream = context
-                        .upstream
-                        .as_ref()
-                        .map(|upstream| upstream.refname.as_str())
-                        .unwrap_or("");
-                    stdout.write_all(for_each_ref_lstrip_name(upstream, count).as_bytes())?;
-                } else if let Some(value) = other.strip_prefix("upstream:rstrip=") {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    let upstream = context
-                        .upstream
-                        .as_ref()
-                        .map(|upstream| upstream.refname.as_str())
-                        .unwrap_or("");
-                    stdout.write_all(for_each_ref_rstrip_name(upstream, count).as_bytes())?;
-                } else if let Some(value) = other
-                    .strip_prefix("push:lstrip=")
-                    .or_else(|| other.strip_prefix("push:strip="))
-                {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    let push = context
-                        .push
-                        .as_ref()
-                        .and_then(|push| push.refname.as_deref())
-                        .unwrap_or("");
-                    stdout.write_all(for_each_ref_lstrip_name(push, count).as_bytes())?;
-                } else if let Some(value) = other.strip_prefix("push:rstrip=") {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    let push = context
-                        .push
-                        .as_ref()
-                        .and_then(|push| push.refname.as_deref())
-                        .unwrap_or("");
-                    stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
-                } else if let Some(value) = other
-                    .strip_prefix("symref:lstrip=")
-                    .or_else(|| other.strip_prefix("symref:strip="))
-                {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    let symref = context.symref.unwrap_or("");
-                    stdout.write_all(for_each_ref_lstrip_name(symref, count).as_bytes())?;
-                } else if let Some(value) = other.strip_prefix("symref:rstrip=") {
-                    let count = parse_for_each_ref_strip_count(value)?;
-                    let symref = context.symref.unwrap_or("");
-                    stdout.write_all(for_each_ref_rstrip_name(symref, count).as_bytes())?;
-                } else if let Some(width) = other.strip_prefix("objectname:short=") {
-                    let width = parse_for_each_ref_abbrev_width(width)?;
-                    stdout.write_all(
-                        for_each_ref_abbrev_oid(
-                            context.oid,
-                            Some(width),
-                            context.objectname_candidates,
-                        )
-                        .as_bytes(),
-                    )?;
-                } else if let Some(width) = other.strip_prefix("*objectname:short=") {
-                    let width = parse_for_each_ref_abbrev_width(width)?;
+                "*objectname:short" => {
                     if let Some(peeled) = &context.peeled_object {
                         stdout.write_all(
                             for_each_ref_abbrev_oid(
                                 &peeled.oid,
-                                Some(width),
+                                context.objectname_abbrev,
                                 context.objectname_candidates,
                             )
                             .as_bytes(),
                         )?;
                     }
-                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "tree") {
-                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                }
+                "deltabase" => write!(stdout, "{}", context.deltabase)?,
+                "*deltabase" => {
+                    if context.peeled_object.is_some() {
+                        write!(stdout, "{}", context.deltabase)?;
+                    }
+                }
+                "raw" => stdout.write_all(context.object_body)?,
+                "raw:size" => write!(stdout, "{}", context.object_body.len())?,
+                "*raw" => {
+                    if let Some(peeled) = &context.peeled_object {
+                        stdout.write_all(&peeled.object_body)?;
+                    }
+                }
+                "*raw:size" => {
+                    if let Some(peeled) = &context.peeled_object {
+                        write!(stdout, "{}", peeled.object_body.len())?;
+                    }
+                }
+                "objectsize" => write!(stdout, "{}", context.object_size)?,
+                "*objectsize" => {
+                    if let Some(peeled) = &context.peeled_object {
+                        write!(stdout, "{}", peeled.object_size)?;
+                    }
+                }
+                "objectsize:disk" => {
+                    if let Some(size) = context.object_disk_size {
+                        write!(stdout, "{size}")?;
+                    }
+                }
+                "*objectsize:disk" => {
+                    if let Some(size) = context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.object_disk_size)
+                    {
+                        write!(stdout, "{size}")?;
+                    }
+                }
+                "objecttype" => stdout.write_all(context.object_type.as_str().as_bytes())?,
+                "*objecttype" => {
+                    if let Some(peeled) = &context.peeled_object {
+                        stdout.write_all(peeled.object_type.as_str().as_bytes())?;
+                    }
+                }
+                "worktreepath" => {
+                    stdout.write_all(context.worktree_path.unwrap_or("").as_bytes())?
+                }
+                "symref" => stdout.write_all(context.symref.unwrap_or("").as_bytes())?,
+                "symref:short" => stdout.write_all(
+                    context
+                        .symref
+                        .map(for_each_ref_short_name)
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "upstream" => stdout.write_all(
+                    context
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| upstream.refname.as_str())
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "upstream:short" => stdout.write_all(
+                    context
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| for_each_ref_short_name(&upstream.refname))
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "upstream:remotename" => stdout.write_all(
+                    context
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| upstream.remote.as_str())
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "upstream:remoteref" => stdout.write_all(
+                    context
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| upstream.merge.as_str())
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "upstream:track" => {
+                    if let Some(track) = context.upstream_track {
+                        write_for_each_ref_track(stdout, track, true)?;
+                    }
+                }
+                "upstream:track,nobracket" | "upstream:nobracket,track" => {
+                    if let Some(track) = context.upstream_track {
+                        write_for_each_ref_track(stdout, track, false)?;
+                    }
+                }
+                "upstream:trackshort" => {
+                    if let Some(track) = context.upstream_track {
+                        stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
+                    }
+                }
+                "push" => stdout.write_all(
+                    context
+                        .push
+                        .as_ref()
+                        .and_then(|push| push.refname.as_deref())
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "push:short" => stdout.write_all(
+                    context
+                        .push
+                        .as_ref()
+                        .and_then(|push| push.refname.as_deref())
+                        .map(for_each_ref_short_name)
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "push:remotename" => stdout.write_all(
+                    context
+                        .push
+                        .as_ref()
+                        .map(|push| push.remote.as_str())
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "push:remoteref" => stdout.write_all(
+                    context
+                        .push
+                        .as_ref()
+                        .and_then(|push| push.remote_ref.as_deref())
+                        .unwrap_or("")
+                        .as_bytes(),
+                )?,
+                "push:track" => {
+                    if let Some(track) = context.push_track {
+                        write_for_each_ref_track(stdout, track, true)?;
+                    }
+                }
+                "push:track,nobracket" | "push:nobracket,track" => {
+                    if let Some(track) = context.push_track {
+                        write_for_each_ref_track(stdout, track, false)?;
+                    }
+                }
+                "push:trackshort" => {
+                    if let Some(track) = context.push_track {
+                        stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
+                    }
+                }
+                "subject" | "contents:subject" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        let parts = for_each_ref_message_parts(message);
+                        stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
+                    }
+                }
+                "*subject" | "*contents:subject" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        let parts = for_each_ref_message_parts(message);
+                        stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
+                    }
+                }
+                "subject:sanitize" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        let parts = for_each_ref_message_parts(message);
+                        let subject = for_each_ref_copy_subject(parts.subject);
+                        stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
+                    }
+                }
+                "*subject:sanitize" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        let parts = for_each_ref_message_parts(message);
+                        let subject = for_each_ref_copy_subject(parts.subject);
+                        stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
+                    }
+                }
+                "contents:body" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
+                    }
+                }
+                "*contents:body" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
+                    }
+                }
+                "contents:signature" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        stdout.write_all(for_each_ref_message_parts(message).signature)?;
+                    }
+                }
+                "*contents:signature" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        stdout.write_all(for_each_ref_message_parts(message).signature)?;
+                    }
+                }
+                "body" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
+                    }
+                }
+                "*body" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
+                    }
+                }
+                "contents" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        stdout.write_all(for_each_ref_message_parts(message).bare)?;
+                    }
+                }
+                "*contents" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        stdout.write_all(for_each_ref_message_parts(message).bare)?;
+                    }
+                }
+                "contents:size" => {
+                    if let Some(message) = for_each_ref_message(context, false) {
+                        write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
+                    }
+                }
+                "*contents:size" => {
+                    if let Some(message) = for_each_ref_message(context, true) {
+                        write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
+                    }
+                }
+                "author" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.author.as_deref()),
+                )?,
+                "*author" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.author.as_deref()),
+                )?,
+                "authorname" | "*authorname" => {
+                    for_each_ref_try_name_atom(stdout, placeholder, context)
+                        .expect("name atom recognized")?
+                }
+                "authoremail" | "*authoremail" => {
+                    for_each_ref_try_email_atom(stdout, placeholder, context)
+                        .expect("email atom recognized")?
+                }
+                "committer" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.committer.as_deref()),
+                )?,
+                "*committer" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.committer.as_deref()),
+                )?,
+                "committername" | "*committername" => {
+                    for_each_ref_try_name_atom(stdout, placeholder, context)
+                        .expect("name atom recognized")?
+                }
+                "committeremail" | "*committeremail" => {
+                    for_each_ref_try_email_atom(stdout, placeholder, context)
+                        .expect("email atom recognized")?
+                }
+                "tagger" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.tagger.as_deref()),
+                )?,
+                "*tagger" => write_for_each_ref_identity(stdout, None)?,
+                "taggername" | "*taggername" => {
+                    for_each_ref_try_name_atom(stdout, placeholder, context)
+                        .expect("name atom recognized")?
+                }
+                "taggeremail" | "*taggeremail" => {
+                    for_each_ref_try_email_atom(stdout, placeholder, context)
+                        .expect("email atom recognized")?
+                }
+                "creator" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.creator.as_deref()),
+                )?,
+                "*creator" => write_for_each_ref_identity(
+                    stdout,
+                    context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.creator.as_deref()),
+                )?,
+                "authordate" | "*authordate" | "committerdate" | "*committerdate"
+                | "taggerdate" | "*taggerdate" | "creatordate" | "*creatordate" => {
+                    for_each_ref_try_date_atom(stdout, placeholder, context)
+                        .expect("date atom recognized")?
+                }
+                "tree" => {
                     if let Some(tree) = context
                         .contents
                         .as_ref()
                         .and_then(|contents| contents.tree.as_ref())
                     {
-                        stdout.write_all(
-                            for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
-                                .as_bytes(),
-                        )?;
+                        write!(stdout, "{tree}")?;
                     }
-                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
-                    let width = for_each_ref_oid_atom_width(arg, other)?;
-                    if let Some(tree) = context
-                        .peeled_object
-                        .as_ref()
-                        .and_then(|peeled| peeled.tree.as_ref())
-                    {
-                        stdout.write_all(
-                            for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
-                                .as_bytes(),
-                        )?;
-                    }
-                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
-                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                }
+                "parent" => {
                     if let Some(contents) = &context.contents {
                         for (idx, parent) in contents.parents.iter().enumerate() {
                             if idx > 0 {
                                 stdout.write_all(b" ")?;
                             }
-                            stdout.write_all(
-                                for_each_ref_abbrev_oid(
-                                    parent,
-                                    width,
-                                    context.objectname_candidates,
-                                )
-                                .as_bytes(),
-                            )?;
+                            write!(stdout, "{parent}")?;
                         }
                     }
-                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*parent") {
-                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                }
+                "numparent" => {
+                    if let Some(contents) = &context.contents
+                        && contents.tree.is_some()
+                    {
+                        write!(stdout, "{}", contents.parents.len())?;
+                    }
+                }
+                "*tree" => {
+                    if let Some(tree) = context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.tree.as_ref())
+                    {
+                        write!(stdout, "{tree}")?;
+                    }
+                }
+                "*parent" => {
                     if let Some(peeled) = &context.peeled_object {
                         for (idx, parent) in peeled.parents.iter().enumerate() {
                             if idx > 0 {
                                 stdout.write_all(b" ")?;
                             }
+                            write!(stdout, "{parent}")?;
+                        }
+                    }
+                }
+                "*numparent" => {
+                    if let Some(peeled) = &context.peeled_object
+                        && peeled.tree.is_some()
+                    {
+                        write!(stdout, "{}", peeled.parents.len())?;
+                    }
+                }
+                "tag" => {
+                    if let Some(tag) = context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.tag.as_ref())
+                    {
+                        stdout.write_all(tag)?;
+                    }
+                }
+                "type" => {
+                    if let Some(object_type) = context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.tag_object_type)
+                    {
+                        stdout.write_all(object_type.as_str().as_bytes())?;
+                    }
+                }
+                "object" => {
+                    if let Some(object) = context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.tag_object.as_ref())
+                    {
+                        write!(stdout, "{object}")?;
+                    }
+                }
+                other => {
+                    if let Some(value) = other.strip_prefix("color:") {
+                        let color = for_each_ref_color_escape(value)?;
+                        if context.color {
+                            stdout.write_all(color.as_bytes())?;
+                        }
+                    } else if let Some(value) = other
+                        .strip_prefix("refname:lstrip=")
+                        .or_else(|| other.strip_prefix("refname:strip="))
+                    {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        stdout.write_all(
+                            for_each_ref_lstrip_name(context.refname, count).as_bytes(),
+                        )?;
+                    } else if let Some(value) = other.strip_prefix("refname:rstrip=") {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        stdout.write_all(
+                            for_each_ref_rstrip_name(context.refname, count).as_bytes(),
+                        )?;
+                    } else if let Some(value) = other
+                        .strip_prefix("upstream:lstrip=")
+                        .or_else(|| other.strip_prefix("upstream:strip="))
+                    {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        let upstream = context
+                            .upstream
+                            .as_ref()
+                            .map(|upstream| upstream.refname.as_str())
+                            .unwrap_or("");
+                        stdout.write_all(for_each_ref_lstrip_name(upstream, count).as_bytes())?;
+                    } else if let Some(value) = other.strip_prefix("upstream:rstrip=") {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        let upstream = context
+                            .upstream
+                            .as_ref()
+                            .map(|upstream| upstream.refname.as_str())
+                            .unwrap_or("");
+                        stdout.write_all(for_each_ref_rstrip_name(upstream, count).as_bytes())?;
+                    } else if let Some(value) = other
+                        .strip_prefix("push:lstrip=")
+                        .or_else(|| other.strip_prefix("push:strip="))
+                    {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        let push = context
+                            .push
+                            .as_ref()
+                            .and_then(|push| push.refname.as_deref())
+                            .unwrap_or("");
+                        stdout.write_all(for_each_ref_lstrip_name(push, count).as_bytes())?;
+                    } else if let Some(value) = other.strip_prefix("push:rstrip=") {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        let push = context
+                            .push
+                            .as_ref()
+                            .and_then(|push| push.refname.as_deref())
+                            .unwrap_or("");
+                        stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
+                    } else if let Some(value) = other
+                        .strip_prefix("symref:lstrip=")
+                        .or_else(|| other.strip_prefix("symref:strip="))
+                    {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        let symref = context.symref.unwrap_or("");
+                        stdout.write_all(for_each_ref_lstrip_name(symref, count).as_bytes())?;
+                    } else if let Some(value) = other.strip_prefix("symref:rstrip=") {
+                        let count = parse_for_each_ref_strip_count(value)?;
+                        let symref = context.symref.unwrap_or("");
+                        stdout.write_all(for_each_ref_rstrip_name(symref, count).as_bytes())?;
+                    } else if let Some(width) = other.strip_prefix("objectname:short=") {
+                        let width = parse_for_each_ref_abbrev_width(width)?;
+                        stdout.write_all(
+                            for_each_ref_abbrev_oid(
+                                context.oid,
+                                Some(width),
+                                context.objectname_candidates,
+                            )
+                            .as_bytes(),
+                        )?;
+                    } else if let Some(width) = other.strip_prefix("*objectname:short=") {
+                        let width = parse_for_each_ref_abbrev_width(width)?;
+                        if let Some(peeled) = &context.peeled_object {
                             stdout.write_all(
                                 for_each_ref_abbrev_oid(
-                                    parent,
-                                    width,
+                                    &peeled.oid,
+                                    Some(width),
                                     context.objectname_candidates,
                                 )
                                 .as_bytes(),
                             )?;
                         }
-                    }
-                } else if let Some(result) = for_each_ref_try_trailers_atom(stdout, other, context) {
-                    result?;
-                } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context) {
-                    result?;
-                } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context) {
-                    result?;
-                } else if let Some(result) = for_each_ref_try_date_atom(stdout, other, context) {
-                    result?;
-                } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
-                    let target = resolve_revision(context.git_dir, context.format, rev)?;
-                    if let Some(track) =
-                        for_each_ref_ahead_behind(context.db, context.format, context.oid, &target)?
+                    } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "tree") {
+                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        if let Some(tree) = context
+                            .contents
+                            .as_ref()
+                            .and_then(|contents| contents.tree.as_ref())
+                        {
+                            stdout.write_all(
+                                for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                    .as_bytes(),
+                            )?;
+                        }
+                    } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
+                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        if let Some(tree) = context
+                            .peeled_object
+                            .as_ref()
+                            .and_then(|peeled| peeled.tree.as_ref())
+                        {
+                            stdout.write_all(
+                                for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                    .as_bytes(),
+                            )?;
+                        }
+                    } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
+                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        if let Some(contents) = &context.contents {
+                            for (idx, parent) in contents.parents.iter().enumerate() {
+                                if idx > 0 {
+                                    stdout.write_all(b" ")?;
+                                }
+                                stdout.write_all(
+                                    for_each_ref_abbrev_oid(
+                                        parent,
+                                        width,
+                                        context.objectname_candidates,
+                                    )
+                                    .as_bytes(),
+                                )?;
+                            }
+                        }
+                    } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*parent") {
+                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        if let Some(peeled) = &context.peeled_object {
+                            for (idx, parent) in peeled.parents.iter().enumerate() {
+                                if idx > 0 {
+                                    stdout.write_all(b" ")?;
+                                }
+                                stdout.write_all(
+                                    for_each_ref_abbrev_oid(
+                                        parent,
+                                        width,
+                                        context.objectname_candidates,
+                                    )
+                                    .as_bytes(),
+                                )?;
+                            }
+                        }
+                    } else if let Some(result) =
+                        for_each_ref_try_trailers_atom(stdout, other, context)
                     {
-                        write!(stdout, "{} {}", track.ahead, track.behind)?;
-                    }
-                } else if let Some(value) = other.strip_prefix("contents:lines=") {
-                    let count = parse_for_each_ref_contents_lines_count(value)?;
-                    if let Some(contents) = &context.contents {
-                        write_for_each_ref_contents_lines(stdout, &contents.message, count)?;
-                    }
-                } else if let Some(value) = other.strip_prefix("*contents:lines=") {
-                    let count = parse_for_each_ref_contents_lines_count(value)?;
-                    if let Some(message) = context
-                        .peeled_object
-                        .as_ref()
-                        .and_then(|peeled| peeled.message.as_ref())
+                        result?;
+                    } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context)
                     {
-                        write_for_each_ref_contents_lines(stdout, message, count)?;
+                        result?;
+                    } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context)
+                    {
+                        result?;
+                    } else if let Some(result) = for_each_ref_try_date_atom(stdout, other, context)
+                    {
+                        result?;
+                    } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
+                        let target = resolve_revision(context.git_dir, context.format, rev)?;
+                        if let Some(track) = for_each_ref_ahead_behind(
+                            context.db,
+                            context.format,
+                            context.oid,
+                            &target,
+                        )? {
+                            write!(stdout, "{} {}", track.ahead, track.behind)?;
+                        }
+                    } else if let Some(value) = other.strip_prefix("contents:lines=") {
+                        let count = parse_for_each_ref_contents_lines_count(value)?;
+                        if let Some(contents) = &context.contents {
+                            write_for_each_ref_contents_lines(stdout, &contents.message, count)?;
+                        }
+                    } else if let Some(value) = other.strip_prefix("*contents:lines=") {
+                        let count = parse_for_each_ref_contents_lines_count(value)?;
+                        if let Some(message) = context
+                            .peeled_object
+                            .as_ref()
+                            .and_then(|peeled| peeled.message.as_ref())
+                        {
+                            write_for_each_ref_contents_lines(stdout, message, count)?;
+                        }
+                    } else if let Some(arg) = other
+                        .strip_prefix("contents:")
+                        .or_else(|| other.strip_prefix("*contents:"))
+                    {
+                        // A `%(contents:XXX)` that none of the contents sub-atoms
+                        // above recognized — git reports the bare contents arg.
+                        eprintln!("fatal: unrecognized %(contents) argument: {arg}");
+                        return Err(GitError::Exit(128));
+                    } else {
+                        return Err(GitError::Command(format!(
+                            "unsupported for-each-ref format placeholder %({other})"
+                        )));
                     }
-                } else if let Some(arg) = other
-                    .strip_prefix("contents:")
-                    .or_else(|| other.strip_prefix("*contents:"))
-                {
-                    // A `%(contents:XXX)` that none of the contents sub-atoms
-                    // above recognized — git reports the bare contents arg.
-                    eprintln!("fatal: unrecognized %(contents) argument: {arg}");
-                    return Err(GitError::Exit(128));
-                } else {
-                    return Err(GitError::Command(format!(
-                        "unsupported for-each-ref format placeholder %({other})"
-                    )));
                 }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 fn write_for_each_ref_typed_atom(
@@ -5298,7 +5405,6 @@ fn write_for_each_ref_contents_lines(
     Ok(())
 }
 
-
 /// The set of `%(...email)` options, mirroring git's `email_option` bitset
 /// (ref-filter.c `EO_TRIM`/`EO_LOCALPART`/`EO_MAILMAP`).
 #[derive(Clone, Copy, Default)]
@@ -5313,7 +5419,9 @@ struct ForEachRefEmailOptions {
 /// each must be an exact `trim`/`localpart`/`mailmap` token between commas.
 /// On an unrecognized token, returns `Err(bad_arg)` where `bad_arg` is the
 /// unconsumed remainder at the point of failure (git reports this verbatim).
-fn parse_for_each_ref_email_options(arg: &str) -> std::result::Result<ForEachRefEmailOptions, String> {
+fn parse_for_each_ref_email_options(
+    arg: &str,
+) -> std::result::Result<ForEachRefEmailOptions, String> {
     let mut options = ForEachRefEmailOptions::default();
     let mut rest = arg;
     loop {
@@ -5383,7 +5491,9 @@ fn for_each_ref_try_email_atom(
         },
         None => ForEachRefEmailOptions::default(),
     };
-    Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+    Some(for_each_ref_write_email(
+        stdout, context, peeled, role, options,
+    ))
 }
 
 /// If `placeholder` is a trailers atom (`%(trailers[:opts])` or
@@ -6030,7 +6140,9 @@ fn log_split_embedded_timezone(rest: &str) -> (&str, Option<String>) {
     if bytes.len() >= 5 {
         let tz_start = bytes.len() - 5;
         if matches!(bytes[tz_start], b'+' | b'-')
-            && bytes[tz_start + 1..].iter().all(|byte| byte.is_ascii_digit())
+            && bytes[tz_start + 1..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit())
         {
             return (&rest[..tz_start], Some(rest[tz_start..].to_string()));
         }
@@ -6231,6 +6343,17 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
+    // `git log` accepts the empty `--output-indicator-*=`, even though the diff
+    // plumbing command rejects it. Keep the shared diff/stash validator strict
+    // and relax only log's option passthrough.
+    if value.is_empty() {
+        Ok(())
+    } else {
+        log_validate_output_indicator(option, value)
+    }
+}
+
 fn log_validate_submodule_format(value: &str) -> Result<()> {
     match value {
         "short" | "log" | "diff" => Ok(()),
@@ -6347,7 +6470,10 @@ fn git_parse_blob_limit(value: &str) -> Option<u64> {
         b'g' | b'G' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
         _ => (value, 1),
     };
-    let base = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+    let base = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
         u64::from_str_radix(hex, 16).ok()?
     } else if digits.len() > 1 && digits.starts_with('0') {
         u64::from_str_radix(&digits[1..], 8).ok()?
@@ -7230,8 +7356,12 @@ enum SimpleLogRegexClassItem {
 impl SimpleLogRegex {
     fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
-            let regex =
-                commands::grep::Regex::compile(pattern, commands::grep::RegexMode::Pcre, false, false)?;
+            let regex = commands::grep::Regex::compile(
+                pattern,
+                commands::grep::RegexMode::Pcre,
+                false,
+                false,
+            )?;
             return Ok(Self {
                 alternatives: Vec::new(),
                 perl: Some(regex),
@@ -7457,19 +7587,8 @@ fn log_regex_unterminated_class_error(
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    // `class_bytes` is everything after the opening `[`. git (via POSIX regerror)
-    // distinguishes two cases: an opening bracket with no class content at all —
-    // `[` or `[^` at end of pattern — reports a generic "Invalid regular
-    // expression"; an unterminated class that does have content (e.g. `[a`, `[]`,
-    // `[[:alpha:]`) reports the bracket-specific "Unmatched" diagnostic. In POSIX
-    // BRE a `]` immediately following `[`/`[^` is a literal member, so it counts as
-    // content. Match that split exactly for git 2.54 parity.
-    let after_caret = class_bytes.strip_prefix(b"^").unwrap_or(class_bytes);
-    let message = if after_caret.is_empty() {
-        "Invalid regular expression"
-    } else {
-        "Unmatched [, [^, [:, [., or [="
-    };
+    let _ = class_bytes;
+    let message = "brackets ([ ]) not balanced";
     eprintln!("fatal: {error_context}, '{pattern}': {message}");
     Err(GitError::Exit(128))
 }
@@ -7733,9 +7852,7 @@ fn emit_compiled_log_format(
                 let t = &tokens[idx];
                 let is_modifier = matches!(
                     t,
-                    FormatToken::ColorParen
-                        | FormatToken::ColorName(_)
-                        | FormatToken::ColorAuto
+                    FormatToken::ColorParen | FormatToken::ColorName(_) | FormatToken::ColorAuto
                 );
                 emit_log_one_token(
                     t,
@@ -7815,8 +7932,11 @@ fn emit_log_one_token(
     // log output encoding once at the end (handled by the print path). So here we
     // always normalise the message to UTF-8.
     let _ = output_encoding;
-    let reencoded_message =
-        log_reencode_message(&record.commit.message, &commit_encoding(&record.commit), "UTF-8");
+    let reencoded_message = log_reencode_message(
+        &record.commit.message,
+        &commit_encoding(&record.commit),
+        "UTF-8",
+    );
     let message: &[u8] = &reencoded_message;
     {
         match token {
@@ -7992,14 +8112,11 @@ fn emit_log_one_token(
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
             FormatToken::Trailers(opts) => {
-                let parsed = crate::commands::for_each_ref::parse_for_each_ref_trailer_options(
-                    opts,
-                )
-                .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
-                let rendered = crate::commands::for_each_ref::for_each_ref_format_trailers(
-                    message,
-                    &parsed,
-                );
+                let parsed =
+                    crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts)
+                        .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
+                let rendered =
+                    crate::commands::for_each_ref::for_each_ref_format_trailers(message, &parsed);
                 out.extend_from_slice(&rendered);
             }
             FormatToken::Decorate(spec) => {
@@ -8120,13 +8237,12 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
                     }
                     if go_new_line {
                         out.push(b'\n');
-                        let advance = if (text.get(sp).copied().unwrap_or(0) as char)
-                            .is_ascii_whitespace()
-                        {
-                            1
-                        } else {
-                            0
-                        };
+                        let advance =
+                            if (text.get(sp).copied().unwrap_or(0) as char).is_ascii_whitespace() {
+                                1
+                            } else {
+                                0
+                            };
                         bol = sp + advance;
                         pos = bol;
                         space = None;
@@ -8142,13 +8258,12 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
                     // new_line (width exceeded, break at the last space)
                     out.push(b'\n');
                     let sp = space.unwrap_or(pos);
-                    let advance = if (text.get(sp).copied().unwrap_or(0) as char)
-                        .is_ascii_whitespace()
-                    {
-                        1
-                    } else {
-                        0
-                    };
+                    let advance =
+                        if (text.get(sp).copied().unwrap_or(0) as char).is_ascii_whitespace() {
+                            1
+                        } else {
+                            0
+                        };
                     bol = sp + advance;
                     pos = bol;
                     space = None;
@@ -8342,12 +8457,7 @@ fn apply_padding(out: &mut Vec<u8>, captured: &[u8], spec: log_format::PaddingSp
     if len > padding {
         match spec.trunc {
             PaddingTrunc::Left => {
-                captured = log_utf8_replace(
-                    &captured,
-                    0,
-                    (len - (padding - 2)) as usize,
-                    "..",
-                );
+                captured = log_utf8_replace(&captured, 0, (len - (padding - 2)) as usize, "..");
             }
             PaddingTrunc::Middle => {
                 captured = log_utf8_replace(
@@ -8863,9 +8973,7 @@ fn commit_encoding(commit: &Commit) -> String {
 /// True when `name` denotes a UTF-8 encoding (git's `is_encoding_utf8`).
 fn encoding_is_utf8(name: &str) -> bool {
     let n = name.trim();
-    n.is_empty()
-        || n.eq_ignore_ascii_case("utf-8")
-        || n.eq_ignore_ascii_case("utf8")
+    n.is_empty() || n.eq_ignore_ascii_case("utf-8") || n.eq_ignore_ascii_case("utf8")
 }
 
 /// True when `name` is ISO-8859-1 / Latin-1.
@@ -8913,9 +9021,7 @@ fn log_reencode_message<'a>(message: &'a [u8], from: &str, to: &str) -> std::bor
             if b < 0x80 {
                 out.push(b);
                 idx += 1;
-            } else if b & 0xe0 == 0xc0
-                && idx + 1 < message.len()
-                && message[idx + 1] & 0xc0 == 0x80
+            } else if b & 0xe0 == 0xc0 && idx + 1 < message.len() && message[idx + 1] & 0xc0 == 0x80
             {
                 let cp = (((b & 0x1f) as u32) << 6) | (message[idx + 1] & 0x3f) as u32;
                 if cp <= 0xff {
@@ -9709,9 +9815,11 @@ fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
     if target.is_absolute() {
         Ok(Some(target))
     } else {
-        Ok(Some(
-            path.parent().unwrap_or_else(|| Path::new("")).join(target),
-        ))
+        let parent = match path.parent() {
+            Some(parent) => parent,
+            None => Path::new(""),
+        };
+        Ok(Some(parent.join(target)))
     }
 }
 

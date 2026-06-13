@@ -476,11 +476,12 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // Upstream absolutizes a local source path (`absolute_pathdup` in
     // builtin/clone.c) so later chdirs — the bare/mirror path fetches from
     // inside the destination — cannot re-anchor a relative source like ".".
+    // It does not resolve symlinks in that spelling, so `/var/...` must stay
+    // `/var/...` instead of becoming `/private/var/...` on macOS.
     let repository = if Path::new(&repository).is_dir() {
-        cwd.join(&repository)
-            .canonicalize()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or(repository)
+        resolve_cli_path(&cwd, &repository)
+            .to_string_lossy()
+            .into_owned()
     } else {
         repository
     };
@@ -608,7 +609,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         depth
     };
-    let deepen_since = if deepen_since.is_some() && (local_mechanism || bare || revision.is_some()) {
+    let deepen_since = if deepen_since.is_some() && (local_mechanism || bare || revision.is_some())
+    {
         eprintln!("warning: --shallow-since is ignored in local clones; use file:// instead.");
         None
     } else {
@@ -940,7 +942,10 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         .unwrap_or_else(|| remote_head_branch.clone());
 
     if !options.quiet {
-        eprintln!("Cloning into '{}'...", options.destination_display.display());
+        eprintln!(
+            "Cloning into '{}'...",
+            options.destination_display.display()
+        );
     }
 
     let single_branch = options.single_branch;
@@ -1060,7 +1065,10 @@ fn clone_ssh_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         .unwrap_or_else(|| remote_head_branch.clone());
 
     if !options.quiet {
-        eprintln!("Cloning into '{}'...", options.destination_display.display());
+        eprintln!(
+            "Cloning into '{}'...",
+            options.destination_display.display()
+        );
     }
 
     let single_branch = options.single_branch;

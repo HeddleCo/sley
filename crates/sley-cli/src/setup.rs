@@ -57,10 +57,7 @@ enum Discovered {
     Explicit { git_dir: String },
     /// `.git` was found by walking up; `dir` is the directory containing it,
     /// `git_dir` is the (relative-to-`dir`) value.
-    Found {
-        dir: PathBuf,
-        git_dir: String,
-    },
+    Found { dir: PathBuf, git_dir: String },
     /// A bare repository was found at `dir` (cwd was inside a git dir).
     Bare { dir: PathBuf },
 }
@@ -101,22 +98,14 @@ fn discover(cwd: &Path) -> Option<Discovered> {
     }
 
     let one_filesystem = !git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM");
-    let start_device = if one_filesystem {
-        device_of(cwd)
-    } else {
-        None
-    };
+    let start_device = if one_filesystem { device_of(cwd) } else { None };
 
     let ceilings = ceiling_directories();
 
     for dir in cwd.ancestors() {
         // GIT_CEILING_DIRECTORIES: stop before entering a listed *proper*
         // ancestor; the starting directory itself is always examined.
-        if dir != cwd
-            && ceilings
-                .iter()
-                .any(|ceiling| paths_same_dir(ceiling, dir))
-        {
+        if dir != cwd && ceilings.iter().any(|ceiling| paths_same_dir(ceiling, dir)) {
             return None;
         }
 
@@ -499,9 +488,7 @@ fn read_worktree_config(gitdir: &Path) -> (bool, Option<String>) {
         .unwrap_or(false);
 
     let mut is_bare = config.get_bool("core", None, "bare").unwrap_or(false);
-    let mut core_worktree = config
-        .get("core", None, "worktree")
-        .map(str::to_string);
+    let mut core_worktree = config.get("core", None, "worktree").map(str::to_string);
 
     if worktree_config {
         // Per-worktree config overrides core.bare/core.worktree.
@@ -680,13 +667,15 @@ pub(crate) fn trace_repo_setup(result: &SetupResult) {
         return;
     };
     let bare = git_env_bool("GIT_TRACE_BARE");
-    let worktree = result
-        .worktree
-        .as_ref()
-        .map(|w| path_to_string(w))
-        .unwrap_or_else(|| "(null)".to_string());
+    let worktree = match result.worktree.as_ref() {
+        Some(worktree) => path_to_string(worktree),
+        None => "(null)".to_string(),
+    };
     let cwd = path_to_string(&result.cwd);
-    let prefix = result.prefix.clone().unwrap_or_else(|| "(null)".to_string());
+    let prefix = match &result.prefix {
+        Some(prefix) => prefix.clone(),
+        None => "(null)".to_string(),
+    };
 
     let lines = [
         format!("setup: git_dir: {}", quote_crnl(&result.git_dir)),

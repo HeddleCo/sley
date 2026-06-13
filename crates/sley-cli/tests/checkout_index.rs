@@ -116,13 +116,29 @@ fn prepare_pair(name: &str, root: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn prepare_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
-    run_success(sley_testkit::oracle_git(), root, &["config", "core.autocrlf", "false"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["config", "core.autocrlf", "false"],
+    );
     fs::write(root.join("file.txt"), b"base\n").expect("write file");
     fs::create_dir_all(root.join("dir")).expect("create dir");
     fs::write(root.join("dir/nested.txt"), b"nested\n").expect("write nested");
-    run_success(sley_testkit::oracle_git(), root, &["add", "file.txt", "dir/nested.txt"]);
-    run_success(sley_testkit::oracle_git(), root, &["commit", "-q", "-m", "base"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["add", "file.txt", "dir/nested.txt"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["commit", "-q", "-m", "base"],
+    );
 }
 
 /// Remove the worktree files sley and git will recreate, leaving the index.
@@ -442,14 +458,30 @@ fn checkout_index_executable_and_symlink_modes_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
-            run_success(sley_testkit::oracle_git(), repo, &["config", "core.autocrlf", "false"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["config", "core.autocrlf", "false"],
+            );
             fs::write(repo.join("run.sh"), b"#!/bin/sh\necho hi\n").expect("write script");
             set_executable(&repo.join("run.sh"));
             std::os::unix::fs::symlink("run.sh", repo.join("link")).expect("create symlink");
             fs::write(repo.join("plain.txt"), b"plain\n").expect("write plain");
-            run_success(sley_testkit::oracle_git(), repo, &["add", "run.sh", "link", "plain.txt"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "-q", "-m", "modes"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["add", "run.sh", "link", "plain.txt"],
+            );
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "-q", "-m", "modes"],
+            );
             clear_worktree(repo, &["run.sh", "link", "plain.txt"]);
         }
         let args = ["checkout-index", "-a"];

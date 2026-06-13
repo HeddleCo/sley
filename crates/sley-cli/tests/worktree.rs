@@ -155,7 +155,11 @@ fn normalize_output_paths(
 
 fn prepare_repo_with_linked_worktree(repo: &Path, linked: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        repo,
+        &["init", "-q", "-b", "main"],
+    );
     run_success_with_identity(repo, &["commit", "--allow-empty", "-qm", "initial"]);
     run_success(sley_testkit::oracle_git(), repo, &["branch", "topic"]);
     let linked_path = linked.to_string_lossy().into_owned();
@@ -173,13 +177,21 @@ fn prepare_repo_with_stale_linked_worktree(repo: &Path, linked: &Path) {
 
 fn prepare_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        repo,
+        &["init", "-q", "-b", "main"],
+    );
     prepare_worktree_add_contents(repo);
 }
 
 fn prepare_sha256_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        repo,
+        &["init", "-q", "--object-format=sha256", "-b", "main"],
+    );
     prepare_worktree_add_contents(repo);
 }
 
@@ -198,7 +210,11 @@ fn worktree_list_matches_upstream_git() {
         let repo = root.join("repo");
         let linked = root.join("linked");
         fs::create_dir_all(&repo).expect("create repo");
-        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &repo,
+            &["init", "-q", "-b", "main"],
+        );
         run_success_with_identity(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
         run_success(sley_testkit::oracle_git(), &repo, &["branch", "topic"]);
         let linked_path = linked.to_string_lossy().into_owned();
@@ -230,9 +246,17 @@ fn worktree_list_detached_head_matches_upstream_git() {
     {
         let repo = root.join("repo");
         fs::create_dir_all(&repo).expect("create repo");
-        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &repo,
+            &["init", "-q", "-b", "main"],
+        );
         run_success_with_identity(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
-        run_success(sley_testkit::oracle_git(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &repo,
+            &["checkout", "-q", "--detach", "HEAD"],
+        );
 
         for args in [
             vec!["worktree", "list"],
@@ -380,7 +404,11 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
             ],
         );
 
-        let expected_list = run(sley_testkit::oracle_git(), &upstream, &["worktree", "list", "--porcelain"]);
+        let expected_list = run(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["worktree", "list", "--porcelain"],
+        );
         let actual_list = run(
             env!("CARGO_BIN_EXE_sley"),
             &actual,
@@ -400,7 +428,12 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
                 &["status", "--short"]
             )
             .stdout,
-            run(sley_testkit::oracle_git(), &upstream_topic, &["status", "--short"]).stdout
+            run(
+                sley_testkit::oracle_git(),
+                &upstream_topic,
+                &["status", "--short"]
+            )
+            .stdout
         );
     };
     let _ = fs::remove_dir_all(&root);
@@ -517,7 +550,11 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
 
         fs::write(upstream_linked.join("linked.txt"), b"linked\n").expect("write upstream file");
         fs::write(actual_linked.join("linked.txt"), b"linked\n").expect("write actual file");
-        run_success(sley_testkit::oracle_git(), &upstream_linked, &["add", "linked.txt"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &upstream_linked,
+            &["add", "linked.txt"],
+        );
         run_success(
             env!("CARGO_BIN_EXE_sley"),
             &actual_linked,
@@ -532,7 +569,11 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
             assert_same_output(actual, expected, &args);
         }
 
-        let upstream_head = run_success(sley_testkit::oracle_git(), &upstream_linked, &["rev-parse", "HEAD"]);
+        let upstream_head = run_success(
+            sley_testkit::oracle_git(),
+            &upstream_linked,
+            &["rev-parse", "HEAD"],
+        );
         let actual_head = run_success(
             env!("CARGO_BIN_EXE_sley"),
             &actual_linked,

@@ -257,7 +257,11 @@ impl core::fmt::Display for PathspecParseError {
                 write!(f, "Missing ')' at end of pathspec magic")
             }
             PathspecParseError::UnknownMagic(word) => {
-                write!(f, "Invalid pathspec magic '{}'", String::from_utf8_lossy(word))
+                write!(
+                    f,
+                    "Invalid pathspec magic '{}'",
+                    String::from_utf8_lossy(word)
+                )
             }
             PathspecParseError::GlobLiteralConflict => {
                 write!(f, "'literal' and 'glob' are incompatible")
@@ -633,10 +637,7 @@ fn dowild(pattern: &[u8], text: &[u8], flags: u32) -> i32 {
                             matched = true;
                         }
                         next_prev = p_ch2;
-                    } else if p_ch2 == b'-'
-                        && prev_ch != 0
-                        && pi + 1 < p.len()
-                        && p[pi + 1] != b']'
+                    } else if p_ch2 == b'-' && prev_ch != 0 && pi + 1 < p.len() && p[pi + 1] != b']'
                     {
                         pi += 1;
                         p_ch2 = p[pi];
@@ -760,8 +761,11 @@ mod tests {
     use super::*;
 
     fn ps(args: &[&str]) -> Pathspec {
-        Pathspec::parse(args.iter().map(|s| s.as_bytes()), PathspecMatchMagic::default())
-            .expect("valid pathspec")
+        Pathspec::parse(
+            args.iter().map(|s| s.as_bytes()),
+            PathspecMatchMagic::default(),
+        )
+        .expect("valid pathspec")
     }
 
     #[test]
@@ -850,7 +854,10 @@ mod tests {
 
     fn parse_err(arg: &[u8]) -> PathspecParseError {
         match Pathspec::parse([arg], PathspecMatchMagic::default()) {
-            Ok(_) => panic!("expected parse error for {:?}", String::from_utf8_lossy(arg)),
+            Ok(_) => panic!(
+                "expected parse error for {:?}",
+                String::from_utf8_lossy(arg)
+            ),
             Err(e) => e,
         }
     }

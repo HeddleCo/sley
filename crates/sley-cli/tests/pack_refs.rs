@@ -73,7 +73,11 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_pack_refs_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "initial"]);
     run_success(sley_testkit::oracle_git(), root, &["branch", "topic"]);
     run_success(sley_testkit::oracle_git(), root, &["tag", "light"]);

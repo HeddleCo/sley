@@ -11,6 +11,7 @@ pub(crate) enum ConfigAction {
     GetAll,
     GetRegexp,
     List,
+    Edit,
     Set,
     /// git's `ACTION_SET_ALL` — the legacy default `git config <key> <value>
     /// <value-pattern>` (3 positionals, no explicit mode). Like `--replace-all`
@@ -122,6 +123,7 @@ enum ConfigMode {
     GetColor,
     GetColorBool,
     GetUrlMatch,
+    Edit,
     Set,
     Add,
     ReplaceAll,
@@ -141,6 +143,7 @@ impl ConfigMode {
             ConfigAction::GetColor => Self::GetColor,
             ConfigAction::GetColorBool => Self::GetColorBool,
             ConfigAction::GetUrlMatch => Self::GetUrlMatch,
+            ConfigAction::Edit => Self::Edit,
             ConfigAction::Set | ConfigAction::SetAll => Self::Set,
             ConfigAction::Add => Self::Add,
             ConfigAction::ReplaceAll => Self::ReplaceAll,
@@ -219,6 +222,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 action = Some(ConfigAction::RemoveSection);
                 rest
             }
+            "edit" => {
+                action = Some(ConfigAction::Edit);
+                rest
+            }
             _ => args,
         }
     } else {
@@ -236,8 +243,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     // explicit type errors ("only one type at a time"); `--no-type` resets to 0.
     let mut type_set = false;
     let mut positional = Vec::new();
-    // Subcommand-mode `git config get` filter options (git 2.54). These only
-    // exist on the `get` subcommand; the classic flag form rejects them.
+    // Subcommand-mode filter options (git 2.54). `get --value=<pattern>`,
+    // `set --all --value=<pattern>`, and `unset --value=<pattern>` all feed the
+    // same value-pattern matcher; the classic flag form uses positionals.
     let mut subcommand_get_regexp = false;
     let mut subcommand_show_names = false;
     let mut subcommand_value_pattern: Option<String> = None;
@@ -275,9 +283,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("--url requires a value".into()))?;
                 subcommand_url = Some(value.to_string());
             }
-            value
-                if subcommand == Some(ConfigSubcommand::Get) && value.starts_with("--url=") =>
-            {
+            value if subcommand == Some(ConfigSubcommand::Get) && value.starts_with("--url=") => {
                 subcommand_url = Some(value["--url=".len()..].to_string());
             }
             "-f" | "--file" => {
@@ -315,8 +321,12 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             }
             "--list" => modes.set_action_value(&mut action, ConfigAction::List, "--list")?,
             "-l" => modes.set_action_value(&mut action, ConfigAction::List, "--list")?,
+            "--edit" => modes.set_action_value(&mut action, ConfigAction::Edit, "--edit")?,
             "--all" if subcommand == Some(ConfigSubcommand::Get) => {
                 action = Some(ConfigAction::GetAll);
+            }
+            "--all" if subcommand == Some(ConfigSubcommand::Set) => {
+                action = Some(ConfigAction::ReplaceAll);
             }
             "--all" if subcommand == Some(ConfigSubcommand::Unset) => {
                 action = Some(ConfigAction::UnsetAll);
@@ -336,15 +346,22 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             // `--value=<pattern>` filters matches by their value (a regexp by
             // default, an exact string under `--fixed-value`; a leading `!`
             // negates). Subcommand `get` only.
-            "--value" if subcommand == Some(ConfigSubcommand::Get) => {
+            "--value"
+                if matches!(
+                    subcommand,
+                    Some(ConfigSubcommand::Get | ConfigSubcommand::Set | ConfigSubcommand::Unset)
+                ) =>
+            {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--value requires a value".into()))?;
                 subcommand_value_pattern = Some(value.to_string());
             }
             value
-                if subcommand == Some(ConfigSubcommand::Get)
-                    && value.starts_with("--value=") =>
+                if matches!(
+                    subcommand,
+                    Some(ConfigSubcommand::Get | ConfigSubcommand::Set | ConfigSubcommand::Unset)
+                ) && value.starts_with("--value=") =>
             {
                 subcommand_value_pattern = Some(value["--value=".len()..].to_string());
             }
@@ -428,6 +445,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     "--remove-section",
                 )?;
             }
+            value if value.starts_with("--no-") => {
+                eprintln!("error: unknown option `{}'", &value[2..]);
+                return Err(GitError::Exit(129));
+            }
             value => positional.push(value),
         }
     }
@@ -435,6 +456,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         action
     } else {
         match positional.len() {
+            0 => {
+                eprintln!("error: no action specified");
+                return Err(GitError::Exit(129));
+            }
             1 => ConfigAction::Get,
             2 => ConfigAction::Set,
             // Legacy `git config <key> <value> <value-pattern>` (git's
@@ -451,6 +476,11 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         ConfigAction::List if !positional.is_empty() => {
             return Err(GitError::Command(
                 "config --list does not accept positional arguments".into(),
+            ));
+        }
+        ConfigAction::Edit if !positional.is_empty() => {
+            return Err(GitError::Command(
+                "config --edit does not accept positional arguments".into(),
             ));
         }
         ConfigAction::GetRegexp if !(1..=2).contains(&positional.len()) => {
@@ -520,6 +550,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     // `--get-regexp` paths, because its display semantics differ (keys are only
     // shown under `--show-names`, only the last match prints without `--all`).
     let is_subcommand_get = subcommand == Some(ConfigSubcommand::Get);
+    let subcommand_color_default_only = is_subcommand_get
+        && value_type == ConfigValueType::Color
+        && default_value.is_some()
+        && positional.first().is_some_and(|value| value.is_empty());
     if is_subcommand_get {
         // git's `cmd_config_get` validation order. `--fixed-value` is only
         // meaningful with a `--value=<pattern>`; `--default` cannot combine with
@@ -528,9 +562,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             eprintln!("fatal: --fixed-value only applies with 'value-pattern'");
             return Err(GitError::Exit(128));
         }
-        if default_value.is_some()
-            && (action == ConfigAction::GetAll || subcommand_url.is_some())
-        {
+        if default_value.is_some() && (action == ConfigAction::GetAll || subcommand_url.is_some()) {
             eprintln!("fatal: --default= cannot be used with --all or --url=");
             return Err(GitError::Exit(128));
         }
@@ -565,10 +597,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     if comment.is_some()
         && !matches!(
             action,
-            ConfigAction::Set
-                | ConfigAction::SetAll
-                | ConfigAction::ReplaceAll
-                | ConfigAction::Add
+            ConfigAction::Set | ConfigAction::SetAll | ConfigAction::ReplaceAll | ConfigAction::Add
         )
     {
         eprintln!("error: --comment is only applicable to add/set/replace operations");
@@ -584,9 +613,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             | ConfigAction::GetAll
             | ConfigAction::GetRegexp
             | ConfigAction::Unset
-            | ConfigAction::UnsetAll => positional.len() > 1,
+            | ConfigAction::UnsetAll => positional.len() > 1 || subcommand_value_pattern.is_some(),
             ConfigAction::Set | ConfigAction::SetAll | ConfigAction::ReplaceAll => {
-                positional.len() > 2
+                positional.len() > 2 || subcommand_value_pattern.is_some()
             }
             _ => false,
         };
@@ -598,12 +627,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     // The value-pattern positional, parsed as git's value-pattern (a leading `!`
     // negates the match, unless `--fixed-value` requests literal comparison).
     let value_pattern_filter = match action {
-        ConfigAction::SetAll | ConfigAction::ReplaceAll if positional.len() == 3 => {
-            Some(ConfigValuePatternFilter::parse(positional[2], fixed_value))
-        }
-        ConfigAction::Unset | ConfigAction::UnsetAll if positional.len() == 2 => {
-            Some(ConfigValuePatternFilter::parse(positional[1], fixed_value))
-        }
+        ConfigAction::SetAll | ConfigAction::ReplaceAll => subcommand_value_pattern
+            .as_deref()
+            .or_else(|| positional.get(2).copied())
+            .map(|pattern| ConfigValuePatternFilter::parse(pattern, fixed_value)),
+        ConfigAction::Unset | ConfigAction::UnsetAll => subcommand_value_pattern
+            .as_deref()
+            .or_else(|| positional.get(1).copied())
+            .map(|pattern| ConfigValuePatternFilter::parse(pattern, fixed_value)),
         _ => None,
     };
     let value_pattern_filter = value_pattern_filter.as_ref();
@@ -611,6 +642,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let key = if matches!(
         action,
         ConfigAction::List
+            | ConfigAction::Edit
             | ConfigAction::GetColor
             | ConfigAction::GetColorBool
             | ConfigAction::GetUrlMatch
@@ -618,6 +650,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             | ConfigAction::RenameSection
             | ConfigAction::RemoveSection
     ) || (is_subcommand_get && (subcommand_get_regexp || subcommand_url.is_some()))
+        || subcommand_color_default_only
     {
         // Under `git config get --regexp` the positional is a key pattern, not a
         // concrete key, and under `get --url=` it may be a bare section name, so
@@ -660,6 +693,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
     }
+    let editor_repo_git_dir = match &repo_git_dir {
+        Ok(git_dir) => Some(git_dir.clone()),
+        Err(_) => None,
+    };
     let source = if use_global {
         ConfigSource::ScopedFile {
             path: global_config_file_path()?,
@@ -710,6 +747,11 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         ConfigSource::Repository(repo_git_dir?)
     };
 
+    if action == ConfigAction::Edit {
+        config_edit(&source, editor_repo_git_dir.as_deref())?;
+        return Ok(());
+    }
+
     let is_write_action = matches!(
         action,
         ConfigAction::Set
@@ -744,14 +786,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 // multiple values with a single value").
                 let value = normalize_set_value(&key, positional[1], value_type)?;
                 if !config_raw_edit(&source, &key, Some(&value), comment.as_deref(), None, false)? {
-                    eprintln!(
-                        "warning: {} has multiple values",
-                        config_key_display(&key)
-                    );
-                    eprintln!(
-                        "error: cannot overwrite multiple values with a single value\n       Use a regexp, --add or --replace-all to change {}.",
-                        config_key_display(&key)
-                    );
+                    print_config_multiple_values_error(&key);
                     return Err(GitError::Exit(5));
                 }
             }
@@ -769,6 +804,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     pred.as_deref(),
                     false,
                 )? {
+                    print_config_multiple_values_error(&key);
                     return Err(GitError::Exit(5));
                 }
             }
@@ -816,11 +852,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
             }
             ConfigAction::RenameSection => {
-                config_rename_or_remove_section(
-                    &source,
-                    positional[0],
-                    Some(positional[1]),
-                )?;
+                config_rename_or_remove_section(&source, positional[0], Some(positional[1]))?;
             }
             ConfigAction::RemoveSection => {
                 config_rename_or_remove_section(&source, positional[0], None)?;
@@ -848,6 +880,24 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     }
     let entries = entries;
     if is_subcommand_get {
+        if subcommand_color_default_only {
+            if let Some(default) = default_value.as_deref() {
+                let formatted = format_config_value(default, value_type)?;
+                let mut stdout = io::stdout();
+                write_config_metadata(
+                    &mut stdout,
+                    &ConfigValueMeta::command_line(),
+                    display,
+                    null_terminate,
+                )?;
+                if null_terminate {
+                    write!(stdout, "{formatted}\0")?;
+                } else {
+                    write!(stdout, "{formatted}")?;
+                }
+                return Ok(());
+            }
+        }
         // `git config get --url=<url>` routes through the urlmatch lookup,
         // exactly like the classic `--get-urlmatch`.
         if let Some(url) = subcommand_url.as_deref() {
@@ -895,6 +945,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     }
                     ConfigSource::Blob(_) | ConfigSource::Stdin => None,
                 };
+                if matches!(source, ConfigSource::Stdin) {
+                    return Err(report_config_stdin_parse_error(err));
+                }
                 return Err(report_config_parse_error(err, path.as_deref()));
             }
         }
@@ -955,6 +1008,23 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     };
                     value.to_string()
                 }
+                ConfigValueType::BoolOrInt => match entry {
+                    Some(entry) => match entry.value.as_deref() {
+                        None => "true".to_string(),
+                        Some(value) => format_config_value_with(
+                            value,
+                            value_type,
+                            Some(&name),
+                            Some(&entry.origin),
+                        )?,
+                    },
+                    None => {
+                        let Some(default) = default_value.as_deref() else {
+                            return Err(GitError::Exit(1));
+                        };
+                        format_config_value_with(default, value_type, Some(&name), None)?
+                    }
+                },
                 _ => match entry {
                     Some(entry) => match entry.value.as_deref() {
                         Some(value) => format_config_value_with(
@@ -963,6 +1033,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                             Some(&name),
                             Some(&entry.origin),
                         )?,
+                        None if value_type == ConfigValueType::Path => {
+                            return config_missing_path_value(&name, entry);
+                        }
                         None => String::new(),
                     },
                     None => {
@@ -982,6 +1055,16 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             )?;
         }
         ConfigAction::GetColor => {
+            if positional[0].is_empty() {
+                if let Some(default) = positional.get(1) {
+                    write!(
+                        io::stdout(),
+                        "{}",
+                        format_config_default_color_value(default)?
+                    )?;
+                }
+                return Ok(());
+            }
             let key = parse_config_key(positional[0])?;
             let value = entries_get(&entries, &key).and_then(|entry| entry.value.as_deref());
             if let Some(value) = value {
@@ -1072,7 +1155,13 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             for entry in values {
                 let formatted = match entry.value.as_deref() {
-                    None if value_type == ConfigValueType::Bool => "true".to_string(),
+                    None if matches!(
+                        value_type,
+                        ConfigValueType::Bool | ConfigValueType::BoolOrInt
+                    ) =>
+                    {
+                        "true".to_string()
+                    }
                     None => String::new(),
                     Some(value) => format_config_value_with(
                         value,
@@ -1144,8 +1233,10 @@ fn load_read_entries(
             }
             // An explicit-but-missing git dir (e.g. `--git-dir=nonexistent`)
             // still lists the non-repo layers, like git.
-            let common =
-                common_git_dir_for_git_dir(git_dir).unwrap_or_else(|_| git_dir.clone());
+            let common = match common_git_dir_for_git_dir(git_dir) {
+                Ok(common) => common,
+                Err(_) => git_dir.clone(),
+            };
             let local_path = config_display_path(common.join("config"));
             stack
                 .push_file(&local_path, sley_config::ConfigScope::Local, true, &context)
@@ -1185,7 +1276,7 @@ fn load_read_entries(
         ConfigSource::Stdin => {
             let mut bytes = Vec::new();
             io::stdin().read_to_end(&mut bytes)?;
-            let (parsed, tail) = parse_config_bytes(&bytes, action, None)?;
+            let (parsed, tail) = parse_stdin_config_bytes(&bytes, action)?;
             tail_error = tail;
             stack
                 .push_parsed(
@@ -1271,6 +1362,20 @@ fn parse_config_bytes(
     }
 }
 
+fn parse_stdin_config_bytes(
+    bytes: &[u8],
+    action: ConfigAction,
+) -> Result<(GitConfig, Option<GitError>)> {
+    if action == ConfigAction::List {
+        let (config, tail_error) = GitConfig::parse_collecting(bytes)?;
+        Ok((config, tail_error))
+    } else {
+        GitConfig::parse(bytes)
+            .map(|config| (config, None))
+            .map_err(report_config_stdin_parse_error)
+    }
+}
+
 /// The document writes operate on: the target file parsed alone, includes left
 /// in place. Missing files start empty.
 /// Resolve the on-disk path a write action targets, or `None` for the
@@ -1281,6 +1386,103 @@ fn config_write_path(source: &ConfigSource) -> Option<PathBuf> {
         ConfigSource::ScopedFile { path, .. } | ConfigSource::File(path) => Some(path.clone()),
         ConfigSource::Blob(_) | ConfigSource::Stdin => None,
     }
+}
+
+/// Open the selected config file in the user's editor. The edited path comes
+/// from the command's file/scope source, while `core.editor` is resolved from
+/// the ambient repository config, matching git's `git config --edit -f <file>`.
+fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()> {
+    let Some(path) = config_write_path(source) else {
+        match source {
+            ConfigSource::Stdin => eprintln!("fatal: editing stdin is not supported"),
+            _ => eprintln!("fatal: editing blobs is not supported"),
+        }
+        return Err(GitError::Exit(128));
+    };
+    let editor = config_editor_command(repo_git_dir)?;
+    if editor == ":" {
+        return Ok(());
+    }
+    match ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor)
+        .arg(&path)
+        .status()
+    {
+        Ok(status) => {
+            if !status.success() {
+                eprintln!("error: there was a problem with the editor '{editor}'");
+            }
+        }
+        Err(err) => {
+            eprintln!("error: cannot run {editor}: {err}");
+            eprintln!("error: unable to start editor '{editor}'");
+        }
+    }
+    Ok(())
+}
+
+fn config_editor_command(repo_git_dir: Option<&Path>) -> Result<String> {
+    if let Ok(editor) = env::var("GIT_EDITOR") {
+        return Ok(editor);
+    }
+    if let Some(editor) = global_config_value("core.editor")? {
+        return Ok(editor);
+    }
+    if let Some(editor) = config_core_editor(repo_git_dir)? {
+        return Ok(editor);
+    }
+    if let Ok(editor) = env::var("VISUAL")
+        && !editor.is_empty()
+        && config_terminal_allows_visual()
+    {
+        return Ok(editor);
+    }
+    if let Ok(editor) = env::var("EDITOR") {
+        return Ok(editor);
+    }
+    Ok("vi".to_string())
+}
+
+fn config_terminal_allows_visual() -> bool {
+    match env::var("TERM") {
+        Ok(term) => term != "dumb",
+        Err(_) => false,
+    }
+}
+
+fn config_core_editor(repo_git_dir: Option<&Path>) -> Result<Option<String>> {
+    match repo_git_dir {
+        Some(git_dir) => {
+            let source = ConfigSource::Repository(git_dir.to_path_buf());
+            let loaded = load_read_entries(&source, ConfigAction::Get, None)?;
+            Ok(config_core_editor_from_entries(&loaded.entries))
+        }
+        None => config_core_editor_from_default_layers(),
+    }
+}
+
+fn config_core_editor_from_default_layers() -> Result<Option<String>> {
+    let context = config_include_context();
+    let mut stack = sley_config::ConfigStack::new();
+    for (path, scope) in sley_config::default_config_layer_paths() {
+        stack
+            .push_file(&path, scope, true, &context)
+            .map_err(|err| report_config_parse_error(err, Some(&path)))?;
+    }
+    Ok(config_core_editor_from_entries(&stack.entries))
+}
+
+fn config_core_editor_from_entries(entries: &[sley_config::ConfigStackEntry]) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.matches("core", None, "editor"))
+        .map(|entry| match &entry.value {
+            Some(value) => value.clone(),
+            None => "true".to_string(),
+        })
 }
 
 /// Apply a git-faithful surgical edit (`git config set/add/--replace-all/--unset`)
@@ -1492,7 +1694,10 @@ fn global_config_file_path() -> Result<PathBuf> {
             .filter(|value| !value.is_empty())
         {
             Some(xdg) => PathBuf::from(xdg).join("git").join("config"),
-            None => PathBuf::from(&home).join(".config").join("git").join("config"),
+            None => PathBuf::from(&home)
+                .join(".config")
+                .join("git")
+                .join("config"),
         };
         if xdg.exists() {
             return Ok(xdg);
@@ -1559,15 +1764,30 @@ fn config_blob_resolve_error<T>(spec: &str) -> Result<T> {
 fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {
-            if let Some(line) = message.strip_prefix("config line ") {
-                if let Some((line, _)) = line.split_once(':') {
-                    if let Some(path) = path {
-                        eprintln!("fatal: bad config line {line} in file {}", path.display());
-                    } else {
-                        eprintln!("fatal: bad config line {line}");
-                    }
-                    return GitError::Exit(128);
+            if let Some((line, message_path)) = parse_bad_config_line_with_path(&message) {
+                eprintln!("fatal: bad config line {line} in file {message_path}");
+                return GitError::Exit(128);
+            }
+            if let Some(line) = parse_bad_config_line_without_path(&message) {
+                if let Some(path) = path {
+                    eprintln!("fatal: bad config line {line} in file {}", path.display());
+                } else {
+                    eprintln!("fatal: bad config line {line}");
                 }
+                return GitError::Exit(128);
+            }
+            GitError::InvalidFormat(message)
+        }
+        other => other,
+    }
+}
+
+fn report_config_stdin_parse_error(err: GitError) -> GitError {
+    match err {
+        GitError::InvalidFormat(message) => {
+            if let Some(line) = parse_bad_config_line_without_path(&message) {
+                eprintln!("fatal: bad config line {line} in standard input");
+                return GitError::Exit(128);
             }
             GitError::InvalidFormat(message)
         }
@@ -1616,15 +1836,16 @@ fn format_config_value(value: &str, value_type: ConfigValueType) -> Result<Strin
 
 /// Side-effect-free predicate: can `value` be canonicalised as `value_type`?
 /// Used by `--list --type=<T>` to silently drop non-conforming values without
-/// printing the formatter's `fatal:` diagnostic. `Raw` and `Path` always pass
-/// (a path is stored verbatim / tilde-expanded, never rejected here).
+/// printing the formatter's `fatal:` diagnostic. `Raw` always passes; `Path`
+/// only passes when `~` expansion is possible.
 fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
     match value_type {
-        ConfigValueType::Raw | ConfigValueType::Path => true,
+        ConfigValueType::Raw => true,
         ConfigValueType::Bool => sley_config::parse_config_bool(value).is_some(),
         ConfigValueType::Int => sley_config::parse_config_int(value).is_some(),
         ConfigValueType::BoolOrInt => sley_config::parse_config_bool_or_int(value).is_some(),
         ConfigValueType::Color => try_format_config_color_value(value).is_ok(),
+        ConfigValueType::Path => config_path_value_can_expand(value),
         ConfigValueType::ExpiryDate => {
             // Side-effect-free: accept exactly what git's approxidate accepts
             // (absolute dates, relative dates, the never/now sentinels), without
@@ -1632,6 +1853,13 @@ fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
             super::approxidate::parse_expiry_date(value).is_some()
         }
     }
+}
+
+fn value_less_canonicalizes_as(value_type: ConfigValueType) -> bool {
+    matches!(
+        value_type,
+        ConfigValueType::Raw | ConfigValueType::Bool | ConfigValueType::BoolOrInt
+    )
 }
 
 /// Format a typed value, attributing parse failures to the key and the
@@ -1661,7 +1889,7 @@ fn format_config_value_with(
         },
         ConfigValueType::ExpiryDate => format_config_expiry_date_value(value),
         ConfigValueType::Color => format_config_color_value(value),
-        ConfigValueType::Path => Ok(format_config_path_value(value)),
+        ConfigValueType::Path => format_config_path_value(value).map(std::borrow::Cow::into_owned),
     }
 }
 
@@ -1888,16 +2116,159 @@ fn config_bad_color_value(value: &str) -> GitError {
     GitError::Exit(128)
 }
 
-fn format_config_path_value(value: &str) -> String {
+fn format_config_path_value(value: &str) -> Result<std::borrow::Cow<'_, str>> {
+    if let Some(optional) = strip_config_optional_path(value) {
+        if optional_path_exists(optional) {
+            return Ok(std::borrow::Cow::Borrowed(optional));
+        }
+        return Err(GitError::Exit(1));
+    }
     if value == "~" {
-        return env::var("HOME").unwrap_or_else(|_| value.to_string());
+        return expand_config_home_path(value, "");
     }
-    if let Some(rest) = value.strip_prefix("~/")
-        && let Ok(home) = env::var("HOME")
+    if let Some(rest) = value.strip_prefix("~/") {
+        return expand_config_home_path(value, rest);
+    }
+    Ok(std::borrow::Cow::Borrowed(value))
+}
+
+fn config_path_value_can_expand(value: &str) -> bool {
+    if let Some(optional) = strip_config_optional_path(value) {
+        return optional_path_exists(optional);
+    }
+    !(value == "~" || value.starts_with("~/")) || env::var_os("HOME").is_some()
+}
+
+fn strip_config_optional_path(value: &str) -> Option<&str> {
+    value.strip_prefix(":(optional)")
+}
+
+fn optional_path_exists(value: &str) -> bool {
+    !value.is_empty() && Path::new(value).exists()
+}
+
+fn expand_config_home_path<'a>(original: &str, rest: &str) -> Result<std::borrow::Cow<'a, str>> {
+    let Some(home) = env::var_os("HOME") else {
+        eprintln!("error: failed to expand user dir in: '{original}'");
+        return Err(GitError::Exit(128));
+    };
+    Ok(std::borrow::Cow::Owned(
+        PathBuf::from(home).join(rest).display().to_string(),
+    ))
+}
+
+fn config_missing_path_value<T>(name: &str, entry: &sley_config::ConfigStackEntry) -> Result<T> {
+    eprintln!("error: missing value for '{name}'");
+    match entry.origin.kind {
+        sley_config::ConfigOriginKind::File if !entry.origin.name.is_empty() => {
+            if let Some(line) = config_entry_physical_line(Path::new(&entry.origin.name), entry) {
+                eprintln!(
+                    "fatal: bad config line {line} in file {}",
+                    entry.origin.name
+                );
+            } else {
+                eprintln!("fatal: bad config line in file {}", entry.origin.name);
+            }
+        }
+        sley_config::ConfigOriginKind::Stdin => {
+            eprintln!("fatal: bad config line in standard input");
+        }
+        _ => {
+            eprintln!("fatal: bad config line");
+        }
+    }
+    Err(GitError::Exit(128))
+}
+
+fn config_entry_physical_line(
+    path: &Path,
+    target: &sley_config::ConfigStackEntry,
+) -> Option<usize> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut section = String::new();
+    let mut subsection = None::<String>;
+    for (line_index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            if let Some((next_section, next_subsection)) =
+                parse_config_header_for_line_scan(trimmed)
+            {
+                section = next_section;
+                subsection = next_subsection;
+            }
+            continue;
+        }
+        if !section.eq_ignore_ascii_case(&target.section)
+            || subsection.as_deref() != target.subsection.as_deref()
+        {
+            continue;
+        }
+        let Some(key) = config_line_key_for_line_scan(trimmed) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case(&target.key) {
+            return Some(line_index + 1);
+        }
+    }
+    None
+}
+
+fn parse_config_header_for_line_scan(line: &str) -> Option<(String, Option<String>)> {
+    let close = line.find(']')?;
+    let content = line.get(1..close)?.trim();
+    let mut parts = content.splitn(2, char::is_whitespace);
+    let section = parts.next()?.trim();
+    let rest = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(rest) = rest {
+        let subsection = match rest
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            Some(quoted) => unescape_config_subsection_for_line_scan(quoted),
+            None => rest.to_string(),
+        };
+        return Some((section.to_string(), Some(subsection)));
+    }
+    match content.split_once('.') {
+        Some((section, subsection)) => Some((section.to_string(), Some(subsection.to_string()))),
+        None => Some((section.to_string(), None)),
+    }
+}
+
+fn unescape_config_subsection_for_line_scan(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
+}
+
+fn config_line_key_for_line_scan(line: &str) -> Option<&str> {
+    let end = match line
+        .find(|ch: char| ch == '=' || ch.is_ascii_whitespace() || ch == '#' || ch == ';')
     {
-        return PathBuf::from(home).join(rest).display().to_string();
-    }
-    value.to_string()
+        Some(end) => end,
+        None => line.len(),
+    };
+    let key = line.get(..end)?;
+    (!key.is_empty()).then_some(key)
 }
 
 #[derive(Debug)]
@@ -2031,13 +2402,14 @@ fn config_get_urlmatch(
     display: ConfigDisplayOptions,
     value_type: ConfigValueType,
 ) -> Result<bool> {
-    let mut values = BTreeMap::<String, (usize, Option<String>, ConfigValueMeta)>::new();
+    let mut values =
+        BTreeMap::<String, (ConfigUrlMatchScore, Option<String>, ConfigValueMeta)>::new();
     for entry in entries {
         if !entry.section.eq_ignore_ascii_case(&target.section) {
             continue;
         }
-        let match_len = match entry.subsection.as_deref() {
-            None => 0,
+        let score = match entry.subsection.as_deref() {
+            None => ConfigUrlMatchScore::default(),
             Some(base) => match config_urlmatch_score(base, url) {
                 Some(score) => score,
                 None => continue,
@@ -2055,9 +2427,12 @@ fn config_get_urlmatch(
         );
         let replace = values
             .get(&name)
-            .is_none_or(|(previous_len, _, _)| match_len >= *previous_len);
+            .is_none_or(|(previous_score, _, _)| score >= *previous_score);
         if replace {
-            values.insert(name, (match_len, entry.value.clone(), ConfigValueMeta::of(entry)));
+            values.insert(
+                name,
+                (score, entry.value.clone(), ConfigValueMeta::of(entry)),
+            );
         }
     }
     if values.is_empty() {
@@ -2090,6 +2465,13 @@ fn config_get_urlmatch(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct ConfigUrlMatchScore {
+    host_len: usize,
+    path_len: usize,
+    user_matched: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigUrlParts {
     scheme: String,
@@ -2099,30 +2481,76 @@ pub(crate) struct ConfigUrlParts {
     path: String,
 }
 
-fn config_urlmatch_score(base: &str, url: &str) -> Option<usize> {
+fn config_urlmatch_score(base: &str, url: &str) -> Option<ConfigUrlMatchScore> {
     let Some(base_url) = parse_config_url(base) else {
-        return url.starts_with(base).then_some(base.len());
+        return url.starts_with(base).then_some(ConfigUrlMatchScore {
+            host_len: 0,
+            path_len: base.len(),
+            user_matched: false,
+        });
     };
     let url = parse_config_url(url)?;
-    if base_url.scheme != url.scheme
-        || base_url.host != url.host
-        || base_url.port != url.port
-        || (base_url.user.is_some() && base_url.user != url.user)
-    {
+    if base_url.scheme != url.scheme || base_url.port != url.port {
         return None;
     }
-    let base_path = normalize_config_url_path_for_match(&base_url.path);
-    let url_path = normalize_config_url_path_for_match(&url.path);
-    if base_path != "/" && url_path != base_path && !url_path.starts_with(&format!("{base_path}/"))
-    {
+    let user_matched = if let Some(base_user) = base_url.user.as_deref() {
+        if Some(base_user) != url.user.as_deref() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+    if !config_url_host_matches(&url.host, &base_url.host) {
         return None;
     }
-    Some(
-        base_url.scheme.len()
-            + base_url.host.len()
-            + base_url.user.as_ref().map_or(0, |user| user.len() + 1)
-            + base_path.len(),
-    )
+    let path_len = config_url_path_match_len(&url.path, &base_url.path)?;
+    Some(ConfigUrlMatchScore {
+        host_len: base_url.host.len(),
+        path_len,
+        user_matched,
+    })
+}
+
+fn config_url_host_matches(url_host: &str, pattern_host: &str) -> bool {
+    let mut url_parts = url_host.split('.');
+    let mut pattern_parts = pattern_host.split('.');
+    loop {
+        match (url_parts.next(), pattern_parts.next()) {
+            (None, None) => return true,
+            (Some(_), None) | (None, Some(_)) => return false,
+            (Some(_), Some("*")) => {}
+            (Some(url_part), Some(pattern_part)) if url_part == pattern_part => {}
+            _ => return false,
+        }
+    }
+}
+
+fn config_url_path_match_len(url_path: &str, base_path: &str) -> Option<usize> {
+    let base_path = if base_path.is_empty() { "/" } else { base_path };
+    if base_path == "/" {
+        return if url_path.is_empty() || url_path.starts_with('/') {
+            Some(1)
+        } else {
+            None
+        };
+    }
+    let base_path = match base_path.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => base_path,
+    };
+    if !url_path.starts_with(base_path) {
+        return None;
+    }
+    if url_path.len() == base_path.len()
+        || url_path
+            .as_bytes()
+            .get(base_path.len())
+            .is_some_and(|byte| *byte == b'/')
+    {
+        return Some(base_path.len() + 1);
+    }
+    None
 }
 
 fn parse_config_url(value: &str) -> Option<ConfigUrlParts> {
@@ -2188,14 +2616,6 @@ fn normalize_config_url_port(scheme: &str, port: Option<u16>) -> Option<u16> {
         ("http", Some(80)) | ("https", Some(443)) => None,
         _ => port,
     }
-}
-
-fn normalize_config_url_path_for_match(path: &str) -> String {
-    let path = if path.is_empty() { "/" } else { path };
-    if path == "/" {
-        return "/".into();
-    }
-    path.trim_end_matches('/').to_string()
 }
 
 fn decode_config_url_path(path: &str) -> String {
@@ -2436,7 +2856,10 @@ struct SimpleConfigRegexToken {
 enum SimpleConfigRegexAtom {
     Literal(u8),
     Any,
-    Class { negated: bool, ranges: Vec<(u8, u8)> },
+    Class {
+        negated: bool,
+        ranges: Vec<(u8, u8)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2625,11 +3048,13 @@ fn parse_config_regex_class(bytes: &[u8], start: usize) -> Option<(SimpleConfigR
         }
         // `a-z` range, but only when `-` is not trailing (a trailing `-` before
         // `]` is a literal hyphen).
-        if bytes.get(idx + 1) == Some(&b'-')
-            && bytes.get(idx + 2).is_some_and(|&end| end != b']')
-        {
+        if bytes.get(idx + 1) == Some(&b'-') && bytes.get(idx + 2).is_some_and(|&end| end != b']') {
             let end = bytes[idx + 2];
-            let (lo, hi) = if byte <= end { (byte, end) } else { (end, byte) };
+            let (lo, hi) = if byte <= end {
+                (byte, end)
+            } else {
+                (end, byte)
+            };
             ranges.push((lo, hi));
             idx += 3;
         } else {
@@ -2668,11 +3093,12 @@ fn config_list(
         // The untyped default (`Raw`) prints everything. The check must be
         // side-effect-free — the formatter prints a `fatal:` diagnostic on
         // failure, which the list path must NOT emit.
-        if value_type != ConfigValueType::Raw
-            && let Some(value) = entry.value.as_deref()
-            && !value_canonicalizes_as(value, value_type)
-        {
-            continue;
+        if value_type != ConfigValueType::Raw {
+            match entry.value.as_deref() {
+                Some(value) if !value_canonicalizes_as(value, value_type) => continue,
+                None if !value_less_canonicalizes_as(value_type) => continue,
+                _ => {}
+            }
         }
         write_config_entry(
             &mut stdout,
@@ -2761,7 +3187,17 @@ fn write_config_entry(
         ' '
     };
     let formatted_value = match value {
-        None if options.value_type == ConfigValueType::Bool => Some("true".to_string()),
+        None if matches!(
+            options.value_type,
+            ConfigValueType::Bool | ConfigValueType::BoolOrInt
+        ) =>
+        {
+            Some("true".to_string())
+        }
+        None if options.value_type == ConfigValueType::Path => {
+            eprintln!("error: missing value for '{name}'");
+            return Err(GitError::Exit(128));
+        }
         // A value-less entry with no requested type prints just the key (git
         // backs out the key delimiter), so there is no value to render.
         None => None,
@@ -2878,6 +3314,14 @@ fn config_key_display(key: &ConfigKey) -> String {
     }
 }
 
+fn print_config_multiple_values_error(key: &ConfigKey) {
+    let name = config_key_display(key);
+    eprintln!("warning: {name} has multiple values");
+    eprintln!(
+        "error: cannot overwrite multiple values with a single value\n       Use a regexp, --add or --replace-all to change {name}."
+    );
+}
+
 /// git's `normalize_value` for the set path: `string`/`path`/`expiry-date` are
 /// stored verbatim; `int`/`bool`/`bool-or-int` are canonicalised; `color` is
 /// validated but stored as written.
@@ -2892,7 +3336,14 @@ fn normalize_set_value(
         }
         ConfigValueType::Color => {
             // Validate (git dies on a bad color) but store the original spelling.
-            format_config_color_value(value).map(|_| value.to_string())
+            match try_format_config_color_value(value) {
+                Ok(_) => Ok(value.to_string()),
+                Err(()) => {
+                    eprintln!("error: invalid color value: {value}");
+                    eprintln!("fatal: cannot parse color '{value}'");
+                    Err(GitError::Exit(128))
+                }
+            }
         }
         ConfigValueType::Int | ConfigValueType::Bool | ConfigValueType::BoolOrInt => {
             format_config_value_with(value, value_type, Some(&config_key_display(key)), None)
@@ -2902,9 +3353,7 @@ fn normalize_set_value(
 
 /// Adapt a [`ConfigValuePatternFilter`] into the value-matching predicate the raw
 /// editor expects.
-fn filter_predicate(
-    filter: &ConfigValuePatternFilter,
-) -> Box<dyn Fn(Option<&str>) -> bool + '_> {
+fn filter_predicate(filter: &ConfigValuePatternFilter) -> Box<dyn Fn(Option<&str>) -> bool + '_> {
     Box::new(move |value: Option<&str>| filter.matches(value))
 }
 
@@ -2979,4 +3428,3 @@ pub(crate) fn config_set_value_with_comment(
     entry.comment = comment.map(str::to_string);
     section.entries.push(entry);
 }
-

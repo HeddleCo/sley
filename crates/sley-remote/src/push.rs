@@ -491,7 +491,7 @@ fn execute_push_local(
         push_options: None,
         packfile,
     };
-    crate::local::receive_pack_reachable_pack_into_local_repository(
+    let report = crate::local::receive_pack_reachable_pack_into_local_repository(
         &remote_git_dir,
         request.format,
         &receive_request,
@@ -499,9 +499,10 @@ fn execute_push_local(
         starts,
         remote_excluded,
     )?;
+    validate_receive_pack_report(&report)?;
     Ok(PushOutcome {
         commands,
-        report: None,
+        report: Some(report),
     })
 }
 
@@ -867,4 +868,199 @@ fn resolve_for_each_ref_target(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sley_formats::RepositoryLayout;
+    use sley_object::{Commit, EncodedObject, ObjectType, Tree};
+    use sley_odb::{FileObjectDatabase, ObjectWriter};
+    use sley_protocol::{ReceivePackCommandStatus, ReceivePackUnpackStatus};
+    use sley_refs::{RefTarget, RefUpdate};
+
+    use crate::{NoCredentials, SilentProgress};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sley-remote-push-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        RepositoryLayout::init_at(&dir, ObjectFormat::Sha1, false)
+            .expect("test repository should initialize");
+        dir.join(".git")
+    }
+
+    fn write_commit(git_dir: &Path, parents: Vec<ObjectId>, message: &str) -> ObjectId {
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree { entries: vec![] }.write(),
+            ))
+            .expect("tree should write");
+        let identity = b"Test User <test@example.invalid> 1 +0000".to_vec();
+        db.write_object(EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree,
+                parents,
+                author: identity.clone(),
+                committer: identity,
+                encoding: None,
+                message: format!("{message}\n").into_bytes(),
+            }
+            .write(),
+        ))
+        .expect("commit should write")
+    }
+
+    fn set_ref(git_dir: &Path, name: &str, target: RefTarget) {
+        let store = FileRefStore::new(git_dir, ObjectFormat::Sha1);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: name.to_string(),
+            expected: None,
+            new: target,
+            reflog: None,
+        });
+        tx.commit().expect("ref should update");
+    }
+
+    fn default_options() -> PushOptions {
+        PushOptions {
+            quiet: true,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn local_push_returns_success_report_status_and_updates_ref() {
+        let local = temp_repo("local-success");
+        let remote = temp_repo("remote-success");
+        let base = write_commit(&local, Vec::new(), "base");
+        let tip = write_commit(&local, vec![base], "tip");
+        set_ref(&local, "refs/heads/main", RefTarget::Direct(tip));
+        set_ref(
+            &local,
+            "HEAD",
+            RefTarget::Symbolic("refs/heads/main".into()),
+        );
+        let destination = PushDestination::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let refspecs = vec!["refs/heads/main:refs/heads/main".to_string()];
+        let options = default_options();
+        let request = PushRequest {
+            git_dir: &local,
+            common_git_dir: &local,
+            format: ObjectFormat::Sha1,
+            config: &GitConfig::default(),
+            remote: "origin",
+            destination: &destination,
+            refspecs: &refspecs,
+            options: &options,
+        };
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let outcome = push(
+            request,
+            PushServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("push should succeed");
+
+        assert_eq!(outcome.commands.len(), 1);
+        let report = outcome.report.expect("local receive-pack reports status");
+        assert!(matches!(report.unpack, ReceivePackUnpackStatus::Ok));
+        assert!(matches!(
+            report.commands.as_slice(),
+            [ReceivePackCommandStatus::Ok { name }] if name == "refs/heads/main"
+        ));
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(tip))
+        );
+    }
+
+    #[test]
+    fn report_status_rejection_is_an_error() {
+        let report = ReceivePackReportStatus {
+            unpack: ReceivePackUnpackStatus::Ok,
+            commands: vec![ReceivePackCommandStatus::Ng {
+                name: "refs/heads/main".into(),
+                message: "hook declined".into(),
+            }],
+        };
+
+        let err = validate_receive_pack_report(&report).expect_err("ng report should fail");
+
+        assert!(err.to_string().contains("hook declined"));
+    }
+
+    #[test]
+    fn failed_local_push_does_not_partially_mutate_remote_ref() {
+        let local = temp_repo("local-rejected");
+        let remote = temp_repo("remote-rejected");
+        let base = write_commit(&local, Vec::new(), "base");
+        let planned = write_commit(&local, vec![base], "planned");
+        let concurrent = write_commit(&local, vec![base], "concurrent");
+        set_ref(&local, "refs/heads/main", RefTarget::Direct(planned));
+        set_ref(
+            &local,
+            "HEAD",
+            RefTarget::Symbolic("refs/heads/main".into()),
+        );
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+        let destination = PushDestination::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let refspecs = vec!["refs/heads/main:refs/heads/main".to_string()];
+        let options = default_options();
+        let request = PushRequest {
+            git_dir: &local,
+            common_git_dir: &local,
+            format: ObjectFormat::Sha1,
+            config: &GitConfig::default(),
+            remote: "origin",
+            destination: &destination,
+            refspecs: &refspecs,
+            options: &options,
+        };
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+        let mut services = PushServices {
+            credentials: &mut credentials,
+            progress: &mut progress,
+        };
+        let plan = plan_push(request, &mut services).expect("push should plan");
+
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(concurrent));
+        let _err = execute_push_plan(request, &mut services, plan)
+            .expect_err("stale old id should reject the ref update");
+
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(concurrent))
+        );
+    }
 }

@@ -148,7 +148,11 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn prepare_tag_message_repo(root: &Path) {
-    run(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     let commit = run_output_with_identity(
         sley_testkit::oracle_git(),
         root,
@@ -393,7 +397,8 @@ fn tag_file_messages_match_upstream_git_objects() {
             prepare_tag_message_repo(&expected_root);
             prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected =
+                run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
@@ -582,7 +587,8 @@ fn tag_cleanup_modes_match_upstream_git_objects() {
             prepare_tag_message_repo(&expected_root);
             prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected =
+                run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
@@ -609,7 +615,8 @@ fn tag_cleanup_modes_match_upstream_git_objects() {
             prepare_tag_message_repo(&expected_root);
             prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected =
+                run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -754,7 +761,11 @@ fn tag_trailers_match_upstream_git_objects() {
             prepare_tag_message_repo(&actual_root);
 
             let expected = if name == "trailer-only" {
-                run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args)
+                run_output_with_identity_and_editor(
+                    sley_testkit::oracle_git(),
+                    &expected_root,
+                    &args,
+                )
             } else {
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args)
             };
@@ -788,7 +799,8 @@ fn tag_trailers_match_upstream_git_objects() {
                 "--no-trailer=foo",
             ],
         ] {
-            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected =
+                run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -961,7 +973,11 @@ fn tag_edit_option_matches_upstream_git_objects() {
             prepare_tag_message_repo(&expected_root);
             prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected = run_output_with_identity_and_editor(
+                sley_testkit::oracle_git(),
+                &expected_root,
+                &args,
+            );
             let actual = run_output_with_identity_and_editor(
                 env!("CARGO_BIN_EXE_sley"),
                 &actual_root,
@@ -989,7 +1005,11 @@ fn tag_edit_option_matches_upstream_git_objects() {
             prepare_tag_message_repo(&expected_root);
             prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected = run_output_with_identity_and_editor(
+                sley_testkit::oracle_git(),
+                &expected_root,
+                &args,
+            );
             let actual = run_output_with_identity_and_editor(
                 env!("CARGO_BIN_EXE_sley"),
                 &actual_root,
@@ -1219,7 +1239,8 @@ fn tag_local_user_negation_and_missing_values_match_upstream_git() {
             prepare_tag_message_repo(&expected_root);
             prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+            let expected =
+                run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(

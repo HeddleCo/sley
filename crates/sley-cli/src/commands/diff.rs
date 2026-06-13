@@ -239,8 +239,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--dirstat-by-file=") => {
                 let opts = dirstat.get_or_insert_with(DirstatOptions::default);
                 opts.mode = DirstatMode::Files;
-                dirstat_cli_params
-                    .push(value["--dirstat-by-file=".len()..].to_string());
+                dirstat_cli_params.push(value["--dirstat-by-file=".len()..].to_string());
                 no_patch = false;
             }
             "-p" | "-u" | "--patch" => {
@@ -1083,11 +1082,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // worktree-involved diffs collect each staged submodule's dirt (for the
     // `-dirty` patch suffix) and append dirty-but-same-commit pairs the map
     // comparison alone cannot see.
-    let submodule_config = submodule_diff_config(
-        &git_dir,
-        worktree_root.as_deref(),
-        ignore_submodules_cli,
-    );
+    let submodule_config =
+        submodule_diff_config(&git_dir, worktree_root.as_deref(), ignore_submodules_cli);
     let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
     let dirty_submodules = match (use_worktree_new, worktree_root.as_deref()) {
         (true, Some(root)) => {
@@ -1263,8 +1259,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
                 writeln!(stdout)?;
             }
-            let colors = color_always
-                .then(|| commands::diff_words::DiffColors::enabled(read_repo_config(&git_dir).ok().as_ref()));
+            let colors = color_always.then(|| {
+                commands::diff_words::DiffColors::enabled(read_repo_config(&git_dir).ok().as_ref())
+            });
             let word_request = word_diff_mode.map(|mode| WordDiffRequest {
                 mode,
                 cli_regex: word_diff_regex.as_deref(),
@@ -1662,7 +1659,9 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     // Repository context is optional: when present, .gitattributes drivers,
     // diff.<name>.* config, and color overrides all apply.
     let git_dir = discover_git_dir(cwd).ok();
-    let config = git_dir.as_deref().and_then(|dir| read_repo_config(dir).ok());
+    let config = git_dir
+        .as_deref()
+        .and_then(|dir| read_repo_config(dir).ok());
     let worktree_root = git_dir
         .as_deref()
         .and_then(|dir| worktree_root_for_git_dir(dir).ok());

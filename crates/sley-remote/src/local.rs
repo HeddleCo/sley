@@ -16,8 +16,7 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
-    build_and_install_reachable_pack_filtered,
-    build_reachable_pack, collect_reachable_object_ids,
+    build_and_install_reachable_pack_filtered, build_reachable_pack, collect_reachable_object_ids,
 };
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchShallowInfo, ReceivePackFeatures,

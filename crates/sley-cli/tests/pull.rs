@@ -86,10 +86,12 @@ fn prepare_fast_forward_upstream(upstream: &Path) {
     fs::write(upstream.join("hello.txt"), b"base\n").expect("write base file");
     git(upstream, &["add", "hello.txt"]);
     git_with_identity(upstream, &["commit", "-m", "base", "-q"]);
-    let base = String::from_utf8(run_output(sley_testkit::oracle_git(), upstream, &["rev-parse", "HEAD"]).stdout)
-        .expect("base oid utf8")
-        .trim()
-        .to_string();
+    let base = String::from_utf8(
+        run_output(sley_testkit::oracle_git(), upstream, &["rev-parse", "HEAD"]).stdout,
+    )
+    .expect("base oid utf8")
+    .trim()
+    .to_string();
     git(upstream, &["checkout", "-b", "topic", &base, "-q"]);
     fs::write(upstream.join("topic.txt"), b"topic\n").expect("write topic file");
     git(upstream, &["add", "topic.txt"]);
@@ -156,7 +158,12 @@ fn pull_fast_forward_matches_upstream_git() {
         "expected Fast-forward in output"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after fast-forward pull"
     );
@@ -193,7 +200,12 @@ fn pull_three_way_clean_matches_upstream_git() {
         "expected ort merge summary in output"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after three-way pull"
     );

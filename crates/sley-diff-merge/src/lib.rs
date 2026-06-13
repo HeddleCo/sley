@@ -46,7 +46,11 @@ pub fn gitlink_git_dir(sub_root: &Path) -> Option<PathBuf> {
     } else {
         sub_root.join(target)
     };
-    if git_dir.is_dir() { Some(git_dir) } else { None }
+    if git_dir.is_dir() {
+        Some(git_dir)
+    } else {
+        None
+    }
 }
 
 /// Resolve the commit checked out in the embedded repository at `sub_root`
@@ -2660,7 +2664,13 @@ fn collect_worktree_entries(
             let git_path = git_path_bytes(relative)?;
             if let Some(staged_oid) = index_gitlinks.get(&git_path) {
                 let oid = gitlink_head_oid(&path, format).unwrap_or(*staged_oid);
-                entries.insert(git_path, TrackedEntry { mode: 0o160000, oid });
+                entries.insert(
+                    git_path,
+                    TrackedEntry {
+                        mode: 0o160000,
+                        oid,
+                    },
+                );
                 continue;
             }
             // An untracked embedded repository is a boundary too: its files
@@ -3817,13 +3827,8 @@ pub fn merge_entry_maps(
     if options.directory_renames != DirectoryRenames::False
         && let Some((ours_side, theirs_side)) = &side_renames
     {
-        let dir_renames = compute_directory_renames(
-            base_map,
-            ours_map,
-            theirs_map,
-            ours_side,
-            theirs_side,
-        );
+        let dir_renames =
+            compute_directory_renames(base_map, ours_map, theirs_map, ours_side, theirs_side);
         let (new_ours, new_theirs, _rehomed) =
             apply_directory_renames(&eff_base, &eff_ours, &eff_theirs, &dir_renames);
         eff_ours = new_ours;
@@ -3904,7 +3909,10 @@ pub fn merge_entry_maps(
                         qualify_label(options.theirs_label, theirs_path),
                     )
                 }
-                None => (options.ours_label.to_string(), options.theirs_label.to_string()),
+                None => (
+                    options.ours_label.to_string(),
+                    options.theirs_label.to_string(),
+                ),
             };
             let result = merge_blobs(
                 &base_bytes,
@@ -3938,10 +3946,8 @@ pub fn merge_entry_maps(
                 paths.push(clean_path_auto(path, chosen, true));
             } else {
                 clean = false;
-                let oid = db.write_object(EncodedObject::new(
-                    ObjectType::Blob,
-                    result.content.clone(),
-                ))?;
+                let oid =
+                    db.write_object(EncodedObject::new(ObjectType::Blob, result.content.clone()))?;
                 leaves.insert(path.clone(), (resolved_mode, oid));
                 let worktree_mode = if *ours_mode == *theirs_mode {
                     *ours_mode
@@ -4043,12 +4049,14 @@ pub fn merge_entry_maps(
                 RenameSide::Theirs => (None, renamed_entry),
             };
             let (renamed_in, deleted_in) = match rd.side {
-                RenameSide::Ours => {
-                    (options.ours_label.to_string(), options.theirs_label.to_string())
-                }
-                RenameSide::Theirs => {
-                    (options.theirs_label.to_string(), options.ours_label.to_string())
-                }
+                RenameSide::Ours => (
+                    options.ours_label.to_string(),
+                    options.theirs_label.to_string(),
+                ),
+                RenameSide::Theirs => (
+                    options.theirs_label.to_string(),
+                    options.ours_label.to_string(),
+                ),
             };
             let worktree = match &renamed_entry {
                 Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
@@ -4081,7 +4089,11 @@ fn clean_path(path: Vec<u8>, result: Option<(u32, ObjectId)>) -> MergedPath {
 
 /// Like [`clean_path`] but records whether the path went through a textual
 /// 3-way content merge (for the "Auto-merging" message).
-fn clean_path_auto(path: Vec<u8>, result: Option<(u32, ObjectId)>, auto_merged: bool) -> MergedPath {
+fn clean_path_auto(
+    path: Vec<u8>,
+    result: Option<(u32, ObjectId)>,
+    auto_merged: bool,
+) -> MergedPath {
     MergedPath {
         path,
         stages: MergeStages::default(),

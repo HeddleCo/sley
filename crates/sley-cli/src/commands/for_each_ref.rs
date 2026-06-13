@@ -535,7 +535,9 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         let deltabase = zero_oid(format)?;
         // `%(worktreepath)` reads from the hoisted map; the placeholder is the empty
         // path for refs not checked out anywhere, matching git.
-        let worktree_path = worktree_paths.get(reference.name.as_str()).map(String::as_str);
+        let worktree_path = worktree_paths
+            .get(reference.name.as_str())
+            .map(String::as_str);
         // When the format needs no object, these fields are never observed (every
         // atom that reads them is gated behind `needs.object`); the placeholders are
         // therefore unobservable.
@@ -543,7 +545,10 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             .as_ref()
             .map(|object| object.object_type)
             .unwrap_or(ObjectType::Commit);
-        let object_body: &[u8] = object.as_ref().map(|object| object.body.as_ref()).unwrap_or(&[]);
+        let object_body: &[u8] = object
+            .as_ref()
+            .map(|object| object.body.as_ref())
+            .unwrap_or(&[]);
         let format_context = ForEachRefFormatContext {
             git_dir: &git_dir,
             db: &db,
@@ -866,7 +871,8 @@ pub(crate) fn parse_for_each_ref_trailer_options(
             rest = tail;
         } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "only", &mut options.only) {
             rest = tail;
-        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "unfold", &mut options.unfold) {
+        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "unfold", &mut options.unfold)
+        {
             rest = tail;
         } else if let Some(tail) =
             for_each_ref_match_bool_arg(rest, "keyonly", &mut options.key_only)
@@ -878,9 +884,7 @@ pub(crate) fn parse_for_each_ref_trailer_options(
             rest = tail;
         } else {
             // git: invalid_arg = up to the next ',' or ')'.
-            let len = rest
-                .find([',', ')'])
-                .unwrap_or(rest.len());
+            let len = rest.find([',', ')']).unwrap_or(rest.len());
             return Err(Some(rest[..len].to_string()));
         }
     }
@@ -983,7 +987,10 @@ struct ForEachRefTrailerItem {
 
 /// Render `%(trailers)` for `message` under `options`, mirroring git's
 /// `format_trailers_from_commit` + `format_trailers`.
-pub(crate) fn for_each_ref_format_trailers(message: &[u8], options: &ForEachRefTrailerOptions) -> Vec<u8> {
+pub(crate) fn for_each_ref_format_trailers(
+    message: &[u8],
+    options: &ForEachRefTrailerOptions,
+) -> Vec<u8> {
     let text = String::from_utf8_lossy(message);
     let block = for_each_ref_trailer_block(&text);
     // Fast path: unmodified whole block.
@@ -1249,7 +1256,11 @@ fn for_each_ref_last_line(bytes: &[u8], len: usize) -> Option<usize> {
         return None;
     }
     // If the region ends with '\n', that newline terminates the prior line.
-    let end = if bytes[len - 1] == b'\n' { len - 1 } else { len };
+    let end = if bytes[len - 1] == b'\n' {
+        len - 1
+    } else {
+        len
+    };
     if end == 0 {
         return Some(0);
     }

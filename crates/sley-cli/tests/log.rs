@@ -408,8 +408,7 @@ fn log_minimal_format_matches_upstream_git() {
             // date modes), not the medium layout — so pin both sides to the same
             // explicit `--format=` that omits the medium-only `Date:` line and
             // commit-line coloring, keeping the comparison layout-agnostic.
-            let mut git_rs_args =
-                vec!["log", "--format=commit %H%nAuthor: %an <%ae>%n%n    %s"];
+            let mut git_rs_args = vec!["log", "--format=commit %H%nAuthor: %an <%ae>%n%n    %s"];
             git_rs_args.extend_from_slice(&args);
             let actual = git_rs(&root, &git_rs_args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");

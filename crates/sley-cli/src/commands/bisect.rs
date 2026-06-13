@@ -527,7 +527,13 @@ fn bisect_next_check(repo: &BisectRepo, terms: &BisectTerms, current_term: Optio
         Ok(state) => state,
         Err(_) => return -1,
     };
-    decide_next(repo, terms, current_term, state.nr_good == 0, state.nr_bad == 0)
+    decide_next(
+        repo,
+        terms,
+        current_term,
+        state.nr_good == 0,
+        state.nr_bad == 0,
+    )
 }
 
 fn bisect_autostart(repo: &BisectRepo, terms: &mut BisectTerms) -> i32 {
@@ -724,7 +730,11 @@ fn bisect_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) 
     Ok(res)
 }
 
-fn bisect_auto_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) -> Result<i32> {
+fn bisect_auto_next(
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    out: &mut dyn Write,
+) -> Result<i32> {
     if bisect_next_check(repo, terms, None) != 0 {
         bisect_print_status(repo, terms, out)?;
         return Ok(BISECT_OK);
@@ -1017,7 +1027,9 @@ fn cmd_bisect_log(args: &[String]) -> Result<()> {
     let _ = args; // upstream ignores extra arguments
     let repo = BisectRepo::open()?;
     let log_path = repo.state_path("BISECT_LOG");
-    let empty_or_missing = fs::metadata(&log_path).map(|m| m.len() == 0).unwrap_or(true);
+    let empty_or_missing = fs::metadata(&log_path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
     if empty_or_missing {
         eprintln!("error: We are not bisecting.");
         return Err(GitError::Exit(1));
@@ -1430,11 +1442,7 @@ fn count_distance(start: usize, parents: &[Vec<usize>]) -> i64 {
     nr
 }
 
-fn do_find_bisection(
-    oids: &[ObjectId],
-    parents: &[Vec<usize>],
-    find_all: bool,
-) -> Bisection {
+fn do_find_bisection(oids: &[ObjectId], parents: &[Vec<usize>], find_all: bool) -> Bisection {
     let nr = oids.len();
     let mut weights: Vec<i64> = vec![0; nr];
     let mut counted = 0usize;
@@ -1503,8 +1511,7 @@ fn do_find_bisection(
     } else {
         // best_bisection_sorted: distance descending, ties by ascending oid.
         let mut order: Vec<usize> = (0..nr).collect();
-        let distance =
-            |idx: usize| -> i64 { weights[idx].min(nr as i64 - weights[idx]) };
+        let distance = |idx: usize| -> i64 { weights[idx].min(nr as i64 - weights[idx]) };
         order.sort_by(|&a, &b| {
             distance(b)
                 .cmp(&distance(a))
@@ -1520,7 +1527,9 @@ fn do_find_bisection(
 
 /// Pseudo random number generator from upstream bisect.c (used by skip_away).
 fn get_prn(count: usize) -> usize {
-    let count = (count as u32).wrapping_mul(1_103_515_245).wrapping_add(12_345);
+    let count = (count as u32)
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(12_345);
     ((count / 65_536) % 32_768) as usize
 }
 
@@ -1648,7 +1657,10 @@ fn bisect_checkout(
         format!("{}\n", rev.to_hex()),
     )?;
     if no_checkout {
-        fs::write(repo.state_path("BISECT_HEAD"), format!("{}\n", rev.to_hex()))?;
+        fs::write(
+            repo.state_path("BISECT_HEAD"),
+            format!("{}\n", rev.to_hex()),
+        )?;
     } else {
         let Some(worktree_root) = &repo.worktree_root else {
             return Ok(BISECT_FAILED);
@@ -1951,7 +1963,12 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
         if res != BISECT_OK {
             return Ok(res);
         }
-        writeln!(out, "{} is the first {} commit", bisect_rev.to_hex(), terms.bad)?;
+        writeln!(
+            out,
+            "{} is the first {} commit",
+            bisect_rev.to_hex(),
+            terms.bad
+        )?;
         bisect_show_commit(repo, &bisect_rev, out)?;
         return Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND);
     }

@@ -123,10 +123,18 @@ fn reset_fixture(root: &Path) {
     let _ = fs::remove_file(root.join("new.txt"));
     let _ = fs::remove_file(root.join("z.txt"));
     let _ = fs::remove_file(root.join("--add"));
-    run_success(sley_testkit::oracle_git(), root, &["reset", "-q", "--mixed"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["reset", "-q", "--mixed"],
+    );
     fs::write(root.join("one.txt"), b"one").expect("write one");
     fs::write(root.join("keep.txt"), b"keep").expect("write keep");
-    run_success(sley_testkit::oracle_git(), root, &["add", "one.txt", "keep.txt"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["add", "one.txt", "keep.txt"],
+    );
     fs::write(root.join("keep.txt"), b"changed").expect("modify keep");
     fs::remove_file(root.join("one.txt")).expect("remove one");
     fs::write(root.join("new.txt"), b"new").expect("write new");
@@ -137,14 +145,26 @@ fn reset_fixture(root: &Path) {
 fn reset_clean_fixture(root: &Path) {
     let _ = fs::remove_file(root.join("one.txt"));
     let _ = fs::remove_file(root.join("keep.txt"));
-    run_success(sley_testkit::oracle_git(), root, &["reset", "-q", "--mixed"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["reset", "-q", "--mixed"],
+    );
     fs::write(root.join("one.txt"), b"one").expect("write one");
     fs::write(root.join("keep.txt"), b"keep").expect("write keep");
-    run_success(sley_testkit::oracle_git(), root, &["add", "one.txt", "keep.txt"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["add", "one.txt", "keep.txt"],
+    );
 }
 
 fn assert_index_matches(expected: &Path, actual: &Path, args: &[&str]) {
-    let expected_index = run_success(sley_testkit::oracle_git(), expected, &["ls-files", "--stage"]);
+    let expected_index = run_success(
+        sley_testkit::oracle_git(),
+        expected,
+        &["ls-files", "--stage"],
+    );
     let actual_index = run_success(sley_testkit::oracle_git(), actual, &["ls-files", "--stage"]);
     assert_eq!(
         actual_index, expected_index,
@@ -153,7 +173,11 @@ fn assert_index_matches(expected: &Path, actual: &Path, args: &[&str]) {
 }
 
 fn assert_index_matches_for_label(expected: &Path, actual: &Path, label: &str) {
-    let expected_index = run_success(sley_testkit::oracle_git(), expected, &["ls-files", "--stage"]);
+    let expected_index = run_success(
+        sley_testkit::oracle_git(),
+        expected,
+        &["ls-files", "--stage"],
+    );
     let actual_index = run_success(sley_testkit::oracle_git(), actual, &["ls-files", "--stage"]);
     assert_eq!(actual_index, expected_index, "index differed after {label}");
 }
@@ -168,8 +192,16 @@ fn assert_ls_files_verbose_matches(expected: &Path, actual: &Path, label: &str) 
 }
 
 fn assert_index_version_matches(expected: &Path, actual: &Path, label: &str) {
-    let expected_output = run_success(sley_testkit::oracle_git(), expected, &["update-index", "--show-index-version"]);
-    let actual_output = run_success(sley_testkit::oracle_git(), actual, &["update-index", "--show-index-version"]);
+    let expected_output = run_success(
+        sley_testkit::oracle_git(),
+        expected,
+        &["update-index", "--show-index-version"],
+    );
+    let actual_output = run_success(
+        sley_testkit::oracle_git(),
+        actual,
+        &["update-index", "--show-index-version"],
+    );
     assert_eq!(
         actual_output, expected_output,
         "index version differed after {label}"
@@ -213,8 +245,16 @@ fn update_index_path_modes_match_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "keep.txt"],
@@ -363,8 +403,16 @@ fn update_index_add_symlink_matches_upstream_git() {
         fs::create_dir_all(&expected).expect("create expected repo dir");
         fs::create_dir_all(&actual).expect("create actual repo dir");
 
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
         setup(&expected);
         setup(&actual);
 
@@ -389,8 +437,16 @@ fn update_index_no_input_compat_flags_match_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         let args_cases = [
             vec!["update-index", "--ignore-submodules"],
@@ -454,8 +510,16 @@ fn update_index_git_index_file_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
         for repo in [&expected, &actual] {
             fs::create_dir_all(repo.join("custom-index")).expect("create custom index dir");
             fs::write(repo.join("file.txt"), b"file\n").expect("write file");
@@ -463,7 +527,8 @@ fn update_index_git_index_file_matches_upstream_git() {
         let envs = [("GIT_INDEX_FILE", "custom-index/index")];
 
         let update_args = ["update-index", "--add", "file.txt"];
-        let expected_output = run_with_env(sley_testkit::oracle_git(), &expected, &update_args, &envs);
+        let expected_output =
+            run_with_env(sley_testkit::oracle_git(), &expected, &update_args, &envs);
         let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &update_args, &envs);
         assert_same_output(actual_output, expected_output, &update_args);
 
@@ -497,8 +562,16 @@ fn update_index_test_untracked_cache_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--test-untracked-cache"],
@@ -542,8 +615,16 @@ fn update_index_fsmonitor_matches_upstream_git_when_unset() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--fsmonitor"],
@@ -588,8 +669,16 @@ fn update_index_unresolve_no_resolve_undo_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--unresolve"],
@@ -637,13 +726,25 @@ fn update_index_again_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for repo in [&expected, &actual] {
             fs::write(repo.join("one.txt"), b"base-one").expect("write one");
             fs::write(repo.join("keep.txt"), b"base-keep").expect("write keep");
-            run_success(sley_testkit::oracle_git(), repo, &["add", "one.txt", "keep.txt"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["add", "one.txt", "keep.txt"],
+            );
             run_success(
                 sley_testkit::oracle_git(),
                 repo,
@@ -666,10 +767,18 @@ fn update_index_again_matches_upstream_git() {
             vec!["update-index", "--remove", "--again"],
         ] {
             for repo in [&expected, &actual] {
-                run_success(sley_testkit::oracle_git(), repo, &["reset", "-q", "--hard", "HEAD"]);
+                run_success(
+                    sley_testkit::oracle_git(),
+                    repo,
+                    &["reset", "-q", "--hard", "HEAD"],
+                );
                 fs::write(repo.join("one.txt"), b"staged-one").expect("stage one");
                 fs::write(repo.join("keep.txt"), b"staged-keep").expect("stage keep");
-                run_success(sley_testkit::oracle_git(), repo, &["add", "one.txt", "keep.txt"]);
+                run_success(
+                    sley_testkit::oracle_git(),
+                    repo,
+                    &["add", "one.txt", "keep.txt"],
+                );
                 fs::write(repo.join("one.txt"), b"worktree-one").expect("modify one");
                 fs::write(repo.join("keep.txt"), b"worktree-keep").expect("modify keep");
                 if args == ["update-index", "--remove", "--again"] {
@@ -684,7 +793,11 @@ fn update_index_again_matches_upstream_git() {
         }
 
         for repo in [&expected, &actual] {
-            run_success(sley_testkit::oracle_git(), repo, &["reset", "-q", "--hard", "HEAD"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["reset", "-q", "--hard", "HEAD"],
+            );
             fs::write(repo.join("keep.txt"), b"unstaged-only").expect("modify keep");
         }
         let args = ["update-index", "--again"];
@@ -704,8 +817,16 @@ fn update_index_verbose_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--verbose", "keep.txt"],
@@ -749,8 +870,16 @@ fn update_index_refresh_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--refresh"],
@@ -830,8 +959,16 @@ fn update_index_refresh_quiet_ordering_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         // The user's exact repro shape: ten files committed once, then for each
         // case one file modified to differ from the committed content.
@@ -871,9 +1008,12 @@ fn update_index_refresh_quiet_ordering_matches_upstream_git() {
             for repo in [&expected, &actual] {
                 // Restore the committed content, then modify f3 to differ so the
                 // refresh sees exactly one needs-update entry.
-                run_success(sley_testkit::oracle_git(), repo, &["checkout", "-q", "--", "."]);
-                fs::write(repo.join("f3.txt"), b"MODIFIED LONGER CONTENT\n")
-                    .expect("modify f3");
+                run_success(
+                    sley_testkit::oracle_git(),
+                    repo,
+                    &["checkout", "-q", "--", "."],
+                );
+                fs::write(repo.join("f3.txt"), b"MODIFIED LONGER CONTENT\n").expect("modify f3");
             }
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
@@ -891,8 +1031,16 @@ fn update_index_refresh_ignore_missing_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--ignore-missing"],
@@ -937,8 +1085,16 @@ fn update_index_clear_resolve_undo_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--clear-resolve-undo"],
@@ -978,8 +1134,16 @@ fn update_index_assume_unchanged_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for (label, args) in [
             (
@@ -1044,8 +1208,16 @@ fn update_index_skip_worktree_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for (label, args) in [
             ("skip", vec!["update-index", "--skip-worktree", "keep.txt"]),
@@ -1129,8 +1301,16 @@ fn update_index_ignore_skip_worktree_entries_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for (label, args) in [
             ("path-update", vec!["update-index", "keep.txt"]),
@@ -1211,8 +1391,16 @@ fn update_index_fsmonitor_valid_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--fsmonitor-valid"],
@@ -1259,8 +1447,16 @@ fn update_index_info_only_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for (label, args) in [
             (
@@ -1308,8 +1504,16 @@ fn update_index_show_index_version_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for args in [
             vec!["update-index", "--show-index-version"],
@@ -1359,8 +1563,16 @@ fn update_index_index_version_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for (label, args) in [
             ("empty-split", vec!["update-index", "--index-version", "2"]),
@@ -1463,8 +1675,16 @@ fn update_index_cacheinfo_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
         reset_fixture(&expected);
         reset_fixture(&actual);
         let blob = String::from_utf8(
@@ -1539,16 +1759,36 @@ fn update_index_index_info_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
         let one = String::from_utf8(
-            run_with_stdin(sley_testkit::oracle_git(), &expected, &["hash-object", "-w", "--stdin"], b"one").stdout,
+            run_with_stdin(
+                sley_testkit::oracle_git(),
+                &expected,
+                &["hash-object", "-w", "--stdin"],
+                b"one",
+            )
+            .stdout,
         )
         .expect("first blob oid utf8")
         .trim()
         .to_string();
         let two = String::from_utf8(
-            run_with_stdin(sley_testkit::oracle_git(), &expected, &["hash-object", "-w", "--stdin"], b"two").stdout,
+            run_with_stdin(
+                sley_testkit::oracle_git(),
+                &expected,
+                &["hash-object", "-w", "--stdin"],
+                b"two",
+            )
+            .stdout,
         )
         .expect("second blob oid utf8")
         .trim()
@@ -1566,7 +1806,8 @@ fn update_index_index_info_matches_upstream_git() {
             ("staged", staged.as_bytes()),
         ] {
             let args = ["update-index", "--index-info"];
-            let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, stdin);
+            let expected_output =
+                run_with_stdin(sley_testkit::oracle_git(), &expected, &args, stdin);
             let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, stdin);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
@@ -1588,8 +1829,16 @@ fn update_index_stdin_modes_match_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "-b", "main"],
+        );
 
         for (args, stdin) in [
             (
@@ -1612,7 +1861,8 @@ fn update_index_stdin_modes_match_upstream_git() {
         ] {
             reset_fixture(&expected);
             reset_fixture(&actual);
-            let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, &stdin);
+            let expected_output =
+                run_with_stdin(sley_testkit::oracle_git(), &expected, &args, &stdin);
             let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, &stdin);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
@@ -1632,8 +1882,16 @@ fn update_index_adds_sha256_index_entries() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "--object-format=sha256", "-b", "main"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
         fs::write(expected.join("a.txt"), b"sha256\n").expect("write expected fixture");
         fs::write(actual.join("a.txt"), b"sha256\n").expect("write actual fixture");
 

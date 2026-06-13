@@ -1717,6 +1717,17 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_remote_url("/srv/git/repo.git").expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Local,
+                user: None,
+                password: None,
+                host: None,
+                port: None,
+                path: "/srv/git/repo.git".into(),
+            }
+        );
+        assert_eq!(
             parse_remote_url("C:/work/repo.git").expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Local,
@@ -1739,6 +1750,18 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_remote_url("file:///Users/alice/repo.git")
+                .expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::File,
+                user: None,
+                password: None,
+                host: None,
+                port: None,
+                path: "/Users/alice/repo.git".into(),
+            }
+        );
+        assert_eq!(
             parse_remote_url("https://example.com/org/repo.git")
                 .expect("test operation should succeed"),
             RemoteUrl {
@@ -1748,6 +1771,42 @@ mod tests {
                 host: Some("example.com".into()),
                 port: None,
                 path: "/org/repo.git".into(),
+            }
+        );
+        assert_eq!(
+            parse_remote_url("https://alice:s3cret@example.com/org/repo.git")
+                .expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Https,
+                user: Some("alice".into()),
+                password: Some("s3cret".into()),
+                host: Some("example.com".into()),
+                port: None,
+                path: "/org/repo.git".into(),
+            }
+        );
+        assert_eq!(
+            parse_remote_url("https://token@example.com/org/repo.git")
+                .expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Https,
+                user: Some("token".into()),
+                password: None,
+                host: Some("example.com".into()),
+                port: None,
+                path: "/org/repo.git".into(),
+            }
+        );
+        assert_eq!(
+            parse_remote_url("https://[2001:db8::2]:8443/repo.git")
+                .expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Https,
+                user: None,
+                password: None,
+                host: Some("2001:db8::2".into()),
+                port: Some(8443),
+                path: "/repo.git".into(),
             }
         );
         assert_eq!(
@@ -1786,7 +1845,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("ssh://git@example.com/org/repo%20space/it%27s.git")
+            parse_remote_url("ssh://git@example.com/org/repo%20space/it%27s%2Fnested.git")
                 .expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
@@ -1794,7 +1853,7 @@ mod tests {
                 password: None,
                 host: Some("example.com".into()),
                 port: None,
-                path: "/org/repo space/it's.git".into(),
+                path: "/org/repo space/it's/nested.git".into(),
             }
         );
         assert_eq!(
@@ -1803,6 +1862,17 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
+                password: None,
+                host: Some("example.com".into()),
+                port: None,
+                path: "org/repo.git".into(),
+            }
+        );
+        assert_eq!(
+            parse_remote_url("example.com:org/repo.git").expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Ssh,
+                user: None,
                 password: None,
                 host: Some("example.com".into()),
                 port: None,

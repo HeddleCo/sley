@@ -335,7 +335,10 @@ fn ls_files_sha256_stage_cached_and_modified_match_upstream_git() {
     let root = unique_temp_dir("ls-files-sha256");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+        git(
+            &root,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked fixture");
         git(&root, &["add", "modify.txt", "tracked.txt"]);
@@ -545,7 +548,13 @@ fn ls_files_default_global_excludes_match_upstream_git() {
             ],
             vec!["ls-files", "-o", "-i", "--exclude-standard", "-z"],
         ] {
-            let expected_output = run_with_global_env(sley_testkit::oracle_git(), &upstream, &args, &home, Some(&xdg));
+            let expected_output = run_with_global_env(
+                sley_testkit::oracle_git(),
+                &upstream,
+                &args,
+                &home,
+                Some(&xdg),
+            );
             let actual_output =
                 run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
             assert_eq!(
@@ -559,7 +568,13 @@ fn ls_files_default_global_excludes_match_upstream_git() {
         fs::write(upstream.join("repo-excludes"), b"*.tmp\n").expect("write upstream excludes");
         fs::write(rust.join("repo-excludes"), b"*.tmp\n").expect("write rust excludes");
         let args = ["ls-files", "--others", "--exclude-standard"];
-        let expected_output = run_with_global_env(sley_testkit::oracle_git(), &upstream, &args, &home, Some(&xdg));
+        let expected_output = run_with_global_env(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &args,
+            &home,
+            Some(&xdg),
+        );
         let actual_output =
             run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
         assert_eq!(
@@ -575,7 +590,13 @@ fn ls_files_default_global_excludes_match_upstream_git() {
         prepare_default_global_excludes_fixture(&fallback_upstream);
         prepare_default_global_excludes_fixture(&fallback_rust);
         let args = ["ls-files", "--others", "--exclude-standard"];
-        let expected_output = run_with_global_env(sley_testkit::oracle_git(), &fallback_upstream, &args, &home, None);
+        let expected_output = run_with_global_env(
+            sley_testkit::oracle_git(),
+            &fallback_upstream,
+            &args,
+            &home,
+            None,
+        );
         let actual_output = run_with_global_env(
             env!("CARGO_BIN_EXE_sley"),
             &fallback_rust,

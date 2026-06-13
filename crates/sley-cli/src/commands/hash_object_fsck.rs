@@ -170,7 +170,10 @@ struct TreeEntry<'a> {
 /// Decode the tree entry beginning at `buf` (`decode_tree_entry` in tree-walk.c).
 /// On a structural problem the matching git error string is returned in `Err`,
 /// and the caller prints it via `error()` then reports `badTree`.
-fn decode_tree_entry<'a>(buf: &'a [u8], hashsz: usize) -> std::result::Result<TreeEntry<'a>, &'static str> {
+fn decode_tree_entry<'a>(
+    buf: &'a [u8],
+    hashsz: usize,
+) -> std::result::Result<TreeEntry<'a>, &'static str> {
     // `if (size < hashsz + 3 || buf[size - (hashsz + 1)])`
     //
     // The entry must hold at least one mode digit, a space, a one-byte name, a
@@ -289,7 +292,8 @@ fn fsck_tree(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> 
                 Ok(entry) => Some(entry),
                 Err(msg) => {
                     reporter.error_line(msg);
-                    retval += reporter.report(Severity::Error, "badTree", "cannot be parsed as a tree");
+                    retval +=
+                        reporter.report(Severity::Error, "badTree", "cannot be parsed as a tree");
                     // git: `goto`-less `break` right after the failed advance.
                     break;
                 }
@@ -326,7 +330,11 @@ fn fsck_tree(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> 
     // Post-walk property reports, in git's exact order, each with its severity,
     // message id, and detail string verbatim from fsck.c.
     if has_null_sha1 {
-        retval += reporter.report(Severity::Warn, "nullSha1", "contains entries pointing to null sha1");
+        retval += reporter.report(
+            Severity::Warn,
+            "nullSha1",
+            "contains entries pointing to null sha1",
+        );
     }
     if has_full_path {
         retval += reporter.report(Severity::Warn, "fullPathname", "contains full pathnames");
@@ -344,19 +352,31 @@ fn fsck_tree(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> 
         retval += reporter.report(Severity::Warn, "hasDotgit", "contains '.git'");
     }
     if has_zero_pad {
-        retval += reporter.report(Severity::Warn, "zeroPaddedFilemode", "contains zero-padded file modes");
+        retval += reporter.report(
+            Severity::Warn,
+            "zeroPaddedFilemode",
+            "contains zero-padded file modes",
+        );
     }
     if has_bad_modes {
         retval += reporter.report(Severity::Info, "badFilemode", "contains bad file modes");
     }
     if has_dup_entries {
-        retval += reporter.report(Severity::Error, "duplicateEntries", "contains duplicate file entries");
+        retval += reporter.report(
+            Severity::Error,
+            "duplicateEntries",
+            "contains duplicate file entries",
+        );
     }
     if not_properly_sorted {
         retval += reporter.report(Severity::Error, "treeNotSorted", "not properly sorted");
     }
     if has_large_name {
-        retval += reporter.report(Severity::Warn, "largePathname", "contains excessively large pathname");
+        retval += reporter.report(
+            Severity::Warn,
+            "largePathname",
+            "contains excessively large pathname",
+        );
     }
     retval
 }
@@ -368,10 +388,7 @@ const MAX_TREE_ENTRY_LEN: usize = 4096;
 /// under hash-object `opts.strict = 1`, the nonstandard `0o100664` is *not*
 /// allowed (it only passes when `!options->strict`).
 fn is_standard_mode(mode: u16) -> bool {
-    matches!(
-        mode,
-        0o100755 | 0o100644 | 0o120000 | 0o040000 | 0o160000
-    )
+    matches!(mode, 0o100755 | 0o100644 | 0o120000 | 0o040000 | 0o160000)
 }
 
 /// Whether `name` is one of git's `.git` spellings flagged by `has_dotgit`.
@@ -443,12 +460,20 @@ fn fsck_commit(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -
 
     // tree <oid>\n — `if (!skip_prefix("tree ")) return report(MISSING_TREE)`.
     let Some(after_tree) = strip_prefix(rest, b"tree ") else {
-        return reporter.report(Severity::Error, "missingTree", "invalid format - expected 'tree' line");
+        return reporter.report(
+            Severity::Error,
+            "missingTree",
+            "invalid format - expected 'tree' line",
+        );
     };
     match parse_oid_line(format, after_tree) {
         Some(next) => rest = next,
         None => {
-            let err = reporter.report(Severity::Error, "badTreeSha1", "invalid 'tree' line format - bad sha1");
+            let err = reporter.report(
+                Severity::Error,
+                "badTreeSha1",
+                "invalid 'tree' line format - bad sha1",
+            );
             if err != 0 {
                 return err;
             }
@@ -461,7 +486,11 @@ fn fsck_commit(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -
         match parse_oid_line(format, after_parent) {
             Some(next) => rest = next,
             None => {
-                let err = reporter.report(Severity::Error, "badParentSha1", "invalid 'parent' line format - bad sha1");
+                let err = reporter.report(
+                    Severity::Error,
+                    "badParentSha1",
+                    "invalid 'parent' line format - bad sha1",
+                );
                 if err != 0 {
                     return err;
                 }
@@ -482,9 +511,17 @@ fn fsck_commit(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -
     }
     let mut err;
     if author_count < 1 {
-        err = reporter.report(Severity::Error, "missingAuthor", "invalid format - expected 'author' line");
+        err = reporter.report(
+            Severity::Error,
+            "missingAuthor",
+            "invalid format - expected 'author' line",
+        );
     } else if author_count > 1 {
-        err = reporter.report(Severity::Error, "multipleAuthors", "invalid format - multiple 'author' lines");
+        err = reporter.report(
+            Severity::Error,
+            "multipleAuthors",
+            "invalid format - multiple 'author' lines",
+        );
     } else {
         err = 0;
     }
@@ -494,7 +531,11 @@ fn fsck_commit(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -
 
     // committer <ident>\n (exactly one). `if (err) return err`.
     let Some(after_committer) = strip_prefix(rest, b"committer ") else {
-        return reporter.report(Severity::Error, "missingCommitter", "invalid format - expected 'committer' line");
+        return reporter.report(
+            Severity::Error,
+            "missingCommitter",
+            "invalid format - expected 'committer' line",
+        );
     };
     let (cerr, _) = fsck_ident(after_committer, reporter);
     if cerr != 0 {
@@ -504,7 +545,11 @@ fn fsck_commit(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -
 
     // NUL anywhere in the object body (WARN → ERROR under strict).
     if body.contains(&0) {
-        err = reporter.report(Severity::Warn, "nulInCommit", "NUL byte in the commit object body");
+        err = reporter.report(
+            Severity::Warn,
+            "nulInCommit",
+            "NUL byte in the commit object body",
+        );
         if err != 0 {
             return err;
         }
@@ -532,12 +577,20 @@ fn fsck_tag(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> i
 
     // object <oid>\n
     let Some(after_object) = strip_prefix(rest, b"object ") else {
-        return reporter.report(Severity::Error, "missingObject", "invalid format - expected 'object' line");
+        return reporter.report(
+            Severity::Error,
+            "missingObject",
+            "invalid format - expected 'object' line",
+        );
     };
     match parse_oid_line(format, after_object) {
         Some(next) => rest = next,
         None => {
-            let err = reporter.report(Severity::Error, "badObjectSha1", "invalid 'object' line format - bad sha1");
+            let err = reporter.report(
+                Severity::Error,
+                "badObjectSha1",
+                "invalid 'object' line format - bad sha1",
+            );
             if err != 0 {
                 return err;
             }
@@ -547,10 +600,18 @@ fn fsck_tag(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> i
     // type <type>\n. Absent `type ` prefix => `missingTypeEntry`; present prefix
     // with no terminating newline => `missingType`.
     let Some(after_type) = strip_prefix(rest, b"type ") else {
-        return reporter.report(Severity::Error, "missingTypeEntry", "invalid format - expected 'type' line");
+        return reporter.report(
+            Severity::Error,
+            "missingTypeEntry",
+            "invalid format - expected 'type' line",
+        );
     };
     let Some((type_value, after_type_line)) = split_line(after_type) else {
-        return reporter.report(Severity::Error, "missingType", "invalid format - unexpected end after 'type' line");
+        return reporter.report(
+            Severity::Error,
+            "missingType",
+            "invalid format - unexpected end after 'type' line",
+        );
     };
     if parse_object_type(type_value).is_none() {
         let err = reporter.report(Severity::Error, "badType", "invalid 'type' value");
@@ -563,10 +624,18 @@ fn fsck_tag(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> i
     // tag <name>\n. Absent prefix => `missingTagEntry`; present prefix without a
     // newline => `missingTag` (git's detail string copy-pastes "after 'type'").
     let Some(after_tag) = strip_prefix(rest, b"tag ") else {
-        return reporter.report(Severity::Error, "missingTagEntry", "invalid format - expected 'tag' line");
+        return reporter.report(
+            Severity::Error,
+            "missingTagEntry",
+            "invalid format - expected 'tag' line",
+        );
     };
     let Some((tag_name, after_tag_line)) = split_line(after_tag) else {
-        return reporter.report(Severity::Error, "missingTag", "invalid format - unexpected end after 'type' line");
+        return reporter.report(
+            Severity::Error,
+            "missingTag",
+            "invalid format - unexpected end after 'type' line",
+        );
     };
     // git validates `refs/tags/<name>` via check_refname_format; badTagName is
     // INFO (still printed + fatal here), with `if (ret) goto done`.
@@ -590,7 +659,11 @@ fn fsck_tag(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> i
             rest = next;
         }
         None => {
-            ret = reporter.report(Severity::Info, "missingTaggerEntry", "invalid format - expected 'tagger' line");
+            ret = reporter.report(
+                Severity::Info,
+                "missingTaggerEntry",
+                "invalid format - expected 'tagger' line",
+            );
             if ret != 0 {
                 return ret;
             }
@@ -598,8 +671,8 @@ fn fsck_tag(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> i
     }
 
     // Optional gpgsig / gpgsig-sha256 header with folded continuation lines.
-    if let Some(after_sig) = strip_prefix(rest, b"gpgsig ")
-        .or_else(|| strip_prefix(rest, b"gpgsig-sha256 "))
+    if let Some(after_sig) =
+        strip_prefix(rest, b"gpgsig ").or_else(|| strip_prefix(rest, b"gpgsig-sha256 "))
     {
         let Some(nl) = after_sig.iter().position(|&b| b == b'\n') else {
             return reporter.report(
@@ -625,7 +698,11 @@ fn fsck_tag(format: ObjectFormat, body: &[u8], reporter: &mut FsckReporter) -> i
     // OVERWRITES `ret` (extraHeaderEntry is FSCK_IGNORE → 0), matching git's
     // masking of a preceding identity error.
     if !rest.is_empty() && rest.first() != Some(&b'\n') {
-        ret = reporter.report(Severity::Ignore, "extraHeaderEntry", "invalid format - extra header(s) after 'tagger'");
+        ret = reporter.report(
+            Severity::Ignore,
+            "extraHeaderEntry",
+            "invalid format - extra header(s) after 'tagger'",
+        );
     }
     ret
 }
@@ -729,12 +806,20 @@ fn fsck_ident<'a>(ident: &'a [u8], reporter: &mut FsckReporter) -> (i32, &'a [u8
     // Scan the name up to '<'. Hitting end/'\n' => missingEmail; '>' => badName.
     loop {
         if p >= end || byte(p) == Some(b'\n') {
-            let r = reporter.report(Severity::Error, "missingEmail", "invalid author/committer line - missing email");
+            let r = reporter.report(
+                Severity::Error,
+                "missingEmail",
+                "invalid author/committer line - missing email",
+            );
             return (r, after);
         }
         match byte(p) {
             Some(b'>') => {
-                let r = reporter.report(Severity::Error, "badName", "invalid author/committer line - bad name");
+                let r = reporter.report(
+                    Severity::Error,
+                    "badName",
+                    "invalid author/committer line - bad name",
+                );
                 return (r, after);
             }
             Some(b'<') => break, // end of name, beginning of email
@@ -754,7 +839,11 @@ fn fsck_ident<'a>(ident: &'a [u8], reporter: &mut FsckReporter) -> (i32, &'a [u8
     // Scan the email up to '>'. Hitting end/'<'/'\n' => badEmail.
     loop {
         if p >= end || byte(p) == Some(b'<') || byte(p) == Some(b'\n') {
-            let r = reporter.report(Severity::Error, "badEmail", "invalid author/committer line - bad email");
+            let r = reporter.report(
+                Severity::Error,
+                "badEmail",
+                "invalid author/committer line - bad email",
+            );
             return (r, after);
         }
         if byte(p) == Some(b'>') {
@@ -779,12 +868,20 @@ fn fsck_ident<'a>(ident: &'a [u8], reporter: &mut FsckReporter) -> (i32, &'a [u8
         p += 1;
     }
     if !byte(p).is_some_and(|c| c.is_ascii_digit()) {
-        let r = reporter.report(Severity::Error, "badDate", "invalid author/committer line - bad date");
+        let r = reporter.report(
+            Severity::Error,
+            "badDate",
+            "invalid author/committer line - bad date",
+        );
         return (r, after);
     }
     // `if (*p == '0' && p[1] != ' ')` — a leading-zero multi-digit timestamp.
     if byte(p) == Some(b'0') && byte(p + 1) != Some(b' ') {
-        let r = reporter.report(Severity::Error, "zeroPaddedDate", "invalid author/committer line - zero-padded date");
+        let r = reporter.report(
+            Severity::Error,
+            "zeroPaddedDate",
+            "invalid author/committer line - zero-padded date",
+        );
         return (r, after);
     }
     // Consume the timestamp digits (parse_timestamp_from_buf) and check overflow.
@@ -802,7 +899,11 @@ fn fsck_ident<'a>(ident: &'a [u8], reporter: &mut FsckReporter) -> (i32, &'a [u8
     }
     // `if (*p != ' ')` — exactly one space separates date and timezone.
     if byte(p) != Some(b' ') {
-        let r = reporter.report(Severity::Error, "badDate", "invalid author/committer line - bad date");
+        let r = reporter.report(
+            Severity::Error,
+            "badDate",
+            "invalid author/committer line - bad date",
+        );
         return (r, after);
     }
     p += 1;
@@ -814,7 +915,11 @@ fn fsck_ident<'a>(ident: &'a [u8], reporter: &mut FsckReporter) -> (i32, &'a [u8
         && byte(p + 4).is_some_and(|c| c.is_ascii_digit())
         && byte(p + 5) == Some(b'\n');
     if !tz_ok {
-        let r = reporter.report(Severity::Error, "badTimezone", "invalid author/committer line - bad time zone");
+        let r = reporter.report(
+            Severity::Error,
+            "badTimezone",
+            "invalid author/committer line - bad time zone",
+        );
         return (r, after);
     }
 
@@ -908,7 +1013,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_too_short_entry() {
-        assert_eq!(decode_tree_entry(b"abc\n", 20).err(), Some("too-short tree object"));
+        assert_eq!(
+            decode_tree_entry(b"abc\n", 20).err(),
+            Some("too-short tree object")
+        );
     }
 
     #[test]
@@ -916,14 +1024,20 @@ mod tests {
         // Leading space => parse_mode returns NULL.
         let mut buf = b" 100644 name\0".to_vec();
         buf.extend(std::iter::repeat(0u8).take(20));
-        assert_eq!(decode_tree_entry(&buf, 20).err(), Some("malformed mode in tree entry"));
+        assert_eq!(
+            decode_tree_entry(&buf, 20).err(),
+            Some("malformed mode in tree entry")
+        );
     }
 
     #[test]
     fn decode_rejects_empty_filename() {
         let mut buf = b"100644 \0".to_vec();
         buf.extend(std::iter::repeat(0u8).take(20));
-        assert_eq!(decode_tree_entry(&buf, 20).err(), Some("empty filename in tree entry"));
+        assert_eq!(
+            decode_tree_entry(&buf, 20).err(),
+            Some("empty filename in tree entry")
+        );
     }
 
     #[test]

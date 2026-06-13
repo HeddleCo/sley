@@ -69,7 +69,10 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 /// the one sley targets, because the patch signature trailer embeds that
 /// version string.
 fn interop_enabled() -> bool {
-    let Ok(git_version) = Command::new(sley_testkit::oracle_git()).arg("--version").output() else {
+    let Ok(git_version) = Command::new(sley_testkit::oracle_git())
+        .arg("--version")
+        .output()
+    else {
         return false;
     };
     if !git_version.status.success() {

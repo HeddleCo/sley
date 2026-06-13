@@ -81,7 +81,11 @@ fn repository_promisor_sidecars(git_dir: &Path) -> Vec<PathBuf> {
 fn assert_reachable_objects_stored_in_pack(repo: &Path, git_dir: &Path) {
     let (_pack_path, index_path) = repository_pack_pair(git_dir);
     let index_arg = index_path.to_string_lossy();
-    run_success(sley_testkit::oracle_git(), repo, &["verify-pack", "-v", &index_arg]);
+    run_success(
+        sley_testkit::oracle_git(),
+        repo,
+        &["verify-pack", "-v", &index_arg],
+    );
 
     let objects = String::from_utf8(run_success(
         sley_testkit::oracle_git(),
@@ -182,7 +186,11 @@ fn assert_same_output_with_normalized_paths(
 }
 
 fn create_source_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
     run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
@@ -199,12 +207,20 @@ fn create_source_repo(root: &Path) {
             "-q",
         ],
     );
-    run_success(sley_testkit::oracle_git(), root, &["branch", "feature/topic"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["branch", "feature/topic"],
+    );
     run_success(sley_testkit::oracle_git(), root, &["tag", "v1.0"]);
 }
 
 fn create_sha256_nested_source_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "--object-format=sha256", "-b", "main"],
+    );
     fs::create_dir_all(root.join("dir")).expect("create source dir");
     fs::create_dir_all(root.join("deep/nested")).expect("create source nested dir");
     fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
@@ -228,7 +244,11 @@ fn create_sha256_nested_source_repo(root: &Path) {
 }
 
 fn add_feature_commit(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "feature/topic"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["checkout", "-q", "feature/topic"],
+    );
     fs::write(root.join("payload.txt"), b"feature payload\n").expect("write feature payload");
     run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
@@ -245,7 +265,11 @@ fn add_feature_commit(root: &Path) {
             "-q",
         ],
     );
-    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["checkout", "-q", "main"],
+    );
 }
 
 #[test]
@@ -261,7 +285,11 @@ fn clone_local_repository_matches_upstream_git() {
         let expected_arg = expected_repo.to_str().expect("expected path is utf8");
         let actual_arg = actual_repo.to_str().expect("actual path is utf8");
 
-        let expected = run(sley_testkit::oracle_git(), &root, &["clone", "-q", source_arg, expected_arg]);
+        let expected = run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["clone", "-q", source_arg, expected_arg],
+        );
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
             &root,
@@ -292,8 +320,16 @@ fn clone_local_repository_matches_upstream_git() {
             format!("branch.{branch}.remote"),
             format!("branch.{branch}.merge"),
         ] {
-            let expected = run(sley_testkit::oracle_git(), &expected_repo, &["config", "--get", &key]);
-            let actual = run(sley_testkit::oracle_git(), &actual_repo, &["config", "--get", &key]);
+            let expected = run(
+                sley_testkit::oracle_git(),
+                &expected_repo,
+                &["config", "--get", &key],
+            );
+            let actual = run(
+                sley_testkit::oracle_git(),
+                &actual_repo,
+                &["config", "--get", &key],
+            );
             assert_same_output(actual, expected, &["config", "--get", &key]);
         }
         assert_eq!(
@@ -322,7 +358,11 @@ fn clone_local_repository_default_directory_matches_upstream_git() {
             .expect("source git path is utf8")
             .to_string();
 
-        let expected = run(sley_testkit::oracle_git(), &expected_root, &["clone", "-q", &source_arg]);
+        let expected = run(
+            sley_testkit::oracle_git(),
+            &expected_root,
+            &["clone", "-q", &source_arg],
+        );
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
             &actual_root,
@@ -553,7 +593,11 @@ fn clone_local_repository_mirror_matches_upstream_git() {
     {
         create_source_repo(&source);
         add_feature_commit(&source);
-        run_success(sley_testkit::oracle_git(), &source, &["update-ref", "refs/notes/test", "HEAD"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &source,
+            &["update-ref", "refs/notes/test", "HEAD"],
+        );
         let source_arg = source
             .join(".git")
             .to_str()
@@ -1472,7 +1516,11 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
         let missing_bundle_arg = missing_bundle
             .to_str()
             .expect("missing bundle path is utf8");
-        run_success(sley_testkit::oracle_git(), &source, &["bundle", "create", bundle_arg, "--all"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &source,
+            &["bundle", "create", bundle_arg, "--all"],
+        );
         let bundle_equals = format!("--bundle-uri={bundle_arg}");
 
         for (label, options) in [
@@ -1555,7 +1603,11 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
     fs::create_dir_all(source.join("dir")).expect("create source dir");
     fs::create_dir_all(source.join("deep/nested")).expect("create source nested dir");
     {
-        run_success(sley_testkit::oracle_git(), &source, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &source,
+            &["init", "-q", "-b", "main"],
+        );
         fs::write(source.join("root.txt"), b"root\n").expect("write root file");
         fs::write(source.join("dir/file.txt"), b"dir\n").expect("write dir file");
         fs::write(source.join("deep/nested/file.txt"), b"deep\n").expect("write deep file");
@@ -1830,10 +1882,18 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
     {
         create_source_repo(&source);
         add_feature_commit(&source);
-        run_success(sley_testkit::oracle_git(), &reference, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &reference,
+            &["init", "-q", "-b", "main"],
+        );
         fs::write(reference.join("reference.txt"), b"reference payload\n")
             .expect("write reference payload");
-        run_success(sley_testkit::oracle_git(), &reference, &["add", "reference.txt"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &reference,
+            &["add", "reference.txt"],
+        );
         run_success(
             sley_testkit::oracle_git(),
             &reference,

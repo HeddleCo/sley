@@ -122,7 +122,12 @@ fn autocrlf_true_round_trip_matches_git() {
 
     // Both implementations stored the identical blob OID.
     assert_eq!(
-        run_env(sley_testkit::oracle_git(), &root.join("ref"), &["rev-parse", "HEAD:f.txt"]).stdout,
+        run_env(
+            sley_testkit::oracle_git(),
+            &root.join("ref"),
+            &["rev-parse", "HEAD:f.txt"]
+        )
+        .stdout,
         run_env(GIT_RS, &root.join("cand"), &["rev-parse", "HEAD:f.txt"]).stdout,
         "blob OID differs between git and sley under autocrlf"
     );
@@ -218,7 +223,12 @@ fn no_filter_default_is_passthrough() {
         assert!(porcelain(program, repo).is_empty());
     }
     assert_eq!(
-        run_env(sley_testkit::oracle_git(), &reference, &["rev-parse", "HEAD:m.bin"]).stdout,
+        run_env(
+            sley_testkit::oracle_git(),
+            &reference,
+            &["rev-parse", "HEAD:m.bin"]
+        )
+        .stdout,
         run_env(GIT_RS, &cand, &["rev-parse", "HEAD:m.bin"]).stdout,
     );
 

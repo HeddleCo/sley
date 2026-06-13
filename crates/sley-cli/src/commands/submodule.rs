@@ -300,7 +300,10 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
             value if let Some(value) = value.strip_prefix("--name=") => {
                 name = Some(value.to_string());
             }
-            value if value.starts_with("--reference=") || value.starts_with("--reference-if-able=") => {
+            value
+                if value.starts_with("--reference=")
+                    || value.starts_with("--reference-if-able=") =>
+            {
                 eprintln!("fatal: sley submodule add does not support --reference yet");
                 return Err(GitError::Exit(128));
             }

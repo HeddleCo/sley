@@ -242,7 +242,10 @@ fn diff_sha256_name_status_matches_upstream_git() {
     let root = unique_temp_dir("diff-sha256-name-status");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+        git(
+            &root,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         git(&root, &["add", "delete.txt", "modify.txt"]);

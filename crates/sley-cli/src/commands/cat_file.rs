@@ -112,10 +112,8 @@ impl CatFileOptions {
                         if option.has_value() {
                             return option_takes_no_value("batch-all-objects");
                         }
-                        options.set_cmd_mode(
-                            CatFileCmdMode::BatchAllObjects,
-                            "--batch-all-objects",
-                        )?;
+                        options
+                            .set_cmd_mode(CatFileCmdMode::BatchAllObjects, "--batch-all-objects")?;
                     }
                     "buffer" => {
                         if option.has_value() {
@@ -293,9 +291,7 @@ impl CatFileOptions {
             match self.positional.len() {
                 0 => {
                     return match mode {
-                        CatFileCmdMode::Textconv => {
-                            cat_file_rev_required_with("--textconv")
-                        }
+                        CatFileCmdMode::Textconv => cat_file_rev_required_with("--textconv"),
                         CatFileCmdMode::Filters => cat_file_rev_required_with("--filters"),
                         _ => cat_file_object_required_with(selection.name),
                     };
@@ -709,7 +705,10 @@ fn git_parse_ulong(value: &str) -> Option<u64> {
 /// Parse an unsigned integer the way C's `strtoumax(value, &end, 0)` does for the leading
 /// numeric run: hex (`0x`), octal (`0`), or decimal. The whole string must be consumed.
 fn parse_git_unsigned_base0(value: &str) -> Option<u64> {
-    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         return u64::from_str_radix(hex, 16).ok();
     }
     if value.len() > 1 && value.starts_with('0') {
@@ -1868,7 +1867,10 @@ mod tests {
             parse_batch_command(" info x"),
             Err(GitError::Exit(128))
         ));
-        assert!(matches!(parse_batch_command("info"), Err(GitError::Exit(128))));
+        assert!(matches!(
+            parse_batch_command("info"),
+            Err(GitError::Exit(128))
+        ));
         assert!(matches!(
             parse_batch_command("flush x"),
             Err(GitError::Exit(128))
@@ -1885,6 +1887,9 @@ mod tests {
             parse_batch_command("contents HEAD"),
             Ok(BatchCommand::Contents("HEAD"))
         ));
-        assert!(matches!(parse_batch_command("flush"), Ok(BatchCommand::Flush)));
+        assert!(matches!(
+            parse_batch_command("flush"),
+            Ok(BatchCommand::Flush)
+        ));
     }
 }

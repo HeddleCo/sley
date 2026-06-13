@@ -189,12 +189,22 @@ fn pull_conflict_then_continue_matches_upstream_git() {
         "git-rs MERGE_MSG should be removed"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after merge --continue"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%P"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%P"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -204,7 +214,12 @@ fn pull_conflict_then_continue_matches_upstream_git() {
         "merge commit parents differed"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%s"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -219,9 +234,15 @@ fn pull_conflict_then_continue_matches_upstream_git() {
         "worktree content differed after merge --continue"
     );
 
-    let upstream_parents =
-        String::from_utf8(run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%P"]).stdout)
-            .expect("upstream parents utf8");
+    let upstream_parents = String::from_utf8(
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%P"],
+        )
+        .stdout,
+    )
+    .expect("upstream parents utf8");
     assert!(
         upstream_parents
             .split_whitespace()

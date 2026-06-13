@@ -95,10 +95,12 @@ fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
         fs::write(root.join("conflict.txt"), b"base\n").expect("write base file");
         git(root, &["add", "conflict.txt"]);
         git_with_identity(root, &["commit", "-m", "base", "-q"]);
-        let base = String::from_utf8(run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]).stdout)
-            .expect("base oid utf8")
-            .trim()
-            .to_string();
+        let base = String::from_utf8(
+            run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]).stdout,
+        )
+        .expect("base oid utf8")
+        .trim()
+        .to_string();
         git(root, &["checkout", "-b", "topic", &base, "-q"]);
         fs::write(root.join("conflict.txt"), b"topic\n").expect("write topic file");
         git(root, &["add", "conflict.txt"]);
@@ -166,12 +168,22 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
         "git-rs MERGE_MSG should be removed"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after merge --continue"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%P"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%P"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -181,7 +193,12 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
         "merge commit parents differed"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%s"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,

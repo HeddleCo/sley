@@ -6,6 +6,12 @@
 //! [`EncodedObject`]) together with their parse/serialize routines and the
 //! [`parse_framed_object`] helper that decodes the `"<type> <len>\0<body>"`
 //! loose-object frame.
+//!
+//! [`Commit`] and [`Tag`] are parsed, canonical representations of the headers
+//! this crate understands. They are convenient for structured edits, but they
+//! are not byte-lossless round-trippers for signed objects, custom headers, or
+//! other raw object body details. Use [`EncodedObject`] whenever exact object
+//! bytes, object ids, or framed-object bytes must be preserved.
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result, Signature};
 use std::str::FromStr;
@@ -54,6 +60,12 @@ pub struct EncodedObject {
 }
 
 impl EncodedObject {
+    /// Create a raw encoded object body.
+    ///
+    /// This is the byte-exact API for preserving Git object contents. For
+    /// commit and tag objects that may contain signatures, continuation
+    /// headers, custom headers, or otherwise unknown data, keep the original
+    /// body here instead of parsing through [`Commit`] or [`Tag`].
     pub fn new(object_type: ObjectType, body: impl Into<Vec<u8>>) -> Self {
         Self {
             object_type,
@@ -61,6 +73,7 @@ impl EncodedObject {
         }
     }
 
+    /// Return the exact loose-object frame bytes: `"<type> <len>\0<body>"`.
     pub fn framed_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.body.len() + 32);
         out.extend_from_slice(self.object_type.as_str().as_bytes());
@@ -71,6 +84,7 @@ impl EncodedObject {
         out
     }
 
+    /// Compute the object id from the raw body bytes.
     pub fn object_id(&self, format: ObjectFormat) -> Result<ObjectId> {
         sley_core::object_id_for_bytes(format, self.object_type.as_str(), &self.body)
     }
@@ -455,6 +469,14 @@ impl TreeBuilder {
     }
 }
 
+/// A parsed, canonical representation of the commit headers this crate
+/// understands.
+///
+/// `Commit` preserves `tree`, `parent`, `author`, `committer`, `encoding`, and
+/// message bytes. It intentionally does not retain unknown headers,
+/// continuation blocks such as `gpgsig`, mergetags, or their original ordering.
+/// Use [`EncodedObject`] when commit object bytes or object ids must be
+/// preserved exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub tree: ObjectId,
@@ -469,7 +491,9 @@ pub struct Commit {
 ///
 /// The identity, encoding, and message slices point into the original commit
 /// body. Object ids are parsed into fixed-size values while preserving the same
-/// validation behavior as [`Commit::parse`].
+/// validation behavior as [`Commit::parse`]. Like [`Commit`], this is a parsed
+/// canonical view of known fields rather than a byte-lossless view of every raw
+/// header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRef<'a> {
     pub tree: ObjectId,
@@ -481,6 +505,10 @@ pub struct CommitRef<'a> {
 }
 
 impl Commit {
+    /// Parse a commit into the canonical typed representation.
+    ///
+    /// Unknown headers and continuation records are accepted but not retained.
+    /// Use [`EncodedObject`] for byte-exact commit preservation.
     pub fn parse(format: ObjectFormat, bytes: &[u8]) -> Result<Self> {
         Ok(Self::parse_ref(format, bytes)?.into())
     }
@@ -489,6 +517,11 @@ impl Commit {
         CommitRef::parse(format, bytes)
     }
 
+    /// Serialize the canonical typed commit representation.
+    ///
+    /// The output contains only the fields represented by [`Commit`]; it is not
+    /// intended to reproduce raw input bytes that contained unknown headers,
+    /// signatures, or mergetags.
     pub fn write(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(format!("tree {}\n", self.tree).as_bytes());
@@ -613,6 +646,13 @@ impl<'a> From<CommitRef<'a>> for Commit {
     }
 }
 
+/// A parsed, canonical representation of the annotated tag headers this crate
+/// understands.
+///
+/// `Tag` preserves `object`, `type`, `tag`, optional `tagger`, and message
+/// bytes. It intentionally does not retain unknown headers, signature
+/// continuation blocks, or original header ordering. Use [`EncodedObject`] when
+/// annotated tag object bytes or object ids must be preserved exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     pub object: ObjectId,
@@ -626,7 +666,9 @@ pub struct Tag {
 ///
 /// The tag name, tagger identity, and message slices point into the original
 /// tag body. The object id and object type are parsed into owned values while
-/// preserving the same validation behavior as [`Tag::parse`].
+/// preserving the same validation behavior as [`Tag::parse`]. Like [`Tag`],
+/// this is a parsed canonical view of known fields rather than a byte-lossless
+/// view of every raw header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagRef<'a> {
     pub object: ObjectId,
@@ -637,6 +679,10 @@ pub struct TagRef<'a> {
 }
 
 impl Tag {
+    /// Parse an annotated tag into the canonical typed representation.
+    ///
+    /// Unknown headers and continuation records are accepted but not retained.
+    /// Use [`EncodedObject`] for byte-exact tag preservation.
     pub fn parse(format: ObjectFormat, bytes: &[u8]) -> Result<Self> {
         Ok(Self::parse_ref(format, bytes)?.into())
     }
@@ -645,6 +691,11 @@ impl Tag {
         TagRef::parse(format, bytes)
     }
 
+    /// Serialize the canonical typed tag representation.
+    ///
+    /// The output contains only the fields represented by [`Tag`]; it is not
+    /// intended to reproduce raw input bytes that contained unknown headers or
+    /// signatures.
     pub fn write(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(format!("object {}\n", self.object).as_bytes());
@@ -819,6 +870,88 @@ mod tests {
             parse_framed_object(&object.framed_bytes()).expect("test operation should succeed"),
             object
         );
+    }
+
+    #[test]
+    fn encoded_raw_commit_with_multiline_gpgsig_preserves_bytes_and_id() {
+        let format = ObjectFormat::Sha1;
+        let tree = ObjectId::empty_tree(format);
+        let body = format!(
+            concat!(
+                "tree {tree}\n",
+                "author Signer <signer@example.invalid> 1700000000 +0000\n",
+                "committer Signer <signer@example.invalid> 1700000000 +0000\n",
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n",
+                " \n",
+                " iQEzBAABCgAdFiEErawcommitbytescontract\n",
+                " =abcd\n",
+                " -----END PGP SIGNATURE-----\n",
+                "\n",
+                "signed commit\n",
+            ),
+            tree = tree,
+        )
+        .into_bytes();
+
+        assert_encoded_preserves_framed_bytes_and_id(ObjectType::Commit, body, format);
+    }
+
+    #[test]
+    fn encoded_raw_commit_with_mergetag_and_custom_headers_preserves_bytes_and_id() {
+        let format = ObjectFormat::Sha1;
+        let tree = ObjectId::empty_tree(format);
+        let parent = ObjectId::empty_blob(format);
+        let body = format!(
+            concat!(
+                "tree {tree}\n",
+                "parent {parent}\n",
+                "author Merger <merger@example.invalid> 1700000000 +0000\n",
+                "committer Merger <merger@example.invalid> 1700000001 +0000\n",
+                "x-review-id 42\n",
+                "mergetag object {parent}\n",
+                " type commit\n",
+                " tag imported-v1\n",
+                " tagger Tagger <tagger@example.invalid> 1699999999 +0000\n",
+                " \n",
+                " imported tag body\n",
+                " gpgsig -----BEGIN PGP SIGNATURE-----\n",
+                " nested-signature-line\n",
+                " -----END PGP SIGNATURE-----\n",
+                "x-sley-extra raw bytes stay here\n",
+                "\n",
+                "merge commit\n",
+            ),
+            tree = tree,
+            parent = parent,
+        )
+        .into_bytes();
+
+        assert_encoded_preserves_framed_bytes_and_id(ObjectType::Commit, body, format);
+    }
+
+    #[test]
+    fn encoded_raw_annotated_tag_with_signature_and_custom_headers_preserves_bytes_and_id() {
+        let format = ObjectFormat::Sha1;
+        let object = ObjectId::empty_blob(format);
+        let body = format!(
+            concat!(
+                "object {object}\n",
+                "type blob\n",
+                "tag signed-v1\n",
+                "tagger Tagger <tagger@example.invalid> 1700000000 -0000\n",
+                "x-release-channel stable\n",
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n",
+                " tag-signature-line-1\n",
+                " tag-signature-line-2\n",
+                " -----END PGP SIGNATURE-----\n",
+                "\n",
+                "release notes\n",
+            ),
+            object = object,
+        )
+        .into_bytes();
+
+        assert_encoded_preserves_framed_bytes_and_id(ObjectType::Tag, body, format);
     }
 
     #[test]
@@ -1091,6 +1224,71 @@ mod tests {
     }
 
     #[test]
+    fn typed_commit_and_tag_parse_write_drops_unknown_headers_by_contract() {
+        let format = ObjectFormat::Sha1;
+        let tree = ObjectId::empty_tree(format);
+        let raw_commit = format!(
+            concat!(
+                "tree {tree}\n",
+                "author A U Thor <a@example.invalid> 0 +0000\n",
+                "x-hidden keep only in raw encoded object\n",
+                "committer C O Mitter <c@example.invalid> 0 +0000\n",
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n",
+                " typed-parser-accepts-this\n",
+                " -----END PGP SIGNATURE-----\n",
+                "\n",
+                "subject\n",
+            ),
+            tree = tree,
+        )
+        .into_bytes();
+
+        let commit = Commit::parse(format, &raw_commit).expect("test operation should succeed");
+        assert_eq!(commit.tree, tree);
+        assert_eq!(commit.author, b"A U Thor <a@example.invalid> 0 +0000");
+        assert_eq!(commit.committer, b"C O Mitter <c@example.invalid> 0 +0000");
+        assert_eq!(commit.message, b"subject\n");
+
+        let written_commit = commit.write();
+        assert_ne!(written_commit, raw_commit);
+        assert_bytes_not_contains(&written_commit, b"x-hidden");
+        assert_bytes_not_contains(&written_commit, b"gpgsig");
+
+        let object = ObjectId::empty_blob(format);
+        let raw_tag = format!(
+            concat!(
+                "object {object}\n",
+                "type blob\n",
+                "tag v1.0\n",
+                "x-hidden keep only in raw encoded object\n",
+                "tagger Example User <example@example.invalid> 0 +0000\n",
+                "gpgsig -----BEGIN PGP SIGNATURE-----\n",
+                " typed-parser-accepts-this-too\n",
+                " -----END PGP SIGNATURE-----\n",
+                "\n",
+                "release\n",
+            ),
+            object = object,
+        )
+        .into_bytes();
+
+        let tag = Tag::parse(format, &raw_tag).expect("test operation should succeed");
+        assert_eq!(tag.object, object);
+        assert_eq!(tag.object_type, ObjectType::Blob);
+        assert_eq!(tag.name, b"v1.0");
+        assert_eq!(
+            tag.tagger.as_deref(),
+            Some(&b"Example User <example@example.invalid> 0 +0000"[..])
+        );
+        assert_eq!(tag.message, b"release\n");
+
+        let written_tag = tag.write();
+        assert_ne!(written_tag, raw_tag);
+        assert_bytes_not_contains(&written_tag, b"x-hidden");
+        assert_bytes_not_contains(&written_tag, b"gpgsig");
+    }
+
+    #[test]
     fn tag_ref_borrows_name_tagger_and_message() {
         let format = ObjectFormat::Sha1;
         let object_hex = "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15";
@@ -1266,6 +1464,39 @@ mod tests {
             Err(GitError::InvalidObject(message)) => assert_eq!(message, expected),
             other => panic!("expected invalid object {expected:?}, got {other:?}"),
         }
+    }
+
+    fn assert_encoded_preserves_framed_bytes_and_id(
+        object_type: ObjectType,
+        body: Vec<u8>,
+        format: ObjectFormat,
+    ) {
+        let object = EncodedObject::new(object_type, body.clone());
+        let expected_id = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let framed = object.framed_bytes();
+
+        let parsed = parse_framed_object(&framed).expect("test operation should succeed");
+        assert_eq!(parsed.object_type, object_type);
+        assert_eq!(parsed.body, body);
+        assert_eq!(
+            parsed
+                .object_id(format)
+                .expect("test operation should succeed"),
+            expected_id
+        );
+        assert_eq!(parsed.framed_bytes(), framed);
+    }
+
+    fn assert_bytes_not_contains(haystack: &[u8], needle: &[u8]) {
+        assert!(
+            !haystack
+                .windows(needle.len())
+                .any(|window| window == needle),
+            "expected bytes not to contain {:?}",
+            String::from_utf8_lossy(needle)
+        );
     }
 
     fn assert_borrows_from(body: &[u8], slice: &[u8], expected: &[u8]) {

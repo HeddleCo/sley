@@ -590,7 +590,11 @@ fn branch_upstream_config_matches_upstream_git() {
             ],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let _ = run_output(sley_testkit::oracle_git(), &root, &["branch", "--unset-upstream", "topic"]);
+            let _ = run_output(
+                sley_testkit::oracle_git(),
+                &root,
+                &["branch", "--unset-upstream", "topic"],
+            );
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
             let remote = String::from_utf8(git(&root, &["config", "branch.topic.remote"]))
@@ -603,7 +607,11 @@ fn branch_upstream_config_matches_upstream_git() {
                 assert_eq!(remote, ".\n");
             }
             assert_eq!(merge, "refs/heads/main\n");
-            let _ = run_output(sley_testkit::oracle_git(), &root, &["branch", "--unset-upstream", "topic"]);
+            let _ = run_output(
+                sley_testkit::oracle_git(),
+                &root,
+                &["branch", "--unset-upstream", "topic"],
+            );
         }
 
         git(&root, &["branch", "-u", "main", "topic"]);
@@ -1069,7 +1077,11 @@ fn branch_verbose_listing_matches_upstream_git() {
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             if args == ["branch", "-v", "created-from-verbose"] {
-                let _ = run_output(sley_testkit::oracle_git(), &root, &["branch", "-D", "created-from-verbose"]);
+                let _ = run_output(
+                    sley_testkit::oracle_git(),
+                    &root,
+                    &["branch", "-D", "created-from-verbose"],
+                );
             }
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);

@@ -372,11 +372,18 @@ pub fn read_repo_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<
     let path = git_dir.join("config");
     // `includeIf "gitdir:"` matches against the absolute git directory; canonicalise
     // so a relative `git_dir` still resolves includes correctly.
-    let git_dir_abs = fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+    let git_dir_abs = match fs::canonicalize(git_dir) {
+        Ok(path) => path,
+        Err(_) => git_dir.to_path_buf(),
+    };
     let context = ConfigIncludeContext::new(Some(git_dir_abs), repo_current_branch_name(git_dir));
     let mut config = load_config_with_includes(&path, &context)?;
     if let Ok(parameters) = injected_config_parameters(parameters_env) {
-        config.sections.extend(injected_config_sections(&parameters));
+        let base = match std::env::current_dir() {
+            Ok(path) => path,
+            Err(_) => PathBuf::from("."),
+        };
+        append_injected_config_sections_with_includes(&mut config, &parameters, &context, &base)?;
     }
     Ok(config)
 }
@@ -409,9 +416,33 @@ fn load_config_file(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     };
-    let parsed = GitConfig::parse(&bytes)?;
-    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let parsed = GitConfig::parse(&bytes).map_err(|err| annotate_config_parse_path(err, path))?;
+    let base_dir = match path.parent() {
+        Some(parent) => parent,
+        None => Path::new("."),
+    };
     splice_includes(&parsed, base_dir, context, depth, forbid_remote_url, out)
+}
+
+fn annotate_config_parse_path(err: GitError, path: &Path) -> GitError {
+    match err {
+        GitError::InvalidFormat(message) => {
+            let Some(rest) = message.strip_prefix("config line ") else {
+                return GitError::InvalidFormat(message);
+            };
+            let Some((line, detail)) = rest.split_once(':') else {
+                return GitError::InvalidFormat(format!(
+                    "config line {rest} in file {}",
+                    path.display()
+                ));
+            };
+            GitError::InvalidFormat(format!(
+                "config line {line} in file {}:{detail}",
+                path.display()
+            ))
+        }
+        other => other,
+    }
 }
 
 /// Walk the parsed sections in order, copying ordinary sections through and
@@ -458,10 +489,16 @@ fn splice_includes(
                         loaded.extend_from_slice(&included);
                         out.extend(included);
                     }
-                } else if include_condition_matches(condition, base_dir, context, &loaded, parsed)
-                {
+                } else if include_condition_matches(condition, base_dir, context, &loaded, parsed) {
                     let before = out.len();
-                    expand_include_paths(section, base_dir, context, depth, forbid_remote_url, out)?;
+                    expand_include_paths(
+                        section,
+                        base_dir,
+                        context,
+                        depth,
+                        forbid_remote_url,
+                        out,
+                    )?;
                     loaded.extend_from_slice(&out[before..]);
                 }
             }
@@ -1110,7 +1147,8 @@ fn stack_include_condition_matches(
     }
     if let Some(glob) = condition.strip_prefix("hasconfig:remote.*.url:") {
         let stack_urls = emitted.iter().filter(|entry| {
-            eq_ignore_ascii_case(&entry.section, "remote") && eq_ignore_ascii_case(&entry.key, "url")
+            eq_ignore_ascii_case(&entry.section, "remote")
+                && eq_ignore_ascii_case(&entry.key, "url")
         });
         return stack_urls
             .filter_map(|entry| entry.value.as_deref())
@@ -2117,7 +2155,9 @@ pub fn canonicalize_config_key(key: &str) -> std::result::Result<String, ConfigP
 /// used for `-c` and old-style `GIT_CONFIG_PARAMETERS` entries). The value is
 /// split off at the *first* `=`; a missing `=` is a bare boolean entry; an empty
 /// key is rejected.
-fn parse_config_parameter(text: &str) -> std::result::Result<ConfigParameter, ConfigParameterError> {
+fn parse_config_parameter(
+    text: &str,
+) -> std::result::Result<ConfigParameter, ConfigParameterError> {
     let (key, value) = match text.split_once('=') {
         Some((key, value)) => (key, Some(value.to_string())),
         None => (text, None),
@@ -2296,9 +2336,7 @@ fn parse_strtoul_count(value: &str) -> std::result::Result<Option<u64>, ConfigPa
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         // Wrapping mirrors C's unsigned long overflow behaviour; an oversized
         // value still trips the caller's INT_MAX "too many entries" check.
-        acc = acc
-            .wrapping_mul(10)
-            .wrapping_add((bytes[i] - b'0') as u64);
+        acc = acc.wrapping_mul(10).wrapping_add((bytes[i] - b'0') as u64);
         i += 1;
     }
     if i == digits_start {
@@ -2376,9 +2414,7 @@ pub fn injected_config_parameters(
 /// appending to a [`GitConfig`] at the end (highest precedence). Each parameter
 /// becomes its own one-entry section so duplicate keys and `--get-all`/`--list`
 /// ordering match git's "each `-c` is a distinct config event" semantics.
-pub fn injected_config_sections(
-    parameters: &[ConfigParameter],
-) -> Vec<ConfigSection> {
+pub fn injected_config_sections(parameters: &[ConfigParameter]) -> Vec<ConfigSection> {
     parameters
         .iter()
         .map(|param| {
@@ -2390,6 +2426,28 @@ pub fn injected_config_sections(
             )
         })
         .collect()
+}
+
+/// Append command-line/environment config parameters, resolving any
+/// `include.path` / `includeIf.<condition>.path` directives they contain.
+///
+/// Git treats injected config as real config events, so a command-line
+/// `-c includeIf.onbranch:main.path=/tmp/config` can load more config before the
+/// target command runs. The returned entries stay ordered as injected: ordinary
+/// parameters are copied through, while matching include directives splice the
+/// included file at that position.
+pub fn append_injected_config_sections_with_includes(
+    config: &mut GitConfig,
+    parameters: &[ConfigParameter],
+    context: &ConfigIncludeContext,
+    base_dir: &Path,
+) -> Result<()> {
+    let injected = GitConfig {
+        preamble: Vec::new(),
+        suffix: Vec::new(),
+        sections: injected_config_sections(parameters),
+    };
+    splice_includes(&injected, base_dir, context, 0, false, &mut config.sections)
 }
 
 /// Quote a string as a single shell word, exactly as git's `sq_quote_buf`:
@@ -2747,8 +2805,7 @@ mod tests {
         for value in ["plain", "with space", "with'quote", "with!bang", "a'b!c"] {
             let quoted = sq_quote(value);
             let bytes = quoted.as_bytes();
-            let (dequoted, next) =
-                sq_dequote_step(bytes, 0).expect("sq_quote output must dequote");
+            let (dequoted, next) = sq_dequote_step(bytes, 0).expect("sq_quote output must dequote");
             assert_eq!(dequoted, value, "round-trip failed for {value:?}");
             assert_eq!(next, bytes.len(), "consumed whole word for {value:?}");
         }
@@ -2771,7 +2828,10 @@ mod tests {
         // Last one wins, case-insensitive on section + variable.
         assert_eq!(config.get("sec", None, "VAR"), Some("VAL"));
         // Both values are preserved for --get-all in order.
-        assert_eq!(config.get_all("SEC", None, "var"), vec![Some("val"), Some("VAL")]);
+        assert_eq!(
+            config.get_all("SEC", None, "var"),
+            vec![Some("val"), Some("VAL")]
+        );
     }
 
     #[test]

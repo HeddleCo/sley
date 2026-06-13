@@ -219,7 +219,12 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
             fs::write(repo.join("two.txt"), b"two\n").expect("write two");
             let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
             for path in ["one.txt", "two.txt"] {
-                let output = run_output_with_env(sley_testkit::oracle_git(), repo, &["hash-object", "-w", path], &envs);
+                let output = run_output_with_env(
+                    sley_testkit::oracle_git(),
+                    repo,
+                    &["hash-object", "-w", path],
+                    &envs,
+                );
                 assert!(
                     output.status.success(),
                     "hash-object failed:\n{}",
@@ -255,7 +260,12 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
             let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
-            let output = run_output_with_env(sley_testkit::oracle_git(), repo, &["hash-object", "-w", "one.txt"], &envs);
+            let output = run_output_with_env(
+                sley_testkit::oracle_git(),
+                repo,
+                &["hash-object", "-w", "one.txt"],
+                &envs,
+            );
             assert!(
                 output.status.success(),
                 "hash-object failed:\n{}",

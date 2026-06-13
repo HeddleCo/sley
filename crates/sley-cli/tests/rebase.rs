@@ -93,10 +93,12 @@ fn prepare_diverged_repos(upstream: &Path, rust: &Path) {
         fs::write(root.join("shared.txt"), b"base\n").expect("write shared file");
         git(root, &["add", "shared.txt"]);
         git_with_identity(root, &["commit", "-m", "base", "-q"]);
-        let base = String::from_utf8(run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]).stdout)
-            .expect("base oid utf8")
-            .trim()
-            .to_string();
+        let base = String::from_utf8(
+            run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]).stdout,
+        )
+        .expect("base oid utf8")
+        .trim()
+        .to_string();
         git(root, &["checkout", "-b", "topic", &base, "-q"]);
         fs::write(root.join("topic.txt"), b"topic-only\n").expect("write topic file");
         git(root, &["add", "topic.txt"]);
@@ -148,7 +150,12 @@ fn rebase_clean_matches_upstream_git() {
         String::from_utf8_lossy(&actual.stderr)
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after clean rebase"
     );
@@ -173,7 +180,12 @@ fn rebase_already_up_to_date_matches_upstream_git() {
     let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
     assert_same_output(actual, expected, &args);
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after up-to-date rebase"
     );
@@ -216,10 +228,23 @@ fn checkout_can_leave_gitlink_branch_with_dirty_populated_submodule() {
     git_with_identity(&superproject, &["commit", "-m", "add submodule", "-q"]);
 
     fs::write(superproject.join("sub/file0"), b"changed\n").expect("dirty submodule");
-    run_success(env!("CARGO_BIN_EXE_sley"), &superproject, &["reset", "--hard"]);
-    run_success(env!("CARGO_BIN_EXE_sley"), &superproject, &["checkout", "main"]);
+    run_success(
+        env!("CARGO_BIN_EXE_sley"),
+        &superproject,
+        &["reset", "--hard"],
+    );
+    run_success(
+        env!("CARGO_BIN_EXE_sley"),
+        &superproject,
+        &["checkout", "main"],
+    );
     assert_eq!(
-        run_output(env!("CARGO_BIN_EXE_sley"), &superproject, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &superproject,
+            &["rev-parse", "--abbrev-ref", "HEAD"]
+        )
+        .stdout,
         b"main\n",
         "checkout should leave the gitlink branch"
     );

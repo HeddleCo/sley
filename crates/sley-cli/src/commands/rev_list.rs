@@ -1962,7 +1962,8 @@ fn rev_list_try_bitmap(
         return Ok(false);
     }
 
-    let mut result = sley_odb::bitmap_reachable(&bitmap, db, format, query.want_roots, query.objects)?;
+    let mut result =
+        sley_odb::bitmap_reachable(&bitmap, db, format, query.want_roots, query.objects)?;
     if !query.exclude_tips.is_empty() {
         let haves =
             sley_odb::bitmap_reachable(&bitmap, db, format, query.exclude_tips, query.objects)?;

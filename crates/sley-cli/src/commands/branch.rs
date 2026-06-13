@@ -6901,11 +6901,10 @@ pub(crate) fn branch_create_set_tracking(
             // refspec. `simple` additionally requires the remote branch name
             // to equal the new branch name.
             let Some(start) = start else { return Ok(()) };
-            let resolved =
-                match resolve_remote_tracking_upstream(store, &config, start.as_str())? {
-                    Some(resolved) => resolved,
-                    None => return Ok(()),
-                };
+            let resolved = match resolve_remote_tracking_upstream(store, &config, start.as_str())? {
+                Some(resolved) => resolved,
+                None => return Ok(()),
+            };
             if effective == EffectiveTrack::Simple {
                 let tracked = resolved.merge.strip_prefix("refs/heads/");
                 if tracked != Some(branch) {
@@ -7007,7 +7006,13 @@ fn install_tracking_config(
         "remote",
         &resolved.remote,
     );
-    set_config_value(&mut config, "branch", Some(branch), "merge", &resolved.merge);
+    set_config_value(
+        &mut config,
+        "branch",
+        Some(branch),
+        "merge",
+        &resolved.merge,
+    );
     if rebasing {
         set_config_value(&mut config, "branch", Some(branch), "rebase", "true");
     }

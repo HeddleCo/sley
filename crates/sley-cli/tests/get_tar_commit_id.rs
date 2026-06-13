@@ -98,9 +98,17 @@ fn get_tar_commit_id_matches_upstream_git() {
             .expect("run git commit");
         assert!(commit.status.success(), "git commit failed");
 
-        let commit_tar = run_output(sley_testkit::oracle_git(), &root, &["archive", "--format=tar", "HEAD"]);
+        let commit_tar = run_output(
+            sley_testkit::oracle_git(),
+            &root,
+            &["archive", "--format=tar", "HEAD"],
+        );
         assert!(commit_tar.status.success(), "git archive HEAD failed");
-        let tree_tar = run_output(sley_testkit::oracle_git(), &root, &["archive", "--format=tar", "HEAD^{tree}"]);
+        let tree_tar = run_output(
+            sley_testkit::oracle_git(),
+            &root,
+            &["archive", "--format=tar", "HEAD^{tree}"],
+        );
         assert!(tree_tar.status.success(), "git archive tree failed");
 
         assert_stdin_match(&root, &["get-tar-commit-id"], &commit_tar.stdout);

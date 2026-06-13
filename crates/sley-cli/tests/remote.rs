@@ -918,7 +918,11 @@ fn remote_set_head_option_order_matches_upstream_git() {
                 &upstream,
                 &["symbolic-ref", "refs/remotes/origin/HEAD"],
             );
-            let actual = run_output(sley_testkit::oracle_git(), &rust, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
+            let actual = run_output(
+                sley_testkit::oracle_git(),
+                &rust,
+                &["symbolic-ref", "refs/remotes/origin/HEAD"],
+            );
             assert_same_output(
                 actual,
                 expected,
@@ -1161,7 +1165,11 @@ fn remote_prune_local_remote_matches_upstream_git() {
         let no_dry_run_reset_args = ["remote", "prune", "--no-dry-run", "--dry-run", "origin"];
         assert_same_output(
             run_output(env!("CARGO_BIN_EXE_sley"), &rust, &no_dry_run_reset_args),
-            run_output(sley_testkit::oracle_git(), &upstream, &no_dry_run_reset_args),
+            run_output(
+                sley_testkit::oracle_git(),
+                &upstream,
+                &no_dry_run_reset_args,
+            ),
             &no_dry_run_reset_args,
         );
         let prune_args = ["remote", "prune", "origin"];

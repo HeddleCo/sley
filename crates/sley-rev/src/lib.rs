@@ -27,6 +27,67 @@ impl RevisionSpec {
         }
         Ok(Self { raw })
     }
+
+    pub fn borrowed(&self) -> Result<RevisionSpecRef<'_>> {
+        RevisionSpecRef::parse(&self.raw)
+    }
+}
+
+/// A borrowed, allocation-free classification of a revision spelling.
+///
+/// This is intentionally only a top-level parse for now: it separates the
+/// forms that change the resolver entry point (`:/text`, `:[stage:]path`, and
+/// `<rev>:<path>`) while leaving suffix chains like `^`, `~`, `^{tree}`, and
+/// `^{/text}` to the existing suffix resolver. Keeping the slices borrowed lets
+/// callers route a user-provided spec without copying, and it avoids the
+/// brittle "first colon wins" behavior that misclassified colons inside
+/// `^{/text}` and reflog selectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevisionSpecRef<'a> {
+    raw: &'a str,
+    kind: RevisionSpecKind<'a>,
+}
+
+impl<'a> RevisionSpecRef<'a> {
+    pub fn parse(raw: &'a str) -> Result<Self> {
+        if raw.is_empty() {
+            return Err(GitError::InvalidFormat("empty revision spec".into()));
+        }
+        let kind = if let Some(text) = raw.strip_prefix(":/") {
+            RevisionSpecKind::MessageSearch { text }
+        } else if let Some(rest) = raw.strip_prefix(':') {
+            let (stage, path) = parse_index_stage_path(rest);
+            RevisionSpecKind::IndexPath { stage, path }
+        } else if let Some((rev, path)) = split_top_level_rev_path(raw) {
+            RevisionSpecKind::TreePath { rev, path }
+        } else {
+            RevisionSpecKind::Revision { rev: raw }
+        };
+        Ok(Self { raw, kind })
+    }
+
+    pub fn raw(&self) -> &'a str {
+        self.raw
+    }
+
+    pub fn kind(&self) -> RevisionSpecKind<'a> {
+        self.kind
+    }
+
+    pub fn tree_path(&self) -> Option<(&'a str, &'a str)> {
+        match self.kind {
+            RevisionSpecKind::TreePath { rev, path } => Some((rev, path)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionSpecKind<'a> {
+    MessageSearch { text: &'a str },
+    IndexPath { stage: u8, path: &'a str },
+    TreePath { rev: &'a str, path: &'a str },
+    Revision { rev: &'a str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +111,64 @@ pub struct CommitMetadata {
     /// Committer time in seconds since the epoch (the value the commit-graph
     /// records, identical to the object's committer line).
     pub commit_time: i64,
+}
+
+/// Terms that name the new/bad and old/good sides of an active bisect.
+///
+/// Git stores these as two LF-terminated lines in `$GIT_DIR/BISECT_TERMS`.
+/// Missing state means the default `bad`/`good` vocabulary. Commands that need
+/// to enumerate `refs/bisect/*` should use [`Self::is_bad_ref`] and
+/// [`Self::is_good_ref`] so custom terms stay centralized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BisectTerms {
+    pub bad: String,
+    pub good: String,
+}
+
+impl Default for BisectTerms {
+    fn default() -> Self {
+        Self {
+            bad: "bad".to_string(),
+            good: "good".to_string(),
+        }
+    }
+}
+
+impl BisectTerms {
+    pub fn is_bad_ref(&self, ref_name: &str) -> bool {
+        bisect_ref_matches_term(ref_name, &self.bad)
+    }
+
+    pub fn is_good_ref(&self, ref_name: &str) -> bool {
+        bisect_ref_matches_term(ref_name, &self.good)
+    }
+}
+
+pub fn read_bisect_terms(git_dir: impl AsRef<Path>) -> Result<BisectTerms> {
+    let path = git_dir.as_ref().join("BISECT_TERMS");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BisectTerms::default());
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let mut lines = contents.lines();
+    let bad = match lines.next() {
+        Some(line) => line.to_string(),
+        None => String::new(),
+    };
+    let good = match lines.next() {
+        Some(line) => line.to_string(),
+        None => String::new(),
+    };
+    Ok(BisectTerms { bad, good })
+}
+
+fn bisect_ref_matches_term(ref_name: &str, term: &str) -> bool {
+    ref_name
+        .strip_prefix("refs/bisect/")
+        .is_some_and(|name| name.starts_with(term))
 }
 
 pub fn resolve_revision(
@@ -98,21 +217,21 @@ fn resolve_revision_inner<R: ObjectReader>(
     rev: &str,
     config: Option<&GitConfig>,
 ) -> Result<ObjectId> {
-    // `:/text` and `:[N:]path` are anchored at the start of the spec; handle them
-    // before the `^`/`~` suffix machinery so the leading colon is not mistaken
-    // for a normal revision name.
-    if let Some(text) = rev.strip_prefix(":/") {
-        return search_commit_message_all(git_dir, format, reader, text);
-    }
-    if let Some(rest) = rev.strip_prefix(':') {
-        let (stage, path) = parse_index_stage_path(rest);
-        return resolve_index_path(git_dir, format, stage, path);
-    }
-    // `<rev>:<path>` resolves to the object at `<path>` within `<rev>`'s tree. The
-    // colon binds looser than the `^`/`~` navigation suffixes, so an unsuffixed
-    // colon here means the whole left side is the revision-ish to peel to a tree.
-    if let Some((rev_part, path)) = split_rev_path(rev) {
-        return resolve_rev_path(git_dir, format, reader, rev_part, path);
+    let parsed = RevisionSpecRef::parse(rev)?;
+    match parsed.kind() {
+        RevisionSpecKind::MessageSearch { text } => {
+            return search_commit_message_all(git_dir, format, reader, text);
+        }
+        RevisionSpecKind::IndexPath { stage, path } => {
+            return resolve_index_path(git_dir, format, stage, path);
+        }
+        RevisionSpecKind::TreePath {
+            rev: rev_part,
+            path,
+        } => {
+            return resolve_rev_path(git_dir, format, reader, rev_part, path);
+        }
+        RevisionSpecKind::Revision { rev: _ } => {}
     }
     // `@`, `@{N}`, `<branch>@{N}`, `@{u}`/`@{upstream}`, `@{push}`, and `@{-N}` are
     // resolved before the `^`/`~` suffix machinery so that a base like `HEAD@{1}^`
@@ -239,7 +358,10 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
         format!("refs/{rev}")
     } else if refs.read_ref(&format!("refs/remotes/{rev}"))?.is_some() {
         format!("refs/remotes/{rev}")
-    } else if refs.read_ref(&format!("refs/remotes/{rev}/HEAD"))?.is_some() {
+    } else if refs
+        .read_ref(&format!("refs/remotes/{rev}/HEAD"))?
+        .is_some()
+    {
         format!("refs/remotes/{rev}/HEAD")
     } else if validate_symref_name(rev).is_ok() {
         rev.to_string()
@@ -1537,7 +1659,10 @@ fn commit_metadata_from_object<R: ObjectReader>(
         .committer_signature()
         .map(|signature| signature.time.seconds)
         .unwrap_or(0);
-    Ok((sley_odb::grafted_parents(reader, oid, commit.parents), commit_time))
+    Ok((
+        sley_odb::grafted_parents(reader, oid, commit.parents),
+        commit_time,
+    ))
 }
 
 pub fn walk_commits<R: ObjectReader>(
@@ -1692,10 +1817,7 @@ fn commit_graph_bloom_paths_for_pathspec(pathspec: &Pathspec) -> Option<Vec<Vec<
     let mut paths = Vec::new();
     for element in pathspec.elements() {
         let mut pattern = element.pattern();
-        if element.is_exclude()
-            || element.is_icase()
-            || pattern.is_empty()
-        {
+        if element.is_exclude() || element.is_icase() || pattern.is_empty() {
             return None;
         }
         while pattern.ends_with(b"/") {
@@ -1814,7 +1936,8 @@ fn compute_treesame(
                     }
                     GraphBloomConsult::Maybe => {
                         bloom_stats.maybe += 1;
-                        let same = tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
+                        let same =
+                            tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
                         if same {
                             bloom_stats.false_positive += 1;
                         }
@@ -2336,7 +2459,10 @@ pub fn resolve_tree_path_follow_symlinks<R: ObjectReader>(
                 // names the tree just loaded.
                 return SymlinkedTreePath::Found(tree_oid);
             }
-            if parents.last().is_some_and(|(_, object)| object.body.is_empty()) {
+            if parents
+                .last()
+                .is_some_and(|(_, object)| object.body.is_empty())
+            {
                 return fail;
             }
             need_load = false;
@@ -2455,11 +2581,27 @@ pub fn split_rev_path_spec(rev: &str) -> Option<(&str, &str)> {
 }
 
 fn split_rev_path(rev: &str) -> Option<(&str, &str)> {
-    let colon = rev.find(':')?;
-    if colon == 0 {
-        return None;
+    RevisionSpecRef::parse(rev).ok()?.tree_path()
+}
+
+fn split_top_level_rev_path(rev: &str) -> Option<(&str, &str)> {
+    let bytes = rev.as_bytes();
+    let mut braced_selector_depth = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'{' if index > 0 && matches!(bytes[index - 1], b'^' | b'@') => {
+                braced_selector_depth = braced_selector_depth.saturating_add(1);
+            }
+            b'}' if braced_selector_depth > 0 => {
+                braced_selector_depth -= 1;
+            }
+            b':' if braced_selector_depth == 0 && index > 0 => {
+                return Some((&rev[..index], &rev[index + 1..]));
+            }
+            _ => {}
+        }
     }
-    Some((&rev[..colon], &rev[colon + 1..]))
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3723,6 +3865,84 @@ mod tests {
     }
 
     #[test]
+    fn revision_spec_ref_splits_only_top_level_tree_path_colons() {
+        assert_eq!(
+            RevisionSpecRef::parse("HEAD:hello")
+                .expect("test operation should succeed")
+                .tree_path(),
+            Some(("HEAD", "hello"))
+        );
+        assert_eq!(
+            RevisionSpecRef::parse("HEAD^{/testing:}:hello")
+                .expect("test operation should succeed")
+                .tree_path(),
+            Some(("HEAD^{/testing:}", "hello"))
+        );
+        assert_eq!(
+            RevisionSpecRef::parse("HEAD@{2024-01-01 10:00:00}:hello")
+                .expect("test operation should succeed")
+                .tree_path(),
+            Some(("HEAD@{2024-01-01 10:00:00}", "hello"))
+        );
+        assert_eq!(
+            RevisionSpecRef::parse(":/testing: message")
+                .expect("test operation should succeed")
+                .kind(),
+            RevisionSpecKind::MessageSearch {
+                text: "testing: message"
+            }
+        );
+    }
+
+    #[test]
+    fn read_bisect_terms_defaults_and_matches_custom_refs() {
+        let git_dir = temp_git_dir();
+        let terms = read_bisect_terms(&git_dir).expect("test operation should succeed");
+        assert_eq!(terms, BisectTerms::default());
+        assert!(terms.is_bad_ref("refs/bisect/bad"));
+        assert!(terms.is_good_ref("refs/bisect/good-1234"));
+
+        fs::write(git_dir.join("BISECT_TERMS"), b"curious\nknown\n")
+            .expect("test operation should succeed");
+        let terms = read_bisect_terms(&git_dir).expect("test operation should succeed");
+        assert_eq!(terms.bad, "curious");
+        assert_eq!(terms.good, "known");
+        assert!(terms.is_bad_ref("refs/bisect/curious-1"));
+        assert!(terms.is_good_ref("refs/bisect/known-3"));
+        assert!(!terms.is_bad_ref("refs/bisect/bad"));
+        assert!(!terms.is_good_ref("refs/bisect/good"));
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn resolve_rev_path_after_commit_message_search_suffix() {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
+            .expect("test operation should succeed");
+        let tree = write_tree(&mut db, &[(0o100644, b"hello", &blob)]);
+        let base = write_dated_commit(&mut db, tree, Vec::new(), b"base\n", 1000);
+        let searched =
+            write_dated_commit(&mut db, tree, vec![base], b"testing: path search\n", 2000);
+        let tip = write_dated_commit(&mut db, tree, vec![searched], b"tip\n", 3000);
+        set_branch(&git_dir, "other", &tip);
+
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                "other^{/testing:}:hello",
+            )
+            .expect("test operation should succeed"),
+            blob
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
     fn parse_revision_range_recognizes_dot_forms() {
         assert_eq!(
             parse_revision_range("a..b"),
@@ -4343,7 +4563,7 @@ mod tests {
             .expect("test operation should succeed")
     }
 
-    fn write_tree(db: &mut ObjectDatabase, entries: &[(u32, &[u8], &ObjectId)]) -> ObjectId {
+    fn write_tree<W: ObjectWriter>(db: &mut W, entries: &[(u32, &[u8], &ObjectId)]) -> ObjectId {
         let tree = sley_object::Tree {
             entries: entries
                 .iter()
@@ -4969,9 +5189,8 @@ mod tests {
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let oids = build_linear_history(&git_dir, 5);
         let tip = *oids.last().expect("tip");
-        let got = walk_oids(
-            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).max_count(Some(2)),
-        );
+        let got =
+            walk_oids(RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).max_count(Some(2)));
         assert_eq!(got, vec![oids[4], oids[3]]);
         fs::remove_dir_all(git_dir).expect("cleanup");
     }
@@ -5033,9 +5252,8 @@ mod tests {
         let side = write_dated_commit(&mut db, tree, vec![base], b"side\n", 110);
         let main = write_dated_commit(&mut db, tree, vec![base], b"main\n", 120);
         let merge = write_dated_commit(&mut db, tree, vec![main, side], b"merge\n", 130);
-        let first_parent = walk_oids(
-            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [merge]).first_parent(true),
-        );
+        let first_parent =
+            walk_oids(RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [merge]).first_parent(true));
         // first-parent line: merge -> main -> base; `side` is skipped.
         assert_eq!(first_parent, vec![merge, main, base]);
         assert!(!first_parent.contains(&side));
@@ -5050,12 +5268,10 @@ mod tests {
         let tip = *oids.last().expect("tip");
         // since=102 (>=102), until=103 (<=103) -> times 102,103 -> oids[3],oids[2].
         let got = walk_oids(
-            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).date_window(
-                RevWalkDateWindow {
-                    min_time: Some(102),
-                    max_time: Some(103),
-                },
-            ),
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).date_window(RevWalkDateWindow {
+                min_time: Some(102),
+                max_time: Some(103),
+            }),
         );
         assert_eq!(got, vec![oids[3], oids[2]]);
         fs::remove_dir_all(git_dir).expect("cleanup");
@@ -5070,10 +5286,12 @@ mod tests {
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let oids = build_linear_history(&git_dir, 3);
         let tip = *oids.last().expect("tip");
-        let spec = Pathspec::parse([b"does/not/exist".as_slice()], PathspecMatchMagic::default())
-            .expect("pathspec");
-        let walk =
-            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).pathspec(spec.clone());
+        let spec = Pathspec::parse(
+            [b"does/not/exist".as_slice()],
+            PathspecMatchMagic::default(),
+        )
+        .expect("pathspec");
+        let walk = RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).pathspec(spec.clone());
         assert_eq!(walk.pathspec_ref(), &spec);
         let got = walk_oids(walk);
         assert_eq!(got.len(), 3, "pathspec must not prune in STAGE-A");

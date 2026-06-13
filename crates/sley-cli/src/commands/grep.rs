@@ -206,7 +206,10 @@ fn resolve_pattern_config(config: &GitConfig) -> Result<GrepConfig> {
 
     // 2. `-c` / GIT_CONFIG_PARAMETERS injected entries, in order.
     for param in injected_config_parameters()? {
-        apply(&param.canonical_key.to_ascii_lowercase(), param.value.as_deref())?;
+        apply(
+            &param.canonical_key.to_ascii_lowercase(),
+            param.value.as_deref(),
+        )?;
     }
 
     Ok(GrepConfig {
@@ -437,10 +440,11 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--threads=") => {}
             value if value.starts_with("--color=") => {}
-            value if value.starts_with('-')
-                && value.len() > 1
-                && !value.starts_with("--")
-                && !is_negative_number(value) =>
+            value
+                if value.starts_with('-')
+                    && value.len() > 1
+                    && !value.starts_with("--")
+                    && !is_negative_number(value) =>
             {
                 match expand_short_flag_bundle(value, &mut opts, &mut cli_pattern_type)? {
                     ShortBundle::Handled => {}
@@ -559,7 +563,12 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         Ok(root) if root.is_dir() => Some(root),
         _ => None,
     };
-    let pathspec = GrepPathspec::new(worktree_root.as_deref(), cwd, opts.full_name, &opts.pathspecs)?;
+    let pathspec = GrepPathspec::new(
+        worktree_root.as_deref(),
+        cwd,
+        opts.full_name,
+        &opts.pathspecs,
+    )?;
 
     let plan = GrepPlan {
         matcher: &matcher,
@@ -928,7 +937,14 @@ fn grep_tree_source(
         let display = plan.pathspec.display(&path);
         let object = source.db.read_object(&oid)?;
         let content = &object.body;
-        let matched = grep_buffer(content, &display, Some(source.rev), plan, out, &mut printed_file)?;
+        let matched = grep_buffer(
+            content,
+            &display,
+            Some(source.rev),
+            plan,
+            out,
+            &mut printed_file,
+        )?;
         any = any || matched;
     }
     Ok(any)
@@ -1171,11 +1187,7 @@ struct LineFlag {
 }
 
 /// Compute, for each input line, whether it is selected/context/function.
-fn compute_output_lines(
-    lines: &[&[u8]],
-    hits: &[LineHit],
-    opts: &GrepOptions,
-) -> Vec<LineFlag> {
+fn compute_output_lines(lines: &[&[u8]], hits: &[LineHit], opts: &GrepOptions) -> Vec<LineFlag> {
     let mut flags = vec![LineFlag::default(); lines.len()];
     for hit in hits {
         flags[hit.line_no - 1].selected = true;
@@ -1283,9 +1295,7 @@ fn emit_lines(
             .unwrap_or(0)
     };
 
-    let has_context = opts.before_context > 0
-        || opts.after_context > 0
-        || opts.function_context;
+    let has_context = opts.before_context > 0 || opts.after_context > 0 || opts.function_context;
 
     let mut last_printed: Option<usize> = None;
     for (i, flag) in flags.iter().enumerate() {
@@ -1979,7 +1989,10 @@ pub(crate) enum RegexMode {
 enum Node {
     Literal(u8),
     AnyChar,
-    Class { negate: bool, items: Vec<ClassItem> },
+    Class {
+        negate: bool,
+        items: Vec<ClassItem>,
+    },
     StartAnchor,
     EndAnchor,
     WordBoundary,
@@ -2010,7 +2023,10 @@ enum ClassItem {
     Posix(PosixClass),
     /// `\p{..}` / `\P{..}` Unicode general-category escape, matched against the
     /// ASCII range (sley's grep operates bytewise; non-ASCII bytes never match).
-    Category { negate: bool, cat: PerlCategory },
+    Category {
+        negate: bool,
+        cat: PerlCategory,
+    },
 }
 
 /// ASCII approximation of the Unicode general categories the upstream tests
@@ -2374,7 +2390,9 @@ impl RegexParser<'_> {
         } else if rest.starts_with(b"?:") {
             self.pos += 3;
         } else if rest.starts_with(b"?") {
-            return Err(GitError::Command("unsupported (?...) group in regex".into()));
+            return Err(GitError::Command(
+                "unsupported (?...) group in regex".into(),
+            ));
         } else {
             self.pos += 1;
             self.num_groups += 1;
@@ -2879,9 +2897,13 @@ fn match_seq(
             if pos + captured_len > text.len() {
                 return None;
             }
-            let matches = (0..captured_len)
-                .all(|i| byte_eq(text[pos + i], text[start + i], ignore_case));
-            if matches { cont(pos + captured_len) } else { None }
+            let matches =
+                (0..captured_len).all(|i| byte_eq(text[pos + i], text[start + i], ignore_case));
+            if matches {
+                cont(pos + captured_len)
+            } else {
+                None
+            }
         }
         Node::Concat(nodes) => match_concat(nodes, ctx, pos, ignore_case, cont),
         Node::Alt(branches) => {
@@ -3074,10 +3096,19 @@ fn perl_category_matches(cat: PerlCategory, ch: u8) -> bool {
         PerlCategory::UppercaseLetter => ch.is_ascii_uppercase(),
         PerlCategory::LowercaseLetter => ch.is_ascii_lowercase(),
         PerlCategory::Number => ch.is_ascii_digit(),
-        PerlCategory::Punctuation => ch.is_ascii_punctuation() && !matches!(ch, b'$' | b'+' | b'<' | b'=' | b'>' | b'^' | b'`' | b'|' | b'~'),
+        PerlCategory::Punctuation => {
+            ch.is_ascii_punctuation()
+                && !matches!(
+                    ch,
+                    b'$' | b'+' | b'<' | b'=' | b'>' | b'^' | b'`' | b'|' | b'~'
+                )
+        }
         PerlCategory::OpenPunctuation => matches!(ch, b'(' | b'[' | b'{'),
         PerlCategory::ClosePunctuation => matches!(ch, b')' | b']' | b'}'),
-        PerlCategory::Symbol => matches!(ch, b'$' | b'+' | b'<' | b'=' | b'>' | b'^' | b'`' | b'|' | b'~'),
+        PerlCategory::Symbol => matches!(
+            ch,
+            b'$' | b'+' | b'<' | b'=' | b'>' | b'^' | b'`' | b'|' | b'~'
+        ),
         PerlCategory::Separator => ch == b' ',
     }
 }
@@ -3151,7 +3182,10 @@ mod tests {
 
     #[test]
     fn pcre_unicode_categories_ascii() {
-        assert!(pcre_match(r"\p{Ps}.*?\p{Pe}", "printf(\"Hello world.\\n\");"));
+        assert!(pcre_match(
+            r"\p{Ps}.*?\p{Pe}",
+            "printf(\"Hello world.\\n\");"
+        ));
         assert!(!pcre_match(r"\p{Ps}\p{Pe}", "no parens here"));
         assert!(pcre_match(r"(*NO_JIT)\p{Ps}.*?\p{Pe}", "f(x)"));
         assert!(pcre_match(r"\p{L}+", "word"));

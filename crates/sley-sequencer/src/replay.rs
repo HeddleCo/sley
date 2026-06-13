@@ -285,9 +285,7 @@ pub fn parse_todo(text: &str) -> std::result::Result<Vec<ParsedTodoLine>, TodoPa
             errors.push(format!("invalid line {}: {}", idx + 1, line));
             continue;
         }
-        let end = rest
-            .find([' ', '\t'])
-            .unwrap_or(rest.len());
+        let end = rest.find([' ', '\t']).unwrap_or(rest.len());
         let (object_name, tail) = rest.split_at(end);
         let tail = tail.trim_start_matches([' ', '\t']);
         items.push(ParsedTodoLine {
@@ -523,8 +521,7 @@ mod tests {
             },
         ];
         save_todo(git_dir, &items).expect("test operation should succeed");
-        let text =
-            fs::read_to_string(todo_path(git_dir)).expect("test operation should succeed");
+        let text = fs::read_to_string(todo_path(git_dir)).expect("test operation should succeed");
         assert_eq!(text, "pick 21b83cd base\npick 963b36c picked\n");
         let parsed = parse_todo(&text).expect("test operation should succeed");
         assert_eq!(parsed.len(), 2);
@@ -568,8 +565,7 @@ mod tests {
             ..ReplayOpts::default()
         };
         save_opts(git_dir, &opts).expect("test operation should succeed");
-        let text =
-            fs::read_to_string(opts_path(git_dir)).expect("test operation should succeed");
+        let text = fs::read_to_string(opts_path(git_dir)).expect("test operation should succeed");
         assert_eq!(
             text,
             "[options]\n\tedit = true\n\tsignoff = true\n\tmainline = 4\n\tstrategy = recursive\n\tstrategy-option = patience\n\tstrategy-option = ours\n"
@@ -596,18 +592,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("test operation should succeed");
         let git_dir = dir.path();
         create_seq_dir(git_dir).expect("test operation should succeed");
-        fs::write(git_dir.join("CHERRY_PICK_HEAD"), "x\n")
-            .expect("test operation should succeed");
+        fs::write(git_dir.join("CHERRY_PICK_HEAD"), "x\n").expect("test operation should succeed");
         fs::write(todo_path(git_dir), "pick 1234567 one\npick 89abcde two\n")
             .expect("test operation should succeed");
         post_commit_cleanup(git_dir);
         assert!(!git_dir.join("CHERRY_PICK_HEAD").exists());
         assert!(seq_dir(git_dir).is_dir(), "two items left: state stays");
 
-        fs::write(git_dir.join("CHERRY_PICK_HEAD"), "x\n")
-            .expect("test operation should succeed");
-        fs::write(todo_path(git_dir), "pick 1234567 one\n")
-            .expect("test operation should succeed");
+        fs::write(git_dir.join("CHERRY_PICK_HEAD"), "x\n").expect("test operation should succeed");
+        fs::write(todo_path(git_dir), "pick 1234567 one\n").expect("test operation should succeed");
         post_commit_cleanup(git_dir);
         assert!(!seq_dir(git_dir).is_dir(), "single item: state removed");
     }

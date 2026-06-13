@@ -164,8 +164,7 @@ pub type TodoParseMessages = Vec<String>;
 /// space/tab/EOL; returns the remainder.
 fn strip_todo_command(bol: &str, command: TodoCommand) -> Option<&str> {
     let word = command.as_str();
-    let separator_ok =
-        |rest: &str| rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r']);
+    let separator_ok = |rest: &str| rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r']);
     if let Some(rest) = bol.strip_prefix(word)
         && separator_ok(rest)
     {
@@ -274,10 +273,7 @@ fn parse_todo_line(
     }
 
     if padding == 0 {
-        messages.push(format!(
-            "error: missing arguments for {}",
-            command.as_str()
-        ));
+        messages.push(format!("error: missing arguments for {}", command.as_str()));
         return Err(());
     }
 
@@ -383,8 +379,7 @@ fn push_merge_commit_messages(command: TodoCommand, messages: &mut TodoParseMess
             push_todo_error_disable_hint(messages);
         }
         TodoCommand::Fixup | TodoCommand::Squash => {
-            messages
-                .push("error: cannot squash merge commit into another commit".to_string());
+            messages.push("error: cannot squash merge commit into another commit".to_string());
         }
         _ => {}
     }
@@ -696,8 +691,12 @@ mod tests {
 
     #[test]
     fn fixup_flags_parse() {
-        let (items, messages) =
-            parse_todo_buffer("pick 21b83cd # a\nfixup -C 21b83cd # b\nfixup -c 21b83cd # c\n", false, '#', &mut resolver);
+        let (items, messages) = parse_todo_buffer(
+            "pick 21b83cd # a\nfixup -C 21b83cd # b\nfixup -c 21b83cd # c\n",
+            false,
+            '#',
+            &mut resolver,
+        );
         assert!(messages.is_empty());
         assert_eq!(items[1].flags, FLAG_REPLACE_FIXUP_MSG);
         assert_eq!(items[2].flags, FLAG_EDIT_FIXUP_MSG);

@@ -39,7 +39,14 @@ struct Event {
     begin: usize,
     end: usize,
     /// For `Section` events: whether this header names the target section.
+    /// For `Entry` events: whether the entry is inside such a section, so an
+    /// absent key can be inserted there.
     is_keys_section: bool,
+    /// For `Entry` events: whether the entry's section/subsection prefix is an
+    /// exact key match. Deprecated dotted headers are section-compatible
+    /// case-insensitively, but their parsed subsection is lower-cased for full
+    /// key matching.
+    is_key_match_section: bool,
     /// For `Entry` events: the parsed key (lower-cased) and decoded value.
     key: Option<String>,
     value: Option<String>,
@@ -69,7 +76,6 @@ pub struct RawConfigEditor {
     /// newly-synthesised line (git's `write_pair` preserves the caller's case,
     /// e.g. `git config Section.Movie x` writes `Movie`, not `movie`).
     name_as_typed: String,
-    subsection_case_sensitive: bool,
 }
 
 impl RawConfigEditor {
@@ -78,12 +84,7 @@ impl RawConfigEditor {
     /// case-insensitive; quoted subsections are case-sensitive. The `section`
     /// and `name` are written verbatim (preserving the caller's case) when a new
     /// header/line must be synthesised.
-    pub fn new(
-        contents: Vec<u8>,
-        section: &str,
-        subsection: Option<&str>,
-        name: &str,
-    ) -> Self {
+    pub fn new(contents: Vec<u8>, section: &str, subsection: Option<&str>, name: &str) -> Self {
         let mut editor = Self {
             contents,
             events: Vec::new(),
@@ -91,7 +92,6 @@ impl RawConfigEditor {
             subsection: subsection.map(str::to_string),
             name: name.to_ascii_lowercase(),
             name_as_typed: name.to_string(),
-            subsection_case_sensitive: subsection.is_some(),
         };
         editor.parse_events();
         editor
@@ -107,6 +107,7 @@ impl RawConfigEditor {
         // Whether the most recent section header names the target section, so
         // entries know whether they belong to it.
         let mut cur_is_keys_section = false;
+        let mut cur_is_key_match_section = false;
 
         // Skip a UTF-8 BOM exactly as git does.
         if bytes.starts_with(b"\xEF\xBB\xBF") {
@@ -141,6 +142,7 @@ impl RawConfigEditor {
                     begin,
                     end: i,
                     is_keys_section: false,
+                    is_key_match_section: false,
                     key: None,
                     value: None,
                 });
@@ -148,17 +150,23 @@ impl RawConfigEditor {
             }
             if c == b'[' {
                 let begin = i;
-                let (section, sub, next) = parse_section_header(&bytes, i);
+                let (section, sub, subsection_case_sensitive, next) =
+                    parse_section_header(&bytes, i);
                 i = next;
-                let is_keys = section
+                let is_keys = section.as_ref().is_some_and(|s| {
+                    self.section_matches(s, sub.as_deref(), subsection_case_sensitive)
+                });
+                let is_key_match = section
                     .as_ref()
-                    .is_some_and(|s| self.section_matches(s, sub.as_deref()));
+                    .is_some_and(|s| self.section_exact_matches(s, sub.as_deref()));
                 cur_is_keys_section = is_keys;
+                cur_is_key_match_section = is_key_match;
                 self.events.push(Event {
                     ty: EventType::Section,
                     begin,
                     end: i,
                     is_keys_section: is_keys,
+                    is_key_match_section: is_key_match,
                     key: None,
                     value: None,
                 });
@@ -173,6 +181,7 @@ impl RawConfigEditor {
                     begin,
                     end: i,
                     is_keys_section: cur_is_keys_section,
+                    is_key_match_section: cur_is_key_match_section,
                     key,
                     value,
                 });
@@ -206,24 +215,41 @@ impl RawConfigEditor {
             begin,
             end,
             is_keys_section: false,
+            is_key_match_section: false,
             key: None,
             value: None,
         });
     }
 
-    fn section_matches(&self, section: &str, subsection: Option<&str>) -> bool {
+    fn section_matches(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        subsection_case_sensitive: bool,
+    ) -> bool {
         if !section.eq_ignore_ascii_case(&self.section) {
             return false;
         }
         match (self.subsection.as_deref(), subsection) {
             (None, None) => true,
             (Some(a), Some(b)) => {
-                if self.subsection_case_sensitive {
+                if subsection_case_sensitive {
                     a == b
                 } else {
                     a.eq_ignore_ascii_case(b)
                 }
             }
+            _ => false,
+        }
+    }
+
+    fn section_exact_matches(&self, section: &str, subsection: Option<&str>) -> bool {
+        if !section.eq_ignore_ascii_case(&self.section) {
+            return false;
+        }
+        match (self.subsection.as_deref(), subsection) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
             _ => false,
         }
     }
@@ -316,16 +342,12 @@ impl RawConfigEditor {
         RawEditOutcome::Changed
     }
 
-    fn entry_matches(
-        &self,
-        ev: &Event,
-        value_matches: Option<ValueMatcher>,
-    ) -> bool {
+    fn entry_matches(&self, ev: &Event, value_matches: Option<ValueMatcher>) -> bool {
         // git's `matches()` compares the FULL key (`section.subsection.name`), so
         // an entry only matches when it is BOTH in the target section and has the
         // target variable name. (Without the section guard a same-named variable
         // in a different section would be wrongly collected — t1300 #235.)
-        if !ev.is_keys_section || ev.key.as_deref() != Some(self.name.as_str()) {
+        if !ev.is_key_match_section || ev.key.as_deref() != Some(self.name.as_str()) {
             return false;
         }
         match value_matches {
@@ -363,7 +385,8 @@ impl RawConfigEditor {
                 // or last entry of the section). Copy up to its end; include the
                 // trailing '\n' when present.
                 let mut ce = self.events[j].end;
-                if ce > 0 && ce < contents_sz && contents[ce - 1] != b'\n' && contents[ce] == b'\n' {
+                if ce > 0 && ce < contents_sz && contents[ce - 1] != b'\n' && contents[ce] == b'\n'
+                {
                     ce += 1;
                 }
                 copy_end = ce;
@@ -733,12 +756,13 @@ fn write_section(out: &mut Vec<u8>, section: &str, subsection: Option<&str>) {
 }
 
 /// Parse a section header starting at `bytes[start] == b'['`, returning the
-/// (section, subsection, next_index). On a malformed header the whole rest of
-/// the line is consumed and `None` is returned for the name.
+/// (section, subsection, subsection_case_sensitive, next_index). On a malformed
+/// header the whole rest of the line is consumed and `None` is returned for the
+/// name.
 fn parse_section_header(
     bytes: &[u8],
     start: usize,
-) -> (Option<String>, Option<String>, usize) {
+) -> (Option<String>, Option<String>, bool, usize) {
     let len = bytes.len();
     let mut i = start + 1; // past '['
     let name_start = i;
@@ -764,6 +788,7 @@ fn parse_section_header(
         return (
             Some(head.to_ascii_lowercase()),
             Some(rest.to_ascii_lowercase()),
+            false,
             i,
         );
     }
@@ -806,9 +831,9 @@ fn parse_section_header(
         while i < len && bytes[i] != b'\n' {
             i += 1;
         }
-        return (None, None, i);
+        return (None, None, true, i);
     }
-    (Some(raw_name), subsection, i)
+    (Some(raw_name), subsection, true, i)
 }
 
 /// Parse an entry starting at `bytes[start]` (an alpha key char). Returns
@@ -826,8 +851,7 @@ fn parse_entry(bytes: &[u8], start: usize) -> (Option<String>, Option<String>, u
             break;
         }
     }
-    let key = String::from_utf8_lossy(&bytes[key_start..i])
-        .to_ascii_lowercase();
+    let key = String::from_utf8_lossy(&bytes[key_start..i]).to_ascii_lowercase();
     // Skip blanks.
     while i < len && matches!(bytes[i], b' ' | b'\t' | b'\r') {
         i += 1;
@@ -1013,8 +1037,35 @@ mod tests {
         let expect = "[abc]\n\tkeepSection\n[xyz]\n\tkey = 1\n[abc]\n\tkey = b\n";
         assert_eq!(out, expect);
     }
-}
 
+    #[test]
+    fn set_uses_case_compatible_dotted_subsection_for_insert() {
+        let src = "[V.A]\n\tx = old\n";
+        let (out, outcome) = edit(src, "V", Some("A"), "r", Some("new"), None, None, false);
+        assert_eq!(outcome, RawEditOutcome::Changed);
+        assert_eq!(out, "[V.A]\n\tx = old\n\tr = new\n");
+    }
+
+    #[test]
+    fn set_keeps_dotted_subsection_exactness_for_replacement() {
+        let src = "[V.A]\n\tr = old\n";
+        let (out, outcome) = edit(src, "v", Some("a"), "r", Some("new"), None, None, false);
+        assert_eq!(outcome, RawEditOutcome::Changed);
+        assert_eq!(out, "[V.A]\n\tr = new\n");
+
+        let (out, outcome) = edit(src, "V", Some("A"), "r", Some("new"), None, None, false);
+        assert_eq!(outcome, RawEditOutcome::Changed);
+        assert_eq!(out, "[V.A]\n\tr = old\n\tr = new\n");
+    }
+
+    #[test]
+    fn quoted_subsection_stays_case_sensitive_for_insert() {
+        let src = "[V \"a\"]\n\tx = old\n";
+        let (out, outcome) = edit(src, "V", Some("A"), "r", Some("new"), None, None, false);
+        assert_eq!(outcome, RawEditOutcome::Changed);
+        assert_eq!(out, "[V \"a\"]\n\tx = old\n[V \"A\"]\n\tr = new\n");
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -1041,7 +1092,10 @@ mod section_tests {
         let SectionEditOutcome::Changed(out) = rr(src, "branch.vier", Some("branch.zwei")) else {
             panic!("expected Changed");
         };
-        assert_eq!(String::from_utf8(out).unwrap(), "[branch \"zwei\"]\n\tz = 1\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "[branch \"zwei\"]\n\tz = 1\n"
+        );
     }
 
     #[test]
@@ -1056,7 +1110,9 @@ mod section_tests {
     #[test]
     fn rename_nonexistent_is_not_found() {
         let src = "[a]\n\tx = 1\n";
-        assert!(matches!(rr(src, "zzz", Some("q.r")), SectionEditOutcome::NotFound));
+        assert!(matches!(
+            rr(src, "zzz", Some("q.r")),
+            SectionEditOutcome::NotFound
+        ));
     }
 }
-

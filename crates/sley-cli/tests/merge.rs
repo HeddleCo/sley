@@ -115,6 +115,29 @@ fn setup_clean(dir: &Path) {
     git_ok(dir, &["commit", "-qm", "mainwork"]);
 }
 
+/// Build a repo whose current branch is explicitly `main` and where `side` is a
+/// fast-forward candidate from that branch.
+fn setup_fast_forward_main(dir: &Path) {
+    git_ok(
+        dir.parent().unwrap_or(dir),
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            dir.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(dir, "base.txt", "base\n");
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-qm", "base"]);
+    git_ok(dir, &["checkout", "-q", "-b", "side"]);
+    write_file(dir, "side.txt", "side\n");
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-qm", "side"]);
+    git_ok(dir, &["checkout", "-q", "main"]);
+}
+
 fn default_branch(dir: &Path) -> String {
     // Whichever of main/master currently has commits.
     for name in ["main", "master"] {
@@ -123,6 +146,76 @@ fn default_branch(dir: &Path) -> String {
         }
     }
     "main".to_string()
+}
+
+#[test]
+fn merge_branch_mergeoptions_malformed_on_main_fails_like_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-mergeoptions-bad-main");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    setup_fast_forward_main(&reference);
+    git_ok(&reference, &["config", "branch.main.mergeoptions", "'"]);
+    copy_dir_all(&reference, &candidate);
+
+    let ref_out = git(&reference, &["merge", "main"]);
+    let rs_out = git_rs(&candidate, &["merge", "main"]);
+
+    assert_eq!(ref_out.status.code(), Some(128));
+    assert_eq!(rs_out.status.code(), Some(128));
+    assert_eq!(
+        String::from_utf8_lossy(&rs_out.stderr),
+        String::from_utf8_lossy(&ref_out.stderr),
+        "malformed mergeoptions stderr differed"
+    );
+    assert_eq!(head(&candidate), head(&reference), "HEAD moved on failure");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn merge_branch_mergeoptions_are_prepended_before_cli_args() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-mergeoptions-precedence");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    setup_fast_forward_main(&reference);
+    git_ok(
+        &reference,
+        &["config", "branch.main.mergeoptions", "--ff-only"],
+    );
+    copy_dir_all(&reference, &candidate);
+
+    let args = ["merge", "side", "--no-ff", "-m", "manual merge"];
+    let ref_out = git(&reference, &args);
+    let rs_out = git_rs(&candidate, &args);
+
+    assert!(
+        ref_out.status.success(),
+        "git merge failed: {}",
+        String::from_utf8_lossy(&ref_out.stderr)
+    );
+    assert!(
+        rs_out.status.success(),
+        "sley merge failed: {}",
+        String::from_utf8_lossy(&rs_out.stderr)
+    );
+    assert_eq!(
+        git(&candidate, &["rev-list", "--parents", "-1", "HEAD"]).stdout,
+        git(&reference, &["rev-list", "--parents", "-1", "HEAD"]).stdout,
+        "merge parent list differed from git"
+    );
+    assert_eq!(
+        head(&candidate),
+        head(&reference),
+        "merge commit oid differed from git"
+    );
+
+    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -430,8 +523,14 @@ fn merge_rename_clean_matches_git() {
     setup_rename_merge(&reference, "1\n2\n3\n4\nFIVE\n", "ONE\n2\n3\n4\n5\n");
     copy_dir_all(&reference, &candidate);
 
-    let ref_out = git(&reference, &["merge", "-m", "Merge branch 'feature'", "feature"]);
-    let rs_out = git_rs(&candidate, &["merge", "-m", "Merge branch 'feature'", "feature"]);
+    let ref_out = git(
+        &reference,
+        &["merge", "-m", "Merge branch 'feature'", "feature"],
+    );
+    let rs_out = git_rs(
+        &candidate,
+        &["merge", "-m", "Merge branch 'feature'", "feature"],
+    );
 
     assert!(ref_out.status.success(), "git rename merge failed");
     assert!(
@@ -470,8 +569,14 @@ fn merge_rename_conflict_matches_git() {
     setup_rename_merge(&reference, "1\n2\nTHEIRS\n4\n5\n", "1\n2\nOURS\n4\n5\n");
     copy_dir_all(&reference, &candidate);
 
-    let ref_out = git(&reference, &["merge", "-m", "Merge branch 'feature'", "feature"]);
-    let rs_out = git_rs(&candidate, &["merge", "-m", "Merge branch 'feature'", "feature"]);
+    let ref_out = git(
+        &reference,
+        &["merge", "-m", "Merge branch 'feature'", "feature"],
+    );
+    let rs_out = git_rs(
+        &candidate,
+        &["merge", "-m", "Merge branch 'feature'", "feature"],
+    );
 
     assert_eq!(ref_out.status.code(), Some(1), "git should conflict");
     assert_eq!(

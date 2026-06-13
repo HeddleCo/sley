@@ -158,21 +158,57 @@ impl<'a> WordDiffConfig<'a> {
         let colors = self.colors;
         match self.mode {
             WordDiffMode::Porcelain => WordStyle {
-                new_word: StyleElem { prefix: "+", suffix: "\n", color: &colors.new },
-                old_word: StyleElem { prefix: "-", suffix: "\n", color: &colors.old },
-                ctx: StyleElem { prefix: " ", suffix: "\n", color: &colors.context },
+                new_word: StyleElem {
+                    prefix: "+",
+                    suffix: "\n",
+                    color: &colors.new,
+                },
+                old_word: StyleElem {
+                    prefix: "-",
+                    suffix: "\n",
+                    color: &colors.old,
+                },
+                ctx: StyleElem {
+                    prefix: " ",
+                    suffix: "\n",
+                    color: &colors.context,
+                },
                 newline: "~\n",
             },
             WordDiffMode::Plain => WordStyle {
-                new_word: StyleElem { prefix: "{+", suffix: "+}", color: &colors.new },
-                old_word: StyleElem { prefix: "[-", suffix: "-]", color: &colors.old },
-                ctx: StyleElem { prefix: "", suffix: "", color: &colors.context },
+                new_word: StyleElem {
+                    prefix: "{+",
+                    suffix: "+}",
+                    color: &colors.new,
+                },
+                old_word: StyleElem {
+                    prefix: "[-",
+                    suffix: "-]",
+                    color: &colors.old,
+                },
+                ctx: StyleElem {
+                    prefix: "",
+                    suffix: "",
+                    color: &colors.context,
+                },
                 newline: "\n",
             },
             WordDiffMode::Color => WordStyle {
-                new_word: StyleElem { prefix: "", suffix: "", color: &colors.new },
-                old_word: StyleElem { prefix: "", suffix: "", color: &colors.old },
-                ctx: StyleElem { prefix: "", suffix: "", color: &colors.context },
+                new_word: StyleElem {
+                    prefix: "",
+                    suffix: "",
+                    color: &colors.new,
+                },
+                old_word: StyleElem {
+                    prefix: "",
+                    suffix: "",
+                    color: &colors.old,
+                },
+                ctx: StyleElem {
+                    prefix: "",
+                    suffix: "",
+                    color: &colors.context,
+                },
                 newline: "\n",
             },
         }
@@ -423,12 +459,7 @@ impl WordDiffBuffers {
             );
         }
         if current_plus != self.plus.len() {
-            write_word_helper(
-                out,
-                &style.ctx,
-                style.newline,
-                &self.plus[current_plus..],
-            );
+            write_word_helper(out, &style.ctx, style.newline, &self.plus[current_plus..]);
         }
         self.minus.clear();
         self.plus.clear();

@@ -114,7 +114,11 @@ fn assert_same_output(actual: &Output, expected: &Output, args: &[&str]) {
 /// Initialize a repo with `count` commits ("c1", "c2", ...) and a worktree
 /// file per commit, using deterministic identity/date.
 fn init_repo_with_commits(root: &Path, count: usize) {
-    run_ok(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_ok(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     for i in 1..=count {
         let name = format!("f{i}.txt");
         std::fs::write(root.join(&name), format!("content {i}\n")).expect("write worktree file");
@@ -149,7 +153,11 @@ fn assert_notes_match(expected_root: &Path, actual_root: &Path, args: &[&str]) {
 /// Assert that a notes ref resolves to byte-identical commit/tree content in
 /// both repos (so the on-disk object graph sley produced matches git's).
 fn assert_notes_object_match(expected_root: &Path, actual_root: &Path, notes_ref: &str) {
-    let expected = run_output(sley_testkit::oracle_git(), expected_root, &["rev-parse", notes_ref]);
+    let expected = run_output(
+        sley_testkit::oracle_git(),
+        expected_root,
+        &["rev-parse", notes_ref],
+    );
     let actual = run_output(git_rs_bin(), actual_root, &["rev-parse", notes_ref]);
     assert_same_output(&actual, &expected, &["rev-parse", notes_ref]);
     if !expected.status.success() {
@@ -269,8 +277,16 @@ fn notes_non_ref_write_target_refused_like_git() {
         // The two cases from t3301's cell: a tree-ish peel (resolves but is not a
         // ref → "Cannot use notes ref ...") and an out-of-range reflog selector
         // (resolution itself fails → "log for ... only has 1 entries").
-        assert_notes_match(&expected, &actual, &["notes", "--ref", "commits^{tree}", "edit"]);
-        assert_notes_match(&expected, &actual, &["notes", "--ref", "commits@{1}", "edit"]);
+        assert_notes_match(
+            &expected,
+            &actual,
+            &["notes", "--ref", "commits^{tree}", "edit"],
+        );
+        assert_notes_match(
+            &expected,
+            &actual,
+            &["notes", "--ref", "commits@{1}", "edit"],
+        );
 
         // The refusal is shared by the other no-positional writable subcommands.
         for verb in ["add", "append", "remove"] {
@@ -279,11 +295,7 @@ fn notes_non_ref_write_target_refused_like_git() {
                 &actual,
                 &["notes", "--ref", "commits^{tree}", verb],
             );
-            assert_notes_match(
-                &expected,
-                &actual,
-                &["notes", "--ref", "commits@{1}", verb],
-            );
+            assert_notes_match(&expected, &actual, &["notes", "--ref", "commits@{1}", verb]);
         }
 
         // `copy` parses its <from>/<to> positionals before initialising notes,
@@ -464,7 +476,12 @@ fn notes_custom_ref_matches_git() {
 
         // GIT_NOTES_REF selects the ref when no --ref is given.
         let env = [("GIT_NOTES_REF", "refs/notes/review")];
-        let expected_out = run_output_env(sley_testkit::oracle_git(), &expected, &["notes", "get-ref"], &env);
+        let expected_out = run_output_env(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["notes", "get-ref"],
+            &env,
+        );
         let actual_out = run_output_env(git_rs_bin(), &actual, &["notes", "get-ref"], &env);
         assert_same_output(&actual_out, &expected_out, &["notes", "get-ref"]);
     });

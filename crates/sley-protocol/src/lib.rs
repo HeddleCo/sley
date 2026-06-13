@@ -623,7 +623,9 @@ fn fetch_refname_match_score(abbrev: &str, full: &str) -> usize {
 fn fetch_local_ref_name(name: &str) -> String {
     if name.starts_with("refs/") {
         name.to_string()
-    } else if name.starts_with("heads/") || name.starts_with("tags/") || name.starts_with("remotes/")
+    } else if name.starts_with("heads/")
+        || name.starts_with("tags/")
+        || name.starts_with("remotes/")
     {
         format!("refs/{name}")
     } else {

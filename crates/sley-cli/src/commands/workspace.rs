@@ -101,13 +101,13 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             format,
             Some(&target_commit),
         )
-            .map_err(|err| match err {
-                GitError::Command(message) => {
-                    eprintln!("fatal: {message}");
-                    GitError::Exit(128)
-                }
-                other => other,
-            });
+        .map_err(|err| match err {
+            GitError::Command(message) => {
+                eprintln!("fatal: {message}");
+                GitError::Exit(128)
+            }
+            other => other,
+        });
     }
     if matches!(mode, ResetMode::Soft | ResetMode::Hard) {
         if pathspec_from_file_provided {
@@ -503,7 +503,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 .iter()
                 .map(|path| {
                     let path = PathBuf::from(path);
-                    if path.is_absolute() { path } else { cwd.join(path) }
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.join(path)
+                    }
                 })
                 .collect();
             match source {
@@ -539,10 +543,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     // of upstream's test_commit_bulk): force-restore the index and working tree
     // to that commit without changing which branch HEAD is on, and stay silent on
     // success — exactly git's behavior when no branch switch happens.
-    if force
-        && matches!(branch_mode, CheckoutBranchMode::Existing)
-        && positional.len() == 1
-    {
+    if force && matches!(branch_mode, CheckoutBranchMode::Existing) && positional.len() == 1 {
         let target = &positional[0];
         let store = FileRefStore::new(&git_dir, format);
         let head_commit = resolve_ref_peeled(&store, "HEAD")?;
@@ -665,8 +666,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 let config = read_repo_config(&git_dir)?;
                 let subject = detached_checkout_subject(&git_dir, format, &target_oid);
                 let from = checkout_reflog_from_name(&store);
-                let message =
-                    format!("checkout: moving from {from} to {branch}").into_bytes();
+                let message = format!("checkout: moving from {from} to {branch}").into_bytes();
                 match sley_worktree::checkout_detached_filtered(
                     &worktree_root,
                     &git_dir,
@@ -776,10 +776,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or(checkout_old_head);
     run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
-    commands::hooks::run_hook(
-        "reference-transaction",
-        commands::hooks::HookRun::default(),
-    )?;
+    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     if !quiet {
         checkout_message.print();
     }
@@ -795,7 +792,11 @@ fn run_post_checkout_hook(
     let new = new_head.to_hex();
     commands::hooks::run_hook_l(
         "post-checkout",
-        &[old.as_str(), new.as_str(), if branch_checkout { "1" } else { "0" }],
+        &[
+            old.as_str(),
+            new.as_str(),
+            if branch_checkout { "1" } else { "0" },
+        ],
     )?;
     Ok(())
 }
@@ -828,7 +829,9 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
     // `checkout --orphan` which keeps them staged.
     if let Some(pos) = args.iter().position(|arg| arg == "--orphan") {
         let Some(branch) = args.get(pos + 1) else {
-            return Err(GitError::Command("switch --orphan requires a branch".into()));
+            return Err(GitError::Command(
+                "switch --orphan requires a branch".into(),
+            ));
         };
         let cwd = env::current_dir()?;
         let git_dir = discover_git_dir(&cwd)?;
@@ -1236,9 +1239,7 @@ fn checkout_twoway_dirty(
     }
     // Staged adds whose path is in neither tree are carried too.
     for (path, entry) in &stage0 {
-        if !target_map.contains_key(path)
-            && !head_map.contains_key(path)
-            && !carried.contains(path)
+        if !target_map.contains_key(path) && !head_map.contains_key(path) && !carried.contains(path)
         {
             entries.push(entry.clone());
         }
@@ -1395,9 +1396,7 @@ enum CommitShortFlag {
 fn commit_short_flag_kind(ch: char) -> Option<CommitShortFlag> {
     match ch {
         // OPT__QUIET / OPT__VERBOSE and the plain OPT_BOOL entries.
-        'q' | 'v' | 's' | 'e' | 'a' | 'i' | 'p' | 'o' | 'n' | 'z' => {
-            Some(CommitShortFlag::Boolean)
-        }
+        'q' | 'v' | 's' | 'e' | 'a' | 'i' | 'p' | 'o' | 'n' | 'z' => Some(CommitShortFlag::Boolean),
         // OPT_CALLBACK('m'), OPT_FILENAME('F'/'t'), OPT_STRING('c'/'C'),
         // OPT_DIFF_UNIFIED ('U').
         'm' | 'F' | 'c' | 'C' | 't' | 'U' => Some(CommitShortFlag::RequiresValue),
@@ -1435,7 +1434,10 @@ fn expand_commit_short_clusters(args: &[String]) -> Result<Vec<String>> {
         // Only expand clusters that *start* with a boolean flag. If the first
         // flag is unknown or already takes a value, defer entirely to the main
         // parser (its glued-value / error arms own that input).
-        if !matches!(commit_short_flag_kind(first), Some(CommitShortFlag::Boolean)) {
+        if !matches!(
+            commit_short_flag_kind(first),
+            Some(CommitShortFlag::Boolean)
+        ) {
             expanded.push(arg.clone());
             continue;
         }
@@ -1446,8 +1448,7 @@ fn expand_commit_short_clusters(args: &[String]) -> Result<Vec<String>> {
         for (idx, ch) in chars {
             match commit_short_flag_kind(ch) {
                 Some(CommitShortFlag::Boolean) => expanded.push(format!("-{ch}")),
-                Some(CommitShortFlag::RequiresValue)
-                | Some(CommitShortFlag::OptionalValue) => {
+                Some(CommitShortFlag::RequiresValue) | Some(CommitShortFlag::OptionalValue) => {
                     // `-q` `m` `rest` -> `-mrest`; when `rest` is empty we emit
                     // just `-m`, and the main parser consumes the next argument
                     // (required) or treats the value as absent (optional).
@@ -2274,9 +2275,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     // Emptiness is judged before the signoff trailer is added (git aborts
     // `commit -m "" -s`).
-    let empty_before_signoff = commit_message_is_empty(
-        &commands::tag::tag_message_with_trailers(message.clone(), &trailers),
-    );
+    let empty_before_signoff = commit_message_is_empty(&commands::tag::tag_message_with_trailers(
+        message.clone(),
+        &trailers,
+    ));
     let mut message = if signoff {
         commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
     } else {
@@ -2316,9 +2318,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         prepare_args.push("template");
     }
     commands::hooks::run_hook_l("prepare-commit-msg", &prepare_args)?;
-    if use_editor
-        && let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg)
-    {
+    if use_editor && let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg) {
         eprintln!("error: {err}");
         eprintln!("Please supply the message using either -m or -F option.");
         return Err(GitError::Exit(1));
@@ -2336,10 +2336,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if let Some(cleanup_mode) = cleanup_mode {
         message = commit_cleanup_message(message, cleanup_mode);
     }
-    if (in_cherry_pick || in_revert)
-        && !allow_empty_message
-        && commit_message_is_empty(&message)
-    {
+    if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
@@ -2413,12 +2410,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if !quiet {
         println!("{}", result.oid);
     }
-    commands::hooks::run_hook(
-        "reference-transaction",
-        commands::hooks::HookRun::default(),
-    )?;
+    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
-    if amend && !no_post_rewrite
+    if amend
+        && !no_post_rewrite
         && let Some(old_oid) = amended_old_oid
     {
         commands::hooks::run_hook(
@@ -2483,9 +2478,7 @@ fn conclude_replay_via_commit(
         } else {
             "revert"
         };
-        eprintln!(
-            "The previous cherry-pick is now empty, possibly due to conflict resolution."
-        );
+        eprintln!("The previous cherry-pick is now empty, possibly due to conflict resolution.");
         eprintln!("If you wish to commit it anyway, use:");
         eprintln!();
         eprintln!("    git commit --allow-empty");
@@ -2740,7 +2733,11 @@ fn write_entry_map_level(
 ) -> Result<ObjectId> {
     let mut tree_entries: Vec<sley_object::TreeEntry> = Vec::new();
     let mut subdirs: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let prefix_len = if prefix.is_empty() { 0 } else { prefix.len() + 1 };
+    let prefix_len = if prefix.is_empty() {
+        0
+    } else {
+        prefix.len() + 1
+    };
     for (path, (mode, oid)) in entries {
         if !prefix.is_empty()
             && (!path.starts_with(prefix) || path.get(prefix.len()) != Some(&b'/'))
@@ -3429,6 +3426,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let _config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     // status needs a work tree; emit git's diagnostic (bare / no-worktree, or
     // the core.bare+core.worktree conflict) when one isn't available.
     let worktree_root = require_work_tree(&git_dir)?;
@@ -3601,7 +3599,9 @@ impl StatusPathspec {
 
     fn matches(&self, path: &[u8]) -> bool {
         let magic = effective_pathspec_flags();
-        self.filters.iter().any(|filter| filter.matches(path, magic))
+        self.filters
+            .iter()
+            .any(|filter| filter.matches(path, magic))
     }
 }
 
@@ -3653,7 +3653,11 @@ fn print_status_porcelain_v2(
                 "S{}{}{}",
                 if submodule.new_commits { 'C' } else { '.' },
                 if submodule.modified_content { 'M' } else { '.' },
-                if submodule.untracked_content { 'U' } else { '.' },
+                if submodule.untracked_content {
+                    'U'
+                } else {
+                    '.'
+                },
             ),
             None if entry.index_mode == Some(0o160000) || entry.worktree_mode == Some(0o160000) => {
                 "S...".to_string()

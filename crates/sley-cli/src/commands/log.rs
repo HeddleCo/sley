@@ -877,34 +877,34 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("output-indicator-new"))?;
-                log_validate_output_indicator("output-indicator-new", value)?;
+                log_validate_output_indicator_for_log("output-indicator-new", value)?;
             }
             "--output-indicator-old" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("output-indicator-old"))?;
-                log_validate_output_indicator("output-indicator-old", value)?;
+                log_validate_output_indicator_for_log("output-indicator-old", value)?;
             }
             "--output-indicator-context" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("output-indicator-context"))?;
-                log_validate_output_indicator("output-indicator-context", value)?;
+                log_validate_output_indicator_for_log("output-indicator-context", value)?;
             }
             value if value.starts_with("--output-indicator-new=") => {
-                log_validate_output_indicator(
+                log_validate_output_indicator_for_log(
                     "output-indicator-new",
                     &value["--output-indicator-new=".len()..],
                 )?;
             }
             value if value.starts_with("--output-indicator-old=") => {
-                log_validate_output_indicator(
+                log_validate_output_indicator_for_log(
                     "output-indicator-old",
                     &value["--output-indicator-old=".len()..],
                 )?;
             }
             value if value.starts_with("--output-indicator-context=") => {
-                log_validate_output_indicator(
+                log_validate_output_indicator_for_log(
                     "output-indicator-context",
                     &value["--output-indicator-context=".len()..],
                 )?;
@@ -1211,11 +1211,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
     let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
-        let show_root = show_root_flag.unwrap_or_else(|| {
-            config
-                .get_bool("log", None, "showroot")
-                .unwrap_or(true)
-        });
+        let show_root = show_root_flag
+            .unwrap_or_else(|| config.get_bool("log", None, "showroot").unwrap_or(true));
         // diff.renames: false disables detection, "copies"/"copy" adds copy
         // detection, anything else (or unset) means rename detection.
         let (detect_renames, detect_copies) = match config
@@ -1673,20 +1670,20 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // `%S` source labels: each commit is tagged with the start ref from which it
     // is reachable; when several starts reach it, the last one (command-line
     // order) wins — matching git's `revision.c` source naming.
-    let format_uses_source = matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.uses_source());
-    let source_labels: Option<HashMap<ObjectId, String>> = if format_uses_source
-        && !source_starts.is_empty()
-    {
-        let mut map = HashMap::new();
-        for (start_oid, label) in &source_starts {
-            for record in rev_list_walk_commits(&db, format, [*start_oid], first_parent)? {
-                map.insert(record.oid, label.clone());
+    let format_uses_source =
+        matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.uses_source());
+    let source_labels: Option<HashMap<ObjectId, String>> =
+        if format_uses_source && !source_starts.is_empty() {
+            let mut map = HashMap::new();
+            for (start_oid, label) in &source_starts {
+                for record in rev_list_walk_commits(&db, format, [*start_oid], first_parent)? {
+                    map.insert(record.oid, label.clone());
+                }
             }
-        }
-        Some(map)
-    } else {
-        None
-    };
+            Some(map)
+        } else {
+            None
+        };
     // Resolve the notes-display refs once. Notes show by default only for the
     // medium (no-`--pretty`) format; an explicit `--notes`/`--no-notes` flag
     // overrides. The empty list short-circuits all per-commit note lookups.
@@ -1754,8 +1751,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     if let Some(log_diff) = &log_diff {
                         let mut padding = String::new();
                         graph_state.padding_line(&mut padding);
-                        let prefix_width = log_prefix_display_width(&padding)
-                            + log_prefix_display_width(prefix);
+                        let prefix_width =
+                            log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
                         let block = log_diff.render(record, prefix_width)?;
                         if !block.is_empty() {
                             if msg.last() != Some(&b'\n') {
@@ -1799,8 +1796,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             record.parents.iter().map(format_log_abbrev_oid).collect();
                         writeln!(msg, "Merge: {}", merged.join(" ")).map_err(io::Error::from)?;
                     }
-                    writeln!(msg, "Author: {}", commit_author_identity(&record.commit.author))
-                        .map_err(io::Error::from)?;
+                    writeln!(
+                        msg,
+                        "Author: {}",
+                        commit_author_identity(&record.commit.author)
+                    )
+                    .map_err(io::Error::from)?;
                     if *kind == LogDefaultKind::Medium {
                         writeln!(
                             msg,
@@ -1823,8 +1824,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         // git's line-prefix callback gives it.
                         let mut padding = String::new();
                         graph_state.padding_line(&mut padding);
-                        let prefix_width = log_prefix_display_width(&padding)
-                            + log_prefix_display_width(prefix);
+                        let prefix_width =
+                            log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
                         let block = log_diff.render(record, prefix_width)?;
                         if !block.is_empty() {
                             msg.extend_from_slice(diff_opts.block_separator());
@@ -2290,9 +2291,7 @@ impl LogDiffContext<'_> {
         // An explicit non-off --diff-merges without any diff-output option
         // shows patches for merge commits only.
         let merges_only = !self.opts.any();
-        if merges_only
-            && (record.commit.parents.len() <= 1 || self.merges == LogDiffMerges::Off)
-        {
+        if merges_only && (record.commit.parents.len() <= 1 || self.merges == LogDiffMerges::Off) {
             return Ok(Vec::new());
         }
         let parents = &record.commit.parents;

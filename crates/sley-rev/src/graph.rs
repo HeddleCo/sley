@@ -175,7 +175,9 @@ impl Graph {
     }
 
     fn find_new_column_by_commit(&self, commit: &ObjectId) -> Option<usize> {
-        self.new_columns.iter().position(|col| col.commit == *commit)
+        self.new_columns
+            .iter()
+            .position(|col| col.commit == *commit)
     }
 
     fn insert_into_new_columns(&mut self, commit: ObjectId, idx: Option<usize>) {

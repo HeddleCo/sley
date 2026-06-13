@@ -36,7 +36,11 @@ fn loose_object_path(git_dir: &Path, oid: &str) -> PathBuf {
 }
 
 fn create_single_commit_repo(root: &Path) -> String {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     fs::write(root.join("payload.txt"), b"payload\n").expect("write payload");
     run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
@@ -53,10 +57,14 @@ fn create_single_commit_repo(root: &Path) -> String {
             "-q",
         ],
     );
-    String::from_utf8(run_success(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD^{tree}"]))
-        .expect("tree oid is utf8")
-        .trim()
-        .to_string()
+    String::from_utf8(run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["rev-parse", "HEAD^{tree}"],
+    ))
+    .expect("tree oid is utf8")
+    .trim()
+    .to_string()
 }
 
 #[test]
@@ -105,7 +113,11 @@ fn fsck_dangling_blob_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp repo");
     {
         create_single_commit_repo(&root);
-        run_success(sley_testkit::oracle_git(), &root, &["hash-object", "-w", "--stdin"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["hash-object", "-w", "--stdin"],
+        );
         let args = ["fsck", "--no-progress"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
@@ -129,8 +141,12 @@ fn fsck_unreachable_commit_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp repo");
     {
         create_single_commit_repo(&root);
-        let tree = String::from_utf8(run_success(sley_testkit::oracle_git(), &root, &["rev-parse", "HEAD^{tree}"]))
-            .expect("tree oid is utf8");
+        let tree = String::from_utf8(run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["rev-parse", "HEAD^{tree}"],
+        ))
+        .expect("tree oid is utf8");
         let tree = tree.trim();
         run_success(
             sley_testkit::oracle_git(),

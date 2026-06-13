@@ -244,13 +244,15 @@ fn virtual_ancestor_entry_map(
                 }
                 MergePathResult::Resolved(None) => {}
                 MergePathResult::Conflict {
-                    worktree, ours, theirs, ..
+                    worktree,
+                    ours,
+                    theirs,
+                    ..
                 } => {
                     // Keep the conflicted content in the virtual tree, mirroring
                     // merge-recursive (it writes the marker blob at stage 0).
                     if let Some((mode, bytes)) = worktree {
-                        let oid =
-                            db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
+                        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
                         next.insert(path, (mode, oid));
                     } else if let Some(entry) = ours.or(theirs) {
                         next.insert(path, entry);
@@ -420,10 +422,7 @@ fn merge_commit_and_advance(
         }),
     });
     tx.commit()?;
-    commands::hooks::run_hook(
-        "reference-transaction",
-        commands::hooks::HookRun::default(),
-    )?;
+    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     Ok(oid)
 }
 
@@ -473,14 +472,15 @@ fn merge_octopus(
 
     // git's `reduce_heads`: drop heads already reachable from HEAD or from
     // another head (a duplicate keeps only its first occurrence).
-    let is_ancestor = |db: &FileObjectDatabase, ancestor: &ObjectId, of: &ObjectId| -> Result<bool> {
-        if ancestor == of {
-            return Ok(true);
-        }
-        Ok(merge_bases(git_dir, db, format, ancestor, of)?
-            .iter()
-            .any(|base| base == ancestor))
-    };
+    let is_ancestor =
+        |db: &FileObjectDatabase, ancestor: &ObjectId, of: &ObjectId| -> Result<bool> {
+            if ancestor == of {
+                return Ok(true);
+            }
+            Ok(merge_bases(git_dir, db, format, ancestor, of)?
+                .iter()
+                .any(|base| base == ancestor))
+        };
     let mut reduced: Vec<(String, ObjectId)> = Vec::new();
     'heads: for (index, (name, oid)) in heads.iter().enumerate() {
         if is_ancestor(&db, oid, &head_oid)? {
@@ -522,7 +522,10 @@ fn merge_octopus(
             // Already covered by the merges performed so far.
             continue;
         }
-        if !non_ff && merged_commits.len() == 1 && common.len() == 1 && common[0] == merged_commits[0]
+        if !non_ff
+            && merged_commits.len() == 1
+            && common.len() == 1
+            && common[0] == merged_commits[0]
         {
             // Fast-forward the running state to this head.
             let tree = commit_tree_oid(&db, format, oid)?;
@@ -584,7 +587,12 @@ fn merge_octopus(
             }),
         });
         tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            worktree_root,
+            git_dir,
+            format,
+            &new_oid,
+        )?;
         if !options.quiet {
             let mut stdout = io::stdout();
             writeln!(
@@ -651,10 +659,7 @@ fn merge_octopus(
             parents,
             author,
             committer: committer.clone(),
-            message: commit_cleanup_message(
-                message.into_bytes(),
-                CommitCleanupMode::Whitespace,
-            ),
+            message: commit_cleanup_message(message.into_bytes(), CommitCleanupMode::Whitespace),
             encoding: None,
         },
     )?;
@@ -723,9 +728,18 @@ fn apply_merge_strategy_option(value: &str, options: &mut MergeOptions) -> Resul
     match value {
         "ours" => options.favor = MergeFavor::Ours,
         "theirs" => options.favor = MergeFavor::Theirs,
-        "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol"
-        | "ignore-cr-at-eol" | "renormalize" | "no-renormalize" | "find-renames"
-        | "no-renames" | "diff-algorithm" | "patience" | "histogram" | "subtree" => {}
+        "ignore-space-change"
+        | "ignore-all-space"
+        | "ignore-space-at-eol"
+        | "ignore-cr-at-eol"
+        | "renormalize"
+        | "no-renormalize"
+        | "find-renames"
+        | "no-renames"
+        | "diff-algorithm"
+        | "patience"
+        | "histogram"
+        | "subtree" => {}
         other => {
             if other.starts_with("find-renames=")
                 || other.starts_with("rename-threshold=")
@@ -774,8 +788,11 @@ pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
 /// path is flagged rather than applied silently.
 fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
     use sley_diff_merge::DirectoryRenames;
-    let value = effective_config_with_overrides()
-        .and_then(|config| config.get("merge", None, "directoryRenames").map(str::to_string));
+    let value = effective_config_with_overrides().and_then(|config| {
+        config
+            .get("merge", None, "directoryRenames")
+            .map(str::to_string)
+    });
     match value.as_deref() {
         Some("false") => DirectoryRenames::False,
         Some("true") => DirectoryRenames::True,
@@ -788,25 +805,47 @@ fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
 /// `branch.<branch>.mergeoptions` from the effective config (all layers plus
 /// `-c`/env injection), exactly the value git's `git_merge_config` picks up.
 fn branch_mergeoptions_value(branch: &str) -> Option<String> {
-    identity_effective_config()?
+    effective_config_with_overrides()?
         .get("branch", Some(branch), "mergeoptions")
         .map(str::to_string)
 }
 
 /// git's `parse_branch_merge_options`: split the stored string with
-/// `split_cmdline` (dying on malformed quoting), then apply each token as a
-/// merge option. Unknown options are rejected just like git's `parse_options`.
-fn apply_branch_merge_options(raw: &str, branch: &str, options: &mut MergeOptions) -> Result<()> {
-    let tokens = split_cmdline(raw).map_err(|err| {
-        eprintln!("fatal: Bad branch.{branch}.mergeoptions string: {}", err.message());
+/// `split_cmdline` (dying on malformed quoting). The resulting tokens are
+/// prepended to the command-line argv before normal option parsing, which gives
+/// explicit command-line args their usual later-token precedence.
+fn split_branch_merge_options(raw: &str, branch: &str) -> Result<Vec<String>> {
+    split_cmdline(raw).map_err(|err| {
+        eprintln!(
+            "fatal: Bad branch.{branch}.mergeoptions string: {}",
+            err.message()
+        );
         GitError::Exit(128)
-    })?;
-    let mut iter = tokens.iter();
+    })
+}
+
+#[derive(Default)]
+struct ParsedMergeArgs {
+    abort: bool,
+    continue_merge: bool,
+    positional: Vec<String>,
+}
+
+fn set_merge_fast_forward(options: &mut MergeOptions, no_ff: bool, ff_only: bool) {
+    options.no_ff = no_ff;
+    options.ff_only = ff_only;
+}
+
+fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<ParsedMergeArgs> {
+    let mut parsed = ParsedMergeArgs::default();
+    let mut iter = args.iter();
     while let Some(token) = iter.next() {
         match token.as_str() {
-            "--no-ff" => options.no_ff = true,
-            "--ff" => options.no_ff = false,
-            "--ff-only" => options.ff_only = true,
+            "--abort" => parsed.abort = true,
+            "--continue" => parsed.continue_merge = true,
+            "--no-ff" => set_merge_fast_forward(options, true, false),
+            "--ff" => set_merge_fast_forward(options, false, false),
+            "--ff-only" => set_merge_fast_forward(options, false, true),
             "--no-commit" => options.no_commit = true,
             "--commit" => options.no_commit = false,
             "-q" | "--quiet" => options.quiet = true,
@@ -814,9 +853,7 @@ fn apply_branch_merge_options(raw: &str, branch: &str, options: &mut MergeOption
             "-m" | "--message" => {
                 options.message = Some(
                     iter.next()
-                        .ok_or_else(|| {
-                            GitError::Command("merge -m requires a value".into())
-                        })?
+                        .ok_or_else(|| GitError::Command("merge -m requires a value".into()))?
                         .clone(),
                 );
             }
@@ -825,13 +862,50 @@ fn apply_branch_merge_options(raw: &str, branch: &str, options: &mut MergeOption
                     .strip_prefix("--message=")
                     .map(|value| value.to_string());
             }
+            "-s" | "--strategy" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("merge -s requires a value".into()))?;
+                accept_merge_strategy(value)?;
+            }
+            value if value.starts_with("--strategy=") => {
+                accept_merge_strategy(value.strip_prefix("--strategy=").unwrap_or(""))?;
+            }
+            value if value.starts_with("-s") && value.len() > 2 => {
+                accept_merge_strategy(&value[2..])?;
+            }
+            "-X" | "--strategy-option" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("merge -X requires a value".into()))?;
+                apply_merge_strategy_option(value, options)?;
+            }
+            value if value.starts_with("--strategy-option=") => {
+                apply_merge_strategy_option(
+                    value.strip_prefix("--strategy-option=").unwrap_or(""),
+                    options,
+                )?;
+            }
+            value if value.starts_with("-X") && value.len() > 2 => {
+                apply_merge_strategy_option(&value[2..], options)?;
+            }
+            "--" => {
+                parsed
+                    .positional
+                    .extend(iter.by_ref().map(|value| value.to_string()));
+                break;
+            }
             value => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return Err(GitError::Exit(129));
+                if value.starts_with('-') {
+                    return Err(GitError::Command(format!(
+                        "unsupported merge option {value}"
+                    )));
+                }
+                parsed.positional.push(value.to_string());
             }
         }
     }
-    Ok(())
+    Ok(parsed)
 }
 
 /// The split_cmdline failure modes git distinguishes (`split_cmdline_errors`).
@@ -900,79 +974,30 @@ fn split_cmdline(cmdline: &str) -> std::result::Result<Vec<String>, SplitCmdline
 
 pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut options = MergeOptions::default();
-    let mut abort = false;
-    let mut continue_merge = false;
-    let mut positional = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--abort" => abort = true,
-            "--continue" => continue_merge = true,
-            "--no-ff" => options.no_ff = true,
-            "--ff" => options.no_ff = false,
-            "--ff-only" => options.ff_only = true,
-            "--no-commit" => options.no_commit = true,
-            "--commit" => options.no_commit = false,
-            "-q" | "--quiet" => options.quiet = true,
-            "--no-quiet" => options.quiet = false,
-            "-m" | "--message" => {
-                options.message = Some(
-                    iter.next()
-                        .ok_or_else(|| GitError::Command("merge -m requires a value".into()))?
-                        .clone(),
-                );
-            }
-            value if value.starts_with("--message=") => {
-                options.message = value
-                    .strip_prefix("--message=")
-                    .map(|value| value.to_string());
-            }
-            "-s" | "--strategy" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("merge -s requires a value".into()))?;
-                accept_merge_strategy(value)?;
-            }
-            value if value.starts_with("--strategy=") => {
-                accept_merge_strategy(value.strip_prefix("--strategy=").unwrap_or(""))?;
-            }
-            value if value.starts_with("-s") && value.len() > 2 => {
-                accept_merge_strategy(&value[2..])?;
-            }
-            "-X" | "--strategy-option" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("merge -X requires a value".into()))?;
-                apply_merge_strategy_option(value, &mut options)?;
-            }
-            value if value.starts_with("--strategy-option=") => {
-                apply_merge_strategy_option(
-                    value.strip_prefix("--strategy-option=").unwrap_or(""),
-                    &mut options,
-                )?;
-            }
-            value if value.starts_with("-X") && value.len() > 2 => {
-                apply_merge_strategy_option(&value[2..], &mut options)?;
-            }
-            "--" => {
-                positional.extend(iter.by_ref().map(|value| value.to_string()));
-                break;
-            }
-            value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported merge option {value}"
-                )));
-            }
-            value => positional.push(value.to_string()),
-        }
-    }
-
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let refs = FileRefStore::new(&git_dir, format);
+
+    // git's `git_merge_config` reads `branch.<current>.mergeoptions` from the
+    // effective config and prepends it to the command-line argv before normal
+    // parse-options handling. That makes malformed split strings fatal before
+    // any action option (including --abort) and lets explicit CLI flags override
+    // earlier branch defaults in the usual left-to-right way.
+    let mut merged_args = Vec::new();
+    if let Some(branch) = current_branch_short_name(&refs)?
+        && let Some(raw) = branch_mergeoptions_value(&branch)
+    {
+        merged_args.extend(split_branch_merge_options(&raw, &branch)?);
+    }
+    merged_args.extend(args.iter().cloned());
+    let ParsedMergeArgs {
+        abort,
+        continue_merge,
+        positional,
+    } = parse_merge_args(&merged_args, &mut options)?;
 
     if abort {
         if !positional.is_empty() {
@@ -987,17 +1012,6 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(129));
         }
         return cmd_merge_continue();
-    }
-
-    // git's `git_merge_config` reads `branch.<current>.mergeoptions` from the
-    // effective config and prepends it to the command-line options
-    // (`parse_branch_merge_options`). The stored string is split with
-    // git's `split_cmdline`, which dies on an unbalanced quote or a trailing
-    // backslash — exposing malformed values before any merge work happens.
-    if let Some(branch) = current_branch_short_name(&refs)?
-        && let Some(raw) = branch_mergeoptions_value(&branch)
-    {
-        apply_branch_merge_options(&raw, &branch, &mut options)?;
     }
 
     if git_dir.join("MERGE_HEAD").exists() {

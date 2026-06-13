@@ -176,7 +176,12 @@ fn pull_conflict_matches_upstream_git() {
         "git-rs MERGE_HEAD should exist after conflict pull"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["ls-files", "--unmerged"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["ls-files", "--unmerged"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -219,15 +224,26 @@ fn pull_conflict_then_abort_matches_upstream_git() {
         "git-rs MERGE_HEAD should be removed"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after merge --abort"
     );
-    let upstream_post_abort_head =
-        String::from_utf8(run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout)
-            .expect("upstream post-abort HEAD utf8")
-            .trim()
-            .to_string();
+    let upstream_post_abort_head = String::from_utf8(
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"],
+        )
+        .stdout,
+    )
+    .expect("upstream post-abort HEAD utf8")
+    .trim()
+    .to_string();
     assert_eq!(
         upstream_pre_abort, upstream_post_abort_head,
         "upstream HEAD should return to pre-pull commit"
@@ -238,7 +254,12 @@ fn pull_conflict_then_abort_matches_upstream_git() {
         "worktree content differed after merge --abort"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["status", "--porcelain"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["status", "--porcelain"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -248,7 +269,12 @@ fn pull_conflict_then_abort_matches_upstream_git() {
         "status differed after merge --abort"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["ls-files", "--unmerged"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["ls-files", "--unmerged"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,

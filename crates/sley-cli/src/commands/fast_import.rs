@@ -83,14 +83,7 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         }
         if let Some(rest) = line_after(line, b"commit ") {
             let ref_name = resolve_commit_ref(&store, rest)?;
-            handle_commit(
-                &mut parser,
-                &mut db,
-                &store,
-                format,
-                &mut marks,
-                ref_name,
-            )?;
+            handle_commit(&mut parser, &mut db, &store, format, &mut marks, ref_name)?;
         } else if let Some(rest) = line_after(line, b"blob") {
             handle_blob(&mut parser, &mut db, &mut marks, rest)?;
         } else if line_after(line, b"reset ").is_some() {
@@ -212,13 +205,25 @@ fn handle_commit(
         } else if let Some(rest) = line_after(line, b"M ") {
             parser.next_command_line();
             default_base_from_branch(
-                db, store, format, &ref_name, &mut base_fixed, &mut parent, &mut tree,
+                db,
+                store,
+                format,
+                &ref_name,
+                &mut base_fixed,
+                &mut parent,
+                &mut tree,
             )?;
             apply_filemodify(parser, db, marks, format, rest, &mut tree)?;
         } else if let Some(rest) = line_after(line, b"D ") {
             parser.next_command_line();
             default_base_from_branch(
-                db, store, format, &ref_name, &mut base_fixed, &mut parent, &mut tree,
+                db,
+                store,
+                format,
+                &ref_name,
+                &mut base_fixed,
+                &mut parent,
+                &mut tree,
             )?;
             apply_filedelete(rest, &mut tree)?;
         } else if line == b"deleteall" {
@@ -235,11 +240,17 @@ fn handle_commit(
 
     // An empty commit (no filemodify lines) still inherits the branch tip.
     default_base_from_branch(
-        db, store, format, &ref_name, &mut base_fixed, &mut parent, &mut tree,
+        db,
+        store,
+        format,
+        &ref_name,
+        &mut base_fixed,
+        &mut parent,
+        &mut tree,
     )?;
 
-    let author = author
-        .ok_or_else(|| GitError::Command("fast-import: commit missing author".into()))?;
+    let author =
+        author.ok_or_else(|| GitError::Command("fast-import: commit missing author".into()))?;
     let committer = committer
         .ok_or_else(|| GitError::Command("fast-import: commit missing committer".into()))?;
     let message =
@@ -378,9 +389,7 @@ fn resolve_committish(
 ) -> Result<ObjectId> {
     let operand = trim_ascii(operand);
     // `<ref>^0` — strip the peel suffix; it just means the commit itself.
-    let operand = operand
-        .strip_suffix(b"^0")
-        .unwrap_or(operand);
+    let operand = operand.strip_suffix(b"^0").unwrap_or(operand);
     let text = std::str::from_utf8(operand)
         .map_err(|_| GitError::InvalidFormat("fast-import: committish not utf8".into()))?;
     if let Some(mark) = text.strip_prefix(':') {
@@ -674,9 +683,9 @@ impl<'a> StreamParser<'a> {
         } else {
             let count_text = std::str::from_utf8(arg)
                 .map_err(|_| GitError::InvalidFormat("fast-import: data count not utf8".into()))?;
-            let count: usize = count_text
-                .parse()
-                .map_err(|_| GitError::Command(format!("fast-import: bad data count '{count_text}'")))?;
+            let count: usize = count_text.parse().map_err(|_| {
+                GitError::Command(format!("fast-import: bad data count '{count_text}'"))
+            })?;
             self.read_counted_data(count)
         }
     }
@@ -703,7 +712,10 @@ impl<'a> StreamParser<'a> {
 
     /// `data N`: read exactly N bytes, then skip an optional trailing newline.
     fn read_counted_data(&mut self, count: usize) -> Result<Vec<u8>> {
-        let end = self.pos.checked_add(count).filter(|e| *e <= self.input.len());
+        let end = self
+            .pos
+            .checked_add(count)
+            .filter(|e| *e <= self.input.len());
         let Some(end) = end else {
             return Err(GitError::Command(
                 "fast-import: data count exceeds stream length".into(),

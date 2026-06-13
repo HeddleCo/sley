@@ -7,11 +7,15 @@
 use sley_config::{ConfigIncludeContext, GitConfig};
 use sley_core::{GitError, Result};
 use std::env;
+use std::fs;
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::commands::remote_cmds::repo_current_branch_name;
-use crate::{common_git_dir_for_git_dir, discover_git_dir, global_config_value};
+use crate::{
+    common_git_dir_for_git_dir, discover_git_dir, global_config_value, worktree_root_for_git_dir,
+};
 
 pub(crate) const MAX_ALIAS_DEPTH: usize = 20;
 
@@ -167,11 +171,12 @@ fn load_alias_file_config() -> Result<GitConfig> {
     sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
 }
 
-/// Execute a `!`-prefixed alias through the user's shell.
+/// Execute a `!`-prefixed alias through git's shell path.
 pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()> {
-    let shell = env::var("GIT_SHELL_PATH")
-        .or_else(|_| env::var("SHELL"))
-        .unwrap_or_else(|_| "/bin/sh".into());
+    let shell = match env::var("GIT_SHELL_PATH") {
+        Ok(shell) => shell,
+        Err(_) => "/bin/sh".into(),
+    };
     let mut script = command.to_string();
     for arg in extra_args {
         script.push(' ');
@@ -179,6 +184,7 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
     }
     let mut process = ProcessCommand::new(&shell);
     process.arg("-c").arg(&script);
+    configure_shell_alias_worktree_env(&mut process)?;
     // Propagate the effective config-injection parameters (`-c` / `--config-env`
     // folded onto any inherited `GIT_CONFIG_PARAMETERS`) to the subprocess git,
     // exactly as upstream git does by mutating its own env before running the
@@ -193,7 +199,49 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
     if status.success() {
         Ok(())
     } else {
-        Err(GitError::Exit(status.code().unwrap_or(1)))
+        let code = match status.code() {
+            Some(code) => code,
+            None => 1,
+        };
+        Err(GitError::Exit(code))
+    }
+}
+
+fn configure_shell_alias_worktree_env(process: &mut ProcessCommand) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let Ok(git_dir) = discover_git_dir(&cwd) else {
+        return Ok(());
+    };
+    let Ok(root) = worktree_root_for_git_dir(&git_dir) else {
+        return Ok(());
+    };
+    let root = canonical_or_self(root);
+    let cwd = canonical_or_self(cwd);
+    let Ok(prefix_path) = cwd.strip_prefix(&root) else {
+        return Ok(());
+    };
+    process.current_dir(&root);
+    let prefix = git_prefix_from_path(prefix_path);
+    if prefix.is_empty() {
+        process.env_remove("GIT_PREFIX");
+    } else {
+        process.env("GIT_PREFIX", prefix);
+    }
+    Ok(())
+}
+
+fn canonical_or_self(path: PathBuf) -> PathBuf {
+    match fs::canonicalize(&path) {
+        Ok(canonical) => canonical,
+        Err(_) => path,
+    }
+}
+
+fn git_prefix_from_path(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", path.to_string_lossy().replace('\\', "/"))
     }
 }
 

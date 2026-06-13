@@ -600,7 +600,10 @@ fn parse_complex_directive(
                     return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
                 }
                 *fields |= FormatFields::BODY;
-                Ok(Some((Some(FormatToken::Trailers(opts.to_string())), consumed)))
+                Ok(Some((
+                    Some(FormatToken::Trailers(opts.to_string())),
+                    consumed,
+                )))
             } else if inner == "decorate" || inner.starts_with("decorate:") {
                 let opts = inner.strip_prefix("decorate").unwrap_or("");
                 let opts = opts.strip_prefix(':').unwrap_or("");
@@ -848,7 +851,9 @@ fn parse_leading_i64(s: &str) -> (i64, usize) {
     let digit_start = idx;
     let mut value: i64 = 0;
     while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-        value = value.saturating_mul(10).saturating_add((bytes[idx] - b'0') as i64);
+        value = value
+            .saturating_mul(10)
+            .saturating_add((bytes[idx] - b'0') as i64);
         idx += 1;
     }
     if idx == digit_start {

@@ -97,12 +97,20 @@ fn create_repo_with_packable_loose_objects(root: &Path) -> String {
         .output()
         .expect("run git commit");
     assert!(commit.status.success(), "git commit failed");
-    let blob = run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD:file.txt"]);
+    let blob = run_output(
+        sley_testkit::oracle_git(),
+        root,
+        &["rev-parse", "HEAD:file.txt"],
+    );
     assert!(blob.status.success(), "git rev-parse failed");
     let blob = String::from_utf8(blob.stdout).expect("utf8 oid");
     let blob = blob.trim().to_string();
 
-    let object_list = run_output(sley_testkit::oracle_git(), root, &["rev-list", "--objects", "--all"]);
+    let object_list = run_output(
+        sley_testkit::oracle_git(),
+        root,
+        &["rev-list", "--objects", "--all"],
+    );
     assert!(object_list.status.success(), "git rev-list failed");
     let pack = run_with_input(
         sley_testkit::oracle_git(),

@@ -89,18 +89,38 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "one"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "two"]);
-    run_success(sley_testkit::oracle_git(), root, &["branch", "topic", "HEAD~1"]);
-    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "topic"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["branch", "topic", "HEAD~1"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["checkout", "-q", "topic"],
+    );
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "topic"]);
-    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["checkout", "-q", "main"],
+    );
 }
 
 fn prepare_drop_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     run_success_with_identity_at(
         root,
         &["commit", "--allow-empty", "-qm", "one"],
@@ -120,7 +140,11 @@ fn prepare_drop_reflog_repo(root: &Path) {
 
 fn prepare_linear_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     for (index, message) in ["one", "two", "three"].iter().enumerate() {
         let date = format!("1970-01-01T00:00:0{} +0000", index + 1);
         let output = Command::new(sley_testkit::oracle_git())
@@ -261,7 +285,11 @@ fn reflog_list_matches_upstream_git() {
     let root = unique_temp_dir("reflog-list");
     {
         prepare_reflog_repo(&root);
-        run_success(sley_testkit::oracle_git(), &root, &["tag", "--create-reflog", "v1"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["tag", "--create-reflog", "v1"],
+        );
 
         for args in [
             vec!["reflog", "list"],
@@ -342,7 +370,12 @@ fn reflog_delete_updateref_matches_upstream_git() {
         );
         assert_eq!(
             run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
-            run(sley_testkit::oracle_git(), &upstream, &["rev-parse", "main"]).stdout,
+            run(
+                sley_testkit::oracle_git(),
+                &upstream,
+                &["rev-parse", "main"]
+            )
+            .stdout,
             "main ref differed after {args:?}"
         );
     }
@@ -542,7 +575,12 @@ fn reflog_expire_matches_upstream_git() {
         );
         assert_eq!(
             run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
-            run(sley_testkit::oracle_git(), &upstream, &["rev-parse", "main"]).stdout,
+            run(
+                sley_testkit::oracle_git(),
+                &upstream,
+                &["rev-parse", "main"]
+            )
+            .stdout,
             "main ref differed after {args:?}"
         );
     }

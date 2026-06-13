@@ -230,7 +230,10 @@ fn rev_parse_core_bare_config_matches_upstream_git() {
         // Set `core.bare` to the requested state on the repo whose config the
         // active GIT_DIR resolves to, then compare sley to the oracle for each
         // flag under the same cwd + env.
-        let check = |bare: Option<bool>, config_dir: &Path, cwd: &Path, env_git_dir: Option<&str>| {
+        let check = |bare: Option<bool>,
+                     config_dir: &Path,
+                     cwd: &Path,
+                     env_git_dir: Option<&str>| {
             match bare {
                 Some(true) => {
                     git(config_dir, &["config", "core.bare", "true"]);
@@ -240,7 +243,11 @@ fn rev_parse_core_bare_config_matches_upstream_git() {
                 }
                 None => {
                     // Tolerate an already-unset key (exit 5), like `test_unconfig`.
-                    let _ = run_status(sley_testkit::oracle_git(), config_dir, &["config", "--unset", "core.bare"]);
+                    let _ = run_status(
+                        sley_testkit::oracle_git(),
+                        config_dir,
+                        &["config", "--unset", "core.bare"],
+                    );
                 }
             }
             for args in &flags {
@@ -954,9 +961,17 @@ fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
 fn setup_rev_parse_repo(dir: &Path, sha256: bool) {
     fs::create_dir_all(dir).expect("create repo dir");
     if sha256 {
-        run(sley_testkit::oracle_git(), dir, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+        run(
+            sley_testkit::oracle_git(),
+            dir,
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
     } else {
-        run(sley_testkit::oracle_git(), dir, &["init", "-q", "-b", "main"]);
+        run(
+            sley_testkit::oracle_git(),
+            dir,
+            &["init", "-q", "-b", "main"],
+        );
     }
     run(
         sley_testkit::oracle_git(),

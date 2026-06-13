@@ -125,7 +125,14 @@ const TIMEZONE_NAMES: &[(&str, i64, i64)] = &[
 ];
 
 const SPECIAL_NAMES: [&str; 8] = [
-    "yesterday", "noon", "midnight", "tea", "PM", "AM", "never", "now",
+    "yesterday",
+    "noon",
+    "midnight",
+    "tea",
+    "PM",
+    "AM",
+    "never",
+    "now",
 ];
 
 const NUMBER_NAMES: [&str; 11] = [
@@ -336,12 +343,23 @@ fn is_date_known(tm: &Tm) -> bool {
 
 /// git's `match_multi_number`. `date`/`end` are byte offsets into the full
 /// string; returns the number of consumed bytes (0 = no match).
-fn match_multi_number(num: i64, c: u8, full: &[u8], start_off: usize, tm: &mut Tm, now: i64) -> usize {
+fn match_multi_number(
+    num: i64,
+    c: u8,
+    full: &[u8],
+    start_off: usize,
+    tm: &mut Tm,
+    now: i64,
+) -> usize {
     // `start_off` is the index of the separator `c` in `full`; git's `end`
     // pointer sits there and num2 is parsed from end+1.
     let (num2, mut cursor) = parse_long(full, start_off + 1);
     let mut num3: i64 = -1;
-    if cursor < full.len() && full[cursor] == c && cursor + 1 < full.len() && is_ascii_digit_byte(full[cursor + 1]) {
+    if cursor < full.len()
+        && full[cursor] == c
+        && cursor + 1 < full.len()
+        && is_ascii_digit_byte(full[cursor + 1])
+    {
         let (n3, c3) = parse_long(full, cursor + 1);
         num3 = n3;
         cursor = c3;
@@ -472,7 +490,11 @@ fn match_alpha(date: &[u8], tm: &mut Tm, offset: &mut i64) -> usize {
         tm.hour = tm.hour % 12;
         return 2;
     }
-    if date.first() == Some(&b'T') && date.len() > 1 && is_ascii_digit_byte(date[1]) && tm.hour == -1 {
+    if date.first() == Some(&b'T')
+        && date.len() > 1
+        && is_ascii_digit_byte(date[1])
+        && tm.hour == -1
+    {
         tm.min = 0;
         tm.sec = 0;
         return 1;
@@ -521,7 +543,11 @@ fn match_digit(date: &[u8], tm: &mut Tm, offset: &mut i64, tm_gmt: &mut bool) ->
         if n == 8 {
             let _ = set_date(num1, num2, num3, None, now_unix(), tm);
         } else if n == 6 && set_time(num1, num2, num3, tm).is_ok() {
-            if cursor < date.len() && date[cursor] == b'.' && cursor + 1 < date.len() && is_ascii_digit_byte(date[cursor + 1]) {
+            if cursor < date.len()
+                && date[cursor] == b'.'
+                && cursor + 1 < date.len()
+                && is_ascii_digit_byte(date[cursor + 1])
+            {
                 let (_v, c) = parse_uint(date, cursor + 1);
                 cursor = c;
             }
@@ -678,7 +704,8 @@ fn parse_date_basic_full(date: &[u8]) -> Option<(i64, i64)> {
             m = match_alpha(rest, &mut tm, &mut offset);
         } else if is_ascii_digit_byte(c) {
             m = match_digit(rest, &mut tm, &mut offset, &mut tm_gmt);
-        } else if (c == b'-' || c == b'+') && i + 1 < date.len() && is_ascii_digit_byte(date[i + 1]) {
+        } else if (c == b'-' || c == b'+') && i + 1 < date.len() && is_ascii_digit_byte(date[i + 1])
+        {
             m = match_tz(rest, &mut offset);
         }
         if m == 0 {
@@ -813,7 +840,13 @@ fn apply_special(name: &str, tm: &mut Tm, now: &Tm, num: &mut i64) {
 }
 
 /// git's `approxidate_alpha`. Returns bytes consumed.
-fn approxidate_alpha(date: &[u8], tm: &mut Tm, now: &Tm, num: &mut i64, touched: &mut bool) -> usize {
+fn approxidate_alpha(
+    date: &[u8],
+    tm: &mut Tm,
+    now: &Tm,
+    num: &mut i64,
+    touched: &mut bool,
+) -> usize {
     let mut end = 1usize;
     while end < date.len() && is_ascii_alpha_byte(date[end]) {
         end += 1;
@@ -948,7 +981,8 @@ fn approxidate_str(date: &[u8], now: i64, error_ret: &mut bool) -> i64 {
             continue;
         }
         if is_ascii_alpha_byte(c) {
-            let consumed = approxidate_alpha(&date[i..], &mut tm, &now_tm, &mut number, &mut touched);
+            let consumed =
+                approxidate_alpha(&date[i..], &mut tm, &now_tm, &mut number, &mut touched);
             i += consumed.max(1);
             continue;
         }
@@ -1087,7 +1121,10 @@ mod tests {
         assert_eq!(parse_expiry_date("never"), Some(0));
         assert_eq!(parse_expiry_date("false"), Some(0));
         assert_eq!(parse_expiry_date("now"), Some(u64::MAX as i64));
-        assert_eq!(format_expiry_date("now").as_deref(), Some("18446744073709551615"));
+        assert_eq!(
+            format_expiry_date("now").as_deref(),
+            Some("18446744073709551615")
+        );
     }
 
     #[test]

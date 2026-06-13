@@ -441,6 +441,88 @@ mod tests {
     }
 
     #[test]
+    fn remote_config_values_preserve_config_order() {
+        let config = config_from(
+            "[remote \"origin\"]\n\turl = first\n\turl = second\n\
+             [remote \"origin\"]\n\turl = third\n\tpushurl = push\n",
+        );
+        assert_eq!(
+            remote_config_values(&config, "origin", "url"),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(
+            remote_config_values(&config, "origin", "pushurl"),
+            vec!["push"]
+        );
+    }
+
+    #[test]
+    fn rewrite_url_uses_longest_insteadof_match() {
+        let config = config_from(
+            "[url \"ssh://example.com/\"]\n\tinsteadOf = ex:\n\
+             [url \"ssh://example.com/specific/\"]\n\tinsteadOf = ex:specific/\n",
+        );
+        assert_eq!(
+            rewrite_url_with_config(&config, "ex:specific/repo.git", false),
+            "ssh://example.com/specific/repo.git"
+        );
+    }
+
+    #[test]
+    fn rewrite_url_prefers_pushinsteadof_for_pushes() {
+        let config = config_from(
+            "[url \"https://example.com/\"]\n\tinsteadOf = ex:\n\
+             [url \"ssh://push.example.com/\"]\n\tpushInsteadOf = ex:\n",
+        );
+        assert_eq!(
+            rewrite_url_with_config(&config, "ex:repo.git", false),
+            "https://example.com/repo.git"
+        );
+        assert_eq!(
+            rewrite_url_with_config(&config, "ex:repo.git", true),
+            "ssh://push.example.com/repo.git"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_fetch_and_push_urls_apply_precedence_and_rewrites() {
+        let config = config_from(
+            "[url \"https://fetch.example/\"]\n\tinsteadOf = short:\n\
+             [url \"ssh://push.example/\"]\n\tpushInsteadOf = short:\n\
+             [remote \"origin\"]\n\turl = short:repo.git\n\tpushurl = short:push.git\n",
+        );
+        assert_eq!(
+            resolve_remote_fetch_url(&config, "origin"),
+            "https://fetch.example/repo.git"
+        );
+        assert_eq!(
+            resolve_remote_push_url(&config, "origin"),
+            "ssh://push.example/push.git"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_push_url_falls_back_to_fetch_url() {
+        let config = config_from(
+            "[url \"ssh://push.example/\"]\n\tpushInsteadOf = short:\n\
+             [remote \"origin\"]\n\turl = short:repo.git\n",
+        );
+        assert_eq!(
+            resolve_remote_push_url(&config, "origin"),
+            "ssh://push.example/repo.git"
+        );
+    }
+
+    #[test]
+    fn resolve_literal_remote_url_is_rewritten_when_no_remote_exists() {
+        let config = config_from("[url \"ssh://example/\"]\n\tinsteadOf = ex:\n");
+        assert_eq!(
+            resolve_remote_fetch_url(&config, "ex:repo.git"),
+            "ssh://example/repo.git"
+        );
+    }
+
+    #[test]
     fn add_remote_writes_url_and_default_fetch() {
         let mut config = GitConfig::default();
         add_remote_with_fetch(&mut config, "origin", "https://example/x.git", &[])
@@ -464,6 +546,24 @@ mod tests {
     }
 
     #[test]
+    fn add_remote_accepts_mirror_style_entries() {
+        let mut config = GitConfig::default();
+        add_remote(
+            &mut config,
+            "origin",
+            vec![
+                ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())),
+                ConfigEntry::new("mirror", Some("true".into())),
+            ],
+        )
+        .expect("add mirror remote");
+        assert_eq!(
+            render(&config),
+            "[remote \"origin\"]\n\tfetch = +refs/*:refs/*\n\tmirror = true\n"
+        );
+    }
+
+    #[test]
     fn add_remote_rejects_duplicate() {
         let mut config = config_from("[remote \"origin\"]\n\turl = a\n");
         let err = add_remote_with_fetch(&mut config, "origin", "b", &[]).expect_err("duplicate");
@@ -479,6 +579,25 @@ mod tests {
         );
         remove_remote(&mut config, "origin").expect("remove");
         assert_eq!(render(&config), "");
+    }
+
+    #[test]
+    fn remove_remote_drops_pushremote_references_but_keeps_other_remotes() {
+        let mut config = config_from(
+            "[remote \"origin\"]\n\turl = a\n\
+             [remote \"backup\"]\n\turl = b\n\
+             [branch \"main\"]\n\tremote = backup\n\tmerge = refs/heads/main\n\tpushRemote = origin\n\
+             [branch \"topic\"]\n\tpushRemote = backup\n\
+             [remote]\n\tpushDefault = backup\n",
+        );
+        remove_remote(&mut config, "origin").expect("remove");
+        assert_eq!(
+            render(&config),
+            "[remote \"backup\"]\n\turl = b\n\
+             [branch \"main\"]\n\tremote = backup\n\tmerge = refs/heads/main\n\
+             [branch \"topic\"]\n\tpushRemote = backup\n\
+             [remote]\n\tpushDefault = backup\n"
+        );
     }
 
     #[test]
@@ -510,6 +629,25 @@ mod tests {
         )
         .expect("set");
         assert_eq!(config.get("remote", Some("origin"), "url"), Some("new"));
+    }
+
+    #[test]
+    fn set_url_edits_highest_precedence_remote_section() {
+        let mut config = config_from(
+            "[remote \"origin\"]\n\turl = old-low\n\
+             [remote \"origin\"]\n\turl = old-high\n",
+        );
+        set_url(
+            &mut config,
+            "origin",
+            SetUrlKind::Fetch,
+            SetUrlOp::Set { url: "new-high" },
+        )
+        .expect("set");
+        assert_eq!(
+            remote_config_values(&config, "origin", "url"),
+            vec!["old-low", "new-high"]
+        );
     }
 
     #[test]

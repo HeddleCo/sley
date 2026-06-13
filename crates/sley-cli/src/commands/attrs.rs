@@ -100,60 +100,59 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let terminator = if z { b'\0' } else { b'\n' };
     let mut matched_any = false;
-    let process_path = |display_path: Vec<u8>,
-                        stdout: &mut std::io::StdoutLock<'_>|
-     -> Result<bool> {
-        let path_arg = String::from_utf8_lossy(&display_path);
-        let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
-        let absolute = resolve_cli_path(cwd, &path_arg);
-        // Tracked paths are never ignored (upstream check-ignore consults the
-        // index via find_pathspecs_matching_against_index and skips matching
-        // entries): report them as non-matching rather than skipping output,
-        // so `-v -n` still prints the `::` line for them.
-        let ignore_match = if tracked_paths.contains(&git_path) {
-            None
-        } else {
-            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
-        };
-        let path_matched = ignore_match
-            .as_ref()
-            .is_some_and(|ignore_match| verbose || ignore_match.ignored);
-        if let Some(ignore_match) = ignore_match {
-            if !quiet && verbose {
-                if z {
-                    stdout.write_all(&ignore_match.source)?;
-                    stdout.write_all(&[0])?;
-                    write!(stdout, "{}", ignore_match.line_number)?;
-                    stdout.write_all(&[0])?;
-                    stdout.write_all(&ignore_match.pattern)?;
-                    stdout.write_all(&[0])?;
-                    stdout.write_all(&display_path)?;
-                    stdout.write_all(&[0])?;
-                } else {
-                    stdout.write_all(&ignore_match.source)?;
-                    write!(stdout, ":{}:", ignore_match.line_number)?;
-                    stdout.write_all(&ignore_match.pattern)?;
-                    stdout.write_all(b"\t")?;
+    let process_path =
+        |display_path: Vec<u8>, stdout: &mut std::io::StdoutLock<'_>| -> Result<bool> {
+            let path_arg = String::from_utf8_lossy(&display_path);
+            let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
+            let absolute = resolve_cli_path(cwd, &path_arg);
+            // Tracked paths are never ignored (upstream check-ignore consults the
+            // index via find_pathspecs_matching_against_index and skips matching
+            // entries): report them as non-matching rather than skipping output,
+            // so `-v -n` still prints the `::` line for them.
+            let ignore_match = if tracked_paths.contains(&git_path) {
+                None
+            } else {
+                sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
+            };
+            let path_matched = ignore_match
+                .as_ref()
+                .is_some_and(|ignore_match| verbose || ignore_match.ignored);
+            if let Some(ignore_match) = ignore_match {
+                if !quiet && verbose {
+                    if z {
+                        stdout.write_all(&ignore_match.source)?;
+                        stdout.write_all(&[0])?;
+                        write!(stdout, "{}", ignore_match.line_number)?;
+                        stdout.write_all(&[0])?;
+                        stdout.write_all(&ignore_match.pattern)?;
+                        stdout.write_all(&[0])?;
+                        stdout.write_all(&display_path)?;
+                        stdout.write_all(&[0])?;
+                    } else {
+                        stdout.write_all(&ignore_match.source)?;
+                        write!(stdout, ":{}:", ignore_match.line_number)?;
+                        stdout.write_all(&ignore_match.pattern)?;
+                        stdout.write_all(b"\t")?;
+                        stdout.write_all(&display_path)?;
+                        stdout.write_all(&[terminator])?;
+                    }
+                } else if !quiet && ignore_match.ignored {
                     stdout.write_all(&display_path)?;
                     stdout.write_all(&[terminator])?;
                 }
-            } else if !quiet && ignore_match.ignored {
-                stdout.write_all(&display_path)?;
-                stdout.write_all(&[terminator])?;
+            } else if verbose && non_matching && !quiet {
+                if z {
+                    stdout.write_all(&[0, 0, 0])?;
+                    stdout.write_all(&display_path)?;
+                    stdout.write_all(&[0])?;
+                } else {
+                    stdout.write_all(b"::\t")?;
+                    stdout.write_all(&display_path)?;
+                    stdout.write_all(&[terminator])?;
+                }
             }
-        } else if verbose && non_matching && !quiet {
-            if z {
-                stdout.write_all(&[0, 0, 0])?;
-                stdout.write_all(&display_path)?;
-                stdout.write_all(&[0])?;
-            } else {
-                stdout.write_all(b"::\t")?;
-                stdout.write_all(&display_path)?;
-                stdout.write_all(&[terminator])?;
-            }
-        }
-        Ok(path_matched)
-    };
+            Ok(path_matched)
+        };
     if read_stdin {
         crate::commands::stdin_stream::stream_stdin_records(
             terminator,

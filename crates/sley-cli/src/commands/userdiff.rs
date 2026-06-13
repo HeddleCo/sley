@@ -456,8 +456,7 @@ impl UserdiffResolver {
                             None => Some(true),
                         };
                     }
-                    "command" | "trustexitcode" | "textconv" | "cachetextconv"
-                    | "algorithm" => {
+                    "command" | "trustexitcode" | "textconv" | "cachetextconv" | "algorithm" => {
                         any = true;
                     }
                     _ => {}
@@ -497,14 +496,12 @@ mod tests {
     fn builtin_patterns_compile() {
         for driver in BUILTIN_DRIVERS {
             if let Some(spec) = driver.funcname {
-                CompiledFuncname::compile(spec, true, driver.icase).unwrap_or_else(|_| {
-                    panic!("funcname for {} failed to compile", driver.name)
-                });
+                CompiledFuncname::compile(spec, true, driver.icase)
+                    .unwrap_or_else(|_| panic!("funcname for {} failed to compile", driver.name));
             }
             if let Some(word_regex) = driver.word_regex {
-                Regex::compile_bytes(word_regex, RegexMode::Ere, false, false).unwrap_or_else(
-                    |_| panic!("word regex for {} failed to compile", driver.name),
-                );
+                Regex::compile_bytes(word_regex, RegexMode::Ere, false, false)
+                    .unwrap_or_else(|_| panic!("word regex for {} failed to compile", driver.name));
             }
         }
     }

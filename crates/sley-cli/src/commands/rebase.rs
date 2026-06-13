@@ -219,7 +219,10 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             _ if arg.starts_with("--whitespace=") => {
                 let value = &arg["--whitespace=".len()..];
-                if !matches!(value, "warn" | "nowarn" | "error" | "error-all" | "fix" | "strip") {
+                if !matches!(
+                    value,
+                    "warn" | "nowarn" | "error" | "error-all" | "fix" | "strip"
+                ) {
                     eprintln!("fatal: Invalid whitespace option: '{value}'");
                     return Err(GitError::Exit(128));
                 }
@@ -227,8 +230,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--rebase-merges" | "-r" => {}
             _ if arg.starts_with("--rebase-merges=") => {}
             "--" => {
-                out.positional
-                    .extend(args[index + 1..].iter().cloned());
+                out.positional.extend(args[index + 1..].iter().cloned());
                 break;
             }
             _ if arg.starts_with('-') && arg.len() > 1 => {
@@ -529,8 +531,12 @@ fn read_populate_todo(ctx: &Ctx, db: &FileObjectDatabase) -> Result<TodoList> {
     let text = fs::read_to_string(ctx.state_path("git-rebase-todo"))?;
     let done_exists = ctx.state_path("done").exists();
     let mut resolver = make_resolver(ctx, db);
-    let (items, messages) =
-        seq::parse_todo_buffer(&text, done_exists, comment_char(&ctx.git_dir) as char, &mut resolver);
+    let (items, messages) = seq::parse_todo_buffer(
+        &text,
+        done_exists,
+        comment_char(&ctx.git_dir) as char,
+        &mut resolver,
+    );
     if !messages.is_empty() {
         for message in &messages {
             eprintln!("{message}");
@@ -745,10 +751,18 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     };
     let onto = if onto_name.contains("...") {
         let (left, right) = onto_name.split_once("...").expect("contains ...");
-        let left_oid = resolve_revision(&ctx.git_dir, ctx.format, if left.is_empty() { "HEAD" } else { left })
-            .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
-        let right_oid = resolve_revision(&ctx.git_dir, ctx.format, if right.is_empty() { "HEAD" } else { right })
-            .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
+        let left_oid = resolve_revision(
+            &ctx.git_dir,
+            ctx.format,
+            if left.is_empty() { "HEAD" } else { left },
+        )
+        .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
+        let right_oid = resolve_revision(
+            &ctx.git_dir,
+            ctx.format,
+            if right.is_empty() { "HEAD" } else { right },
+        )
+        .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
         match (left_oid, right_oid) {
             (Ok(left), Ok(right)) => {
                 let bases = merge_bases(&ctx.common_git_dir, &db, ctx.format, &left, &right)?;
@@ -869,10 +883,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     // The apply backend's explicit fast-forward case.
-    if allow_preemptive_ff
-        && !force
-        && branch_base.as_ref() == Some(&orig_head)
-    {
+    if allow_preemptive_ff && !force && branch_base.as_ref() == Some(&orig_head) {
         // onto is a descendant of orig_head: fast-forward.
         sley_worktree::reset_index_and_worktree_to_commit(
             &ctx.worktree_root,
@@ -986,9 +997,7 @@ fn default_upstream_name(ctx: &Ctx, refs: &FileRefStore) -> Option<String> {
 
 fn print_missing_upstream_advice(ctx: &Ctx, refs: &FileRefStore) {
     let branch = match refs.read_ref("HEAD") {
-        Ok(Some(RefTarget::Symbolic(name))) => name
-            .strip_prefix("refs/heads/")
-            .map(str::to_string),
+        Ok(Some(RefTarget::Symbolic(name))) => name.strip_prefix("refs/heads/").map(str::to_string),
         _ => None,
     };
     let _ = ctx;
@@ -1717,10 +1726,7 @@ fn pick_commits(
                 }
             }
             TodoCommand::UpdateRef => {}
-            TodoCommand::Noop
-            | TodoCommand::Drop
-            | TodoCommand::Comment
-            | TodoCommand::Revert => {}
+            TodoCommand::Noop | TodoCommand::Drop | TodoCommand::Comment | TodoCommand::Revert => {}
         }
 
         todo.current += 1;
@@ -1820,8 +1826,8 @@ fn do_exec(ctx: &Ctx, command: &str, quiet: bool) -> Result<i32> {
 
 fn do_label(ctx: &Ctx, name: &str) -> Result<()> {
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("could not read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("could not read HEAD".into()))?;
     let refname = format!("refs/rewritten/{name}");
     let committer = commit_identity_from_env("COMMITTER")?;
     let mut tx = refs.transaction();
@@ -1859,13 +1865,7 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Result<()> {
     let refs = ctx.refs();
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
     let committer = commit_identity_from_env("COMMITTER")?;
-    detach_head_with_reflog(
-        ctx,
-        old,
-        target,
-        ctx.reflog("reset", Some(name)),
-        committer,
-    )
+    detach_head_with_reflog(ctx, old, target, ctx.reflog("reset", Some(name)), committer)
 }
 
 fn do_merge(
@@ -1900,8 +1900,8 @@ fn pick_one_commit(
     let oid = item.oid.expect("pick-like commands carry a commit");
     let record = read_rev_list_commit_record(db, ctx.format, oid)?;
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
 
     let is_fixup = item.command.is_fixup();
     let final_fixup = is_fixup && !next_is_fixup(todo);
@@ -1991,10 +1991,8 @@ fn pick_one_commit(
     // Compose the message (fixup/squash machinery).
     let mut message = record.commit.message.clone();
     if opts.signoff && !is_fixup {
-        message = commands::replay::append_signoff_before_comments(
-            message,
-            &commit_signoff_from_env()?,
-        );
+        message =
+            commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?);
     }
     if is_fixup {
         update_squash_messages(ctx, db, item, &record)?;
@@ -2300,8 +2298,8 @@ fn print_conflict_hints() {
 
 fn intend_to_amend(ctx: &Ctx) -> Result<()> {
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     fs::write(ctx.state_path("amend"), format!("{head}\n"))?;
     Ok(())
 }
@@ -2377,9 +2375,7 @@ fn render_patch_between_trees(
         let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
         let path = String::from_utf8_lossy(&entry.path).into_owned();
         let old_display = String::from_utf8_lossy(old_path).into_owned();
-        out.extend_from_slice(
-            format!("diff --git a/{old_display} b/{path}\n").as_bytes(),
-        );
+        out.extend_from_slice(format!("diff --git a/{old_display} b/{path}\n").as_bytes());
         let old_content = entry
             .old_oid
             .as_ref()
@@ -2572,7 +2568,10 @@ fn update_squash_messages(
     fixups.push(' ');
     fixups.push_str(&record.oid.to_hex());
     fixups.push('\n');
-    fs::write(ctx.state_path("current-fixups"), fixups.trim_end_matches('\n'))?;
+    fs::write(
+        ctx.state_path("current-fixups"),
+        fixups.trim_end_matches('\n'),
+    )?;
     Ok(())
 }
 
@@ -2604,8 +2603,8 @@ fn machine_commit(
     commit: MachineCommit<'_>,
 ) -> Result<CommitOutcome> {
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
 
     let mut message = match &commit.message_file {
@@ -2715,8 +2714,8 @@ fn read_author_script_identity(ctx: &Ctx) -> Result<Option<Vec<u8>>> {
 
 fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_name_display;
     if let Some(head_name) = &opts.head_name {
         let committer = commit_identity_from_env("COMMITTER")?;
@@ -2783,8 +2782,8 @@ fn flush_rewritten_pending(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let mut list = fs::read_to_string(rewritten_list_path(ctx)).unwrap_or_default();
     for line in pending.lines().filter(|line| !line.trim().is_empty()) {
         list.push_str(line.trim());
@@ -2797,7 +2796,11 @@ fn flush_rewritten_pending(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn record_rewritten(ctx: &Ctx, old_oid: &ObjectId, next_command: Option<TodoCommand>) -> Result<()> {
+fn record_rewritten(
+    ctx: &Ctx,
+    old_oid: &ObjectId,
+    next_command: Option<TodoCommand>,
+) -> Result<()> {
     let pending_path = rewritten_pending_path(ctx);
     let mut pending = fs::read_to_string(&pending_path).unwrap_or_default();
     pending.push_str(&old_oid.to_hex());
@@ -2885,8 +2888,8 @@ fn commit_staged_changes(
     todo: &TodoList,
 ) -> Result<bool> {
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
     let index_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     let is_clean = index_tree == head_tree;
@@ -2940,7 +2943,10 @@ fn commit_staged_changes(
                     // Update the squash message to skip the latest commit
                     // message.
                     let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
-                    fs::write(ctx.state_path("message-squash"), &head_record.commit.message)?;
+                    fs::write(
+                        ctx.state_path("message-squash"),
+                        &head_record.commit.message,
+                    )?;
                 }
             }
         }
@@ -3005,8 +3011,8 @@ fn rebase_skip(ctx: &Ctx) -> Result<()> {
     let db = ctx.db();
     let opts = read_basic_state(ctx)?;
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     sley_worktree::reset_index_and_worktree_to_commit(
         &ctx.worktree_root,
         &ctx.git_dir,
@@ -3157,8 +3163,8 @@ fn create_autostash(ctx: &Ctx) -> Result<()> {
     let db = ctx.db();
     println!("Created autostash: {}", find_unique_abbrev_hex(&db, &oid));
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     sley_worktree::reset_index_and_worktree_to_commit(
         &ctx.worktree_root,
         &ctx.git_dir,

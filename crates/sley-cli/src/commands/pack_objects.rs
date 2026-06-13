@@ -21,7 +21,7 @@ use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
-use sley_pack::{pack_order_index_positions, PackInput, PackReverseIndex, PackWriteOptions};
+use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
 
 use crate::*;
 
@@ -131,8 +131,11 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         // The enumeration meter counts every packed object, the verbatim
         // reused ones included (upstream's bitmap path displays the full
         // result cardinality).
-        let enumerated =
-            oids.len() as u64 + reused_packs.iter().map(|reuse| reuse.count as u64).sum::<u64>();
+        let enumerated = oids.len() as u64
+            + reused_packs
+                .iter()
+                .map(|reuse| reuse.count as u64)
+                .sum::<u64>();
         eprintln!("Enumerating objects: {enumerated}, done.");
     }
 
@@ -178,8 +181,11 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             checksum: build.pack_checksum,
         }
     } else {
-        let written =
-            PackFile::write_packed_with_known_ids_and_options(&inputs, format, &pack_write_options)?;
+        let written = PackFile::write_packed_with_known_ids_and_options(
+            &inputs,
+            format,
+            &pack_write_options,
+        )?;
         if options.stdout_mode {
             let mut stdout = io::stdout();
             stdout.write_all(&written.pack)?;
@@ -262,8 +268,7 @@ fn sort_no_delta_traversal_pack(
         })
         .collect::<Result<Vec<_>>>()?;
     entries.sort_by(|(left, left_oid, _), (right, right_oid, _)| {
-        left
-            .type_rank
+        left.type_rank
             .cmp(&right.type_rank)
             .then_with(|| right.timestamp.cmp(&left.timestamp))
             .then_with(|| left_oid.as_bytes().cmp(right_oid.as_bytes()))
@@ -308,7 +313,11 @@ struct VerbatimPackReuse {
     count: u32,
 }
 
-type TraversalPackObjects = (Vec<ObjectId>, Vec<Arc<EncodedObject>>, Vec<VerbatimPackReuse>);
+type TraversalPackObjects = (
+    Vec<ObjectId>,
+    Vec<Arc<EncodedObject>>,
+    Vec<VerbatimPackReuse>,
+);
 
 /// Enumerate the want set for the traversal mode and decide on pack reuse.
 /// Returns the objects to encode fresh (oids + bodies) and the optional
@@ -541,13 +550,8 @@ fn find_verbatim_reusable_packs(
             continue;
         };
         let wanted: HashSet<ObjectId> = index.entries.iter().map(|entry| entry.oid).collect();
-        let Some(entry_bytes) = raw_pack_entries_for_oids(
-            format,
-            &pack_bytes,
-            &index.entries,
-            &wanted,
-            false,
-        )?
+        let Some(entry_bytes) =
+            raw_pack_entries_for_oids(format, &pack_bytes, &index.entries, &wanted, false)?
         else {
             continue;
         };
@@ -576,7 +580,10 @@ fn find_midx_verbatim_reusable_packs(
         return Ok(None);
     };
     if !pack_dir
-        .join(format!("multi-pack-index-{}.bitmap", midx.checksum.to_hex()))
+        .join(format!(
+            "multi-pack-index-{}.bitmap",
+            midx.checksum.to_hex()
+        ))
         .exists()
     {
         return Ok(None);
@@ -614,7 +621,8 @@ fn find_midx_verbatim_reusable_packs(
         let Ok(pack_bytes) = fs::read(&pack_path) else {
             continue;
         };
-        let all_pack_oids: HashSet<ObjectId> = index.entries.iter().map(|entry| entry.oid).collect();
+        let all_pack_oids: HashSet<ObjectId> =
+            index.entries.iter().map(|entry| entry.oid).collect();
         let wanted_count = index
             .entries
             .iter()
@@ -663,7 +671,8 @@ fn raw_partial_pack_entries_for_wanted_oids(
     if oids.is_empty() {
         return Ok(None);
     }
-    let Some(entry_bytes) = raw_pack_entries_for_oids(format, pack_bytes, index_entries, &oids, true)?
+    let Some(entry_bytes) =
+        raw_pack_entries_for_oids(format, pack_bytes, index_entries, &oids, true)?
     else {
         return Ok(None);
     };

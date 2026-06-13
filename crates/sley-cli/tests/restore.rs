@@ -81,7 +81,10 @@ fn prepare_repo(root: &Path) {
 }
 
 fn prepare_sha256_repo(root: &Path) {
-    git(root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+    git(
+        root,
+        &["init", "-q", "--object-format=sha256", "-b", "main"],
+    );
     prepare_repo_contents(root);
 }
 

@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -24,7 +24,7 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
-    Command::new(program)
+    sley_testkit::hermetic_git_command(program)
         .current_dir(cwd)
         .args(args)
         .output()
@@ -32,7 +32,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn run_output_with_input(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    let mut child = Command::new(program)
+    let mut child = sley_testkit::hermetic_git_command(program)
         .current_dir(cwd)
         .args(args)
         .stdin(Stdio::piped())
@@ -50,30 +50,32 @@ fn run_output_with_input(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
 }
 
 /// Run a program with an explicit environment overlay, capturing status, stdout,
-/// and stderr. Inherited `GIT_CONFIG*` variables are cleared first so the
-/// config-injection tests are hermetic regardless of the caller's environment.
+/// and stderr. The testkit builder applies hermetic defaults first; the overlay
+/// is applied afterward so config-injection cases can opt back into
+/// `GIT_CONFIG_*` sources deliberately.
 fn run_output_with_env(program: &str, cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(program);
+    let mut command = sley_testkit::hermetic_git_command(program);
     command.current_dir(cwd).args(args);
-    for key in [
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG",
-        "GIT_CONFIG_KEY_0",
-        "GIT_CONFIG_VALUE_0",
-        "GIT_CONFIG_KEY_1",
-        "GIT_CONFIG_VALUE_1",
-    ] {
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+fn run_output_with_env_removed(
+    program: &str,
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    removed: &[&str],
+) -> Output {
+    let mut command = sley_testkit::hermetic_git_command(program);
+    command.current_dir(cwd).args(args);
+    for key in removed {
         command.env_remove(key);
     }
-    // Sandbox system/global config so `config --list` (effective) compares only
-    // the repository config plus any injected overrides — identically for the git
-    // oracle and sley, regardless of the developer's real ~/.gitconfig.
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .env("XDG_CONFIG_HOME", cwd);
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -101,6 +103,33 @@ fn assert_env_match(upstream: &Path, rust: &Path, args: &[&str], envs: &[(&str, 
     assert_eq!(
         actual.stderr, expected.stderr,
         "sley stderr differed for {args:?} env={envs:?}"
+    );
+}
+
+fn assert_env_removed_match(
+    upstream: &Path,
+    rust: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    removed: &[&str],
+) {
+    let expected =
+        run_output_with_env_removed(sley_testkit::oracle_git(), upstream, args, envs, removed);
+    let actual = run_output_with_env_removed(env!("CARGO_BIN_EXE_sley"), rust, args, envs, removed);
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "sley status differed for {args:?} env={envs:?} removed={removed:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "sley stdout differed for {args:?} env={envs:?} removed={removed:?}"
+    );
+    assert_eq!(
+        actual.stderr, expected.stderr,
+        "sley stderr differed for {args:?} env={envs:?} removed={removed:?}"
     );
 }
 
@@ -483,6 +512,56 @@ fn config_file_and_stdin_sources_match_upstream_git() {
             &rust,
             &["config", "set", "--file", "-", "core.editor", "ed"],
         );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_edit_matches_upstream_git_editor_precedence() {
+    let root = unique_temp_dir("config-edit");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
+
+        let editor_env = [("GIT_EDITOR", "echo [test]value=yes >")];
+        for edit_mode in [
+            ["config", "--edit", "-f", "tmp"],
+            ["config", "edit", "-f", "tmp"],
+        ] {
+            assert_eq!(
+                git(&upstream, &["config", "-f", "tmp", "test.value", "no"]),
+                git_rs(&rust, &["config", "-f", "tmp", "test.value", "no"])
+            );
+            assert_env_match(&upstream, &rust, &edit_mode, &editor_env);
+            assert_outputs_match(&upstream, &rust, &["config", "list", "-f", "tmp"]);
+        }
+
+        assert_eq!(
+            git(&upstream, &["config", "-f", "tmp", "test.value", "no"]),
+            git_rs(&rust, &["config", "-f", "tmp", "test.value", "no"])
+        );
+        assert_eq!(
+            git(
+                &upstream,
+                &["config", "core.editor", "echo [test]value=yes >"],
+            ),
+            git_rs(&rust, &["config", "core.editor", "echo [test]value=yes >"],)
+        );
+        assert_env_removed_match(
+            &upstream,
+            &rust,
+            &["config", "--edit", "-f", "tmp"],
+            &[
+                ("VISUAL", "echo [visual]value=no >"),
+                ("EDITOR", "echo [editor]value=no >"),
+            ],
+            &["GIT_EDITOR"],
+        );
+        assert_outputs_match(&upstream, &rust, &["config", "list", "-f", "tmp"]);
     }
     let _ = fs::remove_dir_all(&root);
 }
@@ -1475,6 +1554,83 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ],
         );
 
+        for (key, value) in [
+            ("http.https://example.com/.cookieFile", "/tmp/root.txt"),
+            (
+                "http.https://example.com/subdirectory.cookieFile",
+                "/tmp/subdirectory.txt",
+            ),
+            ("http.https://user@example.com/.cookieFile", "/tmp/user.txt"),
+            (
+                "http.https://averylonguser@example.com/.cookieFile",
+                "/tmp/averylonguser.txt",
+            ),
+            (
+                "http.https://preceding.example.com.cookieFile",
+                "/tmp/preceding.txt",
+            ),
+            ("http.https://*.example.com.cookieFile", "/tmp/wildcard.txt"),
+            (
+                "http.https://*.example.com/wildcardwithsubdomain.cookieFile",
+                "/tmp/wildcardwithsubdomain.txt",
+            ),
+            (
+                "http.https://*.example.*.cookieFile",
+                "/tmp/multiwildcard.txt",
+            ),
+            (
+                "http.https://trailing.example.com.cookieFile",
+                "/tmp/trailing.txt",
+            ),
+            (
+                "http.https://user@*.example.com/.cookieFile",
+                "/tmp/wildcardwithuser.txt",
+            ),
+            ("http.https://sub.example.com/.cookieFile", "/tmp/sub.txt"),
+            ("http.https://*.example.com.sslVerify", "false"),
+        ] {
+            let args = ["config", key, value];
+            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+        }
+        for url in [
+            "https://example.com",
+            "https://example.com/subdirectory",
+            "https://example.com/subdirectory/nested",
+            "https://user@example.com/",
+            "https://averylonguser@example.com/subdirectory",
+            "https://preceding.example.com",
+            "https://wildcard.example.com",
+            "https://sub.example.com/wildcardwithsubdomain",
+            "https://trailing.example.com",
+            "https://user@sub.example.com",
+            "https://wildcard.example.org",
+        ] {
+            assert_outputs_match(&upstream, &rust, &["config", "--get-urlmatch", "http", url]);
+            assert_outputs_match(&upstream, &rust, &["config", "get", "--url", url, "http"]);
+        }
+        for url in [
+            "https://example.com",
+            "https://good-example.com",
+            "https://deep.nested.example.com",
+            "https://good.example.com",
+        ] {
+            assert_outputs_match(
+                &upstream,
+                &rust,
+                &["config", "--bool", "--get-urlmatch", "http.sslVerify", url],
+            );
+        }
+        assert_outputs_match(
+            &upstream,
+            &rust,
+            &[
+                "config",
+                "--get-urlmatch",
+                "http",
+                "https://more.example.com.au",
+            ],
+        );
+
         let path_args = ["config", "core.editorpath", "~/bin/editor"];
         assert_eq!(git(&upstream, &path_args), git_rs(&rust, &path_args));
         assert_outputs_match(&upstream, &rust, &["config", "--path", "core.editorpath"]);
@@ -1551,25 +1707,51 @@ fn config_injection_matches_upstream_git() {
         assert_env_match(
             &upstream,
             &rust,
-            &["-c", "section.foo=value with = in it", "config", "section.foo"],
+            &[
+                "-c",
+                "section.foo=value with = in it",
+                "config",
+                "section.foo",
+            ],
             &[],
         );
         // last one wins (two-level: case-insensitive on first+last level).
         assert_env_match(
             &upstream,
             &rust,
-            &["-c", "sec.var=val", "-c", "sec.VAR=VAL", "config", "--get", "sec.var"],
+            &[
+                "-c",
+                "sec.var=val",
+                "-c",
+                "sec.VAR=VAL",
+                "config",
+                "--get",
+                "sec.var",
+            ],
             &[],
         );
         // three-level: middle level is case-sensitive, so these are distinct.
         assert_env_match(
             &upstream,
             &rust,
-            &["-c", "v.a.r=val", "-c", "v.A.r=VAL", "config", "--get", "v.a.r"],
+            &[
+                "-c",
+                "v.a.r=val",
+                "-c",
+                "v.A.r=VAL",
+                "config",
+                "--get",
+                "v.a.r",
+            ],
             &[],
         );
         // injected entries show up in --list.
-        assert_env_match(&upstream, &rust, &["-c", "x.one=1", "config", "--list"], &[]);
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "x.one=1", "config", "--list"],
+            &[],
+        );
 
         // --- invalid `-c` keys are rejected --------------------------------
         for bad in ["name=value", "=foo", "", "a.0b=VAL", ".a=VAL", "a.=VAL"] {
@@ -1616,7 +1798,12 @@ fn config_injection_matches_upstream_git() {
         assert_env_match(
             &upstream,
             &rust,
-            &["--config-env=foo.flag=NONEXISTENT", "config", "--bool", "foo.flag"],
+            &[
+                "--config-env=foo.flag=NONEXISTENT",
+                "config",
+                "--bool",
+                "foo.flag",
+            ],
             &[],
         );
         // `-c` and `--config-env` combine and override left-to-right.
@@ -1762,7 +1949,14 @@ fn config_injection_matches_upstream_git() {
         assert_env_match(
             &upstream,
             &rust,
-            &["-c", "pair.one=fromcmd", "config", "-f", "other.cfg", "pair.one"],
+            &[
+                "-c",
+                "pair.one=fromcmd",
+                "config",
+                "-f",
+                "other.cfg",
+                "pair.one",
+            ],
             &[],
         );
 

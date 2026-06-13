@@ -1201,11 +1201,6 @@ fn write_patch_diffstat(
     )
 }
 
-
-
-
-
-
 /// The ` create mode`/` delete mode`/` rename`/` copy`/` mode change` summary
 /// line for a single entry (the `--summary` lines format-patch always includes
 /// when stats are on), mirroring the shared renderer.
@@ -1274,7 +1269,6 @@ fn write_patch_summary_entry(
     }
     Ok(())
 }
-
 
 /// Read the old blob for an entry, if it has one.
 fn entry_old_content(

@@ -218,6 +218,105 @@ pub struct ShortStatusOptions {
     pub untracked_mode: StatusUntrackedMode,
 }
 
+/// The worktree state of one tracked path relative to an expected index/tree
+/// entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeEntryState {
+    /// The path exists in the worktree and matches the expected mode/object id.
+    Clean,
+    /// The path exists, but its type, mode, filtered content, symlink target, or
+    /// gitlink HEAD differs from the expected entry.
+    Modified,
+    /// The path, or one of its parents, is missing from the worktree.
+    Deleted,
+}
+
+/// Stage-0 index stat data that can prove a worktree path clean without
+/// re-reading and re-hashing it.
+///
+/// This is the public carrier for sley's racy-git shortcut. Callers that already
+/// parsed `.git/index` can build a probe from the matching [`IndexEntry`] and
+/// the index file's mtime, then pass it to [`worktree_entry_state`] or
+/// [`worktree_entry_state_by_git_path`]. The probe is trusted only when its path,
+/// mode, and object id match the expected entry and the cached stat is not
+/// racily clean; otherwise the helper falls back to the same content hashing
+/// path used by [`short_status_with_options`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStatProbe {
+    entry: IndexEntry,
+    index_mtime: Option<(u64, u64)>,
+}
+
+impl IndexStatProbe {
+    /// Build a probe from a parsed stage-0 index entry and the index file's mtime
+    /// split as `(seconds, nanoseconds)`.
+    pub fn from_index_entry(entry: IndexEntry, index_mtime: Option<(u64, u64)>) -> Self {
+        Self { entry, index_mtime }
+    }
+
+    /// Build a probe from a parsed index entry and the path of the index file on
+    /// disk, using that file's mtime as the racy-clean reference timestamp.
+    pub fn from_index_entry_and_index_path(
+        entry: IndexEntry,
+        index_path: impl AsRef<Path>,
+    ) -> Self {
+        let index_mtime = fs::metadata(index_path.as_ref())
+            .ok()
+            .and_then(|metadata| file_mtime_parts(&metadata));
+        Self { entry, index_mtime }
+    }
+
+    /// Read this repository's index and return a probe for `git_path` when a
+    /// stage-0 entry exists.
+    pub fn from_repository_index(
+        git_dir: impl AsRef<Path>,
+        format: ObjectFormat,
+        git_path: &[u8],
+    ) -> Result<Option<Self>> {
+        let index_path = repository_index_path(git_dir);
+        if !index_path.exists() {
+            return Ok(None);
+        }
+        let index = Index::parse(&fs::read(&index_path)?, format)?;
+        Ok(index
+            .entries
+            .into_iter()
+            .find(|entry| index_entry_stage(entry) == 0 && entry.path.as_bytes() == git_path)
+            .map(|entry| Self::from_index_entry_and_index_path(entry, index_path)))
+    }
+
+    /// The parsed index entry this probe was built from.
+    pub fn entry(&self) -> &IndexEntry {
+        &self.entry
+    }
+
+    /// The index file mtime used as the racy-clean reference timestamp.
+    pub fn index_mtime(&self) -> Option<(u64, u64)> {
+        self.index_mtime
+    }
+
+    fn stat_cache_for(
+        &self,
+        git_path: &[u8],
+        expected_oid: &ObjectId,
+        expected_mode: u32,
+    ) -> Option<IndexStatCache> {
+        if index_entry_stage(&self.entry) != 0
+            || self.entry.path.as_bytes() != git_path
+            || self.entry.oid != *expected_oid
+            || self.entry.mode != expected_mode
+        {
+            return None;
+        }
+        let mut entries = BTreeMap::new();
+        entries.insert(git_path.to_vec(), self.entry.clone());
+        Some(IndexStatCache {
+            entries,
+            index_mtime: self.index_mtime,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckoutResult {
     pub branch: String,
@@ -1444,6 +1543,76 @@ pub fn short_status(
         format,
         ShortStatusOptions::default(),
     )
+}
+
+/// Compare one expected tracked entry to the worktree path named by `path`.
+///
+/// `path` is repository-relative and uses the platform path representation. For
+/// callers that already carry git's byte path form, use
+/// [`worktree_entry_state_by_git_path`].
+pub fn worktree_entry_state(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    path: impl AsRef<Path>,
+    expected_oid: &ObjectId,
+    expected_mode: u32,
+    index_probe: Option<&IndexStatProbe>,
+) -> Result<WorktreeEntryState> {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        return Err(GitError::InvalidPath(format!(
+            "worktree entry path {} is absolute",
+            path.display()
+        )));
+    }
+    let git_path = git_path_bytes(path)?;
+    worktree_entry_state_by_git_path(
+        worktree_root,
+        git_dir,
+        format,
+        &git_path,
+        expected_oid,
+        expected_mode,
+        index_probe,
+    )
+}
+
+/// Compare one expected tracked entry to the worktree path named by a
+/// repository-relative git path (`/` separators, raw bytes).
+///
+/// The comparison uses the same clean-filter, symlink-target, gitlink, and
+/// racy-clean stat shortcut rules as [`short_status_with_options`].
+pub fn worktree_entry_state_by_git_path(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    git_path: &[u8],
+    expected_oid: &ObjectId,
+    expected_mode: u32,
+    index_probe: Option<&IndexStatProbe>,
+) -> Result<WorktreeEntryState> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let stat_cache =
+        index_probe.and_then(|probe| probe.stat_cache_for(git_path, expected_oid, expected_mode));
+    let Some(worktree_entry) = worktree_entry_for_git_path(
+        worktree_root,
+        git_dir,
+        format,
+        git_path,
+        expected_oid,
+        expected_mode,
+        stat_cache.as_ref(),
+    )?
+    else {
+        return Ok(WorktreeEntryState::Deleted);
+    };
+    if worktree_entry.mode == expected_mode && worktree_entry.oid == *expected_oid {
+        Ok(WorktreeEntryState::Clean)
+    } else {
+        Ok(WorktreeEntryState::Modified)
+    }
 }
 
 pub fn short_status_with_options(
@@ -3675,9 +3844,8 @@ impl ContentFilterPlan {
             Some(Some(AttributeState::Value(_))) => TextDecision::Text,
             // `!text` (unspecified) or no text attribute: fall through to `crlf`.
             _ => {
-                let (decision, eol) = decode_crlf_family_attribute(
-                    crlf_attr.and_then(|check| check.state.as_ref()),
-                );
+                let (decision, eol) =
+                    decode_crlf_family_attribute(crlf_attr.and_then(|check| check.state.as_ref()));
                 forced_eol = eol;
                 decision
             }
@@ -4008,7 +4176,9 @@ impl WorktreeAttributes {
         path: &[u8],
         content: &[u8],
     ) -> Result<Vec<u8>> {
-        let checks = self.matcher.attributes_for_path(path, &filter_attribute_names(), false);
+        let checks = self
+            .matcher
+            .attributes_for_path(path, &filter_attribute_names(), false);
         apply_clean_filter_with_attributes(config, &checks, path, content)
     }
 }
@@ -4889,7 +5059,13 @@ pub fn restore_worktree_paths(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    restore_worktree_paths_inner(worktree_root.as_ref(), git_dir.as_ref(), format, paths, None)
+    restore_worktree_paths_inner(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        paths,
+        None,
+    )
 }
 
 /// Like [`restore_worktree_paths`], applying the smudge-side content filters
@@ -6811,6 +6987,75 @@ fn worktree_entries_with_submodule_dirt(
     Ok((entries, submodule_dirt_map))
 }
 
+fn worktree_entry_for_git_path(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    git_path: &[u8],
+    expected_oid: &ObjectId,
+    expected_mode: u32,
+    stat_cache: Option<&IndexStatCache>,
+) -> Result<Option<TrackedEntry>> {
+    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if expected_mode == 0o160000 {
+        if !metadata.is_dir() {
+            return Ok(Some(TrackedEntry {
+                mode: worktree_entry_mode(&metadata),
+                oid: ObjectId::null(format),
+            }));
+        }
+        let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(*expected_oid);
+        return Ok(Some(TrackedEntry {
+            mode: 0o160000,
+            oid,
+        }));
+    }
+
+    if metadata.is_dir() {
+        return Ok(Some(TrackedEntry {
+            mode: worktree_entry_mode(&metadata),
+            oid: ObjectId::null(format),
+        }));
+    }
+
+    if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+        return Ok(Some(TrackedEntry {
+            mode: worktree_entry_mode(&metadata),
+            oid: ObjectId::null(format),
+        }));
+    }
+
+    if let Some(tracked) =
+        stat_cache.and_then(|cache| cache.reuse_tracked_entry(git_path, &metadata))
+    {
+        return Ok(Some(tracked));
+    }
+
+    let mode = worktree_entry_mode(&metadata);
+    let body = if metadata.file_type().is_symlink() {
+        symlink_target_bytes(&absolute)?
+    } else {
+        let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+        let body = fs::read(&absolute)?;
+        apply_clean_filter(worktree_root, git_dir, &config, git_path, &body)?
+    };
+    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+    Ok(Some(TrackedEntry { mode, oid }))
+}
+
 struct WorktreeEntriesWalk<'a> {
     root: &'a Path,
     git_dir: &'a Path,
@@ -6955,16 +7200,22 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
                 );
                 continue;
             }
-            let body = fs::read(&path)?;
-            // Resolve this path's attributes against the prebuilt matcher (a cheap
-            // pattern match) and apply the clean filter -- no per-file matcher
-            // rebuild. With no attributes/autocrlf configured this is an exact
-            // passthrough, so the stored OID is unchanged.
-            let checks = context
-                .matcher
-                .attributes_for_path(&git_path, context.requested, false);
-            let body =
-                apply_clean_filter_with_attributes(context.config, &checks, &git_path, &body)?;
+            let body = if metadata.file_type().is_symlink() {
+                // The blob for a symlink is the raw link target; clean filters
+                // never apply because git treats symlink content as opaque.
+                symlink_target_bytes(&path)?
+            } else {
+                let body = fs::read(&path)?;
+                // Resolve this path's attributes against the prebuilt matcher (a cheap
+                // pattern match) and apply the clean filter -- no per-file matcher
+                // rebuild. With no attributes/autocrlf configured this is an exact
+                // passthrough, so the stored OID is unchanged.
+                let checks =
+                    context
+                        .matcher
+                        .attributes_for_path(&git_path, context.requested, false);
+                apply_clean_filter_with_attributes(context.config, &checks, &git_path, &body)?
+            };
             let oid = EncodedObject::new(ObjectType::Blob, body).object_id(context.format)?;
             context.entries.insert(
                 git_path,
@@ -8484,6 +8735,260 @@ mod tests {
             Some(&bogus),
             "the worktree entry must have reused the planted bogus index oid, not the real hash"
         );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_entry_state_detects_same_size_content_change() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"aaaa\n").expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["f.txt"]);
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"f.txt").clone();
+        let probe = IndexStatProbe::from_index_entry_and_index_path(
+            entry.clone(),
+            repository_index_path(&git_dir),
+        );
+
+        fs::write(root.join("f.txt"), b"bbbb\n").expect("test operation should succeed");
+        let state = worktree_entry_state(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            Path::new("f.txt"),
+            &entry.oid,
+            entry.mode,
+            Some(&probe),
+        )
+        .expect("test operation should succeed");
+        assert_eq!(state, WorktreeEntryState::Modified);
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_entry_state_reports_deleted_for_missing_and_parent_not_directory() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("dir")).expect("test operation should succeed");
+        fs::write(root.join("dir").join("f.txt"), b"hello\n")
+            .expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["dir/f.txt"]);
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"dir/f.txt").clone();
+
+        fs::remove_file(root.join("dir").join("f.txt")).expect("test operation should succeed");
+        let missing = worktree_entry_state_by_git_path(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            b"dir/f.txt",
+            &entry.oid,
+            entry.mode,
+            None,
+        )
+        .expect("test operation should succeed");
+        assert_eq!(missing, WorktreeEntryState::Deleted);
+
+        fs::remove_dir(root.join("dir")).expect("test operation should succeed");
+        fs::write(root.join("dir"), b"not a directory").expect("test operation should succeed");
+        let parent_not_directory = worktree_entry_state_by_git_path(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            b"dir/f.txt",
+            &entry.oid,
+            entry.mode,
+            None,
+        )
+        .expect("test operation should succeed");
+        assert_eq!(parent_not_directory, WorktreeEntryState::Deleted);
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_entry_state_trusts_clean_non_racy_probe() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["f.txt"]);
+        let index_path = repository_index_path(&git_dir);
+        let mut index = read_index(&git_dir);
+        let bogus = ObjectId::from_hex(ObjectFormat::Sha1, &"1".repeat(40))
+            .expect("test operation should succeed");
+        index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == b"f.txt")
+            .expect("test operation should succeed")
+            .oid = bogus;
+        fs::write(
+            &index_path,
+            index
+                .write(ObjectFormat::Sha1)
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(
+            &index_path,
+            fs::read(&index_path).expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"f.txt").clone();
+        let probe = IndexStatProbe::from_index_entry_and_index_path(
+            entry.clone(),
+            repository_index_path(&git_dir),
+        );
+
+        let state = worktree_entry_state(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            Path::new("f.txt"),
+            &entry.oid,
+            entry.mode,
+            Some(&probe),
+        )
+        .expect("test operation should succeed");
+        assert_eq!(
+            state,
+            WorktreeEntryState::Clean,
+            "a non-racy stat match must be enough to prove this path clean"
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_entry_state_rehashes_racy_probe() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["f.txt"]);
+        let index = read_index(&git_dir);
+        let mut entry = index_entry_for(&index, b"f.txt").clone();
+        entry.oid = ObjectId::from_hex(ObjectFormat::Sha1, &"2".repeat(40))
+            .expect("test operation should succeed");
+        let probe = IndexStatProbe::from_index_entry(
+            entry.clone(),
+            Some((
+                u64::from(entry.mtime_seconds),
+                u64::from(entry.mtime_nanoseconds),
+            )),
+        );
+
+        let state = worktree_entry_state(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            Path::new("f.txt"),
+            &entry.oid,
+            entry.mode,
+            Some(&probe),
+        )
+        .expect("test operation should succeed");
+        assert_eq!(
+            state,
+            WorktreeEntryState::Modified,
+            "a racily-clean stat match must fall through to hashing"
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_entry_state_detects_chmod_only_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["f.txt"]);
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"f.txt").clone();
+
+        let file = root.join("f.txt");
+        let mut permissions = fs::metadata(&file)
+            .expect("test operation should succeed")
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(&file, permissions).expect("test operation should succeed");
+        let state = worktree_entry_state(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            Path::new("f.txt"),
+            &entry.oid,
+            entry.mode,
+            None,
+        )
+        .expect("test operation should succeed");
+        assert_eq!(state, WorktreeEntryState::Modified);
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_entry_state_detects_symlink_target_change() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        symlink("one", root.join("link")).expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["link"]);
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"link").clone();
+
+        fs::remove_file(root.join("link")).expect("test operation should succeed");
+        symlink("two", root.join("link")).expect("test operation should succeed");
+        let state = worktree_entry_state(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            Path::new("link"),
+            &entry.oid,
+            entry.mode,
+            None,
+        )
+        .expect("test operation should succeed");
+        assert_eq!(state, WorktreeEntryState::Modified);
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_entry_state_treats_present_unpopulated_gitlink_directory_as_clean() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("submodule")).expect("test operation should succeed");
+        let oid = ObjectId::from_hex(ObjectFormat::Sha1, &"3".repeat(40))
+            .expect("test operation should succeed");
+
+        let state = worktree_entry_state(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            Path::new("submodule"),
+            &oid,
+            0o160000,
+            None,
+        )
+        .expect("test operation should succeed");
+        assert_eq!(state, WorktreeEntryState::Clean);
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

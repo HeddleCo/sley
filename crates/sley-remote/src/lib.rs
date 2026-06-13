@@ -175,6 +175,16 @@ impl ProgressSink for SilentProgress {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sley_config::{ConfigEntry, ConfigSection};
+    use sley_formats::RepositoryLayout;
+    use sley_object::{Commit, EncodedObject, ObjectType, Tree};
+    use sley_odb::{FileObjectDatabase, ObjectWriter};
+    use sley_refs::{FileRefStore, RefTarget, RefUpdate};
+    use sley_transport::{RemoteUrl, parse_remote_url};
 
     #[test]
     fn no_credentials_never_fills() {
@@ -192,5 +202,363 @@ mod tests {
     fn silent_progress_accepts_messages() {
         let mut progress = SilentProgress;
         progress.message("Cloning into 'x'...");
+    }
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn live_env(name: &str) -> Option<String> {
+        match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Some(value),
+            _ => None,
+        }
+    }
+
+    fn live_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sley-remote-live-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        RepositoryLayout::init_at(&dir, ObjectFormat::Sha1, false)
+            .expect("live test repository should initialize");
+        dir.join(".git")
+    }
+
+    fn remote_config(url: &str) -> GitConfig {
+        GitConfig {
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin".into()),
+                vec![
+                    ConfigEntry::new("url", Some(url.into())),
+                    ConfigEntry::new("fetch", Some("+refs/heads/*:refs/remotes/origin/*".into())),
+                ],
+            )],
+            ..GitConfig::default()
+        }
+    }
+
+    fn fetch_options(depth: Option<u32>) -> FetchOptions {
+        FetchOptions {
+            quiet: true,
+            auto_follow_tags: false,
+            fetch_all_tags: false,
+            prune: false,
+            dry_run: false,
+            append: false,
+            write_fetch_head: true,
+            tag_option_explicit: true,
+            prune_option_explicit: true,
+            depth,
+            merge_src: None,
+            filter: None,
+            cloning: false,
+            update_shallow: false,
+            deepen_relative: false,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+        }
+    }
+
+    fn write_live_commit(git_dir: &Path, branch: &str) {
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree { entries: vec![] }.write(),
+            ))
+            .expect("live commit tree should write");
+        let timestamp = 1 + TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let identity =
+            format!("Sley Remote Live <sley@example.invalid> {timestamp} +0000").into_bytes();
+        let oid = db
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: Vec::new(),
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: format!("sley remote live {branch}\n").into_bytes(),
+                }
+                .write(),
+            ))
+            .expect("live commit should write");
+        let store = FileRefStore::new(git_dir, format);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: format!("refs/heads/{branch}"),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic(format!("refs/heads/{branch}")),
+            reflog: None,
+        });
+        tx.commit().expect("live refs should update");
+    }
+
+    struct EnvCredentials {
+        username: String,
+        password: String,
+    }
+
+    impl CredentialProvider for EnvCredentials {
+        fn fill(&mut self, mut request: GitCredential) -> Result<Option<GitCredential>> {
+            request.username = Some(self.username.clone());
+            request.password = Some(self.password.clone());
+            Ok(Some(request))
+        }
+    }
+
+    fn live_fetch(
+        url_var: &str,
+        branch_var: &str,
+        source: FetchSource,
+        credentials: &mut dyn CredentialProvider,
+        depth: Option<u32>,
+    ) {
+        let Some(url) = live_env(url_var) else {
+            return;
+        };
+        let branch = live_env(branch_var).unwrap_or_else(|| "main".into());
+        let local = live_repo(url_var);
+        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let config = remote_config(&url);
+        let options = fetch_options(depth);
+        let mut progress = SilentProgress;
+
+        let outcome = fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &config,
+                remote_name: "origin",
+                source: &source,
+                refspecs: &[refspec],
+                options: &options,
+            },
+            FetchServices {
+                credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("live fetch should succeed");
+
+        assert!(!outcome.ref_updates.is_empty());
+        if depth.is_some() {
+            assert!(
+                local.join("shallow").exists(),
+                "shallow fetch should write .git/shallow"
+            );
+        }
+    }
+
+    fn live_push(
+        url_var: &str,
+        branch_prefix_var: &str,
+        destination: PushDestination,
+        credentials: &mut dyn CredentialProvider,
+    ) {
+        let Some(_) = live_env(url_var) else {
+            return;
+        };
+        let branch_prefix =
+            live_env(branch_prefix_var).unwrap_or_else(|| "sley-remote-live".into());
+        let branch = format!(
+            "{branch_prefix}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let local = live_repo(url_var);
+        write_live_commit(&local, &branch);
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let options = PushOptions {
+            quiet: true,
+            force: false,
+        };
+        let mut progress = SilentProgress;
+
+        let outcome = push(
+            PushRequest {
+                git_dir: &local,
+                common_git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote: "origin",
+                destination: &destination,
+                refspecs: &[refspec],
+                options: &options,
+            },
+            PushServices {
+                credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("live push should succeed");
+
+        assert_eq!(outcome.commands.len(), 1);
+    }
+
+    #[test]
+    fn live_github_https_public_fetch() {
+        let Some(url) = live_env("SLEY_REMOTE_LIVE_GITHUB_HTTPS_PUBLIC_URL") else {
+            return;
+        };
+        let remote = parse_remote_url(&url).expect("live HTTPS URL should parse");
+        let mut credentials = NoCredentials;
+        live_fetch(
+            "SLEY_REMOTE_LIVE_GITHUB_HTTPS_PUBLIC_URL",
+            "SLEY_REMOTE_LIVE_GITHUB_HTTPS_PUBLIC_BRANCH",
+            FetchSource::Http(remote),
+            &mut credentials,
+            None,
+        );
+    }
+
+    #[test]
+    fn live_private_https_auth_fetch_uses_credential_provider() {
+        let (Some(url), Some(username), Some(password)) = (
+            live_env("SLEY_REMOTE_LIVE_PRIVATE_HTTPS_URL"),
+            live_env("SLEY_REMOTE_LIVE_PRIVATE_HTTPS_USERNAME"),
+            live_env("SLEY_REMOTE_LIVE_PRIVATE_HTTPS_PASSWORD"),
+        ) else {
+            return;
+        };
+        let remote = parse_remote_url(&url).expect("live private HTTPS URL should parse");
+        let mut credentials = EnvCredentials { username, password };
+        live_fetch(
+            "SLEY_REMOTE_LIVE_PRIVATE_HTTPS_URL",
+            "SLEY_REMOTE_LIVE_PRIVATE_HTTPS_BRANCH",
+            FetchSource::Http(remote),
+            &mut credentials,
+            None,
+        );
+    }
+
+    #[test]
+    fn live_https_push() {
+        let Some(url) = live_env("SLEY_REMOTE_LIVE_HTTPS_PUSH_URL") else {
+            return;
+        };
+        let remote = parse_remote_url(&url).expect("live HTTPS push URL should parse");
+        let mut no_credentials;
+        let mut env_credentials;
+        let credentials: &mut dyn CredentialProvider = match (
+            live_env("SLEY_REMOTE_LIVE_HTTPS_PUSH_USERNAME"),
+            live_env("SLEY_REMOTE_LIVE_HTTPS_PUSH_PASSWORD"),
+        ) {
+            (Some(username), Some(password)) => {
+                env_credentials = EnvCredentials { username, password };
+                &mut env_credentials
+            }
+            _ => {
+                no_credentials = NoCredentials;
+                &mut no_credentials
+            }
+        };
+        live_push(
+            "SLEY_REMOTE_LIVE_HTTPS_PUSH_URL",
+            "SLEY_REMOTE_LIVE_HTTPS_PUSH_BRANCH_PREFIX",
+            PushDestination::Http(remote),
+            credentials,
+        );
+    }
+
+    #[test]
+    fn live_ssh_fetch() {
+        let Some(url) = live_env("SLEY_REMOTE_LIVE_SSH_FETCH_URL") else {
+            return;
+        };
+        let remote = parse_remote_url(&url).expect("live SSH fetch URL should parse");
+        let mut credentials = NoCredentials;
+        live_fetch(
+            "SLEY_REMOTE_LIVE_SSH_FETCH_URL",
+            "SLEY_REMOTE_LIVE_SSH_FETCH_BRANCH",
+            FetchSource::Ssh(remote),
+            &mut credentials,
+            None,
+        );
+    }
+
+    #[test]
+    fn live_ssh_push() {
+        let Some(url) = live_env("SLEY_REMOTE_LIVE_SSH_PUSH_URL") else {
+            return;
+        };
+        let remote = parse_remote_url(&url).expect("live SSH push URL should parse");
+        let mut credentials = NoCredentials;
+        live_push(
+            "SLEY_REMOTE_LIVE_SSH_PUSH_URL",
+            "SLEY_REMOTE_LIVE_SSH_PUSH_BRANCH_PREFIX",
+            PushDestination::Ssh(remote),
+            &mut credentials,
+        );
+    }
+
+    #[test]
+    fn live_shallow_https_fetch_and_clone() {
+        let Some(url) = live_env("SLEY_REMOTE_LIVE_SHALLOW_HTTPS_URL") else {
+            return;
+        };
+        let branch =
+            live_env("SLEY_REMOTE_LIVE_SHALLOW_HTTPS_BRANCH").unwrap_or_else(|| "main".into());
+        let remote = parse_remote_url(&url).expect("live shallow HTTPS URL should parse");
+        let mut credentials = NoCredentials;
+        live_fetch(
+            "SLEY_REMOTE_LIVE_SHALLOW_HTTPS_URL",
+            "SLEY_REMOTE_LIVE_SHALLOW_HTTPS_BRANCH",
+            FetchSource::Http(remote.clone()),
+            &mut credentials,
+            Some(1),
+        );
+
+        let destination = std::env::temp_dir().join(format!(
+            "sley-remote-live-clone-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&destination);
+        let config = remote_config(&url);
+        let mut configure = |_git_dir: &Path| Ok(config.clone());
+        let mut configure_branch = |_git_dir: &Path, _branch: &str| Ok(config.clone());
+        let options = CloneOptions {
+            origin: "origin",
+            checkout_branch: &branch,
+            remote_head_branch: &branch,
+            single_branch: true,
+            depth: Some(1),
+            deepen_since: None,
+            deepen_not: Vec::new(),
+            committer: b"Sley Remote Live <sley@example.invalid> 1 +0000".to_vec(),
+            detached_head: None,
+            filter: None,
+        };
+        let mut clone_credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let outcome = clone(
+            CloneRequest {
+                destination: &destination,
+                format: ObjectFormat::Sha1,
+                source: &CloneSource::Http(RemoteUrl { ..remote }),
+                options: &options,
+            },
+            CloneServices {
+                configure: &mut configure,
+                configure_branch: &mut configure_branch,
+                credentials: &mut clone_credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("live shallow HTTPS clone should succeed");
+
+        assert!(outcome.git_dir.join("shallow").exists());
     }
 }

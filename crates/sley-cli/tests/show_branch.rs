@@ -118,7 +118,12 @@ impl RepoBuilder {
     fn commit_file(&mut self, file: &str, content: &str, message: &str) {
         fs::write(self.repo.join(file), content).expect("write file");
         git_ok(&self.repo, &["add", file]);
-        let out = run_env_dated(sley_testkit::oracle_git(), &self.repo, &["commit", "-qm", message], &self.date());
+        let out = run_env_dated(
+            sley_testkit::oracle_git(),
+            &self.repo,
+            &["commit", "-qm", message],
+            &self.date(),
+        );
         assert!(
             out.status.success(),
             "commit failed: {}",

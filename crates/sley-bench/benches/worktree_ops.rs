@@ -91,14 +91,7 @@ impl Worktree {
         run(
             &git,
             &root,
-            &[
-                "-c",
-                "init.defaultBranch=main",
-                "init",
-                "-b",
-                "main",
-                ".",
-            ],
+            &["-c", "init.defaultBranch=main", "init", "-b", "main", "."],
         )?;
         for index in 0..FILE_COUNT {
             let path = file_path(&root, index);
@@ -130,11 +123,8 @@ impl Worktree {
     fn dirty(&self) -> Result<()> {
         for index in 0..DIRTY_COUNT {
             let path = file_path(&self.root, index);
-            fs::write(
-                &path,
-                format!("dirtied content {index} {}\n", nonce()),
-            )
-            .map_err(|e| GitError::Io(e.to_string()))?;
+            fs::write(&path, format!("dirtied content {index} {}\n", nonce()))
+                .map_err(|e| GitError::Io(e.to_string()))?;
         }
         Ok(())
     }

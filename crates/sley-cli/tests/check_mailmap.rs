@@ -114,7 +114,11 @@ Earlier <earlier@example.com> <dupe@example.com>
 ",
     )
     .expect("write forms map");
-    let blob = run_output(sley_testkit::oracle_git(), &repo, &["hash-object", "-w", "forms.map"]);
+    let blob = run_output(
+        sley_testkit::oracle_git(),
+        &repo,
+        &["hash-object", "-w", "forms.map"],
+    );
     assert!(blob.status.success(), "git hash-object failed");
     let blob = String::from_utf8(blob.stdout).expect("utf8 oid");
     let blob = blob.trim();

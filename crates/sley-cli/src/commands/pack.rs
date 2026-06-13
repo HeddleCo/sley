@@ -344,7 +344,10 @@ fn repack_preferred_bitmap_tips(
     }
     let store = FileRefStore::new(git_dir, format);
     for reference in store.list_refs()? {
-        if !prefixes.iter().any(|prefix| reference.name.starts_with(prefix)) {
+        if !prefixes
+            .iter()
+            .any(|prefix| reference.name.starts_with(prefix))
+        {
             continue;
         }
         let RefTarget::Direct(oid) = reference.target else {
@@ -631,8 +634,9 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "-n" => dry_run = true,
             "-q" | "-r" | "--strict" => {}
-            value if value.starts_with("--pack_header=") || value.starts_with("--max-input-size=") => {
-            }
+            value
+                if value.starts_with("--pack_header=")
+                    || value.starts_with("--max-input-size=") => {}
             value => {
                 return Err(GitError::Command(format!(
                     "unpack-objects: unsupported option {value}"
@@ -1265,25 +1269,22 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             "--bitmap" => write_bitmap = true,
             "--no-bitmap" => write_bitmap = false,
             "--preferred-pack" => {
-                let value = iter.next().ok_or_else(|| {
-                    GitError::Command("--preferred-pack requires a value".into())
-                })?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--preferred-pack requires a value".into()))?;
                 preferred_pack_name = Some(value.clone());
             }
             value if value.starts_with("--preferred-pack=") => {
                 preferred_pack_name = Some(value["--preferred-pack=".len()..].to_string());
             }
             "--refs-snapshot" => {
-                let value = iter.next().ok_or_else(|| {
-                    GitError::Command("--refs-snapshot requires a value".into())
-                })?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--refs-snapshot requires a value".into()))?;
                 refs_snapshot = Some(resolve_cli_path(&cwd, value));
             }
             value if value.starts_with("--refs-snapshot=") => {
-                refs_snapshot = Some(resolve_cli_path(
-                    &cwd,
-                    &value["--refs-snapshot=".len()..],
-                ));
+                refs_snapshot = Some(resolve_cli_path(&cwd, &value["--refs-snapshot=".len()..]));
             }
             other => {
                 return Err(GitError::Unsupported(format!(

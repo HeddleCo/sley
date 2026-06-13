@@ -4452,8 +4452,7 @@ mod tests {
         let bombs: &[u64] = &[u64::MAX, 1024 * 1024 * 1024 * 1024];
         for &declared in bombs {
             for delta_kind in [DeltaKind::Ref, DeltaKind::Offset] {
-                let pack =
-                    lying_result_size_delta_pack(ObjectFormat::Sha1, declared, delta_kind);
+                let pack = lying_result_size_delta_pack(ObjectFormat::Sha1, declared, delta_kind);
                 let handle = std::thread::spawn(move || PackFile::parse_sha1(&pack));
                 let join_result = handle.join();
                 assert!(
@@ -4706,12 +4705,9 @@ mod tests {
     fn read_object_header_at_cached_matches_uncached_cold_and_warm_for_ofs_delta() {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(true);
-        let written = PackFile::write_packed_with_options(
-            &[base, changed],
-            ObjectFormat::Sha1,
-            &options,
-        )
-        .expect("test operation should succeed");
+        let written =
+            PackFile::write_packed_with_options(&[base, changed], ObjectFormat::Sha1, &options)
+                .expect("test operation should succeed");
         // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
         let mut second = written.entries[1].offset as usize;
         assert_eq!(
@@ -7133,7 +7129,8 @@ mod tests {
                 .entries
                 .iter()
                 .position(|entry| position_of(entry.offset) == commit_position)
-                .expect("test operation should succeed") as u32;
+                .expect("test operation should succeed")
+                as u32;
             let reachable: Vec<u32> = (0..index.entries.len() as u32).collect();
             let bytes = write_bitmap(
                 ObjectFormat::Sha1,

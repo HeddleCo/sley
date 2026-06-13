@@ -712,6 +712,15 @@ pub struct CommitGraphWriteEntry {
 
 impl CommitGraph {
     pub fn write(format: ObjectFormat, entries: &[CommitGraphWriteEntry]) -> Result<Vec<u8>> {
+        Self::write_with_bloom_settings(format, entries, DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS)
+    }
+
+    pub fn write_with_bloom_settings(
+        format: ObjectFormat,
+        entries: &[CommitGraphWriteEntry],
+        bloom_settings: CommitGraphBloomSettings,
+    ) -> Result<Vec<u8>> {
+        validate_commit_graph_bloom_settings(bloom_settings)?;
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
         validate_commit_graph_write_entries(format, &entries)?;
@@ -730,7 +739,7 @@ impl CommitGraph {
         if !edge.is_empty() {
             chunks.push((*b"EDGE", edge));
         }
-        let bloom = write_commit_graph_bloom_filters(&entries, DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS);
+        let bloom = write_commit_graph_bloom_filters(&entries, bloom_settings);
         if let Some((bidx, bdat)) = bloom {
             chunks.push((*b"BIDX", bidx));
             chunks.push((*b"BDAT", bdat));
@@ -894,6 +903,15 @@ impl CommitGraphBloomFilters {
                 max_changed_paths: DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
             },
         ))
+    }
+}
+
+fn validate_commit_graph_bloom_settings(settings: CommitGraphBloomSettings) -> Result<()> {
+    match settings.hash_version {
+        1 | 2 => Ok(()),
+        other => Err(GitError::Unsupported(format!(
+            "commit-graph changed-path Bloom filter hash version {other}"
+        ))),
     }
 }
 
@@ -1143,19 +1161,17 @@ pub fn commit_graph_bloom_filter_contains(
     if filter.is_empty() {
         return false;
     }
-    commit_graph_bloom_key_hashes(path, settings).into_iter().all(|hash| {
-        let bit = u64::from(hash) % ((filter.len() as u64) * 8);
-        let byte = (bit / 8) as usize;
-        let mask = 1u8 << (bit & 7);
-        filter.get(byte).is_some_and(|value| value & mask != 0)
-    })
+    commit_graph_bloom_key_hashes(path, settings)
+        .into_iter()
+        .all(|hash| {
+            let bit = u64::from(hash) % ((filter.len() as u64) * 8);
+            let byte = (bit / 8) as usize;
+            let mask = 1u8 << (bit & 7);
+            filter.get(byte).is_some_and(|value| value & mask != 0)
+        })
 }
 
-fn add_commit_graph_bloom_key(
-    filter: &mut [u8],
-    path: &[u8],
-    settings: CommitGraphBloomSettings,
-) {
+fn add_commit_graph_bloom_key(filter: &mut [u8], path: &[u8], settings: CommitGraphBloomSettings) {
     if filter.is_empty() {
         return;
     }
@@ -2442,9 +2458,14 @@ fn repair_worktree_after_gitdir_move(admin_dir: &Path, old_git_dir: &Path) -> Re
 /// are absolute. The two paths used by git are the worktree root (`dotgit`
 /// minus the trailing `/.git`) and the admin dir (`gitdir_file` minus the
 /// trailing `/gitdir`), each `realpath`-resolved.
-fn write_worktree_linking_files(dotgit: &Path, gitdir_file: &Path, use_relative: bool) -> Result<()> {
+fn write_worktree_linking_files(
+    dotgit: &Path,
+    gitdir_file: &Path,
+    use_relative: bool,
+) -> Result<()> {
     let worktree_root = dotgit.parent().unwrap_or(Path::new("."));
-    let worktree_root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+    let worktree_root =
+        fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
     let admin_dir = gitdir_file.parent().unwrap_or(Path::new("."));
     let admin_dir = fs::canonicalize(admin_dir).unwrap_or_else(|_| admin_dir.to_path_buf());
     let worktree_dotgit = worktree_root.join(".git");
@@ -2456,10 +2477,7 @@ fn write_worktree_linking_files(dotgit: &Path, gitdir_file: &Path, use_relative:
         let link = relative_path_lexical(&admin_dir, &worktree_root);
         fs::write(&worktree_dotgit, format!("gitdir: {link}\n"))?;
     } else {
-        fs::write(
-            gitdir_file,
-            format!("{}\n", worktree_dotgit.display()),
-        )?;
+        fs::write(gitdir_file, format!("{}\n", worktree_dotgit.display()))?;
         fs::write(
             &worktree_dotgit,
             format!("gitdir: {}\n", admin_dir.display()),
@@ -3027,6 +3045,59 @@ mod tests {
                 bits_per_entry: 10,
                 filters: vec![vec![0xaa, 0xbb], vec![0xcc]],
             })
+        );
+    }
+
+    #[test]
+    fn writes_commit_graph_bloom_filters_with_requested_hash_version() {
+        let tree = oid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut settings = DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+        settings.hash_version = 2;
+        let bytes = CommitGraph::write_with_bloom_settings(
+            ObjectFormat::Sha1,
+            &[CommitGraphWriteEntry {
+                oid: oid("1111111111111111111111111111111111111111"),
+                tree,
+                parents: Vec::new(),
+                generation: 1,
+                commit_time: 1,
+                bloom_filter: Some(vec![0xaa, 0xbb]),
+            }],
+            settings,
+        )
+        .expect("test operation should succeed");
+
+        let parsed =
+            CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
+        let bloom = parsed
+            .bloom_filters
+            .expect("test operation should parse bloom filters");
+        assert_eq!(bloom.hash_version, 2);
+        assert_eq!(bloom.hash_count, settings.hash_count);
+        assert_eq!(bloom.bits_per_entry, settings.bits_per_entry);
+        assert_eq!(bloom.filters, vec![vec![0xaa, 0xbb]]);
+    }
+
+    #[test]
+    fn rejects_unsupported_commit_graph_bloom_hash_version_on_write() {
+        let tree = oid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut settings = DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+        settings.hash_version = 3;
+
+        assert!(
+            CommitGraph::write_with_bloom_settings(
+                ObjectFormat::Sha1,
+                &[CommitGraphWriteEntry {
+                    oid: oid("1111111111111111111111111111111111111111"),
+                    tree,
+                    parents: Vec::new(),
+                    generation: 1,
+                    commit_time: 1,
+                    bloom_filter: Some(vec![0xaa]),
+                }],
+                settings,
+            )
+            .is_err()
         );
     }
 

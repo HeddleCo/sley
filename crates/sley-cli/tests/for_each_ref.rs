@@ -1294,7 +1294,10 @@ fn for_each_ref_name_only_format_skips_missing_object() {
         // a plain filesystem write, no host state, fully hermetic.
         let dangling = "0123456789012345678901234567890123456789";
         fs::write(
-            root.join(".git").join("refs").join("heads").join("dangling"),
+            root.join(".git")
+                .join("refs")
+                .join("heads")
+                .join("dangling"),
             format!("{dangling}\n"),
         )
         .expect("write dangling loose ref");

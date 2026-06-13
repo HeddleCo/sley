@@ -16,7 +16,7 @@
 //! / `FETCH_HEAD` / prune helpers are shared so there is a single implementation.
 
 use crate::local::LocalDeepenPlan;
-use std::collections::{HashMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -90,9 +90,10 @@ pub struct FetchOptions {
     /// matches this value as eligible for merge in `FETCH_HEAD` (used by `pull`).
     pub merge_src: Option<String>,
     /// Partial-clone object filter (`--filter=blob:none`): omit filtered
-    /// objects from the transferred pack. Only honored by the in-process local
-    /// (`file://`/path) server today; directly-wanted tips are always packed,
-    /// mirroring upstream's filter traversal.
+    /// objects from the transferred pack. Local-only today: HTTP and SSH do not
+    /// send `filter` requests yet, so callers that require network filtering
+    /// must gate that before calling [`fetch`]. Directly-wanted tips are always
+    /// packed on the local path, mirroring upstream's filter traversal.
     pub filter: Option<sley_odb::PackObjectFilter>,
     /// This fetch is a clone (`fetch_pack_args.cloning`): shallow points sent
     /// by a shallow server are accepted into `$GIT_DIR/shallow` unconditionally.
@@ -101,11 +102,14 @@ pub struct FetchOptions {
     /// (otherwise refs whose history needs them are rejected).
     pub update_shallow: bool,
     /// `--deepen=N`: `depth` is relative to the client's current boundary.
+    /// Local-only today; HTTP and SSH treat `depth` as an absolute `--depth N`.
     pub deepen_relative: bool,
     /// `--shallow-since=<date>`: deepen to commits newer than the date.
+    /// Local-only today; HTTP and SSH do not send `deepen-since` yet.
     pub deepen_since: Option<i64>,
     /// `--shallow-exclude=<ref>`: deepen to commits not reachable from the ref
     /// (resolved on the remote; a non-ref is an error, like upstream).
+    /// Local-only today; HTTP and SSH do not send `deepen-not` yet.
     pub deepen_not: Vec<String>,
 }
 
@@ -399,8 +403,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     return Ok(None);
                 }
                 // Replay the current boundary, like the HTTP and SSH paths.
-                let client_shallow =
-                    crate::shallow::read_shallow(request.git_dir, request.format)?;
+                let client_shallow = crate::shallow::read_shallow(request.git_dir, request.format)?;
                 if options.deepen_since.is_some() || !deepen_not_oids.is_empty() {
                     return Ok(Some(crate::local::compute_local_deepen_by_rev_list(
                         &remote_db,
@@ -478,12 +481,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                         if let Some(&cached) = dirty_cache.get(tip) {
                             return Ok(cached);
                         }
-                        let result = tip_reaches_boundary(
-                            &remote_db,
-                            request.format,
-                            tip,
-                            &new_points,
-                        )?;
+                        let result =
+                            tip_reaches_boundary(&remote_db, request.format, tip, &new_points)?;
                         dirty_cache.insert(*tip, result);
                         Ok(result)
                     };
@@ -1050,4 +1049,245 @@ fn remote_tracking_branch_names(refs: &[Ref], name: &str) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sley_formats::RepositoryLayout;
+    use sley_object::{Commit, EncodedObject, ObjectType, Tree};
+    use sley_odb::{FileObjectDatabase, ObjectWriter};
+    use sley_refs::{RefTarget, RefUpdate};
+
+    use crate::{NoCredentials, SilentProgress};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sley-remote-fetch-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        RepositoryLayout::init_at(&dir, ObjectFormat::Sha1, false)
+            .expect("test repository should initialize");
+        dir.join(".git")
+    }
+
+    fn commit_on(git_dir: &Path, branch: &str, message: &str) -> ObjectId {
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree { entries: vec![] }.write(),
+            ))
+            .expect("tree should write");
+        let identity = b"Test User <test@example.invalid> 1 +0000".to_vec();
+        let oid = db
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: Vec::new(),
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: format!("{message}\n").into_bytes(),
+                }
+                .write(),
+            ))
+            .expect("commit should write");
+        let store = FileRefStore::new(git_dir, format);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: format!("refs/heads/{branch}"),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic(format!("refs/heads/{branch}")),
+            reflog: None,
+        });
+        tx.commit().expect("refs should update");
+        oid
+    }
+
+    fn default_options() -> FetchOptions {
+        FetchOptions {
+            quiet: true,
+            auto_follow_tags: false,
+            fetch_all_tags: false,
+            prune: false,
+            dry_run: false,
+            append: false,
+            write_fetch_head: true,
+            tag_option_explicit: true,
+            prune_option_explicit: true,
+            depth: None,
+            merge_src: None,
+            filter: None,
+            cloning: false,
+            update_shallow: false,
+            deepen_relative: false,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn local_fetch_installs_pack_updates_ref_and_fetch_head() {
+        let remote = temp_repo("remote");
+        let local = temp_repo("local");
+        let tip = commit_on(&remote, "main", "remote tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let refspecs = vec!["refs/heads/main:refs/remotes/origin/main".to_string()];
+        let options = default_options();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let outcome = fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &refspecs,
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("fetch should succeed");
+
+        assert_eq!(outcome.ref_updates.len(), 1);
+        assert!(outcome.wrote_fetch_head);
+        let local_db = FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1);
+        assert!(local_db.contains(&tip).expect("contains should read"));
+        let local_refs = FileRefStore::new(&local, ObjectFormat::Sha1);
+        assert_eq!(
+            local_refs
+                .read_ref("refs/remotes/origin/main")
+                .expect("ref should read"),
+            Some(RefTarget::Direct(tip))
+        );
+        let fetch_head = fs::read_to_string(local.join("FETCH_HEAD")).expect("FETCH_HEAD exists");
+        assert!(fetch_head.contains("origin"));
+    }
+
+    #[test]
+    fn shallow_local_fetch_writes_depth_boundary_metadata() {
+        let remote = temp_repo("remote-shallow");
+        let local = temp_repo("local-shallow");
+        let tip = commit_on(&remote, "main", "tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let mut options = default_options();
+        options.depth = Some(1);
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("shallow fetch should succeed");
+
+        assert_eq!(
+            crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+                .expect("shallow file should read"),
+            vec![tip]
+        );
+    }
+
+    #[test]
+    fn failed_local_fetch_does_not_partially_mutate_refs_or_fetch_head() {
+        let remote = temp_repo("remote-missing");
+        let local = temp_repo("local-missing");
+        let old = commit_on(&local, "main", "old local");
+        let bogus =
+            ObjectId::from_hex(ObjectFormat::Sha1, &"11".repeat(20)).expect("valid bogus oid");
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        let mut tx = remote_refs.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(bogus),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/main".into()),
+            reflog: None,
+        });
+        tx.commit().expect("remote bogus ref should write");
+        let local_refs = FileRefStore::new(&local, ObjectFormat::Sha1);
+        let mut tx = local_refs.transaction();
+        tx.update(RefUpdate {
+            name: "refs/remotes/origin/main".into(),
+            expected: None,
+            new: RefTarget::Direct(old),
+            reflog: None,
+        });
+        tx.commit().expect("local tracking ref should write");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let options = default_options();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let err = fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect_err("fetch should fail before finalizing refs");
+
+        assert!(err.to_string().contains("missing object"));
+        assert_eq!(
+            local_refs
+                .read_ref("refs/remotes/origin/main")
+                .expect("ref should read"),
+            Some(RefTarget::Direct(old))
+        );
+        assert!(!local.join("FETCH_HEAD").exists());
+    }
 }

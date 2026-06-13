@@ -486,7 +486,9 @@ pub fn assemble_pack_with_verbatim_reuses(
             return Err(GitError::InvalidFormat("reused pack too short".into()));
         }
         if &reused_pack_bytes[..4] != b"PACK" {
-            return Err(GitError::InvalidFormat("reused pack has no signature".into()));
+            return Err(GitError::InvalidFormat(
+                "reused pack has no signature".into(),
+            ));
         }
         let version = u32::from_be_bytes([
             reused_pack_bytes[4],
@@ -495,7 +497,9 @@ pub fn assemble_pack_with_verbatim_reuses(
             reused_pack_bytes[7],
         ]);
         if version != 2 {
-            return Err(GitError::Unsupported(format!("reused pack version {version}")));
+            return Err(GitError::Unsupported(format!(
+                "reused pack version {version}"
+            )));
         }
         let count = u32::from_be_bytes([
             reused_pack_bytes[8],
@@ -1891,7 +1895,10 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
         return Ok(None);
     };
-    let bitmap_path = pack_dir.join(format!("multi-pack-index-{}.bitmap", midx.checksum.to_hex()));
+    let bitmap_path = pack_dir.join(format!(
+        "multi-pack-index-{}.bitmap",
+        midx.checksum.to_hex()
+    ));
     if !bitmap_path.exists() {
         return Ok(None);
     }
@@ -1915,7 +1922,9 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
                 // Without the RIDX permutation the bit numbering is unknown.
                 return Ok(None);
             };
-            let Ok(parsed_rev) = sley_pack::PackReverseIndex::parse(&rev_bytes, format, object_count) else {
+            let Ok(parsed_rev) =
+                sley_pack::PackReverseIndex::parse(&rev_bytes, format, object_count)
+            else {
                 return Ok(None);
             };
             sley_core::trace2::data("load_midx_revindex", "source", "rev");
@@ -2017,9 +2026,8 @@ fn assemble_loaded_bitmap(
         }
         let words = Arc::new(words);
         resolved.push(Arc::clone(&words));
-        let commit_oid = lookup_oid(entry.object_position as usize).ok_or_else(|| {
-            GitError::InvalidFormat("bitmap entry position out of range".into())
-        })?;
+        let commit_oid = lookup_oid(entry.object_position as usize)
+            .ok_or_else(|| GitError::InvalidFormat("bitmap entry position out of range".into()))?;
         commit_words.insert(commit_oid, words);
     }
 
@@ -3743,10 +3751,7 @@ impl LooseObjectStore {
                 Err(_) => return true,
             }
         }
-        guard
-            .as_ref()
-            .map(|set| set.contains(oid))
-            .unwrap_or(true)
+        guard.as_ref().map(|set| set.contains(oid)).unwrap_or(true)
     }
 
     /// Record `oid` as present in loose storage so subsequent reads find it

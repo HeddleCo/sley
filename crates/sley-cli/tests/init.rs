@@ -85,7 +85,11 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
     {
         let repo = root.join("repo");
         let repo_arg = repo.to_str().expect("utf8 temp path");
-        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "-b", "topic", repo_arg]);
+        let expected = run_status(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-b", "topic", repo_arg],
+        );
         assert_eq!(expected.0, 0, "upstream init failed");
         fs::remove_dir_all(&repo).expect("remove upstream repo");
         let actual = run_status(
@@ -98,7 +102,11 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
 
         let bare = root.join("bare.git");
         let bare_arg = bare.to_str().expect("utf8 temp path");
-        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "--bare", "-b", "topic", bare_arg]);
+        let expected = run_status(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "--bare", "-b", "topic", bare_arg],
+        );
         assert_eq!(expected.0, 0, "upstream bare init failed");
         fs::remove_dir_all(&bare).expect("remove upstream bare repo");
         let actual = run_status(
@@ -115,7 +123,11 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
         let reinit = root.join("reinit");
         let reinit_arg = reinit.to_str().expect("utf8 temp path");
         git(&root, &["init", "-q", "-b", "topic", reinit_arg]);
-        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "-b", "other", reinit_arg]);
+        let expected = run_status(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-b", "other", reinit_arg],
+        );
         let expected_head = git(&reinit, &["symbolic-ref", "HEAD"]);
         fs::remove_dir_all(&reinit).expect("remove upstream reinit repo");
         git_rs(&root, &["init", "-q", "-b", "topic", reinit_arg]);
@@ -134,7 +146,11 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
             &root,
             &["init", "-q", "--bare", "-b", "topic", bare_reinit_arg],
         );
-        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "--bare", bare_reinit_arg]);
+        let expected = run_status(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "--bare", bare_reinit_arg],
+        );
         let expected_head = git(
             &root,
             &["--git-dir", bare_reinit_arg, "symbolic-ref", "HEAD"],
@@ -362,7 +378,11 @@ fn init_unknown_ref_format_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp root");
     let repo = root.join("repo");
     let repo_arg = repo.to_str().expect("utf8 temp path");
-    let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "--ref-format=garbage", repo_arg]);
+    let expected = run_status(
+        sley_testkit::oracle_git(),
+        &root,
+        &["init", "--ref-format=garbage", repo_arg],
+    );
     let actual = run_status(
         env!("CARGO_BIN_EXE_sley"),
         &root,
@@ -447,8 +467,12 @@ fn init_default_branch_honors_config_and_falls_back_to_master() {
             &["symbolic-ref", "HEAD"],
             &envs,
         );
-        let actual_head =
-            run_status_env(sley_testkit::oracle_git(), &rust, &["symbolic-ref", "HEAD"], &envs);
+        let actual_head = run_status_env(
+            sley_testkit::oracle_git(),
+            &rust,
+            &["symbolic-ref", "HEAD"],
+            &envs,
+        );
         assert_eq!(actual_head.1, expected_head.1, "HEAD differed for {name}");
     }
     let _ = fs::remove_dir_all(&root);
@@ -479,10 +503,25 @@ fn init_invalid_default_object_format_warns_like_upstream_git() {
         &["init", "-q", rust.to_str().expect("utf8 temp path")],
         &envs,
     );
-    assert_eq!(actual, expected, "invalid init.defaultObjectFormat differed");
     assert_eq!(
-        run_status_env(sley_testkit::oracle_git(), &rust, &["rev-parse", "--show-object-format"], &envs).1,
-        run_status_env(sley_testkit::oracle_git(), &upstream, &["rev-parse", "--show-object-format"], &envs).1,
+        actual, expected,
+        "invalid init.defaultObjectFormat differed"
+    );
+    assert_eq!(
+        run_status_env(
+            sley_testkit::oracle_git(),
+            &rust,
+            &["rev-parse", "--show-object-format"],
+            &envs
+        )
+        .1,
+        run_status_env(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "--show-object-format"],
+            &envs
+        )
+        .1,
         "fallback object format differed"
     );
     let _ = fs::remove_dir_all(&root);
@@ -513,7 +552,10 @@ fn init_invalid_default_ref_format_config_warns_env_is_fatal() {
         &["init", "-q", rust.to_str().expect("utf8 temp path")],
         &config_envs,
     );
-    assert_eq!(actual, expected, "invalid init.defaultRefFormat (config) differed");
+    assert_eq!(
+        actual, expected,
+        "invalid init.defaultRefFormat (config) differed"
+    );
 
     let empty_home = root.join("home-empty");
     write_global_config(&empty_home, "");
@@ -598,12 +640,28 @@ fn init_object_format_env_and_cli_precedence_match_upstream_git() {
 
         let expected = run_status_env(sley_testkit::oracle_git(), &root, &upstream_args, case.envs);
         let actual = run_status_env(env!("CARGO_BIN_EXE_sley"), &root, &rust_args, case.envs);
-        assert_eq!(actual, expected, "object-format case {} differed", case.name);
+        assert_eq!(
+            actual, expected,
+            "object-format case {} differed",
+            case.name
+        );
 
         if case.show_format {
             assert_eq!(
-                run_status_env(sley_testkit::oracle_git(), &rust, &["rev-parse", "--show-object-format"], case.envs).1,
-                run_status_env(sley_testkit::oracle_git(), &upstream, &["rev-parse", "--show-object-format"], case.envs).1,
+                run_status_env(
+                    sley_testkit::oracle_git(),
+                    &rust,
+                    &["rev-parse", "--show-object-format"],
+                    case.envs
+                )
+                .1,
+                run_status_env(
+                    sley_testkit::oracle_git(),
+                    &upstream,
+                    &["rev-parse", "--show-object-format"],
+                    case.envs
+                )
+                .1,
                 "object format differed for {}",
                 case.name
             );
@@ -637,7 +695,12 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
         let created = run_status_env(
             program,
             &root,
-            &["init", "-q", "--object-format=sha256", path.to_str().expect("utf8 temp path")],
+            &[
+                "init",
+                "-q",
+                "--object-format=sha256",
+                path.to_str().expect("utf8 temp path"),
+            ],
             &envs,
         );
         assert_eq!(created.0, 0, "initial sha256 init failed");
@@ -662,7 +725,13 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
     );
     // The repository must be left untouched at sha256 after the rejected reinit.
     assert_eq!(
-        run_status_env(sley_testkit::oracle_git(), &rust, &["rev-parse", "--show-object-format"], &envs).1,
+        run_status_env(
+            sley_testkit::oracle_git(),
+            &rust,
+            &["rev-parse", "--show-object-format"],
+            &envs
+        )
+        .1,
         b"sha256\n".to_vec(),
         "rejected reinit must not change the object format"
     );
@@ -705,13 +774,23 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
     let expected_ref = run_status_env(
         sley_testkit::oracle_git(),
         &root,
-        &["init", "-q", "--ref-format=reftable", upstream_ref.to_str().expect("utf8 temp path")],
+        &[
+            "init",
+            "-q",
+            "--ref-format=reftable",
+            upstream_ref.to_str().expect("utf8 temp path"),
+        ],
         &envs,
     );
     let actual_ref = run_status_env(
         env!("CARGO_BIN_EXE_sley"),
         &root,
-        &["init", "-q", "--ref-format=reftable", rust_ref.to_str().expect("utf8 temp path")],
+        &[
+            "init",
+            "-q",
+            "--ref-format=reftable",
+            rust_ref.to_str().expect("utf8 temp path"),
+        ],
         &envs,
     );
     assert_eq!(
@@ -767,7 +846,13 @@ fn init_reinit_ignores_default_hash_env_like_upstream_git() {
     assert_eq!(actual.0, expected.0, "reinit exit differed");
     assert_eq!(actual.2, expected.2, "reinit stderr differed");
     assert_eq!(
-        run_status_env(sley_testkit::oracle_git(), &rust, &["rev-parse", "--show-object-format"], &base_envs).1,
+        run_status_env(
+            sley_testkit::oracle_git(),
+            &rust,
+            &["rev-parse", "--show-object-format"],
+            &base_envs
+        )
+        .1,
         b"sha1\n".to_vec(),
         "defaulted GIT_DEFAULT_HASH must not change the existing format"
     );

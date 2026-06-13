@@ -389,7 +389,12 @@ fn shortlog_stdin_matches_git() {
     }
     let repo = build_repo("shortlog-stdin");
     // Feed the canonical `git log --pretty=short` stream into both binaries.
-    let log = run(sley_testkit::oracle_git(), &repo, &["log", "--pretty=short", "HEAD"]).stdout;
+    let log = run(
+        sley_testkit::oracle_git(),
+        &repo,
+        &["log", "--pretty=short", "HEAD"],
+    )
+    .stdout;
     let cases: &[&[&str]] = &[&[], &["-s"], &["-e"], &["-se"], &["-sn"], &["--committer"]];
     for case in cases {
         assert_same_stdin(&repo, case, &log);
@@ -400,7 +405,12 @@ fn shortlog_stdin_matches_git() {
     assert_same_stdin(&repo, &["-s"], &medium);
     // The `--format=fuller` stream carries `Commit:` headers, so committer grouping
     // from stdin produces real output rather than an empty result.
-    let fuller = run(sley_testkit::oracle_git(), &repo, &["log", "--format=fuller", "HEAD"]).stdout;
+    let fuller = run(
+        sley_testkit::oracle_git(),
+        &repo,
+        &["log", "--format=fuller", "HEAD"],
+    )
+    .stdout;
     assert_same_stdin(&repo, &["-s", "--committer"], &fuller);
     assert_same_stdin(&repo, &["-se", "--committer"], &fuller);
     assert_same_stdin(&repo, &["-s"], &fuller);

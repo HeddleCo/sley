@@ -79,7 +79,11 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
 }
 
 fn git_rs() -> &'static str {
@@ -114,22 +118,40 @@ fn mktree_basic_and_z_modes_match_upstream_git() {
         assert_eq!(actual_z, expected_z);
 
         let input = format!("100644 blob {expected_z}\tz\n100644 blob {expected_a}\ta\n");
-        let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &["mktree"], input.as_bytes());
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["mktree"],
+            input.as_bytes(),
+        );
         let actual_output = run_with_stdin(git_rs(), &actual, &["mktree"], input.as_bytes());
         let actual_tree = String::from_utf8(actual_output.stdout.clone())
             .expect("mktree output is utf8")
             .trim()
             .to_string();
         assert_same_output(actual_output, expected_output, &["mktree"]);
-        let expected_tree = run_success(sley_testkit::oracle_git(), &expected, &["cat-file", "-p", &actual_tree]);
-        let actual_tree = run_success(sley_testkit::oracle_git(), &actual, &["cat-file", "-p", &actual_tree]);
+        let expected_tree = run_success(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["cat-file", "-p", &actual_tree],
+        );
+        let actual_tree = run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["cat-file", "-p", &actual_tree],
+        );
         assert_eq!(actual_tree, expected_tree);
 
         let mut nul_input = format!("100644 blob {expected_z}\tz").into_bytes();
         nul_input.push(0);
         nul_input.extend_from_slice(format!("100644 blob {expected_a}\ta").as_bytes());
         nul_input.push(0);
-        let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &["mktree", "-z"], &nul_input);
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["mktree", "-z"],
+            &nul_input,
+        );
         let actual_output = run_with_stdin(git_rs(), &actual, &["mktree", "-z"], &nul_input);
         assert_same_output(actual_output, expected_output, &["mktree", "-z"]);
     };
@@ -146,8 +168,12 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
         prepare_repo(&actual);
         let missing = "0000000000000000000000000000000000000000";
         let missing_blob = format!("100644 blob {missing}\tmissing\n");
-        let expected_output =
-            run_with_stdin(sley_testkit::oracle_git(), &expected, &["mktree"], missing_blob.as_bytes());
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["mktree"],
+            missing_blob.as_bytes(),
+        );
         let actual_output = run_with_stdin(git_rs(), &actual, &["mktree"], missing_blob.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree"]);
 
@@ -166,8 +192,12 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
         assert_same_output(actual_output, expected_output, &["mktree", "--missing"]);
 
         let commit_entry = format!("160000 commit {missing}\tsubmodule\n");
-        let expected_output =
-            run_with_stdin(sley_testkit::oracle_git(), &expected, &["mktree"], commit_entry.as_bytes());
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["mktree"],
+            commit_entry.as_bytes(),
+        );
         let actual_output = run_with_stdin(git_rs(), &actual, &["mktree"], commit_entry.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree"]);
 
@@ -176,8 +206,12 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
         hash_blob(&actual, b"a");
         hash_blob(&actual, b"b");
         let batch = format!("100644 blob {a}\ta\n\n100644 blob {b}\tb\n");
-        let expected_output =
-            run_with_stdin(sley_testkit::oracle_git(), &expected, &["mktree", "--batch"], batch.as_bytes());
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["mktree", "--batch"],
+            batch.as_bytes(),
+        );
         let actual_output =
             run_with_stdin(git_rs(), &actual, &["mktree", "--batch"], batch.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree", "--batch"]);

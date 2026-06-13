@@ -197,7 +197,12 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         "REBASE_HEAD presence differed after rebase --continue"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "HEAD"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after rebase --continue"
     );
@@ -207,7 +212,12 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         "log order differed after rebase --continue"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "master"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "master"]
+        )
+        .stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "master"]).stdout,
         "master branch differed after rebase --continue"
     );
@@ -217,7 +227,12 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         "worktree content differed after rebase --continue"
     );
     assert_eq!(
-        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%s"]
+        )
+        .stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -226,9 +241,15 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         .stdout,
         "latest commit subject differed after rebase --continue"
     );
-    let upstream_pre_pull_parent =
-        String::from_utf8(run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%P"]).stdout)
-            .expect("upstream parents utf8");
+    let upstream_pre_pull_parent = String::from_utf8(
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["log", "-1", "--format=%P"],
+        )
+        .stdout,
+    )
+    .expect("upstream parents utf8");
     assert_eq!(
         upstream_pre_pull_parent.split_whitespace().count(),
         1,

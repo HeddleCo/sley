@@ -71,12 +71,20 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn fixture(root: &Path) {
-    run(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "-b", "main"],
+    );
     write_fixture_contents(root);
 }
 
 fn sha256_fixture(root: &Path) {
-    run(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+    run(
+        sley_testkit::oracle_git(),
+        root,
+        &["init", "-q", "--object-format=sha256", "-b", "main"],
+    );
     write_fixture_contents(root);
 }
 
@@ -97,7 +105,11 @@ fn write_fixture_contents(root: &Path) {
     fs::write(root.join("visible.txt"), b"visible\n").expect("write visible file");
     fs::create_dir_all(root.join("dir")).expect("create ignored dir");
     fs::write(root.join("dir/a.txt"), b"ignored\n").expect("write ignored dir file");
-    run(sley_testkit::oracle_git(), root, &["add", "-f", "tracked.log"]);
+    run(
+        sley_testkit::oracle_git(),
+        root,
+        &["add", "-f", "tracked.log"],
+    );
 }
 
 #[test]

@@ -1370,17 +1370,14 @@ fn worktree_add_resolve_commitish(
         Err(_) => {
             let attempt_hint = !options.quiet && options.start.is_none();
             if attempt_hint {
-                eprintln!(
-                    "hint: If you meant to create a worktree containing a new unborn branch"
-                );
+                eprintln!("hint: If you meant to create a worktree containing a new unborn branch");
                 eprintln!("hint: (branch with no commits) for this repository, you can do so");
                 eprintln!("hint: using the --orphan flag:");
                 eprintln!("hint:");
                 if let Some(branch) = options.branch.as_ref() {
                     eprintln!(
                         "hint:     git worktree add --orphan -b {} {}",
-                        branch,
-                        options.path
+                        branch, options.path
                     );
                 } else {
                     eprintln!("hint:     git worktree add --orphan {}", options.path);
@@ -1475,7 +1472,8 @@ fn write_worktree_linking_files(
     if relative_paths {
         upgrade_repo_for_relative_worktrees(common_git_dir)?;
         // git canonicalizes both real paths before computing the relatives.
-        let real_wt = fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+        let real_wt =
+            fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
         let real_admin = fs::canonicalize(admin_dir).unwrap_or_else(|_| admin_dir.to_path_buf());
         let admin_to_wt = relative_path_from_absolute_components(&real_admin, &real_wt)?;
         let wt_to_admin = relative_path_from_absolute_components(&real_wt, &real_admin)?;

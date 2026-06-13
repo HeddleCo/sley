@@ -6,6 +6,7 @@ use sley_object::{EncodedObject, ObjectType, TreeEntries, tree_entry_object_type
 use sley_odb::{FileObjectDatabase, LooseObjectStore, ObjectReader, ObjectWriter};
 use sley_pack::{PackFile, PackIndex, PackWriteOptions};
 use sley_refs::{FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,68 @@ const REQUIRED_ORACLE_GIT_SERIES: &str = "2.54";
 
 static ORACLE_GIT: OnceLock<&'static str> = OnceLock::new();
 
+#[cfg(not(windows))]
+pub const HERMETIC_GIT_CONFIG_PATH: &str = "/dev/null";
+#[cfg(windows)]
+pub const HERMETIC_GIT_CONFIG_PATH: &str = "NUL";
+
+/// Stable author/committer name used by test subprocesses that need identity.
+pub const TEST_GIT_USER_NAME: &str = "Example User";
+/// Stable author/committer email used by test subprocesses that need identity.
+pub const TEST_GIT_USER_EMAIL: &str = "example@example.invalid";
+/// Stable author/committer date used by test subprocesses that need identity.
+pub const TEST_GIT_IDENT_DATE: &str = "@0 +0000";
+
+const HERMETIC_GIT_ENV_REMOVE: &[&str] = &["GIT_CONFIG", "GIT_CONFIG_PARAMETERS"];
+
+/// Return a `Command` for an oracle-git-like program with host config sealed
+/// off.
+///
+/// The command starts with `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` pointed
+/// at [`HERMETIC_GIT_CONFIG_PATH`] and `GIT_CONFIG_COUNT=0`, so ordinary test
+/// invocations do not inherit a developer's global/system config or ambient
+/// `GIT_CONFIG_COUNT` injection. Callers may still deliberately override these
+/// variables after construction when a test is specifically exercising config
+/// injection.
+pub fn hermetic_git_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    apply_hermetic_git_env(&mut command);
+    command
+}
+
+/// Return a hermetic git command with deterministic author/committer identity.
+///
+/// Use this for tests that create commits or otherwise ask git for author or
+/// committer identity. Tests that only read repository state should prefer
+/// [`hermetic_git_command`].
+pub fn hermetic_git_command_with_identity(program: impl AsRef<OsStr>) -> Command {
+    let mut command = hermetic_git_command(program);
+    apply_standard_git_identity_env(&mut command);
+    command
+}
+
+/// Apply sley's hermetic git environment to an existing command.
+pub fn apply_hermetic_git_env(command: &mut Command) -> &mut Command {
+    for name in HERMETIC_GIT_ENV_REMOVE {
+        command.env_remove(name);
+    }
+    command
+        .env("GIT_CONFIG_GLOBAL", HERMETIC_GIT_CONFIG_PATH)
+        .env("GIT_CONFIG_SYSTEM", HERMETIC_GIT_CONFIG_PATH)
+        .env("GIT_CONFIG_COUNT", "0")
+}
+
+/// Apply sley's deterministic author/committer identity to an existing command.
+pub fn apply_standard_git_identity_env(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_AUTHOR_NAME", TEST_GIT_USER_NAME)
+        .env("GIT_AUTHOR_EMAIL", TEST_GIT_USER_EMAIL)
+        .env("GIT_AUTHOR_DATE", TEST_GIT_IDENT_DATE)
+        .env("GIT_COMMITTER_NAME", TEST_GIT_USER_NAME)
+        .env("GIT_COMMITTER_EMAIL", TEST_GIT_USER_EMAIL)
+        .env("GIT_COMMITTER_DATE", TEST_GIT_IDENT_DATE)
+}
+
 /// Returns the program name/path to use as the **oracle git** in parity tests.
 ///
 /// Resolution order:
@@ -39,7 +102,8 @@ static ORACLE_GIT: OnceLock<&'static str> = OnceLock::new();
 /// getting dozens of bogus diffs) into a single, self-explaining error.
 ///
 /// The returned value is `&'static str` so it is a drop-in for the `program`
-/// argument of the per-test `run`/`run_output`/… helpers and for
+/// argument of the per-test `run`/`run_output`/… helpers. New helpers should
+/// create subprocesses through [`hermetic_git_command`] rather than raw
 /// `Command::new(...)`.
 pub fn oracle_git() -> &'static str {
     ORACLE_GIT.get_or_init(|| {
@@ -57,7 +121,7 @@ pub fn oracle_git() -> &'static str {
 /// Runs `<program> --version`, parses the reported version, and panics unless it
 /// is on the [`REQUIRED_ORACLE_GIT_SERIES`] series.
 fn assert_oracle_git_version(program: &str) {
-    let output = Command::new(program)
+    let output = hermetic_git_command(program)
         .arg("--version")
         .output()
         .unwrap_or_else(|err| {
@@ -5283,7 +5347,7 @@ fn upstream_git_hash_object(
 }
 
 fn upstream_git_hash_object_in_dir(cwd: &Path, object_type: &str, body: &[u8]) -> Result<String> {
-    let mut child = Command::new(oracle_git())
+    let mut child = hermetic_git_command(oracle_git())
         .args(["hash-object", "-t", object_type, "--stdin"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -5341,7 +5405,7 @@ pub fn write_stdin_tolerating_early_exit(stdin: &mut std::process::ChildStdin, b
 }
 
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N], stdin: &[u8]) -> Result<Vec<u8>> {
-    let mut child = Command::new(oracle_git())
+    let mut child = hermetic_git_command(oracle_git())
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -5371,7 +5435,7 @@ fn run_git_with_env<const N: usize, const M: usize>(
     stdin: &[u8],
     env: [(&str, &str); M],
 ) -> Result<Vec<u8>> {
-    let mut command = Command::new(oracle_git());
+    let mut command = hermetic_git_command(oracle_git());
     command.args(args).current_dir(cwd);
     for (name, value) in env {
         command.env(name, value);
@@ -5399,7 +5463,7 @@ fn run_git_with_env<const N: usize, const M: usize>(
 }
 
 fn run_git_owned(cwd: &Path, args: &[String], stdin: &[u8]) -> Result<Vec<u8>> {
-    let mut child = Command::new(oracle_git())
+    let mut child = hermetic_git_command(oracle_git())
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -5426,7 +5490,11 @@ fn run_git_owned(cwd: &Path, args: &[String], stdin: &[u8]) -> Result<Vec<u8>> {
 fn init_repo_with_format(root: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
     match format {
         ObjectFormat::Sha1 => run_git(root, ["init", "-q", "-b", "main"], &[]),
-        ObjectFormat::Sha256 => run_git(root, ["init", "-q", "-b", "main", "--object-format=sha256"], &[]),
+        ObjectFormat::Sha256 => run_git(
+            root,
+            ["init", "-q", "-b", "main", "--object-format=sha256"],
+            &[],
+        ),
     }
 }
 
@@ -5748,6 +5816,97 @@ pub mod upstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hermetic_git_command_ignores_ambient_config_sources() {
+        let root = unique_temp_dir("sley-hermetic-git-config");
+        fs::create_dir_all(&root).expect("create temp root");
+        let global = root.join("global.gitconfig");
+        let system = root.join("system.gitconfig");
+        fs::write(&global, "[user]\n\tname = Host User\n").expect("write global config");
+        fs::write(&system, "[core]\n\teditor = host-editor\n").expect("write system config");
+
+        let mut global_command = std::process::Command::new(oracle_git());
+        global_command
+            .current_dir(&root)
+            .args(["config", "--get", "user.name"])
+            .env("GIT_CONFIG_GLOBAL", &global);
+        apply_hermetic_git_env(&mut global_command);
+        let global_output = global_command.output().expect("run git config");
+        assert!(!global_output.status.success());
+        assert!(global_output.stdout.is_empty());
+
+        let mut system_command = std::process::Command::new(oracle_git());
+        system_command
+            .current_dir(&root)
+            .args(["config", "--get", "core.editor"])
+            .env("GIT_CONFIG_SYSTEM", &system);
+        apply_hermetic_git_env(&mut system_command);
+        let system_output = system_command.output().expect("run git config");
+        assert!(!system_output.status.success());
+        assert!(system_output.stdout.is_empty());
+
+        let mut injected_command = std::process::Command::new(oracle_git());
+        injected_command
+            .current_dir(&root)
+            .args(["config", "--get", "pair.one"])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "pair.one")
+            .env("GIT_CONFIG_VALUE_0", "from-env");
+        apply_hermetic_git_env(&mut injected_command);
+        let injected_output = injected_command.output().expect("run git config");
+        assert!(!injected_output.status.success());
+        assert!(injected_output.stdout.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hermetic_git_command_allows_explicit_config_overlay_after_construction() {
+        let root = unique_temp_dir("sley-hermetic-git-overlay");
+        fs::create_dir_all(&root).expect("create temp root");
+        let output = hermetic_git_command(oracle_git())
+            .current_dir(&root)
+            .args(["config", "--get", "pair.one"])
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "pair.one")
+            .env("GIT_CONFIG_VALUE_0", "from-env")
+            .output()
+            .expect("run git config");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"from-env\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hermetic_git_command_with_identity_sets_standard_identity() {
+        let root = unique_temp_dir("sley-hermetic-git-identity");
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let author = hermetic_git_command_with_identity(oracle_git())
+            .current_dir(&root)
+            .args(["var", "GIT_AUTHOR_IDENT"])
+            .output()
+            .expect("run git var");
+        assert!(author.status.success());
+        assert_eq!(
+            author.stdout,
+            format!("{TEST_GIT_USER_NAME} <{TEST_GIT_USER_EMAIL}> 0 +0000\n").into_bytes()
+        );
+
+        let committer = hermetic_git_command_with_identity(oracle_git())
+            .current_dir(&root)
+            .args(["var", "GIT_COMMITTER_IDENT"])
+            .output()
+            .expect("run git var");
+        assert!(committer.status.success());
+        assert_eq!(
+            committer.stdout,
+            format!("{TEST_GIT_USER_NAME} <{TEST_GIT_USER_EMAIL}> 0 +0000\n").into_bytes()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn default_hash_object_cases_match_upstream_git() {

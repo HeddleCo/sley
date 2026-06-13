@@ -576,11 +576,11 @@ fn prepare_three_way_fixture(root: &Path) -> (String, String, String) {
 
 /// Hash `content` into the object store with `git hash-object -w`.
 fn hash_blob(root: &Path, content: &[u8]) -> String {
-    let mut child = with_fixed_env(Command::new(sley_testkit::oracle_git()).current_dir(root).args([
-        "hash-object",
-        "-w",
-        "--stdin",
-    ]))
+    let mut child = with_fixed_env(
+        Command::new(sley_testkit::oracle_git())
+            .current_dir(root)
+            .args(["hash-object", "-w", "--stdin"]),
+    )
     .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
@@ -604,12 +604,16 @@ fn make_tree(root: &Path, entries: &[(&str, &str)]) -> String {
     for (name, oid) in entries {
         input.push_str(&format!("100644 blob {oid}\t{name}\n"));
     }
-    let mut child = with_fixed_env(Command::new(sley_testkit::oracle_git()).current_dir(root).arg("mktree"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn git mktree");
+    let mut child = with_fixed_env(
+        Command::new(sley_testkit::oracle_git())
+            .current_dir(root)
+            .arg("mktree"),
+    )
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("spawn git mktree");
     use std::io::Write as _;
     child
         .stdin

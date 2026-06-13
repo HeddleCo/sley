@@ -344,6 +344,10 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         bare = true;
     }
 
+    let cwd = env::current_dir()?;
+    let init_config_git_dir =
+        init_config_git_dir_for_lookup(&cwd, &path, bare, separate_git_dir.as_deref())?;
+
     // Mirror refs.c `repo_default_branch_name`: an explicit `--initial-branch`
     // wins; otherwise `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` (when non-empty),
     // then `init.defaultBranch`, then "master" (which triggers the
@@ -366,7 +370,13 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
                 .ok()
                 .filter(|value| !value.is_empty())
                 .map_or_else(
-                    || init_config_value("init.defaultBranch", global_config),
+                    || {
+                        init_config_value(
+                            "init.defaultBranch",
+                            global_config,
+                            init_config_git_dir.as_deref(),
+                        )
+                    },
                     |name| Ok(Some(name)),
                 )?
                 .filter(|value| !value.is_empty());
@@ -386,7 +396,6 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         }
     };
 
-    let cwd = env::current_dir()?;
     let worktree = resolve_cli_path(&cwd, path.to_string_lossy().as_ref());
     let separate_git_dir = separate_git_dir.map(|value| resolve_cli_path(&cwd, &value));
 
@@ -461,8 +470,10 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
                 Some(raw_work_tree) => {
                     let work_tree_abs =
                         resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
-                    let work_tree_abs =
-                        fs::canonicalize(&work_tree_abs).unwrap_or(work_tree_abs);
+                    let work_tree_abs = match fs::canonicalize(&work_tree_abs) {
+                        Ok(path) => path,
+                        Err(_) => work_tree_abs,
+                    };
                     if git_dir_abs != work_tree_abs.join(".git") {
                         core_worktree = Some(work_tree_abs.to_string_lossy().into_owned());
                     }
@@ -484,12 +495,15 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
                 Some(raw_work_tree) => {
                     let resolved =
                         resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
-                    fs::canonicalize(&resolved).unwrap_or(resolved)
+                    match fs::canonicalize(&resolved) {
+                        Ok(path) => path,
+                        Err(_) => resolved,
+                    }
                 }
-                None => git_dir_abs
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| worktree.clone()),
+                None => match git_dir_abs.parent() {
+                    Some(parent) => parent.to_path_buf(),
+                    None => worktree.clone(),
+                },
             };
             if git_dir_abs != work_tree_abs.join(".git") {
                 core_worktree = Some(work_tree_abs.to_string_lossy().into_owned());
@@ -500,11 +514,22 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
     }
 
     let (object_format, object_format_explicit) =
-        resolve_init_object_format(object_format, global_config)?;
+        resolve_init_object_format(object_format, global_config, init_config_git_dir.as_deref())?;
     let (ref_storage, ref_storage_explicit) =
-        resolve_init_ref_storage(ref_format, global_config)?;
-    let shared_repository = resolve_init_shared_repository(shared_repository, global_config, bare)?;
-    let template_dir = resolve_init_template_dir(template, template_config, global_config, &cwd)?;
+        resolve_init_ref_storage(ref_format, global_config, init_config_git_dir.as_deref())?;
+    let shared_repository = resolve_init_shared_repository(
+        shared_repository,
+        global_config,
+        bare,
+        init_config_git_dir.as_deref(),
+    )?;
+    let template_dir = resolve_init_template_dir(
+        template,
+        template_config,
+        global_config,
+        &cwd,
+        init_config_git_dir.as_deref(),
+    )?;
 
     let layout = RepositoryBootstrap::init(InitOptions {
         worktree,
@@ -533,7 +558,11 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
     })?;
 
     if branch_defaulted && !quiet && !layout.reinitialized {
-        emit_default_branch_advice(&initial_branch, global_config)?;
+        emit_default_branch_advice(
+            &initial_branch,
+            global_config,
+            init_config_git_dir.as_deref(),
+        )?;
     }
     if layout.reinitialized && initial_branch_explicit {
         eprintln!("warning: re-init: ignored --initial-branch={initial_branch}");
@@ -550,22 +579,60 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
     Ok(())
 }
 
+fn init_config_git_dir_for_lookup(
+    cwd: &Path,
+    path: &Path,
+    bare: bool,
+    separate_git_dir: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    if let Some(raw) = separate_git_dir {
+        return Ok(Some(resolve_cli_path(cwd, raw)));
+    }
+    if let Some(raw) = explicit_git_dir() {
+        let git_dir = resolve_cli_path(cwd, raw.to_string_lossy().as_ref());
+        if git_dir.is_file()
+            && let Some(target) = read_gitdir_file(&git_dir)?
+        {
+            return common_git_dir_for_git_dir(&target).map(Some);
+        }
+        return Ok(Some(git_dir));
+    }
+    let target = resolve_cli_path(cwd, path.to_string_lossy().as_ref());
+    if bare {
+        Ok(Some(target))
+    } else {
+        let git_file = target.join(".git");
+        if git_file.is_file()
+            && let Some(git_dir) = read_gitdir_file(&git_file)?
+        {
+            return common_git_dir_for_git_dir(&git_dir).map(Some);
+        }
+        Ok(Some(git_file))
+    }
+}
+
 fn emit_default_branch_advice(
     branch: &str,
     global_config: &[GlobalConfigOverride],
+    config_git_dir: Option<&Path>,
 ) -> Result<()> {
     if let Ok(value) = env::var("GIT_ADVICE") {
-        if !parse_config_bool(&value).unwrap_or(!value.is_empty()) {
+        let enabled = match parse_config_bool(&value) {
+            Some(value) => value,
+            None => !value.is_empty(),
+        };
+        if !enabled {
             return Ok(());
         }
     }
-    if init_config_bool("advice.defaultBranchName", global_config)? == Some(false) {
+    if init_config_bool("advice.defaultBranchName", global_config, config_git_dir)? == Some(false) {
         return Ok(());
     }
     // `color.advice`: "always" colours unconditionally; "never"/false disables;
     // "auto"/true/unset colour only when stderr is a terminal (color.c
     // `git_config_colorbool` + `want_color_stderr`).
-    let colored = match init_config_value("color.advice", global_config)?.as_deref() {
+    let colored = match init_config_value("color.advice", global_config, config_git_dir)?.as_deref()
+    {
         Some(value) if value.eq_ignore_ascii_case("always") => true,
         Some(value) if value.eq_ignore_ascii_case("never") => false,
         Some(value) if value.eq_ignore_ascii_case("auto") => stderr_is_terminal(),
@@ -575,7 +642,11 @@ fn emit_default_branch_advice(
         },
         None => stderr_is_terminal(),
     };
-    let (color, reset) = if colored { ("\x1b[33m", "\x1b[m") } else { ("", "") };
+    let (color, reset) = if colored {
+        ("\x1b[33m", "\x1b[m")
+    } else {
+        ("", "")
+    };
     // The advice body already ends without a trailing newline; the
     // `Disable this message ...` instruction line was appended above with the
     // leading blank line git's `turn_off_instructions` carries.
@@ -596,20 +667,22 @@ fn stderr_is_terminal() -> bool {
 fn resolve_init_object_format(
     cli_format: Option<String>,
     global_config: &[GlobalConfigOverride],
+    config_git_dir: Option<&Path>,
 ) -> Result<(ObjectFormat, bool)> {
     // git reads the config defaults FIRST (setup.c `read_default_format_config`),
     // so an invalid `init.defaultObjectFormat` warns even when the command line
     // or `GIT_DEFAULT_HASH` ends up choosing the format.
-    let config_format = match init_config_value("init.defaultObjectFormat", global_config)? {
-        Some(value) => match value.parse::<ObjectFormat>() {
-            Ok(format) => Some(format),
-            Err(_) => {
-                eprintln!("warning: unknown hash algorithm '{value}'");
-                None
-            }
-        },
-        None => None,
-    };
+    let config_format =
+        match init_config_value("init.defaultObjectFormat", global_config, config_git_dir)? {
+            Some(value) => match value.parse::<ObjectFormat>() {
+                Ok(format) => Some(format),
+                Err(_) => {
+                    eprintln!("warning: unknown hash algorithm '{value}'");
+                    None
+                }
+            },
+            None => None,
+        };
     if let Some(value) = cli_format {
         return Ok((parse_init_object_format(&value)?, true));
     }
@@ -634,23 +707,29 @@ fn parse_init_object_format(value: &str) -> Result<ObjectFormat> {
 fn resolve_init_ref_storage(
     cli_ref_format: Option<Option<String>>,
     global_config: &[GlobalConfigOverride],
+    config_git_dir: Option<&Path>,
 ) -> Result<(RefStorageFormat, bool)> {
     // git reads the config defaults FIRST (setup.c `read_default_format_config`),
     // so an invalid `init.defaultRefFormat` warns even when the command line or
     // `GIT_DEFAULT_REF_FORMAT` ends up choosing the format.
-    let config_format = match init_config_value("init.defaultRefFormat", global_config)? {
-        Some(value) if value.is_empty() => Some(RefStorageFormat::Files),
-        Some(value) => match RefStorageFormat::parse(&value) {
-            Ok(format) => Some(format),
-            Err(_) => {
-                eprintln!("warning: unknown ref storage format '{value}'");
-                None
-            }
-        },
-        None => None,
-    };
+    let config_format =
+        match init_config_value("init.defaultRefFormat", global_config, config_git_dir)? {
+            Some(value) if value.is_empty() => Some(RefStorageFormat::Files),
+            Some(value) => match RefStorageFormat::parse(&value) {
+                Ok(format) => Some(format),
+                Err(_) => {
+                    eprintln!("warning: unknown ref storage format '{value}'");
+                    None
+                }
+            },
+            None => None,
+        };
     if let Some(value) = cli_ref_format {
-        return Ok((parse_init_ref_storage(value.as_deref().unwrap_or(""))?, true));
+        let value = match value.as_deref() {
+            Some(value) => value,
+            None => "",
+        };
+        return Ok((parse_init_ref_storage(value)?, true));
     }
     if let Ok(value) = env::var("GIT_DEFAULT_REF_FORMAT") {
         return Ok((parse_init_ref_storage(&value)?, false));
@@ -658,7 +737,7 @@ fn resolve_init_ref_storage(
     if let Some(format) = config_format {
         return Ok((format, false));
     }
-    if init_config_bool("feature.experimental", global_config)?.unwrap_or(false) {
+    if init_config_bool("feature.experimental", global_config, config_git_dir)? == Some(true) {
         return Ok((RefStorageFormat::Reftable, false));
     }
     Ok((RefStorageFormat::Files, false))
@@ -678,6 +757,7 @@ fn resolve_init_shared_repository(
     cli_shared: Option<Option<String>>,
     global_config: &[GlobalConfigOverride],
     bare: bool,
+    config_git_dir: Option<&Path>,
 ) -> Result<Option<String>> {
     if let Some(value) = cli_shared {
         return Ok(value);
@@ -685,7 +765,7 @@ fn resolve_init_shared_repository(
     if bare {
         return Ok(None);
     }
-    init_config_value("core.sharedRepository", global_config)
+    init_config_value("core.sharedRepository", global_config, config_git_dir)
 }
 
 fn resolve_init_template_dir(
@@ -693,6 +773,7 @@ fn resolve_init_template_dir(
     template_config: bool,
     global_config: &[GlobalConfigOverride],
     cwd: &Path,
+    config_git_dir: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
     let _ = template_config;
     match cli_template {
@@ -705,7 +786,9 @@ fn resolve_init_template_dir(
             }
         }
         None => {
-            if let Some(path) = init_config_value("init.templatedir", global_config)? {
+            if let Some(path) =
+                init_config_value("init.templatedir", global_config, config_git_dir)?
+            {
                 let expanded = sley_config::expand_user_path(&path);
                 Ok(Some(if expanded.is_absolute() {
                     expanded
@@ -738,8 +821,13 @@ fn default_init_template_dir() -> Option<PathBuf> {
     candidate.canonicalize().ok().filter(|path| path.is_dir())
 }
 
-fn init_config_bool(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<bool>> {
-    init_config_value(key, global_config).map(|value| value.as_deref().and_then(parse_config_bool))
+fn init_config_bool(
+    key: &str,
+    global_config: &[GlobalConfigOverride],
+    config_git_dir: Option<&Path>,
+) -> Result<Option<bool>> {
+    init_config_value(key, global_config, config_git_dir)
+        .map(|value| value.as_deref().and_then(parse_config_bool))
 }
 
 pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
@@ -2821,13 +2909,31 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
+    let repo_config = sley_config::read_repo_config(&git_dir, None).ok();
+    let changed_paths_version = commit_graph_changed_paths_version(repo_config.as_ref())?;
+    if !(-1..=2).contains(&changed_paths_version) {
+        eprintln!(
+            "warning: attempting to write a commit-graph, but 'commitGraph.changedPathsVersion' ({changed_paths_version}) is not supported"
+        );
+        return Ok(());
+    }
+    let existing_bloom_settings = existing_commit_graph_bloom_settings(&object_dir, format)?;
+    let bloom_settings =
+        commit_graph_bloom_settings_for_write(existing_bloom_settings, changed_paths_version);
     let changed_paths = changed_paths.unwrap_or_else(|| {
-        sley_config::read_repo_config(&git_dir, None)
-            .ok()
+        repo_config
+            .as_ref()
             .and_then(|config| config.get_bool("commitGraph", None, "changedPaths"))
             .unwrap_or(false)
+            || existing_bloom_settings.is_some()
     });
-    let graph = commit_graph_for_reachable_refs(&git_dir, &object_dir, format, changed_paths)?;
+    let graph = commit_graph_for_reachable_refs(
+        &git_dir,
+        &object_dir,
+        format,
+        changed_paths,
+        bloom_settings,
+    )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
     fs::write(graph_dir.join("commit-graph"), graph)?;
@@ -2934,6 +3040,7 @@ fn commit_graph_for_reachable_refs(
     object_dir: &Path,
     format: ObjectFormat,
     changed_paths: bool,
+    bloom_settings: sley_formats::CommitGraphBloomSettings,
 ) -> Result<Vec<u8>> {
     let db = FileObjectDatabase::new(object_dir, format);
     let store = FileRefStore::new(git_dir, format);
@@ -2969,6 +3076,7 @@ fn commit_graph_for_reachable_refs(
                 format,
                 record,
                 &record_map,
+                bloom_settings,
             )?)
         } else {
             None
@@ -2982,7 +3090,7 @@ fn commit_graph_for_reachable_refs(
             bloom_filter,
         });
     }
-    CommitGraph::write(format, &entries)
+    CommitGraph::write_with_bloom_settings(format, &entries, bloom_settings)
 }
 
 fn commit_graph_bloom_filter_for_record(
@@ -2990,6 +3098,7 @@ fn commit_graph_bloom_filter_for_record(
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
     records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+    bloom_settings: sley_formats::CommitGraphBloomSettings,
 ) -> Result<Vec<u8>> {
     let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: false,
@@ -3022,13 +3131,73 @@ fn commit_graph_bloom_filter_for_record(
             options,
         )?
     };
-    if changes.len() > sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths {
+    if changes.len() > bloom_settings.max_changed_paths {
         return Ok(vec![0xff]);
     }
     Ok(sley_formats::commit_graph_bloom_filter_for_paths(
         changes.iter().map(|entry| entry.path.as_bytes()),
-        sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
+        bloom_settings,
     ))
+}
+
+fn commit_graph_changed_paths_version(config: Option<&sley_config::GitConfig>) -> Result<i64> {
+    let Some(config) = config else {
+        return Ok(-1);
+    };
+    match config.get_entry("commitGraph", None, "changedPathsVersion") {
+        Some(None) => return Ok(1),
+        Some(Some(value)) => {
+            return sley_config::parse_config_int(value).ok_or_else(|| {
+                GitError::Command(format!(
+                    "bad numeric config value '{value}' for 'commitGraph.changedPathsVersion'"
+                ))
+            });
+        }
+        None => {}
+    }
+    match config.get_bool("commitGraph", None, "readChangedPaths") {
+        Some(false) => Ok(0),
+        Some(true) => Ok(-1),
+        None => Ok(-1),
+    }
+}
+
+fn commit_graph_bloom_settings_for_write(
+    existing: Option<sley_formats::CommitGraphBloomSettings>,
+    changed_paths_version: i64,
+) -> sley_formats::CommitGraphBloomSettings {
+    let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+    if changed_paths_version == -1
+        && let Some(existing) = existing
+    {
+        settings = existing;
+    }
+    settings.hash_version = if changed_paths_version == 2
+        || (changed_paths_version == -1 && settings.hash_version == 2)
+    {
+        2
+    } else {
+        1
+    };
+    settings
+}
+
+fn existing_commit_graph_bloom_settings(
+    object_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<sley_formats::CommitGraphBloomSettings>> {
+    let graph_path = object_dir.join("info").join("commit-graph");
+    if !graph_path.exists() {
+        return Ok(None);
+    }
+    let graph = CommitGraph::parse(&fs::read(graph_path)?, format)?;
+    Ok(graph.bloom_filters.map(|filters| {
+        let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+        settings.hash_version = filters.hash_version;
+        settings.hash_count = filters.hash_count;
+        settings.bits_per_entry = filters.bits_per_entry;
+        settings
+    }))
 }
 
 fn read_commit_tree_for_graph(

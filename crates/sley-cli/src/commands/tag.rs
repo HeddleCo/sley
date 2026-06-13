@@ -483,10 +483,12 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 resolve_tag_merged_filter(&git_dir, format, rev).map(|oid| (oid, *include))
             })
             .transpose()?;
-        let prereleases = if sorts
-            .iter()
-            .any(|sort| matches!(sort, TagListSort::VersionRefname | TagListSort::VersionRefnameDescending))
-        {
+        let prereleases = if sorts.iter().any(|sort| {
+            matches!(
+                sort,
+                TagListSort::VersionRefname | TagListSort::VersionRefnameDescending
+            )
+        }) {
             resolve_versionsort_prereleases(&config)
         } else {
             Vec::new()
@@ -1175,7 +1177,9 @@ fn resolve_versionsort_prereleases(config: &GitConfig) -> Vec<String> {
     let suffix = collect(config, "suffix", "versionsort.suffix");
     let prerelease = collect(config, "prereleasesuffix", "versionsort.prereleasesuffix");
     if suffix.is_some() && prerelease.is_some() {
-        eprintln!("warning: ignoring versionsort.prereleasesuffix because versionsort.suffix is set");
+        eprintln!(
+            "warning: ignoring versionsort.prereleasesuffix because versionsort.suffix is set"
+        );
     }
     suffix.or(prerelease).unwrap_or_default()
 }
