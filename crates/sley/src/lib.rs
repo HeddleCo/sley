@@ -106,8 +106,9 @@ pub use sley_refs::{
 };
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
-    AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, ShortStatusEntry,
-    ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState, write_metadata_file_atomic,
+    AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
+    ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
+    write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;

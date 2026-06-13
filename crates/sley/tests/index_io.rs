@@ -123,6 +123,27 @@ fn repository_write_index_with_result_returns_probe_metadata() {
 }
 
 #[test]
+fn repository_index_stat_probes_parse_index_once_for_many_paths() {
+    let temp = TempDir::new();
+    let repo = Repository::init(&temp.path).expect("init");
+    let index = test_index(vec![
+        test_entry("normal.txt", 0o100644, IndexStage::Normal),
+        test_entry("conflicted.txt", 0o100644, IndexStage::Ours),
+    ]);
+    repo.write_index(&index, IndexWriteOptions::default())
+        .expect("write index");
+
+    let probes = repo.index_stat_probes().expect("stat probes");
+    assert_eq!(probes.len(), 1, "only stage-0 entries are reusable probes");
+    let probe = probes
+        .probe_for_git_path(b"normal.txt")
+        .expect("normal probe");
+    assert_eq!(probe.entry().path, BString::from("normal.txt"));
+    assert!(probes.probe_for_git_path(b"conflicted.txt").is_none());
+    assert!(probes.index_mtime().is_some());
+}
+
+#[test]
 fn repository_write_index_existing_lock_fails_and_preserves_index() {
     let temp = TempDir::new();
     let repo = Repository::init(&temp.path).expect("init");
