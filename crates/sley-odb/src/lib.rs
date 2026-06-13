@@ -36,6 +36,11 @@ pub trait ObjectReader {
     }
 }
 
+fn implied_empty_tree_object(format: ObjectFormat, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
+    (*oid == ObjectId::empty_tree(format))
+        .then(|| Arc::new(EncodedObject::new(ObjectType::Tree, Vec::new())))
+}
+
 /// Parents of a parsed commit with the graft seam applied: empty when the
 /// reader cuts history at `oid` (shallow boundary), the raw parsed parents
 /// otherwise.
@@ -2251,6 +2256,7 @@ impl ObjectReader for ObjectDatabase {
             .map_err(|_| GitError::object_not_found(*oid))?
             .get(oid)
             .map(Arc::clone)
+            .or_else(|| implied_empty_tree_object(self.format, oid))
             .ok_or_else(|| GitError::object_not_found(*oid))
     }
 }
@@ -3041,6 +3047,9 @@ impl FileObjectDatabase {
     /// stays cheap on huge blobs and deep delta chains. It does not populate the
     /// decoded-object cache (nothing is decoded).
     pub fn read_object_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
+        if implied_empty_tree_object(self.format, oid).is_some() {
+            return Ok(Some((ObjectType::Tree, 0)));
+        }
         if let Ok(mut cache) = self.decoded.lock()
             && let Some(object) = cache.get(oid)
         {
@@ -3536,6 +3545,9 @@ impl ObjectReader for FileObjectDatabase {
     }
 
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        if let Some(object) = implied_empty_tree_object(self.format, oid) {
+            return Ok(object);
+        }
         match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),
             Err(GitError::NotFound(_)) => {}

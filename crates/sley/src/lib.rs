@@ -837,6 +837,20 @@ mod tests {
         commit_oid
     }
 
+    fn seed_empty_tree_commit(repo: &Repository) -> ObjectId {
+        let db = repo.objects_mut();
+        let commit = Commit {
+            tree: ObjectId::empty_tree(repo.object_format()),
+            parents: Vec::new(),
+            author: b"Tester <test@example.com> 1700000000 +0000".to_vec(),
+            committer: b"Tester <test@example.com> 1700000000 +0000".to_vec(),
+            encoding: None,
+            message: b"empty tree\n".to_vec(),
+        };
+        db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
+            .expect("write empty tree commit")
+    }
+
     #[test]
     fn init_creates_repo_and_open_reads_it_back() {
         let temp = TempDir::new();
@@ -919,6 +933,20 @@ mod tests {
         let blob = repo.read_object(&tree.entries[0].oid).expect("read blob");
         assert_eq!(blob.object_type, ObjectType::Blob);
         assert_eq!(blob.body, b"hello\n");
+    }
+
+    #[test]
+    fn read_tree_accepts_implied_empty_tree_without_stored_object() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let empty = ObjectId::empty_tree(repo.object_format());
+
+        let object = repo.read_object(&empty).expect("read implied empty tree");
+        assert_eq!(object.object_type, ObjectType::Tree);
+        assert!(object.body.is_empty());
+
+        let tree = repo.read_tree(&empty).expect("parse implied empty tree");
+        assert!(tree.entries.is_empty());
     }
 
     #[test]
@@ -1256,6 +1284,27 @@ mod tests {
         let original = source.read_commit(&commit_oid).expect("read source commit");
         assert_eq!(copied.tree, original.tree);
         assert_eq!(copied.message, original.message);
+    }
+
+    #[test]
+    fn copy_reachable_from_accepts_implied_empty_tree() {
+        let source_dir = TempDir::new();
+        let dest_dir = TempDir::new();
+        let source = Repository::init(source_dir.path()).expect("source");
+        let dest = Repository::init(dest_dir.path()).expect("dest");
+        let commit_oid = seed_empty_tree_commit(&source);
+
+        dest.copy_reachable_from(&source, std::slice::from_ref(&commit_oid))
+            .expect("copy empty-tree commit");
+
+        let copied = dest.read_commit(&commit_oid).expect("read copied commit");
+        assert_eq!(copied.tree, ObjectId::empty_tree(dest.object_format()));
+        assert!(
+            dest.read_tree(&copied.tree)
+                .expect("read tree")
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]
