@@ -22,6 +22,8 @@ pub enum NoWalkMode {
 pub struct RevisionTip {
     pub oid: ObjectId,
     pub rev: String,
+    pub source_name: Option<String>,
+    pub from_ref_selector: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,10 @@ pub struct RevisionOptions {
     pub no_walk: NoWalkMode,
     pub date_window: RevWalkDateWindow,
     pub full_history: bool,
+    pub sparse: bool,
+    pub remove_empty: bool,
+    pub simplify_merges: bool,
+    pub show_pulls: bool,
     pub ignore_missing: bool,
     pub had_ref_selector: bool,
 }
@@ -197,6 +203,11 @@ where
                     );
                 }
                 "--full-history" => self.setup.options.full_history = true,
+                "--sparse" => self.setup.options.sparse = true,
+                "--dense" => self.setup.options.sparse = false,
+                "--remove-empty" => self.setup.options.remove_empty = true,
+                "--simplify-merges" => self.setup.options.simplify_merges = true,
+                "--show-pulls" => self.setup.options.show_pulls = true,
                 "--reverse" => self.setup.options.reverse = true,
                 "--first-parent" => self.setup.options.first_parent = true,
                 "--no-first-parent" => self.setup.options.first_parent = false,
@@ -451,6 +462,8 @@ where
             self.setup.options.positives.push(RevisionTip {
                 oid,
                 rev: rev.to_string(),
+                source_name: Some(rev.to_string()),
+                from_ref_selector: false,
             });
         }
         Ok(())
@@ -476,6 +489,8 @@ where
                 self.setup.options.positives.push(RevisionTip {
                     oid: parent,
                     rev: format!("{rev}^@"),
+                    source_name: Some(format!("{rev}^@")),
+                    from_ref_selector: false,
                 });
             }
         }
@@ -491,6 +506,8 @@ where
                     self.setup.options.positives.push(RevisionTip {
                         oid: start_oid,
                         rev: start,
+                        source_name: None,
+                        from_ref_selector: false,
                     });
                     self.setup.options.negatives.push(end_oid);
                 } else {
@@ -498,6 +515,8 @@ where
                     self.setup.options.positives.push(RevisionTip {
                         oid: end_oid,
                         rev: end,
+                        source_name: None,
+                        from_ref_selector: false,
                     });
                 }
             }
@@ -520,15 +539,21 @@ where
                         .extend(bases.iter().map(|oid| RevisionTip {
                             oid: *oid,
                             rev: "merge-base".to_string(),
+                            source_name: None,
+                            from_ref_selector: false,
                         }));
                 } else {
                     self.setup.options.positives.push(RevisionTip {
                         oid: left_oid,
-                        rev: left,
+                        rev: left.clone(),
+                        source_name: Some(left),
+                        from_ref_selector: false,
                     });
                     self.setup.options.positives.push(RevisionTip {
                         oid: right_oid,
-                        rev: right,
+                        rev: right.clone(),
+                        source_name: Some(right),
+                        from_ref_selector: false,
                     });
                     self.setup.options.negatives.extend(bases);
                 }
@@ -573,6 +598,8 @@ where
                 self.setup.options.positives.push(RevisionTip {
                     oid,
                     rev: reference.name.clone(),
+                    source_name: Some(reference.name.clone()),
+                    from_ref_selector: true,
                 });
             }
             if exclude_ref
@@ -649,9 +676,10 @@ fn parse_skip(value: &str) -> Result<usize> {
 }
 
 fn parse_timestamp(value: &str) -> Result<i64> {
-    value
-        .parse::<i64>()
-        .map_err(|_| GitError::Command(format!("invalid timestamp {value}")))
+    value.parse::<i64>().map_err(|_| {
+        eprintln!("fatal: '{value}': not a number of seconds since epoch");
+        GitError::Exit(128)
+    })
 }
 
 fn max_age_requires_value_error() -> GitError {

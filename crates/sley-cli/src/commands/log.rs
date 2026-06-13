@@ -247,14 +247,9 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
 }
 
 fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
-    let mut includes = Vec::new();
-    let mut excludes = Vec::new();
-    let mut linear_ranges = Vec::new();
-    let mut symmetric_ranges = Vec::new();
-    let mut stdin_revisions = Vec::new();
-    let mut default_revision = None;
-    let mut max_count = None;
-    let mut skip = 0usize;
+    let mut setup_args = Vec::new();
+    let mut setup_not = false;
+    let mut default_revision_given = false;
     let mut output = LogOutput::Default(LogDefaultKind::Medium);
     let mut notes_display = NotesDisplay::default();
     let mut preset_oneline: Option<bool> = None;
@@ -263,13 +258,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // "format kind" flag: `--format=`/`tformat:` terminate each entry with a
     // newline; `--pretty=format:` separates entries instead.
     let mut pretty_spec: Option<(String, bool)> = None;
-    let mut reverse = false;
-    let mut ordering = RevListOrdering::Default;
-    let mut walk = true;
     let mut walk_reflogs = false;
-    let mut max_age = None;
-    let mut min_age = None;
-    let mut first_parent = false;
     let mut min_parents = None;
     let mut max_parents = None;
     let mut show_parents = false;
@@ -277,17 +266,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut abbrev_commit = false;
     let mut abbrev_len = Some(7usize);
     let mut decoration = LogDecorationMode::Off;
-    let mut all_refs = false;
-    let mut branches = false;
-    let mut branch_patterns = Vec::new();
-    let mut tags = false;
-    let mut tag_patterns = Vec::new();
-    let mut remotes = false;
-    let mut remote_patterns = Vec::new();
-    let mut ref_selectors = Vec::new();
-    let mut pending_ref_exclude_patterns = Vec::new();
-    let mut pending_hidden_refs = None;
-    let mut not = false;
     let mut read_stdin = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
@@ -301,8 +279,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // `-z` / `--null`: separate/terminate compiled-format entries with NUL
     // instead of newline.
     let mut null_terminate = false;
-    let mut pathspecs: Vec<String> = Vec::new();
-    let mut full_history = false;
     let mut graph = false;
     // Diff-output options (`-p`, `--stat`, ...): rendered per commit against
     // its first parent, mirroring git's log diff machinery.
@@ -311,188 +287,56 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut show_root_flag: Option<bool> = None;
     let mut line_prefix: Option<String> = None;
     let mut color_always = false;
-    // `--no-walk[=sorted]` sorts the given commits by commit time;
-    // `--no-walk=unsorted` keeps the command-line order.
-    let mut no_walk_unsorted = true;
-    let mut positional_only = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if positional_only {
-            // After `--`, every remaining argument is a pathspec.
-            pathspecs.push(arg.to_string());
-            continue;
-        }
         match arg.as_str() {
-            "--" => positional_only = true,
-            "--full-history" => full_history = true,
-            "--not" => not = !not,
+            "--" => {
+                setup_args.push(arg.clone());
+                setup_args.extend(iter.cloned());
+                break;
+            }
+            "--not" => {
+                setup_not = !setup_not;
+                setup_args.push(arg.clone());
+            }
             "--stdin" => read_stdin = true,
             "--default" => {
-                default_revision = Some(
+                default_revision_given = true;
+                setup_args.push(arg.clone());
+                setup_args.push(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("--default requires a value".into()))?,
+                        .ok_or_else(|| GitError::Command("--default requires a value".into()))?
+                        .clone(),
                 );
             }
-            "--reverse" => reverse = true,
-            "--topo-order" => ordering = RevListOrdering::Topo,
-            "--date-order" => ordering = RevListOrdering::Date,
-            "--author-date-order" => ordering = RevListOrdering::AuthorDate,
-            "--first-parent" => first_parent = true,
+            "--full-history" | "--sparse" | "--dense" | "--remove-empty"
+            | "--simplify-merges" | "--show-pulls" | "--reverse" | "--topo-order"
+            | "--date-order" | "--author-date-order" | "--first-parent" | "--no-walk"
+            | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" | "--all"
+            | "--branches" | "--tags" | "--remotes" => setup_args.push(arg.clone()),
             "--parents" => show_parents = true,
             "--children" => show_children = true,
             "--abbrev-commit" => abbrev_commit = true,
             "--no-abbrev-commit" => abbrev_commit = false,
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
-            "--all" => {
-                if not || !pending_ref_exclude_patterns.is_empty() || pending_hidden_refs.is_some()
-                {
-                    ref_selectors.push(RevListRefSelector::All {
-                        not,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    all_refs = true;
-                }
+            "--glob" | "--exclude" | "--exclude-hidden" => {
+                setup_args.push(arg.clone());
+                setup_args.push(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?
+                        .clone(),
+                );
             }
-            "--branches" => {
-                if pending_hidden_refs.is_some() {
-                    return rev_list_exclude_hidden_selector_error("--branches");
-                }
-                if not || !pending_ref_exclude_patterns.is_empty() {
-                    ref_selectors.push(RevListRefSelector::Branches {
-                        not,
-                        patterns: Vec::new(),
-                        include_all: true,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    branches = true;
-                }
-            }
-            value if value.starts_with("--branches=") => {
-                let pattern = value["--branches=".len()..].to_string();
-                if pending_hidden_refs.is_some() {
-                    return rev_list_exclude_hidden_selector_error("--branches");
-                }
-                if not || !pending_ref_exclude_patterns.is_empty() {
-                    ref_selectors.push(RevListRefSelector::Branches {
-                        not,
-                        patterns: vec![pattern],
-                        include_all: false,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    branch_patterns.push(pattern);
-                }
-            }
-            "--tags" => {
-                if pending_hidden_refs.is_some() {
-                    return rev_list_exclude_hidden_selector_error("--tags");
-                }
-                if not || !pending_ref_exclude_patterns.is_empty() {
-                    ref_selectors.push(RevListRefSelector::Tags {
-                        not,
-                        patterns: Vec::new(),
-                        include_all: true,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    tags = true;
-                }
-            }
-            value if value.starts_with("--tags=") => {
-                let pattern = value["--tags=".len()..].to_string();
-                if pending_hidden_refs.is_some() {
-                    return rev_list_exclude_hidden_selector_error("--tags");
-                }
-                if not || !pending_ref_exclude_patterns.is_empty() {
-                    ref_selectors.push(RevListRefSelector::Tags {
-                        not,
-                        patterns: vec![pattern],
-                        include_all: false,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    tag_patterns.push(pattern);
-                }
-            }
-            "--remotes" => {
-                if pending_hidden_refs.is_some() {
-                    return rev_list_exclude_hidden_selector_error("--remotes");
-                }
-                if not || !pending_ref_exclude_patterns.is_empty() {
-                    ref_selectors.push(RevListRefSelector::Remotes {
-                        not,
-                        patterns: Vec::new(),
-                        include_all: true,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    remotes = true;
-                }
-            }
-            value if value.starts_with("--remotes=") => {
-                let pattern = value["--remotes=".len()..].to_string();
-                if pending_hidden_refs.is_some() {
-                    return rev_list_exclude_hidden_selector_error("--remotes");
-                }
-                if not || !pending_ref_exclude_patterns.is_empty() {
-                    ref_selectors.push(RevListRefSelector::Remotes {
-                        not,
-                        patterns: vec![pattern],
-                        include_all: false,
-                        excludes: mem::take(&mut pending_ref_exclude_patterns),
-                        hidden: pending_hidden_refs.take(),
-                    });
-                } else {
-                    remote_patterns.push(pattern);
-                }
-            }
-            "--exclude" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--exclude requires a value".into()))?;
-                pending_ref_exclude_patterns.push(value.to_string());
-            }
-            value if value.starts_with("--exclude=") => {
-                pending_ref_exclude_patterns.push(value["--exclude=".len()..].to_string());
-            }
-            "--glob" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--glob requires a value".into()))?;
-                ref_selectors.push(RevListRefSelector::Glob {
-                    not,
-                    pattern: value.to_string(),
-                    excludes: mem::take(&mut pending_ref_exclude_patterns),
-                    hidden: pending_hidden_refs.take(),
-                });
-            }
-            value if value.starts_with("--glob=") => {
-                ref_selectors.push(RevListRefSelector::Glob {
-                    not,
-                    pattern: value["--glob=".len()..].to_string(),
-                    excludes: mem::take(&mut pending_ref_exclude_patterns),
-                    hidden: pending_hidden_refs.take(),
-                });
-            }
-            "--exclude-hidden" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--exclude-hidden requires a value".into()))?;
-                pending_hidden_refs = Some(parse_rev_list_exclude_hidden(value)?);
-            }
-            value if value.starts_with("--exclude-hidden=") => {
-                pending_hidden_refs = Some(parse_rev_list_exclude_hidden(
-                    &value["--exclude-hidden=".len()..],
-                )?);
+            value
+                if value.starts_with("--glob=")
+                    || value.starts_with("--exclude=")
+                    || value.starts_with("--exclude-hidden=")
+                    || value.starts_with("--branches=")
+                    || value.starts_with("--tags=")
+                    || value.starts_with("--remotes=") =>
+            {
+                setup_args.push(arg.clone());
             }
             "--author" => {
                 let value = iter.next().ok_or_else(log_author_requires_value_error)?;
@@ -529,50 +373,33 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 regexp_mode = SimpleLogRegexMode::Basic
             }
             "-P" | "--perl-regexp" => regexp_mode = SimpleLogRegexMode::Perl,
-            "--do-walk" => walk = true,
-            "--no-walk" => {
-                walk = false;
-                no_walk_unsorted = false;
-            }
             "-g" | "--walk-reflogs" => walk_reflogs = true,
             "--no-walk-reflogs" => walk_reflogs = false,
             "--max-age" => {
-                let value = iter.next().ok_or_else(log_max_age_requires_value_error)?;
-                max_age = Some(log_parse_age(value)?);
-            }
-            value if value.starts_with("--max-age=") => {
-                max_age = Some(log_parse_age(&value["--max-age=".len()..])?);
+                setup_args.push(arg.clone());
+                setup_args.push(iter.next().ok_or_else(log_max_age_requires_value_error)?.clone());
             }
             "--min-age" => {
-                let value = iter.next().ok_or_else(log_min_age_requires_value_error)?;
-                min_age = Some(log_parse_age(value)?);
+                setup_args.push(arg.clone());
+                setup_args.push(iter.next().ok_or_else(log_min_age_requires_value_error)?.clone());
             }
-            value if value.starts_with("--min-age=") => {
-                min_age = Some(log_parse_age(&value["--min-age=".len()..])?);
+            "--since" | "--after" | "--until" | "--before" => {
+                setup_args.push(arg.clone());
+                setup_args.push(
+                    iter.next()
+                        .ok_or_else(|| log_date_cutoff_requires_value_error(arg))?
+                        .clone(),
+                );
             }
-            "--since" | "--after" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| log_date_cutoff_requires_value_error(arg))?;
-                max_age = Some(log_parse_date_cutoff(value)?);
-            }
-            value if value.starts_with("--since=") => {
-                max_age = Some(log_parse_date_cutoff(&value["--since=".len()..])?);
-            }
-            value if value.starts_with("--after=") => {
-                max_age = Some(log_parse_date_cutoff(&value["--after=".len()..])?);
-            }
-            "--until" | "--before" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| log_date_cutoff_requires_value_error(arg))?;
-                min_age = Some(log_parse_date_cutoff(value)?);
-            }
-            value if value.starts_with("--until=") => {
-                min_age = Some(log_parse_date_cutoff(&value["--until=".len()..])?);
-            }
-            value if value.starts_with("--before=") => {
-                min_age = Some(log_parse_date_cutoff(&value["--before=".len()..])?);
+            value
+                if value.starts_with("--max-age=")
+                    || value.starts_with("--min-age=")
+                    || value.starts_with("--since=")
+                    || value.starts_with("--after=")
+                    || value.starts_with("--until=")
+                    || value.starts_with("--before=") =>
+            {
+                setup_args.push(arg.clone());
             }
             "--merges" => min_parents = Some(2),
             "--no-merges" => max_parents = Some(1),
@@ -581,12 +408,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "-q"
             | "--quiet"
             | "--no-quiet"
-            | "--sparse"
-            | "--dense"
-            | "--remove-empty"
             | "--unpacked"
-            | "--simplify-merges"
-            | "--show-pulls"
             | "--no-source"
             | "--use-mailmap"
             | "--no-use-mailmap"
@@ -685,14 +507,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 let mode = log_parse_diff_merges(&value["--diff-merges=".len()..])?;
                 diff_opts.merges = Some(mode);
                 diff_opts.merges_imply_patch = mode != LogDiffMerges::Off;
-            }
-            "--no-walk=sorted" => {
-                walk = false;
-                no_walk_unsorted = false;
-            }
-            "--no-walk=unsorted" => {
-                walk = false;
-                no_walk_unsorted = true;
             }
             value if value.starts_with("--no-walk=") => {
                 return log_no_walk_invalid_argument(value);
@@ -1078,48 +892,39 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 preset_oneline = None;
             }
             "-n" | "--max-count" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?;
-                max_count = Some(parse_log_count(value)?);
+                setup_args.push(arg.clone());
+                setup_args.push(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?
+                        .clone(),
+                );
             }
             value if value.starts_with("--max-count=") => {
-                let value = value
-                    .strip_prefix("--max-count=")
-                    .ok_or_else(|| GitError::Command("--max-count requires a value".into()))?;
-                max_count = Some(parse_log_count(value)?);
+                setup_args.push(arg.clone());
             }
             "--skip" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--skip requires a value".into()))?;
-                skip = parse_log_count(value)?;
+                setup_args.push(arg.clone());
+                setup_args.push(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command("--skip requires a value".into()))?
+                        .clone(),
+                );
             }
             value if value.starts_with("--skip=") => {
-                let value = value
-                    .strip_prefix("--skip=")
-                    .ok_or_else(|| GitError::Command("--skip requires a value".into()))?;
-                skip = parse_log_count(value)?;
+                setup_args.push(arg.clone());
             }
             value if value.starts_with("--format=") => {
                 pretty_spec = Some((value["--format=".len()..].to_string(), true));
                 preset_oneline = None;
             }
             value if value.starts_with("-n") && value.len() > 2 => {
-                max_count = Some(parse_log_count(&value[2..])?);
+                setup_args.push(arg.clone());
             }
             value
                 if value.starts_with('-')
                     && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
             {
-                max_count = Some(parse_log_count(&value[1..])?);
-            }
-            value if value.starts_with('^') && value.len() > 1 => {
-                if not {
-                    includes.push(value[1..].to_string());
-                } else {
-                    excludes.push(value[1..].to_string());
-                }
+                setup_args.push(arg.clone());
             }
             "-p" | "-u" | "--patch" => diff_opts.patch = true,
             "-s" | "--no-patch" => diff_opts = LogDiffOptions::default(),
@@ -1156,58 +961,79 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported log option {value}")));
             }
-            value => add_rev_list_revision_arg(
-                value,
-                not,
-                &mut includes,
-                &mut excludes,
-                &mut linear_ranges,
-                &mut symmetric_ranges,
-            )?,
+            value => setup_args.push(value.to_string()),
         }
     }
     if read_stdin {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        stdin_revisions.extend(
+        if setup_not {
+            setup_args.push("--not".to_string());
+        }
+        setup_args.extend(
             input
                 .lines()
                 .filter(|line| !line.is_empty())
                 .map(str::to_string),
         );
-        let mut stdin_not = false;
-        for line in &stdin_revisions {
-            if line == "--not" {
-                stdin_not = !stdin_not;
-                continue;
-            }
-            add_rev_list_revision_arg(
-                line,
-                stdin_not,
-                &mut includes,
-                &mut excludes,
-                &mut linear_ranges,
-                &mut symmetric_ranges,
-            )?;
-        }
     }
     if show_parents && show_children {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if graph && !walk {
-        eprintln!("fatal: cannot combine --no-walk with --graph");
-        return Err(GitError::Exit(128));
-    }
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
+    }
+    if !default_revision_given {
+        setup_args.splice(0..0, ["--default".to_string(), "HEAD".to_string()]);
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
-    let hidden_refs = RevListHiddenRefs::from_config(&config);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let output_encoding = log_output_encoding(&config);
+    let cwd = env::current_dir()?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let setup = sley_rev::setup_revisions(
+        &setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir: &git_dir,
+            worktree_root: worktree_root.as_deref(),
+            cwd: &cwd,
+            format,
+            reader: &db,
+            config: Some(&config),
+        },
+    )?;
+    if let Some(leftover) = setup.leftovers.first() {
+        return Err(GitError::Command(format!(
+            "unsupported log option {leftover}"
+        )));
+    }
+    let revision_options = setup.options;
+    let max_count = revision_options.max_count;
+    let skip = revision_options.skip;
+    let max_age = revision_options.date_window.min_time;
+    let min_age = revision_options.date_window.max_time;
+    let reverse = revision_options.reverse;
+    let ordering = match revision_options.order {
+        sley_rev::RevisionOrder::Default => RevListOrdering::Default,
+        sley_rev::RevisionOrder::Topo => RevListOrdering::Topo,
+        sley_rev::RevisionOrder::Date => RevListOrdering::Date,
+        sley_rev::RevisionOrder::AuthorDate => RevListOrdering::AuthorDate,
+    };
+    let (walk, no_walk_unsorted) = match revision_options.no_walk {
+        sley_rev::NoWalkMode::Walk => (true, true),
+        sley_rev::NoWalkMode::Sorted => (false, false),
+        sley_rev::NoWalkMode::Unsorted => (false, true),
+    };
+    let first_parent = revision_options.first_parent;
+    let pathspecs = setup.pathspecs;
+    let full_history = revision_options.full_history;
+    if graph && !walk {
+        eprintln!("fatal: cannot combine --no-walk with --graph");
+        return Err(GitError::Exit(128));
+    }
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
     let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
@@ -1313,49 +1139,26 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
-    let has_ref_selectors = all_refs
-        || branches
-        || !branch_patterns.is_empty()
-        || tags
-        || !tag_patterns.is_empty()
-        || remotes
-        || !remote_patterns.is_empty()
-        || !ref_selectors.is_empty();
-    if includes.is_empty()
-        && excludes.is_empty()
-        && linear_ranges.is_empty()
-        && symmetric_ranges.is_empty()
-        && !has_ref_selectors
-        && let Some(default_revision) = default_revision
-    {
-        add_rev_list_revision_arg(
-            default_revision,
-            false,
-            &mut includes,
-            &mut excludes,
-            &mut linear_ranges,
-            &mut symmetric_ranges,
-        )?;
-    }
-    if includes.is_empty()
-        && excludes.is_empty()
-        && linear_ranges.is_empty()
-        && symmetric_ranges.is_empty()
-        && !has_ref_selectors
-    {
-        includes.push("HEAD".to_string());
-    }
     if walk_reflogs {
+        let reflog_revisions = revision_options
+            .positives
+            .iter()
+            .filter_map(|tip| tip.source_name.clone())
+            .collect::<Vec<_>>();
         return log_walk_reflogs(
-            &git_dir, format, &includes, max_count, skip, &output, reverse,
+            &git_dir,
+            format,
+            &reflog_revisions,
+            max_count,
+            skip,
+            &output,
+            reverse,
         );
     }
-    let log_format_source = if !has_ref_selectors
-        && includes.len() == 1
-        && linear_ranges.is_empty()
-        && symmetric_ranges.is_empty()
+    let log_format_source = if !revision_options.had_ref_selector
+        && revision_options.positives.len() == 1
     {
-        Some(includes[0].to_string())
+        revision_options.positives[0].source_name.clone()
     } else {
         None
     };
@@ -1363,95 +1166,28 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // `(start_commit_oid, source_label)` pairs in command-line order, used to
     // build the `%S` per-commit source map (later starts override earlier ones).
     let mut source_starts: Vec<(ObjectId, String)> = Vec::new();
-    for rev in includes {
-        let start = resolve_revision(&git_dir, format, &rev)?;
-        let commit = sley_rev::peel_to_commit(&db, format, &start)?;
-        source_starts.push((commit, rev.to_string()));
+    for tip in &revision_options.positives {
+        let commit = match sley_rev::peel_to_commit(&db, format, &tip.oid) {
+            Ok(commit) => commit,
+            Err(err) if tip.from_ref_selector => {
+                let Ok(object) = db.read_object(&tip.oid) else {
+                    return Err(err);
+                };
+                if matches!(object.object_type, ObjectType::Blob | ObjectType::Tree) {
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(source_name) = &tip.source_name {
+            source_starts.push((commit, source_name.clone()));
+        }
         starts.push(commit);
     }
-    let mut symmetric_excludes = Vec::new();
-    for (left, right, not) in linear_ranges {
-        let left_oid = resolve_revision(&git_dir, format, &left)?;
-        let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_oid = resolve_revision(&git_dir, format, &right)?;
-        let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
-        if not {
-            starts.push(left_oid);
-            symmetric_excludes.push(right_oid);
-        } else {
-            symmetric_excludes.push(left_oid);
-            starts.push(right_oid);
-        }
-    }
-    for (left, right, not) in symmetric_ranges {
-        let left_oid = resolve_revision(&git_dir, format, &left)?;
-        let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_oid = resolve_revision(&git_dir, format, &right)?;
-        let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
-        let merge_bases = merge_bases(&git_dir, &db, format, &left_oid, &right_oid)?;
-        if not {
-            starts.extend(merge_bases);
-            symmetric_excludes.push(left_oid);
-            symmetric_excludes.push(right_oid);
-        } else {
-            source_starts.push((left_oid, left.to_string()));
-            source_starts.push((right_oid, right.to_string()));
-            starts.push(left_oid);
-            starts.push(right_oid);
-            symmetric_excludes.extend(merge_bases);
-        }
-    }
-    if has_ref_selectors {
-        let store = FileRefStore::new(&git_dir, format);
-        for reference in store.list_refs()? {
-            let (selector_include, selector_exclude) =
-                rev_list_ref_selection(&reference.name, &ref_selectors, &hidden_refs);
-            let include_ref = all_refs
-                || rev_list_ref_selector_matches(
-                    &reference.name,
-                    "refs/heads/",
-                    branches,
-                    &branch_patterns,
-                )
-                || rev_list_ref_selector_matches(
-                    &reference.name,
-                    "refs/tags/",
-                    tags,
-                    &tag_patterns,
-                )
-                || rev_list_ref_selector_matches(
-                    &reference.name,
-                    "refs/remotes/",
-                    remotes,
-                    &remote_patterns,
-                )
-                || selector_include;
-            if !include_ref && !selector_exclude {
-                continue;
-            }
-            let RefTarget::Direct(oid) = reference.target else {
-                continue;
-            };
-            if let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid) {
-                if include_ref {
-                    starts.push(commit);
-                }
-                if selector_exclude {
-                    symmetric_excludes.push(commit);
-                }
-            }
-        }
-    }
     let mut excluded = HashSet::new();
-    for oid in symmetric_excludes {
-        for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
-            excluded.insert(record.oid);
-        }
-    }
-    for rev in excludes {
-        let oid = resolve_revision(&git_dir, format, &rev)?;
-        let oid = sley_rev::peel_to_commit(&db, format, &oid)?;
-        for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
+    for oid in &revision_options.negatives {
+        for record in rev_list_walk_commits(&db, format, [*oid], first_parent)? {
             excluded.insert(record.oid);
         }
     }
@@ -2577,6 +2313,21 @@ fn log_fatal_unrecognized_argument(value: &str) -> Result<()> {
 
 fn log_diff_merges_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--diff-merges' requires a value");
+    GitError::Exit(128)
+}
+
+fn log_max_age_requires_value_error() -> GitError {
+    eprintln!("fatal: Option '--max-age' requires a value");
+    GitError::Exit(128)
+}
+
+fn log_min_age_requires_value_error() -> GitError {
+    eprintln!("fatal: Option '--min-age' requires a value");
+    GitError::Exit(128)
+}
+
+fn log_date_cutoff_requires_value_error(option: &str) -> GitError {
+    eprintln!("fatal: Option '{option}' requires a value");
     GitError::Exit(128)
 }
 
