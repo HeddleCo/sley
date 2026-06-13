@@ -253,7 +253,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     out.extend_from_slice(format!("From: {author_name} <{author_email}>\n").as_bytes());
 
     // Date: header — the *author* date in git's RFC 2822 rendering.
-    let date = commit_identity_date(&commit.author, ForEachRefDateMode::Rfc2822);
+    let date = commit_identity_date(&commit.author, &DateMode::Rfc2822);
     out.extend_from_slice(format!("Date: {date}\n").as_bytes());
 
     // Subject: [PREFIX n/m] <subject> (or, with -k/--keep-subject, the bare

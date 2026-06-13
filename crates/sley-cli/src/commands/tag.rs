@@ -868,8 +868,8 @@ fn tag_reflog_message(git_dir: &Path, format: ObjectFormat, target: &ObjectId) -
         ObjectType::Commit => {
             let commit = Commit::parse(format, &object.body)?;
             let subject = commit_subject(&commit.message);
-            let date = for_each_ref_identity_date(&commit.committer, ForEachRefDateMode::Short)
-                .unwrap_or_default();
+            let date =
+                for_each_ref_identity_date(&commit.committer, &DateMode::Short).unwrap_or_default();
             format!("{subject}, {date}")
         }
         ObjectType::Tag => "other tag object".to_string(),

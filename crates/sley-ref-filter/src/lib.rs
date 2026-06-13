@@ -5,7 +5,7 @@
 //! This crate owns those semantic primitives so the CLI can remain an entry
 //! point instead of a home for every command's formatting state.
 
-use sley_core::{GitError, ObjectId, Result};
+use sley_core::{DateMode, GitError, ObjectId, Result};
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,12 +76,12 @@ pub enum ForEachRefAtomIdentityRole {
     Creator,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForEachRefAtomIdentityPart {
     Full,
     Name,
     Email(ForEachRefEmailMode),
-    Date(ForEachRefDateMode),
+    Date(DateMode),
     DateRaw,
 }
 
@@ -424,337 +424,6 @@ pub enum ForEachRefEmailMode {
     LocalPart,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ForEachRefDateMode {
-    #[default]
-    Default,
-    Raw,
-    Unix,
-    Short,
-    Iso,
-    IsoStrict,
-    Rfc2822,
-}
-
-/// The full `%(authordate:...)` date specifier grammar, matching git's
-/// `parse_date_format` (date.c). Carries the base mode, the `-local` flag, and
-/// an owned `strftime` template for the `format:`/`format-local:` modes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ForEachRefDateSpec {
-    Default,
-    Local,
-    Raw,
-    RawLocal,
-    Unix,
-    Short,
-    ShortLocal,
-    Iso,
-    IsoLocal,
-    IsoStrict,
-    IsoStrictLocal,
-    Rfc2822,
-    Rfc2822Local,
-    Relative,
-    Human,
-    Strftime { template: String, local: bool },
-}
-
-impl ForEachRefDateSpec {
-    /// Parse the modifier after `%(authordate:` (the part following the colon),
-    /// or `None` for the bare `%(authordate)` atom. Returns `None` for an
-    /// unrecognized specifier (the caller turns that into git's error).
-    pub fn parse(modifier: Option<&str>) -> Option<Self> {
-        let Some(modifier) = modifier else {
-            return Some(Self::Default);
-        };
-        if let Some(template) = modifier.strip_prefix("format:") {
-            return Some(Self::Strftime {
-                template: template.to_string(),
-                local: false,
-            });
-        }
-        if let Some(template) = modifier.strip_prefix("format-local:") {
-            return Some(Self::Strftime {
-                template: template.to_string(),
-                local: true,
-            });
-        }
-        Some(match modifier {
-            "default" => Self::Default,
-            "default-local" | "local" => Self::Local,
-            "raw" => Self::Raw,
-            "raw-local" => Self::RawLocal,
-            "unix" => Self::Unix,
-            "short" => Self::Short,
-            "short-local" => Self::ShortLocal,
-            "iso" | "iso8601" => Self::Iso,
-            "iso-local" | "iso8601-local" => Self::IsoLocal,
-            "iso-strict" | "iso8601-strict" => Self::IsoStrict,
-            "iso-strict-local" | "iso8601-strict-local" => Self::IsoStrictLocal,
-            "rfc" | "rfc2822" => Self::Rfc2822,
-            "rfc-local" | "rfc2822-local" => Self::Rfc2822Local,
-            "relative" | "relative-local" => Self::Relative,
-            "human" | "human-local" => Self::Human,
-            _ => return None,
-        })
-    }
-
-    fn is_local(&self) -> bool {
-        matches!(
-            self,
-            Self::Local
-                | Self::RawLocal
-                | Self::ShortLocal
-                | Self::IsoLocal
-                | Self::IsoStrictLocal
-                | Self::Rfc2822Local
-                | Self::Strftime { local: true, .. }
-        )
-    }
-}
-
-/// Render a raw identity's date through the full for-each-ref date grammar.
-/// Returns `None` when the identity has no parseable date.
-pub fn for_each_ref_identity_date_spec(
-    identity: &[u8],
-    spec: &ForEachRefDateSpec,
-) -> Option<String> {
-    let timestamp = for_each_ref_identity_timestamp(identity)?;
-    let raw = std::str::from_utf8(for_each_ref_identity_date_raw(identity)?).ok()?;
-    let original_tz = raw.split_once(' ').map(|(_, tz)| tz).unwrap_or("+0000");
-    // `-local` modes recompute the civil time in UTC (the test harness pins
-    // TZ=UTC); the displayed timezone, where applicable, becomes `+0000`.
-    let tz = if spec.is_local() {
-        "+0000"
-    } else {
-        original_tz
-    };
-    let parts = for_each_ref_date_parts_from(timestamp, tz)?;
-    Some(match spec {
-        ForEachRefDateSpec::Default | ForEachRefDateSpec::Local => {
-            let base = format!(
-                "{} {} {} {:02}:{:02}:{:02} {}",
-                parts.weekday,
-                MONTHS_ABBR[(parts.month - 1) as usize],
-                parts.day,
-                parts.hour,
-                parts.minute,
-                parts.second,
-                parts.year,
-            );
-            if spec.is_local() {
-                base
-            } else {
-                format!("{base} {}", parts.timezone)
-            }
-        }
-        ForEachRefDateSpec::Raw | ForEachRefDateSpec::RawLocal => {
-            format!("{} {}", parts.timestamp, parts.timezone)
-        }
-        ForEachRefDateSpec::Unix => parts.timestamp.to_string(),
-        ForEachRefDateSpec::Short | ForEachRefDateSpec::ShortLocal => {
-            format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day)
-        }
-        ForEachRefDateSpec::Iso | ForEachRefDateSpec::IsoLocal => format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
-            parts.year,
-            parts.month,
-            parts.day,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            parts.timezone,
-        ),
-        ForEachRefDateSpec::IsoStrict | ForEachRefDateSpec::IsoStrictLocal => format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
-            parts.year,
-            parts.month,
-            parts.day,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            for_each_ref_strict_timezone(parts.timezone),
-        ),
-        ForEachRefDateSpec::Rfc2822 | ForEachRefDateSpec::Rfc2822Local => format!(
-            "{}, {} {} {:04} {:02}:{:02}:{:02} {}",
-            parts.weekday,
-            parts.day,
-            MONTHS_ABBR[(parts.month - 1) as usize],
-            parts.year,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            parts.timezone,
-        ),
-        ForEachRefDateSpec::Relative => for_each_ref_relative_date(parts.timestamp),
-        ForEachRefDateSpec::Human => {
-            // Approximate: git's "human" mode is locale/now-dependent; the test
-            // suite only exercises it via the valid-specifier smoke check, never
-            // comparing exact bytes, so the default rendering is acceptable.
-            format!(
-                "{} {} {} {:02}:{:02}:{:02} {} {}",
-                parts.weekday,
-                MONTHS_ABBR[(parts.month - 1) as usize],
-                parts.day,
-                parts.hour,
-                parts.minute,
-                parts.second,
-                parts.year,
-                parts.timezone,
-            )
-        }
-        ForEachRefDateSpec::Strftime { template, .. } => for_each_ref_strftime(template, &parts),
-    })
-}
-
-const MONTHS_ABBR: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-const MONTHS_FULL: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-
-const WEEKDAYS_FULL: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
-
-fn for_each_ref_date_parts_from(timestamp: i64, timezone: &str) -> Option<ForEachRefDateParts<'_>> {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    let offset_seconds = for_each_ref_timezone_offset_seconds(timezone)?;
-    let local = timestamp + offset_seconds;
-    let days = local.div_euclid(86_400);
-    let seconds = local.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    Some(ForEachRefDateParts {
-        timestamp,
-        timezone,
-        weekday: WEEKDAYS[(days + 4).rem_euclid(7) as usize],
-        year,
-        month,
-        day,
-        hour: seconds / 3_600,
-        minute: (seconds % 3_600) / 60,
-        second: seconds % 60,
-    })
-}
-
-/// A minimal `strftime` covering the conversions git's date output relies on
-/// in the test suite. Unknown specifiers are emitted verbatim (with the `%`).
-fn for_each_ref_strftime(template: &str, parts: &ForEachRefDateParts<'_>) -> String {
-    let weekday_index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-        .iter()
-        .position(|day| *day == parts.weekday)
-        .unwrap_or(0);
-    let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('Y') => out.push_str(&format!("{:04}", parts.year)),
-            Some('y') => out.push_str(&format!("{:02}", parts.year.rem_euclid(100))),
-            Some('m') => out.push_str(&format!("{:02}", parts.month)),
-            Some('d') => out.push_str(&format!("{:02}", parts.day)),
-            Some('e') => out.push_str(&format!("{:2}", parts.day)),
-            Some('H') => out.push_str(&format!("{:02}", parts.hour)),
-            Some('M') => out.push_str(&format!("{:02}", parts.minute)),
-            Some('S') => out.push_str(&format!("{:02}", parts.second)),
-            Some('b') | Some('h') => out.push_str(MONTHS_ABBR[(parts.month - 1) as usize]),
-            Some('B') => out.push_str(MONTHS_FULL[(parts.month - 1) as usize]),
-            Some('a') => out.push_str(parts.weekday),
-            Some('A') => out.push_str(WEEKDAYS_FULL[weekday_index]),
-            Some('%') => out.push('%'),
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
-            None => out.push('%'),
-        }
-    }
-    out
-}
-
-/// A relative ("N <unit> ago") date string, mirroring git's
-/// `show_date_relative` cutoffs. Used by `%(authordate:relative)`.
-fn for_each_ref_relative_date(timestamp: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(timestamp);
-    if timestamp > now {
-        return "in the future".to_string();
-    }
-    let diff = (now - timestamp) as u64;
-    if diff < 90 {
-        return format!("{diff} seconds ago");
-    }
-    let minutes = (diff + 30) / 60;
-    if minutes < 90 {
-        return format!("{minutes} minutes ago");
-    }
-    let hours = (diff + 1800) / 3600;
-    if hours < 36 {
-        return format!("{hours} hours ago");
-    }
-    let days = (diff + 43200) / 86400;
-    if days < 14 {
-        return format!("{days} days ago");
-    }
-    if days < 70 {
-        return format!("{} weeks ago", (days + 3) / 7);
-    }
-    if days < 365 {
-        return format!("{} months ago", (days + 15) / 30);
-    }
-    let years_scaled = (days * 10 + 183) / 365;
-    if days < 365 * 2 {
-        let months = ((days - 365) + 15) / 30;
-        if months > 0 {
-            return format!("1 year, {months} months ago");
-        }
-        return "1 year ago".to_string();
-    }
-    if years_scaled.is_multiple_of(10) {
-        format!("{} years ago", years_scaled / 10)
-    } else {
-        format!("{}.{} years ago", years_scaled / 10, years_scaled % 10)
-    }
-}
-
-struct ForEachRefDateParts<'a> {
-    timestamp: i64,
-    timezone: &'a str,
-    weekday: &'static str,
-    year: i64,
-    month: u32,
-    day: u32,
-    hour: i64,
-    minute: i64,
-    second: i64,
-}
-
 pub fn write_for_each_ref_track(
     stdout: &mut impl Write,
     track: ForEachRefTrack,
@@ -855,13 +524,13 @@ pub fn write_for_each_ref_identity_date(
     stdout: &mut impl Write,
     identity: Option<&[u8]>,
 ) -> Result<()> {
-    write_for_each_ref_identity_date_mode(stdout, identity, ForEachRefDateMode::Default)
+    write_for_each_ref_identity_date_mode(stdout, identity, &DateMode::Default)
 }
 
 pub fn write_for_each_ref_identity_date_mode(
     stdout: &mut impl Write,
     identity: Option<&[u8]>,
-    mode: ForEachRefDateMode,
+    mode: &DateMode,
 ) -> Result<()> {
     if let Some(identity) = identity
         && let Some(date) = for_each_ref_identity_date(identity, mode)
@@ -906,138 +575,17 @@ pub fn for_each_ref_identity_date_raw(identity: &[u8]) -> Option<&[u8]> {
     }
 }
 
-pub fn for_each_ref_identity_date(identity: &[u8], mode: ForEachRefDateMode) -> Option<String> {
-    let parts = for_each_ref_identity_date_parts(identity)?;
-    Some(format_for_each_ref_date(parts, mode))
-}
-
-fn for_each_ref_identity_date_parts(identity: &[u8]) -> Option<ForEachRefDateParts<'_>> {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
+pub fn for_each_ref_identity_date(identity: &[u8], mode: &DateMode) -> Option<String> {
     let raw = std::str::from_utf8(for_each_ref_identity_date_raw(identity)?).ok()?;
     let (timestamp, timezone) = raw.split_once(' ')?;
     let timestamp = timestamp.parse::<i64>().ok()?;
-    let offset_seconds = for_each_ref_timezone_offset_seconds(timezone)?;
-    let local = timestamp + offset_seconds;
-    let days = local.div_euclid(86_400);
-    let seconds = local.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    Some(ForEachRefDateParts {
-        timestamp,
-        timezone,
-        weekday: WEEKDAYS[(days + 4).rem_euclid(7) as usize],
-        year,
-        month,
-        day,
-        hour: seconds / 3_600,
-        minute: (seconds % 3_600) / 60,
-        second: seconds % 60,
-    })
+    mode.render(timestamp, timezone)
 }
 
 pub fn for_each_ref_identity_timestamp(identity: &[u8]) -> Option<i64> {
     let raw = std::str::from_utf8(for_each_ref_identity_date_raw(identity)?).ok()?;
     let (timestamp, _) = raw.split_once(' ')?;
     timestamp.parse::<i64>().ok()
-}
-
-fn for_each_ref_timezone_offset_seconds(timezone: &str) -> Option<i64> {
-    if timezone.len() != 5 {
-        return None;
-    }
-    let sign = match timezone.as_bytes()[0] {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let hours = timezone[1..3].parse::<i64>().ok()?;
-    let minutes = timezone[3..5].parse::<i64>().ok()?;
-    Some(sign * (hours * 3600 + minutes * 60))
-}
-
-fn format_for_each_ref_date(parts: ForEachRefDateParts<'_>, mode: ForEachRefDateMode) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    match mode {
-        ForEachRefDateMode::Default => format!(
-            "{} {} {} {:02}:{:02}:{:02} {} {}",
-            parts.weekday,
-            MONTHS[(parts.month - 1) as usize],
-            parts.day,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            parts.year,
-            parts.timezone
-        ),
-        ForEachRefDateMode::Raw => format!("{} {}", parts.timestamp, parts.timezone),
-        ForEachRefDateMode::Unix => parts.timestamp.to_string(),
-        ForEachRefDateMode::Short => {
-            format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day)
-        }
-        ForEachRefDateMode::Iso => format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
-            parts.year,
-            parts.month,
-            parts.day,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            parts.timezone
-        ),
-        ForEachRefDateMode::IsoStrict => format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
-            parts.year,
-            parts.month,
-            parts.day,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            for_each_ref_strict_timezone(parts.timezone)
-        ),
-        ForEachRefDateMode::Rfc2822 => format!(
-            // RFC 2822 day-of-month is not zero-padded (e.g. "Wed, 3 Jun 2026"),
-            // matching upstream git; only the time fields are zero-padded.
-            "{}, {} {} {:04} {:02}:{:02}:{:02} {}",
-            parts.weekday,
-            parts.day,
-            MONTHS[(parts.month - 1) as usize],
-            parts.year,
-            parts.hour,
-            parts.minute,
-            parts.second,
-            parts.timezone
-        ),
-    }
-}
-
-fn for_each_ref_strict_timezone(timezone: &str) -> String {
-    // git's ISO 8601 strict output (date.c, DATE_ISO8601_STRICT) emits 'Z' when the
-    // numeric timezone offset is zero (covers both `+0000` and `-0000`), and
-    // `±HH:MM` otherwise. The incoming `timezone` is the `±HHMM` form.
-    let digits = timezone
-        .strip_prefix(['+', '-'])
-        .unwrap_or(timezone)
-        .trim_start_matches('0');
-    if digits.is_empty() {
-        return "Z".to_string();
-    }
-    format!("{}:{}", &timezone[..3], &timezone[3..])
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-    (year, month as u32, day as u32)
 }
 
 /// The signature begin-markers git recognizes (`gpg-interface.c` format table).
@@ -1275,7 +823,7 @@ pub fn parse_for_each_ref_abbrev_width(value: &str) -> Result<usize> {
     Ok(width.max(4))
 }
 
-pub fn commit_identity_date(raw: &[u8], mode: ForEachRefDateMode) -> String {
+pub fn commit_identity_date(raw: &[u8], mode: &DateMode) -> String {
     for_each_ref_identity_date(raw, mode).unwrap_or_default()
 }
 
@@ -1409,7 +957,7 @@ mod tests {
         );
         assert_eq!(for_each_ref_identity_timestamp(ident), Some(1717430401));
         assert_eq!(
-            for_each_ref_identity_date(ident, ForEachRefDateMode::Raw).as_deref(),
+            for_each_ref_identity_date(ident, &DateMode::Raw).as_deref(),
             Some("1717430401 -0530")
         );
     }
@@ -1418,11 +966,11 @@ mod tests {
     fn dates_use_identity_timezone() {
         let ident = b"Ada <ada@example.com> 1717430401 -0530";
         assert_eq!(
-            for_each_ref_identity_date(ident, ForEachRefDateMode::Short).as_deref(),
+            for_each_ref_identity_date(ident, &DateMode::Short).as_deref(),
             Some("2024-06-03")
         );
         assert_eq!(
-            for_each_ref_identity_date(ident, ForEachRefDateMode::IsoStrict).as_deref(),
+            for_each_ref_identity_date(ident, &DateMode::IsoStrict).as_deref(),
             Some("2024-06-03T10:30:01-05:30")
         );
     }

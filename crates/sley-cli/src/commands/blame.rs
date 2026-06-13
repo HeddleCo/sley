@@ -939,10 +939,10 @@ fn author_and_date(
     // author's timezone); `-t` selects the raw `<seconds> <tz>` form. Both are
     // produced by the shared date-mode formatter.
     let date_mode = match options.date_field {
-        DateField::Iso => ForEachRefDateMode::Iso,
-        DateField::Raw => ForEachRefDateMode::Raw,
+        DateField::Iso => DateMode::Iso,
+        DateField::Raw => DateMode::Raw,
     };
-    let date = for_each_ref_identity_date(identity, date_mode).unwrap_or_default();
+    let date = for_each_ref_identity_date(identity, &date_mode).unwrap_or_default();
 
     Ok((author, date))
 }

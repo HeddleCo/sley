@@ -1,5 +1,5 @@
 use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
-use sley_core::{BString, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{BString, DateMode, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
     Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry, InitOptions,
     RefStorageFormat, RepositoryBootstrap, RepositoryLayout,
@@ -5303,7 +5303,7 @@ fn write_for_each_ref_typed_atom(
                     write_for_each_ref_identity_email_mode(stdout, identity, *mode)?
                 }
                 ForEachRefAtomIdentityPart::Date(mode) => {
-                    write_for_each_ref_identity_date_mode(stdout, identity, *mode)?
+                    write_for_each_ref_identity_date_mode(stdout, identity, mode)?
                 }
                 ForEachRefAtomIdentityPart::DateRaw => {
                     write_for_each_ref_identity_date_raw(stdout, identity)?
@@ -5597,7 +5597,7 @@ fn for_each_ref_try_date_atom(
         "*creatordate" => (true, ForEachRefAtomIdentityRole::Creator),
         _ => return None,
     };
-    let Some(spec) = ForEachRefDateSpec::parse(arg) else {
+    let Some(mode) = DateMode::parse_atom_modifier(arg) else {
         let name = atom.strip_prefix('*').unwrap_or(atom);
         eprintln!(
             "fatal: unrecognized %({name}) argument: {}",
@@ -5607,7 +5607,7 @@ fn for_each_ref_try_date_atom(
     };
     Some((|| -> Result<()> {
         if let Some(identity) = for_each_ref_typed_identity(context, peeled, role)
-            && let Some(value) = for_each_ref_identity_date_spec(identity, &spec)
+            && let Some(value) = for_each_ref_identity_date(identity, &mode)
         {
             stdout.write_all(value.as_bytes())?;
         }
@@ -6262,33 +6262,14 @@ fn log_grep_requires_value_error() -> GitError {
     GitError::Exit(128)
 }
 
-fn log_validate_date_format(value: &str) -> Result<()> {
-    match value {
-        "raw" | "unix" | "relative" | "local" | "iso" | "iso-local" | "iso-strict"
-        | "iso-strict-local" | "rfc" | "rfc-local" | "rfc2822" | "rfc2822-local" | "short"
-        | "short-local" | "default" | "default-local" | "human" | "human-local" => Ok(()),
-        value
-            if value.starts_with("format:")
-                || value.starts_with("format-local:")
-                || value.starts_with("auto:") =>
-        {
-            Ok(())
+fn log_date_mode(value: &str) -> Result<DateMode> {
+    match DateMode::parse(value) {
+        Some(mode) => Ok(mode),
+        None => {
+            log_unknown_date_format(value)?;
+            unreachable!("log_unknown_date_format always returns an error")
         }
-        _ => log_unknown_date_format(value),
     }
-}
-
-fn log_date_mode(value: &str) -> Result<ForEachRefDateMode> {
-    log_validate_date_format(value)?;
-    Ok(match value {
-        "raw" => ForEachRefDateMode::Raw,
-        "unix" => ForEachRefDateMode::Unix,
-        "short" | "short-local" => ForEachRefDateMode::Short,
-        "iso" | "iso-local" => ForEachRefDateMode::Iso,
-        "iso-strict" | "iso-strict-local" => ForEachRefDateMode::IsoStrict,
-        "rfc" | "rfc-local" | "rfc2822" | "rfc2822-local" => ForEachRefDateMode::Rfc2822,
-        _ => ForEachRefDateMode::Default,
-    })
 }
 
 fn log_unknown_date_format(value: &str) -> Result<()> {
@@ -7728,7 +7709,7 @@ struct LogFormatContext<'a> {
     marker: char,
     dialect: LogFormatDialect,
     source: Option<&'a str>,
-    date_mode: ForEachRefDateMode,
+    date_mode: &'a DateMode,
     /// Per-commit `%S` source label (set when walking refs/ranges/bisect).
     source_oid: Option<&'a HashMap<ObjectId, String>>,
     /// `git_dir`/db/format for placeholders that need object access (`%(describe)`).
@@ -8040,7 +8021,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.author, ForEachRefDateMode::Iso)
+                    commit_identity_date(&record.commit.author, &DateMode::Iso)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8048,7 +8029,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.author, ForEachRefDateMode::IsoStrict)
+                    commit_identity_date(&record.commit.author, &DateMode::IsoStrict)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8056,7 +8037,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.author, ForEachRefDateMode::Short)
+                    commit_identity_date(&record.commit.author, &DateMode::Short)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8064,7 +8045,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.author, ForEachRefDateMode::Rfc2822)
+                    commit_identity_date(&record.commit.author, &DateMode::Rfc2822)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8089,7 +8070,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.committer, ForEachRefDateMode::Iso)
+                    commit_identity_date(&record.commit.committer, &DateMode::Iso)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8097,7 +8078,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.committer, ForEachRefDateMode::IsoStrict)
+                    commit_identity_date(&record.commit.committer, &DateMode::IsoStrict)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8105,7 +8086,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.committer, ForEachRefDateMode::Short)
+                    commit_identity_date(&record.commit.committer, &DateMode::Short)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8113,7 +8094,7 @@ fn emit_log_one_token(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&record.commit.committer, ForEachRefDateMode::Rfc2822)
+                    commit_identity_date(&record.commit.committer, &DateMode::Rfc2822)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8685,7 +8666,7 @@ pub(crate) struct StashFormatContext<'a> {
     pub index: usize,
     pub commit: &'a Commit,
     pub abbrev_len: Option<usize>,
-    pub date_mode: ForEachRefDateMode,
+    pub date_mode: &'a DateMode,
     pub date_explicit: bool,
 }
 
@@ -8788,7 +8769,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::Iso)
+                    commit_identity_date(&commit.author, &DateMode::Iso)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8796,7 +8777,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::IsoStrict)
+                    commit_identity_date(&commit.author, &DateMode::IsoStrict)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8804,7 +8785,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::Short)
+                    commit_identity_date(&commit.author, &DateMode::Short)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8812,7 +8793,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::Rfc2822)
+                    commit_identity_date(&commit.author, &DateMode::Rfc2822)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8837,7 +8818,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::Iso)
+                    commit_identity_date(&commit.committer, &DateMode::Iso)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8845,7 +8826,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::IsoStrict)
+                    commit_identity_date(&commit.committer, &DateMode::IsoStrict)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8853,7 +8834,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::Short)
+                    commit_identity_date(&commit.committer, &DateMode::Short)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8861,7 +8842,7 @@ pub(crate) fn emit_compiled_stash_format(
                 write!(
                     out,
                     "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::Rfc2822)
+                    commit_identity_date(&commit.committer, &DateMode::Rfc2822)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -8911,7 +8892,7 @@ pub(crate) fn print_stash_compiled_format(
     commit: &Commit,
     compiled: &CompiledLogFormat,
     abbrev_len: Option<usize>,
-    date_mode: ForEachRefDateMode,
+    date_mode: &DateMode,
     date_explicit: bool,
 ) -> Result<()> {
     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
@@ -8936,7 +8917,7 @@ fn stash_list_reflog_selector(
     reference: &str,
     index: usize,
     entry: &ReflogEntry,
-    date_mode: ForEachRefDateMode,
+    date_mode: &DateMode,
     date_explicit: bool,
 ) -> String {
     if date_explicit {

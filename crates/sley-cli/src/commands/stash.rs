@@ -17,7 +17,7 @@ struct StashListOptions {
     min_parents: Option<usize>,
     max_parents: Option<usize>,
     abbrev_len: Option<usize>,
-    date_mode: ForEachRefDateMode,
+    date_mode: DateMode,
     date_explicit: bool,
     author_filters: Vec<SimpleLogRegex>,
     committer_filters: Vec<SimpleLogRegex>,
@@ -2351,7 +2351,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                     &commit,
                     compiled,
                     options.abbrev_len,
-                    options.date_mode,
+                    &options.date_mode,
                     options.date_explicit,
                 )?;
                 if *final_newline || position + 1 < selected {
@@ -2372,7 +2372,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut min_parents = None;
     let mut max_parents = None;
     let mut abbrev_len = Some(7);
-    let mut date_mode = ForEachRefDateMode::Default;
+    let mut date_mode = DateMode::Default;
     let mut date_explicit = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
@@ -3149,7 +3149,7 @@ fn parse_stash_list_min_age(value: &str) -> Result<i64> {
     if age < 0 { Ok(i64::MAX) } else { Ok(age) }
 }
 
-fn stash_list_date_mode(value: &str) -> Result<ForEachRefDateMode> {
+fn stash_list_date_mode(value: &str) -> Result<DateMode> {
     log_date_mode(value).map_err(|err| match err {
         GitError::Exit(128) => GitError::Exit(1),
         err => err,

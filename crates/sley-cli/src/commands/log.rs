@@ -296,7 +296,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
     let mut regexp_mode = SimpleLogRegexMode::Basic;
-    let mut date_mode = ForEachRefDateMode::Default;
+    let mut date_mode = DateMode::Default;
     let mut date_explicit = false;
     // `-z` / `--null`: separate/terminate compiled-format entries with NUL
     // instead of newline.
@@ -1261,7 +1261,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             ResolvedPretty::Reference => {
                 // reference defaults the date to short; an explicit --date wins.
                 if !date_explicit {
-                    date_mode = ForEachRefDateMode::Short;
+                    date_mode = DateMode::Short;
                 }
                 output = LogOutput::Compiled {
                     compiled: CompiledLogFormat::compile(
@@ -1528,7 +1528,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     marker: '>',
                     dialect: LogFormatDialect::Log,
                     source: log_format_source.as_deref(),
-                    date_mode,
+                    date_mode: &date_mode,
                     source_oid: None,
                     describe: None,
                     color: false,
@@ -1734,7 +1734,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         marker: '>',
                         dialect: LogFormatDialect::Log,
                         source: log_format_source.as_deref(),
-                        date_mode,
+                        date_mode: &date_mode,
                         source_oid: source_labels.as_ref(),
                         describe: Some(&describe_ctx),
                         color: color_always,
@@ -1806,7 +1806,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         writeln!(
                             msg,
                             "Date:   {}",
-                            commit_identity_date(&record.commit.author, date_mode)
+                            commit_identity_date(&record.commit.author, &date_mode)
                         )
                         .map_err(io::Error::from)?;
                     }
@@ -1883,7 +1883,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 if kind == LogDefaultKind::Medium {
                     println!(
                         "Date:   {}",
-                        commit_identity_date(&record.commit.author, date_mode)
+                        commit_identity_date(&record.commit.author, &date_mode)
                     );
                 }
                 println!();
@@ -1923,7 +1923,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     marker: '>',
                     dialect: LogFormatDialect::Log,
                     source: log_format_source.as_deref(),
-                    date_mode,
+                    date_mode: &date_mode,
                     source_oid: source_labels.as_ref(),
                     describe: Some(&describe_ctx),
                     color: false,
