@@ -1,9 +1,14 @@
 pub mod graph;
+mod setup;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
 pub use sley_core::BString;
+pub use setup::{
+    NoWalkMode, RevisionOrder, RevisionOptions, RevisionSetupContext, RevisionSymmetricRange,
+    RevisionTip, SetupRevisions, ambiguous_argument_message, setup_revisions, setup_revisions_os,
+};
 use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
@@ -3296,6 +3301,84 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn setup_revisions_parses_ranges_carets_and_not() {
+        let fixture = setup_revisions_fixture();
+        let setup = run_setup(
+            &fixture,
+            ["base..main", "^side", "--not", "base", "^main"],
+        )
+        .expect("setup should parse");
+        assert_eq!(
+            setup
+                .options
+                .positives
+                .iter()
+                .map(|tip| tip.oid)
+                .collect::<Vec<_>>(),
+            vec![fixture.tip, fixture.tip]
+        );
+        assert_oid_set(
+            setup.options.negatives,
+            [fixture.base, fixture.side, fixture.base],
+        );
+    }
+
+    #[test]
+    fn setup_revisions_parses_symmetric_difference() {
+        let fixture = setup_revisions_fixture();
+        let setup = run_setup(&fixture, ["left...right"]).expect("setup should parse");
+        assert_oid_set(
+            setup.options.positives.iter().map(|tip| tip.oid),
+            [fixture.left, fixture.right],
+        );
+        assert_eq!(setup.options.negatives, vec![fixture.base]);
+        assert_eq!(
+            setup.options.symmetric_ranges,
+            vec![RevisionSymmetricRange {
+                left: fixture.left,
+                right: fixture.right,
+                negated: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn setup_revisions_expands_all_with_scoped_exclude() {
+        let fixture = setup_revisions_fixture();
+        let setup = run_setup(&fixture, ["--exclude=skip", "--branches"])
+            .expect("setup should parse");
+        assert_oid_set(
+            setup.options.positives.iter().map(|tip| tip.oid),
+            [fixture.tip, fixture.left, fixture.right, fixture.base, fixture.side],
+        );
+        assert!(!setup
+            .options
+            .positives
+            .iter()
+            .any(|tip| tip.oid == fixture.skipped));
+    }
+
+    #[test]
+    fn setup_revisions_collects_pathspecs_after_boundary() {
+        let fixture = setup_revisions_fixture();
+        let setup = run_setup(&fixture, ["HEAD", "--", "missing-path"])
+            .expect("setup should parse");
+        assert_eq!(setup.options.positives[0].oid, fixture.tip);
+        assert_eq!(setup.pathspecs, vec!["missing-path".to_string()]);
+    }
+
+    #[test]
+    fn setup_revisions_reports_ambiguous_argument() {
+        let fixture = setup_revisions_fixture();
+        let err = run_setup(&fixture, ["not-a-rev-or-path"]).expect_err("setup should fail");
+        assert!(matches!(err, GitError::Exit(128)));
+        assert_eq!(
+            ambiguous_argument_message("not-a-rev-or-path"),
+            "fatal: ambiguous argument 'not-a-rev-or-path': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
+        );
+    }
+
+    #[test]
     fn resolve_revision_reads_symbolic_head_and_tags() {
         let git_dir = temp_git_dir();
         let oid = ObjectId::from_hex(
@@ -4486,6 +4569,69 @@ mod tests {
         assert_eq!(oid_set(actual), oid_set(expected));
     }
 
+    struct SetupRevisionsFixture {
+        git_dir: PathBuf,
+        worktree: PathBuf,
+        db: FileObjectDatabase,
+        base: ObjectId,
+        tip: ObjectId,
+        left: ObjectId,
+        right: ObjectId,
+        side: ObjectId,
+        skipped: ObjectId,
+    }
+
+    fn setup_revisions_fixture() -> SetupRevisionsFixture {
+        let git_dir = temp_git_dir();
+        let worktree = git_dir.with_extension("worktree");
+        fs::create_dir_all(&worktree).expect("test operation should succeed");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = write_tree(&mut db, &[]);
+        let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
+        let tip = write_test_commit(&mut db, tree, vec![base], b"tip\n");
+        let left = write_test_commit(&mut db, tree, vec![base], b"left\n");
+        let right = write_test_commit(&mut db, tree, vec![base], b"right\n");
+        let side = write_test_commit(&mut db, tree, Vec::new(), b"side\n");
+        let skipped = write_test_commit(&mut db, tree, Vec::new(), b"skipped\n");
+        set_branch(&git_dir, "main", &tip);
+        set_branch(&git_dir, "base", &base);
+        set_branch(&git_dir, "left", &left);
+        set_branch(&git_dir, "right", &right);
+        set_branch(&git_dir, "side", &side);
+        set_ref(&git_dir, "refs/heads/skip/topic", &skipped);
+        SetupRevisionsFixture {
+            git_dir,
+            worktree,
+            db,
+            base,
+            tip,
+            left,
+            right,
+            side,
+            skipped,
+        }
+    }
+
+    fn run_setup<const N: usize>(
+        fixture: &SetupRevisionsFixture,
+        args: [&str; N],
+    ) -> Result<SetupRevisions> {
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        setup_revisions(
+            &args,
+            &RevisionSetupContext {
+                git_dir: &fixture.git_dir,
+                worktree_root: Some(&fixture.worktree),
+                cwd: &fixture.worktree,
+                format: ObjectFormat::Sha1,
+                reader: &fixture.db,
+                config: None,
+            },
+        )
+    }
+
     fn set_branch(git_dir: &Path, branch: &str, oid: &ObjectId) {
         set_ref(git_dir, &format!("refs/heads/{branch}"), oid);
     }
@@ -4525,8 +4671,8 @@ mod tests {
             .expect("test operation should succeed");
     }
 
-    fn write_test_commit(
-        db: &mut ObjectDatabase,
+    fn write_test_commit<W: ObjectWriter>(
+        db: &mut W,
         tree: ObjectId,
         parents: Vec<ObjectId>,
         message: &[u8],
