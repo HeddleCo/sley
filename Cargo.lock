@@ -1247,6 +1247,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-options"
+version = "0.1.0"
+
+[[package]]
 name = "sley-pack"
 version = "0.1.0"
 dependencies = [
