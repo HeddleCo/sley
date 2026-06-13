@@ -1130,6 +1130,7 @@ dependencies = [
  "sley-notes",
  "sley-object",
  "sley-odb",
+ "sley-options",
  "sley-pack",
  "sley-protocol",
  "sley-ref-filter",
@@ -1245,6 +1246,10 @@ dependencies = [
  "sley-object",
  "sley-pack",
 ]
+
+[[package]]
+name = "sley-options"
+version = "0.1.0"
 
 [[package]]
 name = "sley-pack"
