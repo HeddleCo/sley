@@ -32,7 +32,8 @@ pub fn transport_kind_for_url(url: &str) -> Result<Option<RemoteTransportKind>> 
     }
     Ok(match parse_remote_url(url)?.transport {
         RemoteTransport::Http | RemoteTransport::Https => Some(RemoteTransportKind::Http),
-        RemoteTransport::Ssh | RemoteTransport::Git => Some(RemoteTransportKind::Ssh),
+        RemoteTransport::Ssh => Some(RemoteTransportKind::Ssh),
+        RemoteTransport::Git => Some(RemoteTransportKind::Git),
         RemoteTransport::Local | RemoteTransport::File => Some(RemoteTransportKind::Local),
     })
 }
@@ -87,7 +88,8 @@ impl FetchSource {
         match source {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
-                RemoteTransport::Ssh | RemoteTransport::Git => Self::Ssh(remote),
+                RemoteTransport::Ssh => Self::Ssh(remote),
+                RemoteTransport::Git => Self::Git(remote),
                 RemoteTransport::Local | RemoteTransport::File => {
                     unreachable!("local remotes use FetchSource::Local")
                 }
@@ -108,7 +110,8 @@ impl PushDestination {
         match source {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
-                RemoteTransport::Ssh | RemoteTransport::Git => Self::Ssh(remote),
+                RemoteTransport::Ssh => Self::Ssh(remote),
+                RemoteTransport::Git => Self::Git(remote),
                 RemoteTransport::Local | RemoteTransport::File => {
                     unreachable!("local remotes use PushDestination::Local")
                 }
@@ -254,5 +257,23 @@ mod tests {
             )],
         };
         assert_eq!(push_url(&config, "origin"), "https://push.example/x.git");
+    }
+
+    #[test]
+    fn git_scheme_routes_to_native_git_transport() {
+        let url = "git://127.0.0.1/repo.git";
+
+        assert_eq!(
+            transport_kind_for_url(url).expect("kind"),
+            Some(RemoteTransportKind::Git)
+        );
+        assert!(matches!(
+            fetch_source_for_url(url, Path::new(".")).expect("fetch source"),
+            FetchSource::Git(_)
+        ));
+        assert!(matches!(
+            push_destination_for_url(url, Path::new(".")).expect("push destination"),
+            PushDestination::Git(_)
+        ));
     }
 }

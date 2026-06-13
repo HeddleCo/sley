@@ -569,24 +569,22 @@ impl<'a> CommitRef<'a> {
             .windows(2)
             .position(|window| window == b"\n\n")
             .ok_or_else(|| GitError::InvalidObject("commit missing message separator".into()))?;
-        let headers = std::str::from_utf8(&bytes[..split])
-            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
         let mut tree = None;
         let mut parents = Vec::new();
         let mut author = None;
         let mut committer = None;
         let mut encoding = None;
-        for line in headers.lines() {
-            if let Some(value) = line.strip_prefix("tree ") {
-                tree = Some(ObjectId::from_hex(format, value)?);
-            } else if let Some(value) = line.strip_prefix("parent ") {
-                parents.push(ObjectId::from_hex(format, value)?);
-            } else if let Some(value) = line.strip_prefix("author ") {
-                author = Some(value.as_bytes());
-            } else if let Some(value) = line.strip_prefix("committer ") {
-                committer = Some(value.as_bytes());
-            } else if let Some(value) = line.strip_prefix("encoding ") {
-                encoding = Some(value.as_bytes());
+        for line in bytes[..split].split(|byte| *byte == b'\n') {
+            if let Some(value) = line.strip_prefix(b"tree ") {
+                tree = Some(ObjectId::from_hex(format, ascii_header_value(value)?)?);
+            } else if let Some(value) = line.strip_prefix(b"parent ") {
+                parents.push(ObjectId::from_hex(format, ascii_header_value(value)?)?);
+            } else if let Some(value) = line.strip_prefix(b"author ") {
+                author = Some(value);
+            } else if let Some(value) = line.strip_prefix(b"committer ") {
+                committer = Some(value);
+            } else if let Some(value) = line.strip_prefix(b"encoding ") {
+                encoding = Some(value);
             }
         }
         Ok(Self {
@@ -650,16 +648,16 @@ impl<'a> From<CommitRef<'a>> for Commit {
 /// understands.
 ///
 /// `Tag` preserves `object`, `type`, `tag`, optional `tagger`, and message
-/// bytes. It intentionally does not retain unknown headers, signature
-/// continuation blocks, or original header ordering. Use [`EncodedObject`] when
-/// annotated tag object bytes or object ids must be preserved exactly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// bytes. Parsed tags also retain their original body so parse/write can
+/// preserve annotated tag object ids exactly.
+#[derive(Debug, Clone, Eq)]
 pub struct Tag {
     pub object: ObjectId,
     pub object_type: ObjectType,
     pub name: Vec<u8>,
     pub tagger: Option<Vec<u8>>,
     pub message: Vec<u8>,
+    pub raw_body: Option<Vec<u8>>,
 }
 
 /// A borrowed parse-view of a raw annotated tag object.
@@ -676,6 +674,17 @@ pub struct TagRef<'a> {
     pub name: &'a [u8],
     pub tagger: Option<&'a [u8]>,
     pub message: &'a [u8],
+    pub raw_body: Option<&'a [u8]>,
+}
+
+impl PartialEq for Tag {
+    fn eq(&self, other: &Self) -> bool {
+        self.object == other.object
+            && self.object_type == other.object_type
+            && self.name == other.name
+            && self.tagger == other.tagger
+            && self.message == other.message
+    }
 }
 
 impl Tag {
@@ -697,6 +706,9 @@ impl Tag {
     /// intended to reproduce raw input bytes that contained unknown headers or
     /// signatures.
     pub fn write(&self) -> Vec<u8> {
+        if let Some(raw) = &self.raw_body {
+            return raw.clone();
+        }
         let mut out = Vec::new();
         out.extend_from_slice(format!("object {}\n", self.object).as_bytes());
         out.extend_from_slice(format!("type {}\n", self.object_type.as_str()).as_bytes());
@@ -729,25 +741,24 @@ impl Tag {
 
 impl<'a> TagRef<'a> {
     pub fn parse(format: ObjectFormat, bytes: &'a [u8]) -> Result<Self> {
-        let split = bytes
-            .windows(2)
-            .position(|window| window == b"\n\n")
-            .ok_or_else(|| GitError::InvalidObject("tag missing message separator".into()))?;
-        let headers = std::str::from_utf8(&bytes[..split])
-            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
+        let split = bytes.windows(2).position(|window| window == b"\n\n");
+        let (headers, message) = match split {
+            Some(split) => (&bytes[..split], &bytes[split + 2..]),
+            None => (bytes, &bytes[bytes.len()..]),
+        };
         let mut object = None;
         let mut object_type = None;
         let mut name = None;
         let mut tagger = None;
-        for line in headers.lines() {
-            if let Some(value) = line.strip_prefix("object ") {
-                object = Some(ObjectId::from_hex(format, value)?);
-            } else if let Some(value) = line.strip_prefix("type ") {
-                object_type = Some(value.parse()?);
-            } else if let Some(value) = line.strip_prefix("tag ") {
-                name = Some(value.as_bytes());
-            } else if let Some(value) = line.strip_prefix("tagger ") {
-                tagger = Some(value.as_bytes());
+        for line in headers.split(|byte| *byte == b'\n') {
+            if let Some(value) = line.strip_prefix(b"object ") {
+                object = Some(ObjectId::from_hex(format, ascii_header_value(value)?)?);
+            } else if let Some(value) = line.strip_prefix(b"type ") {
+                object_type = Some(ascii_header_value(value)?.parse()?);
+            } else if let Some(value) = line.strip_prefix(b"tag ") {
+                name = Some(value);
+            } else if let Some(value) = line.strip_prefix(b"tagger ") {
+                tagger = Some(value);
             }
         }
         Ok(Self {
@@ -756,7 +767,8 @@ impl<'a> TagRef<'a> {
                 .ok_or_else(|| GitError::InvalidObject("tag missing type".into()))?,
             name: name.ok_or_else(|| GitError::InvalidObject("tag missing name".into()))?,
             tagger,
-            message: &bytes[split + 2..],
+            message,
+            raw_body: Some(bytes),
         })
     }
 
@@ -767,6 +779,7 @@ impl<'a> TagRef<'a> {
             name: self.name.to_vec(),
             tagger: self.tagger.map(<[u8]>::to_vec),
             message: self.message.to_vec(),
+            raw_body: self.raw_body.map(<[u8]>::to_vec),
         }
     }
 
@@ -792,8 +805,13 @@ impl<'a> From<TagRef<'a>> for Tag {
             name: tag.name.to_vec(),
             tagger: tag.tagger.map(<[u8]>::to_vec),
             message: tag.message.to_vec(),
+            raw_body: tag.raw_body.map(<[u8]>::to_vec),
         }
     }
+}
+
+fn ascii_header_value(value: &[u8]) -> Result<&str> {
+    std::str::from_utf8(value).map_err(|err| GitError::InvalidObject(err.to_string()))
 }
 
 pub fn parse_framed_object(bytes: &[u8]) -> Result<EncodedObject> {
@@ -1176,6 +1194,30 @@ mod tests {
     }
 
     #[test]
+    fn commit_ref_accepts_non_utf8_headers_and_message() {
+        let format = ObjectFormat::Sha1;
+        let tree = ObjectId::empty_tree(format);
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("tree {tree}\n").as_bytes());
+        body.extend_from_slice(b"author J\xF6rg <j@example.invalid> 0 +0000\n");
+        body.extend_from_slice(b"committer M\xFCller <m@example.invalid> 1 +0000\n");
+        body.extend_from_slice(b"encoding ISO-8859-1\n\n");
+        body.extend_from_slice(b"caf\xE9\n");
+
+        let commit = CommitRef::parse(format, &body).expect("non-utf8 commit parses");
+        assert_eq!(commit.tree, tree);
+        assert_borrows_from(&body, commit.author, b"J\xF6rg <j@example.invalid> 0 +0000");
+        assert_borrows_from(
+            &body,
+            commit.committer,
+            b"M\xFCller <m@example.invalid> 1 +0000",
+        );
+        assert_borrows_from(&body, commit.encoding.expect("encoding"), b"ISO-8859-1");
+        assert_borrows_from(&body, commit.message, b"caf\xE9\n");
+        assert_eq!(commit.to_owned().write(), body);
+    }
+
+    #[test]
     fn commit_ref_rejects_missing_or_malformed_required_headers() {
         let format = ObjectFormat::Sha1;
         let valid_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -1216,6 +1258,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
             message: b"release\n".to_vec(),
+            raw_body: None,
         };
         assert_eq!(
             Tag::parse(ObjectFormat::Sha1, &tag.write()).expect("test operation should succeed"),
@@ -1224,7 +1267,31 @@ mod tests {
     }
 
     #[test]
-    fn typed_commit_and_tag_parse_write_drops_unknown_headers_by_contract() {
+    fn tag_ref_accepts_non_utf8_tagger_and_message() {
+        let format = ObjectFormat::Sha1;
+        let object = ObjectId::empty_blob(format);
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("object {object}\n").as_bytes());
+        body.extend_from_slice(b"type blob\n");
+        body.extend_from_slice(b"tag v1.0\n");
+        body.extend_from_slice(b"tagger J\xF6rg <j@example.invalid> 0 +0000\n\n");
+        body.extend_from_slice(b"caf\xE9\n");
+
+        let tag = TagRef::parse(format, &body).expect("non-utf8 tag parses");
+        assert_eq!(tag.object, object);
+        assert_eq!(tag.object_type, ObjectType::Blob);
+        assert_borrows_from(&body, tag.name, b"v1.0");
+        assert_borrows_from(
+            &body,
+            tag.tagger.expect("tagger"),
+            b"J\xF6rg <j@example.invalid> 0 +0000",
+        );
+        assert_borrows_from(&body, tag.message, b"caf\xE9\n");
+        assert_eq!(tag.to_owned().write(), body);
+    }
+
+    #[test]
+    fn typed_commit_canonicalizes_but_tag_write_preserves_raw_body() {
         let format = ObjectFormat::Sha1;
         let tree = ObjectId::empty_tree(format);
         let raw_commit = format!(
@@ -1283,9 +1350,31 @@ mod tests {
         assert_eq!(tag.message, b"release\n");
 
         let written_tag = tag.write();
-        assert_ne!(written_tag, raw_tag);
-        assert_bytes_not_contains(&written_tag, b"x-hidden");
-        assert_bytes_not_contains(&written_tag, b"gpgsig");
+        assert_eq!(written_tag, raw_tag);
+        let original_oid = EncodedObject::new(ObjectType::Tag, raw_tag).object_id(format);
+        let written_oid = EncodedObject::new(ObjectType::Tag, written_tag).object_id(format);
+        assert_eq!(
+            original_oid.expect("original tag oid"),
+            written_oid.expect("written tag oid")
+        );
+    }
+
+    #[test]
+    fn tag_parse_write_preserves_uppercase_object_and_header_only_body() {
+        let format = ObjectFormat::Sha1;
+        let object = ObjectId::empty_blob(format);
+        let mut raw_tag = Vec::new();
+        raw_tag.extend_from_slice(
+            format!("object {}\n", object.to_string().to_uppercase()).as_bytes(),
+        );
+        raw_tag.extend_from_slice(b"type blob\n");
+        raw_tag.extend_from_slice(b"tag v1.0\n");
+        raw_tag.extend_from_slice(b"tagger Example <example@example.invalid> 0 +0000\n");
+
+        let tag = Tag::parse(format, &raw_tag).expect("header-only tag parses");
+        assert_eq!(tag.object, object);
+        assert_eq!(tag.message, b"");
+        assert_eq!(tag.write(), raw_tag);
     }
 
     #[test]
@@ -1425,6 +1514,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: Some(tagger_raw.clone()),
             message: b"release\n".to_vec(),
+            raw_body: None,
         };
         let tagger = tag.tagger_signature().expect("tagger parses");
         assert_eq!(tagger.name.as_bytes(), b"Example User");
@@ -1440,6 +1530,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: None,
             message: b"x\n".to_vec(),
+            raw_body: None,
         };
         assert!(lightweight.tagger_signature().is_none());
     }

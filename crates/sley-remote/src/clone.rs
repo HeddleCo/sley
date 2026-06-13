@@ -57,6 +57,8 @@ pub enum CloneSource {
     /// An SSH remote at the given already-resolved URL. Fetched by spawning `ssh`
     /// (the credential seam is unused — the `ssh` program owns authentication).
     Ssh(RemoteUrl),
+    /// A native anonymous `git://` remote at the given already-resolved URL.
+    Git(RemoteUrl),
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -187,6 +189,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             ));
         }
         CloneSource::Ssh(remote) => FetchSource::Ssh(remote.clone()),
+        CloneSource::Git(remote) => FetchSource::Git(remote.clone()),
         CloneSource::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,

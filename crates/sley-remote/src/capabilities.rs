@@ -21,6 +21,10 @@ pub struct TransportCapabilities {
     pub ssh_push: bool,
     /// `clone` over SSH (bare mirror / checkout destination).
     pub ssh_clone: bool,
+    /// `fetch` / `push` / `clone` / `ls-remote` over native `git://`.
+    pub git_fetch: bool,
+    pub git_push: bool,
+    pub git_clone: bool,
     /// `fetch` from `.bundle` files (git bundle protocol).
     pub bundle_fetch: bool,
     /// In-process `file://` upload-pack / receive-pack.
@@ -57,6 +61,9 @@ impl TransportCapabilities {
             ssh_fetch: true,
             ssh_push: true,
             ssh_clone: SSH_CLONE_SUPPORTED,
+            git_fetch: true,
+            git_push: true,
+            git_clone: true,
             bundle_fetch: BUNDLE_FETCH_SUPPORTED,
             local_fetch: true,
             local_push: true,
@@ -72,6 +79,7 @@ impl TransportCapabilities {
         match transport {
             RemoteTransportKind::Http => self.http_push,
             RemoteTransportKind::Ssh => self.ssh_push,
+            RemoteTransportKind::Git => self.git_push,
             RemoteTransportKind::Local => self.local_push,
             RemoteTransportKind::Bundle => false,
         }
@@ -80,7 +88,9 @@ impl TransportCapabilities {
     /// Whether shallow fetch/clone is available for the given transport class.
     pub fn supports_shallow(&self, transport: RemoteTransportKind) -> bool {
         match transport {
-            RemoteTransportKind::Http | RemoteTransportKind::Ssh => self.shallow_fetch,
+            RemoteTransportKind::Http | RemoteTransportKind::Ssh | RemoteTransportKind::Git => {
+                self.shallow_fetch
+            }
             RemoteTransportKind::Local | RemoteTransportKind::Bundle => false,
         }
     }
@@ -91,6 +101,7 @@ impl TransportCapabilities {
 pub enum RemoteTransportKind {
     Http,
     Ssh,
+    Git,
     Local,
     Bundle,
 }
@@ -115,6 +126,9 @@ impl RemoteTransportKind {
     pub fn from_url_scheme(url: &str) -> Option<Self> {
         if url.starts_with("http://") || url.starts_with("https://") {
             return Some(Self::Http);
+        }
+        if url.starts_with("git://") {
+            return Some(Self::Git);
         }
         if url.starts_with("ssh://")
             || url.starts_with("git@")

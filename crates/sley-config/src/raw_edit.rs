@@ -16,6 +16,11 @@
 //! `--rename-section`/`--remove-section` preserve the original file byte-for-byte
 //! apart from the lines they genuinely touch.
 
+use std::fmt;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use crate::quote_config_value;
 
 /// A value-pattern predicate: given an entry's value (`None` for a bare
@@ -60,6 +65,220 @@ pub enum RawEditOutcome {
     /// Nothing matched on an unset, or more than one entry matched a
     /// single-replace set (git's `CONFIG_NOTHING_SET`, exit code 5).
     NothingSet,
+}
+
+/// Options for writing a config file through `<path>.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigFileWriteOptions {
+    /// Sync the lockfile contents to disk before promoting it into place.
+    pub fsync: bool,
+}
+
+/// A config file write failed before the lockfile could be atomically promoted.
+#[derive(Debug)]
+pub enum ConfigFileWriteError {
+    /// `<path>.lock` already exists; the original config was left untouched.
+    ExistingLock(PathBuf),
+    /// Filesystem failure at the given path.
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for ConfigFileWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExistingLock(path) => {
+                write!(f, "config lock already exists: {}", path.display())
+            }
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for ConfigFileWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ExistingLock(_) => None,
+            Self::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+impl ConfigFileWriteError {
+    fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// Write `contents` to `path` via `<path>.lock` and an atomic rename.
+///
+/// The helper mirrors git's config writer shape: create the parent directory if
+/// needed, refuse to reuse an existing lockfile, write the complete replacement
+/// bytes to the lock, optionally fsync them, then promote the lock into place.
+/// On errors before promotion the lockfile is removed when possible and the
+/// original config file is left untouched.
+///
+/// Two behaviours match git's lockfile + config-writer plumbing exactly:
+///
+/// * **Symlink dereference.** git's `hold_lock_file_for_update` calls
+///   `resolve_symlink` before forming the `.lock` path, so when the config path
+///   is a symlink the lock (and the eventual rename) target the *resolved* real
+///   file. We replicate this so `git config --file=<symlink>` updates the
+///   pointed-at file and leaves the symlink intact (t1300 "symlinked
+///   configuration").
+/// * **Mode preservation.** git's config writer `chmod`s the lockfile to the
+///   original file's permission bits (`st.st_mode & 07777`) before promoting it,
+///   so an existing `0600` config stays `0600` across edits (t1300 "preserves
+///   existing permissions"). We do the same on Unix.
+pub fn write_config_file_locked(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    options: ConfigFileWriteOptions,
+) -> Result<(), ConfigFileWriteError> {
+    // git resolves the symlink chain (`resolve_symlink`) before locking, so the
+    // lock, the mode probe, and the final rename all act on the real file — the
+    // original symlink is never replaced by a regular file.
+    let path = resolve_symlink(path.as_ref());
+    let path = path.as_path();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| ConfigFileWriteError::io(parent, err))?;
+    }
+
+    let lock_path = config_lock_path(path)?;
+    let mut lock = ConfigFileLock::acquire(lock_path)?;
+    lock.write_all(contents, options.fsync)?;
+    let lock_path = lock.close();
+    // git: `chmod(lockfile, st.st_mode & 07777)` using the original config's
+    // mode, before the rename, so an existing file's permissions are preserved.
+    preserve_existing_mode(path, &lock_path);
+    if let Err(err) = fs::rename(&lock_path, path) {
+        let _ = fs::remove_file(&lock_path);
+        return Err(ConfigFileWriteError::io(path, err));
+    }
+    Ok(())
+}
+
+/// git's `resolve_symlink` (`lockfile.c`): if `path` is a symlink, follow the
+/// chain (up to a depth bound) to the real file, which may or may not exist.
+/// An absolute link target replaces the whole path; a relative one replaces the
+/// last path component. Non-symlinks and unreadable links are returned as-is —
+/// this is a best-effort routine, exactly like git's.
+fn resolve_symlink(path: &Path) -> PathBuf {
+    // Mirror git's MAXDEPTH so a symlink cycle terminates instead of looping.
+    const MAXDEPTH: usize = 5;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAXDEPTH {
+        match fs::read_link(&current) {
+            Ok(link) => {
+                if link.is_absolute() {
+                    current = link;
+                } else {
+                    // Replace the last component with the relative target.
+                    current.pop();
+                    current.push(link);
+                }
+            }
+            // Not a symlink (or unreadable): git stops and uses what it has.
+            Err(_) => break,
+        }
+    }
+    current
+}
+
+/// git's config-writer `chmod(lockfile, st.st_mode & 07777)`: copy the existing
+/// config file's permission bits onto the lockfile before it is renamed into
+/// place, so edits preserve the original mode. No-op when the file does not yet
+/// exist (a fresh config keeps the lockfile's default mode, as in git) or on
+/// non-Unix platforms (where mode bits do not apply).
+#[cfg(unix)]
+fn preserve_existing_mode(path: &Path, lock_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.permissions().mode() & 0o7777;
+        let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(mode));
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_existing_mode(_path: &Path, _lock_path: &Path) {}
+
+fn config_lock_path(path: &Path) -> Result<PathBuf, ConfigFileWriteError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        ConfigFileWriteError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "config path has no filename",
+            ),
+        )
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
+}
+
+struct ConfigFileLock {
+    path: PathBuf,
+    file: Option<fs::File>,
+    active: bool,
+}
+
+impl ConfigFileLock {
+    fn acquire(path: PathBuf) -> Result<Self, ConfigFileWriteError> {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Self {
+                path,
+                file: Some(file),
+                active: true,
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ConfigFileWriteError::ExistingLock(path))
+            }
+            Err(err) => Err(ConfigFileWriteError::io(path, err)),
+        }
+    }
+
+    fn write_all(&mut self, contents: &[u8], fsync: bool) -> Result<(), ConfigFileWriteError> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(ConfigFileWriteError::io(
+                &self.path,
+                std::io::Error::other("config lock is already closed"),
+            ));
+        };
+        file.write_all(contents)
+            .map_err(|err| ConfigFileWriteError::io(&self.path, err))?;
+        if fsync {
+            file.sync_all()
+                .map_err(|err| ConfigFileWriteError::io(&self.path, err))?;
+        }
+        Ok(())
+    }
+
+    fn close(mut self) -> PathBuf {
+        self.active = false;
+        let _ = self.file.take();
+        self.path.clone()
+    }
+}
+
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.file.take();
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// A byte-faithful editor over a single config file's raw contents.
@@ -989,6 +1208,31 @@ fn parse_value_span(bytes: &[u8], start: usize) -> (String, usize) {
 #[allow(clippy::unwrap_used, clippy::too_many_arguments)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "sley-config-raw-edit-{}-{}",
+                std::process::id(),
+                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn edit(
         src: &str,
@@ -1003,6 +1247,114 @@ mod tests {
         let mut e = RawConfigEditor::new(src.as_bytes().to_vec(), sec, sub, name);
         let out = e.set_multivar(value, comment, vm, multi);
         (String::from_utf8(e.into_bytes()).unwrap(), out)
+    }
+
+    #[test]
+    fn write_config_file_locked_writes_and_cleans_lock() {
+        let temp = TempDir::new();
+        let path = temp.path.join("nested").join("config");
+
+        write_config_file_locked(
+            &path,
+            b"[user]\n\tname = Ada\n",
+            ConfigFileWriteOptions::default(),
+        )
+        .expect("write config");
+
+        assert_eq!(
+            fs::read(&path).expect("read config"),
+            b"[user]\n\tname = Ada\n"
+        );
+        assert!(!path.with_file_name("config.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_file_locked_follows_symlink_and_keeps_it() {
+        // git's `resolve_symlink`: writing through a symlinked config path must
+        // update the pointed-at file and leave the symlink itself intact
+        // (t1300 "symlinked configuration").
+        let temp = TempDir::new();
+        let real = temp.path.join("notyet");
+        let link = temp.path.join("myconfig");
+        std::os::unix::fs::symlink("notyet", &link).expect("create symlink");
+
+        write_config_file_locked(
+            &link,
+            b"[test]\n\tfrotz = nitfol\n",
+            ConfigFileWriteOptions::default(),
+        )
+        .expect("write through symlink");
+
+        // The symlink is still a symlink; the real file received the bytes.
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("stat link")
+                .file_type()
+                .is_symlink(),
+            "myconfig must remain a symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&real)
+                .expect("stat real")
+                .file_type()
+                .is_file(),
+            "notyet must be a regular file"
+        );
+        assert_eq!(
+            fs::read(&real).expect("read real"),
+            b"[test]\n\tfrotz = nitfol\n"
+        );
+        // No stray lock for either name.
+        assert!(!real.with_file_name("notyet.lock").exists());
+        assert!(!link.with_file_name("myconfig.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_file_locked_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        // git chmods the lockfile to the original config's mode before the
+        // rename, so an existing 0600 file stays 0600 (t1300 "preserves
+        // existing permissions").
+        let temp = TempDir::new();
+        let path = temp.path.join("config");
+        fs::write(&path, b"[user]\n\tname = Old\n").expect("write original");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+        write_config_file_locked(
+            &path,
+            b"[user]\n\tname = New\n",
+            ConfigFileWriteOptions::default(),
+        )
+        .expect("rewrite config");
+
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600, "mode must be preserved across the edit");
+        assert_eq!(fs::read(&path).expect("read"), b"[user]\n\tname = New\n");
+    }
+
+    #[test]
+    fn write_config_file_locked_existing_lock_preserves_original() {
+        let temp = TempDir::new();
+        let path = temp.path.join("config");
+        let lock_path = path.with_file_name("config.lock");
+        fs::write(&path, b"[user]\n\tname = Old\n").expect("write original");
+        fs::write(&lock_path, b"held\n").expect("write lock");
+
+        let err = write_config_file_locked(
+            &path,
+            b"[user]\n\tname = New\n",
+            ConfigFileWriteOptions::default(),
+        )
+        .expect_err("held lock must fail");
+
+        assert!(matches!(err, ConfigFileWriteError::ExistingLock(_)));
+        assert_eq!(
+            fs::read(&path).expect("read original"),
+            b"[user]\n\tname = Old\n"
+        );
+        assert_eq!(fs::read(&lock_path).expect("read lock"), b"held\n");
     }
 
     #[test]

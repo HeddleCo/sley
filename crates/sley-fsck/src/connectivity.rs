@@ -813,6 +813,7 @@ mod tests {
                 name: name.as_bytes().to_vec(),
                 tagger: Some(b"A <a@example.invalid> 0 +0000".to_vec()),
                 message: b"tag msg\n".to_vec(),
+                raw_body: None,
             }
             .write(),
         ))

@@ -48,6 +48,8 @@ pub enum FetchSource {
     /// An SSH remote at the given already-resolved URL. Fetched by spawning `ssh`
     /// (the credential seam is unused — the `ssh` program owns authentication).
     Ssh(RemoteUrl),
+    /// A native anonymous `git://` remote at the given already-resolved URL.
+    Git(RemoteUrl),
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -320,6 +322,52 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
                 crate::ssh::SshFetchPackRequest {
+                    git_dir: request.git_dir,
+                    format: request.format,
+                    remote,
+                    features: &features,
+                    wants,
+                    shallow: existing_shallow,
+                    deepen: options.depth,
+                    promisor: promisor_remote,
+                },
+            )?;
+            if !options.dry_run {
+                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
+            }
+            finalize_fetch(
+                FetchFinalize {
+                    git_dir: request.git_dir,
+                    store: &store,
+                    options: &options,
+                    remote_name: request.remote_name,
+                    fetch_head_source: &fetch_head_source,
+                    default_head_fetch,
+                },
+                &mut updates,
+                &mut outcome,
+            )?;
+            advertisements
+        }
+        FetchSource::Git(remote) => {
+            let (advertisements, features) =
+                crate::git::git_upload_pack_advertisements(remote, request.format)?;
+            outcome.head_symref = head_symref_from_features(&features.symrefs);
+            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+                advertisements: &advertisements,
+                refspecs: &parsed_refspecs,
+                options: &options,
+                store: &store,
+                reachable: None,
+                deepen_excluded: None,
+                format: request.format,
+                configured_remote_fetch,
+            })?;
+            let wants = updates.iter().map(|update| update.oid).collect();
+            let existing_shallow =
+                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+            let shallow_info = crate::git::install_fetch_pack_via_git_upload_pack(
+                crate::git::GitFetchPackRequest {
                     git_dir: request.git_dir,
                     format: request.format,
                     remote,

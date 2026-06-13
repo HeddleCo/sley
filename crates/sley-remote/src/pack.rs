@@ -43,6 +43,9 @@ pub struct PushPackRequest<'a> {
     pub format: ObjectFormat,
     /// Planned receive-pack ref updates (only non-null `new_id` roots are packed).
     pub commands: &'a [ReceivePackCommand],
+    /// Optional explicit pack roots supplied by an embedder-authored push plan.
+    /// When empty, non-null command `new_id`s are used.
+    pub pack_objects: &'a [ObjectId],
     /// Remote ref advertisements used to exclude objects the remote already has.
     pub remote_advertisements: &'a [RefAdvertisement],
     /// Negotiated receive-pack features (honours [`ReceivePackFeatures::no_thin`]).
@@ -64,12 +67,7 @@ pub fn build_push_packfile(req: &PushPackRequest<'_>) -> Result<Vec<u8>> {
         remote_advertisement_tips_known_to_local(req.local_db, req.remote_advertisements)?;
     let remote_excluded =
         collect_reachable_object_ids(req.local_db, req.format, remote_excluded_tips)?;
-    let starts = req
-        .commands
-        .iter()
-        .filter(|command| !command.new_id.is_null())
-        .map(|command| command.new_id.clone())
-        .collect::<Vec<_>>();
+    let starts = push_pack_roots(req.commands, req.pack_objects);
     if starts.is_empty() {
         return Ok(Vec::new());
     }
@@ -83,6 +81,20 @@ pub fn build_push_packfile(req: &PushPackRequest<'_>) -> Result<Vec<u8>> {
                 .unwrap_or_default(),
         )
     }
+}
+
+pub(crate) fn push_pack_roots(
+    commands: &[ReceivePackCommand],
+    pack_objects: &[ObjectId],
+) -> Vec<ObjectId> {
+    if !pack_objects.is_empty() {
+        return pack_objects.to_vec();
+    }
+    commands
+        .iter()
+        .filter(|command| !command.new_id.is_null())
+        .map(|command| command.new_id)
+        .collect()
 }
 
 fn build_thin_push_packfile(
@@ -215,6 +227,7 @@ mod tests {
             local_db: &db,
             format,
             commands: &[push_command(&base_oid, &new_oid)],
+            pack_objects: &[],
             remote_advertisements: &[advertisement(&base_oid, "refs/heads/main")],
             features: &default_features(),
             options: default_options(),
@@ -250,6 +263,7 @@ mod tests {
             local_db,
             format,
             commands,
+            pack_objects: &[],
             remote_advertisements,
             features,
             options: default_options(),
