@@ -38,6 +38,10 @@ impl OptFlags {
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 impl std::ops::BitOr for OptFlags {
@@ -742,6 +746,32 @@ mod tests {
         let argv = args(&["--quiet", "--no-quiet"]);
         let parsed = parse(&argv, &specs).expect("parse");
         assert!(!parsed.last_bool("quiet", true));
+    }
+
+    #[test]
+    fn exact_no_prefixed_long_name_wins_before_negation() {
+        let specs = [
+            OptionSpec {
+                short: None,
+                long: Some("no-renames"),
+                value: OptValue::Bool,
+                flags: OptFlags::NONEG,
+                help: "disable rename detection",
+            },
+            OptionSpec {
+                short: None,
+                long: Some("renames"),
+                value: OptValue::Bool,
+                flags: OptFlags::NONE,
+                help: "enable rename detection",
+            },
+        ];
+        let argv = args(&["--no-renames"]);
+        let parsed = parse(&argv, &specs).expect("parse");
+        assert_eq!(parsed.options.len(), 1);
+        assert_eq!(parsed.options[0].long, Some("no-renames"));
+        assert_eq!(parsed.options[0].name, OptionName::Long("no-renames"));
+        assert_eq!(parsed.options[0].value, ParsedValue::Bool(true));
     }
 
     #[test]

@@ -81,675 +81,68 @@ fn diff_split_revisions(
 }
 
 pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
-    let mut name_status = false;
-    let mut name_only = false;
-    let mut cached = false;
-    let mut quiet = false;
-    let mut exit_code = false;
-    let mut summary = false;
-    let mut raw = false;
-    let mut stat = false;
-    let mut compact_summary = false;
-    let mut stat_count = None;
-    // `git diff` is porcelain: scale --stat to the terminal and honour the
-    // diff.stat*Width config (resolved after the repository is discovered).
-    let mut stat_widths = DiffStatWidths::terminal();
-    let mut numstat = false;
-    let mut shortstat = false;
-    // `--dirstat` family: None = not requested. Parameters accumulate over the
-    // diff.dirstat config base; bad command-line parameters are fatal.
-    let mut dirstat: Option<DirstatOptions> = None;
-    let mut dirstat_cli_params: Vec<String> = Vec::new();
-    let mut patch = false;
-    let mut no_patch = false;
-    // `-U<n>` / `--unified=<n>` hunk context; None keeps the default of 3.
-    let mut context: Option<usize> = None;
-    let mut reverse = false;
-    let mut pickaxe = None;
-    let mut pickaxe_all = false;
-    let mut pickaxe_regex = false;
-    let mut find_object_values = Vec::new();
-    let mut raw_abbrev = None;
-    let mut patch_abbrev = None;
-    let mut patch_full_index = false;
-    let mut color_always = false;
-    let mut diff_algorithm_control = false;
-    let mut diff_driver_control = false;
-    let mut diff_hunk_control = false;
-    let mut diff_whitespace_control = false;
-    let mut diff_output_indicator_control = false;
-    let mut diff_patch_context_control = false;
-    let mut diff_patch_output_control = false;
-    let mut diff_rewrite_control = false;
-    let mut diff_submodule_output_control = false;
-    let mut word_diff_mode: Option<commands::diff_words::WordDiffMode> = None;
-    let mut word_diff_regex: Option<String> = None;
-    let mut no_index = false;
-    let mut diff_relative = DiffRelativeMode::Off;
-    // Whether --relative/--no-relative appeared on the command line (an
-    // explicit flag wins over the diff.relative config).
-    let mut diff_relative_explicit = false;
-    let mut src_prefix = "a/".to_string();
-    let mut dst_prefix = "b/".to_string();
-    let mut head = false;
-    let mut z = false;
-    let mut detect_renames = true;
-    let mut detect_copies = false;
-    let mut find_copies_harder = false;
-    let mut rename_empty = true;
-    // git enables rename detection by default (diff.renames defaults to true);
-    // --no-renames turns it off. -M/-C select the similarity thresholds.
-    let mut inexact_renames = true;
-    // Whether -M/-C/--no-renames appeared explicitly (the diff.renames config
-    // only applies otherwise).
-    let mut renames_explicit = false;
-    let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
-    let mut copy_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
-    let mut diff_filter = DiffFilter::default();
-    let mut ignore_submodules_cli: Option<SubmoduleIgnoreMode> = None;
-    let mut path_args = Vec::new();
-    // Arguments after `--` are always pathspecs, never revisions; keep them apart
-    // so the revision splitter only ever reinterprets the pre-`--` positionals.
-    let mut explicit_paths: Vec<String> = Vec::new();
-    let mut positional_only = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        let arg = &args[idx];
-        if positional_only {
-            explicit_paths.push(arg.clone());
-            idx += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--name-status" => {
-                if no_patch {
-                    return Err(GitError::Command(
-                        "options '--name-only', '--name-status', and '-s' cannot be used together"
-                            .into(),
-                    ));
-                }
-                name_status = true;
-            }
-            "--name-only" => {
-                if no_patch {
-                    return Err(GitError::Command(
-                        "options '--name-only', '--name-status', and '-s' cannot be used together"
-                            .into(),
-                    ));
-                }
-                name_only = true;
-            }
-            // `git diff` is recursive for tree-to-tree comparisons by default;
-            // accept the explicit flag for upstream compatibility.
-            "-r" => {}
-            "--cached" | "--staged" => cached = true,
-            "--quiet" => quiet = true,
-            "--exit-code" => exit_code = true,
-            "--summary" => {
-                summary = true;
-                no_patch = false;
-            }
-            "--raw" => {
-                raw = true;
-                no_patch = false;
-            }
-            "--stat" => {
-                stat = true;
-                no_patch = false;
-            }
-            "--compact-summary" => {
-                compact_summary = true;
-                no_patch = false;
-            }
-            "--numstat" => {
-                numstat = true;
-                no_patch = false;
-            }
-            "--shortstat" => {
-                shortstat = true;
-                no_patch = false;
-            }
-            "--dirstat" | "-X" => {
-                dirstat.get_or_insert_with(DirstatOptions::default);
-                no_patch = false;
-            }
-            value
-                if value.starts_with("--dirstat=")
-                    || (value.starts_with("-X") && value.len() > 2) =>
-            {
-                let params = value
-                    .strip_prefix("--dirstat=")
-                    .or_else(|| value.strip_prefix("-X"))
-                    .unwrap_or("");
-                dirstat.get_or_insert_with(DirstatOptions::default);
-                dirstat_cli_params.push(params.to_string());
-                no_patch = false;
-            }
-            "--cumulative" => {
-                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
-                opts.cumulative = true;
-                no_patch = false;
-            }
-            "--dirstat-by-file" => {
-                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
-                opts.mode = DirstatMode::Files;
-                no_patch = false;
-            }
-            value if value.starts_with("--dirstat-by-file=") => {
-                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
-                opts.mode = DirstatMode::Files;
-                dirstat_cli_params.push(value["--dirstat-by-file=".len()..].to_string());
-                no_patch = false;
-            }
-            "-p" | "-u" | "--patch" => {
-                patch = true;
-                no_patch = false;
-            }
-            "-U" | "--unified" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("unified"))?;
-                commit_validate_unified_context(value, arg == "-U")?;
-                context = Some(parse_unified_count(value));
-                patch = true;
-                no_patch = false;
-            }
-            "--unified=" => {
-                return commit_unified_expects_numerical_value_error(false);
-            }
-            value
-                if let Some(value) = value
-                    .strip_prefix("--unified=")
-                    .or_else(|| value.strip_prefix("-U")) =>
-            {
-                commit_validate_unified_context(value, !arg.starts_with("--"))?;
-                context = Some(parse_unified_count(value));
-                patch = true;
-                no_patch = false;
-            }
-            "--patch-with-raw" => {
-                raw = true;
-                patch = true;
-                no_patch = false;
-            }
-            "--patch-with-stat" => {
-                stat = true;
-                patch = true;
-                no_patch = false;
-            }
-            "-s" | "--no-patch" => {
-                name_status = false;
-                name_only = false;
-                summary = false;
-                raw = false;
-                stat = false;
-                compact_summary = false;
-                numstat = false;
-                shortstat = false;
-                patch = false;
-                no_patch = true;
-            }
-            "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
-            "--no-index" => no_index = true,
-            "-R" => reverse = true,
-            "-S" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(diff_pickaxe_requires_value_error)?;
-                if value.is_empty() {
-                    return Err(diff_pickaxe_requires_non_empty_error());
-                }
-                pickaxe = Some(value.clone());
-            }
-            value if let Some(value) = value.strip_prefix("-S") => {
-                pickaxe = Some(value.to_string());
-            }
-            "--pickaxe-all" => pickaxe_all = true,
-            "--pickaxe-regex" => pickaxe_regex = true,
-            value if value.starts_with("--pickaxe-all=") => {
-                return log_option_takes_no_value_error("pickaxe-all");
-            }
-            value if value.starts_with("--pickaxe-regex=") => {
-                return log_option_takes_no_value_error("pickaxe-regex");
-            }
-            "--find-object" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("find-object"))?;
-                find_object_values.push(value.clone());
-            }
-            value if let Some(value) = value.strip_prefix("--find-object=") => {
-                find_object_values.push(value.to_string());
-            }
-            "--ext-diff" | "--textconv" => diff_driver_control = true,
-            "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
-            "--anchored" => {
-                idx += 1;
-                args.get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("anchored"))?;
-                diff_algorithm_control = true;
-            }
-            value if value.starts_with("--anchored=") => diff_algorithm_control = true,
-            "--diff-algorithm" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("diff-algorithm"))?;
-                log_validate_diff_algorithm(value)?;
-                diff_algorithm_control = true;
-            }
-            value if let Some(value) = value.strip_prefix("--diff-algorithm=") => {
-                log_validate_diff_algorithm(value)?;
-                diff_algorithm_control = true;
-            }
-            value if value.starts_with("--ext-diff=") => {
-                return log_option_takes_no_value_error("ext-diff");
-            }
-            value if value.starts_with("--textconv=") => {
-                return log_option_takes_no_value_error("textconv");
-            }
-            "--inter-hunk-context" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("inter-hunk-context"))?;
-                log_validate_inter_hunk_context(value)?;
-                diff_hunk_control = true;
-            }
-            "--inter-hunk-context=" => {
-                return log_inter_hunk_context_requires_number_error();
-            }
-            value if let Some(value) = value.strip_prefix("--inter-hunk-context=") => {
-                log_validate_inter_hunk_context(value)?;
-                diff_hunk_control = true;
-            }
-            "--ws-error-highlight" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("ws-error-highlight"))?;
-                log_validate_ws_error_highlight(value)?;
-                diff_whitespace_control = true;
-            }
-            value if let Some(value) = value.strip_prefix("--ws-error-highlight=") => {
-                log_validate_ws_error_highlight(value)?;
-                diff_whitespace_control = true;
-            }
-            "-b"
-            | "-w"
-            | "--ignore-space-at-eol"
-            | "--ignore-cr-at-eol"
-            | "--ignore-space-change"
-            | "--ignore-all-space"
-            | "--ignore-blank-lines" => diff_whitespace_control = true,
-            value if value.starts_with("--ignore-space-at-eol=") => {
-                return log_option_takes_no_value_error("ignore-space-at-eol");
-            }
-            value if value.starts_with("--ignore-cr-at-eol=") => {
-                return log_option_takes_no_value_error("ignore-cr-at-eol");
-            }
-            value if value.starts_with("--ignore-space-change=") => {
-                return log_option_takes_no_value_error("ignore-space-change");
-            }
-            value if value.starts_with("--ignore-all-space=") => {
-                return log_option_takes_no_value_error("ignore-all-space");
-            }
-            value if value.starts_with("--ignore-blank-lines=") => {
-                return log_option_takes_no_value_error("ignore-blank-lines");
-            }
-            "--submodule" => diff_submodule_output_control = true,
-            value if let Some(value) = value.strip_prefix("--submodule=") => {
-                log_validate_submodule_format(value)?;
-                diff_submodule_output_control = true;
-            }
-            "--word-diff" => {
-                // Keeps an already-selected mode (git only upgrades NONE to
-                // plain).
-                if word_diff_mode.is_none() {
-                    word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
-                }
-            }
-            value if let Some(value) = value.strip_prefix("--word-diff=") => {
-                log_validate_word_diff(value)?;
-                word_diff_mode = match value {
-                    "plain" => Some(commands::diff_words::WordDiffMode::Plain),
-                    "porcelain" => Some(commands::diff_words::WordDiffMode::Porcelain),
-                    "color" => {
-                        color_always = true;
-                        Some(commands::diff_words::WordDiffMode::Color)
-                    }
-                    _ => None,
-                };
-            }
-            "--word-diff-regex" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("word-diff-regex"))?;
-                word_diff_regex = Some(value.clone());
-                if word_diff_mode.is_none() {
-                    word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
-                }
-            }
-            value if let Some(value) = value.strip_prefix("--word-diff-regex=") => {
-                word_diff_regex = Some(value.to_string());
-                if word_diff_mode.is_none() {
-                    word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
-                }
-            }
-            "--color-words" => {
-                color_always = true;
-                word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
-            }
-            value if let Some(value) = value.strip_prefix("--color-words=") => {
-                color_always = true;
-                word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
-                word_diff_regex = Some(value.to_string());
-            }
-            "--output-indicator-new" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("output-indicator-new"))?;
-                log_validate_output_indicator("output-indicator-new", value)?;
-                diff_output_indicator_control = true;
-            }
-            "--output-indicator-old" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("output-indicator-old"))?;
-                log_validate_output_indicator("output-indicator-old", value)?;
-                diff_output_indicator_control = true;
-            }
-            "--output-indicator-context" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("output-indicator-context"))?;
-                log_validate_output_indicator("output-indicator-context", value)?;
-                diff_output_indicator_control = true;
-            }
-            value if let Some(value) = value.strip_prefix("--output-indicator-new=") => {
-                log_validate_output_indicator("output-indicator-new", value)?;
-                diff_output_indicator_control = true;
-            }
-            value if let Some(value) = value.strip_prefix("--output-indicator-old=") => {
-                log_validate_output_indicator("output-indicator-old", value)?;
-                diff_output_indicator_control = true;
-            }
-            value if let Some(value) = value.strip_prefix("--output-indicator-context=") => {
-                log_validate_output_indicator("output-indicator-context", value)?;
-                diff_output_indicator_control = true;
-            }
-            "-W" | "--function-context" | "--indent-heuristic" | "--no-indent-heuristic" => {
-                diff_patch_context_control = true;
-            }
-            "--full-diff"
-            | "-D"
-            | "--irreversible-delete"
-            | "--ita-visible-in-index"
-            | "--ita-invisible-in-index" => {
-                diff_patch_output_control = true;
-            }
-            "-B" | "--break-rewrites" => diff_rewrite_control = true,
-            value if let Some(value) = value.strip_prefix("-B") => {
-                log_validate_break_rewrites_option(value)?;
-                diff_rewrite_control = true;
-            }
-            value if let Some(value) = value.strip_prefix("--break-rewrites=") => {
-                log_validate_break_rewrites_option(value)?;
-                diff_rewrite_control = true;
-            }
-            value if value.starts_with("--function-context=") => {
-                return log_option_takes_no_value_error("function-context");
-            }
-            value if value.starts_with("--indent-heuristic=") => {
-                return log_option_takes_no_value_error("indent-heuristic");
-            }
-            value if value.starts_with("--no-indent-heuristic=") => {
-                return log_option_takes_no_value_error("no-indent-heuristic");
-            }
-            value if value.starts_with("--full-diff=") => {
-                return log_option_takes_no_value_error("full-diff");
-            }
-            value if value.starts_with("--irreversible-delete=") => {
-                return log_option_takes_no_value_error("irreversible-delete");
-            }
-            value if value.starts_with("--ita-visible-in-index=") => {
-                return log_option_takes_no_value_error("ita-visible-in-index");
-            }
-            value if value.starts_with("--ita-invisible-in-index=") => {
-                return log_option_takes_no_value_error("ita-invisible-in-index");
-            }
-            "--relative" => {
-                diff_relative = DiffRelativeMode::Cwd;
-                diff_relative_explicit = true;
-            }
-            value if let Some(value) = value.strip_prefix("--relative=") => {
-                diff_relative_explicit = true;
-                diff_relative = DiffRelativeMode::Prefix(value.to_string());
-            }
-            "--no-relative" => {
-                diff_relative = DiffRelativeMode::Off;
-                diff_relative_explicit = true;
-            }
-            value if value.starts_with("--no-relative=") => {
-                return log_option_takes_no_value_error("no-relative");
-            }
-            "--color" | "--color=always" => color_always = true,
-            "--no-color" | "--color=never" | "--color=auto" => color_always = false,
-            "--color-moved" | "--no-color-moved" | "--no-color-moved-ws" => {}
-            value if let Some(value) = value.strip_prefix("--color-moved=") => {
-                log_validate_color_moved(value)?;
-            }
-            "--color-moved-ws" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| log_option_requires_value_error("color-moved-ws"))?;
-                log_validate_color_moved_ws(value)?;
-            }
-            value if let Some(value) = value.strip_prefix("--color-moved-ws=") => {
-                log_validate_color_moved_ws(value)?;
-            }
-            value if value.starts_with("--no-color-moved-ws=") => {
-                return log_option_takes_no_value_error("no-color-moved-ws");
-            }
-            // `--ignore-submodules` without a value means "all" (upstream
-            // diff_opt_ignore_submodules with no arg).
-            "--ignore-submodules" => ignore_submodules_cli = Some(SubmoduleIgnoreMode::All),
-            value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
-                let Some(mode) = parse_submodule_ignore_mode(value) else {
-                    eprintln!("fatal: bad --ignore-submodules argument: {value}");
-                    return Err(GitError::Exit(128));
-                };
-                ignore_submodules_cli = Some(mode);
-            }
-            "--abbrev" => {
-                raw_abbrev = Some(Some(7));
-                patch_abbrev = Some(7);
-            }
-            "--no-abbrev" => raw_abbrev = Some(None),
-            "--full-index" => patch_full_index = true,
-            "--no-prefix" => {
-                src_prefix.clear();
-                dst_prefix.clear();
-            }
-            "--default-prefix" => {
-                src_prefix = "a/".to_string();
-                dst_prefix = "b/".to_string();
-            }
-            "--src-prefix" => {
-                idx += 1;
-                src_prefix = args
-                    .get(idx)
-                    .ok_or_else(|| GitError::Command("--src-prefix requires a value".into()))?
-                    .clone();
-            }
-            "--dst-prefix" => {
-                idx += 1;
-                dst_prefix = args
-                    .get(idx)
-                    .ok_or_else(|| GitError::Command("--dst-prefix requires a value".into()))?
-                    .clone();
-            }
-            "-z" => z = true,
-            "-M" | "--find-renames" => {
-                detect_renames = true;
-                inexact_renames = true;
-                renames_explicit = true;
-            }
-            "-C" | "--find-copies" => {
-                // A repeated -C escalates to --find-copies-harder, like git.
-                if detect_copies {
-                    find_copies_harder = true;
-                }
-                detect_copies = true;
-                inexact_renames = true;
-                renames_explicit = true;
-            }
-            "--find-copies-harder" => {
-                detect_copies = true;
-                find_copies_harder = true;
-                inexact_renames = true;
-            }
-            "--no-find-copies-harder" => {
-                find_copies_harder = false;
-            }
-            "--no-rename" => {
-                eprintln!("error: invalid option: --no-rename");
-                return Err(GitError::Exit(129));
-            }
-            "--no-renames" => {
-                detect_renames = false;
-                inexact_renames = false;
-                renames_explicit = true;
-            }
-            "--rename-empty" => rename_empty = true,
-            "--no-rename-empty" => rename_empty = false,
-            value if value.starts_with("-M") && value.len() > 2 => {
-                log_validate_similarity_option(&value[2..], "find-renames")?;
-                detect_renames = true;
-                inexact_renames = true;
-                renames_explicit = true;
-                rename_threshold = parse_similarity_threshold(&value[2..]);
-            }
-            value if let Some(value) = value.strip_prefix("--find-renames=") => {
-                log_validate_similarity_option(value, "find-renames")?;
-                detect_renames = true;
-                inexact_renames = true;
-                rename_threshold = parse_similarity_threshold(value);
-            }
-            value if value.starts_with("-C") && value.len() > 2 => {
-                log_validate_similarity_option(&value[2..], "find-copies")?;
-                detect_copies = true;
-                inexact_renames = true;
-                copy_threshold = parse_similarity_threshold(&value[2..]);
-            }
-            value if let Some(value) = value.strip_prefix("--find-copies=") => {
-                log_validate_similarity_option(value, "find-copies")?;
-                detect_copies = true;
-                inexact_renames = true;
-                copy_threshold = parse_similarity_threshold(value);
-            }
-            value if value.starts_with("--find-copies-harder=") => {
-                return log_option_takes_no_value_error("find-copies-harder");
-            }
-            value if value.starts_with("--no-find-copies-harder=") => {
-                return log_option_takes_no_value_error("no-find-copies-harder");
-            }
-            value if value.starts_with("--rename-empty=") => {
-                return log_option_takes_no_value_error("rename-empty");
-            }
-            value if value.starts_with("--no-rename-empty=") => {
-                return log_option_takes_no_value_error("no-rename-empty");
-            }
-            "-l" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(diff_rename_limit_requires_integer_error)?;
-                validate_diff_rename_limit(value)?;
-            }
-            value if let Some(value) = value.strip_prefix("-l") => {
-                validate_diff_rename_limit(value)?;
-            }
-            "--diff-filter" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| GitError::Command("--diff-filter requires a value".into()))?;
-                diff_filter = parse_diff_filter(value)?;
-            }
-            value if value.starts_with("--diff-filter=") => {
-                let value = value
-                    .strip_prefix("--diff-filter=")
-                    .ok_or_else(|| GitError::Command("--diff-filter requires a value".into()))?;
-                diff_filter = parse_diff_filter(value)?;
-            }
-            value
-                if value.starts_with("--stat=")
-                    || value.starts_with("--stat-width=")
-                    || value.starts_with("--stat-name-width=")
-                    || value.starts_with("--stat-graph-width=")
-                    || value.starts_with("--stat-count=") =>
-            {
-                stat = true;
-                no_patch = false;
-                diff_stat_parse_width_option(value, &mut stat_widths)?;
-                if let Some(count) = diff_stat_count_option(value)? {
-                    stat_count = count;
-                }
-            }
-            value if value.starts_with("--abbrev=") => {
-                let value = value
-                    .strip_prefix("--abbrev=")
-                    .ok_or_else(|| GitError::Command("--abbrev requires a value".into()))?;
-                raw_abbrev = Some(Some(parse_abbrev(value)?.max(4)));
-                patch_abbrev = raw_abbrev.flatten();
-            }
-            value if value.starts_with("--src-prefix=") => {
-                src_prefix = value
-                    .strip_prefix("--src-prefix=")
-                    .ok_or_else(|| GitError::Command("--src-prefix requires a value".into()))?
-                    .to_string();
-            }
-            value if value.starts_with("--dst-prefix=") => {
-                dst_prefix = value
-                    .strip_prefix("--dst-prefix=")
-                    .ok_or_else(|| GitError::Command("--dst-prefix requires a value".into()))?
-                    .to_string();
-            }
-            value if value.starts_with("--default-prefix=") => {
-                return Err(GitError::Command(format!(
-                    "option `{}` takes no value",
-                    value
-                        .trim_start_matches('-')
-                        .split_once('=')
-                        .map(|(name, _)| name)
-                        .unwrap_or("default-prefix")
-                )));
-            }
-            "HEAD" if !head && path_args.is_empty() => head = true,
-            value if !value.starts_with('-') => path_args.push(arg.clone()),
-            value => {
-                return Err(GitError::Command(format!(
-                    "unsupported diff argument {value}"
-                )));
-            }
-        }
-        idx += 1;
-    }
-    if name_status && name_only {
-        return Err(GitError::Command(
-            "diff currently supports: diff [--cached] [-z] [-M|-C] [--diff-filter=<filter>] [--exit-code|--quiet] [--abbrev[=<n>]|--no-abbrev] [--src-prefix=<prefix>|--dst-prefix=<prefix>|--no-prefix|--default-prefix] [--raw|--stat|--compact-summary|--numstat|--shortstat|--summary|--name-status|--name-only|-p|-u|--patch|--patch-with-raw|--patch-with-stat|-s|--no-patch] [HEAD] [-- <path>...] and diff [--cached] [-z] --quiet [HEAD]".into(),
-        ));
-    }
+    let commands::diff_options::DiffOptions {
+        output_format,
+        cached,
+        quiet,
+        exit_code,
+        compact_summary,
+        stat_count,
+        stat_widths,
+        mut dirstat,
+        dirstat_cli_params,
+        context,
+        reverse,
+        pickaxe,
+        pickaxe_all,
+        pickaxe_regex,
+        find_object_values,
+        raw_abbrev,
+        patch_abbrev,
+        patch_full_index,
+        color_always,
+        diff_algorithm_control,
+        diff_driver_control,
+        diff_hunk_control,
+        diff_whitespace_control,
+        diff_output_indicator_control,
+        diff_patch_context_control,
+        diff_patch_output_control,
+        diff_rewrite_control,
+        diff_submodule_output_control,
+        word_diff_mode,
+        word_diff_regex,
+        no_index,
+        mut diff_relative,
+        diff_relative_explicit,
+        src_prefix,
+        dst_prefix,
+        mut head,
+        z,
+        mut detect_renames,
+        mut detect_copies,
+        find_copies_harder,
+        rename_empty,
+        mut inexact_renames,
+        renames_explicit,
+        rename_threshold,
+        copy_threshold,
+        diff_filter,
+        ignore_submodules_cli,
+        mut path_args,
+        explicit_paths,
+    } = commands::diff_options::setup_diff_options(args)?;
+
+    let name_status = output_format.contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
+    let name_only = output_format.contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
+    let check = output_format.contains(commands::diff_options::DiffOutputFormat::CHECK);
+    let summary = output_format.contains(commands::diff_options::DiffOutputFormat::SUMMARY);
+    let raw = output_format.contains(commands::diff_options::DiffOutputFormat::RAW);
+    let stat = output_format.contains(commands::diff_options::DiffOutputFormat::DIFFSTAT);
+    let numstat = output_format.contains(commands::diff_options::DiffOutputFormat::NUMSTAT);
+    let shortstat = output_format.contains(commands::diff_options::DiffOutputFormat::SHORTSTAT);
+    let patch = output_format.contains(commands::diff_options::DiffOutputFormat::PATCH);
+    let no_patch = output_format.contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
     if diff_algorithm_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff algorithm controls are not supported for this output mode".into(),
@@ -810,6 +203,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff find-object output is not supported for this output mode".into(),
         ));
     }
+    if check && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff check output is not supported".into(),
+        ));
+    }
     if pickaxe_all && !find_object_values.is_empty() {
         return diff_find_object_pickaxe_all_conflict_error();
     }
@@ -846,7 +244,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         && let Ok(config) = read_repo_config(&git_dir)
         && config.get_bool("diff", None, "relative").unwrap_or(false)
     {
-        diff_relative = DiffRelativeMode::Cwd;
+        diff_relative = commands::diff_options::DiffRelativeMode::Cwd;
     }
     if !renames_explicit
         && let Ok(config) = read_repo_config(&git_dir)
@@ -1116,7 +514,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // keep resolving against the original location, so the effective worktree
     // root gains the stripped prefix.
     let mut worktree_root = worktree_root;
-    let entries = if matches!(diff_relative, DiffRelativeMode::Off) {
+    let entries = if matches!(diff_relative, commands::diff_options::DiffRelativeMode::Off) {
         entries
     } else {
         let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
@@ -1442,16 +840,6 @@ fn sort_diff_entries_by_path(
     entries
 }
 
-fn diff_pickaxe_requires_value_error() -> GitError {
-    eprintln!("error: switch `S' requires a value");
-    GitError::Exit(129)
-}
-
-fn diff_pickaxe_requires_non_empty_error() -> GitError {
-    eprintln!("error: -S requires a non-empty argument");
-    GitError::Exit(129)
-}
-
 fn diff_find_object_unable_to_resolve_error(value: &str) -> GitError {
     eprintln!("error: unable to resolve '{value}'");
     GitError::Exit(129)
@@ -1464,20 +852,20 @@ fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-enum DiffRelativeMode {
-    Off,
-    Cwd,
-    Prefix(String),
-}
-
-fn diff_relative_prefix(mode: &DiffRelativeMode, cwd: &Path, git_dir: &Path) -> Result<Vec<u8>> {
+fn diff_relative_prefix(
+    mode: &commands::diff_options::DiffRelativeMode,
+    cwd: &Path,
+    git_dir: &Path,
+) -> Result<Vec<u8>> {
     match mode {
-        DiffRelativeMode::Off => Ok(Vec::new()),
-        DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
+        commands::diff_options::DiffRelativeMode::Off => Ok(Vec::new()),
+        commands::diff_options::DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
             .trim_end_matches('/')
             .as_bytes()
             .to_vec()),
-        DiffRelativeMode::Prefix(prefix) => Ok(diff_relative_prefix_arg(prefix).into_bytes()),
+        commands::diff_options::DiffRelativeMode::Prefix(prefix) => {
+            Ok(diff_relative_prefix_arg(prefix).into_bytes())
+        }
     }
 }
 
@@ -1576,36 +964,6 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
     // the prefix happens to end on a path-component boundary.
     path.strip_prefix(prefix)
         .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
-}
-
-/// Parse a validated `-U` / `--unified` count: digits with an optional
-/// k/m/g (1024-based) suffix, clamped at zero for negative values.
-fn parse_unified_count(value: &str) -> usize {
-    let (number, multiplier) = match value.as_bytes().last() {
-        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
-        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),
-        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    if let Some(digits) = number.strip_prefix('-') {
-        let _ = digits;
-        return 0;
-    }
-    let digits = number.strip_prefix('+').unwrap_or(number);
-    digits
-        .parse::<usize>()
-        .unwrap_or(0)
-        .saturating_mul(multiplier)
-}
-
-fn log_validate_word_diff(value: &str) -> Result<()> {
-    match value {
-        "plain" | "color" | "porcelain" | "none" => Ok(()),
-        _ => {
-            eprintln!("error: bad --word-diff argument: {value}");
-            Err(GitError::Exit(129))
-        }
-    }
 }
 
 /// Parameters for `git diff --no-index`.
