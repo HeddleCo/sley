@@ -105,6 +105,7 @@ jobs:
             t1006-cat-file.sh
             t1007-hash-object.sh
             t1300-config.sh
+            t1400-update-ref.sh
             t1401-symbolic-ref.sh
             t1461-refs-list.sh
             t1462-refs-exists.sh

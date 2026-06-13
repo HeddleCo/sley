@@ -27,6 +27,14 @@
 # harness timeout; the summary row still records ok=284 (counts parse from
 # the captured TAP before the hang), so the floor is valid — but the run
 # needs SLEY_TEST_TIMEOUT high enough (900s) to reach cell 284 first.
+# Round-5c floors (hooks-execution epic + stdin-streaming class) measured
+# 2026-06-13 at the integ/round5c tip (epic/sley-hooks +
+# fix/stdin-streaming-class merged onto 5a81341, @ 2b5d2d6). Gains over the
+# round-5c hooks-layer baseline (ffbdc08): t5407-post-rewrite-hook 3->10,
+# t5571-pre-push-hook 6->11, t0008-ignores 284->306 (still deadlocks on its
+# last cell, sley#44 — 306 cells record before the 900s timeout kill), plus the
+# new t1400-update-ref.sh floored at 175. t1800-hook stays at 55 (already a
+# full pass since the hooks-layer landing).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -45,6 +53,7 @@ declare -A FLOOR=(
     [t1006-cat-file.sh]=289
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=445
+    [t1400-update-ref.sh]=175
     [t1401-symbolic-ref.sh]=25
     [t1500-rev-parse.sh]=80
     [t2400-worktree-add.sh]=165
@@ -96,11 +105,11 @@ declare -A FLOOR=(
     [t4015-diff-whitespace.sh]=55
     [t4018-diff-funcname.sh]=287
     [t4034-diff-words.sh]=64
-    [t5407-post-rewrite-hook.sh]=3
+    [t5407-post-rewrite-hook.sh]=10
     [t5500-fetch-pack.sh]=356
-    [t5571-pre-push-hook.sh]=6
+    [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=9
-    [t0008-ignores.sh]=284
+    [t0008-ignores.sh]=306
     [t7400-submodule-basic.sh]=70
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=66
