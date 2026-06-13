@@ -2141,7 +2141,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         }
     }
 
-    let (remote, refspecs) = if delete {
+    let (remote, mut refspecs) = if delete {
         let Some((remote, names)) = positional.split_first() else {
             return Err(GitError::Command(
                 "push --delete requires at least one ref".into(),
@@ -2157,8 +2157,9 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             names.iter().map(|refspec| format!(":{refspec}")).collect(),
         )
     } else {
-        push_remote_and_refspecs(&store, &positional)?
+        push_remote_and_refspecs(&git_dir, &store, &positional)?
     };
+    default_head_push_destinations(&store, &mut refspecs)?;
     let options = PushOptions {
         quiet,
         set_upstream,
@@ -2192,6 +2193,23 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         &refspecs,
         options,
     )
+}
+
+fn default_head_push_destinations(store: &FileRefStore, refspecs: &mut [String]) -> Result<()> {
+    for refspec in refspecs {
+        let forced = refspec.starts_with('+');
+        let body = refspec.strip_prefix('+').unwrap_or(refspec);
+        if body == "HEAD"
+            && let Some(branch) = store.current_branch()?
+        {
+            *refspec = if forced {
+                format!("+HEAD:refs/heads/{branch}")
+            } else {
+                format!("HEAD:refs/heads/{branch}")
+            };
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2249,6 +2267,7 @@ fn run_push(
     run_local_receive_pre_hooks(destination, &plan.commands)?;
     let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
     run_local_receive_post_hooks(destination, &outcome.commands)?;
+    update_push_remote_tracking_refs(git_dir, format, &config, remote, &outcome.commands)?;
     if options.set_upstream {
         configure_push_upstreams(git_dir, remote, &outcome.commands)?;
     }
@@ -2259,6 +2278,37 @@ fn run_push(
         }
     }
     Ok(())
+}
+
+fn update_push_remote_tracking_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    remote: &str,
+    commands: &[ReceivePackCommand],
+) -> Result<()> {
+    if config.get("remote", Some(remote), "url").is_none() {
+        return Ok(());
+    }
+    let refs = FileRefStore::new(git_dir, format);
+    let mut tx = refs.transaction();
+    for command in commands {
+        let Some(branch) = command.name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let name = format!("refs/remotes/{remote}/{branch}");
+        if command.new_id.is_null() {
+            let _ = refs.delete_ref(&name);
+        } else {
+            tx.update(RefUpdate {
+                name,
+                expected: None,
+                new: RefTarget::Direct(command.new_id),
+                reflog: None,
+            });
+        }
+    }
+    tx.commit()
 }
 
 fn run_local_receive_pre_hooks(
@@ -2442,6 +2492,7 @@ fn push_resolved_url(remote: &str) -> Result<String> {
 }
 
 fn push_remote_and_refspecs(
+    git_dir: &Path,
     store: &FileRefStore,
     positional: &[String],
 ) -> Result<(String, Vec<String>)> {
@@ -2450,6 +2501,14 @@ fn push_remote_and_refspecs(
             let branch = store.current_branch()?.ok_or_else(|| {
                 GitError::Command("push requires a refspec when HEAD is detached".into())
             })?;
+            let config = read_repo_config(git_dir).unwrap_or_default();
+            if matches!(
+                config.get("push", None, "default"),
+                Some("upstream" | "tracking")
+            ) && let Some((remote, merge)) = push_upstream_for_branch(&config, &branch)
+            {
+                return Ok((remote, vec![format!("refs/heads/{branch}:{merge}")]));
+            }
             Ok(("origin".into(), vec![branch]))
         }
         [remote] => {
@@ -2460,6 +2519,12 @@ fn push_remote_and_refspecs(
         }
         [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
     }
+}
+
+fn push_upstream_for_branch(config: &GitConfig, branch: &str) -> Option<(String, String)> {
+    let remote = config.get("branch", Some(branch), "remote")?.to_string();
+    let merge = config.get("branch", Some(branch), "merge")?.to_string();
+    Some((remote, merge))
 }
 
 fn configure_push_upstreams(

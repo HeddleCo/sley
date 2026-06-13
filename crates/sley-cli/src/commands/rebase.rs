@@ -1948,6 +1948,7 @@ fn pick_one_commit(
                 if let CommitOutcome::Failed(code) = res {
                     return stop_with_patch(ctx, db, opts, &record, item, code, false);
                 }
+                record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
                 reread_todo_if_changed(ctx, db, todo)?;
                 return Ok(PickOutcome::Continue);
             }
@@ -1959,7 +1960,10 @@ fn pick_one_commit(
                 );
                 return stop_with_patch(ctx, db, opts, &record, item, 0, true);
             }
-            _ => return Ok(PickOutcome::Continue),
+            _ => {
+                record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+                return Ok(PickOutcome::Continue);
+            }
         }
     }
 
@@ -2130,14 +2134,19 @@ fn pick_one_commit(
             original: Some(&record),
         },
     )?;
-    if let CommitOutcome::Failed(code) = result {
-        if is_fixup {
-            intend_to_amend(ctx)?;
-            let squash = fs::read(ctx.state_path("message-squash")).unwrap_or_default();
-            fs::write(ctx.state_path("message"), &squash)?;
-            fs::write(ctx.git_dir.join("MERGE_MSG"), &squash)?;
+    match result {
+        CommitOutcome::Committed => {
+            record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
         }
-        return stop_with_patch(ctx, db, opts, &record, item, code, false);
+        CommitOutcome::Failed(code) => {
+            if is_fixup {
+                intend_to_amend(ctx)?;
+                let squash = fs::read(ctx.state_path("message-squash")).unwrap_or_default();
+                fs::write(ctx.state_path("message"), &squash)?;
+                fs::write(ctx.git_dir.join("MERGE_MSG"), &squash)?;
+            }
+            return stop_with_patch(ctx, db, opts, &record, item, code, false);
+        }
     }
 
     if final_fixup {
@@ -2179,6 +2188,20 @@ fn next_is_fixup(todo: &TodoList) -> bool {
         .iter()
         .find(|item| item.command != TodoCommand::Comment)
         .is_some_and(|item| item.command.is_fixup())
+}
+
+fn next_command_after_current(todo: &TodoList) -> Option<TodoCommand> {
+    todo.items[todo.current + 1..]
+        .iter()
+        .find(|item| item.command != TodoCommand::Comment)
+        .map(|item| item.command)
+}
+
+fn first_todo_command(todo: &TodoList) -> Option<TodoCommand> {
+    todo.items
+        .iter()
+        .find(|item| item.command != TodoCommand::Comment)
+        .map(|item| item.command)
 }
 
 fn write_message_files(
@@ -2733,6 +2756,8 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree)?;
     }
 
+    run_post_rewrite_hook(ctx)?;
+
     apply_autostash(ctx);
 
     if !opts.quiet {
@@ -2740,6 +2765,65 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     }
 
     seq::remove_merge_state(&ctx.git_dir);
+    Ok(())
+}
+
+fn rewritten_list_path(ctx: &Ctx) -> PathBuf {
+    ctx.state_path("rewritten-list")
+}
+
+fn rewritten_pending_path(ctx: &Ctx) -> PathBuf {
+    ctx.state_path("rewritten-pending")
+}
+
+fn flush_rewritten_pending(ctx: &Ctx) -> Result<()> {
+    let pending_path = rewritten_pending_path(ctx);
+    let pending = fs::read_to_string(&pending_path).unwrap_or_default();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let refs = ctx.refs();
+    let head = head_commit_oid(&refs)?
+        .ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let mut list = fs::read_to_string(rewritten_list_path(ctx)).unwrap_or_default();
+    for line in pending.lines().filter(|line| !line.trim().is_empty()) {
+        list.push_str(line.trim());
+        list.push(' ');
+        list.push_str(&head.to_hex());
+        list.push('\n');
+    }
+    fs::write(rewritten_list_path(ctx), list)?;
+    let _ = fs::remove_file(pending_path);
+    Ok(())
+}
+
+fn record_rewritten(ctx: &Ctx, old_oid: &ObjectId, next_command: Option<TodoCommand>) -> Result<()> {
+    let pending_path = rewritten_pending_path(ctx);
+    let mut pending = fs::read_to_string(&pending_path).unwrap_or_default();
+    pending.push_str(&old_oid.to_hex());
+    pending.push('\n');
+    fs::write(&pending_path, pending)?;
+    if !next_command.is_some_and(TodoCommand::is_fixup) {
+        flush_rewritten_pending(ctx)?;
+    }
+    Ok(())
+}
+
+fn run_post_rewrite_hook(ctx: &Ctx) -> Result<()> {
+    flush_rewritten_pending(ctx)?;
+    let path = rewritten_list_path(ctx);
+    let input = fs::read(&path).unwrap_or_default();
+    if input.is_empty() {
+        return Ok(());
+    }
+    let _ = commands::hooks::run_hook(
+        "post-rewrite",
+        commands::hooks::HookRun {
+            args: vec!["rebase".to_string()],
+            stdin: Some(input),
+            ..commands::hooks::HookRun::default()
+        },
+    );
     Ok(())
 }
 
@@ -2778,9 +2862,19 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
+    record_stopped_sha_rewritten(ctx, &todo)?;
     let _ = fs::remove_file(ctx.state_path("stopped-sha"));
 
     pick_commits(ctx, &db, &opts, &mut todo)
+}
+
+fn record_stopped_sha_rewritten(ctx: &Ctx, todo: &TodoList) -> Result<()> {
+    if let Ok(raw) = fs::read_to_string(ctx.state_path("stopped-sha"))
+        && let Ok(stopped) = ObjectId::from_hex(ctx.format, raw.trim())
+    {
+        record_rewritten(ctx, &stopped, first_todo_command(todo))?;
+    }
+    Ok(())
 }
 
 /// Returns `true` when the continue must abort (error already printed).
@@ -2927,6 +3021,7 @@ fn rebase_skip(ctx: &Ctx) -> Result<()> {
     if commit_staged_changes(ctx, &db, &opts, &todo)? {
         return Err(GitError::Exit(1));
     }
+    record_stopped_sha_rewritten(ctx, &todo)?;
     let _ = fs::remove_file(ctx.state_path("stopped-sha"));
     pick_commits(ctx, &db, &opts, &mut todo)
 }
