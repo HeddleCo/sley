@@ -1,5 +1,5 @@
 [package]
-name = "sley-ref-filter"
+name = "sley-strbuf-expand"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 sley-core = { path = "../sley-core" }
-sley-strbuf-expand = { path = "../sley-strbuf-expand" }
 
 [lints]
 workspace = true
