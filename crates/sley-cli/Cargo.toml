@@ -25,6 +25,7 @@ sley-index = { path = "../sley-index" }
 sley-notes = { path = "../sley-notes" }
 sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
+sley-options = { path = "../sley-options" }
 sley-pack = { path = "../sley-pack" }
 sley-protocol = { path = "../sley-protocol" }
 sley-ref-filter = { path = "../sley-ref-filter" }

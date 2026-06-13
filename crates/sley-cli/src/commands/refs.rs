@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_options::{OptFlags, OptValue, OptionSpec, ParsedValue, UsageError, parse_options};
 
 #[derive(Debug)]
 struct ReflogShowOptions {
@@ -2742,50 +2743,30 @@ pub(crate) fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
-    let mut short = false;
-    let mut quiet = false;
-    let mut recurse = true;
-    let mut delete = false;
-    let mut message = Vec::new();
-    let mut positional = Vec::new();
-    let mut positional_only = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        let arg = &args[idx];
-        if positional_only {
-            positional.push(arg.as_str());
-            idx += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--short" => short = true,
-            "--no-short" => short = false,
-            "--quiet" | "-q" => quiet = true,
-            "--no-quiet" => quiet = false,
-            "--recurse" => recurse = true,
-            "--no-recurse" => recurse = false,
-            "--delete" | "-d" => delete = true,
-            "--no-delete" => delete = false,
-            "-m" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(symbolic_ref_message_requires_value_error)?;
-                message = value.as_bytes().to_vec();
-            }
-            value if value.starts_with("-m") && value.len() > 2 => {
-                message = value[2..].as_bytes().to_vec();
-            }
-            value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported symbolic-ref option {value}"
-                )));
-            }
-            value => positional.push(value),
-        }
-        idx += 1;
+    let specs = symbolic_ref_option_specs();
+    let usage = symbolic_ref_usage_lines();
+    let parsed = parse_options(args, &specs, &usage).map_err(symbolic_ref_usage_error)?;
+
+    let short = parsed.last_bool("short", false);
+    let quiet = parsed.last_bool("quiet", false);
+    let recurse = parsed.last_bool("recurse", true);
+    let delete = parsed.last_bool("delete", false);
+    let message_value = parsed
+        .options
+        .iter()
+        .filter(|option| option.short == Some('m'))
+        .filter_map(|option| match option.value {
+            ParsedValue::Str(value) => Some(value),
+            _ => None,
+        })
+        .next_back();
+    if message_value == Some("") {
+        eprintln!("fatal: Refusing to perform update with empty message");
+        return Err(GitError::Exit(128));
     }
+    let message = message_value.unwrap_or("").as_bytes().to_vec();
+
+    let positional = parsed.positionals;
     if delete {
         return match positional.as_slice() {
             [name] => delete_symbolic_ref(&store, name),
@@ -2916,28 +2897,70 @@ fn symbolic_ref_short_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn symbolic_ref_message_requires_value_error() -> GitError {
-    eprintln!("error: switch `m' requires a value");
-    GitError::Exit(129)
-}
-
 fn symbolic_ref_refusing_outside_refs() -> Result<()> {
     eprintln!("fatal: Refusing to point HEAD outside of refs/");
     Err(GitError::Exit(128))
 }
 
 fn symbolic_ref_usage() -> Result<()> {
-    eprintln!("usage: git symbolic-ref [-m <reason>] <name> <ref>");
-    eprintln!("   or: git symbolic-ref [-q] [--short] [--no-recurse] <name>");
-    eprintln!("   or: git symbolic-ref --delete [-q] <name>");
-    eprintln!();
-    eprintln!("    -q, --[no-]quiet      suppress error message for non-symbolic (detached) refs");
-    eprintln!("    -d, --[no-]delete     delete symbolic ref");
-    eprintln!("    --[no-]short          shorten ref output");
-    eprintln!("    --[no-]recurse        recursively dereference (default)");
-    eprintln!("    -m <reason>           reason of the update");
-    eprintln!();
+    eprint!(
+        "{}",
+        sley_options::usage_with_options(&symbolic_ref_option_specs(), &symbolic_ref_usage_lines())
+    );
     Err(GitError::Exit(129))
+}
+
+fn symbolic_ref_option_specs() -> [OptionSpec<'static>; 5] {
+    [
+        OptionSpec {
+            short: Some('q'),
+            long: Some("quiet"),
+            value: OptValue::Bool,
+            flags: OptFlags::NONE,
+            help: "suppress error message for non-symbolic (detached) refs",
+        },
+        OptionSpec {
+            short: Some('d'),
+            long: Some("delete"),
+            value: OptValue::Bool,
+            flags: OptFlags::NONE,
+            help: "delete symbolic ref",
+        },
+        OptionSpec {
+            short: None,
+            long: Some("short"),
+            value: OptValue::Bool,
+            flags: OptFlags::NONE,
+            help: "shorten ref output",
+        },
+        OptionSpec {
+            short: None,
+            long: Some("recurse"),
+            value: OptValue::Bool,
+            flags: OptFlags::NONE,
+            help: "recursively dereference (default)",
+        },
+        OptionSpec {
+            short: Some('m'),
+            long: None,
+            value: OptValue::Str("reason"),
+            flags: OptFlags::NONE,
+            help: "reason of the update",
+        },
+    ]
+}
+
+fn symbolic_ref_usage_lines() -> [&'static str; 3] {
+    [
+        "git symbolic-ref [-m <reason>] <name> <ref>",
+        "git symbolic-ref [-q] [--short] [--no-recurse] <name>",
+        "git symbolic-ref --delete [-q] <name>",
+    ]
+}
+
+fn symbolic_ref_usage_error(error: UsageError) -> GitError {
+    eprint!("{}", error.render_stderr());
+    GitError::Exit(error.exit_code())
 }
 
 /// `git refs` command group (builtin/refs.c, git 2.54). Dispatches to the ref

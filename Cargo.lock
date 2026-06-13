@@ -1130,6 +1130,7 @@ dependencies = [
  "sley-notes",
  "sley-object",
  "sley-odb",
+ "sley-options",
  "sley-pack",
  "sley-protocol",
  "sley-ref-filter",

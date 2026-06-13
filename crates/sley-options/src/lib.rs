@@ -148,6 +148,14 @@ impl UsageError {
         }
     }
 
+    pub fn message_only(message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            usage: String::new(),
+            exit_code: 129,
+        }
+    }
+
     pub const fn exit_code(&self) -> i32 {
         self.exit_code
     }
@@ -167,7 +175,9 @@ impl UsageError {
             out.push_str(message);
             out.push('\n');
         }
-        out.push_str(&self.usage);
+        if !self.usage.is_empty() {
+            out.push_str(&self.usage);
+        }
         out
     }
 }
@@ -239,11 +249,11 @@ pub fn usage_with_options(specs: &[OptionSpec<'_>], usage: &[&str]) -> String {
 
         let width = option.chars().count();
         out.push_str(&option);
-        if width < 30 {
-            out.push_str(&" ".repeat(30 - width));
+        if width < 26 {
+            out.push_str(&" ".repeat(26 - width));
         } else {
             out.push('\n');
-            out.push_str(&" ".repeat(30));
+            out.push_str(&" ".repeat(26));
         }
         out.push_str(spec.help);
         out.push('\n');
@@ -442,10 +452,10 @@ impl<'a> Parser<'a> {
         let spec = self.specs[spec_index];
         let unset = matches!(name, OptionName::NegatedLong(_));
         if unset && attached.is_some() {
-            return Err(self.error(format!("{name} takes no value")));
+            return Err(Self::parse_error(format!("{name} takes no value")));
         }
         if attached.is_some() && !spec.value.expects_value() {
-            return Err(self.error(format!("{name} takes no value")));
+            return Err(Self::parse_error(format!("{name} takes no value")));
         }
 
         let value = match spec.value {
@@ -453,14 +463,15 @@ impl<'a> Parser<'a> {
             OptValue::Int(_) => {
                 let raw = self.required_value(spec, name, attached, short)?;
                 ParsedValue::Int(
-                    parse_plain_int(raw)
-                        .map_err(|_| self.error(format!("{name} expects an integer value")))?,
+                    parse_plain_int(raw).map_err(|_| {
+                        Self::parse_error(format!("{name} expects an integer value"))
+                    })?,
                 )
             }
             OptValue::Magnitude(_) => {
                 let raw = self.required_value(spec, name, attached, short)?;
                 ParsedValue::Magnitude(parse_magnitude(raw).map_err(|err| {
-                    self.error(match err {
+                    Self::parse_error(match err {
                         NumberError::Empty => format!("{name} expects a numerical value"),
                         NumberError::Invalid => {
                             format!("{name} expects an integer value with an optional k/m/g suffix")
@@ -479,7 +490,10 @@ impl<'a> Parser<'a> {
             OptValue::Enum { parse, .. } => {
                 let raw = self.required_value(spec, name, attached, short)?;
                 if !parse(raw) {
-                    return Err(self.error(format!("invalid value for '{}'", name.cli_spelling())));
+                    return Err(Self::parse_error(format!(
+                        "invalid value for '{}'",
+                        name.cli_spelling()
+                    )));
                 }
                 ParsedValue::Enum(raw)
             }
@@ -494,7 +508,7 @@ impl<'a> Parser<'a> {
                     value: raw,
                     unset,
                 };
-                ParsedValue::Callback(parse(callback_value).map_err(|message| self.error(message))?)
+                ParsedValue::Callback(parse(callback_value).map_err(Self::parse_error)?)
             }
         };
 
@@ -528,7 +542,7 @@ impl<'a> Parser<'a> {
                 .get(self.index)
                 .map(String::as_str)
                 .map(Some)
-                .ok_or_else(|| self.error(format!("{name} requires a value")));
+                .ok_or_else(|| Self::parse_error(format!("{name} requires a value")));
         }
         Ok(None)
     }
@@ -541,11 +555,15 @@ impl<'a> Parser<'a> {
         short: bool,
     ) -> Result<&'a str, UsageError> {
         self.value_for(spec, name, attached, short)?
-            .ok_or_else(|| self.error(format!("{name} requires a value")))
+            .ok_or_else(|| Self::parse_error(format!("{name} requires a value")))
     }
 
     fn error(&self, message: String) -> UsageError {
         UsageError::new(message, self.usage_text())
+    }
+
+    fn parse_error(message: String) -> UsageError {
+        UsageError::message_only(message)
     }
 
     fn usage_text(&self) -> String {
