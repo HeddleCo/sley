@@ -6325,11 +6325,14 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
 }
 
 fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
-    if value.is_empty() {
-        Ok(())
-    } else {
-        log_validate_output_indicator(option, value)
+    // git accepts an empty value only for `--output-indicator-context` (it falls
+    // back to the default ' ' marker); empty `--output-indicator-{new,old}=` is
+    // rejected with exit 129, exactly like a single-byte check failing. Defer to
+    // the shared validator so the empty case errors byte-identically to git.
+    if value.is_empty() && option == "output-indicator-context" {
+        return Ok(());
     }
+    log_validate_output_indicator(option, value)
 }
 
 fn log_validate_submodule_format(value: &str) -> Result<()> {
@@ -7565,7 +7568,15 @@ fn log_regex_unterminated_class_error(
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    let message = "brackets ([ ]) not balanced";
+    // Default output must be byte-identical to git: glibc's `regcomp` reports an
+    // unbalanced bracket class via `regerror`, which git surfaces verbatim as
+    // "Invalid regular expression". The friendlier "brackets ([ ]) not balanced"
+    // diagnostic is a strict improvement, but only acceptable behind a verbose
+    // mode — sley-cli has no global `-v`/verbosity seam reaching the log
+    // regex-parse path yet (only per-subcommand verbose flags in worktree/etc.).
+    // TODO(verbose): surface detailed regex diagnostics ("brackets ([ ]) not
+    // balanced") under -v once a global verbosity level is plumbed into log.
+    let message = "Invalid regular expression";
     eprintln!("fatal: {error_context}, '{pattern}': {message}");
     Err(GitError::Exit(128))
 }

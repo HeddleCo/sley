@@ -2,10 +2,9 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_refs::{
-    DeleteRef as StoreDeleteRef, DeleteRefReflog, RefDeleteError,
+    DeleteRef as StoreDeleteRef, RefDeleteError,
     RefDeletePrecondition as StoreRefDeletePrecondition, RefTarget, RefUpdate, ReflogEntry,
 };
 
@@ -151,13 +150,6 @@ impl RefConflict {
             message: message.into(),
         }
     }
-
-    fn from_delete_error(ref_name: String, err: RefDeleteError) -> Self {
-        Self {
-            ref_name,
-            message: err.to_string(),
-        }
-    }
 }
 
 fn extract_ref_name_from_transaction(message: &str) -> Option<String> {
@@ -189,17 +181,10 @@ impl Repository {
         } else {
             None
         };
-        let committer = match delete.reflog_committer {
-            Some(committer) => committer,
-            None => self.delete_ref_committer()?,
-        };
-        let reflog = match delete.reflog {
-            Some(message) => Some(DeleteRefReflog {
-                committer,
-                message: message.message,
-            }),
-            None => None,
-        };
+        // git unlinks logs/refs/<name> on delete and never writes a deletion
+        // reflog entry, so the caller-supplied `reflog`/`reflog_committer` have
+        // no on-disk effect. The fields stay on the public `DeleteRef` for API
+        // stability; we simply do not synthesise a deletion entry here.
         if let Some(RefTarget::Symbolic(_)) = current {
             return self
                 .references()
@@ -222,7 +207,7 @@ impl Repository {
             .delete_ref_checked(StoreDeleteRef {
                 name: delete.name.into(),
                 expected_old,
-                reflog,
+                reflog: None,
             })
             .map(|_| ())
     }
@@ -266,51 +251,17 @@ impl Repository {
                     tx.update(change.clone().into_update());
                 }
                 RefBatchChange::Delete(delete) => {
-                    let reflog = self.store_delete_reflog(delete)?;
+                    // git unlinks the reflog on delete rather than appending a
+                    // deletion entry; the caller-supplied reflog is ignored.
                     tx.delete_with_precondition(
                         delete.name.as_str(),
                         store_delete_precondition(delete),
-                        reflog,
+                        None,
                     );
                 }
             }
         }
         tx.commit().map_err(RefConflict::from_git_error)
-    }
-
-    fn delete_ref_committer(&self) -> std::result::Result<Vec<u8>, RefDeleteError> {
-        let name = self
-            .config_string("user", "name")
-            .map_err(ref_delete_error_from_git)?
-            .unwrap_or_else(|| "sley".to_string());
-        let email = self
-            .config_string("user", "email")
-            .map_err(ref_delete_error_from_git)?
-            .unwrap_or_else(|| "sley@example.invalid".to_string());
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        Ok(format!("{name} <{email}> {seconds} +0000").into_bytes())
-    }
-
-    fn store_delete_reflog(
-        &self,
-        delete: &DeleteRef,
-    ) -> std::result::Result<Option<DeleteRefReflog>, RefConflict> {
-        let Some(message) = delete.reflog.as_ref() else {
-            return Ok(None);
-        };
-        let committer = match delete.reflog_committer.as_ref() {
-            Some(committer) => committer.clone(),
-            None => self.delete_ref_committer().map_err(|err| {
-                RefConflict::from_delete_error(delete.name.as_str().to_string(), err)
-            })?,
-        };
-        Ok(Some(DeleteRefReflog {
-            committer,
-            message: message.message.clone(),
-        }))
     }
 
     fn verify_delete_expected(
@@ -504,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_delete_ref_enforces_expected_and_appends_reflog() {
+    fn repository_delete_ref_enforces_expected_and_removes_reflog() {
         let temp = TempDir::new();
         let repo = Repository::init(&temp.path).expect("init");
         let oid = write_commit(&repo, None);
@@ -512,6 +463,36 @@ mod tests {
             RefChange::new("refs/heads/main", RefTarget::Direct(oid)).expect("valid ref name")
         ])
         .expect("create ref");
+        // Plant a reflog so the file exists; git unlinks it on delete rather than
+        // appending a deletion entry.
+        repo.references()
+            .write_reflog(
+                "refs/heads/main",
+                &[ReflogEntry {
+                    old_oid: sley_core::ObjectId::null(repo.object_format()),
+                    new_oid: oid,
+                    committer: b"Sley <sley@example.invalid> 1 +0000".to_vec(),
+                    message: b"create main".to_vec(),
+                }],
+            )
+            .expect("seed reflog");
+
+        // A stale expected_old must still be rejected (precondition enforced).
+        let stale = sley_core::ObjectId::null(repo.object_format());
+        repo.delete_ref(DeleteRef {
+            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            expected_old: Some(stale),
+            expected: None,
+            reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
+            reflog_committer: None,
+        })
+        .expect_err("stale expected_old must be rejected");
+        assert!(
+            repo.find_reference("refs/heads/main")
+                .expect("lookup")
+                .is_some(),
+            "ref must survive a rejected delete"
+        );
 
         repo.delete_ref(DeleteRef {
             name: FullName::new("refs/heads/main").expect("valid ref name"),
@@ -527,17 +508,12 @@ mod tests {
                 .expect("lookup")
                 .is_none()
         );
+        // git unlinks the reflog on delete: no deletion entry is left behind.
         let log = repo
             .references()
             .read_reflog("refs/heads/main")
             .expect("read reflog");
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].old_oid, oid);
-        assert_eq!(
-            log[0].new_oid,
-            sley_core::ObjectId::null(repo.object_format())
-        );
-        assert_eq!(log[0].message, b"delete main");
+        assert!(log.is_empty(), "reflog must be removed by the delete");
     }
 
     #[test]
@@ -688,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_apply_ref_batch_uses_delete_reflog_committer() {
+    fn repository_apply_ref_batch_delete_removes_reflog() {
         let temp = TempDir::new();
         let repo = Repository::init(&temp.path).expect("init");
         let oid = write_commit(&repo, None);
@@ -696,6 +672,17 @@ mod tests {
             RefChange::new("refs/heads/main", RefTarget::Direct(oid)).expect("valid ref name")
         ])
         .expect("seed main");
+        repo.references()
+            .write_reflog(
+                "refs/heads/main",
+                &[ReflogEntry {
+                    old_oid: sley_core::ObjectId::null(repo.object_format()),
+                    new_oid: oid,
+                    committer: b"Sley <sley@example.invalid> 1 +0000".to_vec(),
+                    message: b"create main".to_vec(),
+                }],
+            )
+            .expect("seed reflog");
         let committer = b"Heddle <actor@example.invalid> 7 +0000".to_vec();
 
         repo.apply_ref_batch(&[RefBatchChange::Delete(DeleteRef {
@@ -703,21 +690,20 @@ mod tests {
             expected_old: Some(oid),
             expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
-            reflog_committer: Some(committer.clone()),
+            reflog_committer: Some(committer),
         })])
         .expect("delete ref");
 
+        // git unlinks the reflog on a transactional delete; no entry remains.
         let log = repo
             .references()
             .read_reflog("refs/heads/main")
             .expect("read reflog");
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].committer, committer);
-        assert_eq!(log[0].message, b"delete main");
+        assert!(log.is_empty(), "reflog must be removed by the batch delete");
     }
 
     #[test]
-    fn repository_delete_ref_uses_explicit_reflog_committer() {
+    fn repository_delete_ref_removes_reflog() {
         let temp = TempDir::new();
         let repo = Repository::init(&temp.path).expect("init");
         let oid = write_commit(&repo, None);
@@ -725,6 +711,17 @@ mod tests {
             RefChange::new("refs/heads/main", RefTarget::Direct(oid)).expect("valid ref name")
         ])
         .expect("seed main");
+        repo.references()
+            .write_reflog(
+                "refs/heads/main",
+                &[ReflogEntry {
+                    old_oid: sley_core::ObjectId::null(repo.object_format()),
+                    new_oid: oid,
+                    committer: b"Sley <sley@example.invalid> 1 +0000".to_vec(),
+                    message: b"create main".to_vec(),
+                }],
+            )
+            .expect("seed reflog");
         let committer = b"Heddle <actor@example.invalid> 7 +0000".to_vec();
 
         repo.delete_ref(DeleteRef {
@@ -732,15 +729,16 @@ mod tests {
             expected_old: Some(oid),
             expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
-            reflog_committer: Some(committer.clone()),
+            reflog_committer: Some(committer),
         })
         .expect("delete ref");
 
+        // git unlinks the reflog on delete rather than writing a deletion entry.
         let log = repo
             .references()
             .read_reflog("refs/heads/main")
             .expect("read reflog");
-        assert_eq!(log[0].committer, committer);
+        assert!(log.is_empty(), "reflog must be removed by the delete");
     }
 
     #[test]

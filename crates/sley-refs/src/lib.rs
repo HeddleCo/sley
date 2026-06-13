@@ -1065,10 +1065,9 @@ impl FileRefStore {
             value: ReftableRefValue::Deletion,
         }])
         .map_err(ref_delete_error_from_git)?;
-        if let Some(reflog) = delete.reflog {
-            self.append_reflog(&delete.name, &reflog.delete_entry(oid, self.format))
-                .map_err(ref_delete_error_from_git)?;
-        }
+        // Git unlinks logs/refs/<name> on delete (pruning now-empty dirs); it
+        // does not keep a deletion entry. Mirror delete_ref / delete_branch.
+        self.remove_reflog_file(&delete.name);
         Ok(RefDelete {
             name: delete.name,
             oid,
@@ -1141,20 +1140,19 @@ impl FileRefStore {
             packed_lock.remove();
         }
 
-        if loose_ref.is_some() {
-            if let Err(err) = fs::remove_file(&path) {
-                if packed_changed && let Some(bytes) = packed_original.as_ref() {
-                    let _ = restore_file_atomically(&packed_path, bytes);
-                }
-                return Err(RefDeleteError::Io(err));
+        if loose_ref.is_some()
+            && let Err(err) = fs::remove_file(&path)
+        {
+            if packed_changed && let Some(bytes) = packed_original.as_ref() {
+                let _ = restore_file_atomically(&packed_path, bytes);
             }
+            return Err(RefDeleteError::Io(err));
         }
         loose_lock.remove();
 
-        if let Some(reflog) = delete.reflog {
-            self.append_reflog(&name, &reflog.delete_entry(oid, self.format))
-                .map_err(ref_delete_error_from_git)?;
-        }
+        // Git unlinks logs/refs/<name> on delete (pruning now-empty dirs); it
+        // does not keep a deletion entry. Mirror delete_ref / delete_branch.
+        self.remove_reflog_file(&name);
         Ok(RefDelete { name, oid })
     }
 
@@ -1503,7 +1501,6 @@ struct QueuedUpdate {
 struct QueuedDelete {
     name: String,
     precondition: RefDeletePrecondition,
-    reflog: Option<DeleteRefReflog>,
 }
 
 enum QueuedRefChange {
@@ -1571,16 +1568,19 @@ impl<'a> FileRefTransaction<'a> {
     }
 
     /// Queue a ref delete with an explicit direct/symbolic precondition.
+    ///
+    /// `_reflog` is accepted for API compatibility but ignored: git unlinks the
+    /// reflog on delete rather than writing a deletion entry, so a
+    /// caller-supplied deletion message has no on-disk effect.
     pub fn delete_with_precondition(
         &mut self,
         name: impl Into<String>,
         precondition: RefDeletePrecondition,
-        reflog: Option<DeleteRefReflog>,
+        _reflog: Option<DeleteRefReflog>,
     ) {
         self.changes.push(QueuedRefChange::Delete(QueuedDelete {
             name: name.into(),
             precondition,
-            reflog,
         }));
     }
 
@@ -1618,6 +1618,7 @@ impl FileRefStore {
     fn commit_reftable(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
         let mut records = Vec::with_capacity(changes.len());
         let mut reflogs = Vec::new();
+        let mut delete_names = Vec::new();
         for change in changes {
             match change {
                 CoalescedRefChange::Update(update) => {
@@ -1640,7 +1641,10 @@ impl FileRefStore {
                 }
                 CoalescedRefChange::Delete(delete) => {
                     let current = self.read_ref(&delete.name)?;
-                    let deleted = verify_delete_precondition(
+                    // Enforce the precondition; git unlinks logs/refs/<name> on
+                    // delete rather than appending a deletion reflog entry, so the
+                    // returned OID is unused.
+                    verify_delete_precondition(
                         self,
                         &delete.name,
                         current.as_ref(),
@@ -1651,15 +1655,17 @@ impl FileRefStore {
                         update_index: 0,
                         value: ReftableRefValue::Deletion,
                     });
-                    if let Some(reflog) = delete.reflog
-                        && let Some(oid) = deleted.oid
-                    {
-                        reflogs.push((delete.name.clone(), reflog.delete_entry(oid, self.format)));
-                    }
+                    delete_names.push(delete.name.clone());
                 }
             }
         }
         self.append_reftable_records(records)?;
+        // Git unlinks logs/refs/<name> (pruning now-empty dirs) on delete; do
+        // this before appending update reflogs so a delete+recreate does not race
+        // the new ref's reflog file.
+        for name in &delete_names {
+            self.remove_reflog_file(name);
+        }
         for (name, entry) in reflogs {
             self.append_reflog(&name, &entry)?;
         }
@@ -1828,18 +1834,18 @@ impl FileRefStore {
                             return Err(err);
                         }
                     };
-                    let deleted = match verify_delete_precondition(
+                    // Enforce the delete precondition under lock; the returned
+                    // OID is unused because git unlinks logs/refs/<name> on
+                    // delete rather than appending a deletion reflog entry.
+                    if let Err(err) = verify_delete_precondition(
                         self,
                         &delete.name,
                         state.current.as_ref(),
                         &delete.precondition,
                     ) {
-                        Ok(deleted) => deleted,
-                        Err(err) => {
-                            release_pending_locks(&pending);
-                            return Err(err);
-                        }
-                    };
+                        release_pending_locks(&pending);
+                        return Err(err);
+                    }
                     pending[index].original = if state.has_loose {
                         match read_optional_file(&pending[index].path) {
                             Ok(original) => original,
@@ -1851,14 +1857,6 @@ impl FileRefStore {
                     } else {
                         None
                     };
-                    if let Some(reflog) = &delete.reflog
-                        && let Some(oid) = deleted.oid
-                    {
-                        reflogs.push((
-                            delete.name.clone(),
-                            reflog.clone().delete_entry(oid, self.format),
-                        ));
-                    }
                     delete_names.insert(delete.name.clone());
                 }
             }
@@ -1909,6 +1907,12 @@ impl FileRefStore {
             if matches!(change.action, PendingPathAction::Delete) && change.original.is_some() {
                 self.prune_empty_ref_dirs(&change.name);
             }
+        }
+        // Git unlinks logs/refs/<name> (and prunes now-empty log dirs) on delete;
+        // do this before appending update reflogs so a delete+recreate in the
+        // same direction does not race the new ref's reflog file.
+        for name in &delete_names {
+            self.remove_reflog_file(name);
         }
         // All refs are durable; append reflogs last, matching git's ordering.
         for (name, entry) in reflogs {
@@ -1977,7 +1981,6 @@ struct CoalescedRefUpdate {
 struct CoalescedRefDelete {
     name: String,
     precondition: RefDeletePrecondition,
-    reflog: Option<DeleteRefReflog>,
 }
 
 fn coalesce_ref_changes(changes: Vec<QueuedRefChange>) -> Result<Vec<CoalescedRefChange>> {
@@ -2023,7 +2026,6 @@ fn coalesce_ref_changes(changes: Vec<QueuedRefChange>) -> Result<Vec<CoalescedRe
             QueuedRefChange::Delete(delete) => CoalescedRefChange::Delete(CoalescedRefDelete {
                 name: delete.name,
                 precondition: delete.precondition,
-                reflog: delete.reflog,
             }),
         });
     }
@@ -2155,17 +2157,6 @@ impl Drop for DeleteLock {
     }
 }
 
-impl DeleteRefReflog {
-    fn delete_entry(self, old_oid: ObjectId, format: ObjectFormat) -> ReflogEntry {
-        ReflogEntry {
-            old_oid,
-            new_oid: ObjectId::null(format),
-            committer: self.committer,
-            message: self.message,
-        }
-    }
-}
-
 fn checked_delete_oid(
     expected: Option<ObjectId>,
     current: Option<RefTarget>,
@@ -2190,26 +2181,29 @@ fn checked_delete_oid(
     Ok(actual)
 }
 
-struct DeletedRefInfo {
-    oid: Option<ObjectId>,
-}
-
+/// Verify a queued/checked delete may proceed, dying on a precondition
+/// mismatch. Git unlinks the reflog on delete (it never writes a deletion
+/// entry), so this validates only — the peeled OID is no longer plumbed out.
+/// `peeled_oid_for_delete` is still invoked where the precondition requires the
+/// peeled value, so a broken/unpeelable ref is still reported.
 fn verify_delete_precondition(
     store: &FileRefStore,
     name: &str,
     current: Option<&RefTarget>,
     precondition: &RefDeletePrecondition,
-) -> Result<DeletedRefInfo> {
+) -> Result<()> {
     let Some(current) = current else {
         return Err(GitError::Transaction(format!("ref {name} not found")));
     };
     match precondition {
-        RefDeletePrecondition::Any => Ok(DeletedRefInfo {
-            oid: peeled_oid_for_delete(store, current)?,
-        }),
-        RefDeletePrecondition::Immediate(expected) if current == expected => Ok(DeletedRefInfo {
-            oid: peeled_oid_for_delete(store, current)?,
-        }),
+        RefDeletePrecondition::Any => {
+            peeled_oid_for_delete(store, current)?;
+            Ok(())
+        }
+        RefDeletePrecondition::Immediate(expected) if current == expected => {
+            peeled_oid_for_delete(store, current)?;
+            Ok(())
+        }
         RefDeletePrecondition::Immediate(_) => Err(delete_precondition_mismatch(name)),
         RefDeletePrecondition::Direct(expected) => {
             let RefTarget::Direct(actual) = current else {
@@ -2220,12 +2214,12 @@ fn verify_delete_precondition(
             {
                 return Err(delete_precondition_mismatch(name));
             }
-            Ok(DeletedRefInfo { oid: Some(*actual) })
+            Ok(())
         }
         RefDeletePrecondition::Peeled(expected) => {
             let actual = peeled_oid_for_delete(store, current)?;
             if actual == Some(*expected) {
-                Ok(DeletedRefInfo { oid: actual })
+                Ok(())
             } else {
                 Err(delete_precondition_mismatch(name))
             }
@@ -3883,7 +3877,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
-    fn file_ref_store_delete_ref_checked_matching_expected_writes_delete_reflog() {
+    fn file_ref_store_delete_ref_checked_removes_reflog() {
         let git_dir = temp_git_dir();
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let oid = ObjectId::from_hex(
@@ -3891,14 +3885,31 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
         .expect("test operation should succeed");
+        // Create the ref *with* a reflog entry so logs/refs/heads/main exists on
+        // disk; git unlinks that file on delete rather than appending a deletion
+        // entry, so the checked delete must remove it (mirroring delete_ref).
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
             new: RefTarget::Direct(oid),
-            reflog: None,
+            reflog: Some(ReflogEntry {
+                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
+                new_oid: oid,
+                committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
+                message: b"create main".to_vec(),
+            }),
         });
         tx.commit().expect("test operation should succeed");
+        assert!(
+            git_dir
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join("main")
+                .exists(),
+            "reflog file should exist before the checked delete"
+        );
 
         let deleted = store
             .delete_ref_checked(DeleteRef {
@@ -3919,13 +3930,23 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .expect("test operation should succeed"),
             None
         );
-        let log = store
-            .read_reflog("refs/heads/main")
-            .expect("test operation should succeed");
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].old_oid, oid);
-        assert_eq!(log[0].new_oid, ObjectId::null(ObjectFormat::Sha1));
-        assert_eq!(log[0].message, b"delete main");
+        // Git unlinks the reflog on delete: the file is gone and there is no
+        // lingering deletion entry to read back.
+        assert!(
+            !git_dir
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join("main")
+                .exists(),
+            "reflog file should be removed by the checked delete"
+        );
+        assert!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("test operation should succeed")
+                .is_empty()
+        );
         assert!(
             !git_dir
                 .join("refs")
