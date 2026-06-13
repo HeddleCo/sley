@@ -4,6 +4,10 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_options::{
+    CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed, ParsedOption, ParsedValue,
+    UsageError, parse_options,
+};
 
 pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
@@ -5971,102 +5975,211 @@ struct BranchVerboseListOptions {
     verbosity: usize,
 }
 
-fn parse_branch_show_current_options(args: &[String]) -> Result<Option<bool>> {
-    let mut show_current = None;
-    let mut saw_positional = false;
-    let mut end_of_options = false;
-    for arg in args {
-        if end_of_options {
-            saw_positional = true;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => end_of_options = true,
-            "--show-current" => show_current = Some(true),
-            "--no-show-current" => show_current = Some(false),
-            value if value.starts_with("--show-current=") => {
-                branch_option_takes_no_value("show-current")?;
-            }
-            value if value.starts_with("--no-show-current=") => {
-                branch_option_takes_no_value("no-show-current")?;
-            }
-            value if value.starts_with('-') => return Ok(None),
-            _ => saw_positional = true,
+const BRANCH_USAGE_LINES: [&str; 8] = [
+    "git branch [<options>] [-r | -a] [--merged] [--no-merged]",
+    "git branch [<options>] [-f] [--recurse-submodules] <branch-name> [<start-point>]",
+    "git branch [<options>] [-l] [<pattern>...]",
+    "git branch [<options>] [-r] (-d | -D) <branch-name>...",
+    "git branch [<options>] (-m | -M) [<old-branch>] <new-branch>",
+    "git branch [<options>] (-c | -C) [<old-branch>] <new-branch>",
+    "git branch [<options>] [-r | -a] [--points-at]",
+    "git branch [<options>] [-r | -a] [--format]",
+];
+
+fn branch_usage_error(error: UsageError) -> GitError {
+    eprint!("{}", error.render_stderr());
+    GitError::Exit(error.exit_code())
+}
+
+fn branch_error_is_unknown(error: &UsageError) -> bool {
+    error.message().is_some_and(|message| {
+        message.starts_with("unknown option `") || message.starts_with("unknown switch `")
+    })
+}
+
+fn parse_branch_options<'a>(
+    args: &'a [String],
+    specs: &'a [OptionSpec<'a>],
+) -> Result<Option<Parsed<'a>>> {
+    match parse_options(args, specs, &BRANCH_USAGE_LINES) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(error) if branch_error_is_unknown(&error) => Ok(None),
+        Err(error) => Err(branch_usage_error(error)),
+    }
+}
+
+fn branch_option_bool(option: &ParsedOption<'_>) -> Option<bool> {
+    match option.value {
+        ParsedValue::Bool(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn branch_positionals(parsed: &Parsed<'_>) -> Vec<String> {
+    parsed
+        .positionals
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn parse_branch_track_value(
+    value: CallbackValue<'_>,
+) -> std::result::Result<Option<String>, String> {
+    if value.unset {
+        return Ok(Some("never".into()));
+    }
+    match value.value.unwrap_or("direct") {
+        "direct" => Ok(Some("direct".into())),
+        "inherit" => Ok(Some("inherit".into())),
+        _ => {
+            let option = match value.option {
+                OptionName::Short(short) => format!("-{short}"),
+                OptionName::Long(long) | OptionName::NegatedLong(long) => format!("--{long}"),
+            };
+            Err(format!(
+                "option `{option}' expects \"direct\" or \"inherit\""
+            ))
         }
     }
+}
+
+fn branch_track_mode(value: &str) -> BranchTrackMode {
+    match value {
+        "inherit" => BranchTrackMode::Inherit,
+        "never" => BranchTrackMode::Never,
+        _ => BranchTrackMode::Direct,
+    }
+}
+
+#[rustfmt::skip]
+macro_rules! branch_bool_option {
+    ($short:expr, $long:expr, $flags:expr, $help:expr) => { OptionSpec { short: $short, long: $long, value: OptValue::Bool, flags: $flags, help: $help } };
+}
+
+#[rustfmt::skip]
+macro_rules! branch_str_option {
+    ($short:expr, $long:expr, $metavar:expr, $flags:expr, $help:expr) => { OptionSpec { short: $short, long: $long, value: OptValue::Str($metavar), flags: $flags, help: $help } };
+}
+
+#[rustfmt::skip]
+macro_rules! branch_track_option {
+    () => { OptionSpec { short: Some('t'), long: Some("track"), value: OptValue::Callback { metavar: Some("(direct|inherit)"), parse: parse_branch_track_value }, flags: OptFlags::OPTARG, help: "set branch tracking configuration" } };
+}
+
+#[rustfmt::skip]
+fn branch_option_specs() -> [OptionSpec<'static>; 25] {
+    [
+        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
+        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
+        branch_track_option!(),
+        branch_bool_option!(None, Some("unset-upstream"), OptFlags::NONE, "unset the upstream info"),
+        branch_str_option!(None, Some("color"), "when", OptFlags::OPTARG, "use colored output"),
+        branch_bool_option!(Some('r'), Some("remotes"), OptFlags::NONEG, "act on remote-tracking branches"),
+        branch_str_option!(None, Some("abbrev"), "n", OptFlags::OPTARG, "use <n> digits to display object names"),
+        branch_bool_option!(Some('a'), Some("all"), OptFlags::NONEG, "list both remote-tracking and local branches"),
+        branch_bool_option!(Some('d'), Some("delete"), OptFlags::NONE, "delete fully merged branch"),
+        branch_bool_option!(Some('D'), None, OptFlags::NONE, "delete branch (even if not merged)"),
+        branch_bool_option!(Some('m'), Some("move"), OptFlags::NONE, "move/rename a branch and its reflog"),
+        branch_bool_option!(Some('M'), None, OptFlags::NONE, "move/rename a branch, even if target exists"),
+        branch_bool_option!(None, Some("omit-empty"), OptFlags::NONE, "do not output a newline after empty formatted refs"),
+        branch_bool_option!(Some('c'), Some("copy"), OptFlags::NONE, "copy a branch and its reflog"),
+        branch_bool_option!(Some('C'), None, OptFlags::NONE, "copy a branch, even if target exists"),
+        branch_bool_option!(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
+        branch_bool_option!(None, Some("show-current"), OptFlags::NONE, "show current branch name"),
+        branch_bool_option!(None, Some("create-reflog"), OptFlags::NONE, "create the branch's reflog"),
+        branch_bool_option!(None, Some("edit-description"), OptFlags::NONE, "edit the description for the branch"),
+        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
+        branch_str_option!(None, Some("column"), "style", OptFlags::OPTARG, "list branches in columns"),
+        branch_str_option!(None, Some("sort"), "key", OptFlags::NONE, "field name to sort on"),
+        branch_bool_option!(Some('i'), Some("ignore-case"), OptFlags::NONE, "sorting and filtering are case insensitive"),
+        branch_bool_option!(None, Some("recurse-submodules"), OptFlags::NONE, "recurse through submodules"),
+        branch_str_option!(None, Some("format"), "format", OptFlags::NONE, "format to use for the output"),
+    ]
+}
+
+fn parse_branch_show_current_options(args: &[String]) -> Result<Option<bool>> {
+    let specs = branch_option_specs();
+    let Some(parsed) = parse_branch_options(args, &specs)? else {
+        return Ok(None);
+    };
+    let show_current = parsed
+        .options
+        .iter()
+        .filter(|option| option.long == Some("show-current"))
+        .filter_map(branch_option_bool)
+        .next_back();
+    let has_other_options = parsed
+        .options
+        .iter()
+        .any(|option| option.long != Some("show-current"));
     match show_current {
         Some(true) => Ok(Some(true)),
-        Some(false) if !saw_positional => Ok(Some(false)),
+        Some(false) if parsed.positionals.is_empty() && !has_other_options => Ok(Some(false)),
         _ => Ok(None),
     }
 }
 
+#[rustfmt::skip]
+fn branch_verbose_list_option_specs() -> [OptionSpec<'static>; 11] {
+    [
+        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
+        branch_bool_option!(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
+        branch_bool_option!(None, Some("no-delete"), OptFlags::NONEG, "do not delete branches"),
+        branch_bool_option!(None, Some("show-current"), OptFlags::NONE, "show current branch name"),
+        branch_bool_option!(Some('r'), Some("remotes"), OptFlags::NONEG, "act on remote-tracking branches"),
+        branch_bool_option!(Some('a'), Some("all"), OptFlags::NONEG, "list both remote-tracking and local branches"),
+        branch_bool_option!(Some('i'), Some("ignore-case"), OptFlags::NONE, "sorting and filtering are case insensitive"),
+        branch_str_option!(None, Some("color"), "when", OptFlags::OPTARG, "use colored output"),
+        branch_str_option!(None, Some("column"), "style", OptFlags::OPTARG, "list branches in columns"),
+        branch_str_option!(None, Some("abbrev"), "n", OptFlags::OPTARG, "use <n> digits to display object names"),
+        branch_str_option!(None, Some("sort"), "key", OptFlags::NONE, "field name to sort on"),
+    ]
+}
+
 fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVerboseListOptions>> {
-    let mut saw_verbose = false;
     let mut verbosity = 0usize;
     let mut explicit_list = false;
     let mut mode = BranchListMode::Local;
     let mut ignore_case = false;
-    let mut patterns = Vec::new();
-    let mut end_of_options = false;
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if end_of_options {
-            if explicit_list || matches!(mode, BranchListMode::Remote | BranchListMode::All) {
-                patterns.push(arg.to_string());
-                continue;
-            }
-            return Ok(None);
-        }
-        match arg.as_str() {
-            "--" => end_of_options = true,
-            "-v" | "--verbose" => {
+    let mut saw_verbose = false;
+    let specs = branch_verbose_list_option_specs();
+    let Some(parsed) = parse_branch_options(args, &specs)? else {
+        return Ok(None);
+    };
+    for option in &parsed.options {
+        match option.long {
+            Some("verbose") => {
                 saw_verbose = true;
-                verbosity = verbosity.saturating_add(1);
-            }
-            "-vv" => {
-                saw_verbose = true;
-                verbosity = verbosity.saturating_add(2);
-            }
-            "--no-verbose" => {
-                saw_verbose = true;
-                verbosity = 0;
-            }
-            "--list" | "-l" => explicit_list = true,
-            "--no-list" | "--no-delete" | "--no-show-current" => {}
-            "-r" | "--remotes" => mode = BranchListMode::Remote,
-            "-a" | "--all" => mode = BranchListMode::All,
-            "-i" | "--ignore-case" => ignore_case = true,
-            "--no-ignore-case" => ignore_case = false,
-            "--color" | "--color=always" | "--color=never" | "--color=auto" | "--no-color" => {}
-            "--no-column" | "--column=auto" | "--column=never" | "--column=plain" => {}
-            "--abbrev" | "--no-abbrev" => {}
-            "--sort" => {
-                let Some(_) = iter.next() else {
-                    return Err(GitError::Command("branch --sort requires a value".into()));
-                };
-            }
-            "--no-sort" => {}
-            value if value.starts_with("--sort=") => {}
-            value if value.starts_with("--abbrev=") => {}
-            value if value.starts_with("--column=") => {}
-            value if value.starts_with("--color=") => {}
-            value if value.starts_with('-') => return Ok(None),
-            value => {
-                if explicit_list || matches!(mode, BranchListMode::Remote | BranchListMode::All) {
-                    patterns.push(value.to_string());
+                if branch_option_bool(option).unwrap_or(true) {
+                    verbosity = verbosity.saturating_add(1);
                 } else {
-                    return Ok(None);
+                    verbosity = 0;
                 }
             }
+            Some("list") => {
+                if branch_option_bool(option).unwrap_or(true) {
+                    explicit_list = true;
+                }
+            }
+            Some("remotes") => mode = BranchListMode::Remote,
+            Some("all") => mode = BranchListMode::All,
+            Some("ignore-case") => ignore_case = branch_option_bool(option).unwrap_or(true),
+            _ => {}
         }
     }
     if !saw_verbose {
         return Ok(None);
     }
+    if !explicit_list
+        && !matches!(mode, BranchListMode::Remote | BranchListMode::All)
+        && !parsed.positionals.is_empty()
+    {
+        return Ok(None);
+    }
     Ok(Some(BranchVerboseListOptions {
         mode,
-        patterns,
+        patterns: branch_positionals(&parsed),
         ignore_case,
         verbosity,
     }))
@@ -6101,64 +6214,57 @@ struct BranchMoveOptions {
     branches: Vec<String>,
 }
 
+#[rustfmt::skip]
+fn branch_move_option_specs() -> [OptionSpec<'static>; 6] {
+    [
+        branch_bool_option!(Some('m'), Some("move"), OptFlags::NONE, "move/rename a branch and its reflog"),
+        branch_bool_option!(Some('M'), None, OptFlags::NONE, "move/rename a branch, even if target exists"),
+        branch_bool_option!(Some('c'), Some("copy"), OptFlags::NONE, "copy a branch and its reflog"),
+        branch_bool_option!(Some('C'), None, OptFlags::NONE, "copy a branch, even if target exists"),
+        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
+        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
+    ]
+}
+
 fn parse_branch_move_options(args: &[String]) -> Result<Option<BranchMoveOptions>> {
     let mut kind = None;
     let mut force = false;
-    let mut branches = Vec::new();
-    let mut end_of_options = false;
-    for arg in args {
-        if end_of_options {
-            branches.push(arg.to_string());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => end_of_options = true,
-            "-m" | "--move" => kind = Some(BranchMoveKind::Rename),
-            "-M" => {
+    let specs = branch_move_option_specs();
+    let Some(parsed) = parse_branch_options(args, &specs)? else {
+        return Ok(None);
+    };
+    for option in &parsed.options {
+        match (option.short, option.long) {
+            (Some('m'), _) | (_, Some("move")) => {
+                if branch_option_bool(option).unwrap_or(true) {
+                    kind = Some(BranchMoveKind::Rename);
+                } else {
+                    kind = None;
+                }
+            }
+            (Some('M'), _) => {
                 kind = Some(BranchMoveKind::Rename);
                 force = true;
             }
-            "-c" | "--copy" => kind = Some(BranchMoveKind::Copy),
-            "-C" => {
+            (Some('c'), _) | (_, Some("copy")) => {
+                if branch_option_bool(option).unwrap_or(true) {
+                    kind = Some(BranchMoveKind::Copy);
+                } else {
+                    kind = None;
+                }
+            }
+            (Some('C'), _) => {
                 kind = Some(BranchMoveKind::Copy);
                 force = true;
             }
-            "-f" | "--force" => force = true,
-            "--no-force" => force = false,
-            "--no-move" | "--no-copy" => kind = None,
-            "-q" | "--quiet" | "--no-quiet" => {}
-            value if value.starts_with("--move=") => {
-                branch_option_takes_no_value("move")?;
-            }
-            value if value.starts_with("--no-move=") => {
-                branch_option_takes_no_value("no-move")?;
-            }
-            value if value.starts_with("--copy=") => {
-                branch_option_takes_no_value("copy")?;
-            }
-            value if value.starts_with("--no-copy=") => {
-                branch_option_takes_no_value("no-copy")?;
-            }
-            value if value.starts_with("--force=") => {
-                branch_option_takes_no_value("force")?;
-            }
-            value if value.starts_with("--no-force=") => {
-                branch_option_takes_no_value("no-force")?;
-            }
-            value if value.starts_with("--quiet=") => {
-                branch_option_takes_no_value("quiet")?;
-            }
-            value if value.starts_with("--no-quiet=") => {
-                branch_option_takes_no_value("no-quiet")?;
-            }
-            value if value.starts_with('-') => return Ok(None),
-            value => branches.push(value.to_string()),
+            (_, Some("force")) => force = branch_option_bool(option).unwrap_or(true),
+            _ => {}
         }
     }
     Ok(kind.map(|kind| BranchMoveOptions {
         kind,
         force,
-        branches,
+        branches: branch_positionals(&parsed),
     }))
 }
 
@@ -6343,54 +6449,46 @@ struct BranchUpstreamOptions {
     branches: Vec<String>,
 }
 
+#[rustfmt::skip]
+fn branch_upstream_option_specs() -> [OptionSpec<'static>; 3] {
+    [
+        branch_bool_option!(None, Some("set-upstream"), OptFlags::NONE, "set upstream for git pull/status"),
+        branch_str_option!(Some('u'), Some("set-upstream-to"), "upstream", OptFlags::NONE, "change the upstream info"),
+        branch_bool_option!(None, Some("unset-upstream"), OptFlags::NONE, "unset the upstream info"),
+    ]
+}
+
 fn parse_branch_upstream_options(args: &[String]) -> Result<Option<BranchUpstreamOptions>> {
     let mut action = None;
-    let mut branches = Vec::new();
-    let mut end_of_options = false;
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if end_of_options {
-            branches.push(arg.to_string());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => end_of_options = true,
-            "-u" | "--set-upstream-to" => {
-                let Some(value) = iter.next() else {
-                    if arg == "-u" {
-                        eprintln!("error: switch `u' requires a value");
-                    } else {
-                        eprintln!("error: option `set-upstream-to' requires a value");
-                    }
-                    return Err(GitError::Exit(129));
-                };
-                action = Some(BranchUpstreamAction::Set(value.to_string()));
+    let specs = branch_upstream_option_specs();
+    let Some(parsed) = parse_branch_options(args, &specs)? else {
+        return Ok(None);
+    };
+    for option in &parsed.options {
+        match option.long {
+            Some("set-upstream-to") => match option.value {
+                ParsedValue::Str(_) if matches!(option.name, OptionName::NegatedLong(_)) => {
+                    action = None;
+                }
+                ParsedValue::Str(value) => {
+                    action = Some(BranchUpstreamAction::Set(value.to_string()));
+                }
+                _ => {}
+            },
+            Some("unset-upstream") => {
+                if branch_option_bool(option).unwrap_or(true) {
+                    action = Some(BranchUpstreamAction::Unset);
+                } else {
+                    action = None;
+                }
             }
-            "--no-set-upstream-to" => action = None,
-            "--unset-upstream" => action = Some(BranchUpstreamAction::Unset),
-            "--no-unset-upstream" => action = None,
-            value if value.starts_with("--set-upstream-to=") => {
-                action = Some(BranchUpstreamAction::Set(
-                    value["--set-upstream-to=".len()..].to_string(),
-                ));
-            }
-            value if value.starts_with("--no-set-upstream-to=") => {
-                branch_option_takes_no_value("no-set-upstream-to")?;
-            }
-            value if value.starts_with("--unset-upstream=") => {
-                branch_option_takes_no_value("unset-upstream")?;
-            }
-            value if value.starts_with("--no-unset-upstream=") => {
-                branch_option_takes_no_value("no-unset-upstream")?;
-            }
-            value if value.starts_with("-u") && value.len() > 2 => {
-                action = Some(BranchUpstreamAction::Set(value[2..].to_string()));
-            }
-            value if value.starts_with('-') => return Ok(None),
-            value => branches.push(value.to_string()),
+            _ => {}
         }
     }
-    Ok(action.map(|action| BranchUpstreamOptions { action, branches }))
+    Ok(action.map(|action| BranchUpstreamOptions {
+        action,
+        branches: branch_positionals(&parsed),
+    }))
 }
 
 fn run_branch_upstream_options(
@@ -6621,113 +6719,31 @@ fn parse_branch_create_options(args: &[String]) -> Result<Option<BranchCreateOpt
     let mut recurse_submodules = false;
     let mut legacy_set_upstream = false;
     let mut edit_description = false;
-    let mut positionals = Vec::new();
-    let mut end_of_options = false;
-    let mut saw_separator = false;
-
-    for arg in args {
-        if end_of_options {
-            positionals.push(arg.to_string());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => {
-                saw_separator = true;
-                end_of_options = true;
+    let saw_separator = args.iter().any(|arg| arg == "--");
+    let specs = branch_create_option_specs();
+    let Some(parsed) = parse_branch_options(args, &specs)? else {
+        return Ok(None);
+    };
+    for option in &parsed.options {
+        saw_create_option = true;
+        match option.long {
+            Some("force") => force = branch_option_bool(option).unwrap_or(true),
+            Some("quiet") => quiet = branch_option_bool(option).unwrap_or(true),
+            Some("track") => {
+                if let ParsedValue::Callback(Some(value)) = &option.value {
+                    track = Some(branch_track_mode(value));
+                }
             }
-            "-f" | "--force" => {
-                saw_create_option = true;
-                force = true;
+            Some("recurse-submodules") => {
+                recurse_submodules = branch_option_bool(option).unwrap_or(true);
             }
-            "--no-force" => {
-                saw_create_option = true;
-                force = false;
+            Some("set-upstream") => {
+                legacy_set_upstream = branch_option_bool(option).unwrap_or(true);
             }
-            "-q" | "--quiet" => {
-                saw_create_option = true;
-                quiet = true;
+            Some("edit-description") => {
+                edit_description = branch_option_bool(option).unwrap_or(true);
             }
-            "--no-quiet" => {
-                saw_create_option = true;
-                quiet = false;
-            }
-            "-t" | "--track" => {
-                saw_create_option = true;
-                track = Some(BranchTrackMode::Direct);
-            }
-            "--track=direct" => {
-                saw_create_option = true;
-                track = Some(BranchTrackMode::Direct);
-            }
-            "--track=inherit" => {
-                saw_create_option = true;
-                track = Some(BranchTrackMode::Inherit);
-            }
-            "--no-track" => {
-                saw_create_option = true;
-                track = Some(BranchTrackMode::Never);
-            }
-            "--recurse-submodules" => {
-                saw_create_option = true;
-                recurse_submodules = true;
-            }
-            "--no-recurse-submodules" => {
-                saw_create_option = true;
-                recurse_submodules = false;
-            }
-            "--set-upstream" => {
-                saw_create_option = true;
-                legacy_set_upstream = true;
-            }
-            "--no-set-upstream" => {
-                saw_create_option = true;
-                legacy_set_upstream = false;
-            }
-            "--edit-description" => {
-                saw_create_option = true;
-                edit_description = true;
-            }
-            "--no-edit-description" => {
-                saw_create_option = true;
-                edit_description = false;
-            }
-            "--create-reflog" | "--no-create-reflog" | "-v" | "--verbose" | "--no-verbose" => {
-                saw_create_option = true;
-            }
-            value if value.starts_with("--track=") => {
-                eprintln!("error: option `track' expects \"direct\" or \"inherit\"");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-track=") => {
-                eprintln!("error: option `no-track' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--recurse-submodules=") => {
-                eprintln!("error: option `recurse-submodules' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-recurse-submodules=") => {
-                eprintln!("error: option `no-recurse-submodules' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--set-upstream=") => {
-                eprintln!("error: option `set-upstream' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-set-upstream=") => {
-                eprintln!("error: option `no-set-upstream' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--edit-description=") => {
-                eprintln!("error: option `edit-description' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-edit-description=") => {
-                eprintln!("error: option `no-edit-description' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with('-') => return Ok(None),
-            value => positionals.push(value.to_string()),
+            _ => {}
         }
     }
 
@@ -6739,9 +6755,23 @@ fn parse_branch_create_options(args: &[String]) -> Result<Option<BranchCreateOpt
             recurse_submodules,
             legacy_set_upstream,
             edit_description,
-            positionals,
+            positionals: branch_positionals(&parsed),
         }),
     )
+}
+
+#[rustfmt::skip]
+fn branch_create_option_specs() -> [OptionSpec<'static>; 8] {
+    [
+        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
+        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
+        branch_track_option!(),
+        branch_bool_option!(None, Some("recurse-submodules"), OptFlags::NONE, "recurse through submodules"),
+        branch_bool_option!(None, Some("set-upstream"), OptFlags::NONE, "set upstream for git pull/status"),
+        branch_bool_option!(None, Some("edit-description"), OptFlags::NONE, "edit the description for the branch"),
+        branch_bool_option!(None, Some("create-reflog"), OptFlags::NONE, "create the branch's reflog"),
+        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
+    ]
 }
 
 fn run_branch_create_options(
@@ -7281,89 +7311,26 @@ fn parse_branch_delete_options(args: &[String]) -> Result<Option<BranchDeleteOpt
     let mut force = false;
     let mut quiet = false;
     let mut mode = BranchDeleteMode::Local;
-    let mut branches = Vec::new();
-    let mut end_of_options = false;
-
-    for arg in args {
-        if end_of_options {
-            branches.push(arg.to_string());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => end_of_options = true,
-            "-d" | "--delete" => {
+    let specs = branch_delete_option_specs();
+    let Some(parsed) = parse_branch_options(args, &specs)? else {
+        return Ok(None);
+    };
+    for option in &parsed.options {
+        match (option.short, option.long) {
+            (Some('d'), _) | (_, Some("delete")) => {
                 saw_delete_option = true;
-                delete = true;
+                delete = branch_option_bool(option).unwrap_or(true);
             }
-            "--no-delete" => {
-                saw_delete_option = true;
-                delete = false;
-            }
-            "-D" => {
+            (Some('D'), _) => {
                 saw_delete_option = true;
                 delete = true;
                 force = true;
             }
-            "-f" | "--force" => force = true,
-            "--no-force" => force = false,
-            "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => quiet = false,
-            "-v" | "--verbose" | "--no-verbose" => {}
-            "-r" | "--remotes" => mode = BranchDeleteMode::Remote,
-            "-a" | "--all" => mode = BranchDeleteMode::All,
-            value if value.starts_with("--delete=") => {
-                branch_option_takes_no_value("delete")?;
-            }
-            value if value.starts_with("--no-delete=") => {
-                branch_option_takes_no_value("no-delete")?;
-            }
-            value if value.starts_with("--force=") => {
-                branch_option_takes_no_value("force")?;
-            }
-            value if value.starts_with("--no-force=") => {
-                branch_option_takes_no_value("no-force")?;
-            }
-            value if value.starts_with("--quiet=") => {
-                branch_option_takes_no_value("quiet")?;
-            }
-            value if value.starts_with("--no-quiet=") => {
-                branch_option_takes_no_value("no-quiet")?;
-            }
-            value if value.starts_with("--verbose=") => {
-                branch_option_takes_no_value("verbose")?;
-            }
-            value if value.starts_with("--no-verbose=") => {
-                branch_option_takes_no_value("no-verbose")?;
-            }
-            value if value.starts_with("--remotes=") => {
-                branch_option_takes_no_value("remotes")?;
-            }
-            value if value.starts_with("--all=") => {
-                branch_option_takes_no_value("all")?;
-            }
-            value if value.starts_with('-') && !value.starts_with("--") => {
-                for option in value[1..].chars() {
-                    match option {
-                        'd' => {
-                            saw_delete_option = true;
-                            delete = true;
-                        }
-                        'D' => {
-                            saw_delete_option = true;
-                            delete = true;
-                            force = true;
-                        }
-                        'f' => force = true,
-                        'q' => quiet = true,
-                        'v' => {}
-                        'r' => mode = BranchDeleteMode::Remote,
-                        'a' => mode = BranchDeleteMode::All,
-                        _ => return Ok(None),
-                    }
-                }
-            }
-            value if value.starts_with('-') => return Ok(None),
-            value => branches.push(value.to_string()),
+            (_, Some("force")) => force = branch_option_bool(option).unwrap_or(true),
+            (_, Some("quiet")) => quiet = branch_option_bool(option).unwrap_or(true),
+            (Some('r'), _) | (_, Some("remotes")) => mode = BranchDeleteMode::Remote,
+            (Some('a'), _) | (_, Some("all")) => mode = BranchDeleteMode::All,
+            _ => {}
         }
     }
 
@@ -7372,14 +7339,22 @@ fn parse_branch_delete_options(args: &[String]) -> Result<Option<BranchDeleteOpt
             force,
             quiet,
             mode,
-            branches,
+            branches: branch_positionals(&parsed),
         }),
     )
 }
 
-fn branch_option_takes_no_value<T>(option: &str) -> Result<T> {
-    eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
+#[rustfmt::skip]
+fn branch_delete_option_specs() -> [OptionSpec<'static>; 7] {
+    [
+        branch_bool_option!(Some('d'), Some("delete"), OptFlags::NONE, "delete fully merged branch"),
+        branch_bool_option!(Some('D'), None, OptFlags::NONE, "delete branch (even if not merged)"),
+        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
+        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
+        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
+        branch_bool_option!(Some('r'), Some("remotes"), OptFlags::NONEG, "act on remote-tracking branches"),
+        branch_bool_option!(Some('a'), Some("all"), OptFlags::NONEG, "list both remote-tracking and local branches"),
+    ]
 }
 
 /// If `name` is a symbolic ref, delete the symref itself (not its target),

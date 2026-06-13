@@ -240,7 +240,7 @@ pub fn usage_with_options(specs: &[OptionSpec<'_>], usage: &[&str]) -> String {
                 option.push_str(", ");
             }
             option.push_str("--");
-            if spec.value.is_bool() && !spec.flags.contains(OptFlags::NONEG) {
+            if spec.value.allows_negation() && !spec.flags.contains(OptFlags::NONEG) {
                 option.push_str("[no-]");
             }
             option.push_str(long);
@@ -370,6 +370,18 @@ impl<'a> Parser<'a> {
     }
 
     fn resolve_long(&self, arg_name: &'a str) -> Result<Option<ResolvedLong<'a>>, UsageError> {
+        for (spec_index, spec) in self.specs.iter().enumerate() {
+            let Some(long) = spec.long else {
+                continue;
+            };
+            if long == arg_name {
+                return Ok(Some(ResolvedLong {
+                    spec_index,
+                    name: OptionName::Long(long),
+                }));
+            }
+        }
+
         let mut name = arg_name;
         let mut unset = false;
         let mut no_no = false;
@@ -391,7 +403,8 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if long == name {
-                if unset && (!spec.value.is_bool() || spec.flags.contains(OptFlags::NONEG)) {
+                if unset && (!spec.value.allows_negation() || spec.flags.contains(OptFlags::NONEG))
+                {
                     return Ok(None);
                 }
                 return Ok(Some(ResolvedLong {
@@ -414,7 +427,8 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if long.starts_with(name) {
-                if unset && (!spec.value.is_bool() || spec.flags.contains(OptFlags::NONEG)) {
+                if unset && (!spec.value.allows_negation() || spec.flags.contains(OptFlags::NONEG))
+                {
                     continue;
                 }
                 matches.push(ResolvedLong {
@@ -596,8 +610,8 @@ impl OptionName<'_> {
 }
 
 impl<'a> OptValue<'a> {
-    const fn is_bool(self) -> bool {
-        matches!(self, Self::Bool)
+    const fn allows_negation(self) -> bool {
+        matches!(self, Self::Bool | Self::Str(_) | Self::Callback { .. })
     }
 
     const fn expects_value(self) -> bool {
@@ -728,6 +742,76 @@ mod tests {
         let argv = args(&["--quiet", "--no-quiet"]);
         let parsed = parse(&argv, &specs).expect("parse");
         assert!(!parsed.last_bool("quiet", true));
+    }
+
+    #[test]
+    fn negated_string_option_records_empty_value_without_consuming_next_arg() {
+        let specs = [OptionSpec {
+            short: None,
+            long: Some("sort"),
+            value: OptValue::Str("key"),
+            flags: OptFlags::NONE,
+            help: "sort key",
+        }];
+        let argv = args(&["--no-sort", "topic"]);
+        let parsed = parse(&argv, &specs).expect("parse");
+        assert_eq!(parsed.last_str("sort"), Some(""));
+        assert_eq!(parsed.positionals, ["topic"]);
+    }
+
+    #[test]
+    fn callback_option_receives_negation() {
+        fn parse_track(value: CallbackValue<'_>) -> Result<Option<String>, String> {
+            if value.unset {
+                Ok(Some("never".into()))
+            } else {
+                Ok(Some(value.value.unwrap_or("direct").into()))
+            }
+        }
+
+        let specs = [OptionSpec {
+            short: Some('t'),
+            long: Some("track"),
+            value: OptValue::Callback {
+                metavar: Some("(direct|inherit)"),
+                parse: parse_track,
+            },
+            flags: OptFlags::OPTARG,
+            help: "tracking mode",
+        }];
+        let argv = args(&["--track=inherit", "--no-track"]);
+        let parsed = parse(&argv, &specs).expect("parse");
+        assert_eq!(
+            parsed.options.last().map(|option| &option.value),
+            Some(&ParsedValue::Callback(Some("never".into())))
+        );
+    }
+
+    #[test]
+    fn exact_no_prefixed_option_wins_before_negation() {
+        let specs = [
+            OptionSpec {
+                short: None,
+                long: Some("contains"),
+                value: OptValue::Str("commit"),
+                flags: OptFlags::NONEG,
+                help: "contains",
+            },
+            OptionSpec {
+                short: None,
+                long: Some("no-contains"),
+                value: OptValue::Str("commit"),
+                flags: OptFlags::NONEG,
+                help: "does not contain",
+            },
+        ];
+        let argv = args(&["--no-contains", "HEAD"]);
+        let parsed = parse(&argv, &specs).expect("parse");
+        assert_eq!(
+            parsed.options.last().map(|option| option.long),
+            Some(Some("no-contains"))
+        );
+        assert_eq!(parsed.last_str("no-contains"), Some("HEAD"));
     }
 
     #[test]
