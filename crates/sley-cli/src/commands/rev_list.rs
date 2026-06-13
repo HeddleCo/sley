@@ -53,7 +53,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
     let mut regexp_mode = SimpleLogRegexMode::Basic;
-    let mut date_mode = ForEachRefDateMode::Default;
+    let mut date_mode = DateMode::Default;
     let mut positional_only = false;
     let mut not = false;
     let mut pathspecs: Vec<String> = Vec::new();
@@ -908,7 +908,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         marker: '>',
                         dialect: LogFormatDialect::RevList,
                         source: None,
-                        date_mode,
+                        date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
                         color: false,
@@ -1164,7 +1164,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         marker: left_right_prefix,
                         dialect: LogFormatDialect::RevList,
                         source: None,
-                        date_mode,
+                        date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
                         color: false,
@@ -1243,7 +1243,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         marker: left_right_prefix,
                         dialect: LogFormatDialect::RevList,
                         source: None,
-                        date_mode,
+                        date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
                         color: false,
@@ -1264,7 +1264,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 timestamp,
                 parents,
                 decorations: &decorations,
-                date_mode,
+                date_mode: &date_mode,
             },
         )?;
     }
@@ -1411,7 +1411,7 @@ struct RevListBoundaryOptions<'a> {
     timestamp: bool,
     parents: bool,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
-    date_mode: ForEachRefDateMode,
+    date_mode: &'a DateMode,
 }
 
 fn write_rev_list_boundary_record(

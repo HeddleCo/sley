@@ -1290,7 +1290,7 @@ fn refer_to_commit(
     let object = db.read_object(oid)?;
     let commit = Commit::parse(ctx.format, &object.body)?;
     let subject = commit_subject(&commit.message);
-    let date = commit_identity_date(&commit.author, ForEachRefDateMode::Short);
+    let date = commit_identity_date(&commit.author, &DateMode::Short);
     Ok(format!(
         "{} ({subject}, {date})",
         format_log_abbrev_oid(oid)

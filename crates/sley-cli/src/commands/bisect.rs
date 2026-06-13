@@ -2022,7 +2022,7 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
     writeln!(
         out,
         "Date:   {}",
-        commit_identity_date(&commit.author, ForEachRefDateMode::Default)
+        commit_identity_date(&commit.author, &DateMode::Default)
     )?;
     writeln!(out)?;
     for line in String::from_utf8_lossy(&commit.message).lines() {

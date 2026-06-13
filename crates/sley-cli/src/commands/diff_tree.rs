@@ -570,7 +570,7 @@ fn diff_tree_header_text(
             ));
             text.push_str(&format!(
                 "Date:   {}\n",
-                commit_identity_date(&commit.author, ForEachRefDateMode::Default)
+                commit_identity_date(&commit.author, &DateMode::Default)
             ));
             text.push('\n');
             for line in String::from_utf8_lossy(&commit.message).lines() {

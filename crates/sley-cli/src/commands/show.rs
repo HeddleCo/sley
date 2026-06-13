@@ -90,7 +90,7 @@ struct ShowOptions {
     /// Copy similarity threshold.
     copy_threshold: u8,
     /// Date rendering mode for the `Date:` line and `%ad`/`%cd`.
-    date_mode: ForEachRefDateMode,
+    date_mode: DateMode,
     /// Ref decoration mode for the `commit` header and `%d`/`%D`. `git show`
     /// defaults to off; `--decorate`/`--decorate=<mode>` enables it.
     decorate: LogDecorationMode,
@@ -141,7 +141,7 @@ impl Default for ShowOptions {
             find_copies_harder: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            date_mode: ForEachRefDateMode::Default,
+            date_mode: DateMode::Default,
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
@@ -363,7 +363,7 @@ fn show_commit(
             writeln!(
                 stdout,
                 "Date:   {}",
-                commit_identity_date(&commit.author, options.date_mode)
+                commit_identity_date(&commit.author, &options.date_mode)
             )?;
             writeln!(stdout)?;
             for line in String::from_utf8_lossy(&commit.message).lines() {
@@ -402,7 +402,7 @@ fn show_commit(
                     marker: '>',
                     dialect: LogFormatDialect::Log,
                     source: None,
-                    date_mode: options.date_mode,
+                    date_mode: &options.date_mode,
                     source_oid: None,
                     describe: None,
                     color: false,
@@ -762,7 +762,7 @@ fn show_tag_header(
     writeln!(stdout, "tag {}", String::from_utf8_lossy(&tag.name))?;
     if let Some(tagger) = &tag.tagger {
         writeln!(stdout, "Tagger: {}", commit_author_identity(tagger))?;
-        let date = commit_identity_date(tagger, ForEachRefDateMode::Default);
+        let date = commit_identity_date(tagger, &DateMode::Default);
         if !date.is_empty() {
             writeln!(stdout, "Date:   {date}")?;
         }
@@ -1090,7 +1090,7 @@ fn show_parse_similarity(value: &str) -> Result<u8> {
 
 /// Translate a `--date=<mode>` value into the shared date renderer's mode. Mirrors
 /// the subset of formats `git log --date=` supports that map onto
-/// [`ForEachRefDateMode`].
-fn show_date_mode(value: &str) -> Result<ForEachRefDateMode> {
+/// [`DateMode`].
+fn show_date_mode(value: &str) -> Result<DateMode> {
     log_date_mode(value)
 }

@@ -7,6 +7,353 @@ use std::str::FromStr;
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.54.0";
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum DateMode {
+    #[default]
+    Default,
+    Local,
+    Raw,
+    RawLocal,
+    Unix,
+    Short,
+    ShortLocal,
+    Iso,
+    IsoLocal,
+    IsoStrict,
+    IsoStrictLocal,
+    Rfc2822,
+    Rfc2822Local,
+    Relative,
+    Human,
+    HumanLocal,
+    Strftime {
+        template: String,
+        local: bool,
+    },
+}
+
+impl DateMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        if let Some(template) = value.strip_prefix("format:") {
+            return Some(Self::Strftime {
+                template: template.to_string(),
+                local: false,
+            });
+        }
+        if let Some(template) = value.strip_prefix("format-local:") {
+            return Some(Self::Strftime {
+                template: template.to_string(),
+                local: true,
+            });
+        }
+        if value == "tformat:" || value.starts_with("tformat:") {
+            return Some(Self::Strftime {
+                template: value["tformat:".len()..].to_string(),
+                local: false,
+            });
+        }
+        if value == "auto:" || value.starts_with("auto:") {
+            return Some(Self::Default);
+        }
+        Some(match value {
+            "default" => Self::Default,
+            "default-local" | "local" => Self::Local,
+            "raw" => Self::Raw,
+            "raw-local" => Self::RawLocal,
+            "unix" => Self::Unix,
+            "short" => Self::Short,
+            "short-local" => Self::ShortLocal,
+            "iso" | "iso8601" => Self::Iso,
+            "iso-local" | "iso8601-local" => Self::IsoLocal,
+            "iso-strict" | "iso8601-strict" => Self::IsoStrict,
+            "iso-strict-local" | "iso8601-strict-local" => Self::IsoStrictLocal,
+            "rfc" | "rfc2822" => Self::Rfc2822,
+            "rfc-local" | "rfc2822-local" => Self::Rfc2822Local,
+            "relative" | "relative-local" => Self::Relative,
+            "human" => Self::Human,
+            "human-local" => Self::HumanLocal,
+            _ => return None,
+        })
+    }
+
+    pub fn parse_atom_modifier(modifier: Option<&str>) -> Option<Self> {
+        modifier.map_or(Some(Self::Default), Self::parse)
+    }
+
+    pub fn render(&self, timestamp: i64, timezone: &str) -> Option<String> {
+        let tz = if self.is_local() { "+0000" } else { timezone };
+        let parts = DateParts::from_timestamp(timestamp, tz)?;
+        Some(match self {
+            Self::Default | Self::Local => {
+                let base = format!(
+                    "{} {} {} {:02}:{:02}:{:02} {}",
+                    parts.weekday,
+                    MONTHS_ABBR[(parts.month - 1) as usize],
+                    parts.day,
+                    parts.hour,
+                    parts.minute,
+                    parts.second,
+                    parts.year,
+                );
+                if self.is_local() {
+                    base
+                } else {
+                    format!("{base} {}", parts.timezone)
+                }
+            }
+            Self::Raw | Self::RawLocal => format!("{} {}", parts.timestamp, parts.timezone),
+            Self::Unix => parts.timestamp.to_string(),
+            Self::Short | Self::ShortLocal => {
+                format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day)
+            }
+            Self::Iso | Self::IsoLocal => format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
+                parts.year,
+                parts.month,
+                parts.day,
+                parts.hour,
+                parts.minute,
+                parts.second,
+                parts.timezone,
+            ),
+            Self::IsoStrict | Self::IsoStrictLocal => format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
+                parts.year,
+                parts.month,
+                parts.day,
+                parts.hour,
+                parts.minute,
+                parts.second,
+                strict_timezone(parts.timezone),
+            ),
+            Self::Rfc2822 | Self::Rfc2822Local => format!(
+                "{}, {} {} {:04} {:02}:{:02}:{:02} {}",
+                parts.weekday,
+                parts.day,
+                MONTHS_ABBR[(parts.month - 1) as usize],
+                parts.year,
+                parts.hour,
+                parts.minute,
+                parts.second,
+                parts.timezone,
+            ),
+            Self::Relative => relative_date(parts.timestamp),
+            Self::Human | Self::HumanLocal => format!(
+                "{} {} {} {:02}:{:02}:{:02} {} {}",
+                parts.weekday,
+                MONTHS_ABBR[(parts.month - 1) as usize],
+                parts.day,
+                parts.hour,
+                parts.minute,
+                parts.second,
+                parts.year,
+                parts.timezone,
+            ),
+            Self::Strftime { template, .. } => strftime(template, &parts),
+        })
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(
+            self,
+            Self::Local
+                | Self::RawLocal
+                | Self::ShortLocal
+                | Self::IsoLocal
+                | Self::IsoStrictLocal
+                | Self::Rfc2822Local
+                | Self::HumanLocal
+                | Self::Strftime { local: true, .. }
+        )
+    }
+}
+
+const MONTHS_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+const MONTHS_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+const WEEKDAYS_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+struct DateParts<'a> {
+    timestamp: i64,
+    timezone: &'a str,
+    weekday: &'static str,
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+impl<'a> DateParts<'a> {
+    fn from_timestamp(timestamp: i64, timezone: &'a str) -> Option<Self> {
+        const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let offset_seconds = timezone_offset_seconds(timezone)?;
+        let local = timestamp + offset_seconds;
+        let days = local.div_euclid(86_400);
+        let seconds = local.rem_euclid(86_400);
+        let (year, month, day) = civil_from_days(days);
+        Some(Self {
+            timestamp,
+            timezone,
+            weekday: WEEKDAYS[(days + 4).rem_euclid(7) as usize],
+            year,
+            month,
+            day,
+            hour: seconds / 3_600,
+            minute: (seconds % 3_600) / 60,
+            second: seconds % 60,
+        })
+    }
+}
+
+fn timezone_offset_seconds(timezone: &str) -> Option<i64> {
+    if timezone.len() != 5 {
+        return None;
+    }
+    let sign = match timezone.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hours = timezone[1..3].parse::<i64>().ok()?;
+    let minutes = timezone[3..5].parse::<i64>().ok()?;
+    Some(sign * (hours * 3_600 + minutes * 60))
+}
+
+fn strict_timezone(timezone: &str) -> String {
+    let digits = timezone.strip_prefix(['+', '-']).unwrap_or(timezone);
+    if digits == "0000" {
+        "Z".to_string()
+    } else if timezone.len() == 5 {
+        format!("{}{}:{}", &timezone[..1], &timezone[1..3], &timezone[3..5])
+    } else {
+        timezone.to_string()
+    }
+}
+
+fn strftime(template: &str, parts: &DateParts<'_>) -> String {
+    let weekday_index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        .iter()
+        .position(|day| *day == parts.weekday)
+        .unwrap_or(0);
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{:04}", parts.year)),
+            Some('y') => out.push_str(&format!("{:02}", parts.year.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{:02}", parts.month)),
+            Some('d') => out.push_str(&format!("{:02}", parts.day)),
+            Some('e') => out.push_str(&format!("{:2}", parts.day)),
+            Some('H') => out.push_str(&format!("{:02}", parts.hour)),
+            Some('M') => out.push_str(&format!("{:02}", parts.minute)),
+            Some('S') => out.push_str(&format!("{:02}", parts.second)),
+            Some('b') | Some('h') => out.push_str(MONTHS_ABBR[(parts.month - 1) as usize]),
+            Some('B') => out.push_str(MONTHS_FULL[(parts.month - 1) as usize]),
+            Some('a') => out.push_str(parts.weekday),
+            Some('A') => out.push_str(WEEKDAYS_FULL[weekday_index]),
+            Some('%') => out.push('%'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+fn relative_date(timestamp: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(timestamp);
+    if timestamp > now {
+        return "in the future".to_string();
+    }
+    let diff = (now - timestamp) as u64;
+    if diff < 90 {
+        return format!("{diff} seconds ago");
+    }
+    let minutes = (diff + 30) / 60;
+    if minutes < 90 {
+        return format!("{minutes} minutes ago");
+    }
+    let hours = (diff + 1800) / 3600;
+    if hours < 36 {
+        return format!("{hours} hours ago");
+    }
+    let days = (diff + 43200) / 86400;
+    if days < 14 {
+        return format!("{days} days ago");
+    }
+    if days < 70 {
+        return format!("{} weeks ago", (days + 3) / 7);
+    }
+    if days < 365 {
+        return format!("{} months ago", (days + 15) / 30);
+    }
+    let years_scaled = (days * 10 + 183) / 365;
+    if days < 365 * 2 {
+        let months = ((days - 365) + 15) / 30;
+        if months > 0 {
+            return format!("1 year, {months} months ago");
+        }
+        return "1 year ago".to_string();
+    }
+    if years_scaled.is_multiple_of(10) {
+        format!("{} years ago", years_scaled / 10)
+    } else {
+        format!("{}.{} years ago", years_scaled / 10, years_scaled % 10)
+    }
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
 /// Minimal trace2 event-target support (`GIT_TRACE2_EVENT`).
 ///
 /// Upstream's trace2 event target writes one JSON object per line to the file
