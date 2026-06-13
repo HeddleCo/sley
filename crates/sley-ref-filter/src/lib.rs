@@ -6,10 +6,12 @@
 //! point instead of a home for every command's formatting state.
 
 use sley_core::{DateMode, GitError, ObjectId, Result};
+use sley_strbuf_expand::{AtomTable, ExpandFormat, ExpandSegment};
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForEachRefFormat {
+    inner: ExpandFormat<ForEachRefAtom>,
     segments: Vec<ForEachRefFormatSegment>,
 }
 
@@ -112,6 +114,16 @@ impl ForEachRefAtom {
             });
         }
         Ok(Self::Raw(value.to_string()))
+    }
+}
+
+struct ForEachRefAtomTable;
+
+impl AtomTable for ForEachRefAtomTable {
+    type Atom = ForEachRefAtom;
+
+    fn parse_atom(&self, value: &str) -> Result<Self::Atom> {
+        ForEachRefAtom::parse(value)
     }
 }
 
@@ -237,49 +249,19 @@ pub fn parse_for_each_ref_contents_lines_count(value: &str) -> Result<usize> {
 
 impl ForEachRefFormat {
     pub fn parse(format_spec: &str) -> Result<Self> {
-        let mut segments = Vec::new();
-        let mut cursor = 0;
-        while let Some(start) = format_spec[cursor..].find('%') {
-            let start = cursor + start;
-            push_for_each_ref_literal(
-                &mut segments,
-                format_spec.as_bytes()[cursor..start].to_vec(),
-            );
-            let bytes = format_spec.as_bytes();
-            match bytes.get(start + 1).copied() {
-                Some(b'%') => {
-                    push_for_each_ref_literal(&mut segments, b"%".to_vec());
-                    cursor = start + 2;
+        let inner = ExpandFormat::parse(format_spec, &ForEachRefAtomTable)?;
+        let segments = inner
+            .segments()
+            .iter()
+            .filter_map(|segment| match segment {
+                ExpandSegment::Literal(literal) => {
+                    Some(ForEachRefFormatSegment::Literal(literal.clone()))
                 }
-                Some(b'(') => {
-                    let Some(end) = format_spec[start + 2..].find(')') else {
-                        return Err(GitError::Command(
-                            "unterminated for-each-ref format placeholder".into(),
-                        ));
-                    };
-                    let end = start + 2 + end;
-                    segments.push(ForEachRefFormatSegment::Atom(ForEachRefAtom::parse(
-                        &format_spec[start + 2..end],
-                    )?));
-                    cursor = end + 1;
-                }
-                Some(_) => {
-                    if let Some(byte) = for_each_ref_hex_escape(bytes.get(start + 1..start + 3)) {
-                        push_for_each_ref_literal(&mut segments, vec![byte]);
-                        cursor = start + 3;
-                    } else {
-                        push_for_each_ref_literal(&mut segments, b"%".to_vec());
-                        cursor = start + 1;
-                    }
-                }
-                None => {
-                    push_for_each_ref_literal(&mut segments, b"%".to_vec());
-                    cursor = start + 1;
-                }
-            }
-        }
-        push_for_each_ref_literal(&mut segments, format_spec.as_bytes()[cursor..].to_vec());
-        Ok(Self { segments })
+                ExpandSegment::Atom(atom) => Some(ForEachRefFormatSegment::Atom(atom.atom.clone())),
+                ExpandSegment::Padding(_) => None,
+            })
+            .collect();
+        Ok(Self { inner, segments })
     }
 
     pub fn segments(&self) -> &[ForEachRefFormatSegment] {
@@ -300,17 +282,6 @@ impl ForEachRefFormat {
     }
 }
 
-fn push_for_each_ref_literal(segments: &mut Vec<ForEachRefFormatSegment>, literal: Vec<u8>) {
-    if literal.is_empty() {
-        return;
-    }
-    if let Some(ForEachRefFormatSegment::Literal(previous)) = segments.last_mut() {
-        previous.extend_from_slice(&literal);
-    } else {
-        segments.push(ForEachRefFormatSegment::Literal(literal));
-    }
-}
-
 pub fn write_for_each_ref_format(
     stdout: &mut impl Write,
     format: &ForEachRefFormat,
@@ -318,37 +289,13 @@ pub fn write_for_each_ref_format(
     reset_color_at_eol: bool,
     mut write_atom: impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
 ) -> Result<()> {
-    for segment in format.segments() {
-        match segment {
-            ForEachRefFormatSegment::Literal(literal) => stdout.write_all(literal)?,
-            ForEachRefFormatSegment::Atom(atom) => {
-                let mut value = Vec::new();
-                write_atom(&mut value, atom)?;
-                write_for_each_ref_quoted_atom(stdout, &value, quote)?;
-            }
-        }
-    }
+    format.inner.write_to(stdout, &mut write_atom, |stdout, value| {
+        write_for_each_ref_quoted_atom(stdout, value, quote)
+    })?;
     if reset_color_at_eol {
         stdout.write_all(b"\x1b[m")?;
     }
     Ok(())
-}
-
-fn for_each_ref_hex_escape(value: Option<&[u8]>) -> Option<u8> {
-    let value = value?;
-    let [high, low] = value else {
-        return None;
-    };
-    Some(for_each_ref_hex_digit(*high)? << 4 | for_each_ref_hex_digit(*low)?)
-}
-
-fn for_each_ref_hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
@@ -934,6 +881,29 @@ mod tests {
         )
         .expect("writes to in-memory buffer");
         assert_eq!(out, b"branch='main'\\''s'");
+    }
+
+    #[test]
+    fn format_renderer_uses_shared_padding_and_magic() {
+        let format =
+            ForEachRefFormat::parse("x\n%-(*objectname)%>(6)%(refname)").expect("valid format");
+        let mut out = Vec::new();
+        write_for_each_ref_format(
+            &mut out,
+            &format,
+            ForEachRefQuoteMode::None,
+            false,
+            |value, atom| {
+                match atom {
+                    ForEachRefAtom::ObjectName { peeled: true, .. } => {}
+                    ForEachRefAtom::RefName { .. } => value.extend_from_slice(b"main"),
+                    other => panic!("unexpected atom {other:?}"),
+                }
+                Ok(())
+            },
+        )
+        .expect("writes to in-memory buffer");
+        assert_eq!(out, b"x  main");
     }
 
     #[test]

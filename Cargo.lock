@@ -1281,6 +1281,7 @@ name = "sley-ref-filter"
 version = "0.1.0"
 dependencies = [
  "sley-core",
+ "sley-strbuf-expand",
 ]
 
 [[package]]
@@ -1336,6 +1337,13 @@ dependencies = [
  "sley-refs",
  "sley-worktree",
  "tempfile",
+]
+
+[[package]]
+name = "sley-strbuf-expand"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
 ]
 
 [[package]]
