@@ -3470,6 +3470,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
             message: b"release\n".to_vec(),
+            raw_body: None,
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
@@ -3501,6 +3502,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
             message: b"release\n".to_vec(),
+            raw_body: None,
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
@@ -3529,6 +3531,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
             message: b"release\n".to_vec(),
+            raw_body: None,
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
@@ -3595,6 +3598,7 @@ mod tests {
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
             message: b"release\n".to_vec(),
+            raw_body: None,
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))

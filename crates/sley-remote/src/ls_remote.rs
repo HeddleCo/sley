@@ -38,6 +38,8 @@ pub enum LsRemoteSource {
     /// An SSH remote at the given already-resolved URL, listed by spawning `ssh`
     /// (the credential seam is unused — the `ssh` program owns authentication).
     Ssh(RemoteUrl),
+    /// A native anonymous `git://` remote at the given already-resolved URL.
+    Git(RemoteUrl),
     /// A local repository read directly from `git_dir` (refs and the object
     /// database used to peel annotated tags both resolve from this `$GIT_DIR`,
     /// matching `git ls-remote` against a local path).
@@ -106,6 +108,7 @@ pub fn ls_remote(
             "HTTP transport is not enabled in this build".into(),
         )),
         LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
+        LsRemoteSource::Git(remote) => crate::git::ls_remote_git(remote, filter, matches),
         LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
     }
 }

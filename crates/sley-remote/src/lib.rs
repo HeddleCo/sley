@@ -50,6 +50,11 @@ pub use ssh::{
     ssh_upload_pack_shallow_fetch_response,
 };
 
+mod git;
+pub use git::{
+    GitFetchPackRequest, git_upload_pack_advertisements, install_fetch_pack_via_git_upload_pack,
+};
+
 mod local;
 pub use local::{
     INFINITE_DEPTH, LocalDeepenPlan, attach_receive_pack_capabilities,

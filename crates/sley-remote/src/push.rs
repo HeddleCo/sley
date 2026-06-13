@@ -60,6 +60,8 @@ pub enum PushDestination {
     /// An SSH remote at the given already-resolved URL. Pushed by spawning `ssh`
     /// (the credential seam is unused — the `ssh` program owns authentication).
     Ssh(RemoteUrl),
+    /// A native anonymous `git://` remote at the given already-resolved URL.
+    Git(RemoteUrl),
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -100,6 +102,10 @@ pub struct PushCommand {
     /// receive-pack treats as create-only for updates and unconditional for
     /// deletes.
     pub expected_old: Option<ObjectId>,
+    /// Bypass the non-fast-forward check for this command. This mirrors a
+    /// refspec-local leading `+`; [`PushOptions::force`] still forces every
+    /// command in the plan.
+    pub force: bool,
 }
 
 /// A typed push action that preserves the caller's exact old/new/delete intent.
@@ -127,16 +133,19 @@ impl From<PushAction> for PushCommand {
                 src: Some(new),
                 dst,
                 expected_old: None,
+                force: false,
             },
             PushAction::Update { dst, old, new } => Self {
                 src: Some(new),
                 dst,
                 expected_old: Some(old),
+                force: false,
             },
             PushAction::Delete { dst, old } => Self {
                 src: None,
                 dst,
                 expected_old: old,
+                force: false,
             },
         }
     }
@@ -155,6 +164,14 @@ impl PushActionPlan {
     pub fn from_actions(actions: Vec<PushAction>, options: PushOptions) -> Self {
         Self {
             commands: actions.into_iter().map(PushCommand::from).collect(),
+            pack_objects: Vec::new(),
+            options,
+        }
+    }
+
+    pub fn from_commands(commands: Vec<PushCommand>, options: PushOptions) -> Self {
+        Self {
+            commands,
             pack_objects: Vec::new(),
             options,
         }
@@ -243,6 +260,7 @@ enum PushExecution {
         pack_objects: Vec<ObjectId>,
     },
     Ssh(crate::ssh::SshPushPlan),
+    Git(crate::git::GitPushPlan),
     Local {
         remote_git_dir: PathBuf,
         remote_common_git_dir: PathBuf,
@@ -324,6 +342,26 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
                 execution,
             })
         }
+        PushDestination::Git(remote_url) => {
+            let plan = crate::git::plan_push_git(crate::git::GitPushRequest {
+                git_dir: request.git_dir,
+                common_git_dir: request.common_git_dir,
+                format: request.format,
+                remote: remote_url,
+                refspecs: request.refspecs,
+                force: request.options.force,
+            })?;
+            let commands = plan.commands.clone();
+            let execution = if commands.is_empty() {
+                PushExecution::Noop
+            } else {
+                PushExecution::Git(plan)
+            };
+            Ok(PushPlan {
+                commands,
+                execution,
+            })
+        }
         PushDestination::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,
@@ -352,7 +390,8 @@ pub fn plan_push_actions(
     let command_forces = commands
         .iter()
         .cloned()
-        .map(|command| (command, request.plan.options.force))
+        .zip(request.plan.commands.iter())
+        .map(|(command, planned)| (command, request.plan.options.force || planned.force))
         .collect::<Vec<_>>();
     match request.destination {
         #[cfg(feature = "http")]
@@ -395,15 +434,33 @@ pub fn plan_push_actions(
                 common_git_dir: request.common_git_dir,
                 format: request.format,
                 remote: remote_url,
-                commands: commands.clone(),
+                command_forces: command_forces.clone(),
                 pack_objects: request.plan.pack_objects.clone(),
-                force: request.plan.options.force,
             })?;
             let commands = plan.commands.clone();
             let execution = if commands.is_empty() {
                 PushExecution::Noop
             } else {
                 PushExecution::Ssh(plan)
+            };
+            Ok(PushPlan {
+                commands,
+                execution,
+            })
+        }
+        PushDestination::Git(remote_url) => {
+            let plan = crate::git::plan_push_git_commands(crate::git::GitPushCommandsRequest {
+                common_git_dir: request.common_git_dir,
+                format: request.format,
+                remote: remote_url,
+                command_forces: command_forces.clone(),
+                pack_objects: request.plan.pack_objects.clone(),
+            })?;
+            let commands = plan.commands.clone();
+            let execution = if commands.is_empty() {
+                PushExecution::Noop
+            } else {
+                PushExecution::Git(plan)
             };
             Ok(PushPlan {
                 commands,
@@ -476,6 +533,7 @@ pub fn execute_push_plan(
             pack_objects,
         ),
         PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan),
+        PushExecution::Git(plan) => crate::git::execute_push_git_plan(request, plan),
         PushExecution::Local {
             remote_git_dir,
             remote_common_git_dir,
@@ -1336,6 +1394,50 @@ mod tests {
                 .read_ref("refs/heads/main")
                 .expect("remote ref should read"),
             Some(RefTarget::Direct(tip))
+        );
+    }
+
+    #[test]
+    fn local_push_actions_honors_per_command_force() {
+        let local = temp_repo("actions-command-force-local");
+        let remote = temp_repo("actions-command-force-remote");
+        let base = write_commit(&local, Vec::new(), "base");
+        let remote_base = write_commit(&remote, Vec::new(), "base");
+        assert_eq!(remote_base, base);
+        let unrelated = write_commit(&local, Vec::new(), "unrelated");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+
+        let unforced = PushActionPlan::from_commands(
+            vec![PushCommand {
+                src: Some(unrelated),
+                dst: "refs/heads/main".into(),
+                expected_old: Some(base),
+                force: false,
+            }],
+            default_options(),
+        );
+        let err = push_local_actions(&local, &remote, &unforced)
+            .expect_err("non-fast-forward should reject without command force");
+        assert!(err.to_string().contains("non-fast-forward"));
+
+        let forced = PushActionPlan::from_commands(
+            vec![PushCommand {
+                src: Some(unrelated),
+                dst: "refs/heads/main".into(),
+                expected_old: Some(base),
+                force: true,
+            }],
+            default_options(),
+        );
+        let outcome = push_local_actions(&local, &remote, &forced).expect("command force pushes");
+
+        assert_eq!(outcome.commands.len(), 1);
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(unrelated))
         );
     }
 

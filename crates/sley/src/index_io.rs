@@ -4,15 +4,29 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
-use sley_index::Index;
+use sley_index::{Index, IndexEntry};
 
-use crate::{GitError, Repository};
+use crate::{GitError, IndexStatProbe, Repository};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IndexWriteOptions {
     pub fsync: bool,
     pub validate_checksum: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWriteResult {
+    pub path: PathBuf,
+    pub len: u64,
+    pub mtime: Option<(u64, u64)>,
+}
+
+impl IndexWriteResult {
+    pub fn stat_probe_for_entry(&self, entry: IndexEntry) -> IndexStatProbe {
+        IndexStatProbe::from_index_entry(entry, self.mtime)
+    }
 }
 
 #[derive(Debug)]
@@ -78,6 +92,16 @@ impl Repository {
         index: &Index,
         options: IndexWriteOptions,
     ) -> std::result::Result<(), IndexWriteError> {
+        self.write_index_with_result(index, options).map(|_| ())
+    }
+
+    /// Write this repository's index through `index.lock` and an atomic rename,
+    /// returning the post-write index metadata needed for racy-git probes.
+    pub fn write_index_with_result(
+        &self,
+        index: &Index,
+        options: IndexWriteOptions,
+    ) -> std::result::Result<IndexWriteResult, IndexWriteError> {
         let path = sley_worktree::repository_index_path(&self.git_dir);
         write_index_locked(&path, index, self.format, options)
     }
@@ -88,7 +112,7 @@ fn write_index_locked(
     index: &Index,
     format: crate::ObjectFormat,
     options: IndexWriteOptions,
-) -> std::result::Result<(), IndexWriteError> {
+) -> std::result::Result<IndexWriteResult, IndexWriteError> {
     let parent = path.parent().ok_or_else(|| {
         IndexWriteError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -111,7 +135,17 @@ fn write_index_locked(
         let _ = fs::remove_file(&lock_path);
         return Err(IndexWriteError::Io(err));
     }
-    Ok(())
+    let metadata = fs::metadata(path).map_err(IndexWriteError::Io)?;
+    Ok(IndexWriteResult {
+        path: path.to_path_buf(),
+        len: metadata.len(),
+        mtime: metadata_mtime(&metadata),
+    })
+}
+
+fn metadata_mtime(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    let duration = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((duration.as_secs(), u64::from(duration.subsec_nanos())))
 }
 
 fn index_lock_path(path: &Path) -> std::result::Result<PathBuf, IndexWriteError> {

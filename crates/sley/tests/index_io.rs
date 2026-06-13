@@ -104,6 +104,25 @@ fn repository_write_index_round_trips_entries_and_checksum() {
 }
 
 #[test]
+fn repository_write_index_with_result_returns_probe_metadata() {
+    let temp = TempDir::new();
+    let repo = Repository::init(&temp.path).expect("init");
+    let index = test_index(vec![test_entry("normal.txt", 0o100644, IndexStage::Normal)]);
+
+    let result = repo
+        .write_index_with_result(&index, IndexWriteOptions::default())
+        .expect("write index");
+
+    let metadata = fs::metadata(index_path(&repo)).expect("index metadata");
+    assert_eq!(result.path, index_path(&repo));
+    assert_eq!(result.len, metadata.len());
+    assert!(result.mtime.is_some());
+    let probe = result.stat_probe_for_entry(index.entries[0].clone());
+    assert_eq!(probe.index_mtime(), result.mtime);
+    assert_eq!(probe.entry().path, BString::from("normal.txt"));
+}
+
+#[test]
 fn repository_write_index_existing_lock_fails_and_preserves_index() {
     let temp = TempDir::new();
     let repo = Repository::init(&temp.path).expect("init");

@@ -4833,6 +4833,7 @@ mod tests {
                 name: b"v1".to_vec(),
                 tagger: Some(b"Example <example@example.invalid> 0 +0000".to_vec()),
                 message: b"tag message\n".to_vec(),
+                raw_body: None,
             }
             .write(),
         );

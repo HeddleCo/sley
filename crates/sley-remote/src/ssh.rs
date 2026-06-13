@@ -75,9 +75,8 @@ pub(crate) struct SshPushCommandsRequest<'a> {
     pub common_git_dir: &'a Path,
     pub format: ObjectFormat,
     pub remote: &'a RemoteUrl,
-    pub commands: Vec<ReceivePackCommand>,
+    pub command_forces: Vec<(ReceivePackCommand, bool)>,
     pub pack_objects: Vec<ObjectId>,
-    pub force: bool,
 }
 
 pub(crate) struct SshPushPlan {
@@ -202,9 +201,8 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         common_git_dir,
         format,
         remote,
-        commands,
+        command_forces,
         pack_objects,
-        force,
     } = request;
     if remote.transport != RemoteTransport::Ssh {
         return Err(GitError::InvalidFormat(
@@ -254,6 +252,11 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         )));
     }
 
+    let commands = command_forces
+        .iter()
+        .map(|(command, _)| command.clone())
+        .collect::<Vec<_>>();
+
     if commands.is_empty() {
         drop(stdin);
         return Ok(SshPushPlan {
@@ -268,11 +271,6 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         });
     }
 
-    let command_forces = commands
-        .iter()
-        .cloned()
-        .map(|command| (command, force))
-        .collect::<Vec<_>>();
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
     Ok(SshPushPlan {

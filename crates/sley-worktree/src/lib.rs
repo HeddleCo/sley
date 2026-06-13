@@ -1,5 +1,5 @@
 use sley_config::GitConfig;
-use sley_core::{BString, GitError, ObjectFormat, ObjectId, RepoPath, Result};
+use sley_core::{BString, GitError, MissingObjectKind, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_index::{CacheTree, Index, IndexEntry, Stage};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -3491,19 +3491,15 @@ fn collect_attribute_patterns_from_tree(
     base: Vec<u8>,
     matcher: &mut AttributeMatcher,
 ) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, tree_oid, ObjectType::Tree)?;
     let mut entries = Tree::parse(format, &object.body)?.entries;
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in &entries {
         if entry.name == b".gitattributes" && tree_entry_object_type(entry.mode) == ObjectType::Blob
         {
-            let object = db.read_object(&entry.oid)?;
+            let object = db.read_object(&entry.oid).map_err(|err| {
+                expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob)
+            })?;
             if object.object_type == ObjectType::Blob {
                 read_attribute_patterns_from_bytes(&object.body, matcher, &base);
             }
@@ -3549,7 +3545,9 @@ fn collect_attribute_patterns_from_index(
             Some(parent) => parent.strip_suffix(b"/").unwrap_or(parent).to_vec(),
             None => continue,
         };
-        let object = db.read_object(&entry.oid)?;
+        let object = db
+            .read_object(&entry.oid)
+            .map_err(|err| expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob))?;
         if object.object_type == ObjectType::Blob {
             read_attribute_patterns_from_bytes(&object.body, matcher, &base);
         }
@@ -4871,14 +4869,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
             index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
             continue;
         }
-        let object = db.read_object(&entry.oid)?;
-        if object.object_type != ObjectType::Blob {
-            return Err(GitError::InvalidObject(format!(
-                "expected blob {}, found {}",
-                entry.oid,
-                object.object_type.as_str()
-            )));
-        }
+        let object = read_expected_object(&db, &entry.oid, ObjectType::Blob)?;
         let body: Cow<'_, [u8]> = match (smudge_config, &attributes) {
             (Some(config), Some(matcher)) => {
                 let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
@@ -5498,14 +5489,7 @@ fn materialize_tree_entry(
             path: BString::from(path),
         });
     }
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -5817,14 +5801,7 @@ fn materialize_index_entry_file(
     file_path: &Path,
     entry: &IndexEntry,
 ) -> Result<()> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -6065,14 +6042,7 @@ pub fn remove_index_and_worktree_paths(
             }
             let worktree_file = worktree_path(worktree_root, path)?;
             if worktree_file.exists() {
-                let object = db.read_object(&index_entry.oid)?;
-                if object.object_type != ObjectType::Blob {
-                    return Err(GitError::InvalidObject(format!(
-                        "expected blob {}, found {}",
-                        index_entry.oid,
-                        object.object_type.as_str()
-                    )));
-                }
+                let object = read_expected_object(&db, &index_entry.oid, ObjectType::Blob)?;
                 let worktree_bytes = apply_clean_filter(
                     worktree_root,
                     git_dir,
@@ -6408,14 +6378,7 @@ fn restore_index_entry(
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
 ) -> Result<()> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let body: Cow<'_, [u8]> = match smudge_config {
         Some(config) => {
             let checks = smudge_attribute_checks_from_index(
@@ -6464,14 +6427,7 @@ fn restored_head_index_entry(
         match fs::metadata(&file_path) {
             Ok(metadata) => metadata.len().min(u32::MAX as u64) as u32,
             Err(_) => {
-                let object = db.read_object(&entry.oid)?;
-                if object.object_type != ObjectType::Blob {
-                    return Err(GitError::InvalidObject(format!(
-                        "expected blob {}, found {}",
-                        entry.oid,
-                        object.object_type.as_str()
-                    )));
-                }
+                let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
                 object.body.len().min(u32::MAX as usize) as u32
             }
         }
@@ -6500,14 +6456,7 @@ fn restore_head_entry_to_worktree(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<()> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -6522,14 +6471,7 @@ fn restore_head_entry_to_worktree_and_index(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -6587,14 +6529,49 @@ fn index_entry_from_metadata(
     }
 }
 
-fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
-    let object = db.read_object(oid)?;
-    if object.object_type != ObjectType::Commit {
+fn read_expected_object(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    expected: ObjectType,
+) -> Result<std::sync::Arc<EncodedObject>> {
+    let object = db
+        .read_object(oid)
+        .map_err(|err| expect_missing_object_kind(err, *oid, missing_kind_for_type(expected)))?;
+    if object.object_type != expected {
         return Err(GitError::InvalidObject(format!(
-            "expected commit {oid}, found {}",
+            "expected {} {}, found {}",
+            expected.as_str(),
+            oid,
             object.object_type.as_str()
         )));
     }
+    Ok(object)
+}
+
+fn expect_missing_object_kind(
+    err: GitError,
+    oid: ObjectId,
+    expected: MissingObjectKind,
+) -> GitError {
+    match err.not_found_kind() {
+        Some(sley_core::NotFoundKind::Object { .. }) => {
+            GitError::object_kind_not_found(oid, expected)
+        }
+        _ => err,
+    }
+}
+
+fn missing_kind_for_type(object_type: ObjectType) -> MissingObjectKind {
+    match object_type {
+        ObjectType::Blob => MissingObjectKind::Blob,
+        ObjectType::Tree => MissingObjectKind::Tree,
+        ObjectType::Commit => MissingObjectKind::Commit,
+        ObjectType::Tag => MissingObjectKind::Tag,
+    }
+}
+
+fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
+    let object = read_expected_object(db, oid, ObjectType::Commit)?;
     Commit::parse(format, &object.body)
 }
 
@@ -6730,12 +6707,7 @@ fn resolve_head_tree_oid(
     let Some(commit_oid) = resolve_head_commit_oid(git_dir, format)? else {
         return Ok(None);
     };
-    let object = db.read_object(&commit_oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "HEAD {commit_oid} is not a commit"
-        )));
-    }
+    let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
     let commit = Commit::parse_ref(format, &object.body)?;
     Ok(Some(commit.tree))
 }
@@ -6877,12 +6849,7 @@ fn head_tree_entries(
     let Some(commit_oid) = commit_oid else {
         return Ok(BTreeMap::new());
     };
-    let object = db.read_object(&commit_oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "HEAD {commit_oid} is not a commit"
-        )));
-    }
+    let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
     let commit = Commit::parse_ref(format, &object.body)?;
     let mut entries = BTreeMap::new();
     collect_tree_entries(db, format, &commit.tree, &mut entries)?;
@@ -7756,6 +7723,22 @@ mod tests {
         let matcher = ignore_matcher(&[b"*.log", b"!keep.log"]);
         assert!(matcher.is_ignored(b"a/x.log", false));
         assert!(!matcher.is_ignored(b"a/keep.log", false));
+    }
+
+    #[test]
+    fn read_expected_object_missing_blob_exposes_oid_and_kind() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let missing = ObjectId::empty_blob(ObjectFormat::Sha1);
+
+        let err = read_expected_object(&db, &missing, ObjectType::Blob)
+            .expect_err("missing blob should error");
+        let kind = err.not_found_kind().expect("typed not found");
+        assert_eq!(kind.object_id(), Some(missing));
+        assert_eq!(kind.missing_object_kind(), Some(MissingObjectKind::Blob));
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]

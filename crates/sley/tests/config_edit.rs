@@ -138,3 +138,73 @@ fn repository_plan_existing_external_include_is_refused_by_default() {
         ConfigEditError::RefusesExternalInclude { path } if path == outside
     ));
 }
+
+#[test]
+fn repository_plan_existing_include_inside_repo_edits_defining_file() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let repo = Repository::init(&repo_dir).expect("init");
+    let included = repo_dir.join("remotes.cfg");
+    fs::write(
+        &included,
+        b"# included\n[remote.Origin] ; keep header comment\n\turl = old-url # touched line\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+    )
+    .expect("write include");
+    fs::write(
+        repo.common_dir().join("config"),
+        format!("[include]\n\tpath = {}\n", included.display()),
+    )
+    .expect("write config");
+
+    let plan = repo
+        .plan_config_set(
+            "remote.origin.url",
+            "new-url",
+            ConfigEditScope::ExistingValue {
+                allow_external_includes: false,
+            },
+        )
+        .expect("included config inside the repo is editable");
+
+    assert_eq!(plan.target_path, included);
+    repo.apply_config_edit_plan(plan).expect("apply set");
+    assert_eq!(
+        fs::read_to_string(repo.common_dir().join("config")).expect("read main"),
+        format!("[include]\n\tpath = {}\n", included.display())
+    );
+    let updated = fs::read_to_string(&included).expect("read include");
+    assert!(updated.contains("[remote.Origin] ; keep header comment\n"));
+    assert!(updated.contains("\turl = new-url\n"));
+    assert!(updated.contains("\tfetch = +refs/heads/*:refs/remotes/origin/*\n"));
+}
+
+#[test]
+fn repository_plan_existing_external_include_can_be_opted_in() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let outside = temp.path.join("outside.cfg");
+    let repo = Repository::init(&repo_dir).expect("init");
+    fs::write(&outside, b"[remote \"origin\"]\n\turl = old-url\n").expect("write include");
+    fs::write(
+        repo.common_dir().join("config"),
+        format!("[include]\n\tpath = {}\n", outside.display()),
+    )
+    .expect("write config");
+
+    let plan = repo
+        .plan_config_set(
+            "remote.origin.url",
+            "new-url",
+            ConfigEditScope::ExistingValue {
+                allow_external_includes: true,
+            },
+        )
+        .expect("external include is editable when allowed");
+
+    assert_eq!(plan.target_path, outside);
+    repo.apply_config_edit_plan(plan).expect("apply set");
+    assert_eq!(
+        fs::read_to_string(&outside).expect("read include"),
+        "[remote \"origin\"]\n\turl = new-url\n"
+    );
+}
