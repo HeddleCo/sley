@@ -541,8 +541,11 @@ pub fn read_repository_index(
 /// This is the repository-intrinsic worktree resolution (it does *not* consult
 /// `GIT_WORK_TREE`/`GIT_DIR` or CLI overrides — those are the caller's job):
 ///
-/// 1. a `core.worktree` setting in `<git_dir>/config` (absolute, or relative to
-///    the git directory), canonicalised;
+/// 0. if `core.bare` is true the repository is bare and `Ok(None)` is returned
+///    immediately — `core.bare` takes precedence, so a bare repo ignores
+///    `core.worktree` and the `.git`-parent fallback;
+/// 1. otherwise, a `core.worktree` setting in `<git_dir>/config` (absolute, or
+///    relative to the git directory), canonicalised;
 /// 2. otherwise, for a linked worktree (a git directory that has both a
 ///    `commondir` and a `gitdir` administrative file), the directory containing
 ///    the worktree's `.git` link, canonicalised;
@@ -550,23 +553,30 @@ pub fn read_repository_index(
 ///    ordinary non-bare layout) — returned verbatim, not canonicalised;
 /// 4. otherwise the repository is bare and `Ok(None)` is returned.
 ///
-/// `Ok(None)` means specifically "bare" (case 4). A [`GitError::Io`] is
+/// `Ok(None)` means specifically "bare" (case 0 or case 4). A [`GitError::Io`] is
 /// returned if a path that should exist cannot be canonicalised, and a
 /// [`GitError::InvalidPath`] if a `.git` directory has no parent (a malformed
 /// layout).
 pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
-    if let Ok(config) = sley_config::read_repo_config(git_dir, None)
-        && let Some(worktree) = config.get("core", None, "worktree")
-    {
-        let worktree = PathBuf::from(worktree);
-        let worktree = if worktree.is_absolute() {
-            worktree
-        } else {
-            git_dir.join(worktree)
-        };
-        return fs::canonicalize(worktree)
-            .map(Some)
-            .map_err(|err| GitError::Io(err.to_string()));
+    if let Ok(config) = sley_config::read_repo_config(git_dir, None) {
+        // A bare repository has no working tree, and `core.bare` takes precedence:
+        // a bare repo ignores `core.worktree`. Check it before any worktree
+        // resolution so a bare `.git`-named directory does not fall through to the
+        // "parent of .git" case below.
+        if config.get_bool("core", None, "bare") == Some(true) {
+            return Ok(None);
+        }
+        if let Some(worktree) = config.get("core", None, "worktree") {
+            let worktree = PathBuf::from(worktree);
+            let worktree = if worktree.is_absolute() {
+                worktree
+            } else {
+                git_dir.join(worktree)
+            };
+            return fs::canonicalize(worktree)
+                .map(Some)
+                .map_err(|err| GitError::Io(err.to_string()));
+        }
     }
     if git_dir.join("commondir").is_file() {
         let gitdir_file = git_dir.join("gitdir");
@@ -9091,6 +9101,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["A  hello.txt", "?? extra.txt"]
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_root_is_none_for_bare_repository() {
+        // A bare git_dir (basename `.git`) with `core.bare = true` must resolve to
+        // `Ok(None)` rather than falling through to the "parent of .git" case.
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).expect("create bare git dir");
+        // Hermetic minimal config — do not depend on host gitconfig.
+        fs::write(git_dir.join("config"), b"[core]\n\tbare = true\n").expect("write bare config");
+
+        assert_eq!(
+            worktree_root_for_git_dir(&git_dir).expect("resolve bare worktree root"),
+            None,
+            "a bare repository has no working tree"
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_root_is_parent_for_non_bare_dot_git() {
+        // A non-bare `.git` directory (no core.bare / core.bare = false) still
+        // resolves to its parent — the ordinary non-bare layout.
+        let root = temp_root();
+        let work = root.join("work");
+        let git_dir = work.join(".git");
+        fs::create_dir_all(&git_dir).expect("create non-bare git dir");
+        fs::write(
+            git_dir.join("config"),
+            b"[core]\n\tbare = false\n",
+        )
+        .expect("write non-bare config");
+
+        assert_eq!(
+            worktree_root_for_git_dir(&git_dir).expect("resolve non-bare worktree root"),
+            Some(work.clone()),
+            "a non-bare .git dir resolves to its parent"
+        );
+
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
