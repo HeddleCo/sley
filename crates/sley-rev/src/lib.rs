@@ -1050,7 +1050,7 @@ enum DirectCommitGraph {
 }
 
 struct RawCommitGraph {
-    bytes: Vec<u8>,
+    bytes: RawCommitGraphBytes,
     format: ObjectFormat,
     fanout: [u32; 256],
     commit_count: usize,
@@ -1059,52 +1059,67 @@ struct RawCommitGraph {
     edge: Option<Range<usize>>,
 }
 
+enum RawCommitGraphBytes {
+    Owned(Vec<u8>),
+    Mapped(sley_mmap::MappedFile),
+}
+
+impl AsRef<[u8]> for RawCommitGraphBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes.as_bytes(),
+        }
+    }
+}
+
 impl RawCommitGraph {
-    fn parse(bytes: Vec<u8>, format: ObjectFormat) -> Result<Self> {
+    fn parse(bytes: RawCommitGraphBytes, format: ObjectFormat) -> Result<Self> {
+        let data = bytes.as_ref();
         let hash_len = format.raw_len();
-        if bytes.len() < 8 + 12 + hash_len {
+        if data.len() < 8 + 12 + hash_len {
             return Err(GitError::InvalidFormat(
                 "commit-graph file too short".into(),
             ));
         }
-        if &bytes[..4] != b"CGPH" {
+        if &data[..4] != b"CGPH" {
             return Err(GitError::InvalidFormat(
                 "missing commit-graph signature".into(),
             ));
         }
-        let version = bytes[4];
+        let version = data[4];
         if version != 1 {
             return Err(GitError::Unsupported(format!(
                 "commit-graph version {version}"
             )));
         }
-        let hash_id = bytes[5];
+        let hash_id = data[5];
         if u32::from(hash_id) != commit_graph_hash_function_id(format) {
             return Err(GitError::InvalidFormat(format!(
                 "commit-graph hash id {hash_id} does not match {}",
                 format.name()
             )));
         }
-        if bytes[7] != 0 {
+        if data[7] != 0 {
             return Err(GitError::Unsupported(
                 "split commit-graph direct lookup".into(),
             ));
         }
-        let chunk_count = bytes[6] as usize;
+        let chunk_count = data[6] as usize;
         let lookup_len = (chunk_count + 1)
             .checked_mul(12)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph lookup overflow".into()))?;
         let data_start = 8usize
             .checked_add(lookup_len)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph lookup overflow".into()))?;
-        let checksum_offset = bytes.len() - hash_len;
+        let checksum_offset = data.len() - hash_len;
         if data_start > checksum_offset {
             return Err(GitError::InvalidFormat(
                 "truncated commit-graph chunk lookup".into(),
             ));
         }
-        let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
-        let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+        let actual_checksum = sley_core::digest_bytes(format, &data[..checksum_offset])?;
+        let checksum = ObjectId::from_raw(format, &data[checksum_offset..])?;
         if actual_checksum != checksum {
             return Err(GitError::InvalidFormat(format!(
                 "commit-graph checksum mismatch: expected {checksum}, got {actual_checksum}"
@@ -1115,12 +1130,12 @@ impl RawCommitGraph {
         let mut offset = 8usize;
         for _ in 0..=chunk_count {
             let id = [
-                bytes[offset],
-                bytes[offset + 1],
-                bytes[offset + 2],
-                bytes[offset + 3],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
             ];
-            let chunk_offset = read_u64_be(&bytes[offset + 4..offset + 12]);
+            let chunk_offset = read_u64_be(&data[offset + 4..offset + 12]);
             lookup.push((id, chunk_offset));
             offset += 12;
         }
@@ -1185,7 +1200,7 @@ impl RawCommitGraph {
         let mut previous = 0u32;
         for (idx, slot) in fanout.iter_mut().enumerate() {
             let start = oidf.start + idx * 4;
-            *slot = read_u32_be(&bytes[start..start + 4]);
+            *slot = read_u32_be(&data[start..start + 4]);
             if *slot < previous {
                 return Err(GitError::InvalidFormat(
                     "commit-graph OIDF fanout is not monotonic".into(),
@@ -1294,6 +1309,7 @@ impl RawCommitGraph {
             .checked_add(hash_len)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL index overflow".into()))?;
         self.bytes
+            .as_ref()
             .get(start..end)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL index overflow".into()))
     }
@@ -1322,6 +1338,7 @@ impl RawCommitGraph {
             .checked_add(entry_len)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))?;
         self.bytes
+            .as_ref()
             .get(start..end)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))
     }
@@ -1359,7 +1376,7 @@ impl RawCommitGraph {
             let end = start.checked_add(4).ok_or_else(|| {
                 GitError::InvalidFormat("commit-graph EDGE index overflow".into())
             })?;
-            let Some(bytes) = self.bytes.get(start..end) else {
+            let Some(bytes) = self.bytes.as_ref().get(start..end) else {
                 return Err(GitError::InvalidFormat(
                     "commit-graph EDGE entry points past chunk".into(),
                 ));
@@ -1566,9 +1583,14 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
     if !path.exists() {
         return DirectCommitGraph::Missing;
     }
-    fs::read(&path)
-        .map_err(|err| GitError::Io(err.to_string()))
-        .and_then(|bytes| RawCommitGraph::parse(bytes, format))
+    let bytes = match sley_mmap::MappedFile::open_commit_graph(&path) {
+        Ok(mapped) => RawCommitGraphBytes::Mapped(mapped),
+        Err(_) => match fs::read(&path) {
+            Ok(bytes) => RawCommitGraphBytes::Owned(bytes),
+            Err(_) => return DirectCommitGraph::Invalid,
+        },
+    };
+    RawCommitGraph::parse(bytes, format)
         .map(DirectCommitGraph::Raw)
         .unwrap_or(DirectCommitGraph::Invalid)
 }

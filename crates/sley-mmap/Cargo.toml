@@ -1,7 +1,7 @@
 [package]
 name = "sley-mmap"
 version = "0.0.1"
-description = "Audited, safe read-only memory maps of pack files — the single home for sley's only unsafe code."
+description = "Audited, safe read-only memory maps of immutable git files — the single home for sley's only unsafe code."
 repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ license.workspace = true
 memmap2 = "0.9"
 
 # This crate is the single, audited home for the workspace's only `unsafe` (the
-# read-only mmap of a pack file). It therefore does NOT inherit the workspace
+# read-only mmap of immutable git files). It therefore does NOT inherit the workspace
 # `unsafe_code = "forbid"` lint; instead it allows unsafe locally while keeping the
 # same hygiene denies as everywhere else. Every other crate stays forbid.
 [lints.rust]
