@@ -2276,6 +2276,23 @@ fn write_diff_patch_entry(
         return write_diff_binary_patch_entry(stdout, entry, old_content, new_content, options);
     }
     let content_changed = old_content.as_deref() != new_content.as_deref();
+    // git's diffcore drops an *unmodified* pair (same content, same mode, not a
+    // rename/copy) before formatting — `diff_flush` → `diff_unmodified_pair` — so
+    // no `diff --git` header is emitted at all. A plain `Modified` entry whose
+    // content and mode are unchanged is exactly such a pair: this happens for the
+    // stat-dirty entries `git diff-files` reports (a `touch`ed or `reset
+    // --no-refresh`-restored file shows `M` in raw/name-status but produces an
+    // empty patch). Suppress the entry entirely to match git.
+    let mode_unchanged = match (entry.old_mode, entry.new_mode) {
+        (Some(old_mode), Some(new_mode)) => old_mode == new_mode,
+        _ => true,
+    };
+    if matches!(entry.status, sley_diff_merge::NameStatus::Modified)
+        && !content_changed
+        && mode_unchanged
+    {
+        return Ok(());
+    }
     write_diff_meta_line(
         stdout,
         colors,

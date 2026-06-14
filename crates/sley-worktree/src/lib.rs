@@ -6109,10 +6109,21 @@ fn restore_index_paths_from_entries(
         }
         for path in matched_paths {
             if let Some(entry) = source_entries.get(&path) {
-                index_entries.insert(
-                    path.clone(),
-                    restored_head_index_entry(worktree_root, db, &path, entry)?,
-                );
+                // git's pathspec reset (`reset_index` → diff against the source
+                // tree) only rewrites entries that actually CHANGE: an entry whose
+                // oid and mode already equal the source is left untouched, so its
+                // cached stat is preserved and `git diff-files` stays clean (t7102
+                // "resetting an unmodified path is a no-op"). Only when the entry
+                // genuinely changes does git write a fresh, stat-zeroed entry.
+                let unchanged = index_entries
+                    .get(&path)
+                    .is_some_and(|existing| existing.oid == entry.oid && existing.mode == entry.mode);
+                if !unchanged {
+                    index_entries.insert(
+                        path.clone(),
+                        restored_head_index_entry(worktree_root, db, &path, entry)?,
+                    );
+                }
             } else {
                 index_entries.remove(&path);
             }

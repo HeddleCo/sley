@@ -403,6 +403,12 @@ impl Index {
     }
 }
 
+/// The `CE_VALID`/assume-unchanged bit in [`IndexEntry::flags`] (git's
+/// `CE_VALID`). When set, git trusts the cached stat unconditionally and never
+/// re-checks the worktree file: `ce_match_stat` short-circuits to "unchanged"
+/// regardless of the on-disk stat (see `git update-index --assume-unchanged`).
+pub const INDEX_FLAG_VALID: u16 = 0x8000;
+
 /// The `extended` bit in [`IndexEntry::flags`]: when set, a second
 /// [`IndexEntry::flags_extended`] `u16` follows on disk (index v3+).
 pub const INDEX_FLAG_EXTENDED: u16 = 0x4000;
@@ -606,6 +612,61 @@ impl IndexStatCache {
         }
         Some(entry)
     }
+
+    /// git's `ce_match_stat` verdict for `entry` against the worktree file's
+    /// `metadata`, used by `diff-files` to decide which entries to select.
+    ///
+    /// Precedence (mirrors `read-cache.c:ie_match_stat`):
+    ///   1. `CE_VALID`/assume-unchanged set → [`StatVerdict::Clean`] (git trusts
+    ///      the cache blindly, regardless of the on-disk stat).
+    ///   2. mode or cached stat mismatch → [`StatVerdict::Dirty`]. A zeroed/invalid
+    ///      cached stat (e.g. a freshly `rm --cached`-then-`reset --no-refresh`
+    ///      entry, whose ctime/mtime are all zero) fails the stat-uptodate check
+    ///      and so is reported dirty — git does NOT re-hash to "rescue" it.
+    ///   3. stat matches but the entry is racily clean (its mtime is at/after the
+    ///      index's, so a same-second edit could be invisible) →
+    ///      [`StatVerdict::RacyNeedsContentCheck`]: the caller must re-hash the
+    ///      content and report dirty only if it actually differs from the cached
+    ///      oid (git's `ce_compare_data` in the racy branch).
+    ///   4. stat matches and is not racy → [`StatVerdict::Clean`].
+    ///
+    /// This never reads or hashes the file; the racy content check is the caller's
+    /// responsibility (it owns the worktree-blob access).
+    pub fn index_entry_worktree_stat_verdict(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+    ) -> StatVerdict {
+        if entry.flags & INDEX_FLAG_VALID != 0 {
+            return StatVerdict::Clean;
+        }
+        if entry.mode != worktree_metadata_mode(worktree_metadata) {
+            return StatVerdict::Dirty;
+        }
+        if !index_entry_stat_is_uptodate(entry, worktree_metadata) {
+            return StatVerdict::Dirty;
+        }
+        if self.is_racily_clean(entry) {
+            return StatVerdict::RacyNeedsContentCheck;
+        }
+        StatVerdict::Clean
+    }
+}
+
+/// The outcome of [`IndexStatCache::index_entry_worktree_stat_verdict`] — git's
+/// `ce_match_stat` result, split so the caller can resolve the racy case by a
+/// content re-hash without this crate needing worktree-blob access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatVerdict {
+    /// The cached stat proves the entry unchanged (or `CE_VALID` is set): no
+    /// content check needed, the entry is clean.
+    Clean,
+    /// Mode or stat mismatch (including a zeroed/invalid cached stat): the entry
+    /// is changed without any content re-hash.
+    Dirty,
+    /// Stat matches but the entry is racily clean: the caller must compare the
+    /// worktree content to the cached oid to decide.
+    RacyNeedsContentCheck,
 }
 
 /// Stage-0 index stat data that can prove a worktree path clean without

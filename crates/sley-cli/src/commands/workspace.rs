@@ -23,6 +23,9 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
     let mut intent_to_add = false;
+    // git's `reset --mixed` refreshes the index stat-cache by default; `--no-refresh`
+    // leaves the freshly-restored entries stat-dirty so `git diff-files` shows them.
+    let mut refresh = true;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if !parsing_options {
@@ -45,10 +48,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
-            // sley's diff-files compares content rather than trusting the cached
-            // stat, so --[no-]refresh is accepted but has no observable effect
-            // (the post-reset index is already content-accurate). Tracked: cell 28.
-            "--refresh" | "--no-refresh" | "--no-recurse-submodules" => {}
+            // A whole-tree `--mixed` reset restores index entries with a zeroed
+            // cached stat (see `restored_head_index_entry`). git refreshes them
+            // by default (re-stat + clear the stat-dirty state for unchanged
+            // content) so `git diff-files` is clean; `--no-refresh` leaves them
+            // stat-dirty so diff-files reports them `M` (t7102 cell 28).
+            "--refresh" => refresh = true,
+            "--no-refresh" => refresh = false,
+            "--no-recurse-submodules" => {}
             "--mixed" => mode = ResetMode::Mixed,
             "--soft" => mode = ResetMode::Soft,
             "--hard" => mode = ResetMode::Hard,
@@ -253,6 +260,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if intent_to_add && !ita_candidates.is_empty() {
             apply_reset_intent_to_add(&git_dir, format, &ita_candidates)?;
         }
+        // git's `--mixed` reset refreshes the index by default: the restored
+        // entries carry a zeroed cached stat, so without a refresh `git diff-files`
+        // would report every unchanged tracked file as `M`. The refresh re-stats
+        // each entry and clears the stat-dirty state where content still matches.
+        // `--no-refresh` skips it, leaving the entries stat-dirty (t7102 cell 28).
+        if refresh {
+            refresh_reset_index(&worktree_root, &git_dir, format)?;
+        }
         update_reset_head_ref(
             &git_dir,
             format,
@@ -353,11 +368,36 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if let Ok(old_head) = resolve_revision(&git_dir, format, "HEAD") {
             write_reset_orig_head(&git_dir, &old_head, format)?;
         }
+        // Whole-tree `--mixed` refreshes the stat-cache by default (see the
+        // single-positional path above); `--no-refresh` leaves it stat-dirty.
+        if refresh {
+            refresh_reset_index(&worktree_root, &git_dir, format)?;
+        }
         sley_sequencer::replay::remove_branch_state(&git_dir);
     }
     if !quiet {
         print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
     }
+    Ok(())
+}
+
+/// Refresh the index stat-cache after a whole-tree `--mixed` reset (git's default
+/// `--refresh` behaviour). The reset restores entries with a zeroed cached stat;
+/// this re-stats each one and clears the stat-dirty state where content still
+/// matches, so `git diff-files` reports a clean index. Mirrors git's
+/// `refresh_index` call in `builtin/reset.c`: quiet (no "needs update" output, and
+/// content mismatches are not an error — they are genuine worktree changes) and
+/// tolerant of missing files (those are deletions, reported elsewhere).
+fn refresh_reset_index(worktree_root: &Path, git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    sley_worktree::refresh_index_paths(
+        worktree_root,
+        git_dir,
+        format,
+        &[],
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
     Ok(())
 }
 

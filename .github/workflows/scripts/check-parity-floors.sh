@@ -91,6 +91,32 @@
 # cell 14 (checkout -m dep), 23 (pull FF ORIG_HEAD), 28 (--no-refresh needs
 # diff-files to honor the stat-cache dirty flag). Neighbors held: t7508-status=86,
 # t2020-checkout-detach=16, t7060-wtstatus=7. No workspace test regressed (2171/0).
+# reset-refresh wave (2026-06-14, parity/reset-refresh): t7102-reset 36 -> 37 (cell
+# 28 "--mixed --[no-]refresh sets refresh behavior") via two coupled pieces:
+# (1) `git diff-files` now selects changed paths by the cached *stat* (git's
+# ce_match_stat), not by content — it does NOT refresh the index, so a stat-dirty
+# entry with unchanged content (a touched file, or a freshly `rm --cached`-then-
+# `reset --no-refresh` entry with a zeroed cached stat) is reported `M` in
+# raw/name-status/name-only and sets --quiet/--exit-code rc=1, while patch/stat
+# (content-based) render an empty hunk. A dedicated diff-files engine layers this
+# over the content diff; porcelain `git diff` (which refreshes first) keeps the
+# plain content engine. A racily-clean entry is re-hashed (git's ce_compare_data)
+# so a touched-then-re-`add`ed file stays clean. (2) `reset --[no-]refresh` threaded
+# through cmd_reset: a whole-tree --mixed reset refreshes the stat-cache by default
+# (clearing the stat-dirty state for unchanged content), --no-refresh leaves it
+# dirty. Supporting fixes: pathspec reset preserves the existing index entry+stat
+# for unchanged paths (t7102 cell 26 "resetting an unmodified path is a no-op"); and
+# `git add` now re-stats the paths it touches (refresh_index_after_add) so a
+# touched-but-content-unchanged tracked file is stamped clean (t2200 cells 14/15),
+# while --chmod skips the refresh to preserve its explicit index mode. Remaining
+# t7102 fail: cell 14 (checkout -m dep). Neighbors held (measured == floor, none
+# regressed vs main): t7508-status=86, t2020-checkout-detach=16, t7506-status-
+# submodule=28, t4013-diff-various=133, t4015-diff-whitespace=55, t4018-diff-
+# funcname=287, t4034-diff-words=64, t4045-diff-relative=29, t4047-diff-dirstat=41,
+# t4052-stat-output=76, t4027-diff-submodule=18, t2107-update-index-basic=10,
+# t3000-ls-files-others=15; unfloored held: t2200-add-update=17, t3903-stash=22,
+# t4006-diff-mode=7, t4011-diff-symlink=0, t7060-wtstatus=7, t7063-status-untracked-
+# cache=14. No workspace test regressed (2171/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -173,7 +199,7 @@ declare -A FLOOR=(
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=86
     [t4027-diff-submodule.sh]=18
-    [t7102-reset.sh]=36
+    [t7102-reset.sh]=37
 )
 
 fail=0
