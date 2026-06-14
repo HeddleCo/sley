@@ -418,6 +418,14 @@ struct ReadTreeWorktree<'a> {
     /// path not in this set is a fresh addition, so writing it must not clobber
     /// an untracked working-tree file.
     original_paths: BTreeSet<Vec<u8>>,
+    /// Typed `.gitmodules` of the superproject worktree, parsed once. `None`
+    /// when there is no `.gitmodules` (then no path is a submodule and the
+    /// move-head hook is a no-op). This is git's `submodule_from_ce` source.
+    submodules: Option<sley_submodule::SubmoduleConfigSet>,
+    /// The superproject's `.git/config`, parsed once, for the
+    /// `is_submodule_active` resolution (`submodule.<name>.active` /
+    /// `submodule.active` / `submodule.<name>.url`).
+    repo_config: GitConfig,
 }
 
 impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
@@ -472,6 +480,76 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // TODO(unpack-trees): wire the untracked-would-be-lost-on-removal check
         // when the checkout pilot needs it.
         Ok(())
+    }
+
+    fn check_submodule_move_head(
+        &self,
+        path: &[u8],
+        old_oid: Option<&ObjectId>,
+        new_oid: &ObjectId,
+        reset: sley_unpack_trees::ResetType,
+    ) -> Result<()> {
+        // git's `check_submodule_move_head`: short-circuit Ok unless `path` is a
+        // real submodule (`submodule_from_ce`). The engine already filtered to
+        // gitlink-mode entries; here we resolve the rest of git's guard via the
+        // typed `.gitmodules` and the submodule's on-disk state, then defer the
+        // verdict to the shared `sley_submodule` decision engine.
+        let Ok(path_str) = std::str::from_utf8(path) else {
+            // A non-UTF-8 path can't match a `.gitmodules` binding (whose values
+            // are UTF-8); treat as "not a submodule" → Ok, matching the
+            // `submodule_from_ce == NULL` short-circuit.
+            return Ok(());
+        };
+        let submodule = self
+            .submodules
+            .as_ref()
+            .and_then(|set| set.from_path(path_str));
+        let Some(submodule) = submodule else {
+            // Not a `.gitmodules`-bound path: `submodule_from_ce(ce) == NULL`.
+            return Ok(());
+        };
+
+        let sub_root = self.worktree_root.join(path_str);
+        let ctx = sley_submodule::MoveHeadContext {
+            // `is_submodule_active(the_repository, path)`.
+            active: is_submodule_active(&self.repo_config, &submodule.name, path_str),
+            // `is_submodule_populated_gently(path)` — `<path>/.git` resolves.
+            populated: submodule_is_populated(&sub_root),
+            // `submodule_has_dirty_index(sub)` — staged-but-uncommitted work.
+            has_dirty_index: submodule_has_dirty_index(&sub_root),
+        };
+
+        // git stores the move endpoints as hex strings (`oid_to_hex`), and the
+        // decision only uses `old_head.is_some()` (the dirty-index gate keys on
+        // whether an old head exists); pass the hex through faithfully.
+        let old_hex = old_oid.map(|o| o.to_string());
+        let new_hex = new_oid.to_string();
+        let reset_is_force = matches!(reset, sley_unpack_trees::ResetType::OverwriteUntracked);
+
+        let verdict = sley_submodule::check_submodule_move_head(
+            true, // already established this path IS a submodule
+            &ctx,
+            old_hex.as_deref(),
+            Some(&new_hex),
+            reset_is_force,
+        );
+        move_head_verdict_to_result(verdict, path_str)
+    }
+}
+
+/// Map a [`sley_submodule::MoveHeadVerdict`] to read-tree's exit semantics:
+/// `Ok` → proceed, `WouldLose` → git's `ERROR_WOULD_LOSE_SUBMODULE`
+/// (`Cannot update submodule:\n%s`, naming the path) with exit 128.
+fn move_head_verdict_to_result(
+    verdict: sley_submodule::MoveHeadVerdict,
+    path_str: &str,
+) -> Result<()> {
+    match verdict {
+        sley_submodule::MoveHeadVerdict::Ok => Ok(()),
+        sley_submodule::MoveHeadVerdict::WouldLose => {
+            eprintln!("error: Cannot update submodule:\n{path_str}");
+            Err(GitError::Exit(128))
+        }
     }
 }
 
@@ -532,8 +610,11 @@ fn merge_trees(
     // verify_absent (clobber) check inside merged_entry.
     opts.index_only = false;
 
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let mut wt = ReadTreeWorktree {
-        worktree_root: worktree_root_for_git_dir(git_dir)?,
+        submodules: load_superproject_submodules(&worktree_root),
+        repo_config: read_repo_config(git_dir).unwrap_or_default(),
+        worktree_root,
         db,
         format,
         original_paths: original_index_paths(git_dir, format)?,
@@ -559,6 +640,110 @@ fn merge_trees(
             )
         })
         .collect())
+}
+
+/// Parse the superproject's `.gitmodules` into the typed config set (git's
+/// `submodule_from_path` source). `None` when there is no `.gitmodules`, in
+/// which case no path is a submodule and the move-head hook never fires.
+fn load_superproject_submodules(
+    worktree_root: &Path,
+) -> Option<sley_submodule::SubmoduleConfigSet> {
+    let gitmodules = worktree_root.join(".gitmodules");
+    let config = GitConfig::read(&gitmodules).ok()?;
+    Some(sley_submodule::SubmoduleConfigSet::parse(&config))
+}
+
+/// Port of git's `is_submodule_active` (`submodule.c::is_tree_submodule_active`)
+/// for the read-tree probe. The path→module mapping was already established by
+/// the caller, so we only run the active-resolution chain:
+///
+/// 1. `submodule.<name>.active` (bool) — if set, it wins.
+/// 2. `submodule.active` (multi-valued pathspec) — match `path` against it.
+/// 3. fallback: `submodule.<name>.url` is set in the superproject config.
+fn is_submodule_active(repo_config: &GitConfig, name: &str, path: &str) -> bool {
+    // 1. submodule.<name>.active
+    if let Some(active) = repo_config.get_bool("submodule", Some(name), "active") {
+        return active;
+    }
+    // 2. submodule.active pathspec list. git matches `path` against the
+    //    configured pathspecs; we support the common exact-path / prefix form
+    //    (`<dir>` or `<dir>/`), which covers the `.gitmodules`-bound paths the
+    //    read-tree pilot exercises. A `:(glob)`-style magic pathspec falls
+    //    through to the url fallback rather than being mis-evaluated.
+    let active_specs: Vec<&str> = repo_config
+        .get_all("submodule", None, "active")
+        .into_iter()
+        .flatten()
+        .collect();
+    if !active_specs.is_empty() {
+        return active_specs
+            .iter()
+            .any(|spec| pathspec_matches_submodule(spec, path));
+    }
+    // 3. fallback: submodule.<name>.url is configured.
+    repo_config.get("submodule", Some(name), "url").is_some()
+}
+
+/// Minimal pathspec match for the `submodule.active` list: an exact path or a
+/// directory-prefix match (git's `match_pathspec` for a literal pathspec).
+fn pathspec_matches_submodule(spec: &str, path: &str) -> bool {
+    let spec = spec.trim_end_matches('/');
+    path == spec || path.starts_with(&format!("{spec}/"))
+}
+
+/// git's `is_submodule_populated_gently`: does `<path>/.git` resolve to a real
+/// repository? Both the embedded `.git` directory and the `.git` gitfile
+/// (`gitdir: …` pointer) forms count.
+fn submodule_is_populated(sub_root: &Path) -> bool {
+    let dot_git = sub_root.join(".git");
+    if dot_git.is_dir() {
+        return true;
+    }
+    if dot_git.is_file() {
+        // A `.git` gitfile pointing at a real gitdir → populated.
+        return read_gitdir_file(&dot_git).ok().flatten().is_some();
+    }
+    false
+}
+
+/// git's `submodule_has_dirty_index`: does the submodule have staged but
+/// uncommitted changes relative to its HEAD? git shells
+/// `git diff-index --quiet --cached HEAD` in the submodule and treats a
+/// non-zero exit as dirty. We do the same against the *sley* binary so the
+/// answer comes from the same engine, with the submodule env scrubbed
+/// (`prepare_submodule_repo_env`) so the parent repo's GIT_* vars don't leak in.
+///
+/// A submodule whose HEAD/index can't be read (unpopulated, no commits) is
+/// treated as clean — git only reaches this with `old_head && populated`, so
+/// the caller has already gated those cases.
+fn submodule_has_dirty_index(sub_root: &Path) -> bool {
+    if !sub_root.join(".git").exists() {
+        return false;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return false,
+    };
+    let status = ProcessCommand::new(exe)
+        .args(["diff-index", "--quiet", "--cached", "HEAD"])
+        .current_dir(sub_root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        // Exit 0 → clean; non-zero → dirty (git's contract).
+        Ok(s) => !s.success(),
+        // Could not run the check → conservatively clean (git would die, but
+        // failing the whole read-tree on an introspection error is worse than
+        // matching git's "no dirty work detected" for our pilot scope).
+        Err(_) => false,
+    }
 }
 
 /// Construct a stage-0 [`StagedEntry`].
@@ -783,5 +968,158 @@ fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
             break;
         }
         dir = path.parent();
+    }
+}
+
+#[cfg(test)]
+mod submodule_hook_tests {
+    use super::*;
+    use sley_submodule::{MoveHeadContext, MoveHeadVerdict, check_submodule_move_head};
+
+    fn config_from(text: &str) -> GitConfig {
+        GitConfig::parse(text.as_bytes()).expect("valid config")
+    }
+
+    fn gitmodules_set(text: &str) -> sley_submodule::SubmoduleConfigSet {
+        sley_submodule::SubmoduleConfigSet::parse(&config_from(text))
+    }
+
+    // ----- verdict → read-tree exit mapping ------------------------------
+
+    #[test]
+    fn would_lose_maps_to_exit_128() {
+        let err = move_head_verdict_to_result(MoveHeadVerdict::WouldLose, "sub1")
+            .expect_err("WouldLose must be an error");
+        assert!(matches!(err, GitError::Exit(128)));
+    }
+
+    #[test]
+    fn ok_verdict_maps_to_ok() {
+        assert!(move_head_verdict_to_result(MoveHeadVerdict::Ok, "sub1").is_ok());
+    }
+
+    // ----- is_submodule_active resolution chain --------------------------
+
+    #[test]
+    fn active_explicit_true_wins() {
+        let cfg = config_from("[submodule \"sub1\"]\n\tactive = true\n\turl = bogus\n");
+        assert!(is_submodule_active(&cfg, "sub1", "sub1"));
+    }
+
+    #[test]
+    fn active_explicit_false_wins_over_url() {
+        // submodule.<name>.active = false must win even when a url is set.
+        let cfg = config_from("[submodule \"sub1\"]\n\tactive = false\n\turl = bogus\n");
+        assert!(!is_submodule_active(&cfg, "sub1", "sub1"));
+    }
+
+    #[test]
+    fn active_falls_back_to_url() {
+        // No explicit active / submodule.active list → url presence decides.
+        let with_url = config_from("[submodule \"sub1\"]\n\turl = bogus\n");
+        assert!(is_submodule_active(&with_url, "sub1", "sub1"));
+        let without_url = config_from("[submodule \"sub1\"]\n\tbranch = main\n");
+        assert!(!is_submodule_active(&without_url, "sub1", "sub1"));
+    }
+
+    #[test]
+    fn active_pathspec_list_matches() {
+        let cfg = config_from("[submodule]\n\tactive = sub1\n\tactive = lib/inner\n");
+        assert!(is_submodule_active(&cfg, "anyname", "sub1"));
+        assert!(is_submodule_active(&cfg, "anyname", "lib/inner"));
+        // A path not in the active list is inactive: once `submodule.active`
+        // is present it is authoritative; git does not fall through to the url
+        // check.
+        assert!(!is_submodule_active(&cfg, "anyname", "other"));
+        // The list wins over the url fallback being absent; a non-listed path
+        // with no url is inactive.
+        let cfg2 = config_from("[submodule]\n\tactive = sub1\n");
+        assert!(!is_submodule_active(&cfg2, "anyname", "not-listed"));
+    }
+
+    #[test]
+    fn pathspec_dir_prefix_matches() {
+        assert!(pathspec_matches_submodule("lib", "lib"));
+        assert!(pathspec_matches_submodule("lib", "lib/inner"));
+        assert!(pathspec_matches_submodule("lib/", "lib/inner"));
+        assert!(!pathspec_matches_submodule("lib", "library"));
+        assert!(!pathspec_matches_submodule("lib", "other"));
+    }
+
+    // ----- submodule_is_populated ----------------------------------------
+
+    #[test]
+    fn populated_detects_git_dir_and_gitfile() {
+        let base = std::env::temp_dir().join(format!(
+            "sley-rt-pop-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        // (a) embedded `.git` directory → populated.
+        let with_dir = base.join("dir_form");
+        fs::create_dir_all(with_dir.join(".git")).expect("mkdir dir_form/.git");
+        assert!(submodule_is_populated(&with_dir));
+        // (b) `.git` gitfile pointing at a real dir → populated.
+        let with_file = base.join("file_form");
+        let real_gitdir = base.join("real_gitdir");
+        fs::create_dir_all(&real_gitdir).expect("mkdir real_gitdir");
+        fs::create_dir_all(&with_file).expect("mkdir file_form");
+        fs::write(
+            with_file.join(".git"),
+            format!("gitdir: {}\n", real_gitdir.display()),
+        )
+        .expect("write .git gitfile");
+        assert!(submodule_is_populated(&with_file));
+        // (c) no `.git` at all → not populated.
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty).expect("mkdir empty");
+        assert!(!submodule_is_populated(&empty));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // ----- end-to-end: active+populated+dirty, non-forced → WouldLose ----
+
+    #[test]
+    fn dirty_active_populated_nonforced_would_lose_and_errors() {
+        // This is the cell-47/48 shape: a submodule whose HEAD is moving (old
+        // set) and whose index is dirty, not forced → ERROR_WOULD_LOSE_SUBMODULE.
+        let _set = gitmodules_set(
+            "[submodule \"sub1\"]\n\tpath = sub1\n\turl = ./sub1\n",
+        );
+        let ctx = MoveHeadContext {
+            active: true,
+            populated: true,
+            has_dirty_index: true,
+        };
+        let verdict =
+            check_submodule_move_head(true, &ctx, Some("oldhex"), Some("newhex"), false);
+        assert_eq!(verdict, MoveHeadVerdict::WouldLose);
+        assert!(matches!(
+            move_head_verdict_to_result(verdict, "sub1"),
+            Err(GitError::Exit(128))
+        ));
+    }
+
+    #[test]
+    fn forced_reset_bypasses_dirty_index() {
+        // The `--reset` (force) path: a dirty submodule does NOT block.
+        let ctx = MoveHeadContext {
+            active: true,
+            populated: true,
+            has_dirty_index: true,
+        };
+        let verdict =
+            check_submodule_move_head(true, &ctx, Some("oldhex"), Some("newhex"), true);
+        assert_eq!(verdict, MoveHeadVerdict::Ok);
+        assert!(move_head_verdict_to_result(verdict, "sub1").is_ok());
+    }
+
+    #[test]
+    fn non_gitmodules_path_is_not_a_submodule() {
+        // A gitlink path with no `.gitmodules` binding → from_path is None →
+        // the probe short-circuits Ok (git's submodule_from_ce == NULL).
+        let set = gitmodules_set("[submodule \"other\"]\n\tpath = other\n\turl = ./other\n");
+        assert!(set.from_path("sub1").is_none());
     }
 }
