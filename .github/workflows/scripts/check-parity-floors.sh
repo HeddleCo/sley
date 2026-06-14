@@ -61,6 +61,25 @@
 # --ignore-if-in-upstream chain (cells #3/4/6/7) that leaves rebuild-1 empty —
 # they are NOT a cover-letter gap. No diff/log floor regressed (t4013/t4015/
 # t4018/t4202/t4034/t4045/t4047/t4027 all held; render.rs untouched).
+# header-encoding + threading wave (2026-06-14, parity/fmtencode):
+# t4014-format-patch 113->142 (+29 — built the email header-encoding + message-
+# threading paths in format_patch.rs). Encoding (15 cells, #106/107/109-118/121/
+# 141/142): a git-faithful add_rfc2047 (Q-encoded =?UTF-8?q?...?= words folded at
+# 76 cols, multibyte never split) for Subject (RFC2047_SUBJECT) and From display
+# names (RFC2047_ADDRESS); RFC 822 quoting (needs_rfc822_quoting/add_rfc822_quoted)
+# + strbuf_add_wrapped_text-equivalent folding of long ASCII/quoted From names;
+# multi-line subject collapse (format_subject); the 8-bit Content-Transfer-Encoding
+# block (non-ASCII body / in-body From / --signoff committer-ident). Threading
+# (14 cells, #55-67/78): Message-ID generation (<oid>.<ts>.git.<email>), the
+# In-Reply-To/References chain, --thread[=shallow|deep]/--no-thread/format.thread,
+# --in-reply-to=<msgid> (clean_message_id), replaying git's per-mail
+# shallow-vs-deep ref state machine (build_thread_plan). All work is contained in
+# crates/sley-cli/src/commands/format_patch.rs. The remaining #161-185 cover-from-
+# description / #197-208 --base / #214-220 interdiff / #191-196 outputDirectory /
+# #49-53 reroll cells are pre-existing, out-of-scope backlog; #16/20/21/23/24 are
+# upstream `# TODO known breakage` (rfc822/rfc2047 To/Cc wrapping). No diff/log
+# floor regressed (t4013=133/t4015=55/t4018=287/t4052=76/t4202=56/t4034=64/
+# t4045=29/t4047=41/t4027=18 all held; render.rs/diff paths untouched).
 # fsck wave (2026-06-14, parity/fsck): t1450-fsck added at 67 (was 22 — built
 # the object-content checker in sley-fsck/content.rs, mirroring git's fsck.c
 # commit/tree/tag buffer validation: fsck_ident, verify_headers, the tree
@@ -201,7 +220,7 @@ declare -A FLOOR=(
     [t5327-multi-pack-bitmaps-rev.sh]=308
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
-    [t4014-format-patch.sh]=113
+    [t4014-format-patch.sh]=142
     [t4052-stat-output.sh]=76
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41
