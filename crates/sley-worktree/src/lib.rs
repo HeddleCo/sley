@@ -7112,12 +7112,20 @@ pub fn remove_index_and_worktree_paths(
         .into_iter()
         .filter(|entry| !selected.contains(entry.path.as_bytes()))
         .collect::<Vec<_>>();
+    // Removing entries invalidates the cache-tree (`TREE` extension): a stale
+    // cached subtree id makes `git diff --cached`/`git status` short-circuit the
+    // comparison of an affected directory against HEAD and miss the deletion
+    // (observed: `git rm dir/nested.txt` left a valid `dir/` cache-tree, so the
+    // deletion never showed in the cached diff). Git invalidates the cache-tree
+    // on any index mutation; drop it so it is rebuilt on the next write, exactly
+    // like the `add` path does above.
+    let extensions = index_extensions_without_cache_tree(&index_extensions);
     fs::write(
         index_path,
         Index {
             version: index_version,
             entries,
-            extensions: index_extensions,
+            extensions,
             checksum: None,
         }
         .write(format)?,
