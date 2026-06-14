@@ -148,6 +148,13 @@ enum CompiledPattern {
 
 impl GrepMatcher {
     pub(crate) fn compile(config: GrepCompileConfig<'_>) -> Result<Self> {
+        Self::compile_with_error_context(config, "command line")
+    }
+
+    pub(crate) fn compile_with_error_context(
+        config: GrepCompileConfig<'_>,
+        error_context: &str,
+    ) -> Result<Self> {
         let mut patterns = Vec::new();
         for raw in config.patterns {
             let compiled = match config.kind {
@@ -165,7 +172,7 @@ impl GrepMatcher {
                         Regex::compile(raw, mode, config.ignore_case, config.word).map_err(
                             |err| {
                                 report_regex_error(
-                                    "command line",
+                                    error_context,
                                     raw,
                                     config.diagnostic_verbosity,
                                     &err,
@@ -185,6 +192,14 @@ impl GrepMatcher {
 
     pub(crate) fn pattern_count(&self) -> usize {
         self.patterns.len()
+    }
+
+    pub(crate) fn matches_any(&self, haystack: &[u8]) -> bool {
+        (0..self.pattern_count()).any(|idx| self.find_idx(idx, haystack, 0).is_some())
+    }
+
+    pub(crate) fn matches_all(&self, haystack: &[u8]) -> bool {
+        (0..self.pattern_count()).all(|idx| self.find_idx(idx, haystack, 0).is_some())
     }
 
     /// Find the leftmost match of pattern `idx` starting at `from`.
@@ -964,7 +979,6 @@ impl RegexParser<'_> {
     }
 
     fn parse_class(&mut self) -> Result<Node> {
-        let start = self.pos;
         self.pos += 1;
         let negate = matches!(self.peek(), Some(b'^'));
         if negate {
@@ -974,8 +988,7 @@ impl RegexParser<'_> {
         let mut first = true;
         loop {
             let Some(byte) = self.peek() else {
-                self.pos = start + 1;
-                return Ok(Node::Literal(b'['));
+                return Err(GitError::Command("unbalanced [ in regex".into()));
             };
             if byte == b']' && !first {
                 self.pos += 1;
