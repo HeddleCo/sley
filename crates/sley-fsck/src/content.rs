@@ -334,11 +334,7 @@ fn verify_headers(body: &[u8]) -> Option<ContentFinding> {
                     true,
                 ));
             }
-            b'\n' => {
-                if body.get(i + 1) == Some(&b'\n') {
-                    return None;
-                }
-            }
+            b'\n' if body.get(i + 1) == Some(&b'\n') => return None,
             _ => {}
         }
     }
@@ -1170,10 +1166,7 @@ fn verify_ordered(
     if c1 == 0 && is_less_than_slash(c2) {
         candidates.push(name1.to_vec());
     } else if c2 == b'/' && is_less_than_slash(c1) {
-        loop {
-            let Some(f_name) = candidates.pop() else {
-                break;
-            };
+        while let Some(f_name) = candidates.pop() {
             // skip_prefix(name2, f_name)
             let Some(rest) = name2.strip_prefix(f_name.as_slice()) else {
                 continue;

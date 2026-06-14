@@ -1671,17 +1671,22 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     }
 
     // Explicit object-id arguments override the default ref-walk roots. git
-    // resolves each to an object; an explicit but unknown head is a hard error
-    // and does NOT fall back to all heads (t1450 "bogus head" case).
+    // resolves each to an object; an explicit but unknown head reports
+    // `invalid sha1 pointer` and does NOT fall back to all heads (t1450 "bogus
+    // head" case), so the rest of the walk sees no roots.
+    let mut explicit_root_error = false;
     let roots = if !explicit_oids.is_empty() {
         let mut resolved = Vec::new();
         for spec in &explicit_oids {
             match ObjectId::from_hex(format, spec) {
-                Ok(oid) => resolved.push(oid),
+                Ok(oid) if db.contains(&oid).unwrap_or(false) => resolved.push(oid),
+                Ok(oid) => {
+                    // An explicit head that does not name a stored object.
+                    eprintln!("error: {oid}: invalid sha1 pointer {oid}");
+                    explicit_root_error = true;
+                }
                 Err(_) => {
-                    return Err(GitError::Command(format!(
-                        "Invalid object name '{spec}'."
-                    )));
+                    return Err(GitError::Command(format!("Invalid object name '{spec}'.")));
                 }
             }
         }
@@ -1692,25 +1697,40 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         fsck_root_oids(&git_dir, format)?
     };
 
-    let mut object_ids = repository_object_ids(&git_dir, format)?;
+    // With explicit object-id roots, git checks only what is reachable from
+    // them — it does not enumerate every loose object (so a removed-but-
+    // unreferenced blob is not independently reported, and nothing is
+    // "dangling").
+    let mut object_ids = if explicit_oids.is_empty() {
+        repository_object_ids(&git_dir, format)?
+    } else {
+        Vec::new()
+    };
+    if !explicit_oids.is_empty() {
+        report_dangling = false;
+    }
     // Mirror builtin/fsck.c `fsck_loose`: probe every loose object file before the
     // connectivity walk, reporting corrupt or mismatched ones at `error:` level on
     // stderr (with git's path-form spelling) and excluding them from the object set
     // so they neither parse nor surface as dangling.
     let objects_dir_display = fsck_objects_dir_display(&git_dir, &cwd);
     let mut bad_loose = HashSet::new();
-    for oid in db.loose().object_ids()? {
-        let hex = oid.to_hex();
-        let display_path = format!("{objects_dir_display}/{}/{}", &hex[..2], &hex[2..]);
-        match db.loose().verify_object(&oid, &display_path)? {
-            None | Some(LooseObjectIntegrity::Ok) => {}
-            Some(LooseObjectIntegrity::HashMismatch { actual }) => {
-                eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
-                bad_loose.insert(oid);
-            }
-            Some(LooseObjectIntegrity::Corrupt) => {
-                eprintln!("error: {oid}: object corrupt or missing: {display_path}");
-                bad_loose.insert(oid);
+    // The loose-object integrity scan enumerates the whole object store, which
+    // git only does for a full fsck (no explicit roots).
+    if explicit_oids.is_empty() {
+        for oid in db.loose().object_ids()? {
+            let hex = oid.to_hex();
+            let display_path = format!("{objects_dir_display}/{}/{}", &hex[..2], &hex[2..]);
+            match db.loose().verify_object(&oid, &display_path)? {
+                None | Some(LooseObjectIntegrity::Ok) => {}
+                Some(LooseObjectIntegrity::HashMismatch { actual }) => {
+                    eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
+                    bad_loose.insert(oid);
+                }
+                Some(LooseObjectIntegrity::Corrupt) => {
+                    eprintln!("error: {oid}: object corrupt or missing: {display_path}");
+                    bad_loose.insert(oid);
+                }
             }
         }
     }
@@ -1730,19 +1750,27 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             severity,
         },
     );
-    // Notices (dangling/unreachable) go to stdout; issues (broken link, missing
-    // object, `error in`/`warning in` content findings) go to stderr — matching
-    // builtin/fsck.c's stream split.
+    // Match builtin/fsck.c's stream split: notices (dangling/unreachable) and
+    // connectivity complaints (broken link, missing, type mismatch) go to
+    // stdout; object-content findings (`error in`/`warning in`) go to stderr.
     for notice in &report.notices {
         println!("{}", notice.message);
     }
     for issue in &report.issues {
-        eprintln!("{}", issue.message);
+        match issue.stream {
+            sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
+            sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
+        }
     }
-    // git exits non-zero (1) when any *error*-severity problem is found;
-    // warning-only runs exit 0. A bad loose object also sets ERROR_OBJECT (= 1).
-    if !report.is_ok() || loose_errors {
-        Err(GitError::Exit(1))
+    // git's exit status is the OR of its `ERROR_*` bits. The connectivity
+    // report contributes ERROR_OBJECT/REACHABLE/REFS; a bad loose object or a
+    // bogus explicit head sets ERROR_OBJECT.
+    let mut exit_bits = report.exit_code();
+    if loose_errors || explicit_root_error {
+        exit_bits |= sley_fsck::ERROR_OBJECT;
+    }
+    if exit_bits != 0 {
+        Err(GitError::Exit(exit_bits))
     } else {
         Ok(())
     }
