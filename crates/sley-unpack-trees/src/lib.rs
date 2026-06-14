@@ -76,6 +76,15 @@ impl CacheEntry {
     }
 }
 
+/// git's `S_ISGITLINK(mode)`: the entry is a submodule (gitlink) when the file
+/// type bits of its raw git mode are `0o160000`. `CacheEntry::mode` holds the
+/// same raw git mode git stores (`0o100644`, `0o120000`, `0o160000`, …), so the
+/// file-type mask matches how every other mode comparison in this crate reads
+/// it.
+fn is_gitlink(mode: u32) -> bool {
+    (mode & 0o170000) == 0o160000
+}
+
 /// git's `same()`: two slots are equal iff both absent, or both present with
 /// equal mode and oid. (Upstream additionally treats either side being
 /// `CE_CONFLICTED` as "not same"; conflictedness is carried by the caller's
@@ -176,6 +185,29 @@ pub trait WorktreeProbe {
     /// git's `verify_absent(… ERROR_WOULD_LOSE_UNTRACKED_REMOVED …)`: would
     /// removing `path` discard an untracked working-tree file at that name?
     fn verify_absent_remove(&self, path: &[u8], reset: ResetType) -> Result<()>;
+
+    /// git's `check_submodule_move_head` (`unpack-trees.c`): would moving this
+    /// gitlink's HEAD from `old_oid` (`None` when the submodule is newly
+    /// appearing in the target tree) to `new_oid` lose uncommitted submodule
+    /// work? The engine only calls this for entries whose mode is a gitlink
+    /// (`S_ISGITLINK`); the probe owns the rest of git's guard condition
+    /// (`submodule_from_ce(ce) && file_exists(ce->name)`), returning `Ok(())`
+    /// when the path is not a real, populated submodule.
+    ///
+    /// Returns `Ok(())` when the move is safe and an error
+    /// (git's `ERROR_WOULD_LOSE_SUBMODULE`) when it would discard work. The
+    /// default is `Ok(())` so index-only / non-submodule-aware consumers (and
+    /// [`NullWorktree`]) keep compiling and behaving exactly as before.
+    fn check_submodule_move_head(
+        &self,
+        path: &[u8],
+        old_oid: Option<&ObjectId>,
+        new_oid: &ObjectId,
+        reset: ResetType,
+    ) -> Result<()> {
+        let _ = (path, old_oid, new_oid, reset);
+        Ok(())
+    }
 }
 
 /// A [`WorktreeProbe`] that always answers "safe" — the correct behaviour for
@@ -609,9 +641,15 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
             if opts.merge && opts.update && !opts.index_only {
                 probe.verify_absent_overwrite(path, &merge, opts.reset)?;
             }
-            // TODO(unpack-trees): submodule check_submodule_move_head(NULL→oid)
-            // when submodule_from_ce(ce) && file_exists(ce->name). A sibling
-            // agent is building the submodule engine those hooks call.
+            // git's `check_submodule_move_head(o, ce, NULL, oid_to_hex(&ce->oid))`:
+            // a submodule coming into existence (old == NULL). The cheap gitlink
+            // mode gate is ours; the `submodule_from_ce && file_exists` half is
+            // the probe's (it answers Ok when the path is not a real, populated
+            // submodule). The default probe impl is a no-op, so index-only
+            // consumers are unaffected.
+            if is_gitlink(merge.mode) {
+                probe.check_submodule_move_head(path, None, &merge.oid, opts.reset)?;
+            }
         }
         Some(old) => {
             // Re-use the old entry directly when identical (keeps stat info and
@@ -621,8 +659,14 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
             } else if opts.merge && !opts.index_only {
                 probe.verify_uptodate(path, old)?;
             }
-            // TODO(unpack-trees): submodule check_submodule_move_head(old→oid)
-            // when submodule_from_ce(ce) && file_exists(ce->name).
+            // git's `check_submodule_move_head(o, ce, oid_to_hex(&old->oid),
+            // oid_to_hex(&ce->oid))`: the gitlink's HEAD is moving from the old
+            // recorded commit to the new one. Same gitlink-mode gate; the probe
+            // owns `submodule_from_ce && file_exists`. Gate on the NEW entry's
+            // mode (the one being written) to mirror git's `S_ISGITLINK(ce->mode)`.
+            if is_gitlink(merge.mode) {
+                probe.check_submodule_move_head(path, Some(&old.oid), &merge.oid, opts.reset)?;
+            }
         }
     }
 
@@ -911,5 +955,169 @@ mod tests {
     /// Whether any path produced conflict stages (a stage > 0 entry).
     fn has_conflict(res: &UnpackTreesResult) -> bool {
         res.entries.iter().any(|e| e.entry.stage != 0)
+    }
+
+    // ----- submodule move-head hook --------------------------------------
+
+    /// Raw git mode for a gitlink (submodule) cache entry.
+    const GITLINK_MODE: u32 = 0o160000;
+
+    /// A probe that records every `check_submodule_move_head` call and, when
+    /// `reject_path` is set, returns git's `ERROR_WOULD_LOSE_SUBMODULE`-style
+    /// error for that path — letting a test assert both *that* the engine
+    /// invoked the hook (and with which args) and that the rejection
+    /// propagates out of `unpack_trees`.
+    #[derive(Default)]
+    struct RecordingProbe {
+        calls: std::cell::RefCell<Vec<(Vec<u8>, Option<ObjectId>, ObjectId, ResetType)>>,
+        reject_path: Option<Vec<u8>>,
+    }
+
+    impl WorktreeProbe for RecordingProbe {
+        fn verify_uptodate(&self, _path: &[u8], _ce: &CacheEntry) -> Result<()> {
+            Ok(())
+        }
+        fn verify_absent_overwrite(
+            &self,
+            _path: &[u8],
+            _merge: &CacheEntry,
+            _reset: ResetType,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn verify_absent_remove(&self, _path: &[u8], _reset: ResetType) -> Result<()> {
+            Ok(())
+        }
+        fn check_submodule_move_head(
+            &self,
+            path: &[u8],
+            old_oid: Option<&ObjectId>,
+            new_oid: &ObjectId,
+            reset: ResetType,
+        ) -> Result<()> {
+            self.calls.borrow_mut().push((
+                path.to_vec(),
+                old_oid.copied(),
+                *new_oid,
+                reset,
+            ));
+            if self.reject_path.as_deref() == Some(path) {
+                return Err(GitError::Exit(128));
+            }
+            Ok(())
+        }
+    }
+
+    /// A gitlink (mode 0o160000) entry flat map.
+    fn gitlink(items: &[(&[u8], u8)]) -> FlatTree {
+        items
+            .iter()
+            .map(|(p, b)| (p.to_vec(), (GITLINK_MODE, oid(*b))))
+            .collect()
+    }
+
+    #[test]
+    fn move_head_hook_fires_for_new_gitlink() {
+        // Empty index, tree adds a gitlink `sub` → the None arm of merged_entry
+        // must call check_submodule_move_head with old == None.
+        let index = flat(&[]);
+        let tree = gitlink(&[(b"sub", 7)]);
+        let probe = RecordingProbe::default();
+        let mut opts = opts();
+        opts.update = true; // exercise the -u worktree path too
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts, &probe).expect("oneway add gitlink");
+        let calls = probe.calls.borrow();
+        assert_eq!(calls.len(), 1, "exactly one move-head call");
+        assert_eq!(calls[0].0, b"sub".to_vec());
+        assert_eq!(calls[0].1, None, "old_oid is None for a new submodule");
+        assert_eq!(calls[0].2, oid(7), "new_oid is the tree's gitlink oid");
+    }
+
+    #[test]
+    fn move_head_hook_fires_for_changed_gitlink() {
+        // Index has gitlink `sub`@1, tree moves it to `sub`@2 → the Some(old)
+        // arm must call the hook with old == Some(1), new == 2.
+        let index = gitlink(&[(b"sub", 1)]);
+        let tree = gitlink(&[(b"sub", 2)]);
+        let probe = RecordingProbe::default();
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe)
+            .expect("oneway move gitlink head");
+        let calls = probe.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, b"sub".to_vec());
+        assert_eq!(calls[0].1, Some(oid(1)), "old_oid is the prior gitlink commit");
+        assert_eq!(calls[0].2, oid(2), "new_oid is the new gitlink commit");
+    }
+
+    #[test]
+    fn move_head_hook_not_fired_for_regular_file() {
+        // A plain blob change must NOT trigger the submodule hook.
+        let index = flat(&[(b"a", 1)]);
+        let tree = flat(&[(b"a", 2)]);
+        let probe = RecordingProbe::default();
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe).expect("oneway blob");
+        assert!(
+            probe.calls.borrow().is_empty(),
+            "non-gitlink entries skip the move-head hook"
+        );
+    }
+
+    #[test]
+    fn move_head_hook_not_fired_for_identical_gitlink() {
+        // Unchanged gitlink: oneway_merge's `same` fast-path keeps the entry
+        // without entering merged_entry, so the hook is not called (git only
+        // runs check_submodule_move_head inside merged_entry).
+        let index = gitlink(&[(b"sub", 5)]);
+        let tree = gitlink(&[(b"sub", 5)]);
+        let probe = RecordingProbe::default();
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe).expect("oneway same gitlink");
+        assert!(
+            probe.calls.borrow().is_empty(),
+            "an unchanged gitlink never reaches merged_entry"
+        );
+    }
+
+    #[test]
+    fn move_head_rejection_propagates() {
+        // A WouldLose verdict (probe returns Err) must abort the whole run.
+        let index = gitlink(&[(b"sub", 1)]);
+        let tree = gitlink(&[(b"sub", 2)]);
+        let probe = RecordingProbe {
+            reject_path: Some(b"sub".to_vec()),
+            ..RecordingProbe::default()
+        };
+        let err = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe)
+            .expect_err("a would-lose-submodule rejection aborts the merge");
+        assert!(matches!(err, GitError::Exit(128)));
+    }
+
+    #[test]
+    fn move_head_hook_carries_reset_flag() {
+        // `--reset` (OverwriteUntracked) must reach the probe so it can map to
+        // the FORCE flag of check_submodule_move_head.
+        let index = gitlink(&[(b"sub", 1)]);
+        let tree = gitlink(&[(b"sub", 2)]);
+        let probe = RecordingProbe::default();
+        let mut opts = opts();
+        opts.reset = ResetType::OverwriteUntracked;
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts, &probe).expect("oneway reset gitlink");
+        assert_eq!(
+            probe.calls.borrow()[0].3,
+            ResetType::OverwriteUntracked,
+            "reset type is forwarded to the move-head hook"
+        );
+    }
+
+    #[test]
+    fn null_worktree_default_hook_is_noop() {
+        // NullWorktree uses the trait default (Ok) for the new method, so a
+        // gitlink move through it succeeds silently — index-only consumers are
+        // unchanged.
+        let index = gitlink(&[(b"sub", 1)]);
+        let tree = gitlink(&[(b"sub", 2)]);
+        let res = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &NullWorktree)
+            .expect("NullWorktree default hook is a no-op");
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(res.entries[0].entry.oid, oid(2));
     }
 }
