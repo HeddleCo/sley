@@ -11,7 +11,7 @@
 //! content matches upstream exactly.
 
 use crate::*;
-use commands::grep::{Regex, RegexMode};
+use crate::grep_source::{Regex, RegexMode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
