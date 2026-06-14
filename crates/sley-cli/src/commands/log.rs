@@ -246,6 +246,63 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
     cmd_log_impl(&filtered, true)
 }
 
+fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
+    !compiled.tokens.is_empty()
+        && compiled.uses_oid()
+        && !compiled.uses_decorations()
+        && !compiled.uses_source()
+        && compiled.tokens.iter().all(|token| {
+            matches!(
+                token,
+                FormatToken::Literal(_)
+                    | FormatToken::Percent
+                    | FormatToken::OidFull
+                    | FormatToken::OidAbbrev
+                    | FormatToken::ParentsFull
+                    | FormatToken::ParentsAbbrev
+                    | FormatToken::Marker
+                    | FormatToken::Subject
+                    | FormatToken::SanitizedSubject
+                    | FormatToken::NoteName
+                    | FormatToken::ColorParen
+                    | FormatToken::ColorName(_)
+                    | FormatToken::Newline
+                    | FormatToken::HexByte(_)
+            )
+        })
+}
+
+fn log_commit_record_from_metadata(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    metadata: &sley_rev::CommitMetadata,
+) -> Result<sley_rev::CommitRecord> {
+    let mut record = log_commit_record_from_oid(db, format, metadata.oid)?;
+    record.parents.clone_from(&metadata.parents);
+    Ok(record)
+}
+
+fn log_commit_record_from_oid(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: ObjectId,
+) -> Result<sley_rev::CommitRecord> {
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            oid,
+            object.object_type.as_str()
+        )));
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(sley_rev::CommitRecord {
+        oid,
+        parents: commit.parents.clone(),
+        commit,
+    })
+}
+
 fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut setup_not = false;
@@ -1273,6 +1330,105 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 &mut line,
             )?;
             stdout.write_all(&line)?;
+            if final_newline {
+                stdout.write_all(term)?;
+            }
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+    if walk
+        && !graph
+        && line_prefix.is_none()
+        && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && pathspecs.is_empty()
+        && !full_history
+        && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
+            if log_limited_commit_format_supported(compiled))
+        && decoration == LogDecorationMode::Off
+        && !show_children
+        && excluded.is_empty()
+        && author_filters.is_none()
+        && committer_filters.is_none()
+        && grep_filters.is_none()
+        && max_age.is_none()
+        && min_age.is_none()
+        && min_parents.is_none()
+        && max_parents.is_none()
+        && let Some(limit) = max_count.map(|max| skip.saturating_add(max))
+        && limit > 0
+    {
+        let (compiled, final_newline) = match &output {
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => (compiled, *final_newline),
+            _ => unreachable!("limited commit fast path requires compiled output"),
+        };
+        let mut stdout = io::stdout();
+        let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
+        let context = LogFormatContext {
+            abbrev_len,
+            decorations: &HashMap::new(),
+            marker: '>',
+            dialect: LogFormatDialect::Log,
+            source: log_format_source.as_deref(),
+            date_mode: &date_mode,
+            source_oid: None,
+            describe: None,
+            color: false,
+            output_encoding: &output_encoding,
+        };
+        if skip == 0 && max_count == Some(1) && starts.len() == 1 {
+            let record = log_commit_record_from_oid(&db, format, starts[0])?;
+            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+            emit_compiled_log_format(
+                &record,
+                compiled,
+                &context,
+                &mut line,
+                0..compiled.tokens.len(),
+            )?;
+            let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
+            stdout.write_all(&out)?;
+            if final_newline {
+                stdout.write_all(term)?;
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
+        let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
+            &git_dir,
+            format,
+            &db,
+            starts.clone(),
+            first_parent,
+            limit,
+        )?;
+        let mut selected = metadata.into_iter().collect::<Vec<_>>();
+        if skip > 0 {
+            selected = selected.into_iter().skip(skip).collect();
+        }
+        selected.truncate(max_count.expect("limited log path requires max-count"));
+        if reverse {
+            selected.reverse();
+        }
+        for (index, metadata) in selected.iter().enumerate() {
+            if index > 0 && !final_newline {
+                stdout.write_all(term)?;
+            }
+            let record = log_commit_record_from_metadata(&db, format, metadata)?;
+            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+            emit_compiled_log_format(
+                &record,
+                compiled,
+                &context,
+                &mut line,
+                0..compiled.tokens.len(),
+            )?;
+            let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
+            stdout.write_all(&out)?;
             if final_newline {
                 stdout.write_all(term)?;
             }

@@ -1089,6 +1089,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             if options.detect_copies && optional_arg(option).is_none() {
                 options.find_copies_harder = true;
             }
+            options.detect_renames = true;
             options.detect_copies = true;
             options.inexact_renames = true;
             options.renames_explicit = true;
@@ -1100,6 +1101,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("find-copies-harder")) => {
             options.find_copies_harder = bool_value(option);
             if options.find_copies_harder {
+                options.detect_renames = true;
                 options.detect_copies = true;
                 options.inexact_renames = true;
             }

@@ -1316,7 +1316,13 @@ pub fn diff_name_status_head_worktree_with_rename_options(
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
+    let cache = worktree_blob_cache_for_entries(
+        worktree_root,
+        &head,
+        &worktree,
+        head.keys().chain(index.keys()),
+        options,
+    )?;
     let changes = diff_name_status_maps_with_renames(
         &head,
         &worktree,
@@ -1499,7 +1505,13 @@ pub fn diff_name_status_tree_worktree_with_rename_options(
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
+    let cache = worktree_blob_cache_for_entries(
+        worktree_root,
+        &tree,
+        &worktree,
+        tree.keys().chain(index.keys()),
+        options,
+    )?;
     let changes = diff_name_status_maps_with_renames(
         &tree,
         &worktree,
@@ -1572,7 +1584,8 @@ pub fn diff_name_status_index_worktree_with_rename_options(
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
+    let cache =
+        worktree_blob_cache_for_entries(worktree_root, &index, &worktree, index.keys(), options)?;
     diff_name_status_maps_with_renames(&index, &worktree, index.keys(), options, |oid| {
         cache_or_odb_blob(&cache, &db, oid)
     })
@@ -2936,17 +2949,58 @@ fn worktree_entry_for_path(
     Ok(Some(TrackedEntry { mode, oid }))
 }
 
-fn worktree_blob_cache_for_entries(
+fn worktree_blob_cache_for_entries<'a>(
     worktree_root: &Path,
-    entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
     options: RenameDetectionOptions,
 ) -> Result<HashMap<ObjectId, Vec<u8>>> {
     if !options.detect_inexact || !(options.base.detect_renames || options.base.detect_copies) {
         return Ok(HashMap::new());
     }
+    let base = options.base;
+    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    if base.detect_renames {
+        changes = detect_exact_renames(changes, left_entries, right_entries, base.rename_empty);
+    }
+    if base.detect_copies {
+        changes = detect_exact_copies(
+            changes,
+            left_entries,
+            right_entries,
+            base.find_copies_harder,
+            base.rename_empty,
+        );
+    }
+    let has_rename_source = base.detect_renames
+        && changes.iter().any(|entry| {
+            entry.status == NameStatus::Deleted
+                && entry
+                    .old_oid
+                    .as_ref()
+                    .is_some_and(|oid| base.rename_empty || !is_empty_blob_oid(oid))
+        });
+    let has_copy_source = base.detect_copies
+        && (base.find_copies_harder
+            || changes
+                .iter()
+                .any(|entry| matches!(entry.status, NameStatus::Deleted | NameStatus::Modified)));
+    if !has_rename_source && !has_copy_source {
+        return Ok(HashMap::new());
+    }
+    let candidate_oids = changes
+        .iter()
+        .filter(|entry| entry.status == NameStatus::Added)
+        .filter_map(|entry| entry.new_oid)
+        .filter(|oid| base.rename_empty || !is_empty_blob_oid(oid))
+        .collect::<BTreeSet<_>>();
+    if candidate_oids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let mut cache = HashMap::new();
-    for (git_path, entry) in entries {
-        if entry.mode == 0o160000 {
+    for (git_path, entry) in right_entries {
+        if entry.mode == 0o160000 || !candidate_oids.contains(&entry.oid) {
             continue;
         }
         let path = worktree_root.join(repo_path_to_path(git_path));

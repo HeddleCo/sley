@@ -253,10 +253,17 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         match value.trim().to_ascii_lowercase().as_str() {
             "false" | "no" | "off" | "0" => {
                 detect_renames = false;
+                detect_copies = false;
                 inexact_renames = false;
             }
             "copies" | "copy" => {
+                detect_renames = true;
                 detect_copies = true;
+                inexact_renames = true;
+            }
+            "true" | "yes" | "on" | "1" | "renames" => {
+                detect_renames = true;
+                inexact_renames = true;
             }
             _ => {}
         }
