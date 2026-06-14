@@ -1,11 +1,72 @@
+use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{ObjectType, TreeEntries, tree_entry_object_type};
 use sley_odb::ObjectReader;
+use sley_worktree::TreeAttributes;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write;
 
 const TAR_BLOCK_SIZE: usize = 512;
 const TAR_RECORD_SIZE: usize = 10 * 1024;
+
+/// Content-conversion context for `git archive` (the smudge / blob -> worktree
+/// direction): EOL `LF`->`CRLF` plus any configured `filter.<name>.smudge`
+/// driver, applied per `.gitattributes`.
+///
+/// Mirrors upstream `archive.c::object_file_to_archive`, which runs
+/// `convert_to_working_tree` on every regular-file blob. Attributes come from
+/// the *archived tree* (upstream sets `GIT_ATTR_INDEX` after unpacking the tree
+/// into a scratch index), captured once in [`TreeAttributes`] so the whole
+/// archive shares one attribute-source scan.
+///
+/// Build with [`ArchiveConvert::from_tree`] and pass it to
+/// [`write_tar_archive_with_convert`]; the plain [`write_tar_archive`] emits raw
+/// blob bytes (no conversion).
+///
+/// Not yet wired: `export-subst` (`$Format:…$` keyword substitution via
+/// `format_subst`) and the `ident` filter (`$Id$` expansion) — both are
+/// archive/convert features the underlying engine does not yet implement; see
+/// the `TODO(convert)` markers.
+pub struct ArchiveConvert<'a> {
+    config: &'a GitConfig,
+    attributes: TreeAttributes,
+}
+
+impl<'a> ArchiveConvert<'a> {
+    /// Capture the archived tree's attribute chain once. `attr_root` locates the
+    /// global config (worktree root for a non-bare repo, git dir for a bare
+    /// one), `git_dir` locates `info/attributes`, and `tree_oid` is the tree
+    /// being archived (its `.gitattributes` blobs govern conversion, matching
+    /// git's index-direction attribute lookup).
+    pub fn from_tree(
+        attr_root: impl AsRef<std::path::Path>,
+        git_dir: impl AsRef<std::path::Path>,
+        config: &'a GitConfig,
+        db: &sley_odb::FileObjectDatabase,
+        format: ObjectFormat,
+        tree_oid: &ObjectId,
+    ) -> Result<Self> {
+        Ok(Self {
+            config,
+            attributes: TreeAttributes::from_tree(attr_root, git_dir, db, format, tree_oid)?,
+        })
+    }
+
+    /// Apply the smudge conversion for a regular-file blob at tree-relative
+    /// `path`. Returns the original bytes (borrowed) when nothing converts.
+    fn smudge<'b>(&self, path: &[u8], body: &'b [u8]) -> Result<Cow<'b, [u8]>> {
+        let converted = self.attributes.apply_smudge_filter(self.config, path, body)?;
+        // `apply_smudge_filter` returns an owned Vec; the borrow-first variant is
+        // private to sley-worktree, so compare here to keep the no-op common case
+        // (binary blobs, no eol/filter attribute) zero-copy through tar output.
+        if converted.as_slice() == body {
+            Ok(Cow::Borrowed(body))
+        } else {
+            Ok(Cow::Owned(converted))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TarArchiveOptions {
@@ -22,6 +83,40 @@ pub fn write_tar_archive<R, W>(
     format: ObjectFormat,
     tree_oid: &ObjectId,
     options: TarArchiveOptions,
+) -> Result<()>
+where
+    R: ObjectReader,
+    W: Write,
+{
+    write_tar_archive_inner(writer, reader, format, tree_oid, options, None)
+}
+
+/// Like [`write_tar_archive`] but applies content conversion (smudge: EOL +
+/// `filter.<name>.smudge`) to each regular-file blob per the archived tree's
+/// `.gitattributes`, mirroring `git archive`. Symlinks are emitted unconverted,
+/// exactly as upstream (`object_file_to_archive` only converts `S_ISREG`).
+pub fn write_tar_archive_with_convert<R, W>(
+    writer: &mut W,
+    reader: &R,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: TarArchiveOptions,
+    convert: &ArchiveConvert<'_>,
+) -> Result<()>
+where
+    R: ObjectReader,
+    W: Write,
+{
+    write_tar_archive_inner(writer, reader, format, tree_oid, options, Some(convert))
+}
+
+fn write_tar_archive_inner<R, W>(
+    writer: &mut W,
+    reader: &R,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: TarArchiveOptions,
+    convert: Option<&ArchiveConvert<'_>>,
 ) -> Result<()>
 where
     R: ObjectReader,
@@ -66,6 +161,7 @@ where
         strip_prefix: &strip_prefix,
         mtime: options.mtime,
         pathspecs: &pathspecs,
+        convert,
     };
     write_tree_entries(
         &mut writer,
@@ -148,6 +244,9 @@ struct ArchiveWriteContext<'a, R> {
     strip_prefix: &'a [u8],
     mtime: u64,
     pathspecs: &'a [Vec<u8>],
+    /// Smudge conversion, when archiving with `--convert` semantics; `None`
+    /// emits raw blob bytes.
+    convert: Option<&'a ArchiveConvert<'a>>,
 }
 
 fn write_tree_entries<R, W>(
@@ -228,6 +327,8 @@ where
                     )));
                 }
                 if entry.mode == 0o120000 {
+                    // Symlinks are never converted (upstream only converts
+                    // S_ISREG); emit the link target bytes verbatim.
                     write_symlink_entry(writer, &path, &object.body, context.mtime)?;
                 } else {
                     let mode = if entry.mode & 0o111 != 0 {
@@ -235,7 +336,17 @@ where
                     } else {
                         0o664
                     };
-                    write_file_entry(writer, &path, mode, &object.body, context.mtime)?;
+                    // Convert blob -> worktree form per the archived tree's
+                    // attributes, keyed by the *tree-relative* path (git's
+                    // `path_without_prefix`), not the prefixed output path.
+                    // TODO(convert): upstream also applies `export-subst`
+                    // (`$Format:…$`) and the `ident` filter here; neither the
+                    // archive crate nor the convert engine implements those yet.
+                    let body = match context.convert {
+                        Some(convert) => convert.smudge(&relative_path, &object.body)?,
+                        None => Cow::Borrowed(object.body.as_slice()),
+                    };
+                    write_file_entry(writer, &path, mode, &body, context.mtime)?;
                 }
             }
             _ => {
@@ -569,7 +680,7 @@ mod tests {
     #[test]
     fn tar_archive_writes_regular_executable_symlink_and_prefix_entries() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let regular = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n"))
             .expect("test operation should succeed");
