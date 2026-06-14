@@ -41,6 +41,32 @@ pub struct IndexEntry {
     pub path: BString,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexEntryRef<'a> {
+    pub ctime_seconds: u32,
+    pub ctime_nanoseconds: u32,
+    pub mtime_seconds: u32,
+    pub mtime_nanoseconds: u32,
+    pub dev: u32,
+    pub ino: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u32,
+    pub oid: ObjectId,
+    pub flags: u16,
+    pub flags_extended: u16,
+    pub path: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorrowedIndex<'a> {
+    pub version: u32,
+    pub entries: Vec<IndexEntryRef<'a>>,
+    pub extensions: &'a [u8],
+    pub checksum: ObjectId,
+}
+
 impl IndexEntry {
     /// Build an intent-to-add placeholder entry for `path` (the shape `git add
     /// -N` writes): zeroed stat, the canonical empty-blob id, mode `100644`,
@@ -116,6 +142,119 @@ impl IndexEntry {
     pub fn refresh_name_length(&mut self) {
         let len = (self.path.len().min(INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
         self.flags = (self.flags & !INDEX_FLAG_NAME_LENGTH_MASK) | len;
+    }
+}
+
+impl IndexEntryRef<'_> {
+    /// The merge stage encoded in this entry's flags.
+    pub fn stage(&self) -> Stage {
+        Stage::from_flags(self.flags)
+    }
+
+    /// Whether this is an intent-to-add (`git add -N`) placeholder.
+    pub fn is_intent_to_add(&self) -> bool {
+        self.flags_extended & INDEX_EXTENDED_FLAG_INTENT_TO_ADD != 0
+    }
+
+    /// Whether this entry is marked skip-worktree (sparse checkout).
+    pub fn is_skip_worktree(&self) -> bool {
+        self.flags_extended & INDEX_EXTENDED_FLAG_SKIP_WORKTREE != 0
+    }
+}
+
+impl<'a> BorrowedIndex<'a> {
+    /// Parse an index whose path names can be borrowed directly from the index
+    /// bytes. Index v4 uses prefix-compressed paths, so callers should fall back
+    /// to the owned [`Index::parse`] path for that version.
+    pub fn parse(bytes: &'a [u8], format: ObjectFormat) -> Result<Self> {
+        let hash_len = format.raw_len();
+        if bytes.len() < 12 + hash_len {
+            return Err(GitError::InvalidFormat("index header too short".into()));
+        }
+        let checksum_offset = bytes.len() - hash_len;
+        let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+        let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+        if actual_checksum != checksum {
+            return Err(GitError::InvalidFormat(format!(
+                "index checksum mismatch: expected {checksum}, got {actual_checksum}"
+            )));
+        }
+        if &bytes[..4] != b"DIRC" {
+            return Err(GitError::InvalidFormat("missing DIRC signature".into()));
+        }
+        let version = u32_be(&bytes[4..8]);
+        if version == 4 {
+            return Err(GitError::Unsupported(
+                "borrowed index parse does not support index version 4".into(),
+            ));
+        }
+        if !(2..=3).contains(&version) {
+            return Err(GitError::Unsupported(format!("index version {version}")));
+        }
+        let count = u32_be(&bytes[8..12]) as usize;
+        let mut offset = 12;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry_header_len = 40 + hash_len + 2;
+            if checksum_offset.saturating_sub(offset) < entry_header_len {
+                return Err(GitError::InvalidFormat("truncated index entry".into()));
+            }
+            let start = offset;
+            let oid_start = offset + 40;
+            let oid_end = oid_start + hash_len;
+            let oid = ObjectId::from_raw(format, &bytes[oid_start..oid_end])?;
+            let flags = u16_be(&bytes[oid_end..oid_end + 2]);
+            offset = oid_end + 2;
+            let flags_extended = if flags & INDEX_FLAG_EXTENDED != 0 {
+                if checksum_offset.saturating_sub(offset) < 2 {
+                    return Err(GitError::InvalidFormat(
+                        "truncated index extended flags".into(),
+                    ));
+                }
+                let flags_extended = u16_be(&bytes[offset..offset + 2]);
+                offset += 2;
+                flags_extended
+            } else {
+                0
+            };
+            let path_start = offset;
+            while bytes.get(offset).copied() != Some(0) {
+                offset += 1;
+                if offset >= checksum_offset {
+                    return Err(GitError::InvalidFormat("unterminated index path".into()));
+                }
+            }
+            let path = &bytes[path_start..offset];
+            offset += 1;
+            while (offset - start) % 8 != 0 {
+                offset += 1;
+                if offset > checksum_offset {
+                    return Err(GitError::InvalidFormat("truncated index padding".into()));
+                }
+            }
+            entries.push(IndexEntryRef {
+                ctime_seconds: u32_be(&bytes[start..start + 4]),
+                ctime_nanoseconds: u32_be(&bytes[start + 4..start + 8]),
+                mtime_seconds: u32_be(&bytes[start + 8..start + 12]),
+                mtime_nanoseconds: u32_be(&bytes[start + 12..start + 16]),
+                dev: u32_be(&bytes[start + 16..start + 20]),
+                ino: u32_be(&bytes[start + 20..start + 24]),
+                mode: u32_be(&bytes[start + 24..start + 28]),
+                uid: u32_be(&bytes[start + 28..start + 32]),
+                gid: u32_be(&bytes[start + 32..start + 36]),
+                size: u32_be(&bytes[start + 36..start + 40]),
+                oid,
+                flags,
+                flags_extended,
+                path,
+            });
+        }
+        Ok(Self {
+            version,
+            entries,
+            extensions: &bytes[offset..checksum_offset],
+            checksum,
+        })
     }
 }
 
@@ -709,6 +848,25 @@ impl IndexStatCache {
         Some(entry)
     }
 
+    /// Whether `entry` describes the current worktree metadata and is not
+    /// racily clean.
+    pub fn reusable_index_entry_ref(
+        &self,
+        entry: &IndexEntryRef<'_>,
+        worktree_metadata: &fs::Metadata,
+    ) -> bool {
+        if entry.mode != worktree_metadata_mode(worktree_metadata) {
+            return false;
+        }
+        if !index_entry_ref_stat_is_uptodate(entry, worktree_metadata) {
+            return false;
+        }
+        if index_entry_ref_is_racily_clean(entry, self.index_mtime) {
+            return false;
+        }
+        true
+    }
+
     /// git's `ce_match_stat` verdict for `entry` against the worktree file's
     /// `metadata`, used by `diff-files` to decide which entries to select.
     ///
@@ -953,6 +1111,37 @@ fn index_entry_is_racily_clean(entry: &IndexEntry, index_mtime: Option<(u64, u64
 }
 
 fn index_entry_stat_is_uptodate(entry: &IndexEntry, metadata: &fs::Metadata) -> bool {
+    if u64::from(entry.size) != metadata.len() {
+        return false;
+    }
+    let Some((mtime_seconds, mtime_nanoseconds)) = file_mtime_parts(metadata) else {
+        return false;
+    };
+    u64::from(entry.mtime_seconds) == mtime_seconds
+        && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
+}
+
+fn index_entry_ref_is_racily_clean(
+    entry: &IndexEntryRef<'_>,
+    index_mtime: Option<(u64, u64)>,
+) -> bool {
+    let Some(index_mtime) = index_mtime else {
+        return true;
+    };
+    if index_mtime == (0, 0) {
+        return true;
+    }
+    let entry_mtime = (
+        u64::from(entry.mtime_seconds),
+        u64::from(entry.mtime_nanoseconds),
+    );
+    if entry_mtime == (0, 0) {
+        return true;
+    }
+    index_mtime <= entry_mtime
+}
+
+fn index_entry_ref_stat_is_uptodate(entry: &IndexEntryRef<'_>, metadata: &fs::Metadata) -> bool {
     if u64::from(entry.size) != metadata.len() {
         return false;
     }
@@ -1569,6 +1758,41 @@ mod tests {
             })
             .expect("test operation should succeed");
             assert_eq!(actual, expected, "paths for v{version}");
+        }
+    }
+
+    #[test]
+    fn borrowed_index_parse_matches_owned_index_for_uncompressed_versions() {
+        for version in [2u32, 3] {
+            let mut index = sample_index(version);
+            if version == 2 {
+                for entry in &mut index.entries {
+                    entry.flags &= !INDEX_FLAG_EXTENDED;
+                    entry.flags_extended = 0;
+                }
+            }
+            let bytes = index.write_sha1().expect("test operation should succeed");
+            let owned = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
+            let borrowed = BorrowedIndex::parse(&bytes, ObjectFormat::Sha1)
+                .expect("test operation should succeed");
+            assert_eq!(borrowed.version, owned.version);
+            assert_eq!(borrowed.entries.len(), owned.entries.len());
+            for (actual, expected) in borrowed.entries.iter().zip(owned.entries.iter()) {
+                assert_eq!(actual.ctime_seconds, expected.ctime_seconds);
+                assert_eq!(actual.ctime_nanoseconds, expected.ctime_nanoseconds);
+                assert_eq!(actual.mtime_seconds, expected.mtime_seconds);
+                assert_eq!(actual.mtime_nanoseconds, expected.mtime_nanoseconds);
+                assert_eq!(actual.dev, expected.dev);
+                assert_eq!(actual.ino, expected.ino);
+                assert_eq!(actual.mode, expected.mode);
+                assert_eq!(actual.uid, expected.uid);
+                assert_eq!(actual.gid, expected.gid);
+                assert_eq!(actual.size, expected.size);
+                assert_eq!(actual.oid, expected.oid);
+                assert_eq!(actual.flags, expected.flags);
+                assert_eq!(actual.flags_extended, expected.flags_extended);
+                assert_eq!(actual.path, expected.path.as_bytes());
+            }
         }
     }
 

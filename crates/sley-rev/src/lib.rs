@@ -1074,7 +1074,7 @@ impl AsRef<[u8]> for RawCommitGraphBytes {
 }
 
 impl RawCommitGraph {
-    fn parse(bytes: RawCommitGraphBytes, format: ObjectFormat) -> Result<Self> {
+    fn parse_for_lookup(bytes: RawCommitGraphBytes, format: ObjectFormat) -> Result<Self> {
         let data = bytes.as_ref();
         let hash_len = format.raw_len();
         if data.len() < 8 + 12 + hash_len {
@@ -1117,13 +1117,6 @@ impl RawCommitGraph {
             return Err(GitError::InvalidFormat(
                 "truncated commit-graph chunk lookup".into(),
             ));
-        }
-        let actual_checksum = sley_core::digest_bytes(format, &data[..checksum_offset])?;
-        let checksum = ObjectId::from_raw(format, &data[checksum_offset..])?;
-        if actual_checksum != checksum {
-            return Err(GitError::InvalidFormat(format!(
-                "commit-graph checksum mismatch: expected {checksum}, got {actual_checksum}"
-            )));
         }
 
         let mut lookup = Vec::with_capacity(chunk_count + 1);
@@ -1590,7 +1583,7 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
             Err(_) => return DirectCommitGraph::Invalid,
         },
     };
-    RawCommitGraph::parse(bytes, format)
+    RawCommitGraph::parse_for_lookup(bytes, format)
         .map(DirectCommitGraph::Raw)
         .unwrap_or(DirectCommitGraph::Invalid)
 }
