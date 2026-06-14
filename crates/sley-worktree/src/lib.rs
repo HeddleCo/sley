@@ -1987,7 +1987,7 @@ fn collect_status_entries_head_matches_index(
                 path: path.clone(),
                 head_mode: Some(index_entry.mode),
                 index_mode: Some(index_entry.mode),
-                worktree_mode: worktree_entry.map(|entry| entry.mode),
+                worktree_mode: status_worktree_mode(Some(index_entry), worktree_entry, worktree_present),
                 head_oid: Some(index_entry.oid),
                 index_oid: Some(index_entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
@@ -2036,7 +2036,7 @@ fn collect_status_entries_parsed_index_head_matches(
                 path: path.to_vec(),
                 head_mode: Some(index_entry.mode),
                 index_mode: Some(index_entry.mode),
-                worktree_mode: worktree_entry.map(|entry| entry.mode),
+                worktree_mode: status_worktree_mode(Some(&index_entry), worktree_entry, worktree_present),
                 head_oid: Some(index_entry.oid),
                 index_oid: Some(index_entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
@@ -2119,13 +2119,23 @@ fn collect_status_entries_with_head(
                 path,
                 head_mode: head_entry.map(|entry| entry.mode),
                 index_mode: index_entry.map(|entry| entry.mode),
-                worktree_mode: worktree_entry.map(|entry| entry.mode),
+                worktree_mode: status_worktree_mode(index_entry, worktree_entry, worktree_present),
                 head_oid: head_entry.map(|entry| entry.oid),
                 index_oid: index_entry.map(|entry| entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
             });
         }
     }
+}
+
+fn status_worktree_mode(
+    index_entry: Option<&TrackedEntry>,
+    worktree_entry: Option<&TrackedEntry>,
+    worktree_present: bool,
+) -> Option<u32> {
+    worktree_entry
+        .map(|entry| entry.mode)
+        .or_else(|| worktree_present.then(|| index_entry.map(|entry| entry.mode)).flatten())
 }
 
 fn status_submodule_from_entries(
