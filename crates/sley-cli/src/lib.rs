@@ -9245,29 +9245,6 @@ fn commit_signoff_from_env() -> Result<Vec<u8>> {
     Ok(format!("Signed-off-by: {name} <{email}>").into_bytes())
 }
 
-fn commit_message_with_signoff(mut message: Vec<u8>, signoff: &[u8]) -> Vec<u8> {
-    if message
-        .split(|byte| *byte == b'\n')
-        .any(|line| line == signoff)
-    {
-        return message;
-    }
-    if message.is_empty() {
-        message.extend_from_slice(signoff);
-        message.push(b'\n');
-        return message;
-    }
-    if !message.is_empty() && !message.ends_with(b"\n") {
-        message.push(b'\n');
-    }
-    if !message.ends_with(b"\n\n") {
-        message.push(b'\n');
-    }
-    message.extend_from_slice(signoff);
-    message.push(b'\n');
-    message
-}
-
 fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
     let subject = String::from_utf8_lossy(message)
         .lines()

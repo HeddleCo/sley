@@ -1127,7 +1127,7 @@ fn create_am_commit(
     commands::hooks::run_hook_l("applypatch-msg", &[message_arg.as_str()])?;
     let mut message = fs::read(&message_path)?;
     if signoff {
-        message = commit_message_with_signoff(message, &commit_signoff_from_env()?);
+        message = am_append_signoff(message, &commit_signoff_from_env()?);
     }
     commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())?;
 
@@ -1174,6 +1174,115 @@ fn am_author_identity(patch: &AmPatch) -> Result<Vec<u8>> {
         .clone()
         .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
     sley_sequencer::format_commit_identity(&patch.author_name, &patch.author_email, &date)
+}
+
+/// Append a `Signed-off-by:` trailer to an am commit message, faithfully
+/// mirroring git's `append_signoff(msgbuf, 0, 0)` as called from
+/// `am_append_signoff` in builtin/am.c. Two behaviours distinguish this from
+/// `commit -s` (which passes `APPEND_SIGNOFF_DEDUP`):
+///
+///   1. **No de-duplication.** `git am --signoff` always appends the trailer
+///      even when an identical `Signed-off-by:` already appears earlier in the
+///      message (t4150 cells "duplicates Signed-off-by: if it is not the last
+///      one" / "adds Signed-off-by: if another author is preset").
+///   2. **Conforming-footer-aware blank line.** A blank line is inserted before
+///      the trailer only when the message does NOT already end with a trailer
+///      block; when the last paragraph is a conforming footer (e.g. ends with a
+///      `Reported-by:`/`Signed-off-by:` line), the new trailer is appended
+///      directly, with no separating blank line.
+fn am_append_signoff(mut message: Vec<u8>, signoff: &[u8]) -> Vec<u8> {
+    // `signoff` is the full "Signed-off-by: name <email>" line (no newline).
+    let mut sob = signoff.to_vec();
+    sob.push(b'\n');
+
+    // git's strbuf_complete_line: ensure the buffer ends with a newline.
+    if !message.is_empty() && !message.ends_with(b"\n") {
+        message.push(b'\n');
+    }
+
+    // git's append_signoff: if the whole buffer equals the sob, has_footer is 3;
+    // otherwise classify the trailing trailer block (0/1/2/3).
+    let has_footer = if message == sob {
+        3
+    } else {
+        am_conforming_footer_state(&message, &sob)
+    };
+
+    if has_footer == 0 {
+        let len = message.len();
+        if len == 0 {
+            message.extend_from_slice(b"\n\n");
+        } else if len == 1 {
+            // Buffer is a single newline.
+            message.push(b'\n');
+        } else if message[len - 2] != b'\n' {
+            // Buffer ends with a single newline; add another for the blank line.
+            message.push(b'\n');
+        } // else already ends with two newlines.
+    }
+
+    // builtin/am.c passes flag 0 (no DEDUP), so git's gate reduces to
+    // `has_footer != 3`: append unless the sob is already the LAST trailer.
+    if has_footer != 3 {
+        message.extend_from_slice(&sob);
+    }
+    message
+}
+
+/// Port of git's `has_conforming_footer` 3-state result for the final paragraph
+/// of `message`, given the target `sob` line (with trailing newline):
+///   0 — the last paragraph is not a conforming trailer block;
+///   1 — it is a trailer block, but contains no line equal to `sob`;
+///   2 — it contains `sob`, but `sob` is not the last trailer;
+///   3 — `sob` is the last trailer line.
+fn am_conforming_footer_state(message: &[u8], sob: &[u8]) -> u8 {
+    let text = String::from_utf8_lossy(message);
+    let trimmed = text.trim_end_matches('\n');
+    let last_para = match trimmed.rfind("\n\n") {
+        Some(pos) => &trimmed[pos + 2..],
+        None => trimmed,
+    };
+    if last_para.is_empty() {
+        return 0;
+    }
+    let lines: Vec<&str> = last_para.lines().collect();
+    if !lines.iter().all(|line| is_trailer_line(line)) {
+        return 0;
+    }
+    let sob_line = String::from_utf8_lossy(sob);
+    let sob_line = sob_line.trim_end_matches('\n');
+    let mut found_sob = None;
+    for (i, line) in lines.iter().enumerate() {
+        if *line == sob_line {
+            found_sob = Some(i);
+        }
+    }
+    match found_sob {
+        None => 1,
+        Some(i) if i + 1 == lines.len() => 3,
+        Some(_) => 2,
+    }
+}
+
+/// A single trailer line: `Token<sep> value`, where the token is non-empty and
+/// contains no whitespace, and the separator is `:` or `#` (git's default
+/// trailer separators), optionally followed by whitespace + value. Also accepts
+/// the cherry-pick footer line git's trailer parser tolerates.
+fn is_trailer_line(line: &str) -> bool {
+    if line.starts_with("(cherry picked from commit ") {
+        return true;
+    }
+    let Some(sep) = line.find([':', '#']) else {
+        return false;
+    };
+    let key = &line[..sep];
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return false;
+    }
+    // For a `:` separator git requires the value to be space-separated; `#`
+    // (e.g. `Bug #1234`) is also a recognised trailer separator.
+    let rest = &line[sep + 1..];
+    line.as_bytes()[sep] == b'#' || rest.is_empty() || rest.starts_with(' ')
 }
 
 /// Best-effort 3-way application: reconstruct the pre-image from the index's
