@@ -48,6 +48,19 @@
 # missing → ENOENT/ENOTDIR skip + abort-before-index-write on non-empty dir),
 # trailing-slash-on-file rejection, and the empty-string pathspec error).
 # Neighbors held: t7508-status=86, t2020-checkout-detach=16, t2107=10, t3000=15.
+# cover-letter wave (2026-06-14, parity/coverletter): t4014-format-patch 96->113
+# (+17 — built the cover-letter renderer: --cover-letter/--no-cover-letter,
+# format.coverletter incl. =auto, --commit-list-format/format.commitlistformat
+# [shortlog/modern/log:<fmt>/bare-%], the 0000-cover-letter file, the synthetic
+# From/Date header + *** SUBJECT/BLURB HERE *** template, the author-grouped
+# shortlog + cumulative range diffstat in the body, --cover-from-description +
+# branch.<name>.description + --description-file, and the cover→patch numbering
+# interplay). Same change lifted t4052-stat-output 71->76 (its --cover-letter
+# --stat cells now pass), so its floor is raised to 76. The cover-from-description
+# / branch-description cells (#161-185) stay blocked by the pre-existing am -3 /
+# --ignore-if-in-upstream chain (cells #3/4/6/7) that leaves rebuild-1 empty —
+# they are NOT a cover-letter gap. No diff/log floor regressed (t4013/t4015/
+# t4018/t4202/t4034/t4045/t4047/t4027 all held; render.rs untouched).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -113,8 +126,8 @@ declare -A FLOOR=(
     [t5327-multi-pack-bitmaps-rev.sh]=308
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
-    [t4014-format-patch.sh]=96
-    [t4052-stat-output.sh]=71
+    [t4014-format-patch.sh]=113
+    [t4052-stat-output.sh]=76
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41
     [t4015-diff-whitespace.sh]=55
