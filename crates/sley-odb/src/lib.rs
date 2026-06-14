@@ -12,7 +12,7 @@ use sley_pack::{
     MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
     PackInput, PackWrite,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2451,8 +2451,16 @@ fn verify_reads_enabled() -> bool {
 struct LruCache<K: std::hash::Hash + Eq + Clone> {
     budget: usize,
     used: usize,
-    map: HashMap<K, Arc<EncodedObject>>,
-    order: VecDeque<K>,
+    map: HashMap<K, LruEntry<K>>,
+    head: Option<K>,
+    tail: Option<K>,
+}
+
+#[derive(Debug)]
+struct LruEntry<K> {
+    object: Arc<EncodedObject>,
+    prev: Option<K>,
+    next: Option<K>,
 }
 
 impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
@@ -2461,39 +2469,90 @@ impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
             budget,
             used: 0,
             map: HashMap::new(),
-            order: VecDeque::new(),
+            head: None,
+            tail: None,
         }
     }
 
     fn get(&mut self, key: &K) -> Option<Arc<EncodedObject>> {
-        let object = Arc::clone(self.map.get(key)?);
+        let object = Arc::clone(&self.map.get(key)?.object);
         self.touch(key);
         Some(object)
     }
 
-    /// Move `key` to the most-recently-used end. Linear in the recency queue, but
-    /// the queue is bounded by the byte budget and this only runs on cache hits.
+    /// Move `key` to the most-recently-used end in O(1).
     fn touch(&mut self, key: &K) {
-        if let Some(position) = self.order.iter().position(|existing| existing == key)
-            && let Some(found) = self.order.remove(position)
-        {
-            self.order.push_back(found);
+        if self.tail.as_ref() == Some(key) {
+            return;
+        }
+        if self.map.contains_key(key) {
+            self.detach(key);
+            self.attach_back(key.clone());
         }
     }
 
     /// Drop `key` from both the map and the recency queue, releasing its budget.
     fn remove(&mut self, key: &K) {
-        if let Some(object) = self.map.remove(key) {
-            self.used = self.used.saturating_sub(cached_object_cost(&object));
+        if let Some(entry) = self.map.get(key) {
+            self.used = self.used.saturating_sub(cached_object_cost(&entry.object));
         }
-        if let Some(position) = self.order.iter().position(|existing| existing == key) {
-            self.order.remove(position);
+        self.detach(key);
+        self.map.remove(key);
+    }
+
+    fn detach(&mut self, key: &K) {
+        let Some((prev, next)) = self.map.get_mut(key).map(|entry| {
+            let prev = entry.prev.take();
+            let next = entry.next.take();
+            (prev, next)
+        }) else {
+            return;
+        };
+
+        match &prev {
+            Some(prev_key) => {
+                if let Some(prev_entry) = self.map.get_mut(prev_key) {
+                    prev_entry.next = next.clone();
+                }
+            }
+            None => self.head = next.clone(),
+        }
+        match &next {
+            Some(next_key) => {
+                if let Some(next_entry) = self.map.get_mut(next_key) {
+                    next_entry.prev = prev.clone();
+                }
+            }
+            None => self.tail = prev.clone(),
+        }
+    }
+
+    fn attach_back(&mut self, key: K) {
+        let previous_tail = self.tail.replace(key.clone());
+        match previous_tail {
+            Some(tail_key) => {
+                if let Some(tail_entry) = self.map.get_mut(&tail_key) {
+                    tail_entry.next = Some(key.clone());
+                }
+                if let Some(entry) = self.map.get_mut(&key) {
+                    entry.prev = Some(tail_key);
+                    entry.next = None;
+                }
+            }
+            None => {
+                self.head = Some(key.clone());
+                if let Some(entry) = self.map.get_mut(&key) {
+                    entry.prev = None;
+                    entry.next = None;
+                }
+            }
         }
     }
 
     fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
+        self.head = None;
+        self.tail = None;
         self.used = 0;
     }
 
@@ -2509,7 +2568,8 @@ impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
             self.remove(&key);
             return;
         }
-        if let Some(previous) = self.map.insert(key.clone(), object) {
+        if let Some(entry) = self.map.get_mut(&key) {
+            let previous = std::mem::replace(&mut entry.object, object);
             // Replacing an existing entry: adjust accounting and refresh recency.
             self.used = self
                 .used
@@ -2518,15 +2578,21 @@ impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
             self.touch(&key);
         } else {
             self.used = self.used.saturating_add(cost);
-            self.order.push_back(key);
+            self.map.insert(
+                key.clone(),
+                LruEntry {
+                    object,
+                    prev: None,
+                    next: None,
+                },
+            );
+            self.attach_back(key);
         }
         while self.used > self.budget {
-            let Some(evicted) = self.order.pop_front() else {
+            let Some(evicted) = self.head.clone() else {
                 break;
             };
-            if let Some(object) = self.map.remove(&evicted) {
-                self.used = self.used.saturating_sub(cached_object_cost(&object));
-            }
+            self.remove(&evicted);
         }
     }
 }
@@ -2596,6 +2662,17 @@ struct DiscoveredPack {
 /// (see [`FileObjectDatabase::find_pack_containing`]).
 type PackListingCache = Arc<Mutex<HashMap<PathBuf, Arc<Vec<DiscoveredPack>>>>>;
 
+/// Last successful pack slot for a pack directory/listing pair. Object streams
+/// usually have strong pack locality, so trying the previous hit first avoids
+/// probing every pack without constructing a full oid table.
+type PackHintCache = Arc<Mutex<HashMap<PathBuf, PackHint>>>;
+
+#[derive(Debug)]
+struct PackHint {
+    listing: Arc<Vec<DiscoveredPack>>,
+    pack_index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileObjectDatabase {
     loose: LooseObjectStore,
@@ -2606,6 +2683,7 @@ pub struct FileObjectDatabase {
     pack_indexes: PackIndexCache,
     multi_pack_indexes: MultiPackIndexCache,
     pack_listing: PackListingCache,
+    pack_hints: PackHintCache,
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
     pack_header_types: PackHeaderTypeCaches,
@@ -2734,7 +2812,10 @@ fn collect_loose_fanout_object_ids(
         if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             continue;
         }
-        oids.insert(ObjectId::from_hex(format, &format!("{fanout_hex}{suffix}"))?);
+        oids.insert(ObjectId::from_hex(
+            format,
+            &format!("{fanout_hex}{suffix}"),
+        )?);
     }
     Ok(())
 }
@@ -2804,6 +2885,7 @@ impl FileObjectDatabase {
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             pack_listing: Arc::new(Mutex::new(HashMap::new())),
+            pack_hints: Arc::new(Mutex::new(HashMap::new())),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
@@ -2822,6 +2904,7 @@ impl FileObjectDatabase {
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             pack_listing: Arc::new(Mutex::new(HashMap::new())),
+            pack_hints: Arc::new(Mutex::new(HashMap::new())),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
@@ -2845,6 +2928,9 @@ impl FileObjectDatabase {
             cache.clear();
         }
         if let Ok(mut cache) = self.multi_pack_indexes.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.pack_hints.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.pack_bytes.lock() {
@@ -3319,16 +3405,86 @@ impl FileObjectDatabase {
         Ok(scanned)
     }
 
-    /// Find `oid` among a cached pack listing, returning its pack path and offset.
-    /// Uses the parsed-index cache, so this performs no directory I/O.
-    fn find_in_pack_listing(
+    fn cached_pack_hint(
         &self,
-        listing: &[DiscoveredPack],
+        pack_dir: &Path,
+        listing: &Arc<Vec<DiscoveredPack>>,
+    ) -> Option<usize> {
+        let cache = self.pack_hints.lock().ok()?;
+        let hint = cache.get(pack_dir)?;
+        Arc::ptr_eq(&hint.listing, listing)
+            .then_some(hint.pack_index)
+            .filter(|pack_index| *pack_index < listing.len())
+    }
+
+    fn remember_pack_hint(
+        &self,
+        pack_dir: &Path,
+        listing: &Arc<Vec<DiscoveredPack>>,
+        pack_index: usize,
+    ) {
+        if let Ok(mut cache) = self.pack_hints.lock() {
+            cache.insert(
+                pack_dir.to_path_buf(),
+                PackHint {
+                    listing: Arc::clone(listing),
+                    pack_index,
+                },
+            );
+        }
+    }
+
+    fn find_in_pack_hint(
+        &self,
+        pack_dir: &Path,
+        listing: &Arc<Vec<DiscoveredPack>>,
+        oid: &ObjectId,
+    ) -> Result<Option<(usize, PackPaths)>> {
+        let Some(pack_index) = self.cached_pack_hint(pack_dir, listing) else {
+            return Ok(None);
+        };
+        let pack = &listing[pack_index];
+        let index = self.cached_pack_index(&pack.idx)?;
+        Ok(index.find(oid).map(|entry| {
+            (
+                pack_index,
+                PackPaths {
+                    pack: pack.pack.clone(),
+                    offset: entry.offset,
+                },
+            )
+        }))
+    }
+
+    fn find_in_pack_lookup(
+        &self,
+        pack_dir: &Path,
+        listing: Arc<Vec<DiscoveredPack>>,
         oid: &ObjectId,
     ) -> Result<Option<PackPaths>> {
-        for pack in listing {
+        let hinted_pack_index =
+            if let Some((_, pack_paths)) = self.find_in_pack_hint(pack_dir, &listing, oid)? {
+                return Ok(Some(pack_paths));
+            } else {
+                self.cached_pack_hint(pack_dir, &listing)
+            };
+        self.find_in_pack_listing_with_hint(pack_dir, &listing, oid, hinted_pack_index)
+    }
+
+    fn find_in_pack_listing_with_hint(
+        &self,
+        pack_dir: &Path,
+        listing: &Arc<Vec<DiscoveredPack>>,
+        oid: &ObjectId,
+        skip_pack_index: Option<usize>,
+    ) -> Result<Option<PackPaths>> {
+        for (pack_index, pack) in listing.iter().enumerate() {
+            if Some(pack_index) == skip_pack_index {
+                continue;
+            }
             let index = self.cached_pack_index(&pack.idx)?;
             if let Some(entry) = index.find(oid) {
+                self.remember_pack_hint(pack_dir, listing, pack_index);
                 return Ok(Some(PackPaths {
                     pack: pack.pack.clone(),
                     offset: entry.offset,
@@ -3359,7 +3515,7 @@ impl FileObjectDatabase {
             return Ok(Some(pack_paths));
         }
         if let Some(listing) = self.cached_loaded_pack_listing(&pack_dir)
-            && let Some(pack_paths) = self.find_in_pack_listing(&listing, oid)?
+            && let Some(pack_paths) = self.find_in_pack_lookup(&pack_dir, listing, oid)?
         {
             return Ok(Some(pack_paths));
         }
@@ -3374,7 +3530,7 @@ impl FileObjectDatabase {
         // the directory once (picking up any pack added since the listing was
         // cached) and search again, so newly written packs are still found.
         let listing = self.cached_pack_listing(&pack_dir, false)?;
-        if let Some(pack_paths) = self.find_in_pack_listing(&listing, oid)? {
+        if let Some(pack_paths) = self.find_in_pack_lookup(&pack_dir, Arc::clone(&listing), oid)? {
             return Ok(Some(pack_paths));
         }
         let refreshed = self.cached_pack_listing(&pack_dir, true)?;
@@ -3382,7 +3538,7 @@ impl FileObjectDatabase {
             // The re-scan produced the same listing, so nothing new appeared.
             return Ok(None);
         }
-        self.find_in_pack_listing(&refreshed, oid)
+        self.find_in_pack_lookup(&pack_dir, refreshed, oid)
     }
 
     fn packed_object_storage_info(&self, oid: &ObjectId) -> Result<Option<ObjectStorageInfo>> {
@@ -5208,6 +5364,57 @@ mod tests {
         );
         assert_eq!(read_object_for_assert(&db, &second_oid), second);
         // The original object still resolves too.
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_database_pack_search_hint_rebuilds_after_pack_added() {
+        // Regression guard for the recent-pack search hint: it is tied to the
+        // cached pack listing, so a miss followed by a changed listing must not
+        // hide newly-added packs.
+        let root = temp_root("sley-file-odb-pack-lookup-added-late");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let first = EncodedObject::new(ObjectType::Blob, b"first lookup\n".to_vec());
+        let second = EncodedObject::new(ObjectType::Blob, b"second lookup\n".to_vec());
+        let third = EncodedObject::new(ObjectType::Blob, b"third lookup\n".to_vec());
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let third_oid = third
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first))
+            .expect("test operation should succeed");
+        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second))
+            .expect("test operation should succeed");
+        db.install_pack(&first_pack)
+            .expect("test operation should succeed");
+        db.install_pack(&second_pack)
+            .expect("test operation should succeed");
+
+        // With two packs, these reads establish a cached listing and pack hint.
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
+        assert!(matches!(
+            db.read_object(&third_oid),
+            Err(GitError::NotFound(_))
+        ));
+
+        let third_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&third))
+            .expect("test operation should succeed");
+        db.install_pack(&third_pack)
+            .expect("test operation should succeed");
+
+        assert_eq!(read_object_for_assert(&db, &third_oid), third);
         assert_eq!(read_object_for_assert(&db, &first_oid), first);
 
         fs::remove_dir_all(root).expect("test operation should succeed");

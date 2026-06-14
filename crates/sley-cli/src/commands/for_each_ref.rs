@@ -363,6 +363,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     // git resolves `%(...:mailmap)` atoms against the repository .mailmap plus
     // mailmap.{file,blob} config; load it once up front (cheap when absent).
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
+    let mut object_headers = ForEachRefObjectHeaderCache::new();
     let mut stdout = io::stdout();
     let mut emitted = 0usize;
     let mut refs = store.list_refs()?;
@@ -384,6 +385,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             head_ref: head_ref.as_deref(),
             format,
         },
+        &mut object_headers,
     )?;
     for reference in refs {
         let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
@@ -451,26 +453,47 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         if count.is_some_and(|limit| limit != 0 && emitted >= limit) {
             break;
         }
-        let upstream = for_each_ref_upstream(&config, &reference.name);
-        let push = for_each_ref_push(&config, &reference.name);
-        let upstream_track = upstream
-            .as_ref()
-            .map(|upstream| {
-                for_each_ref_upstream_track(&store, &db, format, &oid, &upstream.refname)
-            })
-            .transpose()?
-            .flatten();
-        let push_track = push
-            .as_ref()
-            .and_then(|push| push.refname.as_deref())
-            .map(|push_ref| for_each_ref_upstream_track(&store, &db, format, &oid, push_ref))
-            .transpose()?
-            .flatten();
+        let upstream = if needs.upstream || needs.upstream_track {
+            for_each_ref_upstream(&config, &reference.name)
+        } else {
+            None
+        };
+        let push = if needs.push || needs.push_track {
+            for_each_ref_push(&config, &reference.name)
+        } else {
+            None
+        };
+        let upstream_track = if needs.upstream_track {
+            upstream
+                .as_ref()
+                .map(|upstream| {
+                    for_each_ref_upstream_track(&store, &db, format, &oid, &upstream.refname)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let push_track = if needs.push_track {
+            push.as_ref()
+                .and_then(|push| push.refname.as_deref())
+                .map(|push_ref| for_each_ref_upstream_track(&store, &db, format, &oid, push_ref))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         // Only decode the ref object when the format references an atom that needs
-        // it (git's used_atom analysis). Formats like %(objectname)/%(refname) read
-        // nothing here.
+        // its body (git's used_atom analysis). Type/size-only atoms can use the
+        // cheaper header path below, and formats like %(objectname)/%(refname)
+        // read nothing here.
         let object = if needs.object {
             Some(db.read_object(&oid)?)
+        } else {
+            None
+        };
+        let object_header = if object.is_none() && needs.object_header {
+            Some(for_each_ref_object_header(&db, &mut object_headers, &oid)?)
         } else {
             None
         };
@@ -538,17 +561,22 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         let worktree_path = worktree_paths
             .get(reference.name.as_str())
             .map(String::as_str);
-        // When the format needs no object, these fields are never observed (every
-        // atom that reads them is gated behind `needs.object`); the placeholders are
-        // therefore unobservable.
+        // When the format needs neither the object nor its header, these fields are
+        // never observed; the placeholders are therefore unobservable.
         let object_type = object
             .as_ref()
             .map(|object| object.object_type)
+            .or_else(|| object_header.map(|(object_type, _)| object_type))
             .unwrap_or(ObjectType::Commit);
         let object_body: &[u8] = object
             .as_ref()
             .map(|object| object.body.as_ref())
             .unwrap_or(&[]);
+        let object_size = object
+            .as_ref()
+            .map(|object| object.body.len())
+            .or_else(|| object_header.map(|(_, size)| size))
+            .unwrap_or(0);
         let format_context = ForEachRefFormatContext {
             git_dir: &git_dir,
             db: &db,
@@ -558,7 +586,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             deltabase: &deltabase,
             object_type,
             object_body,
-            object_size: object_body.len(),
+            object_size,
             object_disk_size,
             color,
             quote,
@@ -681,8 +709,10 @@ enum ForEachRefSort {
 /// worktree probe whenever the format never references the corresponding atom.
 #[derive(Default, Clone, Copy)]
 struct ForEachRefNeeds {
-    /// The ref's own object must be decoded (object body / type / size / contents).
+    /// The ref's own object must be decoded (object body / contents / identities).
     object: bool,
+    /// The ref's own object header must be read (object type / content size).
+    object_header: bool,
     /// The peeled tag target must be read (any `*`-prefixed object/contents atom).
     /// Implies `object`, since the tag pointer comes from decoding the ref object.
     peeled: bool,
@@ -692,6 +722,14 @@ struct ForEachRefNeeds {
     peeled_disk: bool,
     /// `%(worktreepath)` — the per-ref worktree probe.
     worktree: bool,
+    /// `%(upstream*)` — branch upstream config is needed for formatting.
+    upstream: bool,
+    /// `%(upstream:track*)` — ahead/behind against the upstream is needed.
+    upstream_track: bool,
+    /// `%(push*)` — branch push destination config is needed for formatting.
+    push: bool,
+    /// `%(push:track*)` — ahead/behind against the push destination is needed.
+    push_track: bool,
     /// `%(objectname:short...)` / `%(*objectname:short...)` — needs the ambiguity
     /// candidate set (the full object-id enumeration).
     candidates: bool,
@@ -707,7 +745,11 @@ impl ForEachRefNeeds {
             match atom {
                 ForEachRefAtom::Raw(placeholder) => needs.note_raw(placeholder),
                 ForEachRefAtom::Color(_) => {}
-                ForEachRefAtom::RefName { .. } => {}
+                ForEachRefAtom::RefName { source, .. } => match source {
+                    ForEachRefNameSource::Ref => {}
+                    ForEachRefNameSource::Upstream => needs.upstream = true,
+                    ForEachRefNameSource::Push => needs.push = true,
+                },
                 ForEachRefAtom::ObjectName { peeled, abbrev } => {
                     if abbrev.is_some() {
                         needs.candidates = true;
@@ -748,6 +790,10 @@ impl ForEachRefNeeds {
             .unwrap_or((placeholder, false));
         // Atoms that consult the ref object body (or, when peeled, the tag target).
         let consumes_object = match base {
+            "objectsize" | "objecttype" if !peeled => {
+                self.object_header = true;
+                false
+            }
             "objectsize" | "objecttype" | "raw" | "raw:size" | "subject" | "contents"
             | "contents:subject" | "contents:body" | "contents:size" | "body" | "author"
             | "authorname" | "authoremail" | "authordate" | "committer" | "committername"
@@ -802,6 +848,7 @@ impl ForEachRefNeeds {
                     // the object (or peeled target).
                     true
                 } else {
+                    self.note_ref_relation_atom(other);
                     // refname*, symref*, upstream*, push*, color:, HEAD, ahead-behind:,
                     // and any unsupported placeholder need no object read here.
                     false
@@ -814,6 +861,43 @@ impl ForEachRefNeeds {
             } else {
                 self.object = true;
             }
+        }
+    }
+
+    fn note_ref_relation_atom(&mut self, atom: &str) {
+        match atom {
+            "upstream" | "upstream:short" | "upstream:remotename" | "upstream:remoteref" => {
+                self.upstream = true;
+            }
+            "upstream:track"
+            | "upstream:track,nobracket"
+            | "upstream:nobracket,track"
+            | "upstream:trackshort" => {
+                self.upstream = true;
+                self.upstream_track = true;
+            }
+            "push" | "push:short" | "push:remotename" | "push:remoteref" => {
+                self.push = true;
+            }
+            "push:track" | "push:track,nobracket" | "push:nobracket,track" | "push:trackshort" => {
+                self.push = true;
+                self.push_track = true;
+            }
+            other
+                if other.starts_with("upstream:lstrip=")
+                    || other.starts_with("upstream:strip=")
+                    || other.starts_with("upstream:rstrip=") =>
+            {
+                self.upstream = true;
+            }
+            other
+                if other.starts_with("push:lstrip=")
+                    || other.starts_with("push:strip=")
+                    || other.starts_with("push:rstrip=") =>
+            {
+                self.push = true;
+            }
+            _ => {}
         }
     }
 }
@@ -1407,16 +1491,19 @@ struct ForEachRefSortContext<'a> {
     format: ObjectFormat,
 }
 
+type ForEachRefObjectHeaderCache = HashMap<ObjectId, (ObjectType, usize)>;
+
 fn sort_for_each_refs(
     refs: &mut Vec<sley_refs::Ref>,
     sorts: &[ForEachRefSort],
     context: ForEachRefSortContext<'_>,
+    object_headers: &mut ForEachRefObjectHeaderCache,
 ) -> Result<()> {
     let mut keyed = Vec::with_capacity(refs.len());
     for reference in refs.drain(..) {
         let keys = sorts
             .iter()
-            .map(|sort| for_each_ref_sort_key(&reference, *sort, &context))
+            .map(|sort| for_each_ref_sort_key(&reference, *sort, &context, object_headers))
             .collect::<Result<Vec<_>>>()?;
         keyed.push((reference, keys));
     }
@@ -1493,10 +1580,35 @@ impl ForEachRefSort {
     }
 }
 
+fn for_each_ref_object_header(
+    db: &FileObjectDatabase,
+    cache: &mut ForEachRefObjectHeaderCache,
+    oid: &ObjectId,
+) -> Result<(ObjectType, usize)> {
+    if let Some(header) = cache.get(oid).copied() {
+        return Ok(header);
+    }
+    let header = for_each_ref_read_object_header(db, oid)?;
+    cache.insert(*oid, header);
+    Ok(header)
+}
+
+fn for_each_ref_read_object_header(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+) -> Result<(ObjectType, usize)> {
+    if let Some((object_type, size)) = db.read_object_header(oid)? {
+        return Ok((object_type, size as usize));
+    }
+    let object = db.read_object(oid)?;
+    Ok((object.object_type, object.body.len()))
+}
+
 fn for_each_ref_sort_key(
     reference: &sley_refs::Ref,
     sort: ForEachRefSort,
     context: &ForEachRefSortContext<'_>,
+    object_headers: &mut ForEachRefObjectHeaderCache,
 ) -> Result<ForEachRefSortKey> {
     let key = match sort {
         ForEachRefSort::Refname | ForEachRefSort::RefnameDescending => {
@@ -1581,7 +1693,8 @@ fn for_each_ref_sort_key(
         ),
         ForEachRefSort::RawSize | ForEachRefSort::RawSizeDescending => ForEachRefSortKey::Number(
             if let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? {
-                context.db.read_object(&oid)?.body.len() as i128
+                let (_, size) = for_each_ref_object_header(context.db, object_headers, &oid)?;
+                size as i128
             } else {
                 0
             },
@@ -1723,12 +1836,9 @@ fn for_each_ref_sort_key(
         ForEachRefSort::ObjectType | ForEachRefSort::ObjectTypeDescending => {
             ForEachRefSortKey::Text(
                 if let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? {
-                    context
-                        .db
-                        .read_object(&oid)?
-                        .object_type
-                        .as_str()
-                        .to_string()
+                    let (object_type, _) =
+                        for_each_ref_object_header(context.db, object_headers, &oid)?;
+                    object_type.as_str().to_string()
                 } else {
                     String::new()
                 },
@@ -1737,7 +1847,8 @@ fn for_each_ref_sort_key(
         ForEachRefSort::ObjectSize | ForEachRefSort::ObjectSizeDescending => {
             ForEachRefSortKey::Number(
                 if let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? {
-                    context.db.read_object(&oid)?.body.len() as i128
+                    let (_, size) = for_each_ref_object_header(context.db, object_headers, &oid)?;
+                    size as i128
                 } else {
                     0
                 },
