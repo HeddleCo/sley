@@ -110,18 +110,11 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             write_paired_entries(git_dir, format, entries)?;
         }
         ReadTreeMode::Merge => {
-            // The original index paths distinguish "added" entries (which `-u`
-            // must not write over an untracked file) from those already tracked.
-            let original_paths = original_index_paths(git_dir, format)?;
-            let entries = merge_trees(git_dir, format, db, &tree_oids)?;
-            if parsed.update_worktree {
-                let worktree_root = worktree_root_for_git_dir(git_dir)?;
-                // git validates the whole worktree update before touching
-                // anything; refuse if a freshly added path would clobber an
-                // untracked file.
-                verify_no_untracked_overwrites(&worktree_root, &entries, &original_paths)?;
-                update_worktree_for_merge(&worktree_root, git_dir, format, db, &entries)?;
-            }
+            // The trivial fast-forward / two-way / three-way merge now runs
+            // through the shared `sley-unpack-trees` engine (git's
+            // oneway/twoway/threeway_merge). The engine computes the result
+            // index and the worktree update plan; we apply the plan with `-u`.
+            let entries = merge_trees(git_dir, format, db, &tree_oids, parsed.update_worktree)?;
             write_paired_entries(git_dir, format, entries)?;
         }
     }
@@ -412,25 +405,49 @@ fn original_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet
     Ok(out)
 }
 
-/// Refuse a `-m -u` worktree update that would write a *newly added* path on top
-/// of an existing untracked file, mirroring git's pre-flight check (which aborts
-/// the whole operation, reporting the first offending path in sorted order).
-fn verify_no_untracked_overwrites(
-    worktree_root: &Path,
-    entries: &[(Vec<u8>, StagedEntry)],
-    original_paths: &BTreeSet<Vec<u8>>,
-) -> Result<()> {
-    // `entries` is already sorted by path, so the first hit matches git.
-    for (path, entry) in entries {
-        if entry.stage != 0 || original_paths.contains(path) {
-            continue;
+/// The working-tree side of a `-m` merge, supplying the `sley-unpack-trees`
+/// engine with read-tree's I/O: how to tell whether a path is up to date
+/// (hashing the worktree blob), whether materializing/removing a path would
+/// clobber an untracked file, and how to write/remove worktree files when `-u`
+/// applies the result.
+struct ReadTreeWorktree<'a> {
+    worktree_root: PathBuf,
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    /// Every path present in the *pre-merge* index (any stage). A merged-result
+    /// path not in this set is a fresh addition, so writing it must not clobber
+    /// an untracked working-tree file.
+    original_paths: BTreeSet<Vec<u8>>,
+}
+
+impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
+    fn verify_uptodate(&self, path: &[u8], ce: &sley_unpack_trees::CacheEntry) -> Result<()> {
+        // The engine hands us the *current index* entry for the path; reuse the
+        // existing hash-the-worktree-blob comparison (a missing tracked file is
+        // treated as up to date, matching git's re-materialization allowance).
+        verify_uptodate_path(
+            &self.worktree_root,
+            self.format,
+            path,
+            Some(&(ce.mode, ce.oid)),
+        )
+    }
+
+    fn verify_absent_overwrite(
+        &self,
+        path: &[u8],
+        _merge: &sley_unpack_trees::CacheEntry,
+        _reset: sley_unpack_trees::ResetType,
+    ) -> Result<()> {
+        // git's `verify_absent(ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN)`: a brand
+        // new path must not write over an untracked file. A path already in the
+        // pre-merge index is tracked, so re-materializing it is fine.
+        if self.original_paths.contains(path) {
+            return Ok(());
         }
-        let Some(file_path) = safe_worktree_path(worktree_root, path) else {
-            continue;
+        let Some(file_path) = safe_worktree_path(&self.worktree_root, path) else {
+            return Ok(());
         };
-        // Re-materializing a path we already track is fine; an untracked file in
-        // the way is not. `original_paths` excluded tracked paths above, so any
-        // existing file here is untracked.
         if let Ok(metadata) = fs::symlink_metadata(&file_path)
             && metadata.is_file()
         {
@@ -440,201 +457,108 @@ fn verify_no_untracked_overwrites(
             );
             return Err(GitError::Exit(128));
         }
+        Ok(())
     }
-    Ok(())
+
+    fn verify_absent_remove(
+        &self,
+        _path: &[u8],
+        _reset: sley_unpack_trees::ResetType,
+    ) -> Result<()> {
+        // read-tree's pre-engine path never rejected a removal on an untracked
+        // file in the way (deletions only ran verify_uptodate on the tracked
+        // copy); preserve that behaviour exactly to hold parity. The full
+        // ERROR_WOULD_LOSE_UNTRACKED_REMOVED check is a checkout/merge concern.
+        // TODO(unpack-trees): wire the untracked-would-be-lost-on-removal check
+        // when the checkout pilot needs it.
+        Ok(())
+    }
+}
+
+impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
+    fn write_blob(&mut self, path: &[u8], _mode: u32, oid: &ObjectId) -> Result<()> {
+        write_blob_to_worktree(&self.worktree_root, self.db, path, oid)
+    }
+
+    fn remove_path(&mut self, path: &[u8]) -> Result<()> {
+        remove_worktree_path(&self.worktree_root, path)
+    }
 }
 
 /// Perform git's trivial fast-forward / two-way / three-way merge of the listed
-/// trees, producing the resulting (possibly multi-stage) index entries.
+/// trees through the shared [`sley_unpack_trees`] engine, producing the
+/// resulting (possibly multi-stage) index entries. With `update_worktree`, the
+/// engine's computed worktree plan (removals + resolved-blob writes) is applied
+/// before the entries are returned.
 ///
-/// The number of trees selects the flavour:
-/// * 1 tree  — fast-forward: take the tree wholesale into stage 0.
-/// * 2 trees — two-way merge (`old`, `new`); take `new`, removing paths absent
-///   from `new`. Paths whose worktree/index copy is not up to date abort.
-/// * 3 trees — three-way merge (`base`, `ours`, `theirs`) using the documented
-///   trivial-merge stage rules.
+/// The number of trees selects the merge function:
+/// * 1 tree  — `oneway_merge`: fast-forward, take the tree wholesale.
+/// * 2 trees — `twoway_merge`: switch `old` → `new`, carry forward local adds.
+/// * 3 trees — `threeway_merge`: trivial 3-way, recording stage 1/2/3 on a
+///   non-trivial path.
 fn merge_trees(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     tree_oids: &[ObjectId],
+    update_worktree: bool,
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    match tree_oids {
-        [tree] => merge_one_tree(git_dir, format, db, tree),
-        [old, new] => merge_two_trees(git_dir, format, db, old, new),
-        [base, ours, theirs] => merge_three_trees(git_dir, format, db, base, ours, theirs),
+    use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
+
+    let merge_fn = match tree_oids.len() {
+        1 => MergeFn::OneWay,
+        2 => MergeFn::TwoWay,
+        3 => MergeFn::ThreeWay,
         _ => {
             eprintln!("fatal: you must specify at least one tree to merge");
-            Err(GitError::Exit(128))
+            return Err(GitError::Exit(128));
         }
-    }
-}
+    };
 
-/// One-tree merge (`-m <tree>`): fast-forward the index to `tree`. Paths the
-/// merge changes or removes must be up to date in the worktree.
-fn merge_one_tree(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    tree: &ObjectId,
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
-    let current = current_index_stage0(git_dir, format)?;
-    let target = tree_leaf_map(db, format, tree)?;
-
-    let mut all_paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
-    all_paths.extend(current.keys());
-    all_paths.extend(target.keys());
-    for path in all_paths {
-        if current.get(path) != target.get(path) {
-            verify_uptodate(&worktree_root, db, format, path, current.get(path))?;
-        }
-    }
-
-    Ok(leaves_to_stage0(target))
-}
-
-/// Two-tree merge (`-m <old> <new>`): switch the index from `old` to `new`,
-/// keeping local additions present in the index but absent from `old`.
-fn merge_two_trees(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    old: &ObjectId,
-    new: &ObjectId,
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
-    let old_map = tree_leaf_map(db, format, old)?;
-    let new_map = tree_leaf_map(db, format, new)?;
     let index = current_index_stage0(git_dir, format)?;
+    let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
+        .iter()
+        .map(|oid| tree_leaf_map(db, format, oid))
+        .collect::<Result<_>>()?;
 
-    let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
-    paths.extend(old_map.keys());
-    paths.extend(new_map.keys());
-    paths.extend(index.keys());
+    let mut opts = UnpackTreesOptions::new(format);
+    opts.merge = true;
+    opts.update = update_worktree;
+    // `read-tree -m` is index-only unless `-u` is given; the engine's worktree
+    // safety checks (verify_uptodate / verify_absent) only run when not
+    // index-only, matching upstream where `-m` without `-u` still runs the
+    // up-to-date checks. read-tree's historic behaviour DOES run verify_uptodate
+    // even without `-u`, so keep `index_only` false and let `update` gate the
+    // verify_absent (clobber) check inside merged_entry.
+    opts.index_only = false;
 
-    let mut result: Vec<(Vec<u8>, StagedEntry)> = Vec::new();
-    for path in paths {
-        let in_old = old_map.get(path);
-        let in_new = new_map.get(path);
-        let in_index = index.get(path);
+    let mut wt = ReadTreeWorktree {
+        worktree_root: worktree_root_for_git_dir(git_dir)?,
+        db,
+        format,
+        original_paths: original_index_paths(git_dir, format)?,
+    };
 
-        match (in_old, in_new) {
-            (Some(o), Some(n)) => {
-                if o == n {
-                    // Unchanged old->new: keep the index copy if present, else
-                    // take the (identical) tree copy.
-                    let (mode, oid) = in_index.cloned().unwrap_or_else(|| n.clone());
-                    result.push((path.clone(), stage0(mode, oid)));
-                } else {
-                    // Changed old->new: the working tree must be up to date,
-                    // then we take `new`.
-                    verify_uptodate(&worktree_root, db, format, path, in_index)?;
-                    let (mode, oid) = n.clone();
-                    result.push((path.clone(), stage0(mode, oid)));
-                }
-            }
-            (Some(_o), None) => {
-                // Removed in new: drop it, but the worktree must be up to date.
-                verify_uptodate(&worktree_root, db, format, path, in_index)?;
-            }
-            (None, Some(n)) => {
-                // Added in new: keep an identical index copy, else require the
-                // path be up to date before writing the new content.
-                if in_index != Some(n) {
-                    verify_uptodate(&worktree_root, db, format, path, in_index)?;
-                }
-                let (mode, oid) = n.clone();
-                result.push((path.clone(), stage0(mode, oid)));
-            }
-            (None, None) => {
-                // Only present locally (a local addition): keep it.
-                if let Some((mode, oid)) = in_index {
-                    result.push((path.clone(), stage0(*mode, *oid)));
-                }
-            }
-        }
+    let result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
+
+    if update_worktree {
+        check_updates(&result, &opts, &mut wt)?;
     }
-    result.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(result)
-}
 
-/// Three-tree merge (`-m <base> <ours> <theirs>`): the documented trivial
-/// three-way merge that resolves what it can to stage 0 and otherwise records
-/// stage 1 (base) / 2 (ours) / 3 (theirs) entries.
-fn merge_three_trees(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    base: &ObjectId,
-    ours: &ObjectId,
-    theirs: &ObjectId,
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
-    let base_map = tree_leaf_map(db, format, base)?;
-    let ours_map = tree_leaf_map(db, format, ours)?;
-    let theirs_map = tree_leaf_map(db, format, theirs)?;
-    let index = current_index_stage0(git_dir, format)?;
-
-    let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
-    paths.extend(base_map.keys());
-    paths.extend(ours_map.keys());
-    paths.extend(theirs_map.keys());
-
-    let mut result: Vec<(Vec<u8>, StagedEntry)> = Vec::new();
-    for path in paths {
-        let o = base_map.get(path);
-        let a = ours_map.get(path);
-        let b = theirs_map.get(path);
-        let in_index = index.get(path);
-
-        // Trivial resolutions to stage 0 (see git-read-tree(1) trivial rules):
-        //   * ours == theirs  -> take it (both sides agree, incl. both-removed)
-        //   * theirs == base  -> take ours   (only ours changed)
-        //   * ours == base    -> take theirs (only theirs changed)
-        let resolved: Option<&(u32, ObjectId)> = if a == b || b == o {
-            // Both sides agree, or theirs is unchanged from base: take ours.
-            a
-        } else if a == o {
-            // Only theirs changed: take theirs.
-            b
-        } else {
-            None
-        };
-
-        match resolved {
-            Some(value) => {
-                // A clean resolution. If it changes the working-tree side, the
-                // path must be up to date first.
-                if Some(value) != in_index {
-                    verify_uptodate(&worktree_root, db, format, path, in_index)?;
-                }
-                let (mode, oid) = value.clone();
-                result.push((path.clone(), stage0(mode, oid)));
-            }
-            None => {
-                // No trivial resolution: emit the surviving stages. Before
-                // recording a conflict the path must be up to date so we do not
-                // silently clobber local work.
-                verify_uptodate(&worktree_root, db, format, path, in_index)?;
-                if let Some((mode, oid)) = o {
-                    result.push((path.clone(), staged(*mode, *oid, 1)));
-                }
-                if let Some((mode, oid)) = a {
-                    result.push((path.clone(), staged(*mode, *oid, 2)));
-                }
-                if let Some((mode, oid)) = b {
-                    result.push((path.clone(), staged(*mode, *oid, 3)));
-                }
-            }
-        }
-    }
-    result.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.stage.cmp(&right.1.stage))
-    });
-    Ok(result)
+    Ok(result
+        .entries
+        .into_iter()
+        .map(|e| {
+            (
+                e.path,
+                StagedEntry {
+                    mode: e.entry.mode,
+                    oid: e.entry.oid,
+                    stage: e.entry.stage,
+                },
+            )
+        })
+        .collect())
 }
 
 /// Construct a stage-0 [`StagedEntry`].
@@ -646,11 +570,6 @@ fn stage0(mode: u32, oid: ObjectId) -> StagedEntry {
     }
 }
 
-/// Construct a [`StagedEntry`] at an explicit stage.
-fn staged(mode: u32, oid: ObjectId, stage: u8) -> StagedEntry {
-    StagedEntry { mode, oid, stage }
-}
-
 /// Abort with git's "not uptodate" error when the working-tree copy of `path`
 /// disagrees with the index entry the merge is about to replace/remove.
 ///
@@ -658,9 +577,11 @@ fn staged(mode: u32, oid: ObjectId, stage: u8) -> StagedEntry {
 /// `None` if the path is currently untracked). The worktree file must hash to
 /// the same blob for the operation to be safe; a missing tracked file is
 /// considered up to date (git permits re-materializing it).
-fn verify_uptodate(
+///
+/// This is the I/O behind [`ReadTreeWorktree`]'s `verify_uptodate` probe (git's
+/// `verify_uptodate_1`).
+fn verify_uptodate_path(
     worktree_root: &Path,
-    db: &FileObjectDatabase,
     format: ObjectFormat,
     path: &[u8],
     expected: Option<&(u32, ObjectId)>,
@@ -669,7 +590,6 @@ fn verify_uptodate(
         // Untracked path: nothing in the index to be out of date with.
         return Ok(());
     };
-    let _ = db;
     let Some(file_path) = safe_worktree_path(worktree_root, path) else {
         return Ok(());
     };
@@ -803,44 +723,6 @@ fn reset_worktree_to_entries(
         }
     }
     for (path, entry) in entries {
-        write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
-    }
-    Ok(())
-}
-
-/// Apply a completed merge result to the working tree (`-m -u`): remove tracked
-/// paths the merge dropped, and write resolved (stage-0) blobs whose content
-/// actually changed. Conflicted (stage > 0) paths are left in the working tree
-/// untouched, matching git.
-///
-/// git's `-u` is a *minimal* update: a path whose merged stage-0 entry equals
-/// the pre-merge index entry is left on disk as-is (so a locally deleted file
-/// the merge did not touch stays deleted). This reads the still-unwritten index,
-/// which therefore reflects the original (pre-merge) state.
-fn update_worktree_for_merge(
-    worktree_root: &Path,
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    entries: &[(Vec<u8>, StagedEntry)],
-) -> Result<()> {
-    let kept: BTreeSet<&Vec<u8>> = entries.iter().map(|(path, _)| path).collect();
-    let original = current_index_stage0(git_dir, format)?;
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in &index.entries {
-            if !kept.iter().any(|p| p.as_slice() == entry.path.as_bytes()) {
-                remove_worktree_path(worktree_root, &entry.path)?;
-            }
-        }
-    }
-    for (path, entry) in entries {
-        if entry.stage != 0 {
-            continue;
-        }
-        // Skip paths the merge left identical to the prior index entry.
-        if original.get(path) == Some(&(entry.mode, entry.oid)) {
-            continue;
-        }
         write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
     }
     Ok(())
