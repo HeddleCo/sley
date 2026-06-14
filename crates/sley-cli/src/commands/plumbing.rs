@@ -2515,6 +2515,12 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
         eprintln!("fatal: No pathspec was given. Which files should I remove?");
         return Err(GitError::Exit(128));
     }
+    if paths.iter().any(|path| path.as_os_str().is_empty()) {
+        eprintln!(
+            "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
+        );
+        return Err(GitError::Exit(128));
+    }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -2529,6 +2535,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             }
         })
         .collect::<Vec<_>>();
+    let config_parameters_env = effective_config_parameters_env();
     let result = sley_worktree::remove_index_and_worktree_paths(
         worktree_root,
         git_dir,
@@ -2541,6 +2548,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             dry_run,
             ignore_unmatch,
         },
+        config_parameters_env.as_deref(),
     )?;
     if !quiet {
         let mut stdout = io::stdout().lock();
