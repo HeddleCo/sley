@@ -1122,20 +1122,12 @@ fn parse_submodule_summary_limit(value: &str) -> Result<isize> {
 }
 
 fn submodule_name_for_exact_path(config: &GitConfig, path: &str) -> Option<String> {
-    config
-        .sections
-        .iter()
-        .filter(|section| section.name == "submodule")
-        .find(|section| {
-            section
-                .entries
-                .iter()
-                .rev()
-                .find(|entry| entry.key == "path")
-                .and_then(|entry| entry.value.as_deref())
-                == Some(path)
-        })
-        .and_then(|section| section.subsection.clone())
+    // PILOT (sley-submodule): route the exact-path → name lookup through the
+    // typed parser's `from_path`, which is git's `submodule_from_path` keyed on
+    // the (first-wins) `path` binding.
+    sley_submodule::SubmoduleConfigSet::parse(config)
+        .from_path(path)
+        .map(|submodule| submodule.name.clone())
 }
 
 fn filter_submodule_configs<'a>(
@@ -1562,46 +1554,56 @@ fn clear_submodule_worktree(path: &Path) -> Result<()> {
 }
 
 fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<SubmoduleConfigEntry>> {
+    // PILOT (sley-submodule): the hand-rolled section walk that used to live
+    // here is now the typed `submodule-config.c` port. We map the typed
+    // `Submodule` back onto the CLI's `SubmoduleConfigEntry` so the dozen-odd
+    // call sites are untouched; only the parse is centralized. The new parser
+    // is `overwrite == 0` (first-value-wins) like git, whereas the old walk
+    // used `.rev().find()` (last-value-wins). git's own `.gitmodules` parse is
+    // first-wins, so this is a parity fix, not a behavior break.
+    //
+    // TODO(submodule): migrate the other 13 `.gitmodules` walk sites
+    // (set-url / set-branch / sync / add via `submodule_name_for_exact_path`,
+    // and the scattered reads in sley-cli/{branch,workspace,remote_cmds}.rs,
+    // sley-worktree, sley-remote/clone.rs) onto `SubmoduleConfigSet`.
     let path = worktree_root.join(".gitmodules");
     let Ok(config) = GitConfig::read(path) else {
         return Ok(Vec::new());
     };
+    let set = sley_submodule::SubmoduleConfigSet::parse(&config);
     let mut submodules = Vec::new();
-    for section in config.sections {
-        if section.name != "submodule" {
-            continue;
-        }
-        let Some(name) = section.subsection.clone() else {
+    for submodule in set.iter() {
+        // A submodule with no `path` is not addressable; the old walk skipped
+        // those too (`if let Some(path) = path`).
+        let Some(path) = submodule.path.clone() else {
             continue;
         };
-        let path = section
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.key == "path")
-            .and_then(|entry| entry.value.clone());
-        let url = section
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.key == "url")
-            .and_then(|entry| entry.value.clone());
-        let update = section
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.key == "update")
-            .and_then(|entry| entry.value.clone());
-        if let Some(path) = path {
-            submodules.push(SubmoduleConfigEntry {
-                name,
-                path,
-                url,
-                update,
-            });
-        }
+        submodules.push(SubmoduleConfigEntry {
+            name: submodule.name.clone(),
+            path,
+            url: submodule.url.clone(),
+            update: submodule_update_to_raw(&submodule.update_strategy),
+        });
     }
     Ok(submodules)
+}
+
+/// Re-stringify a typed update strategy back to the raw `.gitmodules` value the
+/// init path copies into `.git/config`. `Unspecified` (never set, or an
+/// invalid value the typed parser rejected) maps to `None`, matching the old
+/// behavior where only a present, recognized `update =` line was copied.
+fn submodule_update_to_raw(
+    strategy: &sley_submodule::UpdateStrategy,
+) -> Option<String> {
+    use sley_submodule::UpdateType;
+    match strategy.kind {
+        UpdateType::Unspecified => None,
+        UpdateType::Command => strategy
+            .command
+            .as_ref()
+            .map(|command| format!("!{command}")),
+        other => sley_submodule::update_type_to_string(other).map(str::to_string),
+    }
 }
 
 fn filter_submodules(
