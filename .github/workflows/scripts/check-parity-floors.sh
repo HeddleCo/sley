@@ -35,6 +35,12 @@
 # last cell, sley#44 — 306 cells record before the 900s timeout kill), plus the
 # new t1400-update-ref.sh floored at 175. t1800-hook stays at 55 (already a
 # full pass since the hooks-layer landing).
+# format-patch wave (2026-06-14, parity/fmtpatch): t4014-format-patch added at
+# 96 (was 38 — banked the To/Cc/extra-header, --from/format.from in-body,
+# --signature/--signature-file, --signoff trailer-block, and --rfc clusters).
+# Same change lifted t4202-log 55->56 (shared --from/identity-header path), so
+# its floor is raised to 56. No diff/log floor regressed (t4013/t4015/t4018/
+# t4052/t4034/t4045/t4047/t4027 all held; render.rs untouched).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -88,7 +94,7 @@ declare -A FLOOR=(
     [t4216-log-bloom.sh]=112
     [t5318-commit-graph.sh]=38
     [t3432-rebase-fast-forward.sh]=144
-    [t4202-log.sh]=55
+    [t4202-log.sh]=56
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
@@ -99,6 +105,7 @@ declare -A FLOOR=(
     [t5327-multi-pack-bitmaps-rev.sh]=308
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
+    [t4014-format-patch.sh]=96
     [t4052-stat-output.sh]=71
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41

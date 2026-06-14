@@ -417,24 +417,18 @@ fn resolve_header_block(options: &FormatPatchOptions, config: &GitConfig) -> Vec
     if !options.no_add_header {
         // format.headers entries route through add_header (To:/Cc: prefixes go
         // to the recipient lists; everything else is a raw header line).
-        for value in config.get_all("format", None, "headers") {
-            if let Some(value) = value {
-                route_config_header(value, &mut headers, &mut to, &mut cc);
-            }
+        for value in config.get_all("format", None, "headers").into_iter().flatten() {
+            route_config_header(value, &mut headers, &mut to, &mut cc);
         }
     }
     if !options.no_to {
-        for value in config.get_all("format", None, "to") {
-            if let Some(value) = value {
-                to.push(value.to_string());
-            }
+        for value in config.get_all("format", None, "to").into_iter().flatten() {
+            to.push(value.to_string());
         }
     }
     if !options.no_cc {
-        for value in config.get_all("format", None, "cc") {
-            if let Some(value) = value {
-                cc.push(value.to_string());
-            }
+        for value in config.get_all("format", None, "cc").into_iter().flatten() {
+            cc.push(value.to_string());
         }
     }
     // Command-line --add-header / --to / --cc always apply (they come after the
@@ -908,14 +902,12 @@ fn append_signoff_trailer(body: &mut Vec<u8>, signoff_line: &[u8]) {
     if footer == FooterState::None {
         // Add a blank line so the body and the sob are separated, mirroring
         // git's buffer-state rules. After the line-completion above, an empty
-        // body needs "\n\n" (title room), a single "\n" needs one more, and a
-        // body ending in a single "\n" gets a blank line; a body already ending
-        // in "\n\n" needs nothing.
+        // body needs "\n\n" (title room); a single "\n" or a body ending in a
+        // single (non-blank-terminated) "\n" needs one more "\n"; a body already
+        // ending in "\n\n" needs nothing.
         if body.is_empty() {
             body.extend_from_slice(b"\n\n");
-        } else if body.len() == 1 {
-            body.push(b'\n');
-        } else if body[body.len() - 2] != b'\n' {
+        } else if body.len() == 1 || body[body.len() - 2] != b'\n' {
             body.push(b'\n');
         }
     }
