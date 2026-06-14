@@ -962,6 +962,10 @@ mod tests {
     /// Raw git mode for a gitlink (submodule) cache entry.
     const GITLINK_MODE: u32 = 0o160000;
 
+    /// One recorded `check_submodule_move_head` invocation:
+    /// `(path, old_oid, new_oid, reset)`.
+    type MoveHeadCall = (Vec<u8>, Option<ObjectId>, ObjectId, ResetType);
+
     /// A probe that records every `check_submodule_move_head` call and, when
     /// `reject_path` is set, returns git's `ERROR_WOULD_LOSE_SUBMODULE`-style
     /// error for that path — letting a test assert both *that* the engine
@@ -969,7 +973,7 @@ mod tests {
     /// propagates out of `unpack_trees`.
     #[derive(Default)]
     struct RecordingProbe {
-        calls: std::cell::RefCell<Vec<(Vec<u8>, Option<ObjectId>, ObjectId, ResetType)>>,
+        calls: std::cell::RefCell<Vec<MoveHeadCall>>,
         reject_path: Option<Vec<u8>>,
     }
 
