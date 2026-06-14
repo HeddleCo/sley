@@ -608,7 +608,7 @@ fn status_hides_root_gitignore_matches_like_upstream_git() {
         git(&root, &["init", "-q", "-b", "main"]);
         fs::write(
             root.join(".gitignore"),
-            b"\\#ignored.hash\n\\!ignored.bang\n\\*.literal\nliteral-\\?.tmp\nliteral-\\[ab\\].tmp\ntrailing.log   \nliteral-space\\ \nclass-[ab].tmp\nrange-[0-2].tmp\nnegclass-[!z].tmp\n*.log\n!important.log\nignored-dir/\n",
+            b"\\#ignored.hash\n\\!ignored.bang\n\\*.literal\nliteral-\\?.tmp\nliteral-\\[ab\\].tmp\ntrailing.log   \nliteral-space\\ \nclass-[ab].tmp\nrange-[0-2].tmp\nnegclass-[!z].tmp\n*.log\n!important.log\nignored-dir/\n/tmp-*/\n",
         )
         .expect("write gitignore");
         fs::write(
@@ -652,6 +652,19 @@ fn status_hides_root_gitignore_matches_like_upstream_git() {
         fs::write(root.join("visible.tmp"), b"visible\n").expect("write visible fixture");
         fs::create_dir_all(root.join("ignored-dir")).expect("create ignored dir");
         fs::write(root.join("ignored-dir/file.txt"), b"ignored\n").expect("write ignored dir file");
+        fs::create_dir_all(root.join("tmp-info-only")).expect("create anchored glob ignored dir");
+        fs::write(root.join("tmp-info-only/file.txt"), b"ignored\n")
+            .expect("write anchored glob ignored file");
+        fs::create_dir_all(root.join("tmp-nested-repo/.git"))
+            .expect("create ignored nested repo fixture");
+        fs::write(root.join("tmp-nested-repo/.git/HEAD"), b"ref: refs/heads/main\n")
+            .expect("write ignored nested repo head");
+        fs::write(root.join("tmp-nested-repo/file.txt"), b"ignored\n")
+            .expect("write ignored nested repo file");
+        fs::create_dir_all(root.join("nested/tmp-info-only"))
+            .expect("create nested anchored glob visible dir");
+        fs::write(root.join("nested/tmp-info-only/file.txt"), b"visible\n")
+            .expect("write nested anchored glob visible file");
         fs::create_dir_all(root.join("info-dir")).expect("create info ignored dir");
         fs::write(root.join("info-dir/file.txt"), b"ignored\n").expect("write info ignored file");
         fs::create_dir_all(root.join("local")).expect("create local ignore dir");

@@ -192,6 +192,7 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
         format,
         ShortStatusOptions {
             include_ignored: false,
+            ignored_mode: StatusIgnoredMode::Traditional,
             untracked_mode: StatusUntrackedMode::Normal,
         },
     ) else {
@@ -217,8 +218,16 @@ pub enum StatusUntrackedMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusIgnoredMode {
+    #[default]
+    Traditional,
+    Matching,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ShortStatusOptions {
     pub include_ignored: bool,
+    pub ignored_mode: StatusIgnoredMode,
     pub untracked_mode: StatusUntrackedMode,
 }
 
@@ -1920,7 +1929,22 @@ pub fn short_status_with_options(
         );
     }
     if options.include_ignored {
-        for path in ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)? {
+        let ignored_paths = ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)?;
+        let ignored_paths: Vec<Vec<u8>> = match options.ignored_mode {
+            StatusIgnoredMode::Matching => ignored_paths,
+            StatusIgnoredMode::Traditional => {
+                let mut rolled = BTreeSet::new();
+                for path in ignored_paths {
+                    let path = untracked_normal_rollup_path(&path, &index, &ignores);
+                    if ignored_traditional_path_is_empty_directory(worktree_root, &path)? {
+                        continue;
+                    }
+                    rolled.insert(path);
+                }
+                rolled.into_iter().collect()
+            }
+        };
+        for path in ignored_paths {
             entries.push(ShortStatusEntry {
                 index: b'!',
                 worktree: b'!',
@@ -3475,6 +3499,20 @@ fn ignored_untracked_paths(
     Ok(paths.into_iter().collect())
 }
 
+fn ignored_traditional_path_is_empty_directory(root: &Path, path: &[u8]) -> Result<bool> {
+    let Some(path) = path.strip_suffix(b"/") else {
+        return Ok(false);
+    };
+    let mut absolute = PathBuf::new();
+    set_worktree_path_from_repo_path(root, path, &mut absolute)?;
+    match fs::read_dir(&absolute) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
 struct IgnoredUntrackedContext<'a> {
     root: &'a Path,
     git_dir: &'a Path,
@@ -3508,9 +3546,6 @@ fn collect_ignored_untracked_paths(
         })?;
         let git_path = git_path_bytes(relative)?;
         if metadata.is_dir() {
-            if is_nested_repository_boundary(&path) {
-                continue;
-            }
             let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
             if ignored && !index_has_path_under(context.index, &git_path) {
                 if context.directory {
@@ -3521,6 +3556,9 @@ fn collect_ignored_untracked_paths(
                     collect_ignored_untracked_paths(context, &path, true, paths)?;
                 }
             } else {
+                if is_nested_repository_boundary(&path) {
+                    continue;
+                }
                 collect_ignored_untracked_paths(context, &path, ignored, paths)?;
             }
         } else if !context.index.contains_key(&git_path)
@@ -4077,11 +4115,13 @@ impl IgnorePattern {
 
     fn matches_directory(&self, path: &[u8], is_dir: bool) -> bool {
         if self.anchored || self.has_slash {
-            return path == self.pattern
-                || path
-                    .strip_prefix(self.pattern.as_slice())
-                    .and_then(|rest| rest.strip_prefix(b"/"))
-                    .is_some();
+            if is_dir && self.match_path(path) {
+                return true;
+            }
+            return path
+                .iter()
+                .enumerate()
+                .any(|(idx, byte)| *byte == b'/' && self.match_path(&path[..idx]));
         }
         let mut components = path.split(|byte| *byte == b'/').peekable();
         while let Some(component) = components.next() {
@@ -4092,22 +4132,22 @@ impl IgnorePattern {
         false
     }
 
-    /// Match a slash-free `value` (a basename or path component) against this
-    /// pattern. Literal and simple `*X`/`X*` patterns resolve with a direct
-    /// comparison; only complex globs pay for the allocating wildcard engine.
-    fn match_segment(&self, value: &[u8]) -> bool {
+    fn match_path(&self, value: &[u8]) -> bool {
         match self.match_kind {
             MatchKind::Literal => self.pattern == value,
-            // `*X` ≡ ends_with(X) and `X*` ≡ starts_with(X), but only on a
-            // slash-free segment: `*` never crosses `/`, so an anchored `/*.log`
-            // applied to a multi-segment path must not match (the slash guard
-            // rejects it). Basename/component call sites are slash-free already.
             MatchKind::Suffix => !value.contains(&b'/') && value.ends_with(&self.pattern[1..]),
             MatchKind::Prefix => {
                 !value.contains(&b'/') && value.starts_with(&self.pattern[..self.pattern.len() - 1])
             }
             MatchKind::Glob => wildcard_path_matches(&self.pattern, value),
         }
+    }
+
+    /// Match a slash-free `value` (a basename or path component) against this
+    /// pattern. Literal and simple `*X`/`X*` patterns resolve with a direct
+    /// comparison; only complex globs pay for the allocating wildcard engine.
+    fn match_segment(&self, value: &[u8]) -> bool {
+        self.match_path(value)
     }
 }
 
@@ -9433,6 +9473,15 @@ mod tests {
         let matcher = ignore_matcher(&[b"/foo"]);
         assert!(matcher.is_ignored(b"foo", false));
         assert!(!matcher.is_ignored(b"a/foo", false));
+    }
+
+    #[test]
+    fn ignore_anchored_directory_glob_matches_root_directory() {
+        let matcher = ignore_matcher(&[b"/tmp-*/"]);
+        assert!(matcher.is_ignored(b"tmp-info-only", true));
+        assert!(matcher.is_ignored(b"tmp-info-only/file.txt", false));
+        assert!(!matcher.is_ignored(b"nested/tmp-info-only", true));
+        assert!(!matcher.is_ignored(b"tmp-info-only", false));
     }
 
     #[test]
