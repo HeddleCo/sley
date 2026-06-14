@@ -273,7 +273,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut grep_all_match = false;
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
-    let mut regexp_mode = SimpleLogRegexMode::Basic;
+    let mut pattern_kind = crate::grep_source::PatternKind::Basic;
     let mut date_mode = DateMode::Default;
     let mut date_explicit = false;
     // `-z` / `--null`: separate/terminate compiled-format entries with NUL
@@ -340,39 +340,32 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             "--author" => {
                 let value = iter.next().ok_or_else(log_author_requires_value_error)?;
-                author_patterns.push(LogFilterPattern::new(value, "header"));
+                author_patterns.push(value.to_string());
             }
             value if value.starts_with("--author=") => {
-                author_patterns.push(LogFilterPattern::new(&value["--author=".len()..], "header"));
+                author_patterns.push(value["--author=".len()..].to_string());
             }
             "--committer" => {
                 let value = iter.next().ok_or_else(log_committer_requires_value_error)?;
-                committer_patterns.push(LogFilterPattern::new(value, "header"));
+                committer_patterns.push(value.to_string());
             }
             value if value.starts_with("--committer=") => {
-                committer_patterns.push(LogFilterPattern::new(
-                    &value["--committer=".len()..],
-                    "header",
-                ));
+                committer_patterns.push(value["--committer=".len()..].to_string());
             }
             "--grep" => {
                 let value = iter.next().ok_or_else(log_grep_requires_value_error)?;
-                grep_patterns.push(LogFilterPattern::new(value, "command line"));
+                grep_patterns.push(value.to_string());
             }
             value if value.starts_with("--grep=") => {
-                grep_patterns.push(LogFilterPattern::new(
-                    &value["--grep=".len()..],
-                    "command line",
-                ));
+                grep_patterns.push(value["--grep=".len()..].to_string());
             }
             "--all-match" => grep_all_match = true,
             "--invert-grep" => invert_grep = true,
             "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
-            "-F" | "--fixed-strings" => regexp_mode = SimpleLogRegexMode::Fixed,
-            "-E" | "--basic-regexp" | "--extended-regexp" => {
-                regexp_mode = SimpleLogRegexMode::Basic
-            }
-            "-P" | "--perl-regexp" => regexp_mode = SimpleLogRegexMode::Perl,
+            "-F" | "--fixed-strings" => pattern_kind = crate::grep_source::PatternKind::Fixed,
+            "--basic-regexp" => pattern_kind = crate::grep_source::PatternKind::Basic,
+            "-E" | "--extended-regexp" => pattern_kind = crate::grep_source::PatternKind::Extended,
+            "-P" | "--perl-regexp" => pattern_kind = crate::grep_source::PatternKind::Perl,
             "-g" | "--walk-reflogs" => walk_reflogs = true,
             "--no-walk-reflogs" => walk_reflogs = false,
             "--max-age" => {
@@ -1136,9 +1129,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     {
         *compiled_children = show_children;
     }
-    let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
-    let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
-    let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
+    let author_filters =
+        compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
+    let committer_filters =
+        compile_log_filter_matcher(&committer_patterns, pattern_kind, regexp_ignore_case, "header")?;
+    let grep_filters = compile_log_filter_matcher(
+        &grep_patterns,
+        pattern_kind,
+        regexp_ignore_case,
+        "command line",
+    )?;
     if walk_reflogs {
         let reflog_revisions = revision_options
             .positives
@@ -1201,9 +1201,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             if compiled.is_metadata_emitable() && compiled.uses_oid() && !compiled.uses_decorations())
         && decoration == LogDecorationMode::Off
         && !show_children
-        && author_filters.is_empty()
-        && committer_filters.is_empty()
-        && grep_filters.is_empty()
+        && author_filters.is_none()
+        && committer_filters.is_none()
+        && grep_filters.is_none()
         && max_age.is_none()
         && min_age.is_none()
         && min_parents.is_none()
@@ -1302,14 +1302,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             || min_parents.is_some_and(|min| record.parents.len() < min)
             || max_parents.is_some_and(|max| record.parents.len() > max)
             || !log_age_filters_match(record, max_age, min_age)?
-            || !log_author_filters_match(record, &author_filters, regexp_ignore_case)
-            || !log_committer_filters_match(record, &committer_filters, regexp_ignore_case)
-            || !log_grep_filters_match(
+            || !log_author_matcher_matches(record, author_filters.as_ref())
+            || !log_committer_matcher_matches(record, committer_filters.as_ref())
+            || !log_grep_matcher_matches(
                 record,
-                &grep_filters,
+                grep_filters.as_ref(),
                 grep_all_match,
                 invert_grep,
-                regexp_ignore_case,
             )
         {
             continue;
@@ -1783,6 +1782,60 @@ fn log_walk_reflogs(
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn compile_log_filter_matcher(
+    patterns: &[String],
+    kind: crate::grep_source::PatternKind,
+    ignore_case: bool,
+    error_context: &str,
+) -> Result<Option<crate::grep_source::GrepMatcher>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    crate::grep_source::GrepMatcher::compile_with_error_context(
+        crate::grep_source::GrepCompileConfig {
+            patterns,
+            kind,
+            ignore_case,
+            word: false,
+            line_regexp: false,
+            diagnostic_verbosity: crate::grep_source::RegexDiagnosticVerbosity::from_env(),
+        },
+        error_context,
+    )
+    .map(Some)
+}
+
+fn log_author_matcher_matches(
+    record: &sley_rev::CommitRecord,
+    filter: Option<&crate::grep_source::GrepMatcher>,
+) -> bool {
+    filter.is_none_or(|filter| filter.matches_any(&record.commit.author))
+}
+
+fn log_committer_matcher_matches(
+    record: &sley_rev::CommitRecord,
+    filter: Option<&crate::grep_source::GrepMatcher>,
+) -> bool {
+    filter.is_none_or(|filter| filter.matches_any(&record.commit.committer))
+}
+
+fn log_grep_matcher_matches(
+    record: &sley_rev::CommitRecord,
+    filter: Option<&crate::grep_source::GrepMatcher>,
+    all_match: bool,
+    invert: bool,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let matched = if all_match {
+        filter.matches_all(&record.commit.message)
+    } else {
+        filter.matches_any(&record.commit.message)
+    };
+    matched != invert
 }
 
 fn emit_compiled_reflog_walk_format(
