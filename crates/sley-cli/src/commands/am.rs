@@ -51,6 +51,9 @@ struct AmOptions {
     ignore_date: bool,
     /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
     no_verify: bool,
+    /// Keep CR at the end of mail lines instead of stripping it (`--keep-cr`).
+    /// Default (false / `--no-keep-cr`) strips the CR a CRLF transport added.
+    keep_cr: bool,
 }
 
 impl AmOptions {
@@ -195,7 +198,13 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let input = read_am_input(&options.mboxes)?;
+    let mut input = read_am_input(&options.mboxes)?;
+    // git's mailsplit strips a trailing CR from each line by default; only
+    // `--keep-cr` keeps it. Normalising CRLF -> LF here lets a CRLF mail apply
+    // and commit byte-identically to its LF original.
+    if !options.keep_cr {
+        input = strip_cr(&input);
+    }
 
     // git treats explicit mbox files and stdin differently. A file must pass
     // patch-format detection: if it does not look like a mailbox, a mail, or a
@@ -245,6 +254,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         committer_date_is_author_date: false,
         ignore_date: false,
         no_verify: false,
+        keep_cr: false,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -283,6 +293,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-ignore-date" => options.ignore_date = false,
             "-n" | "--no-verify" => options.no_verify = true,
             "--verify" => options.no_verify = false,
+            "--keep-cr" => options.keep_cr = true,
+            "--no-keep-cr" => options.keep_cr = false,
             // Accepted no-ops: these affect mail parsing / cosmetics we already
             // handle or that do not change the resulting commits for the inputs
             // `git format-patch` produces.
@@ -292,8 +304,6 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             | "-c"
             | "--scissors"
             | "--no-scissors"
-            | "--keep-cr"
-            | "--no-keep-cr"
             | "--ignore-whitespace"
             | "--no-ignore-whitespace"
             | "--whitespace"
@@ -432,6 +442,21 @@ fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
     Ok(())
 }
 
+/// Strip a trailing CR from every CRLF in the buffer (git's default
+/// `--no-keep-cr` mailsplit behaviour). Only `\r` immediately before a `\n` is
+/// removed, so a lone `\r` mid-line (rare in mail) is preserved.
+fn strip_cr(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut iter = input.iter().peekable();
+    while let Some(&byte) = iter.next() {
+        if byte == b'\r' && iter.peek() == Some(&&b'\n') {
+            continue;
+        }
+        out.push(byte);
+    }
+    out
+}
+
 /// Read every mbox file (or stdin when none are given) into one buffer.
 fn read_am_input(mboxes: &[String]) -> Result<Vec<u8>> {
     let mut input = Vec::new();
@@ -456,7 +481,10 @@ fn read_am_input(mboxes: &[String]) -> Result<Vec<u8>> {
 fn looks_like_patch_input(input: &[u8]) -> bool {
     for line in split_keep_newline(input) {
         let line = trim_trailing_newline(&line);
-        if line.is_empty() {
+        // git's mailsplit treats leading all-whitespace lines as blank and skips
+        // them before locating the first header (the t4150 "preceding
+        // whitespace" patch leads with 255 spaces).
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         if line.starts_with(b"From ") || is_diff_start(line) {
@@ -519,9 +547,21 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
     let mut subject = String::new();
     let mut message_id = None;
 
+    // Skip any leading all-whitespace lines before the headers (git's mailinfo
+    // ignores blank/whitespace lines preceding the first header; the t4150
+    // "preceding whitespace" patch leads with a 255-space line).
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = trim_trailing_newline(&lines[idx]);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
     // Phase 1: RFC822-style headers, ending at the first blank line. Continuation
     // lines (leading whitespace) extend the previous header value.
-    let mut idx = 0;
     let mut last_header: Option<String> = None;
     let mut header_values: Vec<(String, String)> = Vec::new();
     while idx < lines.len() {
