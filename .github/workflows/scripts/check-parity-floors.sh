@@ -169,6 +169,31 @@
 # *directories* but never the files inside them — `!dir/` still needs `!dir/*` to
 # reach files), restoring t0008 to 306 with its failing-cell set IDENTICAL to
 # main and the 57e8c5e directory-glob gain preserved. t0008 floor stays 306.
+# am 3-way wave (2026-06-14, parity/am-3way): t4150-am 41->54 (+13) via two
+# coupled pieces. (1) The shared patch-apply engine (sley-diff-merge
+# apply_file_patch/find_hunk_pos/preimage_matches_at) now ports git's apply.c
+# matching for the default no-whitespace-fuzz path: a hunk anchored at the file
+# start (old_start<=1) must match the beginning, a hunk with no trailing context
+# must match the END of the file, and the FULL preimage (context+deletes) is
+# matched byte-exact at a position found by anchoring at newpos-1 and pinging
+# outward over the whole image — replacing the old lenient MAX_HUNK_OFFSET=1000
+# context-only search that applied at the first spurious offset. git keeps
+# p_context=UINT_MAX by default so there is NO context fuzz and NO begin/end
+# relaxation: a hunk whose full preimage does not match at a valid position is
+# REJECTED. That rejection is what makes `git am -3` correctly fall back to its
+# 3-way merge path (cells 34/35/36/37 + the 42/43/44/45/46/48/50/51 conflict-
+# pause / --show-current-patch chain). (2) `am --resolved` now refuses with git's
+# "No changes - did you forget to use 'git add'?" (index == HEAD) and "You still
+# have unmerged paths" (unmerged index) preconditions (cells 52/53). Cell 70
+# (`am -3 works with rerere`) stays blocked on a SEPARATE gap — am does not wire
+# the rerere record/replay into its 3-way conflict path — NOT an apply-engine
+# gap. Shared-engine neighbors verified measured==floor, NONE regressed (control
+# diff vs main d25cd83 IDENTICAL): t3501-revert-cherry-pick=21, t3507-cherry-
+# pick-conflict=44, t3510-cherry-pick-sequence=52, t3403-rebase-skip=16,
+# t4014-format-patch=142, t4013-diff-various=133; unfloored held: t3400-rebase=17,
+# t3401-rebase-and-am-rename=5, t4012-diff-binary=4, t4105-apply-fuzz=5; bonus:
+# t4104-apply-boundary 2->3 (the stricter boundary matching is more git-faithful).
+# No workspace test regressed (2203/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -236,7 +261,7 @@ declare -A FLOOR=(
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
     [t4014-format-patch.sh]=142
-    [t4150-am.sh]=41
+    [t4150-am.sh]=54
     [t4052-stat-output.sh]=76
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41
