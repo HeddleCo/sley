@@ -1,15 +1,17 @@
 [package]
 name = "sley-formats"
-version = "0.1.0"
+version = "0.0.1"
+description = "Native-Rust readers and writers for Git's on-disk and wire formats: reftables, commit-graph, bundles, and repository layout."
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
-sley-config = { path = "../sley-config" }
-sley-index = { path = "../sley-index" }
-sley-object = { path = "../sley-object" }
+sley-core = { path = "../sley-core", version = "0.0.1" }
+sley-config = { path = "../sley-config", version = "0.0.1" }
+sley-index = { path = "../sley-index", version = "0.0.1" }
+sley-object = { path = "../sley-object", version = "0.0.1" }
 
 [lints]
 workspace = true

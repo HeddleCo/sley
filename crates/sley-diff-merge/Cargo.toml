@@ -1,17 +1,19 @@
 [package]
 name = "sley-diff-merge"
-version = "0.1.0"
+version = "0.0.1"
+description = "Native-Rust Git diff and three-way merge engine for the sley engine, including tree diffing and the textual renderer."
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
-sley-formats = { path = "../sley-formats" }
-sley-index = { path = "../sley-index" }
-sley-object = { path = "../sley-object" }
-sley-odb = { path = "../sley-odb" }
-sley-refs = { path = "../sley-refs" }
+sley-core = { path = "../sley-core", version = "0.0.1" }
+sley-formats = { path = "../sley-formats", version = "0.0.1" }
+sley-index = { path = "../sley-index", version = "0.0.1" }
+sley-object = { path = "../sley-object", version = "0.0.1" }
+sley-odb = { path = "../sley-odb", version = "0.0.1" }
+sley-refs = { path = "../sley-refs", version = "0.0.1" }
 
 [lints]
 workspace = true

@@ -1,6 +1,8 @@
 [package]
 name = "sley-odb"
-version = "0.1.0"
+version = "0.0.1"
+description = "Native-Rust Git object database for the sley engine: loose objects, packfiles, and multi-pack indexes."
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,11 +11,11 @@ license.workspace = true
 # Backend selected by the mutually-exclusive zlib-rs/pure-rust features below;
 # no backend baked into the dep line (see sley-pack for the cfg-cascade rationale).
 flate2 = { version = "1", default-features = false }
-sley-core = { path = "../sley-core" }
-sley-formats = { path = "../sley-formats" }
-sley-mmap = { path = "../sley-mmap", optional = true }
-sley-object = { path = "../sley-object" }
-sley-pack = { path = "../sley-pack", default-features = false }
+sley-core = { path = "../sley-core", version = "0.0.1" }
+sley-formats = { path = "../sley-formats", version = "0.0.1" }
+sley-mmap = { path = "../sley-mmap", version = "0.0.1", optional = true }
+sley-object = { path = "../sley-object", version = "0.0.1" }
+sley-pack = { path = "../sley-pack", version = "0.0.1", default-features = false }
 
 [features]
 default = ["zlib-rs"]

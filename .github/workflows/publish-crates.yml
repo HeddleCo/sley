@@ -1,0 +1,198 @@
+name: Publish crates
+
+# Publishes the sley library facade and its 20-crate lib dependency closure to
+# crates.io. The default run is a DRY RUN (no upload) — a human flips `dry_run`
+# to false to perform the real publish. The token comes from the repo secret
+# CRATES_IO_API_KEY (set as CARGO_REGISTRY_TOKEN for cargo).
+#
+# The crates are published in a VALIDATED topological order (every crate appears
+# after all of its in-set sley-* dependencies; `sley`, the facade, is last). The
+# order was computed from `cargo metadata` and is asserted at runtime below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no real upload). Leave true to validate; set false to publish for real."
+        type: boolean
+        required: true
+        default: true
+      version:
+        description: "Version to publish (must match the crates' Cargo.toml version)."
+        type: string
+        required: true
+        default: "0.0.1"
+
+concurrency:
+  # Never run two real publishes concurrently — they would race on crates.io.
+  group: publish-crates
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -eo pipefail {0}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_KEY }}
+
+jobs:
+  publish:
+    name: Publish (${{ inputs.dry_run && 'dry-run' || 'REAL' }} @ ${{ inputs.version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish crates in topological order
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # VALIDATED topological publish order: each crate appears after all of
+          # its in-set sley-* dependencies; the `sley` facade is last. Computed
+          # from `cargo metadata` (normal + build deps) and re-asserted below.
+          CRATES=(
+            sley-core
+            sley-config
+            sley-index
+            sley-mmap
+            sley-object
+            sley-formats
+            sley-pack
+            sley-odb
+            sley-pathspec
+            sley-protocol
+            sley-refs
+            sley-diff-merge
+            sley-rev
+            sley-transport
+            sley-fetch
+            sley-worktree
+            sley-remote
+            sley-sequencer
+            sley-notes
+            sley
+          )
+
+          # --- Topological-order assertion ------------------------------------
+          # Re-derive the intra-set sley-* dependency edges from the live
+          # `cargo metadata` and confirm each crate is published only after all
+          # of its in-set deps. A drift in the dep graph (a new edge that the
+          # baked order no longer respects) fails the job before any upload.
+          echo "::group::Validate topological order"
+          IN_SET=" ${CRATES[*]} "
+          # positions
+          declare -A POS
+          i=0
+          for c in "${CRATES[@]}"; do
+            POS[$c]=$i
+            i=$((i + 1))
+          done
+          if [ "${#CRATES[@]}" -ne 20 ]; then
+            echo "Expected 20 crates, got ${#CRATES[@]}" >&2
+            exit 1
+          fi
+          META="$(cargo metadata --format-version 1 --all-features --no-deps)"
+          ORDER_OK=1
+          for c in "${CRATES[@]}"; do
+            # normal + build deps of c that are in our publish set
+            DEPS="$(echo "$META" | jq -r --arg c "$c" '
+              .packages[] | select(.name == $c) | .dependencies[]
+              | select((.kind == null) or (.kind == "build"))
+              | .name | select(startswith("sley"))')"
+            for d in $DEPS; do
+              case "$IN_SET" in
+                *" $d "*)
+                  if [ "${POS[$d]}" -ge "${POS[$c]}" ]; then
+                    echo "ORDER VIOLATION: $c (pos ${POS[$c]}) depends on $d (pos ${POS[$d]}) but $d is not earlier" >&2
+                    ORDER_OK=0
+                  fi
+                  ;;
+              esac
+            done
+          done
+          if [ "$ORDER_OK" -ne 1 ]; then
+            echo "Baked topological order is stale vs the dependency graph." >&2
+            exit 1
+          fi
+          echo "Topological order validated for ${#CRATES[@]} crates."
+          echo "::endgroup::"
+
+          # --- Publish loop ----------------------------------------------------
+          PUBLISHED=()
+          for crate in "${CRATES[@]}"; do
+            echo "::group::$crate @ $VERSION"
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry-run publishing $crate"
+              cargo publish -p "$crate" --dry-run
+              echo "::endgroup::"
+              PUBLISHED+=("$crate (dry-run)")
+              continue
+            fi
+
+            # Real publish. --no-verify: each crate is dry-run-verified in prep,
+            # so we skip the 20 slow per-crate rebuilds and the verify-time
+            # registry race (a freshly-published dep may not have propagated to
+            # the verify build's index yet).
+            echo "Publishing $crate for real"
+            set +e
+            PUBLISH_OUT="$(cargo publish -p "$crate" --no-verify 2>&1)"
+            PUBLISH_RC=$?
+            set -e
+            echo "$PUBLISH_OUT"
+
+            if [ "$PUBLISH_RC" -ne 0 ]; then
+              # Idempotency: a re-run after a partial publish must resume, not
+              # fail, on crates that are already on the registry at this version.
+              if echo "$PUBLISH_OUT" | grep -qiE "already (been )?uploaded|already exists|crate version .* is already"; then
+                echo "$crate $VERSION already exists on crates.io — treating as success."
+                echo "::endgroup::"
+                PUBLISHED+=("$crate (already present)")
+                continue
+              fi
+              echo "::endgroup::"
+              echo "Publish of $crate failed (rc=$PUBLISH_RC)." >&2
+              exit "$PUBLISH_RC"
+            fi
+
+            # Poll crates.io until this version is queryable, so the next crate's
+            # publish can resolve it as a dependency. Timeout ~10 min.
+            echo "Waiting for $crate $VERSION to propagate on crates.io..."
+            DEADLINE=$(( $(date +%s) + 600 ))
+            until curl -sf \
+                -H "User-Agent: sley-publish-workflow (https://github.com/HeddleCo/sley)" \
+                "https://crates.io/api/v1/crates/$crate/$VERSION" > /dev/null; do
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                echo "Timed out waiting for $crate $VERSION to propagate." >&2
+                exit 1
+              fi
+              sleep 10
+            done
+            echo "$crate $VERSION is live on crates.io."
+            echo "::endgroup::"
+            PUBLISHED+=("$crate")
+          done
+
+          # --- Job summary -----------------------------------------------------
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "## Dry-run publish (no upload) @ \`$VERSION\`"
+            else
+              echo "## Published @ \`$VERSION\`"
+            fi
+            echo ""
+            echo "| # | crate |"
+            echo "|---|-------|"
+            n=1
+            for entry in "${PUBLISHED[@]}"; do
+              echo "| $n | $entry |"
+              n=$((n + 1))
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
