@@ -32,6 +32,27 @@ struct AmOptions {
     three_way: bool,
     /// Keep non-empty commits whose patch is empty rather than erroring.
     keep_non_patch: bool,
+    /// Append the patch's `Message-ID:` header to each commit message
+    /// (`-m`/`--message-id`, or `am.messageid`).
+    message_id: bool,
+    /// Use each patch's author date as the committer date too
+    /// (`--committer-date-is-author-date`).
+    committer_date_is_author_date: bool,
+    /// Ignore the patch's `Date:` header, using the current time for the author
+    /// (and, with `--committer-date-is-author-date`, the committer) date
+    /// (`--ignore-date`).
+    ignore_date: bool,
+}
+
+/// The subset of `AmOptions` that affects how each commit object is built. Read
+/// back from the state directory for each patch so `--continue` reproduces the
+/// same commits an uninterrupted run would have.
+#[derive(Clone, Copy)]
+struct AmCommitOpts {
+    signoff: bool,
+    message_id: bool,
+    committer_date_is_author_date: bool,
+    ignore_date: bool,
 }
 
 /// A single message extracted from an mbox: identity, message, and raw diff.
@@ -50,6 +71,10 @@ struct AmPatch {
     subject: String,
     /// Full commit message (subject + blank line + body), newline-terminated.
     message: Vec<u8>,
+    /// The raw `Message-ID:` header value (including the surrounding angle
+    /// brackets, e.g. `<...@example.com>`), if the message carried one. Appended
+    /// to the commit message when `--message-id`/`am.messageid` is set.
+    message_id: Option<String>,
     /// The unified diff body (everything from the first `diff`/`---` onward).
     diff: Vec<u8>,
 }
@@ -123,7 +148,13 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         };
     }
 
-    let options = parse_am_options(&option_args)?;
+    let mut options = parse_am_options(&option_args)?;
+
+    // git seeds am.messageid / am.threeWay from config, then lets the
+    // command-line flag (handled in parse_am_options) override. parse_am_options
+    // leaves an unspecified flag at false, so OR the config default in only when
+    // the user did not pass an explicit `--[no-]…` form.
+    apply_am_config_defaults(&git_dir, &option_args, &mut options);
 
     // Starting a new run while one is unfinished is an error in git.
     if state_dir.exists() {
@@ -178,6 +209,9 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         signoff: false,
         three_way: false,
         keep_non_patch: false,
+        message_id: false,
+        committer_date_is_author_date: false,
+        ignore_date: false,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -197,23 +231,27 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "-3" | "--3way" => options.three_way = true,
             "--no-3way" => options.three_way = false,
             "-k" | "--keep" | "--keep-non-patch" => options.keep_non_patch = true,
+            "-m" | "--message-id" => options.message_id = true,
+            "--no-message-id" => options.message_id = false,
+            "--committer-date-is-author-date" => {
+                options.committer_date_is_author_date = true
+            }
+            "--no-committer-date-is-author-date" => {
+                options.committer_date_is_author_date = false
+            }
+            "--ignore-date" => options.ignore_date = true,
+            "--no-ignore-date" => options.ignore_date = false,
             // Accepted no-ops: these affect mail parsing / cosmetics we already
             // handle or that do not change the resulting commits for the inputs
             // `git format-patch` produces.
             "-u"
             | "--utf8"
             | "--no-utf8"
-            | "-m"
-            | "--message-id"
-            | "--no-message-id"
             | "-c"
             | "--scissors"
             | "--no-scissors"
             | "--keep-cr"
             | "--no-keep-cr"
-            | "--committer-date-is-author-date"
-            | "--no-committer-date-is-author-date"
-            | "--ignore-date"
             | "--ignore-whitespace"
             | "--no-ignore-whitespace"
             | "--whitespace"
@@ -238,6 +276,44 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         index += 1;
     }
     Ok(options)
+}
+
+/// Apply `am.messageid` / `am.threeWay` config defaults, but only for a flag the
+/// command line did not explicitly set (an explicit `--[no-]message-id` /
+/// `--[no-]3way` wins over config, matching git's parse order: config first,
+/// then the command-line override).
+fn apply_am_config_defaults(git_dir: &Path, args: &[String], options: &mut AmOptions) {
+    let has = |needles: &[&str]| args.iter().any(|a| needles.contains(&a.as_str()));
+    if !has(&["-m", "--message-id", "--no-message-id"])
+        && let Some(value) = am_config_bool(git_dir, "messageid")
+    {
+        options.message_id = value;
+    }
+    if !has(&["-3", "--3way", "--no-3way"])
+        && let Some(value) = am_config_bool(git_dir, "threeWay")
+    {
+        options.three_way = value;
+    }
+}
+
+/// Read a boolean `am.<key>` value from the effective config (repo + global +
+/// `-c`/env overrides), returning `None` when unset or unparsable.
+fn am_config_bool(git_dir: &Path, key: &str) -> Option<bool> {
+    let value = if let Some(config) = commands::merge_rebase::effective_config_with_overrides()
+        && let Some(value) = config.get("am", None, key)
+    {
+        value.to_string()
+    } else {
+        commands::remote_cmds::read_repo_config(git_dir)
+            .ok()?
+            .get("am", None, key)?
+            .to_string()
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" | "" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn am_usage() {
@@ -399,6 +475,7 @@ fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
     let mut author_date = None;
     let mut author_date_raw = None;
     let mut subject = String::new();
+    let mut message_id = None;
 
     // Phase 1: RFC822-style headers, ending at the first blank line. Continuation
     // lines (leading whitespace) extend the previous header value.
@@ -446,6 +523,11 @@ fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
                 author_date = parse_rfc2822_date(value);
             }
             "subject" => subject = clean_subject(value),
+            "message-id" => {
+                if !value.is_empty() {
+                    message_id = Some(value.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -506,6 +588,7 @@ fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
         author_date_raw,
         subject,
         message,
+        message_id,
         diff,
     })
 }
@@ -792,6 +875,15 @@ fn write_am_state_dir(
     fs::write(state_dir.join("sign"), bool_flag(options.signoff))?;
     fs::write(state_dir.join("threeway"), bool_flag(options.three_way))?;
     fs::write(state_dir.join("keep"), bool_flag(options.keep_non_patch))?;
+    fs::write(state_dir.join("messageid"), bool_flag(options.message_id))?;
+    fs::write(
+        state_dir.join("committer-date-is-author-date"),
+        bool_flag(options.committer_date_is_author_date),
+    )?;
+    fs::write(
+        state_dir.join("ignore-date"),
+        bool_flag(options.ignore_date),
+    )?;
     fs::write(state_dir.join("utf8"), b"t\n")?;
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
@@ -821,6 +913,11 @@ fn encode_patch_file(patch: &AmPatch) -> Vec<u8> {
     if let Some(date) = &patch.author_date_raw {
         out.extend_from_slice(b"Date: ");
         out.extend_from_slice(date.as_bytes());
+        out.push(b'\n');
+    }
+    if let Some(message_id) = &patch.message_id {
+        out.extend_from_slice(b"Message-ID: ");
+        out.extend_from_slice(message_id.as_bytes());
         out.push(b'\n');
     }
     out.extend_from_slice(b"Subject: [PATCH] ");
@@ -916,6 +1013,20 @@ fn read_state_bool(state_dir: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the commit-affecting flags back from the state directory so a resumed
+/// (`--continue`/`--skip`) run builds identical commits to an uninterrupted one.
+fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
+    AmCommitOpts {
+        signoff: read_state_bool(state_dir, "sign"),
+        message_id: read_state_bool(state_dir, "messageid"),
+        committer_date_is_author_date: read_state_bool(
+            state_dir,
+            "committer-date-is-author-date",
+        ),
+        ignore_date: read_state_bool(state_dir, "ignore-date"),
+    }
+}
+
 // ===========================================================================
 // Series driver
 // ===========================================================================
@@ -936,9 +1047,9 @@ fn run_am_series(
 ) -> Result<()> {
     let last = read_state_usize(state_dir, "last")?;
     let quiet = read_state_bool(state_dir, "quiet");
-    let signoff = read_state_bool(state_dir, "sign");
     let three_way = read_state_bool(state_dir, "threeway");
     let keep_non_patch = read_state_bool(state_dir, "keep");
+    let commit_opts = read_am_commit_opts(state_dir);
 
     let mut number = start;
     while number <= last {
@@ -964,7 +1075,7 @@ fn run_am_series(
             worktree_root,
             format,
             &patch,
-            signoff,
+            commit_opts,
             three_way,
         )? {
             ApplyResult::Committed => number += 1,
@@ -997,7 +1108,7 @@ fn apply_one_patch(
     worktree_root: &Path,
     format: ObjectFormat,
     patch: &AmPatch,
-    signoff: bool,
+    commit_opts: AmCommitOpts,
     three_way: bool,
 ) -> Result<ApplyResult> {
     let file_patches = sley_diff_merge::parse_unified_patch(&patch.diff)?;
@@ -1012,7 +1123,7 @@ fn apply_one_patch(
                 format,
                 patch,
                 &actions,
-                signoff,
+                commit_opts,
             )?;
             Ok(ApplyResult::Committed)
         }
@@ -1026,7 +1137,7 @@ fn apply_one_patch(
                     format,
                     patch,
                     &file_patches,
-                    signoff,
+                    commit_opts,
                 );
             }
             for file in &file_patches {
@@ -1126,7 +1237,7 @@ fn stage_and_commit(
     format: ObjectFormat,
     patch: &AmPatch,
     actions: &[ApplyFileAction],
-    signoff: bool,
+    commit_opts: AmCommitOpts,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut index = read_repository_index(git_dir, format)?.unwrap_or(Index {
@@ -1165,7 +1276,7 @@ fn stage_and_commit(
         worktree_root,
         format,
         patch,
-        signoff,
+        commit_opts,
     )
 }
 
@@ -1191,26 +1302,34 @@ fn create_am_commit(
     worktree_root: &Path,
     format: ObjectFormat,
     patch: &AmPatch,
-    signoff: bool,
+    commit_opts: AmCommitOpts,
 ) -> Result<()> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
-    let author = am_author_identity(patch)?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let (author, committer) = am_commit_identities(patch, commit_opts)?;
+    // git's mailinfo appends the `Message-ID:` header to the log message at the
+    // patch break (before --signoff runs), so it lands as the LAST body line and
+    // --signoff (when set) goes after it.
+    let mut base_message = patch.message.clone();
+    if commit_opts.message_id
+        && let Some(message_id) = &patch.message_id
+    {
+        am_append_message_id(&mut base_message, message_id);
+    }
     let message_path = git_dir.join("rebase-apply").join("final-commit");
     let message_path = if message_path.exists() {
         message_path
     } else {
         git_dir.join("COMMIT_EDITMSG")
     };
-    fs::write(&message_path, &patch.message)?;
+    fs::write(&message_path, &base_message)?;
     let message_arg = message_path.to_string_lossy().into_owned();
     commands::hooks::run_hook_l("applypatch-msg", &[message_arg.as_str()])?;
     let mut message = fs::read(&message_path)?;
-    if signoff {
+    if commit_opts.signoff {
         message = am_append_signoff(message, &commit_signoff_from_env()?);
     }
     commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())?;
@@ -1250,14 +1369,58 @@ fn create_am_commit(
     Ok(())
 }
 
-/// Build the author identity bytes from the patch headers, falling back to the
-/// environment author date when the email had no parsable `Date:`.
-fn am_author_identity(patch: &AmPatch) -> Result<Vec<u8>> {
-    let date = patch
-        .author_date
-        .clone()
-        .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
-    sley_sequencer::format_commit_identity(&patch.author_name, &patch.author_email, &date)
+/// Build the author and committer identity bytes for an am commit, honouring
+/// `--ignore-date` and `--committer-date-is-author-date` exactly as builtin/am.c
+/// does:
+///
+///   - author date: the patch's `Date:`; with `--ignore-date`, the current time
+///     (git passes `NULL` to `fmt_ident`, which uses "now").
+///   - committer: normally the environment committer (name/email/date the same
+///     way `git commit` resolves them). With `--committer-date-is-author-date`,
+///     the committer *date* is set to the author date (or "now" under
+///     `--ignore-date`), keeping the committer name/email from the environment.
+fn am_commit_identities(patch: &AmPatch, opts: AmCommitOpts) -> Result<(Vec<u8>, Vec<u8>)> {
+    // The author date: the patch's Date:, the env author date, or "now".
+    let author_date = if opts.ignore_date {
+        am_now_date()
+    } else {
+        patch
+            .author_date
+            .clone()
+            .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| am_now_date()))
+    };
+    let author =
+        sley_sequencer::format_commit_identity(&patch.author_name, &patch.author_email, &author_date)?;
+
+    let committer = if opts.committer_date_is_author_date {
+        commit_identity_from_env_with_date("COMMITTER", &author_date)?
+    } else {
+        commit_identity_from_env("COMMITTER")?
+    };
+    Ok((author, committer))
+}
+
+/// The current wall-clock time formatted as git's raw `<seconds> <±HHMM>`. Used
+/// when `--ignore-date` discards the patch's `Date:` (git passes `NULL` to
+/// `fmt_ident`, which fills in "now"). Mirrors git's behaviour in the t4150
+/// `--ignore-date` test, which runs with a `+0000` (UTC) environment.
+fn am_now_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("@{secs} +0000")
+}
+
+/// Append a `Message-ID: <value>` line to the commit message body, matching
+/// git's mailinfo: the header value is emitted verbatim as the final body line.
+fn am_append_message_id(message: &mut Vec<u8>, message_id: &str) {
+    if !message.is_empty() && !message.ends_with(b"\n") {
+        message.push(b'\n');
+    }
+    message.extend_from_slice(b"Message-ID: ");
+    message.extend_from_slice(message_id.as_bytes());
+    message.push(b'\n');
 }
 
 /// Append a `Signed-off-by:` trailer to an am commit message, faithfully
@@ -1379,7 +1542,7 @@ fn apply_three_way(
     format: ObjectFormat,
     patch: &AmPatch,
     file_patches: &[sley_diff_merge::FilePatch],
-    signoff: bool,
+    commit_opts: AmCommitOpts,
 ) -> Result<ApplyResult> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
@@ -1483,7 +1646,7 @@ fn apply_three_way(
             worktree_root,
             format,
             patch,
-            signoff,
+            commit_opts,
         )?;
         Ok(ApplyResult::Committed)
     } else {
@@ -1788,7 +1951,7 @@ fn am_continue(
     state_dir: &Path,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
-    let signoff = read_state_bool(state_dir, "sign");
+    let commit_opts = read_am_commit_opts(state_dir);
     let quiet = read_state_bool(state_dir, "quiet");
     let next = read_state_usize(state_dir, "next")?;
     let patch = read_patch_file(state_dir, next)?;
@@ -1815,7 +1978,7 @@ fn am_continue(
         worktree_root,
         format,
         &patch,
-        signoff,
+        commit_opts,
     )?;
     run_am_series(
         git_dir,

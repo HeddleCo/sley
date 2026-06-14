@@ -9164,6 +9164,29 @@ fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
     sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
+/// Like [`commit_identity_from_env`] but with the date forced to `date_override`
+/// (any form [`canonicalize_commit_date`] accepts), keeping the env/config
+/// name+email resolution unchanged. Used by `git am
+/// --committer-date-is-author-date`, which keeps the environment committer
+/// name/email but substitutes the author date.
+fn commit_identity_from_env_with_date(role: &str, date_override: &str) -> Result<Vec<u8>> {
+    let env_name = env::var(format!("GIT_{role}_NAME")).ok();
+    let env_email = env::var(format!("GIT_{role}_EMAIL")).ok();
+    let mut config = if env_name.is_none() || env_email.is_none() {
+        IdentityConfig::Lazy(None)
+    } else {
+        IdentityConfig::Skip
+    };
+    let name = env_name
+        .or_else(|| identity_config_value("user.name", &mut config))
+        .unwrap_or_else(|| "Git Rs".into());
+    let email = env_email
+        .or_else(|| identity_config_value("user.email", &mut config))
+        .unwrap_or_else(|| "sley@example.invalid".into());
+    let date = canonicalize_commit_date(date_override);
+    sley_sequencer::format_commit_identity(&name, &email, &date)
+}
+
 /// Canonicalise a `GIT_*_DATE`/`--date=` value to git's raw `<seconds> +HHMM`
 /// form so the sequencer's identity builder (which only accepts the raw form)
 /// stores the same bytes git would.
