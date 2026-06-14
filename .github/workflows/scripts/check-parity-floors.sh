@@ -184,6 +184,7 @@ declare -A FLOOR=(
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
     [t4014-format-patch.sh]=113
+    [t4150-am.sh]=41
     [t4052-stat-output.sh]=76
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41

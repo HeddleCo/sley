@@ -614,11 +614,7 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
                 author_date = parse_rfc2822_date(value);
             }
             "subject" => subject = clean_subject(value, cleanup),
-            "message-id" => {
-                if !value.is_empty() {
-                    message_id = Some(value.clone());
-                }
-            }
+            "message-id" if !value.is_empty() => message_id = Some(value.clone()),
             _ => {}
         }
     }
