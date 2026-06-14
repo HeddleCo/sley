@@ -84,8 +84,13 @@ struct FormatPatchOptions {
     rename_threshold: u8,
     /// Copy similarity threshold.
     copy_threshold: u8,
-    /// Positional revision arguments (single committish or a range).
-    revisions: Vec<String>,
+    /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
+    setup_args: Vec<String>,
+}
+
+struct FormatPatchSelection {
+    commits: Vec<sley_rev::CommitRecord>,
+    pathspecs: Vec<String>,
 }
 
 impl Default for FormatPatchOptions {
@@ -111,7 +116,7 @@ impl Default for FormatPatchOptions {
             find_copies_harder: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            revisions: Vec::new(),
+            setup_args: Vec::new(),
         }
     }
 }
@@ -126,7 +131,17 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let config = repo.config();
     let db = repo.objects();
 
-    let commits = select_commits(&repo, &options)?;
+    let selection = select_commits(&repo, &options)?;
+    let commits = selection.commits;
+    let diff_pathspec = if selection.pathspecs.is_empty() {
+        None
+    } else {
+        Some(DiffPathspec::new(
+            cwd,
+            repo.worktree_root()?,
+            &selection.pathspecs,
+        )?)
+    };
 
     let count = commits.len();
     let numbered = match options.number_mode {
@@ -161,6 +176,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 format,
                 options: &options,
                 record,
+                diff_pathspec: diff_pathspec.as_ref(),
                 seq: start_number + idx,
                 last_number,
                 numbered,
@@ -184,6 +200,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             format,
             options: &options,
             record,
+            diff_pathspec: diff_pathspec.as_ref(),
             seq,
             last_number,
             numbered,
@@ -213,6 +230,7 @@ struct RenderContext<'a> {
     format: ObjectFormat,
     options: &'a FormatPatchOptions,
     record: &'a sley_rev::CommitRecord,
+    diff_pathspec: Option<&'a DiffPathspec>,
     /// 1-based patch number for the `n` in `[PATCH n/m]` and the file name.
     seq: usize,
     /// The highest patch number — the `m` in `[PATCH n/m]`. Equals the commit
@@ -233,6 +251,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         format,
         options,
         record,
+        diff_pathspec,
         seq,
         last_number,
         numbered,
@@ -274,7 +293,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     out.extend_from_slice(&body);
 
     // Diff entries against the first parent (or the empty tree for a root).
-    let entries = first_parent_diff_entries(db, format, options, commit)?;
+    let entries = first_parent_diff_entries(db, format, options, diff_pathspec, commit)?;
 
     // The `---`/diffstat/diff block is emitted only when the commit actually
     // changes something. An empty commit goes straight from the message to the
@@ -453,6 +472,7 @@ fn first_parent_diff_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     options: &FormatPatchOptions,
+    diff_pathspec: Option<&DiffPathspec>,
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     let base = sley_diff_merge::DiffNameStatusOptions {
@@ -467,7 +487,7 @@ fn first_parent_diff_entries(
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
     };
-    match commit.parents.first() {
+    let entries = match commit.parents.first() {
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
@@ -485,7 +505,11 @@ fn first_parent_diff_entries(
             &commit.tree,
             rename_options,
         ),
-    }
+    }?;
+    Ok(match diff_pathspec {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    })
 }
 
 /// Select the commits to format, newest-to-oldest from the walk then reversed to
@@ -494,75 +518,42 @@ fn first_parent_diff_entries(
 fn select_commits(
     repo: &RepositoryContext,
     options: &FormatPatchOptions,
-) -> Result<Vec<sley_rev::CommitRecord>> {
+) -> Result<FormatPatchSelection> {
     let format = repo.format();
     let db = repo.objects();
-    let mut includes: Vec<String> = Vec::new();
-    let mut excludes: Vec<String> = Vec::new();
-    let mut linear_ranges: Vec<(String, String, bool)> = Vec::new();
-    let mut symmetric_ranges: Vec<(String, String, bool)> = Vec::new();
-
-    for rev in &options.revisions {
-        if rev.contains("..") {
-            add_rev_list_revision_arg(
-                rev,
-                false,
-                &mut includes,
-                &mut excludes,
-                &mut linear_ranges,
-                &mut symmetric_ranges,
-            )?;
-        } else if let Some(exclude) = rev.strip_prefix('^') {
-            excludes.push(exclude.to_string());
-        } else if options.count.is_some() {
-            // With `-<n>`, a bare committish X is the *tip* of the walk (format
-            // `n` commits ending at X), not the `X..HEAD` exclude it means on
-            // its own.
-            includes.push(rev.clone());
-        } else {
-            // A bare committish X means "X..HEAD" for format-patch.
-            includes.push("HEAD".to_string());
-            excludes.push(rev.clone());
-        }
+    let setup_args = format_patch_setup_args(options);
+    if let Some(rev) = format_patch_bare_exclude(options) {
+        let oid = repo
+            .resolve_revision(rev)
+            .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
+        sley_rev::peel_to_commit(db, format, &oid)
+            .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
     }
-
-    // With no positional revisions, default to HEAD (optionally limited by -n).
-    if includes.is_empty()
-        && excludes.is_empty()
-        && linear_ranges.is_empty()
-        && symmetric_ranges.is_empty()
-    {
-        includes.push("HEAD".to_string());
+    let setup = sley_rev::setup_revisions(
+        &setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir: repo.git_dir(),
+            worktree_root: repo.worktree_root().ok(),
+            cwd: repo.cwd(),
+            format,
+            reader: db,
+            config: Some(repo.config()),
+        },
+    )?;
+    if let Some(leftover) = setup.leftovers.first() {
+        return Err(GitError::Command(format!(
+            "unsupported format-patch option {leftover}"
+        )));
     }
-
-    let mut starts = Vec::new();
-    for rev in &includes {
-        starts.push(resolve_format_patch_commit(repo, rev)?);
-    }
-    let mut range_excludes = Vec::new();
-    for (left, right, _not) in &linear_ranges {
-        let left_oid = resolve_format_patch_commit(repo, left)?;
-        let right_oid = resolve_format_patch_commit(repo, right)?;
-        range_excludes.push(left_oid);
-        starts.push(right_oid);
-    }
-    for (left, right, _not) in &symmetric_ranges {
-        let left_oid = resolve_format_patch_commit(repo, left)?;
-        let right_oid = resolve_format_patch_commit(repo, right)?;
-        let bases = merge_bases(repo.git_dir(), db, format, &left_oid, &right_oid)?;
-        starts.push(left_oid);
-        starts.push(right_oid);
-        range_excludes.extend(bases);
-    }
+    let revision_options = setup.options;
+    let starts = revision_options
+        .positives
+        .iter()
+        .map(|tip| sley_rev::peel_to_commit(db, format, &tip.oid))
+        .collect::<Result<Vec<_>>>()?;
 
     let mut excluded = HashSet::new();
-    for oid in range_excludes {
-        for record in rev_list_walk_commits(db, format, [oid], false)? {
-            excluded.insert(record.oid);
-        }
-    }
-    for rev in &excludes {
-        let oid = resolve_format_patch_commit(repo, rev)?;
+    for oid in revision_options.negatives {
         for record in rev_list_walk_commits(db, format, [oid], false)? {
             excluded.insert(record.oid);
         }
@@ -574,23 +565,62 @@ fn select_commits(
         .into_iter()
         .filter(|record| !excluded.contains(&record.oid) && record.parents.len() <= 1)
         .collect();
+    if !setup.pathspecs.is_empty() {
+        let pathspec = sley_rev::Pathspec::parse(
+            setup.pathspecs.iter().map(|spec| spec.as_bytes()),
+            sley_rev::PathspecMatchMagic::default(),
+        )
+        .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
+        selected = sley_rev::simplify_history(
+            db,
+            format,
+            selected,
+            &pathspec,
+            sley_rev::SimplifyOptions {
+                full_history: false,
+                first_parent: false,
+            },
+        )?;
+    }
 
     // `-<n>` keeps the n newest of those before reversing to oldest-first.
     if let Some(count) = options.count {
         selected.truncate(count);
     }
     selected.reverse();
-    Ok(selected)
+    Ok(FormatPatchSelection {
+        commits: selected,
+        pathspecs: setup.pathspecs,
+    })
 }
 
-/// Resolve a revision string to a commit id, emitting the canonical unknown
-/// revision/path fatal when it cannot be resolved or peeled.
-fn resolve_format_patch_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
-    let oid = repo
-        .resolve_revision(rev)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
-    sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
+fn format_patch_setup_args(options: &FormatPatchOptions) -> Vec<String> {
+    let mut args = options.setup_args.clone();
+    if let Some(rev) = format_patch_bare_exclude(options) {
+        args[0] = "HEAD".to_string();
+        args.insert(1, format!("^{rev}"));
+        return args;
+    }
+    let dashdash = args.iter().position(|arg| arg == "--");
+    let rev_end = dashdash.unwrap_or(args.len());
+    if rev_end == 0 {
+        args.insert(0, "HEAD".to_string());
+    }
+    args
+}
+
+fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
+    if options.count.is_some() {
+        return None;
+    }
+    let args = &options.setup_args;
+    let dashdash = args.iter().position(|arg| arg == "--");
+    let rev_end = dashdash.unwrap_or(args.len());
+    if rev_end != 1 {
+        return None;
+    }
+    let rev = args[0].as_str();
+    (!rev.starts_with('^') && !rev.contains("..")).then_some(rev)
 }
 
 /// Build the output file name `NNNN-<slug>.patch` for the patch numbered `seq`.
@@ -1358,11 +1388,14 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if positional_only {
-            options.revisions.push(arg.clone());
+            options.setup_args.push(arg.clone());
             continue;
         }
         match arg.as_str() {
-            "--" => positional_only = true,
+            "--" => {
+                positional_only = true;
+                options.setup_args.push(arg.clone());
+            }
             "--stdout" => options.stdout = true,
             "-o" | "--output-directory" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1487,14 +1520,14 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.count = Some(parse_format_patch_number(&value[1..], "count")?);
             }
             value if value.starts_with('^') && value.len() > 1 => {
-                options.revisions.push(value.to_string());
+                options.setup_args.push(value.to_string());
             }
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
                     "unsupported format-patch option {value}"
                 )));
             }
-            value => options.revisions.push(value.to_string()),
+            value => options.setup_args.push(value.to_string()),
         }
     }
     Ok(options)

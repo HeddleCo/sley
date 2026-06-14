@@ -169,7 +169,10 @@ fn parse_replay_args(action: ReplayAction, args: &[String]) -> Result<ParsedRepl
             continue;
         }
         match arg.as_str() {
-            "--" => seen_dashdash = true,
+            "--" => {
+                seen_dashdash = true;
+                rev_args.push(arg.clone());
+            }
             "--quit" => set_cmd(&mut cmd, CmdMode::Quit)?,
             "--continue" => set_cmd(&mut cmd, CmdMode::Continue)?,
             "--abort" => set_cmd(&mut cmd, CmdMode::Abort)?,
@@ -445,88 +448,129 @@ struct RevSelection {
 }
 
 /// Resolve the rev arguments into the ordered commit list (mirrors
-/// `setup_revisions` + `walk_revs_populate_todo` for the option subset the
-/// upstream suite exercises: plain revs, `^rev`, `A..B`/`A...B`, `-<n>`,
-/// `--author=<pat>`).
+/// `setup_revisions` + `walk_revs_populate_todo`.
 fn select_revisions(
     ctx: &ReplayCtx,
     action: ReplayAction,
     rev_args: &[String],
 ) -> Result<RevSelection> {
-    let mut max_count: Option<usize> = None;
-    let mut author: Option<String> = None;
-    let mut specs: Vec<String> = Vec::new();
-    let mut has_walk_spec = false;
-    for arg in rev_args {
-        if arg == "-" {
-            specs.push("@{-1}".to_string());
-            continue;
-        }
-        if let Some(count) = arg.strip_prefix('-')
-            && !count.is_empty()
-            && count.chars().all(|c| c.is_ascii_digit())
-        {
-            max_count = Some(count.parse().unwrap_or(0));
-            continue;
-        }
-        if let Some(pat) = arg.strip_prefix("--author=") {
-            author = Some(pat.to_string());
-            continue;
-        }
-        if arg.starts_with('-') {
-            if arg == "--no-walk" || arg == "--do-walk" {
-                continue;
+    let db = ctx.db();
+    let config = read_repo_config(&ctx.git_dir)?;
+    let cwd = env::current_dir()?;
+    let setup_args = rev_args
+        .iter()
+        .map(|arg| {
+            if arg == "-" {
+                "@{-1}".to_string()
+            } else {
+                arg.clone()
             }
-            // Unknown option survived parse_options and setup_revisions: git
-            // falls through to usage (exit 129).
-            return Err(usage_error(action));
-        }
-        if arg.contains("..") || arg.starts_with('^') {
-            has_walk_spec = true;
-        }
-        specs.push(arg.clone());
+        })
+        .collect::<Vec<_>>();
+    let setup = sley_rev::setup_revisions(
+        &setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir: &ctx.git_dir,
+            worktree_root: Some(&ctx.worktree_root),
+            cwd: &cwd,
+            format: ctx.format,
+            reader: &db,
+            config: Some(&config),
+        },
+    )?;
+    if !setup.leftovers.is_empty() || !setup.pathspecs.is_empty() {
+        return Err(usage_error(action));
+    }
+    let mut options = setup.options;
+    if !options.has_revisions() && options.max_count.is_some() {
+        let oid = resolve_revision(&ctx.git_dir, ctx.format, "HEAD").map_err(|_| {
+            eprintln!("fatal: bad revision 'HEAD'");
+            GitError::Exit(128)
+        })?;
+        options.positives.push(sley_rev::RevisionTip {
+            oid,
+            rev: "HEAD".to_string(),
+            source_name: Some("HEAD".to_string()),
+            from_ref_selector: false,
+        });
+    }
+    if !options.has_revisions() {
+        return Ok(RevSelection {
+            commits: Vec::new(),
+            single: false,
+        });
     }
 
-    let db = ctx.db();
+    let has_walk_spec = !options.negatives.is_empty()
+        || !options.symmetric_ranges.is_empty()
+        || options.max_count.is_some()
+        || options.skip > 0
+        || options.date_window.min_time.is_some()
+        || options.date_window.max_time.is_some()
+        || !options.author_patterns.is_empty();
     let mut commits: Vec<ObjectId> = Vec::new();
     if has_walk_spec {
-        let selection = sley_rev::RevisionSelection::from_specs(specs.iter().map(String::as_str))
-            .map_err(|err| {
-            eprintln!("error: {err}");
-            fatal_failed(action)
-        })?;
-        let resolved = selection
-            .resolve(&ctx.git_dir, ctx.format, &db)
-            .map_err(|err| {
-                eprintln!("error: {err}");
-                fatal_failed(action)
-            })?;
+        let starts = options
+            .positives
+            .iter()
+            .map(|tip| {
+                sley_rev::peel_to_commit(&db, ctx.format, &tip.oid).map_err(|_| {
+                    eprintln!("error: {}: can't cherry-pick that object", tip.rev);
+                    fatal_failed(action)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut excluded = HashSet::new();
+        for oid in &options.negatives {
+            for record in rev_list_walk_commits(&db, ctx.format, [*oid], options.first_parent)? {
+                excluded.insert(record.oid);
+            }
+        }
+        let order = match options.order {
+            sley_rev::RevisionOrder::Default | sley_rev::RevisionOrder::Date => {
+                sley_rev::RevWalkOrder::CommitDate
+            }
+            sley_rev::RevisionOrder::Topo => sley_rev::RevWalkOrder::Topo,
+            sley_rev::RevisionOrder::AuthorDate => sley_rev::RevWalkOrder::AuthorDate,
+        };
         let mut walk =
-            sley_rev::RevWalk::new(&ctx.git_dir, ctx.format, &db, resolved.starts.clone());
+            sley_rev::RevWalk::new(
+                &ctx.git_dir,
+                ctx.format,
+                &db,
+                starts,
+            )
+            .order(order)
+            .first_parent(options.first_parent)
+            .date_window(options.date_window);
         while let Some(record) = walk.try_next()? {
-            if resolved.excluded.contains(&record.oid) {
+            if excluded.contains(&record.oid) {
                 continue;
             }
             commits.push(record.oid);
         }
     } else {
-        for spec in &specs {
-            let oid = resolve_revision(&ctx.git_dir, ctx.format, spec).map_err(|_| {
-                eprintln!("fatal: bad revision '{spec}'");
-                GitError::Exit(128)
-            })?;
-            let commit_oid = sley_rev::peel_to_commit(&db, ctx.format, &oid).map_err(|_| {
-                eprintln!("error: {spec}: can't cherry-pick that object");
+        for tip in &options.positives {
+            let commit_oid = sley_rev::peel_to_commit(&db, ctx.format, &tip.oid).map_err(|_| {
+                eprintln!("error: {}: can't cherry-pick that object", tip.rev);
                 fatal_failed(action)
             })?;
             commits.push(commit_oid);
         }
     }
 
-    if let Some(pattern) = &author {
-        commits.retain(|oid| commit_author_matches(&db, ctx.format, oid, pattern).unwrap_or(false));
+    if !options.author_patterns.is_empty() {
+        commits.retain(|oid| {
+            options
+                .author_patterns
+                .iter()
+                .all(|pattern| commit_author_matches(&db, ctx.format, oid, pattern).unwrap_or(false))
+        });
     }
-    if let Some(limit) = max_count {
+    if options.skip > 0 {
+        commits = commits.into_iter().skip(options.skip).collect();
+    }
+    if let Some(limit) = options.max_count {
         commits.truncate(limit);
     }
     // Picking ranges (a real walk) happens oldest-first; reverting keeps the
@@ -535,10 +579,11 @@ fn select_revisions(
         commits.reverse();
     }
     let single = commits.len() == 1
-        && specs.len() == 1
+        && options.positives.len() == 1
+        && options.negatives.is_empty()
+        && options.symmetric_ranges.is_empty()
         && !has_walk_spec
-        && max_count.is_none()
-        && author.is_none();
+        && options.author_patterns.is_empty();
     Ok(RevSelection { commits, single })
 }
 
