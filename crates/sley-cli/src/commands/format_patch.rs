@@ -59,6 +59,22 @@ enum SignatureMode {
     Suppress,
 }
 
+/// The `--cover-from-description=<mode>` / `format.coverFromDescription` state,
+/// mirroring git's `enum cover_from_description`. The default is `Message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverFromDescription {
+    /// Don't pull anything from the branch/description: keep the placeholder
+    /// subject and blurb.
+    None,
+    /// Subject stays the placeholder; the description becomes the blurb body.
+    Message,
+    /// First line of the description becomes the subject; the rest is the body.
+    Subject,
+    /// Like `Subject`, but fall back to `Message` when the would-be subject is
+    /// longer than 100 characters.
+    Auto,
+}
+
 /// How the `[PATCH ...]` subject prefix is numbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumberMode {
@@ -160,6 +176,25 @@ struct FormatPatchOptions {
     rename_threshold: u8,
     /// Copy similarity threshold.
     copy_threshold: u8,
+    /// `--cover-letter` / `--no-cover-letter`: emit a `0000-cover-letter.patch`
+    /// summary "email" ahead of the per-commit patches. `None` defers to
+    /// `format.coverletter` (resolved in [`resolve_cover_letter`]).
+    cover_letter: Option<bool>,
+    /// `--commit-list-format=<fmt>`: the commit-list rendering used in the cover
+    /// body (`shortlog`, `modern`, `log:<pretty>`, or a bare `<pretty>` with a
+    /// `%`). `None` defers to `format.commitlistformat`, else `shortlog`.
+    commit_list_format: Option<String>,
+    /// `--cover-from-description=<mode>`: where the cover subject/blurb come from.
+    /// `None` defers to `format.coverFromDescription`, else `Message`.
+    cover_from_description: Option<CoverFromDescription>,
+    /// `--description-file=<path>`: read the cover description from a file rather
+    /// than `branch.<name>.description`.
+    description_file: Option<String>,
+    /// `--encode-email-headers` / `--no-encode-email-headers` /
+    /// `format.encodeEmailHeaders`: q-encode non-ASCII Subject text. `None`
+    /// defers to config (default true). Only consulted by the cover subject;
+    /// the per-patch subject path is unchanged.
+    encode_email_headers: Option<bool>,
     /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
     setup_args: Vec<String>,
 }
@@ -204,6 +239,11 @@ impl Default for FormatPatchOptions {
             find_copies_harder: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            cover_letter: None,
+            commit_list_format: None,
+            cover_from_description: None,
+            description_file: None,
+            encode_email_headers: None,
             setup_args: Vec::new(),
         }
     }
@@ -264,12 +304,17 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     };
 
     let count = commits.len();
+    // A cover letter forces `[PATCH n/m]` numbering (the cover is `0/m`), so it
+    // also flips a single-patch run from the bare `[PATCH]` to `[PATCH 1/1]`.
+    // git emits no cover (and no patches) when the range is empty.
+    let cover_letter = count > 0 && resolve_cover_letter(&options, config, count);
     let numbered = match options.number_mode {
         NumberMode::Numbered => true,
         NumberMode::Unnumbered => false,
         // Auto-numbering keys off the count actually emitted, not the start
-        // offset: a single patch is unnumbered, several are numbered.
-        NumberMode::Auto => count > 1,
+        // offset: a single patch is unnumbered, several are numbered. A cover
+        // letter forces numbering on regardless of count.
+        NumberMode::Auto => count > 1 || cover_letter,
     };
     let start_number = options.start_number.unwrap_or(1);
     // The `m` in `[PATCH n/m]` is the highest patch number, which equals the
@@ -283,11 +328,36 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     };
     let abbrev = patch_index_abbrev(git_dir, format, &options)?;
 
+    // Resolve the cover-letter content once: its synthetic header identity, the
+    // subject/blurb (from the branch description / --description-file under the
+    // cover-from-description rules), the commit-list body, and the run's cumulative
+    // diffstat against the boundary commit. Only built when a cover is emitted.
+    let cover = if cover_letter {
+        Some(build_cover_letter(
+            &repo,
+            &options,
+            &resolved,
+            config,
+            &commits,
+            diff_pathspec.as_ref(),
+            last_number,
+            abbrev,
+        )?)
+    } else {
+        None
+    };
+
     if options.stdout {
         let mut stdout = io::stdout();
+        if let Some(cover) = &cover {
+            // The cover's own signature framing ends in a blank line, so the
+            // first patch follows it directly with no extra inter-patch blank.
+            stdout.write_all(cover)?;
+        }
         for (idx, record) in commits.iter().enumerate() {
-            // In stream mode git separates consecutive patches with an extra
-            // blank line (on top of each patch's own trailing blank).
+            // In stream mode git separates consecutive *patches* with an extra
+            // blank line on top of each patch's own trailing blank. The cover →
+            // first-patch boundary gets no such separator (idx 0 is skipped).
             if idx > 0 {
                 stdout.write_all(b"\n")?;
             }
@@ -314,6 +384,21 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let out_dir_path = resolve_cli_path(cwd, out_dir);
     fs::create_dir_all(&out_dir_path)?;
     let mut stdout = io::stdout();
+    if let Some(cover) = &cover {
+        // The cover is patch number `start_number - 1` (0 when numbering starts
+        // at 1): `0000-cover-letter.patch`, or the bare number under
+        // `--numbered-files`.
+        let cover_seq = start_number.saturating_sub(1);
+        let file_name = if options.numbered_files {
+            cover_seq.to_string()
+        } else {
+            format!("{cover_seq:04}-cover-letter.patch")
+        };
+        let file_path = out_dir_path.join(&file_name);
+        fs::write(&file_path, cover)?;
+        let display = Path::new(out_dir).join(&file_name);
+        writeln!(stdout, "{}", display.display())?;
+    }
     for (idx, record) in commits.iter().enumerate() {
         let seq = start_number + idx;
         let buffer = render_patch(RenderContext {
@@ -343,6 +428,674 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     }
     stdout.flush()?;
     Ok(())
+}
+
+/// Resolve whether a cover letter is emitted: `--cover-letter`/`--no-cover-letter`
+/// win over `format.coverletter`; `format.coverletter=auto` (or `--cover-letter`
+/// left to auto) emits a cover only when more than one patch is produced.
+fn resolve_cover_letter(options: &FormatPatchOptions, config: &GitConfig, count: usize) -> bool {
+    if let Some(explicit) = options.cover_letter {
+        return explicit;
+    }
+    // git: an explicit `--commit-list-format` (with no `--cover-letter`/
+    // `--no-cover-letter`) implies a cover letter.
+    if options.commit_list_format.is_some() {
+        return true;
+    }
+    match config.get_entry("format", None, "coverletter") {
+        Some(Some(value)) if value.eq_ignore_ascii_case("auto") => count > 1,
+        // A bare `format.coverletter` (no value), or an unrecognised non-boolean
+        // value, is treated as boolean-true.
+        Some(value) => value.and_then(git_config_bool_str).unwrap_or(true),
+        None => false,
+    }
+}
+
+/// Render the complete `0000-cover-letter` "email" buffer.
+///
+/// Mirrors git's `make_cover_letter` (builtin/log.c): a synthetic mail whose
+/// `From:`/`Date:` are the committer (or `--from`/`format.from`) identity at the
+/// current time, a `Subject: [PATCH 0/m] <subject>` header, the extra-header
+/// block, the cover subject/blurb (resolved from the branch description /
+/// `--description-file` under the cover-from-description rules), the commit-list
+/// body (shortlog / modern / `log:<fmt>` / a bare `%`-format), the run's
+/// cumulative diffstat against the boundary commit, and the signature trailer.
+#[allow(clippy::too_many_arguments)]
+fn build_cover_letter(
+    repo: &RepositoryContext,
+    options: &FormatPatchOptions,
+    resolved: &ResolvedFormat,
+    config: &GitConfig,
+    commits: &[sley_rev::CommitRecord],
+    diff_pathspec: Option<&DiffPathspec>,
+    last_number: usize,
+    abbrev: usize,
+) -> Result<Vec<u8>> {
+    let _ = abbrev; // the cover never emits index lines; kept for signature parity.
+    let format = repo.format();
+    let db = repo.objects();
+    let mut out = Vec::new();
+
+    // The tip (newest) commit anchors the mbox `From <oid>` separator; the
+    // boundary (parent of the oldest) anchors the cumulative diffstat.
+    let head = commits
+        .last()
+        .expect("cover letter requires at least one commit");
+    out.extend_from_slice(b"From ");
+    if resolved.zero_commit {
+        out.extend_from_slice("0".repeat(format.hex_len()).as_bytes());
+    } else {
+        out.extend_from_slice(head.oid.to_hex().as_bytes());
+    }
+    out.extend_from_slice(b" Mon Sep 17 00:00:00 2001\n");
+
+    // From:/Date: come from the cover identity (the `--from`/`format.from` ident
+    // if set, else the runtime committer) at the current time, exactly like
+    // git's `from = cfg->from ? cfg->from : git_committer_info(0)`.
+    let (from_name, from_email) = match &resolved.from_ident {
+        Some(from) => (from.name.clone(), from.email.clone()),
+        None => {
+            let ident = committer_ident_string(config)?;
+            let parsed = parse_from_ident(&ident)?;
+            (parsed.name, parsed.email)
+        }
+    };
+    out.extend_from_slice(format!("From: {from_name} <{from_email}>\n").as_bytes());
+    out.extend_from_slice(format!("Date: {}\n", cover_letter_date()).as_bytes());
+
+    // Resolve the cover subject + blurb body from the branch description /
+    // --description-file under the cover-from-description rules.
+    let (subject, body) = resolve_cover_text(repo, options, config)?;
+
+    // Subject: [PATCH 0/m] <subject>, q-encoded when it carries non-ASCII and
+    // header encoding is on. The cover is patch 0, so it is always numbered.
+    let prefix = subject_prefix_label(resolved, 0, last_number, true);
+    let encoded_subject = maybe_encode_email_subject(&subject, options, config);
+    write_folded_subject(&mut out, prefix.as_deref(), &encoded_subject);
+
+    // Extra headers (custom / To: / Cc:) sit between Subject and the blank line.
+    out.extend_from_slice(&resolved.header_block);
+
+    // Blank line, then the blurb body. git always emits the body followed by a
+    // blank line (`pp_remainder` + the trailing `\n` in `fprintf("%s\n", sb)`).
+    out.push(b'\n');
+    out.extend_from_slice(body.as_bytes());
+    if !body.is_empty() {
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+
+    // The commit-list body (shortlog / modern / log:<fmt> / bare %-format).
+    let list_format = resolve_commit_list_format(options, config);
+    write_commit_list_cover(&mut out, &list_format, commits)?;
+
+    // The cumulative diffstat against the boundary commit, when there is a unique
+    // boundary (a single parent of the oldest commit). git omits it otherwise.
+    if let Some(origin_tree) = cover_origin_tree(db, format, commits)? {
+        let entries = cover_diff_entries(
+            db,
+            format,
+            options,
+            diff_pathspec,
+            &origin_tree,
+            &head.commit.tree,
+        )?;
+        if options.stat {
+            write_patch_diffstat(&mut out, &entries, db, options)?;
+            for entry in &entries {
+                write_patch_summary_entry(&mut out, entry)?;
+            }
+            // git's diff flush ends the diffstat block with a blank line; the
+            // cover has no per-file diff after it, so that blank sits directly
+            // before the signature.
+            out.push(b'\n');
+        }
+    }
+
+    // Signature trailer, identical framing to a normal patch.
+    if let Some(signature) = &resolved.signature {
+        out.extend_from_slice(b"-- \n");
+        out.extend_from_slice(signature);
+        out.extend_from_slice(b"\n\n");
+    }
+    Ok(out)
+}
+
+/// Format the current time (honoring `GIT_COMMITTER_DATE` like git's
+/// `git_committer_info`) as the cover's RFC 2822 `Date:`.
+fn cover_letter_date() -> String {
+    let raw_date = env::var("GIT_COMMITTER_DATE").ok();
+    let (secs, tz) = match raw_date.as_deref().and_then(parse_committer_date) {
+        Some(parsed) => parsed,
+        None => (current_unix_seconds(), "+0000".to_string()),
+    };
+    // commit_identity_date parses the trailing `<ts> <tz>` of an identity line.
+    let ident = format!("C <c@example.invalid> {secs} {tz}");
+    commit_identity_date(ident.as_bytes(), &DateMode::Rfc2822)
+}
+
+/// Parse a `GIT_COMMITTER_DATE` value of the form `@<unix> <tz>` (the canonical
+/// form git stores) into `(unix_seconds, timezone)`. Returns `None` for any
+/// other shape, in which case the cover falls back to the current time.
+fn parse_committer_date(value: &str) -> Option<(i64, String)> {
+    let trimmed = value.trim();
+    let rest = trimmed.strip_prefix('@')?;
+    let (secs_str, tz) = match rest.split_once(' ') {
+        Some((secs, tz)) => (secs, tz.trim().to_string()),
+        None => (rest, "+0000".to_string()),
+    };
+    let secs = secs_str.trim().parse::<i64>().ok()?;
+    Some((secs, tz))
+}
+
+/// Maximum subject length (characters) before cover-from-description `auto`
+/// falls back to keeping the placeholder subject. Mirrors git's
+/// `COVER_FROM_AUTO_MAX_SUBJECT_LEN`.
+const COVER_FROM_AUTO_MAX_SUBJECT_LEN: usize = 100;
+
+/// Resolve the cover's `(subject, blurb_body)` under the cover-from-description
+/// rules, mirroring git's `prepare_cover_text`. The description text comes from
+/// `--description-file` first, else `branch.<name>.description` for the branch
+/// inferred from the revision arguments. With no description (or `none` mode)
+/// the placeholders `*** SUBJECT HERE ***` / `*** BLURB HERE ***` are used.
+fn resolve_cover_text(
+    repo: &RepositoryContext,
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> Result<(String, String)> {
+    let placeholder_subject = "*** SUBJECT HERE ***".to_string();
+    let placeholder_body = "*** BLURB HERE ***".to_string();
+
+    let mode = options
+        .cover_from_description
+        .or_else(|| {
+            config
+                .get("format", None, "coverFromDescription")
+                .and_then(|value| parse_cover_from_description(value).ok())
+        })
+        .unwrap_or(CoverFromDescription::Message);
+
+    if mode == CoverFromDescription::None {
+        return Ok((placeholder_subject, placeholder_body));
+    }
+
+    let description = read_cover_description(repo, options, config)?;
+    let Some(description) = description.filter(|text| !text.is_empty()) else {
+        return Ok((placeholder_subject, placeholder_body));
+    };
+
+    // Split the first paragraph (subject) from the remainder (body) exactly as
+    // git's `format_subject(_, _, " ")` does: join the first paragraph's lines
+    // with a single space, and treat the bytes after the first blank line as the
+    // body.
+    let (subject_para, remainder) = split_cover_description(&description);
+
+    match mode {
+        CoverFromDescription::None => Ok((placeholder_subject, placeholder_body)),
+        CoverFromDescription::Message => {
+            // Subject stays the placeholder; the WHOLE description is the body.
+            Ok((placeholder_subject, pp_remainder(&description)))
+        }
+        CoverFromDescription::Subject => {
+            Ok((subject_para, pp_remainder(remainder)))
+        }
+        CoverFromDescription::Auto => {
+            if subject_para.chars().count() > COVER_FROM_AUTO_MAX_SUBJECT_LEN {
+                // Too-long would-be subject: fall back to MESSAGE behaviour.
+                Ok((placeholder_subject, pp_remainder(&description)))
+            } else {
+                Ok((subject_para, pp_remainder(remainder)))
+            }
+        }
+    }
+}
+
+/// Read the raw cover description text: `--description-file` wins, else
+/// `branch.<name>.description` for the branch inferred from the revision args.
+fn read_cover_description(
+    repo: &RepositoryContext,
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> Result<Option<String>> {
+    if let Some(path) = options.description_file.as_deref().filter(|p| !p.is_empty()) {
+        let resolved = resolve_cli_path(repo.cwd(), path);
+        let bytes = fs::read(&resolved).map_err(|err| {
+            GitError::Command(format!(
+                "unable to read branch description file '{path}': {err}"
+            ))
+        })?;
+        return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+    }
+    let Some(branch) = cover_branch_name(repo, options)? else {
+        return Ok(None);
+    };
+    Ok(config
+        .get("branch", Some(&branch), "description")
+        .map(str::to_string))
+}
+
+/// Infer the branch whose description seeds the cover, mirroring git's
+/// `find_branch_name`: when a single positive revision argument names a branch
+/// whose tip matches, use it; otherwise fall back to the current `HEAD` branch.
+fn cover_branch_name(
+    repo: &RepositoryContext,
+    options: &FormatPatchOptions,
+) -> Result<Option<String>> {
+    // git's `find_branch_name` keys off the single *interesting* (non-excluded)
+    // cmdline ref. A bare single committish in format-patch means `<commit>..HEAD`
+    // — the committish is the EXCLUDED boundary, so the interesting ref is HEAD
+    // and we fall back to the current branch. Only an explicit positive branch
+    // tip (e.g. `rebuild-1~2..rebuild-1`, `^main rebuild-1`) names the branch.
+    if format_patch_bare_exclude(options).is_none() {
+        // Collect the explicit positive ref tokens (drop `^neg`, ranges, options,
+        // and the implicit HEAD). The interesting ref must be a single branch.
+        let positives: Vec<&str> = options
+            .setup_args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .filter_map(|arg| {
+                if arg.starts_with('^') || arg.starts_with('-') || arg.as_str() == "HEAD" {
+                    return None;
+                }
+                // For an explicit `<since>..<until>` the positive side is <until>.
+                match arg.split_once("..") {
+                    Some((_, until)) if !until.is_empty() => Some(until),
+                    Some(_) => None,
+                    None => Some(arg.as_str()),
+                }
+            })
+            .collect();
+        if positives.len() == 1 {
+            let token = positives[0];
+            // The token must dwim to a branch (and, in git, match its tip — here
+            // a positive arg that is a branch name always points at its tip).
+            if repo
+                .refs()
+                .read_ref(&format!("refs/heads/{token}"))?
+                .is_some()
+            {
+                return Ok(Some(token.to_string()));
+            }
+        }
+    }
+    // Fall back to the current branch (the symbolic HEAD short name).
+    match repo.refs().read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => {
+            Ok(name.strip_prefix("refs/heads/").map(str::to_string))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Split a description into `(first_paragraph_joined_with_spaces, remainder)`.
+/// The first paragraph runs until the first blank line; its lines are joined
+/// with single spaces (git's `format_subject(_, _, " ")`). The remainder is the
+/// raw text from the blank line onward.
+fn split_cover_description(description: &str) -> (String, &str) {
+    let mut subject = String::new();
+    let mut first = true;
+    let mut offset = 0usize;
+    for line in description.split_inclusive('\n') {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        if text.trim().is_empty() {
+            // Blank line ends the first paragraph; the remainder starts here.
+            break;
+        }
+        if !first {
+            subject.push(' ');
+        }
+        subject.push_str(text);
+        first = false;
+        offset += line.len();
+    }
+    (subject, &description[offset..])
+}
+
+/// git's `pp_remainder`: skip leading blank lines, then keep the rest with its
+/// trailing whitespace trimmed to a single newline-free block. The cover body is
+/// emitted with its own trailing blank line by the caller, so here we just strip
+/// surrounding blank lines.
+fn pp_remainder(text: &str) -> String {
+    let mut started = false;
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if !started {
+            if body.trim().is_empty() {
+                continue;
+            }
+            started = true;
+        }
+        out.push_str(body);
+        out.push('\n');
+    }
+    // Trim trailing blank lines but keep interior structure.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// q-encode the cover subject as a single RFC 2047 `=?UTF-8?q?...?=` word when
+/// header encoding is on and the subject needs it (non-ASCII or a literal `=?`).
+/// Otherwise the subject is returned unchanged. Mirrors git's `pp_email_subject`
+/// gate plus `add_rfc2047(..., RFC2047_SUBJECT)`.
+fn maybe_encode_email_subject(
+    subject: &str,
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> String {
+    let encode = options
+        .encode_email_headers
+        .or_else(|| config.get_bool("format", None, "encodeEmailHeaders"))
+        .unwrap_or(true);
+    if !encode || !needs_rfc2047_encoding(subject.as_bytes()) {
+        return subject.to_string();
+    }
+    let mut out = String::from("=?UTF-8?q?");
+    for &byte in subject.as_bytes() {
+        if rfc2047_subject_special(byte) {
+            out.push_str(&format!("={byte:02X}"));
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out.push_str("?=");
+    out
+}
+
+/// git's `needs_rfc2047_encoding`: a subject needs encoding if it carries any
+/// non-ASCII byte, a newline, or the literal `=?` introducer.
+fn needs_rfc2047_encoding(bytes: &[u8]) -> bool {
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte >= 0x80 || byte == b'\n' {
+            return true;
+        }
+        if byte == b'=' && bytes.get(i + 1) == Some(&b'?') {
+            return true;
+        }
+    }
+    false
+}
+
+/// git's `is_rfc2047_special` for `RFC2047_SUBJECT`: a byte must be escaped when
+/// it is non-ASCII, non-printable, whitespace, or one of `=` `?` `_`.
+fn rfc2047_subject_special(byte: u8) -> bool {
+    if byte >= 0x80 || !byte.is_ascii_graphic() && byte != b' ' {
+        return true;
+    }
+    byte.is_ascii_whitespace() || byte == b'=' || byte == b'?' || byte == b'_'
+}
+
+/// Resolve the commit-list format used in the cover body: `--commit-list-format`
+/// wins over `format.commitlistformat`; the default is `shortlog`.
+fn resolve_commit_list_format(options: &FormatPatchOptions, config: &GitConfig) -> String {
+    options
+        .commit_list_format
+        .clone()
+        .or_else(|| {
+            config
+                .get("format", None, "commitlistformat")
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "shortlog".to_string())
+}
+
+/// Render the commit-list portion of the cover body, dispatching on the format
+/// token exactly like git's `make_cover_letter`:
+///
+///   - `shortlog`         → author-grouped shortlog (wrap 72, indent 2/4)
+///   - `modern`           → `%w(72)[%(count)/%(total)] %s`
+///   - `log:<pretty>`     → the `<pretty>` format per commit
+///   - a bare `<fmt>` containing `%` → that format per commit
+///   - anything else      → a fatal "is not a valid format string"
+///
+/// A trailing blank line always follows.
+fn write_commit_list_cover(
+    out: &mut Vec<u8>,
+    format: &str,
+    commits: &[sley_rev::CommitRecord],
+) -> Result<()> {
+    if let Some(pretty) = format.strip_prefix("log:") {
+        write_commit_list_pretty(out, pretty, commits)?;
+    } else if format == "shortlog" {
+        write_shortlog_cover(out, commits);
+    } else if format == "modern" {
+        write_commit_list_pretty(out, "%w(72)[%(count)/%(total)] %s", commits)?;
+    } else if format.contains('%') {
+        write_commit_list_pretty(out, format, commits)?;
+    } else {
+        eprintln!("fatal: '{format}' is not a valid format string");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+/// Emit an author-grouped shortlog for the cover (git's
+/// `generate_shortlog_cover_letter`): each group is `Name (N):` followed by its
+/// commit subjects, wrapped at column 76 with the first line indented 2 and
+/// continuations indented 4. Commits are grouped in first-appearance (oldest
+/// first) order.
+fn write_shortlog_cover(out: &mut Vec<u8>, commits: &[sley_rev::CommitRecord]) {
+    // Preserve first-seen group order while collecting each author's subjects.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for record in commits {
+        let (name, _) = commit_identity_name_email(&record.commit.author);
+        let subject = commit_subject(&record.commit.message);
+        if !groups.contains_key(&name) {
+            order.push(name.clone());
+        }
+        groups.entry(name).or_default().push(subject);
+    }
+    for name in &order {
+        let subjects = &groups[name];
+        writeln_buf(out, &format!("{} ({}):", name, subjects.len()));
+        for subject in subjects {
+            // MAIL_DEFAULT_WRAP (72), first line indent 2, continuations 4.
+            for line in cover_wrap_text(subject, 72, 2, 4) {
+                writeln_buf(out, &line);
+            }
+        }
+        out.push(b'\n');
+    }
+}
+
+/// Greedy word-wrap matching git's `strbuf_add_wrapped_text`: break on spaces,
+/// indent the first line by `indent1` and continuations by `indent2`, never
+/// exceeding `width` where a word fits; an over-long word lands alone on its own
+/// line. Used for both the shortlog subjects and the `%w(width)` directive.
+fn cover_wrap_text(text: &str, width: usize, indent1: usize, indent2: usize) -> Vec<String> {
+    let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
+    if words.is_empty() {
+        return vec![" ".repeat(indent1)];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_indent = indent1;
+    let mut column = indent1;
+    let mut first_word = true;
+    for word in words {
+        let word_len = word.chars().count();
+        let needed = if first_word {
+            current_indent + word_len
+        } else {
+            column + 1 + word_len
+        };
+        if !first_word && needed > width {
+            lines.push(current);
+            current = String::new();
+            current_indent = indent2;
+            column = indent2;
+            first_word = true;
+        }
+        if first_word {
+            current.push_str(&" ".repeat(current_indent));
+            current.push_str(word);
+            column = current_indent + word_len;
+            first_word = false;
+        } else {
+            current.push(' ');
+            current.push_str(word);
+            column += 1 + word_len;
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Render a `%`-format commit list (git's `generate_commit_list_cover`): emit
+/// one line per commit, newest first, with `%(count)` running 1..=n, `%(total)`
+/// fixed at n, plus a trailing blank line. Supports the placeholders the cover
+/// formats actually use: `%(count)`, `%(total)`, `%s` (subject), `%an`
+/// (author name), and a leading `%w(width[,i1[,i2]])` wrap directive.
+fn write_commit_list_pretty(
+    out: &mut Vec<u8>,
+    format: &str,
+    commits: &[sley_rev::CommitRecord],
+) -> Result<()> {
+    let total = commits.len();
+    // git iterates `list[n - i]` for i=1..=n; `list` is newest-first (list[0] =
+    // head), so this walks newest→oldest with count ascending. Our `commits` vec
+    // is oldest-first, so iterate it reversed.
+    for (idx, record) in commits.iter().rev().enumerate() {
+        let count = idx + 1;
+        let rendered = expand_commit_list_format(format, record, count, total)?;
+        out.extend_from_slice(rendered.as_bytes());
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// Expand one commit-list format line. Handles a leading `%w(...)` wrap
+/// directive (which wraps the whole rendered line), then the placeholders the
+/// cover formats use. An unrecognised `%`-escape is copied through verbatim,
+/// matching git's lenient passthrough for the tokens we don't special-case.
+fn expand_commit_list_format(
+    format: &str,
+    record: &sley_rev::CommitRecord,
+    count: usize,
+    total: usize,
+) -> Result<String> {
+    let (wrap, rest) = parse_leading_wrap(format);
+    let (author_name, _) = commit_identity_name_email(&record.commit.author);
+    let subject = commit_subject(&record.commit.message);
+
+    let mut line = String::new();
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            let after = &rest[i + 1..];
+            if after.starts_with("(count)") {
+                line.push_str(&count.to_string());
+                i += 1 + "(count)".len();
+                continue;
+            }
+            if after.starts_with("(total)") {
+                line.push_str(&total.to_string());
+                i += 1 + "(total)".len();
+                continue;
+            }
+            if after.starts_with("s") {
+                line.push_str(&subject);
+                i += 2;
+                continue;
+            }
+            if after.starts_with("an") {
+                line.push_str(&author_name);
+                i += 3;
+                continue;
+            }
+            // Unknown escape: copy the `%` and let the next byte through.
+            line.push('%');
+            i += 1;
+            continue;
+        }
+        line.push(bytes[i] as char);
+        i += 1;
+    }
+
+    match wrap {
+        Some((width, indent1, indent2)) if width > 0 => {
+            Ok(cover_wrap_text(&line, width, indent1, indent2).join("\n"))
+        }
+        _ => Ok(line),
+    }
+}
+
+/// Parse a leading `%w(width[,indent1[,indent2]])` directive, returning the
+/// `(width, indent1, indent2)` and the remainder of the format after it. When
+/// the format does not start with `%w(`, returns `(None, format)`.
+fn parse_leading_wrap(format: &str) -> (Option<(usize, usize, usize)>, &str) {
+    let Some(rest) = format.strip_prefix("%w(") else {
+        return (None, format);
+    };
+    let Some(close) = rest.find(')') else {
+        return (None, format);
+    };
+    let args = &rest[..close];
+    let mut nums = args.split(',').map(|n| n.trim().parse::<usize>().unwrap_or(0));
+    let width = nums.next().unwrap_or(0);
+    let indent1 = nums.next().unwrap_or(0);
+    let indent2 = nums.next().unwrap_or(0);
+    (Some((width, indent1, indent2)), &rest[close + 1..])
+}
+
+/// The boundary commit's tree for the cumulative cover diffstat: the first
+/// parent of the oldest selected commit. Returns `None` when the oldest commit
+/// is a root (no parent) — git omits the diffstat when there is no unique
+/// boundary.
+fn cover_origin_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commits: &[sley_rev::CommitRecord],
+) -> Result<Option<ObjectId>> {
+    let oldest = &commits[0];
+    let Some(parent_oid) = oldest.commit.parents.first() else {
+        return Ok(None);
+    };
+    let parent_object = db.read_object(parent_oid)?;
+    let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
+    Ok(Some(parent_commit.tree))
+}
+
+/// Build the cumulative name-status diff for the cover diffstat: the boundary
+/// tree against the tip tree, honoring the run's rename/copy + pathspec options.
+fn cover_diff_entries(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    options: &FormatPatchOptions,
+    diff_pathspec: Option<&DiffPathspec>,
+    origin_tree: &ObjectId,
+    head_tree: &ObjectId,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let base = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames: options.detect_renames,
+        detect_copies: options.detect_copies,
+        find_copies_harder: options.find_copies_harder,
+        rename_empty: true,
+    };
+    let rename_options = sley_diff_merge::RenameDetectionOptions {
+        base,
+        detect_inexact: true,
+        rename_threshold: options.rename_threshold,
+        copy_threshold: options.copy_threshold,
+    };
+    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+        db,
+        format,
+        origin_tree,
+        head_tree,
+        rename_options,
+    )?;
+    Ok(match diff_pathspec {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    })
 }
 
 /// Fold the parsed options together with repository config into the run-wide
@@ -2063,11 +2816,41 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--ita-invisible-in-index" => {}
             value if value.starts_with("--color=") => {}
             value if value.starts_with("--thread") => {}
-            value if value.starts_with("--cover-letter") => {
-                return Err(GitError::Unsupported(
-                    "format-patch --cover-letter is not supported".into(),
-                ));
+            // Cover-letter family.
+            "--cover-letter" => options.cover_letter = Some(true),
+            "--no-cover-letter" => options.cover_letter = Some(false),
+            "--commit-list-format" | "--commit-list" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--commit-list-format requires a value".into())
+                })?;
+                options.commit_list_format = Some(value.clone());
             }
+            value if let Some(fmt) = value.strip_prefix("--commit-list-format=") => {
+                options.commit_list_format = Some(fmt.to_string());
+            }
+            value if let Some(fmt) = value.strip_prefix("--commit-list=") => {
+                options.commit_list_format = Some(fmt.to_string());
+            }
+            "--cover-from-description" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--cover-from-description requires a value".into())
+                })?;
+                options.cover_from_description = Some(parse_cover_from_description(value)?);
+            }
+            value if let Some(mode) = value.strip_prefix("--cover-from-description=") => {
+                options.cover_from_description = Some(parse_cover_from_description(mode)?);
+            }
+            "--description-file" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--description-file requires a value".into())
+                })?;
+                options.description_file = Some(value.clone());
+            }
+            value if let Some(path) = value.strip_prefix("--description-file=") => {
+                options.description_file = Some(path.to_string());
+            }
+            "--encode-email-headers" => options.encode_email_headers = Some(true),
+            "--no-encode-email-headers" => options.encode_email_headers = Some(false),
             // `-<n>`: limit to the last n commits.
             value
                 if value.starts_with('-')
@@ -2114,6 +2897,23 @@ fn push_cli_header(options: &mut FormatPatchOptions, value: &str) {
         options.cli_cc.push(trimmed[4..].to_string());
     } else {
         options.cli_headers.push(trimmed.to_string());
+    }
+}
+
+/// Parse a `--cover-from-description=<mode>` / `format.coverFromDescription`
+/// value, mirroring git's `parse_cover_from_description`. An unrecognised mode
+/// is a fatal error printed exactly as git does (`<arg>: invalid cover from
+/// description mode`) so the byte-for-byte stderr check in t4014 passes.
+fn parse_cover_from_description(arg: &str) -> Result<CoverFromDescription> {
+    match arg {
+        "default" | "message" => Ok(CoverFromDescription::Message),
+        "none" => Ok(CoverFromDescription::None),
+        "subject" => Ok(CoverFromDescription::Subject),
+        "auto" => Ok(CoverFromDescription::Auto),
+        other => {
+            eprintln!("fatal: {other}: invalid cover from description mode");
+            Err(GitError::Exit(128))
+        }
     }
 }
 
