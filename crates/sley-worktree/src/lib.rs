@@ -3183,10 +3183,11 @@ fn status_untracked_paths_from_index(
         return Ok(Vec::new());
     }
     let mut paths = BTreeSet::new();
+    let tracked_dirs = stage0_tracked_directories(index);
     let mut context = StatusUntrackedWalk {
         git_dir,
-        index,
         stat_cache,
+        tracked_dirs: &tracked_dirs,
         ignores,
         untracked_mode,
     };
@@ -3196,8 +3197,8 @@ fn status_untracked_paths_from_index(
 
 struct StatusUntrackedWalk<'a> {
     git_dir: &'a Path,
-    index: &'a Index,
     stat_cache: &'a IndexStatCache,
+    tracked_dirs: &'a HashSet<Vec<u8>>,
     ignores: &'a mut IgnoreMatcher,
     untracked_mode: StatusUntrackedMode,
 }
@@ -3211,55 +3212,77 @@ fn collect_status_untracked_paths(
     if is_same_path(dir, context.git_dir) {
         return Ok(());
     }
+    let ignore_len = context.ignores.patterns.len();
     read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        if file_name == std::ffi::OsStr::new(".git") {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        let is_dir = file_type.is_dir();
-        let git_path = git_path_append_component(dir_git_path, &file_name);
-        if context.ignores.is_ignored(&git_path, is_dir) {
-            continue;
-        }
-        if is_dir {
-            let path = entry.path();
-            if is_same_path(&path, context.git_dir) {
+    let result = (|| -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-            if context.stat_cache.gitlink_entry(&git_path).is_some() {
+            let file_type = entry.file_type()?;
+            let is_dir = file_type.is_dir();
+            let git_path = git_path_append_component(dir_git_path, &file_name);
+            if context.ignores.is_ignored(&git_path, is_dir) {
                 continue;
             }
-            match context.untracked_mode {
-                StatusUntrackedMode::All => {
-                    if !index_has_stage0_path_under(context.index, &git_path)
-                        && is_nested_repository_boundary(&path)
-                    {
-                        insert_untracked_directory(paths, &git_path);
-                    } else {
-                        collect_status_untracked_paths(context, &path, &git_path, paths)?;
-                    }
+            if is_dir {
+                let path = entry.path();
+                if is_same_path(&path, context.git_dir) {
+                    continue;
                 }
-                StatusUntrackedMode::Normal => {
-                    if index_has_stage0_path_under(context.index, &git_path) {
-                        collect_status_untracked_paths(context, &path, &git_path, paths)?;
-                    } else if is_nested_repository_boundary(&path) {
-                        insert_untracked_directory(paths, &git_path);
-                    } else if status_untracked_directory_has_file(context, &path, &git_path)? {
-                        insert_untracked_directory(paths, &git_path);
-                    }
+                if context.stat_cache.gitlink_entry(&git_path).is_some() {
+                    continue;
                 }
-                StatusUntrackedMode::None => {}
+                match context.untracked_mode {
+                    StatusUntrackedMode::All => {
+                        if !context.tracked_dirs.contains(&git_path)
+                            && is_nested_repository_boundary(&path)
+                        {
+                            insert_untracked_directory(paths, &git_path);
+                        } else {
+                            collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                        }
+                    }
+                    StatusUntrackedMode::Normal => {
+                        if context.tracked_dirs.contains(&git_path) {
+                            collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                        } else if is_nested_repository_boundary(&path) {
+                            insert_untracked_directory(paths, &git_path);
+                        } else if status_untracked_directory_has_file(context, &path, &git_path)? {
+                            insert_untracked_directory(paths, &git_path);
+                        }
+                    }
+                    StatusUntrackedMode::None => {}
+                }
+            } else if (file_type.is_file() || file_type.is_symlink())
+                && !context.stat_cache.contains(&git_path)
+            {
+                paths.insert(git_path);
             }
-        } else if (file_type.is_file() || file_type.is_symlink())
-            && !context.stat_cache.contains(&git_path)
-        {
-            paths.insert(git_path);
+        }
+        Ok(())
+    })();
+    context.ignores.patterns.truncate(ignore_len);
+    result
+}
+
+fn stage0_tracked_directories(index: &Index) -> HashSet<Vec<u8>> {
+    let mut directories = HashSet::new();
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+    {
+        let path = entry.path.as_bytes();
+        for (idx, byte) in path.iter().enumerate() {
+            if *byte == b'/' && idx > 0 {
+                directories.insert(path[..idx].to_vec());
+            }
         }
     }
-    Ok(())
+    directories
 }
 
 fn status_untracked_directory_has_file(
@@ -3270,49 +3293,41 @@ fn status_untracked_directory_has_file(
     if is_same_path(dir, context.git_dir) {
         return Ok(false);
     }
+    let ignore_len = context.ignores.patterns.len();
     read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        if file_name == std::ffi::OsStr::new(".git") {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        let is_dir = file_type.is_dir();
-        let git_path = git_path_append_component(dir_git_path, &file_name);
-        if context.ignores.is_ignored(&git_path, is_dir) {
-            continue;
-        }
-        if file_type.is_file() || file_type.is_symlink() {
-            return Ok(!context.stat_cache.contains(&git_path));
-        }
-        if is_dir {
-            let path = entry.path();
-            if is_same_path(&path, context.git_dir) {
+    let result = (|| -> Result<bool> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-            if is_nested_repository_boundary(&path) {
-                return Ok(true);
+            let file_type = entry.file_type()?;
+            let is_dir = file_type.is_dir();
+            let git_path = git_path_append_component(dir_git_path, &file_name);
+            if context.ignores.is_ignored(&git_path, is_dir) {
+                continue;
             }
-            if status_untracked_directory_has_file(context, &path, &git_path)? {
-                return Ok(true);
+            if file_type.is_file() || file_type.is_symlink() {
+                return Ok(!context.stat_cache.contains(&git_path));
+            }
+            if is_dir {
+                let path = entry.path();
+                if is_same_path(&path, context.git_dir) {
+                    continue;
+                }
+                if is_nested_repository_boundary(&path) {
+                    return Ok(true);
+                }
+                if status_untracked_directory_has_file(context, &path, &git_path)? {
+                    return Ok(true);
+                }
             }
         }
-    }
-    Ok(false)
-}
-
-fn index_has_stage0_path_under(index: &Index, directory: &[u8]) -> bool {
-    let mut prefix = Vec::with_capacity(directory.len() + 1);
-    prefix.extend_from_slice(directory);
-    prefix.push(b'/');
-    let idx = index
-        .entries
-        .partition_point(|entry| entry.path.as_bytes() < prefix.as_slice());
-    index.entries[idx..]
-        .iter()
-        .take_while(|entry| entry.path.as_bytes().starts_with(&prefix))
-        .any(|entry| entry.stage() == Stage::Normal)
+        Ok(false)
+    })();
+    context.ignores.patterns.truncate(ignore_len);
+    result
 }
 
 fn untracked_normal_rollup_path(
@@ -3632,23 +3647,23 @@ impl IgnoreMatcher {
     }
 
     fn is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
-        let mut ignored = false;
-        for pattern in &self.patterns {
-            if pattern.matches(path, is_dir) {
-                ignored = !pattern.negated;
+        let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        for pattern in self.patterns.iter().rev() {
+            if pattern.matches_with_basename(path, basename, is_dir) {
+                return !pattern.negated;
             }
         }
-        ignored
+        false
     }
 
     fn match_for(&self, path: &[u8], is_dir: bool) -> Option<&IgnorePattern> {
-        let mut matched = None;
-        for pattern in &self.patterns {
-            if pattern.matches(path, is_dir) {
-                matched = Some(pattern);
+        let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        for pattern in self.patterns.iter().rev() {
+            if pattern.matches_with_basename(path, basename, is_dir) {
+                return Some(pattern);
             }
         }
-        matched
+        None
     }
 }
 
@@ -4016,6 +4031,11 @@ impl IgnorePattern {
     }
 
     fn matches(&self, path: &[u8], is_dir: bool) -> bool {
+        let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        self.matches_with_basename(path, basename, is_dir)
+    }
+
+    fn matches_with_basename(&self, path: &[u8], basename: &[u8], is_dir: bool) -> bool {
         let path = if self.base.is_empty() {
             path
         } else {
@@ -4033,9 +4053,7 @@ impl IgnorePattern {
         if self.anchored || self.has_slash {
             return self.match_segment(path);
         }
-        path.rsplit(|byte| *byte == b'/')
-            .next()
-            .is_some_and(|basename| self.match_segment(basename))
+        self.match_segment(basename)
     }
 
     fn matches_directory(&self, path: &[u8], is_dir: bool) -> bool {
@@ -4046,12 +4064,13 @@ impl IgnorePattern {
                     .and_then(|rest| rest.strip_prefix(b"/"))
                     .is_some();
         }
-        path.split(|byte| *byte == b'/')
-            .enumerate()
-            .any(|(index, component)| {
-                self.match_segment(component)
-                    && (is_dir || index + 1 < path.split(|byte| *byte == b'/').count())
-            })
+        let mut components = path.split(|byte| *byte == b'/').peekable();
+        while let Some(component) = components.next() {
+            if self.match_segment(component) && (is_dir || components.peek().is_some()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Match a slash-free `value` (a basename or path component) against this
