@@ -6862,6 +6862,7 @@ pub fn remove_index_and_worktree_paths(
     format: ObjectFormat,
     paths: &[PathBuf],
     options: RemoveOptions,
+    config_parameters_env: Option<&str>,
 ) -> Result<RemoveResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
@@ -6878,11 +6879,20 @@ pub fn remove_index_and_worktree_paths(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
-    let mut index_entries = index
-        .entries
-        .into_iter()
-        .map(|entry| (entry.path.as_bytes().to_vec(), entry))
-        .collect::<BTreeMap<_, _>>();
+    let Index {
+        version: index_version,
+        entries: index_entry_list,
+        extensions: index_extensions,
+        ..
+    } = index;
+    // The set of distinct index paths (any stage) — used for membership tests.
+    let index_paths: BTreeSet<Vec<u8>> = index_entry_list
+        .iter()
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
+    // Paths selected for removal. A single selected path removes ALL of its
+    // stage entries (so resolving an unmerged path by removal drops stages
+    // 1/2/3 together), matching git's name-keyed removal.
     let mut selected = BTreeSet::new();
     for path in paths {
         let absolute = if path.is_absolute() {
@@ -6893,8 +6903,12 @@ pub fn remove_index_and_worktree_paths(
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
+        // A pathspec with a trailing slash (e.g. `git rm dir/`) only matches a
+        // directory: it must never match a same-named tracked file. `Path`'s
+        // component iterator drops the slash, so capture it before it is lost.
+        let has_trailing_slash = path_has_trailing_separator(&absolute);
         let git_path = git_path_bytes(relative)?;
-        if index_entries.contains_key(&git_path) {
+        if !has_trailing_slash && index_paths.contains(&git_path) {
             selected.insert(git_path);
             continue;
         }
@@ -6904,8 +6918,8 @@ pub fn remove_index_and_worktree_paths(
         // wildcard metacharacters; a glob match removes the entries directly
         // (no `-r` needed — the pathspec already names the files).
         if pathspec_is_glob(&git_path) {
-            let glob_matched = index_entries
-                .keys()
+            let glob_matched = index_paths
+                .iter()
                 .filter(|entry| {
                     pathspec_item_matches(&git_path, entry, PathspecMatchMagic::default())
                 })
@@ -6924,8 +6938,8 @@ pub fn remove_index_and_worktree_paths(
             );
             return Err(GitError::Exit(128));
         }
-        let matched = index_entries
-            .keys()
+        let matched = index_paths
+            .iter()
             .filter(|entry| index_entry_is_under_path(entry, &git_path))
             .cloned()
             .collect::<Vec<_>>();
@@ -6948,63 +6962,162 @@ pub fn remove_index_and_worktree_paths(
         }
         selected.extend(matched);
     }
-    if !options.cached && !options.force {
-        let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+
+    // `git rm` runs the local-modification safety check unless `-f` is given —
+    // even for `--cached`. The check (a faithful port of builtin/rm.c's
+    // `check_local_mod`) buckets each selected path into one of three error
+    // classes and prints all of them at once (collected, not fail-fast), so a
+    // single `git rm a b c` reports every offending path. See the message
+    // assertions in t3600-rm.sh.
+    if !options.force {
+        let config =
+            sley_config::read_repo_config(git_dir, config_parameters_env).unwrap_or_default();
+        // advice.rmhints (default true) gates the parenthetical "(use ...)" hints.
+        let show_hints = config
+            .get_bool("advice", None, "rmhints")
+            .unwrap_or(true);
+        // Map each selected path to its stage-0 index entry for the check; an
+        // unmerged path (no stage 0) is skipped, exactly like git's loop
+        // (index_name_pos fails, and a non-gitlink ours entry `continue`s).
+        let stage0: BTreeMap<&[u8], &IndexEntry> = index_entry_list
+            .iter()
+            .filter(|entry| entry.stage() == Stage::Normal)
+            .map(|entry| (entry.path.as_bytes(), entry))
+            .collect();
+        let mut files_staged: Vec<&[u8]> = Vec::new();
+        let mut files_cached: Vec<&[u8]> = Vec::new();
+        let mut files_local: Vec<&[u8]> = Vec::new();
         for path in &selected {
-            let Some(index_entry) = index_entries.get(path) else {
+            let Some(index_entry) = stage0.get(path.as_slice()) else {
+                // Unmerged path with no stage-0 entry: resolving by removal is
+                // safe and not warning-worthy.
                 continue;
             };
-            match head_entries.get(path) {
-                Some(head_entry)
-                    if head_entry.oid == index_entry.oid && head_entry.mode == index_entry.mode => {
-                }
-                _ => {
-                    eprintln!("error: the following file has changes staged in the index:");
-                    eprintln!("    {}", String::from_utf8_lossy(path));
-                    eprintln!("(use --cached to keep the file, or -f to force removal)");
-                    return Err(GitError::Exit(1));
-                }
-            }
             let worktree_file = worktree_path(worktree_root, path)?;
-            if worktree_file.exists() {
-                let object = read_expected_object(&db, &index_entry.oid, ObjectType::Blob)?;
-                let worktree_bytes = apply_clean_filter(
-                    worktree_root,
-                    git_dir,
-                    &config,
-                    path,
-                    &fs::read(&worktree_file)?,
-                )?;
-                if worktree_bytes != object.body {
-                    eprintln!("error: the following file has local modifications:");
-                    eprintln!("    {}", String::from_utf8_lossy(path));
-                    eprintln!("(use --cached to keep the file, or -f to force removal)");
-                    return Err(GitError::Exit(1));
+            // Is the worktree path different from the index?
+            //
+            // Mirror builtin/rm.c's `check_local_mod`: when `lstat` fails with a
+            // "missing file" error (ENOENT *or* ENOTDIR — the path vanished, or a
+            // leading component became a file) the file has already gone from the
+            // working tree, so git `continue`s and never buckets the path. Same
+            // for a tracked plain path that is now a directory on disk: git
+            // treats that as ENOENT and skips it (the later worktree-removal step
+            // is what fails on a non-empty directory).
+            let local_changes = match fs::symlink_metadata(&worktree_file) {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) || err.raw_os_error() == Some(20) =>
+                {
+                    // ENOENT/ENOTDIR: already gone — not warning-worthy.
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => {
+                    let object =
+                        read_expected_object(&db, &index_entry.oid, ObjectType::Blob)?;
+                    let worktree_bytes = apply_clean_filter(
+                        worktree_root,
+                        git_dir,
+                        &config,
+                        path,
+                        &fs::read(&worktree_file)?,
+                    )?;
+                    worktree_bytes != object.body
+                }
+            };
+            // Is the index different from the HEAD commit? (Before the first
+            // commit, anything staged is treated as changed from HEAD.)
+            let staged_changes = match head_entries.get(path) {
+                Some(head_entry) => {
+                    head_entry.oid != index_entry.oid || head_entry.mode != index_entry.mode
+                }
+                None => true,
+            };
+            if local_changes && staged_changes {
+                // `git rm --cached` of an intent-to-add entry is safe.
+                if !options.cached || !index_entry.is_intent_to_add() {
+                    files_staged.push(path);
+                }
+            } else if !options.cached {
+                if staged_changes {
+                    files_cached.push(path);
+                }
+                if local_changes {
+                    files_local.push(path);
                 }
             }
         }
-    }
-    for path in &selected {
-        if options.dry_run {
-            continue;
+        let mut errs = false;
+        print_rm_error_files(
+            &files_staged,
+            "the following file has staged content different from both the\nfile and the HEAD:",
+            "the following files have staged content different from both the\nfile and the HEAD:",
+            "\n(use -f to force removal)",
+            show_hints,
+            &mut errs,
+        );
+        print_rm_error_files(
+            &files_cached,
+            "the following file has changes staged in the index:",
+            "the following files have changes staged in the index:",
+            "\n(use --cached to keep the file, or -f to force removal)",
+            show_hints,
+            &mut errs,
+        );
+        print_rm_error_files(
+            &files_local,
+            "the following file has local modifications:",
+            "the following files have local modifications:",
+            "\n(use --cached to keep the file, or -f to force removal)",
+            show_hints,
+            &mut errs,
+        );
+        if errs {
+            return Err(GitError::Exit(1));
         }
-        if !options.cached {
-            remove_worktree_file(worktree_root, path)?;
-        }
-        index_entries.remove(path);
     }
+
     if options.dry_run {
         return Ok(RemoveResult {
             removed: selected.into_iter().collect(),
         });
     }
-    let entries = index_entries.into_values().collect::<Vec<_>>();
+    // Mirror builtin/rm.c's ordering: remove the worktree files BEFORE writing
+    // the new index. If the very first removal fails (and nothing has been
+    // removed yet), abort without committing the index, so a `git rm d` where
+    // `d` is now a non-empty directory fails AND leaves the index untouched.
+    // Once any file has been removed we commit to finishing (git does the same).
+    if !options.cached {
+        let mut removed_any = false;
+        for path in &selected {
+            match remove_tracked_worktree_path(worktree_root, path)? {
+                true => removed_any = true,
+                false if !removed_any => {
+                    eprintln!(
+                        "fatal: git rm: '{}': Is a directory",
+                        String::from_utf8_lossy(path)
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                false => {}
+            }
+        }
+    }
+    // Keep every entry whose path was not selected, preserving original order
+    // and all stages of unmerged paths that were not removed.
+    let entries = index_entry_list
+        .into_iter()
+        .filter(|entry| !selected.contains(entry.path.as_bytes()))
+        .collect::<Vec<_>>();
     fs::write(
         index_path,
         Index {
-            version: 2,
+            version: index_version,
             entries,
-            extensions: Vec::new(),
+            extensions: index_extensions,
             checksum: None,
         }
         .write(format)?,
@@ -7012,6 +7125,62 @@ pub fn remove_index_and_worktree_paths(
     Ok(RemoveResult {
         removed: selected.into_iter().collect(),
     })
+}
+
+/// Remove a tracked path from the working tree, mirroring builtin/rm.c's
+/// `remove_path`: unlink the file and prune now-empty parent directories.
+/// Returns `Ok(true)` when a file was removed, `Ok(false)` when the path could
+/// not be unlinked because it is a directory (the caller decides whether that
+/// aborts the run). A path that has already vanished is a no-op success.
+fn remove_tracked_worktree_path(root: &Path, path: &[u8]) -> Result<bool> {
+    let file = worktree_path(root, path)?;
+    match fs::symlink_metadata(&file) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(true);
+        }
+        Err(err) if err.raw_os_error() == Some(20) => return Ok(true), // ENOTDIR
+        Err(err) => return Err(err.into()),
+        // A directory in the worktree where a plain file is tracked cannot be
+        // unlinked (git's remove_path fails on EISDIR). Report it so the caller
+        // can abort the removal without committing the index.
+        Ok(meta) if meta.is_dir() => return Ok(false),
+        Ok(_) => {}
+    }
+    fs::remove_file(&file)?;
+    prune_empty_parents(root, file.parent())?;
+    Ok(true)
+}
+
+/// Print one batched `git rm` safety error block (mirrors builtin/rm.c's
+/// `print_error_files`): the main message, the indented list of offending
+/// paths, and — when `advice.rmhints` is enabled — the trailing hint. Sets
+/// `*errs` so the caller can fail after collecting every class.
+fn print_rm_error_files(
+    files: &[&[u8]],
+    singular: &str,
+    plural: &str,
+    hint: &str,
+    show_hints: bool,
+    errs: &mut bool,
+) {
+    if files.is_empty() {
+        return;
+    }
+    let mut message = String::from(if files.len() == 1 { singular } else { plural });
+    for path in files {
+        message.push_str("\n    ");
+        message.push_str(&String::from_utf8_lossy(path));
+    }
+    if show_hints {
+        message.push_str(hint);
+    }
+    eprintln!("error: {message}");
+    *errs = true;
 }
 
 pub fn move_index_and_worktree_path(

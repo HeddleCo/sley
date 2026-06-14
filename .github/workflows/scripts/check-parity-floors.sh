@@ -41,6 +41,13 @@
 # Same change lifted t4202-log 55->56 (shared --from/identity-header path), so
 # its floor is raised to 56. No diff/log floor regressed (t4013/t4015/t4018/
 # t4052/t4034/t4045/t4047/t4027 all held; render.rs untouched).
+# rm wave (2026-06-14, parity/rm): t3600-rm added at 50 (was 37 — banked the
+# check_local_mod message clusters (staged-content/changes-staged/local-mod,
+# batched + advice.rmhints-gated hints), the --cached safety check incl.
+# intent-to-add, d/f & type-change cases (worktree path now a dir/symlink/
+# missing → ENOENT/ENOTDIR skip + abort-before-index-write on non-empty dir),
+# trailing-slash-on-file rejection, and the empty-string pathspec error).
+# Neighbors held: t7508-status=86, t2020-checkout-detach=16, t2107=10, t3000=15.
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -94,6 +101,7 @@ declare -A FLOOR=(
     [t4216-log-bloom.sh]=112
     [t5318-commit-graph.sh]=38
     [t3432-rebase-fast-forward.sh]=144
+    [t3600-rm.sh]=50
     [t4202-log.sh]=56
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
