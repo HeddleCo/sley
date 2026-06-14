@@ -272,37 +272,6 @@ fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
         })
 }
 
-fn log_commit_record_from_metadata(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    metadata: &sley_rev::CommitMetadata,
-) -> Result<sley_rev::CommitRecord> {
-    let mut record = log_commit_record_from_oid(db, format, metadata.oid)?;
-    record.parents.clone_from(&metadata.parents);
-    Ok(record)
-}
-
-fn log_commit_record_from_oid(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: ObjectId,
-) -> Result<sley_rev::CommitRecord> {
-    let object = db.read_object(&oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "expected commit {}, found {}",
-            oid,
-            object.object_type.as_str()
-        )));
-    }
-    let commit = Commit::parse(format, &object.body)?;
-    Ok(sley_rev::CommitRecord {
-        oid,
-        parents: commit.parents.clone(),
-        commit,
-    })
-}
-
 fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut setup_not = false;
@@ -322,6 +291,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut show_children = false;
     let mut abbrev_commit = false;
     let mut abbrev_len = Some(7usize);
+    let mut abbrev_len_explicit = false;
     let mut decoration = LogDecorationMode::Off;
     let mut read_stdin = false;
     let mut author_patterns = Vec::new();
@@ -375,8 +345,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--children" => show_children = true,
             "--abbrev-commit" => abbrev_commit = true,
             "--no-abbrev-commit" => abbrev_commit = false,
-            "--abbrev" => abbrev_len = Some(7),
-            "--no-abbrev" => abbrev_len = None,
+            "--abbrev" => {
+                abbrev_len = Some(7);
+                abbrev_len_explicit = true;
+            }
+            "--no-abbrev" => {
+                abbrev_len = None;
+                abbrev_len_explicit = true;
+            }
             "--glob" | "--exclude" | "--exclude-hidden" => {
                 setup_args.push(arg.clone());
                 setup_args.push(
@@ -569,6 +545,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             value if value.starts_with("--abbrev=") => {
                 abbrev_len = Some(log_parse_abbrev_width(&value["--abbrev=".len()..]));
+                abbrev_len_explicit = true;
             }
             value if value.starts_with("--unpacked=") => {
                 eprintln!("fatal: --unpacked=<packfile> no longer supported");
@@ -1186,6 +1163,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     {
         *compiled_children = show_children;
     }
+    if !abbrev_len_explicit && log_output_needs_abbrev(&output, abbrev_commit, show_children) {
+        abbrev_len = repository_abbrev(&git_dir, format)?;
+    }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let committer_filters =
@@ -1380,24 +1360,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             color: false,
             output_encoding: &output_encoding,
         };
-        if skip == 0 && max_count == Some(1) && starts.len() == 1 {
-            let record = log_commit_record_from_oid(&db, format, starts[0])?;
-            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-            emit_compiled_log_format(
-                &record,
-                compiled,
-                &context,
-                &mut line,
-                0..compiled.tokens.len(),
-            )?;
-            let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
-            stdout.write_all(&out)?;
-            if final_newline {
-                stdout.write_all(term)?;
-            }
-            stdout.flush()?;
-            return Ok(());
-        }
         let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
             &git_dir,
             format,
@@ -1418,14 +1380,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             if index > 0 && !final_newline {
                 stdout.write_all(term)?;
             }
-            let record = log_commit_record_from_metadata(&db, format, metadata)?;
             let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-            emit_compiled_log_format(
-                &record,
+            emit_compiled_log_format_limited_commit(
+                &db,
+                metadata,
                 compiled,
                 &context,
                 &mut line,
-                0..compiled.tokens.len(),
             )?;
             let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
             stdout.write_all(&out)?;
@@ -2578,6 +2539,27 @@ enum LogOutput {
         /// (oneline presets only; custom `--format=` ignores `--children`).
         inline_children: bool,
     },
+}
+
+fn log_output_needs_abbrev(
+    output: &LogOutput,
+    abbrev_commit: bool,
+    show_children: bool,
+) -> bool {
+    match output {
+        LogOutput::Default(_) => abbrev_commit,
+        LogOutput::Compiled { compiled, .. } => {
+            show_children
+                || compiled.tokens.iter().any(|token| {
+                    matches!(
+                        token,
+                        FormatToken::OidAbbrev
+                            | FormatToken::TreeAbbrev
+                            | FormatToken::ParentsAbbrev
+                    )
+                })
+        }
+    }
 }
 
 fn log_age_filters_match(

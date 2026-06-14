@@ -8141,6 +8141,78 @@ fn emit_compiled_log_format_metadata(
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    emit_compiled_log_format_metadata_inner(record, compiled, context, out, None)
+}
+
+fn emit_compiled_log_format_metadata_with_message(
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    message: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    emit_compiled_log_format_metadata_inner(record, compiled, context, out, Some(message))
+}
+
+fn emit_compiled_log_format_limited_commit(
+    db: &FileObjectDatabase,
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let object = db.read_object(&record.oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            record.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let (message, encoding) = commit_object_message_and_encoding(&object.body);
+    let utf8_message = log_reencode_message(message, encoding.as_ref(), "UTF-8");
+    emit_compiled_log_format_metadata_with_message(record, compiled, context, &utf8_message, out)
+}
+
+fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'_, str>) {
+    let mut encoding = None;
+    let mut offset = 0usize;
+    while offset < body.len() {
+        let line_end = body[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| offset + idx)
+            .unwrap_or(body.len());
+        let line = &body[offset..line_end];
+        if line.is_empty() {
+            let message_start = line_end.saturating_add(1).min(body.len());
+            return (
+                &body[message_start..],
+                encoding.unwrap_or(std::borrow::Cow::Borrowed("")),
+            );
+        }
+        if let Some(value) = line.strip_prefix(b"encoding ") {
+            encoding = Some(
+                std::str::from_utf8(value)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(value)),
+            );
+        }
+        if line_end == body.len() {
+            break;
+        }
+        offset = line_end + 1;
+    }
+    (&[], encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
+}
+
+fn emit_compiled_log_format_metadata_inner(
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+    message: Option<&[u8]>,
+) -> Result<()> {
     let LogFormatContext {
         abbrev_len,
         marker,
@@ -8169,6 +8241,12 @@ fn emit_compiled_log_format_metadata(
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
             FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::Subject if let Some(message) = message => {
+                out.extend_from_slice(commit_subject_bytes(message));
+            }
+            FormatToken::SanitizedSubject if let Some(message) = message => {
+                write!(out, "{}", log_sanitized_subject(message)).map_err(io::Error::from)?;
+            }
             FormatToken::GRefname => out.push(b'N'),
             FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
             FormatToken::GPlaceholder
@@ -9157,24 +9235,28 @@ fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
 
 fn repository_abbrev(git_dir: &Path, format: ObjectFormat) -> Result<Option<usize>> {
     if let Some(value) = global_config_value("core.abbrev")? {
-        return parse_repository_abbrev_value(format, &value);
+        return parse_repository_abbrev_value(git_dir, format, &value);
     }
     let config_path = git_dir.join("config");
     let Ok(config) = GitConfig::read(config_path) else {
-        return Ok(Some(7));
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };
     let Some(value) = config.get("core", None, "abbrev") else {
-        return Ok(Some(7));
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };
-    parse_repository_abbrev_value(format, value)
+    parse_repository_abbrev_value(git_dir, format, value)
 }
 
-fn parse_repository_abbrev_value(format: ObjectFormat, value: &str) -> Result<Option<usize>> {
+fn parse_repository_abbrev_value(
+    git_dir: &Path,
+    format: ObjectFormat,
+    value: &str,
+) -> Result<Option<usize>> {
     if value.eq_ignore_ascii_case("no") {
         return Ok(None);
     }
     if value.eq_ignore_ascii_case("auto") {
-        return Ok(Some(7));
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     }
     let width = value
         .parse::<usize>()
@@ -9185,6 +9267,91 @@ fn parse_repository_abbrev_value(format: ObjectFormat, value: &str) -> Result<Op
         )));
     }
     Ok(Some(width.min(format.hex_len())))
+}
+
+fn repository_auto_abbrev_width(git_dir: &Path, format: ObjectFormat) -> Result<usize> {
+    let object_count = repository_approx_object_count(git_dir, format)?;
+    if object_count == 0 {
+        return Ok(7.min(format.hex_len()));
+    }
+    let bits = u64::BITS as usize - object_count.saturating_sub(1).leading_zeros() as usize;
+    Ok(((bits + 1) / 2).max(7).min(format.hex_len()))
+}
+
+fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Result<u64> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let mut count = repository_loose_object_count(&objects_dir, format)?;
+    let pack_dir = objects_dir.join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(count);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("idx")) {
+            continue;
+        }
+        count = count.saturating_add(u64::from(pack_index_object_count(&path)?));
+    }
+    Ok(count)
+}
+
+fn repository_loose_object_count(objects_dir: &Path, format: ObjectFormat) -> Result<u64> {
+    let mut count = 0u64;
+    let Ok(entries) = fs::read_dir(objects_dir) else {
+        return Ok(0);
+    };
+    let filename_len = format.hex_len().saturating_sub(2);
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in files {
+            let file = file?;
+            let name = file.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.len() == filename_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn pack_index_object_count(path: &Path) -> Result<u32> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 8 + 256 * 4];
+    file.read_exact(&mut header[..8]).map_err(|_| {
+        GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
+    })?;
+    let fanout_offset = if header[..8].starts_with(&[0xff, b't', b'O', b'c']) {
+        file.read_exact(&mut header[8..]).map_err(|_| {
+            GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
+        })?;
+        8
+    } else {
+        file.read_exact(&mut header[8..256 * 4]).map_err(|_| {
+            GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
+        })?;
+        0
+    };
+    let offset = fanout_offset + 255 * 4;
+    Ok(u32::from_be_bytes([
+        header[offset],
+        header[offset + 1],
+        header[offset + 2],
+        header[offset + 3],
+    ]))
 }
 
 fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {

@@ -1033,9 +1033,19 @@ enum GraphBloomConsult {
 struct CommitGraphContext<'a> {
     git_dir: &'a Path,
     format: sley_core::ObjectFormat,
+    /// Direct parsed monolithic commit-graph for hot metadata walks. This avoids
+    /// materializing every graph entry into a `HashMap` when callers only need a
+    /// handful of commits (for example `log -50`).
+    direct_graph: Option<DirectCommitGraph>,
     /// `None` until the first lookup forces a load; afterwards `Some(map)` where
     /// the map is empty iff no usable graph exists.
     commits: Option<HashMap<ObjectId, GraphCommit>>,
+}
+
+enum DirectCommitGraph {
+    Missing,
+    Invalid,
+    Graph(CommitGraph),
 }
 
 impl<'a> CommitGraphContext<'a> {
@@ -1043,8 +1053,18 @@ impl<'a> CommitGraphContext<'a> {
         Self {
             git_dir,
             format,
+            direct_graph: None,
             commits: None,
         }
+    }
+
+    fn direct_graph(&mut self) -> &DirectCommitGraph {
+        if self.direct_graph.is_none() {
+            self.direct_graph = Some(load_direct_commit_graph(self.git_dir, self.format));
+        }
+        self.direct_graph
+            .as_ref()
+            .expect("direct commit graph load state initialized")
     }
 
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
@@ -1148,6 +1168,37 @@ impl<'a> CommitGraphContext<'a> {
             commit_time: i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
         })
     }
+
+    fn metadata_owned<R: ObjectReader>(
+        &mut self,
+        reader: &R,
+        oid: &ObjectId,
+    ) -> Result<Option<CommitMetadata>> {
+        match self.direct_graph() {
+            DirectCommitGraph::Graph(graph) => {
+                let Some(entry) = graph.find(oid) else {
+                    return Ok(None);
+                };
+                let parents = if reader.is_shallow_graft(oid) {
+                    Vec::new()
+                } else {
+                    graph.parent_oids(entry)?.collect()
+                };
+                return Ok(Some(CommitMetadata {
+                    oid: *oid,
+                    parents,
+                    commit_time: i64::try_from(entry.commit_time).unwrap_or(i64::MAX),
+                }));
+            }
+            DirectCommitGraph::Invalid => return Ok(None),
+            DirectCommitGraph::Missing => {}
+        }
+        Ok(self.metadata(oid).map(|metadata| CommitMetadata {
+            oid: *oid,
+            parents: metadata.parents.grafted_vec(reader, oid),
+            commit_time: metadata.commit_time,
+        }))
+    }
 }
 
 /// Read and parse the commit-graph for `git_dir`, returning an oid-keyed map of
@@ -1182,6 +1233,23 @@ fn load_commit_graph_map(
 
     let chain = info.join("commit-graphs").join("commit-graph-chain");
     load_commit_graph_chain(&info, &chain, format).unwrap_or_default()
+}
+
+fn load_direct_commit_graph(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+) -> DirectCommitGraph {
+    let path = repository_objects_dir(git_dir)
+        .join("info")
+        .join("commit-graph");
+    if !path.exists() {
+        return DirectCommitGraph::Missing;
+    }
+    fs::read(&path)
+        .map_err(|err| GitError::Io(err.to_string()))
+        .and_then(|bytes| CommitGraph::parse(&bytes, format))
+        .map(DirectCommitGraph::Graph)
+        .unwrap_or(DirectCommitGraph::Invalid)
 }
 
 /// Load every layer named in a split-graph chain file and merge them.
@@ -1833,12 +1901,8 @@ fn commit_metadata_lookup<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<CommitMetadata> {
-    if let Some(metadata) = graph.metadata(oid) {
-        return Ok(CommitMetadata {
-            oid: *oid,
-            parents: metadata.parents.grafted_vec(reader, oid),
-            commit_time: metadata.commit_time,
-        });
+    if let Some(metadata) = graph.metadata_owned(reader, oid)? {
+        return Ok(metadata);
     }
     let (parents, commit_time) = commit_metadata_from_object(reader, format, oid)?;
     Ok(CommitMetadata {
