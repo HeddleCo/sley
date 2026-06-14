@@ -64,7 +64,11 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
 
     // Resume sub-operations are mutually exclusive and take no mbox arguments.
+    // `--show-current-patch[=raw|=diff]` is a "command mode" like git's
+    // OPT_CMDMODE: setting two *different* modes is an error, but repeating the
+    // *same* mode is accepted (t4150 "accepts repeated --show-current-patch").
     let mut resume = None;
+    let mut show_patch: Option<ShowPatchMode> = None;
     let mut option_args = Vec::new();
     for arg in args {
         match arg.as_str() {
@@ -77,8 +81,24 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                     other => other,
                 });
             }
+            "--show-current-patch" => set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?,
+            "--show-current-patch=raw" => {
+                set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?
+            }
+            "--show-current-patch=diff" => {
+                set_show_patch_mode(&mut show_patch, ShowPatchMode::Diff)?
+            }
+            value if value.starts_with("--show-current-patch=") => {
+                let arg = &value["--show-current-patch=".len()..];
+                eprintln!("error: invalid value for '--show-current-patch': '{arg}'");
+                return Err(GitError::Exit(129));
+            }
             other => option_args.push(other.to_string()),
         }
+    }
+
+    if let Some(mode) = show_patch {
+        return am_show_current_patch(&state_dir, mode);
     }
 
     if let Some(resume) = resume {
@@ -228,6 +248,70 @@ fn am_usage() {
 fn am_incompatible_resume_error(existing: &str, new: &str) -> Result<()> {
     eprintln!("fatal: options '{existing}' and '{new}' cannot be used together");
     Err(GitError::Exit(128))
+}
+
+/// Which artifact `git am --show-current-patch` dumps to stdout.
+#[derive(Clone, Copy, PartialEq)]
+enum ShowPatchMode {
+    /// `--show-current-patch` (default) / `=raw`: the raw mbox message
+    /// (`.git/rebase-apply/NNNN`).
+    Raw,
+    /// `--show-current-patch=diff`: the extracted diff (`.git/rebase-apply/patch`).
+    Diff,
+}
+
+/// Record a `--show-current-patch` command-mode like git's `OPT_CMDMODE`:
+/// repeating the *same* mode is accepted; selecting a second *different* mode is
+/// an error (matching git's "... is incompatible with ..." command-mode check).
+fn set_show_patch_mode(slot: &mut Option<ShowPatchMode>, mode: ShowPatchMode) -> Result<()> {
+    match slot {
+        Some(existing) if *existing != mode => {
+            eprintln!(
+                "error: --show-current-patch={} is incompatible with --show-current-patch={}",
+                show_patch_arg(mode),
+                show_patch_arg(*existing),
+            );
+            Err(GitError::Exit(129))
+        }
+        _ => {
+            *slot = Some(mode);
+            Ok(())
+        }
+    }
+}
+
+fn show_patch_arg(mode: ShowPatchMode) -> &'static str {
+    match mode {
+        ShowPatchMode::Raw => "raw",
+        ShowPatchMode::Diff => "diff",
+    }
+}
+
+/// Implement `git am --show-current-patch[=raw|=diff]`: dump the current paused
+/// patch to stdout. `raw` prints the raw mbox message for the current patch
+/// number (`.git/rebase-apply/NNNN`); `diff` prints the extracted diff
+/// (`.git/rebase-apply/patch`). With no resolve in progress git fails.
+fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
+    if !state_dir.exists() {
+        eprintln!("fatal: Resolve operation not in progress, we are not resuming.");
+        return Err(GitError::Exit(128));
+    }
+    let path = match mode {
+        ShowPatchMode::Raw => {
+            // The current patch number is recorded in `next` (1-based), stored
+            // as the zero-padded `NNNN` filename git uses (e.g. `0001`). A
+            // missing/garbled `next` falls back to the first patch.
+            let next = read_state_usize(state_dir, "next").unwrap_or(1);
+            state_dir.join(format!("{next:04}"))
+        }
+        ShowPatchMode::Diff => state_dir.join("patch"),
+    };
+    let data = fs::read(&path).map_err(|err| {
+        eprintln!("fatal: failed to read '{}': {err}", path.display());
+        GitError::Exit(128)
+    })?;
+    io::stdout().write_all(&data)?;
+    Ok(())
 }
 
 /// Read every mbox file (or stdin when none are given) into one buffer.
