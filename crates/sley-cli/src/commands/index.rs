@@ -564,18 +564,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         };
         exclude_patterns.extend(contents.split(|byte| *byte == b'\n').map(Vec::from));
     }
-    let mut stdout = io::stdout();
     let terminator = if nul { 0 } else { b'\n' };
-    let pathspec = LsFilesPathspec::new(&cwd, &worktree_root, full_name, &path_args)?;
-    let eol_context = if show_eol {
-        Some(EolContext {
-            worktree_root: worktree_root.clone(),
-            db: FileObjectDatabase::from_git_dir(&git_dir, format),
-        })
-    } else {
-        None
-    };
-    let eol = eol_context.as_ref();
     let selected = cached || others || deleted || modified || unmerged;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
@@ -590,6 +579,45 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         eprintln!("fatal: ls-files --ignored needs some exclude pattern");
         return Err(GitError::Exit(128));
     }
+    if !selected
+        && !output_stage
+        && !show_eol
+        && oid_abbrev.is_none()
+        && !nul
+        && path_args.is_empty()
+        && !full_name
+        && !deduplicate
+        && !error_unmatch
+        && !exclude_standard
+        && exclude_patterns.is_empty()
+        && exclude_from.is_empty()
+        && exclude_per_directory.is_empty()
+        && cwd == worktree_root
+    {
+        let stdout = io::stdout();
+        let mut stdout = io::BufWriter::new(stdout.lock());
+        let index_path = sley_worktree::repository_index_path(&git_dir);
+        match fs::read(index_path) {
+            Ok(index_bytes) => {
+                write_ls_files_index_root_fast(&mut stdout, &index_bytes, format, terminator)?
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+    let mut stdout = io::stdout();
+    let pathspec = LsFilesPathspec::new(&cwd, &worktree_root, full_name, &path_args)?;
+    let eol_context = if show_eol {
+        Some(EolContext {
+            worktree_root: worktree_root.clone(),
+            db: FileObjectDatabase::from_git_dir(&git_dir, format),
+        })
+    } else {
+        None
+    };
+    let eol = eol_context.as_ref();
     if others {
         let untracked = sley_worktree::untracked_paths_with_options(
             &worktree_root,
@@ -728,6 +756,19 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         pathspec.exit_if_unmatched()?;
     }
     Ok(())
+}
+
+fn write_ls_files_index_root_fast(
+    stdout: &mut impl Write,
+    index_bytes: &[u8],
+    format: ObjectFormat,
+    terminator: u8,
+) -> Result<()> {
+    sley_index::Index::for_each_path(index_bytes, format, |path| {
+        write_ls_files_path(stdout, path, terminator)?;
+        stdout.write_all(&[terminator])?;
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -906,11 +947,11 @@ fn write_ls_files_entry(
     Ok(())
 }
 
-fn write_ls_files_path(stdout: &mut io::Stdout, path: &[u8], terminator: u8) -> Result<()> {
+fn write_ls_files_path(stdout: &mut impl Write, path: &[u8], terminator: u8) -> Result<()> {
     if terminator == 0 {
         stdout.write_all(path)?;
     } else {
-        stdout.write_all(status_quote_path(path, false).as_bytes())?;
+        write_status_quoted_path(stdout, path, false)?;
     }
     Ok(())
 }

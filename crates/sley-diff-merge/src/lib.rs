@@ -1277,15 +1277,15 @@ pub fn diff_name_status_head_worktree_with_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(head.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let changes =
-        diff_name_status_maps(&head, &worktree, head.keys().chain(index.keys()), options)?;
+    let changes = diff_name_status_maps_for_path_set(&head, &worktree, &candidate_paths, options)?;
     Ok(mark_unstaged_worktree_oids_unresolved(
         changes, &index, &worktree,
     ))
@@ -1309,24 +1309,25 @@ pub fn diff_name_status_head_worktree_with_rename_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(head.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(
+    let cache = worktree_blob_cache_for_path_set(
         worktree_root,
         &head,
         &worktree,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
         options,
     )?;
-    let changes = diff_name_status_maps_with_renames(
+    let changes = diff_name_status_maps_with_renames_for_path_set(
         &head,
         &worktree,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
         options,
         |oid| cache_or_odb_blob(&cache, &db, oid),
     )?;
@@ -1463,15 +1464,15 @@ pub fn diff_name_status_tree_worktree_with_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(tree.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let changes =
-        diff_name_status_maps(&tree, &worktree, tree.keys().chain(index.keys()), options)?;
+    let changes = diff_name_status_maps_for_path_set(&tree, &worktree, &candidate_paths, options)?;
     Ok(mark_unstaged_worktree_oids_unresolved(
         changes, &index, &worktree,
     ))
@@ -1498,24 +1499,25 @@ pub fn diff_name_status_tree_worktree_with_rename_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(tree.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(
+    let cache = worktree_blob_cache_for_path_set(
         worktree_root,
         &tree,
         &worktree,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
         options,
     )?;
-    let changes = diff_name_status_maps_with_renames(
+    let changes = diff_name_status_maps_with_renames_for_path_set(
         &tree,
         &worktree,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
         options,
         |oid| cache_or_odb_blob(&cache, &db, oid),
     )?;
@@ -1550,14 +1552,14 @@ pub fn diff_name_status_index_worktree_with_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let worktree = worktree_entries_for_unique_paths(
         worktree_root,
         format,
         index.keys(),
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    diff_name_status_maps(&index, &worktree, index.keys(), options)
+    diff_name_status_maps_for_unique_paths(&index, &worktree, index.keys(), options)
 }
 
 /// Index-vs-worktree name-status with full rename/copy options, including inexact
@@ -1577,18 +1579,27 @@ pub fn diff_name_status_index_worktree_with_rename_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let worktree = worktree_entries_for_unique_paths(
         worktree_root,
         format,
         index.keys(),
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache =
-        worktree_blob_cache_for_entries(worktree_root, &index, &worktree, index.keys(), options)?;
-    diff_name_status_maps_with_renames(&index, &worktree, index.keys(), options, |oid| {
-        cache_or_odb_blob(&cache, &db, oid)
-    })
+    let cache = worktree_blob_cache_for_unique_paths(
+        worktree_root,
+        &index,
+        &worktree,
+        index.keys(),
+        options,
+    )?;
+    diff_name_status_maps_with_renames_for_unique_paths(
+        &index,
+        &worktree,
+        index.keys(),
+        options,
+        |oid| cache_or_odb_blob(&cache, &db, oid),
+    )
 }
 
 /// Index-vs-worktree name-status for **`git diff-files`** (plumbing), which
@@ -1855,18 +1866,15 @@ fn read_blob_bytes(db: &FileObjectDatabase, oid: &ObjectId) -> Option<Vec<u8>> {
 
 /// Build the raw per-path add/delete/modify change list (before any rename or
 /// copy detection) from the two entry maps and the candidate path set.
-fn raw_name_status_changes<'a>(
+fn raw_name_status_changes_for_unique_paths<'a>(
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
-    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    paths: impl Iterator<Item = &'a Vec<u8>>,
 ) -> Vec<NameStatusEntry> {
-    let mut paths = BTreeSet::new();
-    paths.extend(candidate_paths.cloned());
-
     let mut changes = Vec::new();
     for path in paths {
-        let left = left_entries.get(&path);
-        let right = right_entries.get(&path);
+        let left = left_entries.get(path);
+        let right = right_entries.get(path);
         let status = match (left, right) {
             (None, Some(_)) => Some(NameStatus::Added),
             (Some(_), None) => Some(NameStatus::Deleted),
@@ -1876,7 +1884,7 @@ fn raw_name_status_changes<'a>(
         if let Some(status) = status {
             changes.push(NameStatusEntry {
                 status,
-                path: path.into(),
+                path: path.clone().into(),
                 old_path: None,
                 old_mode: left.map(|entry| entry.mode),
                 new_mode: right.map(|entry| entry.mode),
@@ -1894,7 +1902,32 @@ fn diff_name_status_maps<'a>(
     candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    let paths = candidate_path_set(candidate_paths);
+    diff_name_status_maps_for_path_set(left_entries, right_entries, &paths, options)
+}
+
+fn diff_name_status_maps_for_path_set(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: &BTreeSet<Vec<u8>>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    diff_name_status_maps_for_unique_paths(
+        left_entries,
+        right_entries,
+        candidate_paths.iter(),
+        options,
+    )
+}
+
+fn diff_name_status_maps_for_unique_paths<'a>(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut changes =
+        raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if options.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, options.rename_empty);
     }
@@ -1925,8 +1958,42 @@ fn diff_name_status_maps_with_renames<'a>(
     options: RenameDetectionOptions,
     fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
 ) -> Result<Vec<NameStatusEntry>> {
+    let paths = candidate_path_set(candidate_paths);
+    diff_name_status_maps_with_renames_for_path_set(
+        left_entries,
+        right_entries,
+        &paths,
+        options,
+        fetch_blob,
+    )
+}
+
+fn diff_name_status_maps_with_renames_for_path_set(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: &BTreeSet<Vec<u8>>,
+    options: RenameDetectionOptions,
+    fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Result<Vec<NameStatusEntry>> {
+    diff_name_status_maps_with_renames_for_unique_paths(
+        left_entries,
+        right_entries,
+        candidate_paths.iter(),
+        options,
+        fetch_blob,
+    )
+}
+
+fn diff_name_status_maps_with_renames_for_unique_paths<'a>(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    options: RenameDetectionOptions,
+    fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Result<Vec<NameStatusEntry>> {
     let base = options.base;
-    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    let mut changes =
+        raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if base.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, base.rename_empty);
     }
@@ -2878,20 +2945,39 @@ fn index_gitlinks(index: &BTreeMap<Vec<u8>, TrackedEntry>) -> BTreeMap<Vec<u8>, 
         .collect()
 }
 
-fn worktree_entries_for_paths<'a>(
+fn candidate_path_set<'a>(candidate_paths: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<Vec<u8>> {
+    candidate_paths.cloned().collect()
+}
+
+fn worktree_entries_for_path_set(
     worktree_root: &Path,
     format: ObjectFormat,
-    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    candidates: &BTreeSet<Vec<u8>>,
+    index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
+    stat_cache: Option<&IndexStatCache>,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    worktree_entries_for_unique_paths(
+        worktree_root,
+        format,
+        candidates.iter(),
+        index_gitlinks,
+        stat_cache,
+    )
+}
+
+fn worktree_entries_for_unique_paths<'a>(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    candidates: impl Iterator<Item = &'a Vec<u8>>,
     index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
-    let candidates: BTreeSet<Vec<u8>> = candidate_paths.cloned().collect();
     for git_path in candidates {
         if let Some(entry) =
             worktree_entry_for_path(worktree_root, format, &git_path, index_gitlinks, stat_cache)?
         {
-            entries.insert(git_path, entry);
+            entries.insert(git_path.clone(), entry);
         }
     }
     Ok(entries)
@@ -2949,7 +3035,23 @@ fn worktree_entry_for_path(
     Ok(Some(TrackedEntry { mode, oid }))
 }
 
-fn worktree_blob_cache_for_entries<'a>(
+fn worktree_blob_cache_for_path_set(
+    worktree_root: &Path,
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: &BTreeSet<Vec<u8>>,
+    options: RenameDetectionOptions,
+) -> Result<HashMap<ObjectId, Vec<u8>>> {
+    worktree_blob_cache_for_unique_paths(
+        worktree_root,
+        left_entries,
+        right_entries,
+        candidate_paths.iter(),
+        options,
+    )
+}
+
+fn worktree_blob_cache_for_unique_paths<'a>(
     worktree_root: &Path,
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
@@ -2960,7 +3062,8 @@ fn worktree_blob_cache_for_entries<'a>(
         return Ok(HashMap::new());
     }
     let base = options.base;
-    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    let mut changes =
+        raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if base.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, base.rename_empty);
     }
