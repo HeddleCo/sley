@@ -2392,19 +2392,31 @@ fn write_diff_patch_entry(
         }
         None => None,
     };
-    let hunk_options = commands::format_patch::PatchHunkOptions {
+    // Pilot consumer of the shared renderer: build the engine's hunk-render
+    // options directly (funcname classifier closure, color palette borrow,
+    // word-diff hook) and emit the hunk body via
+    // `sley_diff_merge::render::render_hunks`. The per-file metainfo header
+    // above stays here (it is repository/option-shaped); the engine owns the
+    // `@@`-header/`+`/`-`/no-newline byte-shaping.
+    let mut heading = commands::format_patch::heading_classifier(funcname);
+    let mut word_diff_adapter = word_diff
+        .as_ref()
+        .map(commands::format_patch::WordDiffAdapter::new);
+    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
-        funcname,
-        colors,
-        word_diff: word_diff.as_ref(),
+        heading: Some(&mut heading),
+        colors: colors.map(commands::format_patch::render_colors),
+        word_diff: word_diff_adapter
+            .as_mut()
+            .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         ..Default::default()
     };
     let mut hunks = Vec::new();
-    commands::format_patch::write_patch_hunks_with(
+    sley_diff_merge::render::render_hunks(
         &mut hunks,
         old_content.as_deref(),
         new_content.as_deref(),
-        &hunk_options,
+        &mut render_options,
     );
     stdout.write_all(&hunks)?;
     Ok(())

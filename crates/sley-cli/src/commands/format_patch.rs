@@ -835,24 +835,12 @@ fn write_patch_similarity_headers(
 /// Number of unchanged lines of context git keeps around each change in a hunk.
 const HUNK_CONTEXT: usize = 3;
 
-/// The per-line origin marker for an emitted diff line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LineKind {
-    Context,
-    Delete,
-    Insert,
-}
-
-/// One line of the unified diff, with its origin and 0-based positions in the
-/// old/new files (used to compute hunk ranges).
-struct TaggedLine<'a> {
-    kind: LineKind,
-    content: &'a [u8],
-    old_index: usize,
-    new_index: usize,
-}
-
 /// Options for [`write_patch_hunks_with`]: hunk shaping and heading lookup.
+///
+/// This is the sley-cli-side option bundle; it carries the repository-coupled
+/// concerns (userdiff funcname driver, sley-cli `DiffColors`, word-diff
+/// config) and is translated into the engine's
+/// [`sley_diff_merge::render::HunkRenderOptions`] by [`write_patch_hunks_with`].
 pub(crate) struct PatchHunkOptions<'a> {
     /// Lines of context around each change (`-U<n>`, default 3).
     pub(crate) context: usize,
@@ -879,6 +867,69 @@ impl Default for PatchHunkOptions<'_> {
     }
 }
 
+/// Map a sley-cli [`DiffColors`](commands::diff_words::DiffColors) palette into
+/// the engine's [`RenderColors`](sley_diff_merge::render::RenderColors) borrow.
+pub(crate) fn render_colors(
+    colors: &commands::diff_words::DiffColors,
+) -> sley_diff_merge::render::RenderColors<'_> {
+    sley_diff_merge::render::RenderColors {
+        frag: &colors.frag,
+        func: &colors.func,
+        old: &colors.old,
+        new: &colors.new,
+        context: &colors.context,
+        reset: &colors.reset,
+    }
+}
+
+/// Bridge a sley-cli word-diff config + its line buffers into the engine's
+/// [`HunkWordDiff`](sley_diff_merge::render::HunkWordDiff) hook. The engine
+/// owns hunk shaping; this adapter owns the word-level rendering.
+pub(crate) struct WordDiffAdapter<'a> {
+    config: &'a commands::diff_words::WordDiffConfig<'a>,
+    buffers: commands::diff_words::WordDiffBuffers,
+}
+
+impl<'a> WordDiffAdapter<'a> {
+    pub(crate) fn new(config: &'a commands::diff_words::WordDiffConfig<'a>) -> Self {
+        Self {
+            config,
+            buffers: commands::diff_words::WordDiffBuffers::new(),
+        }
+    }
+}
+
+impl sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
+    fn push_minus(&mut self, content: &[u8]) {
+        self.buffers.push_minus(content);
+    }
+
+    fn push_plus(&mut self, content: &[u8]) {
+        self.buffers.push_plus(content);
+    }
+
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        self.buffers.flush(out, self.config);
+    }
+
+    fn emit_context_line(&mut self, out: &mut Vec<u8>, content: &[u8]) {
+        commands::diff_words::WordDiffBuffers::emit_context_line(out, self.config, content);
+    }
+}
+
+/// A per-line section-heading classifier matching git's funcname resolution:
+/// a userdiff `xfuncname` pattern when a driver is present, else the default
+/// `def_ff` heuristic. Returned as a closure for the engine's
+/// [`HeadingFn`](sley_diff_merge::render::HeadingFn) seam.
+pub(crate) fn heading_classifier<'a>(
+    funcname: Option<&'a commands::userdiff::CompiledFuncname>,
+) -> impl FnMut(&[u8]) -> Option<Vec<u8>> + 'a {
+    move |line: &[u8]| match funcname {
+        Some(funcname) => funcname.match_line(line),
+        None => commands::userdiff::default_funcname_heading(line),
+    }
+}
+
 /// Emit the unified-diff hunks for a single file change into `out`, grouping
 /// changes with [`HUNK_CONTEXT`] lines of surrounding context (merging nearby
 /// groups), and prefixing each `@@` header with git's default section heading.
@@ -891,301 +942,29 @@ pub(crate) fn write_patch_hunks(
 }
 
 /// [`write_patch_hunks`] with explicit hunk shaping options.
+///
+/// Thin adapter over the shared renderer
+/// [`sley_diff_merge::render::render_hunks`]: it translates the sley-cli
+/// option bundle (userdiff funcname, `DiffColors`, word-diff config) into the
+/// engine's seams and delegates all hunk byte-shaping to the engine.
 pub(crate) fn write_patch_hunks_with(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
     options: &PatchHunkOptions<'_>,
 ) {
-    let old = sley_diff_merge::split_lines(old_content.unwrap_or_default());
-    let new = sley_diff_merge::split_lines(new_content.unwrap_or_default());
-    let ops = sley_diff_merge::myers_diff_lines(&old, &new);
-
-    // Flatten the edit script into a tagged line stream carrying old/new
-    // positions.
-    let mut tagged: Vec<TaggedLine<'_>> = Vec::new();
-    let mut old_idx = 0usize;
-    let mut new_idx = 0usize;
-    for op in ops {
-        match op {
-            sley_diff_merge::DiffOp::Equal(n) => {
-                for _ in 0..n {
-                    tagged.push(TaggedLine {
-                        kind: LineKind::Context,
-                        content: old[old_idx].content,
-                        old_index: old_idx,
-                        new_index: new_idx,
-                    });
-                    old_idx += 1;
-                    new_idx += 1;
-                }
-            }
-            sley_diff_merge::DiffOp::Delete(n) => {
-                for _ in 0..n {
-                    tagged.push(TaggedLine {
-                        kind: LineKind::Delete,
-                        content: old[old_idx].content,
-                        old_index: old_idx,
-                        new_index: new_idx,
-                    });
-                    old_idx += 1;
-                }
-            }
-            sley_diff_merge::DiffOp::Insert(n) => {
-                for _ in 0..n {
-                    tagged.push(TaggedLine {
-                        kind: LineKind::Insert,
-                        content: new[new_idx].content,
-                        old_index: old_idx,
-                        new_index: new_idx,
-                    });
-                    new_idx += 1;
-                }
-            }
-        }
-    }
-
-    // Indices of changed (non-context) lines.
-    let change_positions: Vec<usize> = tagged
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.kind != LineKind::Context)
-        .map(|(idx, _)| idx)
-        .collect();
-    if change_positions.is_empty() {
-        return;
-    }
-
-    // Group changes whose context windows overlap into single hunks.
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    let mut group_start = change_positions[0];
-    let mut group_end = change_positions[0];
-    for &pos in &change_positions[1..] {
-        // Two change runs merge when at most 2*context (+ interhunk) equal
-        // lines separate them, mirroring xdl_get_hunk's `distance >
-        // max_common` break (the position gap counts the separating equal
-        // lines plus one, so adjacent delete/insert runs always merge).
-        if pos - group_end <= 2 * options.context + options.interhunk + 1 {
-            group_end = pos;
-        } else {
-            groups.push((group_start, group_end));
-            group_start = pos;
-            group_end = pos;
-        }
-    }
-    groups.push((group_start, group_end));
-
-    for (first_change, last_change) in groups {
-        let hunk_start = first_change.saturating_sub(options.context);
-        let hunk_end = (last_change + options.context + 1).min(tagged.len());
-        write_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
-    }
-}
-
-/// Emit a single hunk covering `tagged[start..end]`: the `@@ -os,oc +ns,nc @@
-/// <heading>` header followed by the context/`-`/`+` lines, including the
-/// `\ No newline at end of file` markers.
-fn write_one_hunk(
-    out: &mut Vec<u8>,
-    tagged: &[TaggedLine<'_>],
-    old_lines: &[sley_diff_merge::DiffLine<'_>],
-    start: usize,
-    end: usize,
-    options: &PatchHunkOptions<'_>,
-) {
-    let slice = &tagged[start..end];
-    let mut old_count = 0usize;
-    let mut new_count = 0usize;
-    for line in slice {
-        match line.kind {
-            LineKind::Context => {
-                old_count += 1;
-                new_count += 1;
-            }
-            LineKind::Delete => old_count += 1,
-            LineKind::Insert => new_count += 1,
-        }
-    }
-    // 1-based starting line numbers; an empty side starts at 0.
-    let old_start = if old_count == 0 {
-        slice.first().map(|line| line.old_index).unwrap_or(0)
-    } else {
-        slice
-            .iter()
-            .find(|line| line.kind != LineKind::Insert)
-            .map(|line| line.old_index + 1)
-            .unwrap_or(1)
+    let mut heading = heading_classifier(options.funcname);
+    let mut word_diff = options.word_diff.map(WordDiffAdapter::new);
+    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
+        context: options.context,
+        interhunk: options.interhunk,
+        heading: Some(&mut heading),
+        colors: options.colors.map(render_colors),
+        word_diff: word_diff
+            .as_mut()
+            .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
     };
-    let new_start = if new_count == 0 {
-        slice.first().map(|line| line.new_index).unwrap_or(0)
-    } else {
-        slice
-            .iter()
-            .find(|line| line.kind != LineKind::Delete)
-            .map(|line| line.new_index + 1)
-            .unwrap_or(1)
-    };
-
-    let heading = hunk_section_heading(
-        old_lines,
-        slice.first().map(|line| line.old_index),
-        options.funcname,
-    );
-    let frag = format!(
-        "@@ -{} +{} @@",
-        format_hunk_range(old_start, old_count),
-        format_hunk_range(new_start, new_count)
-    );
-    match options.colors {
-        // Port of emit_hunk_header: the "@@ .. @@" span in the frag color,
-        // the separating blank in the context color, the heading in the func
-        // color (each reset-terminated).
-        Some(colors) => {
-            out.extend_from_slice(colors.frag.as_bytes());
-            out.extend_from_slice(frag.as_bytes());
-            out.extend_from_slice(colors.reset.as_bytes());
-            if let Some(heading) = &heading {
-                out.extend_from_slice(colors.context.as_bytes());
-                out.push(b' ');
-                out.extend_from_slice(colors.reset.as_bytes());
-                out.extend_from_slice(colors.func.as_bytes());
-                out.extend_from_slice(heading);
-                out.extend_from_slice(colors.reset.as_bytes());
-            }
-            out.push(b'\n');
-        }
-        None => {
-            out.extend_from_slice(frag.as_bytes());
-            if let Some(heading) = &heading {
-                out.push(b' ');
-                out.extend_from_slice(heading);
-            }
-            out.push(b'\n');
-        }
-    }
-
-    if let Some(word_diff) = options.word_diff {
-        // Word-diff rendering: minus/plus runs accumulate and flush at
-        // context lines (fn_out_consume's diff_words branch); the
-        // "\ No newline" markers are eaten.
-        let mut buffers = commands::diff_words::WordDiffBuffers::new();
-        for line in slice {
-            match line.kind {
-                LineKind::Delete => buffers.push_minus(line.content),
-                LineKind::Insert => buffers.push_plus(line.content),
-                LineKind::Context => {
-                    buffers.flush(out, word_diff);
-                    commands::diff_words::WordDiffBuffers::emit_context_line(
-                        out,
-                        word_diff,
-                        line.content,
-                    );
-                }
-            }
-        }
-        buffers.flush(out, word_diff);
-        return;
-    }
-
-    for line in slice {
-        let prefix = match line.kind {
-            LineKind::Context => b' ',
-            LineKind::Delete => b'-',
-            LineKind::Insert => b'+',
-        };
-        match options.colors {
-            Some(colors) => write_patch_line_colored(out, prefix, line.content, colors),
-            None => write_patch_line(out, prefix, line.content),
-        }
-    }
-}
-
-/// Format one `start,count` side of an `@@` header. git omits the count when it
-/// is exactly 1 (e.g. `+5` rather than `+5,1`).
-fn format_hunk_range(start: usize, count: usize) -> String {
-    if count == 1 {
-        start.to_string()
-    } else {
-        format!("{start},{count}")
-    }
-}
-
-/// git's section heading for a hunk: the nearest line *before* the hunk's
-/// first line accepted by the path's funcname patterns (or, without a driver,
-/// the default `def_ff` heuristic: first byte is an ASCII letter, `_`, or
-/// `$`). Headings are capped at the 80-byte upstream header buffer with
-/// trailing whitespace trimmed. Returns `None` when no such line precedes the
-/// hunk.
-fn hunk_section_heading(
-    old_lines: &[sley_diff_merge::DiffLine<'_>],
-    first_old_index: Option<usize>,
-    funcname: Option<&commands::userdiff::CompiledFuncname>,
-) -> Option<Vec<u8>> {
-    let first = first_old_index?;
-    // Scan upward from the line just above the hunk.
-    for idx in (0..first).rev() {
-        let heading = match funcname {
-            Some(funcname) => funcname.match_line(old_lines[idx].content),
-            None => commands::userdiff::default_funcname_heading(old_lines[idx].content),
-        };
-        if heading.is_some() {
-            return heading;
-        }
-    }
-    None
-}
-
-/// Write a single diff line with its `prefix` marker, appending the
-/// `\ No newline at end of file` note when the source line lacks a trailing LF.
-fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
-    out.push(prefix);
-    out.extend_from_slice(line);
-    if !line.ends_with(b"\n") {
-        out.extend_from_slice(b"\n\\ No newline at end of file\n");
-    }
-}
-
-/// [`write_patch_line`] in color. Context/old lines paint the sign and body
-/// in one span; new lines paint the sign and body as separate spans, matching
-/// the default `ws-error-highlight=new` path through `emit_line_ws_markup`
-/// (whitespace-error painting itself is not implemented).
-fn write_patch_line_colored(
-    out: &mut Vec<u8>,
-    prefix: u8,
-    line: &[u8],
-    colors: &commands::diff_words::DiffColors,
-) {
-    let (body, terminated) = match line.split_last() {
-        Some((b'\n', body)) => (body, true),
-        _ => (line, false),
-    };
-    let color = match prefix {
-        b'-' => &colors.old,
-        b'+' => &colors.new,
-        _ => &colors.context,
-    };
-    if prefix == b'+' {
-        out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
-        out.extend_from_slice(colors.reset.as_bytes());
-        if !body.is_empty() {
-            out.extend_from_slice(color.as_bytes());
-            out.extend_from_slice(body);
-            out.extend_from_slice(colors.reset.as_bytes());
-        }
-    } else {
-        out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
-        out.extend_from_slice(body);
-        out.extend_from_slice(colors.reset.as_bytes());
-    }
-    out.push(b'\n');
-    if !terminated {
-        out.extend_from_slice(colors.context.as_bytes());
-        out.extend_from_slice(b"\\ No newline at end of file");
-        out.extend_from_slice(colors.reset.as_bytes());
-        out.push(b'\n');
-    }
+    sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);
 }
 
 /// The diffstat block (`--stat`) written into `out`, via the shared
