@@ -24,6 +24,41 @@
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 
+/// The `--rfc[=<token>]` / `--no-rfc` state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RfcMode {
+    /// No `--rfc` seen — leave the subject prefix untouched.
+    Unset,
+    /// `--no-rfc` or `--rfc=` — explicitly clear any earlier `--rfc`.
+    Clear,
+    /// `--rfc` (default `RFC`) or `--rfc=<token>`.
+    Token(String),
+}
+
+/// The `--from[=<ident>]` / `--no-from` state, before `format.from` is folded in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FromMode {
+    /// No `--from`/`--no-from` — defer to `format.from`.
+    Unset,
+    /// `--no-from` — never rewrite From: (overrides `format.from`).
+    Clear,
+    /// Bare `--from` — use the runtime committer identity.
+    Committer,
+    /// `--from=<ident>`.
+    Ident(String),
+}
+
+/// The `--signature` / `--no-signature` state, before config is folded in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignatureMode {
+    /// No `--signature`/`--no-signature` — use config or the git version.
+    Default,
+    /// `--signature=<text>` (empty text suppresses the block).
+    Text(String),
+    /// `--no-signature` — suppress the signature block entirely.
+    Suppress,
+}
+
 /// How the `[PATCH ...]` subject prefix is numbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumberMode {
@@ -59,13 +94,54 @@ struct FormatPatchOptions {
     stat_widths: DiffStatWidths,
     /// `--stat=,,<count>` / `--stat-count=<count>` display truncation.
     stat_count: Option<usize>,
-    /// Custom subject prefix replacing `PATCH` (`--subject-prefix=<p>`).
-    subject_prefix: String,
-    /// String inserted just before the prefix, e.g. `RFC ` (`--rfc`).
-    reroll_prefix: Option<String>,
+    /// Custom subject prefix replacing `PATCH` (`--subject-prefix=<p>`), if the
+    /// user gave one explicitly on the command line (overrides
+    /// `format.subjectPrefix`). `None` means "use the configured/default value".
+    subject_prefix: Option<String>,
+    /// `--rfc[=<token>]` / `--no-rfc`: the rfc token to weave into the prefix.
+    /// `RfcMode::Unset` is the default (no `--rfc`); `Clear` is `--no-rfc` or
+    /// `--rfc=`; `Token(t)` is `--rfc=t` (a leading `-` appends `t[1..]` after
+    /// the prefix instead of inserting `t ` before it).
+    rfc: RfcMode,
+    /// `-v<n>`/`--reroll-count=<n>`: appends ` v<n>` to the subject prefix and
+    /// is woven into cover-letter/output naming (only the prefix part is wired).
+    reroll_count: Option<String>,
     /// `-k`/`--keep-subject`: emit the commit subject verbatim with no
     /// `[PATCH ...]` prefix.
     keep_subject: bool,
+    /// `--to=<addr>` recipients given on the command line (appended after any
+    /// `format.to` config). `--no-to` clears both the config and these.
+    cli_to: Vec<String>,
+    /// `--cc=<addr>` recipients given on the command line.
+    cli_cc: Vec<String>,
+    /// `--add-header=<hdr>` extra headers given on the command line. A value
+    /// beginning `To: `/`Cc: ` is routed to `cli_to`/`cli_cc` instead.
+    cli_headers: Vec<String>,
+    /// `--no-to` / `--no-cc`: drop all configured + command-line recipients of
+    /// that kind (a later `--to`/`--cc` re-adds command-line ones).
+    no_to: bool,
+    no_cc: bool,
+    /// `--no-add-header`: drop all configured + command-line extra headers,
+    /// `To:` and `Cc:` recipients (git's `header_callback` unset clears all three).
+    no_add_header: bool,
+    /// `--from[=<ident>]` / `--no-from`: rewrite the `From:` header to this
+    /// identity and add an in-body `From:` for the real author. `FromMode::Unset`
+    /// defers to `format.from`; `Clear` is `--no-from`; `Committer` is bare
+    /// `--from`; `Ident(s)` is `--from=<s>`.
+    from: FromMode,
+    /// `--force-in-body-from` / `--no-force-in-body-from`: keep the in-body
+    /// `From:` even when it matches the header `From:`. `None` defers to
+    /// `format.forceInBodyFrom`.
+    force_in_body_from: Option<bool>,
+    /// `--signature=<s>` / `--no-signature` / `--signature=""`: override the
+    /// trailing `-- \n<version>` signature. `SignatureMode::Default` uses the
+    /// git version; `Text(s)` uses `s` (empty `s` suppresses the block);
+    /// `Suppress` is `--no-signature`.
+    signature: SignatureMode,
+    /// `--signature-file=<path>`: read the signature body from a file.
+    signature_file: Option<String>,
+    /// `--zero-commit`: use the all-zero oid in the mbox `From <oid>` line.
+    zero_commit: bool,
     /// `-<n>`: limit to the last n commits of the default tip.
     count: Option<usize>,
     /// `--numbered-files`: name output files `1`, `2`, ... with no slug.
@@ -104,9 +180,21 @@ impl Default for FormatPatchOptions {
             stat: true,
             stat_widths: DiffStatWidths::plumbing(),
             stat_count: None,
-            subject_prefix: "PATCH".to_string(),
-            reroll_prefix: None,
+            subject_prefix: None,
+            rfc: RfcMode::Unset,
+            reroll_count: None,
             keep_subject: false,
+            cli_to: Vec::new(),
+            cli_cc: Vec::new(),
+            cli_headers: Vec::new(),
+            no_to: false,
+            no_cc: false,
+            no_add_header: false,
+            from: FromMode::Unset,
+            force_in_body_from: None,
+            signature: SignatureMode::Default,
+            signature_file: None,
+            zero_commit: false,
             count: None,
             numbered_files: false,
             full_index: false,
@@ -121,6 +209,36 @@ impl Default for FormatPatchOptions {
     }
 }
 
+/// An author/committer identity split into display name and email, used for the
+/// `--from` rewrite and the redundant-in-body-from check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FromIdent {
+    name: String,
+    email: String,
+}
+
+/// Everything derived once from the options + repo config that every patch in
+/// the run shares: the assembled `[PATCH ...]` prefix string, the extra-header
+/// block (custom headers / `To:` / `Cc:`), the `--from` rewrite identity, and
+/// the resolved signature trailer text.
+struct ResolvedFormat {
+    /// The bracket-prefix label body (between `[` and the ` n/m]`), e.g.
+    /// `RFC PATCH` or `PATCH (WIP)` or an empty string for `--subject-prefix=`.
+    prefix_body: String,
+    /// The pre-rendered extra-header block (each line newline-terminated),
+    /// emitted right after the `Subject:` header. Empty when no headers apply.
+    header_block: Vec<u8>,
+    /// `--from`/`format.from` rewrite identity, if active.
+    from_ident: Option<FromIdent>,
+    /// Keep the in-body `From:` even when it is redundant (`--force-in-body-from`).
+    force_in_body_from: bool,
+    /// The resolved signature body, or `None` to suppress the `-- \n...` block.
+    /// An empty trailer (e.g. `--signature=""`) also resolves to `None`.
+    signature: Option<Vec<u8>>,
+    /// Use the all-zero oid in the mbox `From <oid>` separator (`--zero-commit`).
+    zero_commit: bool,
+}
+
 pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let options = parse_format_patch_args(args)?;
 
@@ -130,6 +248,8 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
+
+    let resolved = resolve_format(&options, config)?;
 
     let selection = select_commits(&repo, &options)?;
     let commits = selection.commits;
@@ -175,6 +295,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 db,
                 format,
                 options: &options,
+                resolved: &resolved,
                 record,
                 diff_pathspec: diff_pathspec.as_ref(),
                 seq: start_number + idx,
@@ -199,6 +320,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             db,
             format,
             options: &options,
+            resolved: &resolved,
             record,
             diff_pathspec: diff_pathspec.as_ref(),
             seq,
@@ -223,12 +345,286 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Fold the parsed options together with repository config into the run-wide
+/// [`ResolvedFormat`]: the subject prefix, the To/Cc/extra-header block, the
+/// `--from` rewrite identity, and the signature trailer text. This mirrors
+/// git's `cmd_format_patch` set-up phase (builtin/log.c), which assembles these
+/// once before walking the commits.
+fn resolve_format(options: &FormatPatchOptions, config: &GitConfig) -> Result<ResolvedFormat> {
+    let prefix_body = resolve_prefix_body(options, config);
+    let header_block = resolve_header_block(options, config);
+    let from_ident = resolve_from_ident(options, config)?;
+    let force_in_body_from = options
+        .force_in_body_from
+        .or_else(|| config.get_bool("format", None, "forceInBodyFrom"))
+        .unwrap_or(false);
+    let signature = resolve_signature(options, config)?;
+    Ok(ResolvedFormat {
+        prefix_body,
+        header_block,
+        from_ident,
+        force_in_body_from,
+        signature,
+        zero_commit: options.zero_commit,
+    })
+}
+
+/// Assemble the bracket-prefix body, mirroring git's `cmd_format_patch`:
+/// the base prefix comes from `--subject-prefix`, else `format.subjectPrefix`,
+/// else `PATCH`; `--rfc[=token]` weaves an rfc marker in (a leading `-` appends
+/// `token[1..]` after the prefix, otherwise `token ` is inserted before it);
+/// `-v<n>` appends ` v<n>`.
+fn resolve_prefix_body(options: &FormatPatchOptions, config: &GitConfig) -> String {
+    let mut body = options
+        .subject_prefix
+        .clone()
+        .or_else(|| {
+            config
+                .get("format", None, "subjectPrefix")
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "PATCH".to_string());
+
+    match &options.rfc {
+        RfcMode::Unset | RfcMode::Clear => {}
+        RfcMode::Token(token) if !token.is_empty() => {
+            if let Some(suffix) = token.strip_prefix('-') {
+                body = format!("{body} {suffix}");
+            } else {
+                body = format!("{token} {body}");
+            }
+        }
+        RfcMode::Token(_) => {}
+    }
+
+    if let Some(reroll) = &options.reroll_count {
+        body = format!("{body} v{reroll}");
+    }
+    body
+}
+
+/// Build the To/Cc/extra-header block (each line newline-terminated) that is
+/// emitted right after the `Subject:` header. Mirrors builtin/log.c's assembly
+/// order: custom headers first, then a folded `To:` block, then a folded `Cc:`
+/// block. `--no-add-header` drops everything; `--no-to`/`--no-cc` drop only the
+/// configured recipients of that kind (a later `--to`/`--cc` re-adds the
+/// command-line ones).
+fn resolve_header_block(options: &FormatPatchOptions, config: &GitConfig) -> Vec<u8> {
+    let mut headers: Vec<String> = Vec::new();
+    let mut to: Vec<String> = Vec::new();
+    let mut cc: Vec<String> = Vec::new();
+
+    if !options.no_add_header {
+        // format.headers entries route through add_header (To:/Cc: prefixes go
+        // to the recipient lists; everything else is a raw header line).
+        for value in config.get_all("format", None, "headers") {
+            if let Some(value) = value {
+                route_config_header(value, &mut headers, &mut to, &mut cc);
+            }
+        }
+    }
+    if !options.no_to {
+        for value in config.get_all("format", None, "to") {
+            if let Some(value) = value {
+                to.push(value.to_string());
+            }
+        }
+    }
+    if !options.no_cc {
+        for value in config.get_all("format", None, "cc") {
+            if let Some(value) = value {
+                cc.push(value.to_string());
+            }
+        }
+    }
+    // Command-line --add-header / --to / --cc always apply (they come after the
+    // --no-* clears in git's option order for the tests we model).
+    headers.extend(options.cli_headers.iter().cloned());
+    to.extend(options.cli_to.iter().cloned());
+    cc.extend(options.cli_cc.iter().cloned());
+
+    let mut out = Vec::new();
+    for header in &headers {
+        out.extend_from_slice(header.as_bytes());
+        out.push(b'\n');
+    }
+    write_recipient_block(&mut out, "To: ", &to);
+    write_recipient_block(&mut out, "Cc: ", &cc);
+    out
+}
+
+/// Route a `format.headers` value: a `To: `/`Cc: ` prefix (case-insensitive)
+/// strips the prefix and feeds the recipient lists; everything else is a raw
+/// extra-header line. Mirrors builtin/log.c's `add_header`.
+fn route_config_header(
+    value: &str,
+    headers: &mut Vec<String>,
+    to: &mut Vec<String>,
+    cc: &mut Vec<String>,
+) {
+    let trimmed = value.trim_end_matches('\n');
+    if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("to: ") {
+        to.push(trimmed[4..].to_string());
+    } else if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("cc: ") {
+        cc.push(trimmed[4..].to_string());
+    } else {
+        headers.push(trimmed.to_string());
+    }
+}
+
+/// Emit a folded `To: `/`Cc: ` recipient block: the first recipient on the
+/// header line, each subsequent one on a continuation line indented by four
+/// spaces, with a trailing comma after every recipient except the last.
+fn write_recipient_block(out: &mut Vec<u8>, label: &str, recipients: &[String]) {
+    if recipients.is_empty() {
+        return;
+    }
+    out.extend_from_slice(label.as_bytes());
+    for (idx, recipient) in recipients.iter().enumerate() {
+        if idx > 0 {
+            out.extend_from_slice(b"    ");
+        }
+        out.extend_from_slice(recipient.as_bytes());
+        if idx + 1 < recipients.len() {
+            out.push(b',');
+        }
+        out.push(b'\n');
+    }
+}
+
+/// Resolve the `--from`/`format.from` rewrite identity. `--from`/`--no-from`
+/// override `format.from`; a bare `--from` (or `format.from=true`) uses the
+/// runtime committer identity; an explicit ident string is parsed into a
+/// name/email. A malformed ident is a fatal error (matching
+/// `--from=ident notices bogus ident`).
+fn resolve_from_ident(
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> Result<Option<FromIdent>> {
+    let ident_str: Option<String> = match &options.from {
+        FromMode::Clear => return Ok(None),
+        FromMode::Committer => Some(committer_ident_string(config)?),
+        FromMode::Ident(value) => Some(value.clone()),
+        FromMode::Unset => match config.get_entry("format", None, "from") {
+            // `format.from` unset: no rewrite.
+            None => None,
+            // Bare `format.from` (no value) is boolean-true → committer.
+            Some(None) => Some(committer_ident_string(config)?),
+            Some(Some(value)) => match git_config_bool_str(value) {
+                Some(true) => Some(committer_ident_string(config)?),
+                Some(false) => None,
+                // A non-boolean value is taken as a literal From: address.
+                None => Some(value.to_string()),
+            },
+        },
+    };
+    match ident_str {
+        Some(value) => Ok(Some(parse_from_ident(&value)?)),
+        None => Ok(None),
+    }
+}
+
+/// Format the runtime committer identity as a `Name <email>` string.
+fn committer_ident_string(config: &GitConfig) -> Result<String> {
+    let name = env::var("GIT_COMMITTER_NAME")
+        .ok()
+        .or_else(|| config.get("user", None, "name").map(str::to_string))
+        .unwrap_or_else(|| "Git Rs".to_string());
+    let email = env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .or_else(|| config.get("user", None, "email").map(str::to_string))
+        .unwrap_or_else(|| "sley@example.invalid".to_string());
+    Ok(format!("{name} <{email}>"))
+}
+
+/// Parse a `Name <email>` ident into name + email parts, erroring on a missing
+/// `<...>` mail section (git's `split_ident_line` failure → "invalid ident").
+fn parse_from_ident(value: &str) -> Result<FromIdent> {
+    let open = value
+        .find('<')
+        .ok_or_else(|| GitError::Command(format!("invalid ident line: {value}")))?;
+    let close = value[open..]
+        .find('>')
+        .map(|rel| open + rel)
+        .ok_or_else(|| GitError::Command(format!("invalid ident line: {value}")))?;
+    let email = value[open + 1..close].to_string();
+    let name = value[..open].trim().to_string();
+    Ok(FromIdent { name, email })
+}
+
+/// Apply git's `git_config_bool` keyword rules to a string value, returning
+/// `None` when it is neither a recognised boolean keyword nor empty.
+fn git_config_bool_str(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" | "" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve the trailing signature body. Precedence mirrors git: an explicit
+/// `--no-signature` suppresses; `--signature=<text>` overrides config (empty
+/// text suppresses); `--signature-file=<path>` / `format.signaturefile` reads a
+/// file; `format.signature` config sets text (empty suppresses); otherwise the
+/// default is the git version string. Returns `None` to drop the block.
+fn resolve_signature(
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> Result<Option<Vec<u8>>> {
+    // Command-line --signature / --no-signature win over everything.
+    match &options.signature {
+        SignatureMode::Suppress => return Ok(None),
+        SignatureMode::Text(text) => {
+            return Ok((!text.is_empty()).then(|| text.clone().into_bytes()));
+        }
+        SignatureMode::Default => {}
+    }
+    // --signature-file overrides format.signaturefile; both read a file whose
+    // bytes become the signature (git appends a trailing newline, so an extra
+    // blank line follows the file content).
+    let file = options
+        .signature_file
+        .clone()
+        .or_else(|| {
+            config
+                .get("format", None, "signaturefile")
+                .map(str::to_string)
+        });
+    if let Some(path) = file {
+        let mut bytes = fs::read(&path).map_err(|err| {
+            GitError::Command(format!("could not read signature file {path}: {err}"))
+        })?;
+        // git emits `-- \n` + the file content verbatim + a single `\n`; the
+        // renderer's framing already appends `\n\n` after the signature, so the
+        // signature body is the file content with exactly one trailing newline
+        // removed (yielding file + `\n` once the framing's first `\n` lands).
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        return Ok(Some(bytes));
+    }
+    // format.signature config (empty value suppresses).
+    if let Some(Some(value)) = config.get_entry("format", None, "signature") {
+        return Ok((!value.is_empty()).then(|| value.as_bytes().to_vec()));
+    }
+    if let Some(None) = config.get_entry("format", None, "signature") {
+        // A bare `format.signature` with no value is the empty string → suppress.
+        return Ok(None);
+    }
+    // Default: the git version string.
+    Ok(Some(
+        sley_core::UPSTREAM_GIT_COMPAT_VERSION.as_bytes().to_vec(),
+    ))
+}
+
 /// Bundle of everything a single patch needs to render, to keep the helper from
 /// taking a dozen positional arguments.
 struct RenderContext<'a> {
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     options: &'a FormatPatchOptions,
+    /// Run-wide resolved formatting (prefix, headers, from, signature).
+    resolved: &'a ResolvedFormat,
     record: &'a sley_rev::CommitRecord,
     diff_pathspec: Option<&'a DiffPathspec>,
     /// 1-based patch number for the `n` in `[PATCH n/m]` and the file name.
@@ -250,6 +646,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         db,
         format,
         options,
+        resolved,
         record,
         diff_pathspec,
         seq,
@@ -262,14 +659,39 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     let commit = &record.commit;
     let mut out = Vec::new();
 
-    // mbox `From ` separator: the commit oid + the fixed magic date git uses.
+    // mbox `From ` separator: the commit oid (or the all-zero oid under
+    // `--zero-commit`) + the fixed magic date git uses.
     out.extend_from_slice(b"From ");
-    out.extend_from_slice(record.oid.to_hex().as_bytes());
+    if resolved.zero_commit {
+        out.extend_from_slice("0".repeat(format.hex_len()).as_bytes());
+    } else {
+        out.extend_from_slice(record.oid.to_hex().as_bytes());
+    }
     out.extend_from_slice(b" Mon Sep 17 00:00:00 2001\n");
 
-    // From: header (author identity).
+    // From: header. With `--from`/`format.from` the visible From: is the rewrite
+    // identity and the real author moves to an in-body `From:`; otherwise the
+    // author identity is used directly.
     let (author_name, author_email) = commit_identity_name_email(&commit.author);
-    out.extend_from_slice(format!("From: {author_name} <{author_email}>\n").as_bytes());
+    let in_body_from = match &resolved.from_ident {
+        Some(from) => {
+            out.extend_from_slice(
+                format!("From: {} <{}>\n", from.name, from.email).as_bytes(),
+            );
+            // git keeps the in-body From: only when it differs from the header
+            // From: (i.e. the author differs from the rewrite ident), unless
+            // --force-in-body-from is set.
+            let redundant = from.name == author_name && from.email == author_email;
+            (!redundant || resolved.force_in_body_from)
+                .then(|| format!("From: {author_name} <{author_email}>\n"))
+        }
+        None => {
+            out.extend_from_slice(
+                format!("From: {author_name} <{author_email}>\n").as_bytes(),
+            );
+            None
+        }
+    };
 
     // Date: header — the *author* date in git's RFC 2822 rendering.
     let date = commit_identity_date(&commit.author, &DateMode::Rfc2822);
@@ -280,16 +702,26 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     let prefix = if options.keep_subject {
         None
     } else {
-        Some(subject_prefix_label(options, seq, last_number, numbered))
+        subject_prefix_label(resolved, seq, last_number, numbered)
     };
     let subject = commit_subject(&commit.message);
     write_folded_subject(&mut out, prefix.as_deref(), &subject);
+    let subject_bytes = subject.clone().into_bytes();
 
-    // Blank line, then the commit body (message minus the subject line),
+    // Extra headers (custom `--add-header`/`format.headers`, then `To:`, then
+    // `Cc:`) are emitted directly after the Subject, before the blank line.
+    out.extend_from_slice(&resolved.header_block);
+
+    // Blank line, then optional in-body `From:` header (with its own trailing
+    // blank line), then the commit body (message minus the subject line),
     // normalized to end in exactly one newline. With --signoff the trailer is
     // appended to the body.
     out.push(b'\n');
-    let body = format_patch_body(&commit.message, signoff_line);
+    if let Some(in_body) = in_body_from {
+        out.extend_from_slice(in_body.as_bytes());
+        out.push(b'\n');
+    }
+    let body = format_patch_body(&commit.message, &subject_bytes, signoff_line);
     out.extend_from_slice(&body);
 
     // Diff entries against the first parent (or the empty tree for a root).
@@ -318,33 +750,48 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     }
 
     // Signature trailer. The preceding content already ends in a newline, so
-    // the `-- ` separator follows directly (no intervening blank line). Every
-    // patch ends with a trailing blank line — in files and on stdout alike;
-    // stdout additionally inserts a separator *between* patches.
-    out.extend_from_slice(b"-- \n");
-    out.extend_from_slice(sley_core::UPSTREAM_GIT_COMPAT_VERSION.as_bytes());
-    out.extend_from_slice(b"\n\n");
+    // the `-- ` separator follows directly (no intervening blank line). When a
+    // signature is present every patch ends `-- \n<sig>\n\n` (the trailing blank
+    // is the inter-patch separator on stdout / the file's final newline). A
+    // suppressed signature (`--no-signature`, `--signature=""`, empty
+    // `format.signature`) drops the whole `-- \n...` block *and* the trailing
+    // blank line: git emits nothing past the diff's own final newline.
+    if let Some(signature) = &resolved.signature {
+        out.extend_from_slice(b"-- \n");
+        out.extend_from_slice(signature);
+        out.extend_from_slice(b"\n\n");
+    }
     Ok(out)
 }
 
 /// Build the `[PATCH n/m]` / `[PATCH]` prefix string (without the trailing
 /// space that separates it from the subject — that is added by the folder).
+///
+/// The prefix body (`RFC PATCH`, `PATCH (WIP)`, or an empty string for
+/// `--subject-prefix=`) is resolved once in [`resolve_format`]. An empty body
+/// yields the bare `[1/1]` form (no leading space) for the numbered case, or an
+/// empty `[]` is suppressed entirely (git emits just `Subject: <subject>`).
 fn subject_prefix_label(
-    options: &FormatPatchOptions,
+    resolved: &ResolvedFormat,
     seq: usize,
     last_number: usize,
     numbered: bool,
-) -> String {
-    let mut label = String::from("[");
-    if let Some(reroll) = &options.reroll_prefix {
-        label.push_str(reroll);
-    }
-    label.push_str(&options.subject_prefix);
-    if numbered {
-        label.push_str(&format!(" {seq}/{last_number}"));
-    }
-    label.push(']');
-    label
+) -> Option<String> {
+    let body = &resolved.prefix_body;
+    let number = if numbered {
+        format!("{seq}/{last_number}")
+    } else {
+        String::new()
+    };
+    let inner = match (body.is_empty(), number.is_empty()) {
+        // An empty body *and* no number leaves nothing to bracket: git emits a
+        // bare `Subject: <subject>` with no `[]` at all.
+        (true, true) => return None,
+        (true, false) => number,
+        (false, true) => body.clone(),
+        (false, false) => format!("{body} {number}"),
+    };
+    Some(format!("[{inner}]"))
 }
 
 /// Append the `Subject:` header, folding so each output line is at most 78
@@ -403,32 +850,275 @@ fn write_folded_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &str) 
 /// guaranteed to end in exactly one newline (empty body yields no bytes other
 /// than the optional sign-off). The `---` separator follows whatever this
 /// returns.
-fn format_patch_body(message: &[u8], signoff_line: Option<&[u8]>) -> Vec<u8> {
+///
+/// `subject` is the (unprefixed) subject text. git's `append_signoff` runs over
+/// the *whole* pretty-printed mail (the `Subject:` header line + blank + body),
+/// so its blank-line / footer-detection rules see the subject too. We reproduce
+/// that by running the trailer logic over `subject\n\n<body>` and then slicing
+/// the subject framing back off — this is what makes the subject-only case emit
+/// exactly one blank line before the sign-off (no spurious extra blanks).
+fn format_patch_body(message: &[u8], subject: &[u8], signoff_line: Option<&[u8]>) -> Vec<u8> {
     let mut body = commit_body(message).to_vec();
     // Strip any trailing newlines, then re-add a single one (when non-empty) so
     // the body always ends "...text\n" before the sign-off / separator.
     while body.last() == Some(&b'\n') {
         body.pop();
     }
-    if let Some(signoff) = signoff_line {
-        if body.is_empty() {
-            body.extend_from_slice(signoff);
-            body.push(b'\n');
-            return body;
-        }
-        body.push(b'\n');
-        // git places a blank line before the sign-off trailer unless the body
-        // already ends with a recognised trailer block; reproduce the simple
-        // common case (blank line then the trailer).
-        body.push(b'\n');
-        body.extend_from_slice(signoff);
-        body.push(b'\n');
-        return body;
-    }
     if !body.is_empty() {
         body.push(b'\n');
     }
-    body
+    let Some(signoff) = signoff_line else {
+        return body;
+    };
+    // Reconstruct the mail buffer git's append_signoff operates on: the subject
+    // line, a blank line, then the body. Run the trailer logic, then strip the
+    // `subject\n\n` framing the renderer emits separately.
+    let mut framed = Vec::with_capacity(subject.len() + body.len() + 2);
+    framed.extend_from_slice(subject);
+    framed.push(b'\n');
+    framed.push(b'\n');
+    let frame_len = framed.len();
+    framed.extend_from_slice(&body);
+    append_signoff_trailer(&mut framed, signoff);
+    framed.split_off(frame_len)
+}
+
+/// Append a `Signed-off-by:` trailer to `body` following git's `append_signoff`
+/// (sequencer.c) with `APPEND_SIGNOFF_DEDUP`. `body` is expected to already end
+/// in a single `\n` (or be empty). The new sob is `<signoff_line>\n`.
+///
+/// The key parity behaviour: when the body's trailing paragraph already parses
+/// as a *conforming trailer block* (a run of `Token: value` trailers, possibly
+/// with recognised non-trailer lines like `(cherry picked from commit ...)`),
+/// git appends the new sob directly after it with no blank line — and if that
+/// block's last entry is already an identical sob, it appends nothing at all
+/// (dedup). Otherwise a blank line precedes the sob.
+fn append_signoff_trailer(body: &mut Vec<u8>, signoff_line: &[u8]) {
+    let mut sob = signoff_line.to_vec();
+    sob.push(b'\n');
+
+    // Whole message equals the sob → treat as conforming footer with matching
+    // last sob (git's `has_footer = 3`): nothing to append.
+    if body.as_slice() == sob.as_slice() {
+        return;
+    }
+
+    let footer = conforming_footer_state(body, &sob);
+
+    if footer == FooterState::None {
+        // Add a blank line so the body and the sob are separated, mirroring
+        // git's buffer-state rules. After the line-completion above, an empty
+        // body needs "\n\n" (title room), a single "\n" needs one more, and a
+        // body ending in a single "\n" gets a blank line; a body already ending
+        // in "\n\n" needs nothing.
+        if body.is_empty() {
+            body.extend_from_slice(b"\n\n");
+        } else if body.len() == 1 {
+            body.push(b'\n');
+        } else if body[body.len() - 2] != b'\n' {
+            body.push(b'\n');
+        }
+    }
+
+    // has_footer == 3 (sob is the last entry) → don't duplicate; DEDUP +
+    // has_footer == 2 (sob present, not last) → also don't duplicate.
+    if matches!(footer, FooterState::SobLast | FooterState::SobPresent) {
+        return;
+    }
+    body.extend_from_slice(&sob);
+}
+
+/// The conforming-footer classification git's `has_conforming_footer` returns,
+/// scoped to what `append_signoff` needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterState {
+    /// No conforming trailer block in the trailing paragraph.
+    None,
+    /// A conforming footer with no matching sob.
+    Conforming,
+    /// A conforming footer that contains the sob (not as the last entry).
+    SobPresent,
+    /// A conforming footer whose last entry is the sob.
+    SobLast,
+}
+
+/// Port of git's `has_conforming_footer` (sequencer.c) over `body`: detect the
+/// trailing trailer block via [`find_trailer_block_start`], iterate its trailer
+/// lines, and report whether the new `sob` appears and whether it is last.
+fn conforming_footer_state(body: &[u8], sob: &[u8]) -> FooterState {
+    let start = find_trailer_block_start(body);
+    let block = &body[start..];
+    // Trailer lines are the non-blank, non-continuation lines of the block whose
+    // text begins a trailer (`Token: value`, or a recognised prefix). git counts
+    // every advanced trailer; we mirror that and track the sob position.
+    let mut count = 0usize;
+    let mut found_sob = 0usize;
+    for line in block.split_inclusive(|&b| b == b'\n') {
+        if line == b"\n" || line.is_empty() {
+            continue;
+        }
+        // Continuation lines (leading whitespace) belong to the previous trailer.
+        if line[0].is_ascii_whitespace() {
+            continue;
+        }
+        if !line_is_trailer(line) {
+            continue;
+        }
+        count += 1;
+        if line == sob {
+            found_sob = count;
+        }
+    }
+    if count == 0 {
+        return FooterState::None;
+    }
+    if found_sob == count {
+        FooterState::SobLast
+    } else if found_sob > 0 {
+        FooterState::SobPresent
+    } else {
+        FooterState::Conforming
+    }
+}
+
+/// Does this single line (including its trailing `\n`) begin a git trailer? A
+/// trailer is `Token: value` where `Token` is non-empty and made of
+/// `[A-Za-z0-9-]`, or one of git's recognised non-`:` prefixes.
+fn line_is_trailer(line: &[u8]) -> bool {
+    let text = line.strip_suffix(b"\n").unwrap_or(line);
+    if text.starts_with(b"Signed-off-by: ") || text.starts_with(b"(cherry picked from commit ") {
+        return true;
+    }
+    // Find the `:` separator; the token before it must be non-empty and only
+    // contain token characters (matching git's default `:` trailer separator).
+    let Some(colon) = text.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    if colon == 0 {
+        return false;
+    }
+    text[..colon]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Port of trailer.c `find_trailer_block_start` for the format-patch signoff
+/// path: returns the byte offset in `buf` at which the trailing trailer block
+/// begins (or `buf.len()` if the trailing paragraph is not a trailer block).
+/// Mirrors the for-each-ref port already in the tree, kept local to avoid a
+/// cross-module dependency.
+fn find_trailer_block_start(buf: &[u8]) -> usize {
+    let len = buf.len();
+    // Skip the title paragraph up to the first blank line.
+    let mut s = 0usize;
+    while s < len {
+        if is_blank_line(buf, s) {
+            break;
+        }
+        s = next_line(buf, s, len);
+    }
+    let end_of_title = s;
+
+    let mut only_spaces = true;
+    let mut recognized_prefix = false;
+    let mut trailer_lines: i64 = 0;
+    let mut non_trailer_lines: i64 = 0;
+    let mut possible_continuation: i64 = 0;
+
+    let mut maybe_l = last_line(buf, len);
+    while let Some(l) = maybe_l {
+        if l < end_of_title {
+            break;
+        }
+        if is_blank_line(buf, l) {
+            if only_spaces {
+                // trailing blank; keep scanning upward
+            } else {
+                non_trailer_lines += possible_continuation;
+                if (recognized_prefix && trailer_lines * 3 >= non_trailer_lines)
+                    || (trailer_lines > 0 && non_trailer_lines == 0)
+                {
+                    return next_line(buf, l, len);
+                }
+                return len;
+            }
+        } else {
+            only_spaces = false;
+            let line = &buf[l..next_line(buf, l, len)];
+            let text = line.strip_suffix(b"\n").unwrap_or(line);
+            if text.starts_with(b"Signed-off-by: ")
+                || text.starts_with(b"(cherry picked from commit ")
+            {
+                trailer_lines += 1;
+                possible_continuation = 0;
+                recognized_prefix = true;
+            } else if trailer_separator_pos(text).is_some_and(|pos| pos >= 1)
+                && !buf[l].is_ascii_whitespace()
+            {
+                trailer_lines += 1;
+                possible_continuation = 0;
+            } else if buf[l].is_ascii_whitespace() {
+                possible_continuation += 1;
+            } else {
+                non_trailer_lines += 1;
+                non_trailer_lines += possible_continuation;
+                possible_continuation = 0;
+            }
+        }
+        if l == 0 {
+            break;
+        }
+        maybe_l = last_line(buf, l);
+    }
+    len
+}
+
+/// The position of the trailer `:` separator in a line's text, requiring the
+/// token before it to be made of token characters (`[A-Za-z0-9-]`).
+fn trailer_separator_pos(text: &[u8]) -> Option<usize> {
+    let colon = text.iter().position(|&b| b == b':')?;
+    if colon == 0 {
+        return None;
+    }
+    text[..colon]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+        .then_some(colon)
+}
+
+/// True when the line beginning at `i` is blank (empty or only whitespace up to
+/// the next `\n`).
+fn is_blank_line(buf: &[u8], i: usize) -> bool {
+    let end = next_line(buf, i, buf.len());
+    let line = &buf[i..end];
+    let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+    trimmed.iter().all(|&b| b.is_ascii_whitespace())
+}
+
+/// Byte offset of the start of the line after the one beginning at `i`.
+fn next_line(buf: &[u8], i: usize, len: usize) -> usize {
+    match buf[i..len].iter().position(|&b| b == b'\n') {
+        Some(rel) => i + rel + 1,
+        None => len,
+    }
+}
+
+/// Byte offset of the start of the last line ending before `end` (the line
+/// containing `buf[end-1]`), or `None` when `end == 0`.
+fn last_line(buf: &[u8], end: usize) -> Option<usize> {
+    if end == 0 {
+        return None;
+    }
+    // The last byte before `end`; if it is the line terminator, look at the line
+    // it terminates.
+    let scan_end = if buf[end - 1] == b'\n' { end - 1 } else { end };
+    if scan_end == 0 {
+        return Some(0);
+    }
+    match buf[..scan_end].iter().rposition(|&b| b == b'\n') {
+        Some(pos) => Some(pos + 1),
+        None => Some(0),
+    }
 }
 
 /// Resolve the runtime committer identity (env first, then config `user.*`) and
@@ -1256,16 +1946,113 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.abbrev = Some(width.parse::<usize>().unwrap_or(0).max(4));
             }
             value if let Some(prefix) = value.strip_prefix("--subject-prefix=") => {
-                options.subject_prefix = prefix.to_string();
+                options.subject_prefix = Some(prefix.to_string());
             }
             "--subject-prefix" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--subject-prefix requires a value".into()))?;
-                options.subject_prefix = value.clone();
+                options.subject_prefix = Some(value.clone());
             }
-            "--rfc" => options.reroll_prefix = Some("RFC ".to_string()),
+            // `--rfc` (default token `RFC`), `--rfc=<token>`, `--rfc=` (clear),
+            // `--no-rfc` (clear). A leading `-` in the token appends rather than
+            // prepends (handled in resolve_prefix_body).
+            "--rfc" => options.rfc = RfcMode::Token("RFC".to_string()),
+            "--no-rfc" => options.rfc = RfcMode::Clear,
+            value if let Some(token) = value.strip_prefix("--rfc=") => {
+                options.rfc = if token.is_empty() {
+                    RfcMode::Clear
+                } else {
+                    RfcMode::Token(token.to_string())
+                };
+            }
+            // `-v<n>` / `--reroll-count=<n>` (also `--reroll-count <n>`):
+            // appends ` v<n>` to the subject prefix.
+            "-v" | "--reroll-count" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--reroll-count requires a value".into()))?;
+                options.reroll_count = Some(value.clone());
+            }
+            value if let Some(n) = value.strip_prefix("--reroll-count=") => {
+                options.reroll_count = Some(n.to_string());
+            }
+            value if let Some(n) = value.strip_prefix("-v") => {
+                options.reroll_count = Some(n.to_string());
+            }
             "-k" | "--keep-subject" => options.keep_subject = true,
+            // Recipient / extra-header injection.
+            "--to" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--to requires a value".into()))?;
+                options.cli_to.push(value.clone());
+            }
+            value if let Some(addr) = value.strip_prefix("--to=") => {
+                options.cli_to.push(addr.to_string());
+            }
+            "--no-to" => {
+                options.no_to = true;
+                options.cli_to.clear();
+            }
+            "--cc" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--cc requires a value".into()))?;
+                options.cli_cc.push(value.clone());
+            }
+            value if let Some(addr) = value.strip_prefix("--cc=") => {
+                options.cli_cc.push(addr.to_string());
+            }
+            "--no-cc" => {
+                options.no_cc = true;
+                options.cli_cc.clear();
+            }
+            "--add-header" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--add-header requires a value".into()))?;
+                push_cli_header(&mut options, value);
+            }
+            value if let Some(header) = value.strip_prefix("--add-header=") => {
+                push_cli_header(&mut options, header);
+            }
+            // git's header_callback unset clears all three lists.
+            "--no-add-header" => {
+                options.no_add_header = true;
+                options.cli_headers.clear();
+                options.cli_to.clear();
+                options.cli_cc.clear();
+            }
+            // `--from[=<ident>]` / `--no-from`.
+            "--from" => options.from = FromMode::Committer,
+            value if let Some(ident) = value.strip_prefix("--from=") => {
+                options.from = FromMode::Ident(ident.to_string());
+            }
+            "--no-from" => options.from = FromMode::Clear,
+            "--force-in-body-from" => options.force_in_body_from = Some(true),
+            "--no-force-in-body-from" => options.force_in_body_from = Some(false),
+            // `--signature=<text>` / `--no-signature` / `--signature-file=<path>`.
+            "--signature" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--signature requires a value".into()))?;
+                options.signature = SignatureMode::Text(value.clone());
+            }
+            value if let Some(text) = value.strip_prefix("--signature=") => {
+                options.signature = SignatureMode::Text(text.to_string());
+            }
+            "--no-signature" => options.signature = SignatureMode::Suppress,
+            "--signature-file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--signature-file requires a value".into()))?;
+                options.signature_file = Some(value.clone());
+            }
+            value if let Some(path) = value.strip_prefix("--signature-file=") => {
+                options.signature_file = Some(path.to_string());
+            }
+            "--zero-commit" => options.zero_commit = true,
             // Accepted-but-inert formatting knobs that do not change the bytes
             // sley emits for the common path.
             "--no-color"
@@ -1281,8 +2068,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--no-prefix"
             | "--text"
             | "-a"
-            | "--ita-invisible-in-index"
-            | "--no-signature" => {}
+            | "--ita-invisible-in-index" => {}
             value if value.starts_with("--color=") => {}
             value if value.starts_with("--thread") => {}
             value if value.starts_with("--cover-letter") => {
@@ -1309,7 +2095,34 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value => options.setup_args.push(value.to_string()),
         }
     }
+    // git rejects `-k`/`--keep-subject` combined with an explicit subject prefix
+    // or `--rfc`: the two are mutually exclusive (the prefix has nowhere to go
+    // when the subject is kept verbatim).
+    if options.keep_subject
+        && (options.subject_prefix.is_some() || !matches!(options.rfc, RfcMode::Unset))
+    {
+        // git emits this as a `fatal:` die() (exit 128); the test compares the
+        // stderr text byte-for-byte, so print it here rather than routing through
+        // the generic `sley: command failed:` formatter.
+        eprintln!("fatal: options '--subject-prefix/--rfc' and '-k' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     Ok(options)
+}
+
+/// Route a command-line `--add-header` value: a `To: `/`Cc: ` prefix
+/// (case-insensitive) strips the prefix and routes to the recipient lists;
+/// everything else becomes a raw extra-header line. Mirrors builtin/log.c's
+/// `add_header`.
+fn push_cli_header(options: &mut FormatPatchOptions, value: &str) {
+    let trimmed = value.trim_end_matches('\n');
+    if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("to: ") {
+        options.cli_to.push(trimmed[4..].to_string());
+    } else if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("cc: ") {
+        options.cli_cc.push(trimmed[4..].to_string());
+    } else {
+        options.cli_headers.push(trimmed.to_string());
+    }
 }
 
 /// Parse a non-negative integer flag value, with a git-flavored error context.
