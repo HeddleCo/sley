@@ -108,6 +108,7 @@ struct ShowContext<'a> {
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     config: &'a GitConfig,
+    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
     options: &'a ShowOptions,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
@@ -237,11 +238,25 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 
     let mut shown_one = false;
     let mut stdout = io::stdout();
+    let userdiff = if options.diff_mode == ShowDiffMode::Patch && !options.has_diff_extras() {
+        let attributes = repo
+            .worktree_root()
+            .ok()
+            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .transpose()?;
+        Some(commands::userdiff::UserdiffResolver::with_attributes(
+            attributes,
+            Some(config.clone()),
+        ))
+    } else {
+        None
+    };
     let context = ShowContext {
         git_dir,
         db,
         format,
         config,
+        userdiff: userdiff.as_ref(),
         options: &options,
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
@@ -506,6 +521,7 @@ fn write_commit_trailer(
                 context.db,
                 context.format,
                 context.config,
+                context.userdiff,
                 options,
                 entries,
             )
@@ -652,6 +668,7 @@ fn write_commit_diff(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
+    userdiff: Option<&commands::userdiff::UserdiffResolver>,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
@@ -676,7 +693,7 @@ fn write_commit_diff(
             Ok(())
         }
         ShowDiffMode::Patch => {
-            write_commit_diff_patch(stdout, git_dir, db, format, config, options, entries)
+            write_commit_diff_patch(stdout, git_dir, db, format, config, userdiff, options, entries)
         }
     }
 }
@@ -690,6 +707,7 @@ fn write_commit_diff_patch(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
+    userdiff: Option<&commands::userdiff::UserdiffResolver>,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
@@ -768,7 +786,7 @@ fn write_commit_diff_patch(
                 src_prefix: "a/",
                 dst_prefix: "b/",
                 context: 3,
-                userdiff: None,
+                userdiff,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,

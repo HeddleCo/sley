@@ -2755,6 +2755,33 @@ pub fn standard_attributes_for_path(
     Ok(matcher.attributes_for_path(path, requested, all))
 }
 
+/// A reusable matcher for standard worktree attributes (global or
+/// `core.attributesFile`, every in-tree `.gitattributes`, and
+/// `$GIT_DIR/info/attributes`).
+///
+/// This is behaviourally identical to [`standard_attributes_for_path`] except
+/// the attribute sources are read once and reused for each path.
+pub struct StandardAttributeMatcher {
+    matcher: AttributeMatcher,
+}
+
+impl StandardAttributeMatcher {
+    pub fn from_worktree_root(worktree_root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            matcher: AttributeMatcher::from_worktree_root(worktree_root.as_ref())?,
+        })
+    }
+
+    pub fn attributes_for_path(
+        &self,
+        path: &[u8],
+        requested: &[Vec<u8>],
+        all: bool,
+    ) -> Vec<AttributeCheck> {
+        self.matcher.attributes_for_path(path, requested, all)
+    }
+}
+
 pub fn standard_attributes_for_path_from_tree(
     worktree_root: impl AsRef<Path>,
     db: &FileObjectDatabase,
@@ -9326,6 +9353,37 @@ mod tests {
     /// Resolve attribute checks against an on-disk `.gitattributes` in `root`.
     fn attrs(root: &Path, path: &[u8]) -> Vec<AttributeCheck> {
         filter_attribute_checks(root, path).expect("test operation should succeed")
+    }
+
+    #[test]
+    fn standard_attribute_matcher_matches_per_path_lookup() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".git").join("info"))
+            .expect("test operation should succeed");
+        fs::create_dir_all(root.join("src").join("nested"))
+            .expect("test operation should succeed");
+        fs::write(root.join(".gitattributes"), b"*.rs diff=rust\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("src").join(".gitattributes"), b"*.rs diff=python\n")
+            .expect("test operation should succeed");
+        fs::write(
+            root.join(".git").join("info").join("attributes"),
+            b"src/nested/*.rs diff=java\n",
+        )
+        .expect("test operation should succeed");
+
+        let requested = vec![b"diff".to_vec()];
+        let path = b"src/nested/file.rs";
+        let per_path = standard_attributes_for_path(&root, path, &requested, false)
+            .expect("test operation should succeed");
+        let matcher = StandardAttributeMatcher::from_worktree_root(&root)
+            .expect("test operation should succeed");
+        assert_eq!(
+            matcher.attributes_for_path(path, &requested, false),
+            per_path
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
