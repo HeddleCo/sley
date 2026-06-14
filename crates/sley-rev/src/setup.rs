@@ -644,9 +644,13 @@ Use '--' to separate paths from revisions, like this:\n\
     )
 }
 
-fn ambiguous_argument(value: &str) -> Result<()> {
+pub fn ambiguous_argument_error(value: &str) -> GitError {
     eprintln!("{}", ambiguous_argument_message(value));
-    Err(GitError::Exit(128))
+    GitError::Exit(128)
+}
+
+fn ambiguous_argument(value: &str) -> Result<()> {
+    Err(ambiguous_argument_error(value))
 }
 
 fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {

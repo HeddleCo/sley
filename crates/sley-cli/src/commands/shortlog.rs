@@ -43,9 +43,8 @@ struct ShortlogOptions {
     grep_patterns: Vec<LogFilterPattern>,
     regexp_mode: SimpleLogRegexMode,
     regexp_ignore_case: bool,
-    max_count: Option<usize>,
-    revisions: Vec<String>,
-    paths_present: bool,
+    setup_args: Vec<String>,
+    has_input_specs: bool,
 }
 
 impl Default for ShortlogOptions {
@@ -60,9 +59,8 @@ impl Default for ShortlogOptions {
             grep_patterns: Vec::new(),
             regexp_mode: SimpleLogRegexMode::Basic,
             regexp_ignore_case: false,
-            max_count: None,
-            revisions: Vec::new(),
-            paths_present: false,
+            setup_args: Vec::new(),
+            has_input_specs: false,
         }
     }
 }
@@ -76,18 +74,10 @@ struct ShortlogEntry {
 pub(crate) fn cmd_shortlog(args: &[String]) -> Result<()> {
     let options = parse_shortlog_args(args)?;
 
-    if options.paths_present {
-        // Pathspec limiting needs the diff machinery to decide which commits
-        // touched a path; rather than silently ignore it (and report wrong
-        // counts) we surface an explicit, non-zero failure.
-        eprintln!("fatal: shortlog pathspec limiting is not supported");
-        return Err(GitError::Exit(128));
-    }
-
     let mut groups: Vec<ShortlogEntry> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
 
-    if options.revisions.is_empty() {
+    if !options.has_input_specs {
         read_shortlog_from_stdin(&options, &mut groups, &mut index)?;
     } else {
         read_shortlog_from_revisions(&options, &mut groups, &mut index)?;
@@ -107,14 +97,14 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
     let mut no_more_options = false;
     while let Some(arg) = iter.next() {
         if no_more_options {
-            // Everything after `--` is a pathspec; presence is all we track.
-            options.paths_present = true;
+            options.setup_args.push(arg.clone());
             continue;
         }
         match arg.as_str() {
             "--" => {
+                options.setup_args.push(arg.clone());
+                options.has_input_specs = true;
                 no_more_options = true;
-                options.paths_present = true;
             }
             "-h" | "--help" => return shortlog_usage_help(),
             "--committer" => options.group = ShortlogGroup::Committer,
@@ -156,7 +146,8 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                 let value = iter
                     .next()
                     .ok_or_else(|| shortlog_option_requires_value("max-count"))?;
-                options.max_count = Some(parse_shortlog_count(value)?);
+                options.setup_args.push(arg.clone());
+                options.setup_args.push(value.clone());
             }
             value => {
                 if let Some(rest) = value.strip_prefix("--group=") {
@@ -170,7 +161,8 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                         .grep_patterns
                         .push(LogFilterPattern::new(rest, "command line"));
                 } else if let Some(rest) = value.strip_prefix("--max-count=") {
-                    options.max_count = Some(parse_shortlog_count(rest)?);
+                    parse_shortlog_count(rest)?;
+                    options.setup_args.push(value.to_string());
                 } else if let Some(option) = shortlog_boolean_option_with_value(value) {
                     // Boolean flags reject an attached `=value`, matching git's
                     // `option '<name>' takes no value` diagnostic.
@@ -186,7 +178,8 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                     // or a bundle of short flags (`-sne`, `-w50`, ...).
                     apply_shortlog_short_bundle(value, &mut options)?;
                 } else {
-                    options.revisions.push(value.to_string());
+                    options.setup_args.push(value.to_string());
+                    options.has_input_specs = true;
                 }
             }
         }
@@ -205,7 +198,8 @@ fn apply_shortlog_short_bundle(value: &str, options: &mut ShortlogOptions) -> Re
     // A token whose first character is a digit is the revision `-<n>` shorthand and
     // is handled wholesale by the revision parser, not as a flag bundle.
     if bytes.first().is_some_and(u8::is_ascii_digit) {
-        options.max_count = Some(shortlog_parse_revision_number(body)?);
+        shortlog_parse_revision_number(body)?;
+        options.setup_args.push(value.to_string());
         return Ok(());
     }
 
@@ -227,7 +221,8 @@ fn apply_shortlog_short_bundle(value: &str, options: &mut ShortlogOptions) -> Re
             byte if byte.is_ascii_digit() => {
                 // A digit mid-bundle (e.g. `-sn2`) begins the max-count argument,
                 // consuming the rest of the bundle.
-                options.max_count = Some(shortlog_parse_revision_number(&body[idx..])?);
+                shortlog_parse_revision_number(&body[idx..])?;
+                options.setup_args.push(format!("-{}", &body[idx..]));
                 return Ok(());
             }
             _ => {
@@ -269,82 +264,49 @@ fn read_shortlog_from_revisions(
     let repo = RepositoryContext::discover_current()?;
     let format = repo.format();
     let db = repo.objects();
+    let setup = sley_rev::setup_revisions(
+        &options.setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir: repo.git_dir(),
+            worktree_root: repo.worktree_root().ok(),
+            cwd: repo.cwd(),
+            format,
+            reader: db,
+            config: Some(repo.config()),
+        },
+    )?;
+    if let Some(leftover) = setup.leftovers.first() {
+        return Err(GitError::Command(format!(
+            "unsupported shortlog option {leftover}"
+        )));
+    }
+    if !setup.pathspecs.is_empty() {
+        // Pathspec limiting needs the diff machinery to decide which commits
+        // touched a path; rather than silently ignore it (and report wrong
+        // counts) we surface an explicit, non-zero failure.
+        eprintln!("fatal: shortlog pathspec limiting is not supported");
+        return Err(GitError::Exit(128));
+    }
 
     let author_filters = parse_log_filter_patterns(&options.author_patterns, options.regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&options.grep_patterns, options.regexp_mode)?;
 
-    // Split the revision arguments into positive tips, negative tips, and ranges
-    // exactly as the rev-list/log machinery does, so `A..B`, `A...B`, and `^X`
-    // forms all behave identically to upstream.
-    let mut includes: Vec<String> = Vec::new();
-    let mut excludes: Vec<String> = Vec::new();
-    let mut linear_ranges: Vec<(String, String, bool)> = Vec::new();
-    let mut symmetric_ranges: Vec<(String, String, bool)> = Vec::new();
-    for rev in &options.revisions {
-        add_rev_list_revision_arg(
-            rev,
-            false,
-            &mut includes,
-            &mut excludes,
-            &mut linear_ranges,
-            &mut symmetric_ranges,
-        )?;
-    }
-
     let mut starts = Vec::new();
-    let mut symmetric_excludes = Vec::new();
-    for rev in includes {
-        let oid = repo.resolve_revision(&rev)?;
-        starts.push(sley_rev::peel_to_commit(db, format, &oid)?);
-    }
-    for (left, right, not) in linear_ranges {
-        let left_oid = repo.resolve_revision(&left)?;
-        let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
-        let right_oid = repo.resolve_revision(&right)?;
-        let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
-        if not {
-            starts.push(left_oid);
-            symmetric_excludes.push(right_oid);
-        } else {
-            symmetric_excludes.push(left_oid);
-            starts.push(right_oid);
-        }
-    }
-    for (left, right, not) in symmetric_ranges {
-        let left_oid = repo.resolve_revision(&left)?;
-        let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
-        let right_oid = repo.resolve_revision(&right)?;
-        let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
-        let bases = merge_bases(repo.git_dir(), db, format, &left_oid, &right_oid)?;
-        if not {
-            starts.extend(bases);
-            symmetric_excludes.push(left_oid);
-            symmetric_excludes.push(right_oid);
-        } else {
-            starts.push(left_oid);
-            starts.push(right_oid);
-            symmetric_excludes.extend(bases);
-        }
+    for tip in &setup.options.positives {
+        starts.push(sley_rev::peel_to_commit(db, format, &tip.oid)?);
     }
 
     // Everything reachable from a negative tip is removed from the result set.
     let mut excluded = HashSet::new();
-    for oid in symmetric_excludes {
-        for record in rev_list_walk_commits(db, format, [oid], false)? {
-            excluded.insert(record.oid);
-        }
-    }
-    for rev in excludes {
-        let oid = repo.resolve_revision(&rev)?;
-        let oid = sley_rev::peel_to_commit(db, format, &oid)?;
-        for record in rev_list_walk_commits(db, format, [oid], false)? {
+    for oid in &setup.options.negatives {
+        for record in rev_list_walk_commits(db, format, [*oid], setup.options.first_parent)? {
             excluded.insert(record.oid);
         }
     }
 
     // `walk_commits` yields newest-first; prepending into each bucket therefore
     // leaves subjects oldest-first, matching git's output ordering.
-    let commits = rev_list_walk_commits(db, format, starts, false)?;
+    let commits = rev_list_walk_commits(db, format, starts, setup.options.first_parent)?;
     let mut emitted = 0usize;
     for record in &commits {
         if excluded.contains(&record.oid) {
@@ -362,8 +324,12 @@ fn read_shortlog_from_revisions(
         ) {
             continue;
         }
-        if let Some(max_count) = options.max_count
-            && emitted >= max_count
+        if emitted < setup.options.skip {
+            emitted += 1;
+            continue;
+        }
+        if let Some(max_count) = setup.options.max_count
+            && emitted.saturating_sub(setup.options.skip) >= max_count
         {
             break;
         }
