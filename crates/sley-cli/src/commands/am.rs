@@ -30,8 +30,15 @@ struct AmOptions {
     signoff: bool,
     /// Fall back to a 3-way merge when straight application fails (`-3`).
     three_way: bool,
-    /// Keep non-empty commits whose patch is empty rather than erroring.
+    /// Keep non-empty commits whose patch is empty rather than erroring
+    /// (`-k`/`--keep` / `--keep-non-patch`).
     keep_non_patch: bool,
+    /// Keep the subject line verbatim, skipping all mailinfo cleanup
+    /// (`-k`/`--keep`).
+    keep_subject: bool,
+    /// Strip `[PATCH]`-style brackets but keep other `[…]` brackets in the
+    /// subject (`-b`/`--keep-non-patch`).
+    keep_non_patch_brackets: bool,
     /// Append the patch's `Message-ID:` header to each commit message
     /// (`-m`/`--message-id`, or `am.messageid`).
     message_id: bool,
@@ -44,6 +51,25 @@ struct AmOptions {
     ignore_date: bool,
     /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
     no_verify: bool,
+}
+
+impl AmOptions {
+    fn subject_cleanup(&self) -> SubjectCleanup {
+        SubjectCleanup {
+            keep_subject: self.keep_subject,
+            keep_non_patch_brackets: self.keep_non_patch_brackets,
+        }
+    }
+}
+
+/// How a patch's `Subject:` header should be cleaned, mirroring git's mailinfo
+/// `keep_subject` (`-k`) and `keep_non_patch_brackets_in_subject` (`-b`).
+#[derive(Clone, Copy, Default)]
+struct SubjectCleanup {
+    /// `-k`/`--keep`: keep the subject verbatim, no cleanup at all.
+    keep_subject: bool,
+    /// `-b`/`--keep-non-patch`: strip `[PATCH]` brackets but keep other `[…]`.
+    keep_non_patch_brackets: bool,
 }
 
 /// The subset of `AmOptions` that affects how each commit object is built. Read
@@ -181,7 +207,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let patches = parse_mbox(&input)?;
+    let patches = parse_mbox(&input, options.subject_cleanup())?;
     // No messages at all (empty/whitespace stdin) — nothing to do.
     if patches.is_empty() {
         return Ok(());
@@ -213,6 +239,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         signoff: false,
         three_way: false,
         keep_non_patch: false,
+        keep_subject: false,
+        keep_non_patch_brackets: false,
         message_id: false,
         committer_date_is_author_date: false,
         ignore_date: false,
@@ -235,7 +263,14 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-signoff" => options.signoff = false,
             "-3" | "--3way" => options.three_way = true,
             "--no-3way" => options.three_way = false,
-            "-k" | "--keep" | "--keep-non-patch" => options.keep_non_patch = true,
+            "-k" | "--keep" => {
+                options.keep_non_patch = true;
+                options.keep_subject = true;
+            }
+            "-b" | "--keep-non-patch" => {
+                options.keep_non_patch = true;
+                options.keep_non_patch_brackets = true;
+            }
             "-m" | "--message-id" => options.message_id = true,
             "--no-message-id" => options.message_id = false,
             "--committer-date-is-author-date" => {
@@ -449,7 +484,7 @@ fn looks_like_patch_input(input: &[u8]) -> bool {
 /// messages (the caller treats that as a no-op). A message that turns out to
 /// carry no diff is still returned so the series driver can report the exact
 /// "Patch is empty." behaviour git uses (including its hint block).
-fn parse_mbox(input: &[u8]) -> Result<Vec<AmPatch>> {
+fn parse_mbox(input: &[u8], cleanup: SubjectCleanup) -> Result<Vec<AmPatch>> {
     if input.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Ok(Vec::new());
     }
@@ -463,20 +498,20 @@ fn parse_mbox(input: &[u8]) -> Result<Vec<AmPatch>> {
     }
     if starts.is_empty() {
         // No separator: the whole buffer is one message.
-        return Ok(vec![parse_message(&lines)?]);
+        return Ok(vec![parse_message(&lines, cleanup)?]);
     }
     let mut patches = Vec::new();
     for (position, &start) in starts.iter().enumerate() {
         let end = starts.get(position + 1).copied().unwrap_or(lines.len());
         // Skip the leading "From " separator line itself.
         let body = &lines[start + 1..end];
-        patches.push(parse_message(body)?);
+        patches.push(parse_message(body, cleanup)?);
     }
     Ok(patches)
 }
 
 /// Parse a single message (headers + blank line + body + diff).
-fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
+fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> {
     let mut author_name = String::new();
     let mut author_email = String::new();
     let mut author_date = None;
@@ -529,7 +564,7 @@ fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
                 author_date_raw = Some(value.clone());
                 author_date = parse_rfc2822_date(value);
             }
-            "subject" => subject = clean_subject(value),
+            "subject" => subject = clean_subject(value, cleanup),
             "message-id" => {
                 if !value.is_empty() {
                     message_id = Some(value.clone());
@@ -616,23 +651,59 @@ fn parse_from_header(value: &str) -> (String, String) {
     (addr.clone(), addr)
 }
 
-/// Strip a leading `[PATCH …]`/`[PATCH]` bracket prefix and surrounding space
-/// from a subject, and decode a possible MIME encoded-word.
-fn clean_subject(value: &str) -> String {
+/// Clean a `Subject:` value the way git's mailinfo `cleanup_subject` does:
+/// repeatedly strip a leading `Re:` (case-insensitive), leading spaces / tabs /
+/// colons, and `[…]` brackets, then trim. A `[…]` bracket is removed unless
+/// `keep_non_patch_brackets` (`-b`/`--keep-non-patch`) is set AND the bracket is
+/// ≥7 chars and does NOT contain `PATCH` — those non-patch brackets (e.g.
+/// `[foo]`) are kept, along with one following space. With `keep_subject`
+/// (`-k`/`--keep`) the subject is kept verbatim (only MIME-decoded + trimmed).
+fn clean_subject(value: &str, cleanup: SubjectCleanup) -> String {
     let decoded = decode_mime_word(value);
-    let mut subject = decoded.trim();
-    // Remove one or more leading `[...]` brackets (e.g. `[PATCH 1/3]`, `[RFC]`).
-    loop {
-        let trimmed = subject.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('[')
-            && let Some(close) = rest.find(']')
-        {
-            subject = rest[close + 1..].trim_start();
-            continue;
-        }
-        break;
+    if cleanup.keep_subject {
+        return decoded.trim().to_string();
     }
-    subject.trim().to_string()
+    let keep_non_patch = cleanup.keep_non_patch_brackets;
+    let mut bytes = decoded.trim().as_bytes().to_vec();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'r' | b'R' => {
+                // A leading "Re:" (any case) is dropped.
+                if at + 3 <= bytes.len()
+                    && (bytes[at + 1] == b'e' || bytes[at + 1] == b'E')
+                    && bytes[at + 2] == b':'
+                {
+                    bytes.drain(at..at + 3);
+                    continue;
+                }
+                break;
+            }
+            b' ' | b'\t' | b':' => {
+                bytes.remove(at);
+                continue;
+            }
+            b'[' => {
+                let Some(rel) = bytes[at..].iter().position(|&b| b == b']') else {
+                    break;
+                };
+                let remove = rel + 1; // length of "[...]"
+                let contains_patch =
+                    remove >= 7 && bytes[at..at + remove].windows(5).any(|w| w == b"PATCH");
+                if !keep_non_patch || contains_patch {
+                    bytes.drain(at..at + remove);
+                } else {
+                    at += remove;
+                    if bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+                        at += 1;
+                    }
+                }
+                continue;
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 /// Best-effort decode of a single RFC 2047 encoded-word for UTF-8/Q or B
@@ -928,7 +999,11 @@ fn encode_patch_file(patch: &AmPatch) -> Vec<u8> {
         out.extend_from_slice(message_id.as_bytes());
         out.push(b'\n');
     }
-    out.extend_from_slice(b"Subject: [PATCH] ");
+    // Store the already-cleaned subject verbatim (no `[PATCH]` re-prefix): it has
+    // had mailinfo cleanup applied once at parse time, so `read_patch_file`
+    // re-parses with `keep_subject` to keep it byte-identical across the
+    // store/resume round-trip.
+    out.extend_from_slice(b"Subject: ");
     out.extend_from_slice(patch.subject.as_bytes());
     out.extend_from_slice(b"\n\n");
     // Body (message minus the subject's first line).
@@ -1004,7 +1079,16 @@ fn read_patch_file(state_dir: &Path, number: usize) -> Result<AmPatch> {
     let path = state_dir.join(format!("{number:04}"));
     let content = fs::read(&path)?;
     let lines = split_keep_newline(&content);
-    parse_message(&lines)
+    // The stored subject was already cleaned at the first parse (see
+    // `encode_patch_file`), so re-parse it verbatim — re-running cleanup would
+    // double-strip brackets the original `-k`/`-b` run deliberately kept.
+    parse_message(
+        &lines,
+        SubjectCleanup {
+            keep_subject: true,
+            keep_non_patch_brackets: false,
+        },
+    )
 }
 
 fn read_state_usize(state_dir: &Path, name: &str) -> Result<usize> {
