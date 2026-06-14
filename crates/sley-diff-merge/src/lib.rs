@@ -3602,9 +3602,17 @@ pub enum ApplyOutcome {
     Rejected,
 }
 
-/// Maximum number of lines git-style hunk application will search away from the
-/// recorded position (in either direction) before giving up.
-const MAX_HUNK_OFFSET: usize = 1_000;
+/// The minimum number of context lines git's `apply` insists on keeping when
+/// it tries to fuzz a hunk into place — git's `apply_state.p_context`, which is
+/// initialised to `UINT_MAX` (the `-C<n>` option lowers it). The fuzz loop in
+/// `apply_one_fragment` stops the moment both leading and trailing context have
+/// been reduced to this floor; with the default `UINT_MAX` floor that test is
+/// already satisfied on the first failure, so **the default `git apply` / `git
+/// am` path does no context fuzz and no begin/end relaxation at all** — a hunk
+/// whose full preimage does not match at a valid position is simply rejected.
+/// We keep the floor configurable so the structure mirrors git's, but the
+/// shared apply engine only ever runs with the default.
+const MIN_FUZZ_CONTEXT: usize = usize::MAX;
 
 /// Parse a unified/git diff into one [`FilePatch`] per file it touches.
 ///
@@ -3624,14 +3632,28 @@ pub fn parse_unified_patch(input: &[u8]) -> Result<Vec<FilePatch>> {
 
 /// Apply a single-file patch to `base`, returning the patched bytes.
 ///
-/// Each hunk's context and deleted lines must match `base` exactly. Application
-/// first tries the line recorded in the hunk header and, if that does not
-/// match, searches outward (the same offset-tolerant behaviour git uses) up to
-/// [`MAX_HUNK_OFFSET`] lines in each direction. If any hunk cannot be located,
-/// the whole patch is [`ApplyOutcome::Rejected`] and `base` is left untouched.
+/// This mirrors git's `apply.c` (`apply_one_fragment` / `find_pos` /
+/// `match_fragment`) for the default, no-whitespace-fuzz settings `git am`
+/// and `git apply` use:
+///
+/// * Each hunk builds a *preimage* (context + deleted lines) and *postimage*
+///   (context + inserted lines).
+/// * A hunk anchored at the file start (`old_start <= 1`) must match the
+///   beginning of the file (`match_beginning`); a hunk with no trailing context
+///   must match the end of the file (`match_end`).
+/// * The full preimage is matched byte-for-byte; the search starts at the
+///   recorded position and ping-pongs outward across the whole image.
+/// * Fuzz is applied *only* by dropping leading/trailing context lines (never
+///   by jumping to a spurious context-only match); if no position matches even
+///   after dropping all context, the hunk — and thus the whole patch — is
+///   [`ApplyOutcome::Rejected`].
+///
+/// Rejecting (rather than spuriously applying at a wrong offset) is what lets
+/// `git am -3` correctly fall back to its 3-way merge path.
 ///
 /// New-file patches (empty/ignored base) and the no-final-newline case are
-/// handled byte-accurately.
+/// handled byte-accurately. Clean exact-position applies are byte-identical to
+/// the previous behaviour.
 pub fn apply_file_patch(base: &[u8], patch: &FilePatch) -> ApplyOutcome {
     // A pure deletion with no hunks yields an empty file.
     if patch.is_delete && patch.hunks.is_empty() {
@@ -3641,76 +3663,146 @@ pub fn apply_file_patch(base: &[u8], patch: &FilePatch) -> ApplyOutcome {
     // and build the result from the inserted lines.
     let base_for_match: &[u8] = if patch.is_new { b"" } else { base };
 
-    let base_lines = split_blob_lines(base_for_match);
+    // The "image" git mutates as each hunk applies. We splice in place so later
+    // hunks see the effect of earlier ones (git carries the running offset for
+    // the same reason).
+    let mut image = split_blob_lines(base_for_match);
 
-    // We walk the base line list, copying untouched lines and splicing hunks.
-    let mut result: Vec<Line> = Vec::new();
-    // Index into `base_lines` of the next line we have not yet emitted.
-    let mut cursor: usize = 0;
-    // Running offset applied to subsequent hunk positions (git carries the
-    // offset from earlier hunks forward as a hint).
+    // git seeds the search for hunk N at `newpos-1` *plus* the offset earlier
+    // hunks drifted by, so a uniform shift only costs the search once.
     let mut running_offset: isize = 0;
 
     for hunk in &patch.hunks {
-        let located = match locate_hunk(&base_lines, hunk, cursor, running_offset) {
-            Some(pos) => pos,
+        match apply_one_hunk(&mut image, hunk, running_offset) {
+            Some(drift) => running_offset += drift,
             None => return ApplyOutcome::Rejected,
-        };
-        if located < cursor {
-            // Overlapping/out-of-order application is not representable.
-            return ApplyOutcome::Rejected;
         }
-        // Copy untouched lines preceding this hunk.
-        for line in &base_lines[cursor..located] {
-            result.push(line.clone());
-        }
-        // Emit the hunk: context + inserts replace context + deletes.
-        let mut consumed = 0usize; // old-side lines consumed from base
-        for hl in &hunk.lines {
-            match hl {
-                HunkLine::Context(bytes) => {
-                    result.push(Line {
-                        content: bytes.clone(),
-                        no_newline: false,
-                    });
-                    consumed += 1;
+    }
+
+    ApplyOutcome::Applied(join_lines(&image))
+}
+
+/// Splice a single hunk into `image`, returning the offset (applied position −
+/// expected position) so later hunks can carry it forward, or `None` if the
+/// hunk cannot be located (which rejects the whole patch).
+///
+/// Faithful to git's `apply_one_fragment`: build preimage/postimage, try the
+/// full preimage at progressively-reduced context, and on a match replace the
+/// matched preimage region with the postimage.
+fn apply_one_hunk(image: &mut Vec<Line>, hunk: &Hunk, running_offset: isize) -> Option<isize> {
+    // preimage = context + deletes (the old side we must find in the image).
+    // postimage = context + inserts (what replaces it). They share their
+    // leading/trailing *context* runs, which fuzz peels off symmetrically.
+    let mut preimage: Vec<Line> = Vec::new();
+    let mut postimage: Vec<Line> = Vec::new();
+    let mut leading = 0usize; // context lines before the first +/-
+    let mut trailing = 0usize; // context lines after the last +/-
+    let mut seen_change = false;
+    for hl in &hunk.lines {
+        match hl {
+            HunkLine::Context(bytes) => {
+                preimage.push(Line {
+                    content: bytes.clone(),
+                    no_newline: false,
+                });
+                postimage.push(Line {
+                    content: bytes.clone(),
+                    no_newline: false,
+                });
+                if !seen_change {
+                    leading += 1;
                 }
-                HunkLine::Delete(_) => {
-                    consumed += 1;
-                }
-                HunkLine::Insert(bytes) => {
-                    result.push(Line {
-                        content: bytes.clone(),
-                        no_newline: false,
-                    });
-                }
+                trailing += 1;
+            }
+            HunkLine::Delete(bytes) => {
+                preimage.push(Line {
+                    content: bytes.clone(),
+                    no_newline: false,
+                });
+                seen_change = true;
+                trailing = 0;
+            }
+            HunkLine::Insert(bytes) => {
+                postimage.push(Line {
+                    content: bytes.clone(),
+                    no_newline: false,
+                });
+                seen_change = true;
+                trailing = 0;
             }
         }
-        // Apply the no-newline flags to the last emitted new-side line and the
-        // last consumed old-side line as appropriate.
-        let new_end = located + consumed;
-        if hunk.new_no_newline
-            && let Some(last) = result.last_mut()
-        {
-            last.no_newline = true;
+    }
+
+    // Mark the no-final-newline state on the last preimage/postimage line so the
+    // exact-match check and the spliced result reproduce a missing terminal
+    // newline byte-for-byte.
+    if hunk.old_no_newline && let Some(last) = preimage.last_mut() {
+        last.no_newline = true;
+    }
+    if hunk.new_no_newline && let Some(last) = postimage.last_mut() {
+        last.no_newline = true;
+    }
+
+    // A hunk that is `@@ -1,L ... @@` (or `@@ -0,0 ... @@` for an add-to-empty)
+    // must match the beginning. A hunk with no trailing context must match the
+    // end. (`git am`/`apply` do not pass `--unidiff-zero`, so old_start == 1
+    // still implies match_beginning.)
+    let mut match_beginning = hunk.old_start <= 1;
+    let mut match_end = trailing == 0;
+
+    // git anchors the search at `newpos-1` (0-based), carried by the running
+    // offset from earlier hunks. The anchor (`pos` in git) shifts up whenever a
+    // *leading* context line is peeled, because the preimage then begins one
+    // line later in its own content.
+    let mut expected = expected_position(hunk, running_offset);
+    // The full hunk's expected position never moves, so the returned drift is
+    // measured against it (not the context-reduced anchor).
+    let hunk_expected = expected;
+
+    loop {
+        if let Some(pos) = find_hunk_pos(image, &preimage, expected, match_beginning, match_end) {
+            // Splice: drop the matched preimage lines, insert the postimage.
+            let take = preimage.len();
+            let replacement: Vec<Line> = postimage.clone();
+            image.splice(pos..pos + take, replacement);
+            return Some(pos as isize - hunk_expected);
         }
-        cursor = new_end;
-        // Update running offset by how far the located position drifted from the
-        // naive expectation, so later hunks search around the adjusted spot.
-        let expected = expected_position(hunk, running_offset);
-        running_offset += located as isize - expected;
-        let _ = hunk.old_no_newline; // honoured implicitly via context matching
-    }
 
-    // Copy any trailing untouched lines. These carry their original
-    // newline-state (including a no-final-newline marker on the base's last
-    // line), so the trailing-newline status is preserved automatically when no
-    // hunk touches the tail.
-    for line in &base_lines[cursor..] {
-        result.push(line.clone());
-    }
+        // No position matched. Mirror git's guard *order* exactly: it first
+        // checks whether context is already at the floor (`p_context`) and, if
+        // so, gives up BEFORE relaxing match_beginning/match_end or peeling
+        // context. With the default `UINT_MAX` floor this fires on the very
+        // first failure, so the default path never fuzzes and never relaxes the
+        // begin/end anchors — it rejects. (The comparison is intentionally
+        // against the floor so the structure stays faithful to git even though
+        // the default floor makes it unconditionally true.)
+        #[allow(clippy::absurd_extreme_comparisons)]
+        if leading <= MIN_FUZZ_CONTEXT && trailing <= MIN_FUZZ_CONTEXT {
+            return None;
+        }
 
-    ApplyOutcome::Applied(join_lines(&result))
+        // git relaxes the begin/end anchors before peeling context: a hunk that
+        // "must match the start/end" but didn't is retried free-floating first.
+        if match_beginning || match_end {
+            match_beginning = false;
+            match_end = false;
+            continue;
+        }
+
+        // Reduce context: peel the larger side (both if equal), exactly as git.
+        if leading >= trailing {
+            // Drop the first context line from pre+post; the anchor slides up.
+            preimage.remove(0);
+            postimage.remove(0);
+            expected -= 1;
+            leading -= 1;
+        }
+        if trailing > leading {
+            preimage.pop();
+            postimage.pop();
+            trailing -= 1;
+        }
+    }
 }
 
 /// A line with its content (sans terminator) and whether it is newline-terminated.
@@ -3773,72 +3865,114 @@ fn expected_position(hunk: &Hunk, running_offset: isize) -> isize {
     base + running_offset
 }
 
-/// Locate the 0-based base-line index at which `hunk`'s old-side (context +
-/// delete) lines match. Tries the expected position first, then expands the
-/// search symmetrically outward. Returns `None` if no match is found within
-/// [`MAX_HUNK_OFFSET`].
-fn locate_hunk(
-    base_lines: &[Line],
-    hunk: &Hunk,
-    min_pos: usize,
-    running_offset: isize,
+/// Find the 0-based line index in `image` where `preimage` (the hunk's context
+/// + deleted lines, possibly already context-reduced by fuzz) matches.
+///
+/// Port of git's `find_pos`: start the search at `expected` (clamped, or forced
+/// to 0/end when `match_beginning`/`match_end`), then ping-pong outward across
+/// the *whole* image — backward and forward alternately — until both ends are
+/// exhausted. Returns the first matching line index, or `None`.
+fn find_hunk_pos(
+    image: &[Line],
+    preimage: &[Line],
+    expected: isize,
+    match_beginning: bool,
+    match_end: bool,
 ) -> Option<usize> {
-    let old_side = old_side_lines(hunk);
-    let expected = expected_position(hunk, running_offset);
-    // Clamp the starting guess into range.
-    let guess = expected.max(0) as usize;
+    let line_nr = image.len();
+    let pre_nr = preimage.len();
 
-    // Try the exact guess first.
-    if guess >= min_pos && hunk_matches_at(base_lines, &old_side, hunk, guess) {
-        return Some(guess);
+    // git: if we must match the beginning, start at 0; if we must match the
+    // end, start where the preimage would end exactly at EOF.
+    let mut line: isize = if match_beginning {
+        0
+    } else if match_end {
+        line_nr as isize - pre_nr as isize
+    } else {
+        expected
+    };
+    if line < 0 {
+        line = 0;
     }
-    // Expand outward.
-    for delta in 1..=MAX_HUNK_OFFSET {
-        // Forward.
-        if let Some(pos) = guess.checked_add(delta)
-            && pos >= min_pos
-            && hunk_matches_at(base_lines, &old_side, hunk, pos)
-        {
-            return Some(pos);
-        }
-        // Backward.
-        if let Some(pos) = guess.checked_sub(delta)
-            && pos >= min_pos
-            && hunk_matches_at(base_lines, &old_side, hunk, pos)
-        {
-            return Some(pos);
-        }
+    if line as usize > line_nr {
+        line = line_nr as isize;
     }
-    None
+
+    let start = line as usize;
+    let mut backwards = start;
+    let mut forwards = start;
+    let mut current = start;
+
+    let mut i: u64 = 0;
+    loop {
+        if preimage_matches_at(image, preimage, current, match_beginning, match_end) {
+            return Some(current);
+        }
+
+        loop {
+            // Both ends exhausted: no match anywhere.
+            if backwards == 0 && forwards == line_nr {
+                return None;
+            }
+            if i & 1 == 1 {
+                // Step backward.
+                if backwards == 0 {
+                    i += 1;
+                    continue;
+                }
+                backwards -= 1;
+                current = backwards;
+            } else {
+                // Step forward.
+                if forwards == line_nr {
+                    i += 1;
+                    continue;
+                }
+                forwards += 1;
+                current = forwards;
+            }
+            break;
+        }
+        i += 1;
+    }
 }
 
-/// The old-side (context + delete) line contents of a hunk, in order.
-fn old_side_lines(hunk: &Hunk) -> Vec<&[u8]> {
-    hunk.lines
-        .iter()
-        .filter_map(|hl| match hl {
-            HunkLine::Context(bytes) | HunkLine::Delete(bytes) => Some(bytes.as_slice()),
-            HunkLine::Insert(_) => None,
-        })
-        .collect()
-}
-
-/// Whether `old_side` matches `base_lines` starting at `pos`, including the
-/// trailing-newline expectation when the hunk declares one.
-fn hunk_matches_at(base_lines: &[Line], old_side: &[&[u8]], hunk: &Hunk, pos: usize) -> bool {
-    if pos + old_side.len() > base_lines.len() {
+/// Whether `preimage` matches `image` starting at line `pos`.
+///
+/// Port of git's `match_fragment` for the default (no whitespace-fuzz) path:
+/// a byte-exact full-preimage match. Honours `match_beginning` (pos must be 0)
+/// and `match_end` (the preimage must reach *exactly* the end of the image),
+/// and reproduces git's terminal-newline semantics — a preimage line marked
+/// "no newline" only matches when it is the image's final line and that line is
+/// itself newline-free.
+fn preimage_matches_at(
+    image: &[Line],
+    preimage: &[Line],
+    pos: usize,
+    match_beginning: bool,
+    match_end: bool,
+) -> bool {
+    if match_beginning && pos != 0 {
         return false;
     }
-    for (i, expected) in old_side.iter().enumerate() {
-        if base_lines[pos + i].content.as_slice() != *expected {
+    // The whole preimage must fall within the image.
+    if pos + preimage.len() > image.len() {
+        return false;
+    }
+    if match_end && pos + preimage.len() != image.len() {
+        return false;
+    }
+    for (i, pre) in preimage.iter().enumerate() {
+        let img = &image[pos + i];
+        if img.content != pre.content {
             return false;
         }
-    }
-    // If the hunk asserts the old file's final line lacks a newline, the last
-    // matched line must indeed be the file's terminal line and lack a newline.
-    if hunk.old_no_newline && !old_side.is_empty() {
-        let last = pos + old_side.len() - 1;
-        if last + 1 != base_lines.len() || !base_lines[last].no_newline {
+        // git compares the raw byte buffers, so a missing terminal newline on
+        // either side only matches the other when both agree. A preimage line
+        // that lacks a newline can only sit on the image's final line (which
+        // must itself lack one); a preimage line that *has* a newline cannot
+        // match a newline-free image line.
+        if pre.no_newline != img.no_newline {
             return false;
         }
     }
@@ -5953,15 +6087,19 @@ index ccccccc..ddddddd 100644
 
     #[test]
     fn apply_with_line_offset() {
-        // The hunk header points at line 1, but the matching context actually
-        // lives a few lines down; the offset search must find it.
-        let base = b"pre1\npre2\npre3\nalpha\nbeta\ngamma\n";
+        // The hunk's recorded position (line 2) is a couple of lines above where
+        // the matching context actually lives (line 4); the outward search must
+        // find it. The hunk is NOT anchored at the file start (old_start > 1, so
+        // no match_beginning) and has trailing context (`tail`, so no
+        // match_end), which is exactly the shape a real drifted patch takes —
+        // verified against `git apply` ("Hunk #1 succeeded at 4 (offset 2)").
+        let base = b"pre1\npre2\npre3\nalpha\nbeta\ngamma\ntail\n";
         let patch = parse_unified_patch(
-            b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+            b"--- a/x\n+++ b/x\n@@ -2,4 +2,4 @@\n alpha\n-beta\n+BETA\n gamma\n tail\n",
         )
         .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
-        assert_eq!(out, b"pre1\npre2\npre3\nalpha\nBETA\ngamma\n");
+        assert_eq!(out, b"pre1\npre2\npre3\nalpha\nBETA\ngamma\ntail\n");
     }
 
     #[test]
@@ -5992,6 +6130,67 @@ index ccccccc..ddddddd 100644
     #[test]
     fn reject_on_context_mismatch() {
         let base = b"alpha\nDIFFERENT\ngamma\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+        )
+        .expect("test operation should succeed");
+        assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
+    }
+
+    #[test]
+    fn reject_when_match_end_required_but_not_at_eof() {
+        // git's `apply.c`: a hunk with NO trailing context must match the END of
+        // the file (`match_end`). Here the leading context (`tail`/`anchor`)
+        // matches at the middle of the base, but there are further lines after
+        // it, so the preimage does not reach EOF. git rejects this; the old
+        // sley matcher wrongly applied it (duplicating the appended block). This
+        // is the t4150-am cell-34 lever: rejection forces `am -3`'s 3-way path.
+        let base = b"one\ntwo\nanchor\nalready\nappended\n";
+        // Hunk: context `anchor`, then append `added1`/`added2`. No trailing
+        // context => match_end. At line 3 (`anchor`) the preimage is just one
+        // line and does not reach EOF, so it must be rejected.
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -3,1 +3,3 @@\n anchor\n+added1\n+added2\n",
+        )
+        .expect("test operation should succeed");
+        assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
+    }
+
+    #[test]
+    fn append_at_eof_matches_when_context_reaches_end() {
+        // The mirror of the rejection case: the same shape applies cleanly when
+        // the matching context IS the last line of the file (preimage reaches
+        // EOF), so `match_end` is satisfied.
+        let base = b"one\ntwo\nanchor\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -3,1 +3,3 @@\n anchor\n+added1\n+added2\n",
+        )
+        .expect("test operation should succeed");
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"one\ntwo\nanchor\nadded1\nadded2\n");
+    }
+
+    #[test]
+    fn reject_when_match_beginning_required_but_not_at_start() {
+        // A hunk anchored at line 1 (`old_start <= 1`) must match the START of
+        // the file (`match_beginning`). If the matching context only appears
+        // later, git rejects rather than wandering to it.
+        let base = b"junk\nalpha\nbeta\ngamma\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n alpha\n+INSERT\n beta\n",
+        )
+        .expect("test operation should succeed");
+        assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
+    }
+
+    #[test]
+    fn no_default_fuzz_rejects_on_trailing_context_mismatch() {
+        // `git apply` / `git am` keep `p_context = UINT_MAX` by default, so they
+        // do NOT fuzz a hunk in by dropping context. Here the trailing context
+        // line (`gamma`) differs from the base (`DIVERGED`), and because the
+        // anchor is line 1 the hunk must match the beginning with its FULL
+        // preimage. Verified against real `git apply`: this is rejected.
+        let base = b"alpha\nbeta\nDIVERGED\n";
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
         )
@@ -6091,11 +6290,19 @@ new mode 100755
 
     #[test]
     fn no_final_newline_base_preserved_when_untouched() {
-        // The change is on line 1; the final line has no newline and is not in
-        // the hunk, so its no-newline state must survive.
+        // The change is on line 1; the final line has no newline and is not
+        // modified, so its no-newline state must survive. This uses the patch
+        // shape real `git diff` emits for such a change — `@@ -1,3 +1,3 @@` with
+        // the two unchanged lines as trailing context (the `\ No newline`
+        // marker rides the last context line). A hand-rolled `@@ -1,1 +1,1 @@`
+        // with NO trailing context would (correctly) be rejected by git, since
+        // a no-trailing-context hunk anchored at line 1 must span the whole
+        // file (`match_beginning` && `match_end`).
         let base = b"alpha\nbeta\nnotail"; // "notail" has no trailing \n
-        let patch = parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n")
-            .expect("test operation should succeed");
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n-alpha\n+ALPHA\n beta\n notail\n\\ No newline at end of file\n",
+        )
+        .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"ALPHA\nbeta\nnotail");
     }
