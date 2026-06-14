@@ -542,13 +542,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .collect()
     };
     let has_differences = !entries.is_empty();
-    // Userdiff driver resolution (`diff=<driver>` attributes + `diff.<name>.*`
-    // config) for hunk headings. Attributes always come from the real
-    // worktree, even when the content comparison is `--cached`.
-    let userdiff = commands::userdiff::UserdiffResolver::new(
-        worktree_root_for_git_dir(&git_dir).ok(),
-        read_repo_config(&git_dir).ok(),
-    );
     if !quiet && !no_patch {
         let mut stdout = io::stdout();
         let show_raw = raw && !name_only && !name_status;
@@ -664,6 +657,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 mode,
                 cli_regex: word_diff_regex.as_deref(),
             });
+            // Userdiff driver resolution (`diff=<driver>` attributes +
+            // `diff.<name>.*` config) for hunk headings. Attributes always come
+            // from the real worktree, even when the content comparison is
+            // `--cached`.
+            let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
+                .ok()
+                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .transpose()?;
+            let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+                userdiff_attributes,
+                read_repo_config(&git_dir).ok(),
+            );
             for entry in &entries {
                 let options = DiffPatchOptions {
                     db: &db,
@@ -1023,12 +1028,6 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     let worktree_root = git_dir
         .as_deref()
         .and_then(|dir| worktree_root_for_git_dir(dir).ok());
-    let userdiff = commands::userdiff::UserdiffResolver::new(
-        worktree_root,
-        git_dir
-            .as_deref()
-            .and_then(|dir| read_repo_config(dir).ok()),
-    );
     let colors = params
         .color
         .then(|| commands::diff_words::DiffColors::enabled(config.as_ref()));
@@ -1051,6 +1050,13 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, ObjectFormat::Sha1);
     if !params.quiet {
         let mut stdout = io::stdout();
+        let userdiff_attributes = worktree_root
+            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .transpose()?;
+        let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+            userdiff_attributes,
+            config.clone(),
+        );
         let options = DiffPatchOptions {
             db: &db,
             worktree_root: None,

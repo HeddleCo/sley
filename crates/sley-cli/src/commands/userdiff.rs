@@ -313,15 +313,18 @@ pub(crate) struct ResolvedDriver {
 /// builtins wholesale, as in `userdiff_find_by_namelen`), then the builtin
 /// table.
 pub(crate) struct UserdiffResolver {
-    worktree_root: Option<PathBuf>,
+    attributes: Option<sley_worktree::StandardAttributeMatcher>,
     config: Option<GitConfig>,
     drivers: RefCell<HashMap<Vec<u8>, Option<Rc<ResolvedDriver>>>>,
 }
 
 impl UserdiffResolver {
-    pub(crate) fn new(worktree_root: Option<PathBuf>, config: Option<GitConfig>) -> Self {
+    pub(crate) fn with_attributes(
+        attributes: Option<sley_worktree::StandardAttributeMatcher>,
+        config: Option<GitConfig>,
+    ) -> Self {
         Self {
-            worktree_root,
+            attributes,
             config,
             drivers: RefCell::new(HashMap::new()),
         }
@@ -339,15 +342,10 @@ impl UserdiffResolver {
     /// Resolve the driver for `path`, or `None` when the `diff` attribute is
     /// unspecified (default behaviour). Fatal pattern errors propagate.
     pub(crate) fn driver_for_path(&self, path: &[u8]) -> Result<Option<Rc<ResolvedDriver>>> {
-        let Some(worktree_root) = self.worktree_root.as_deref() else {
+        let Some(attributes) = self.attributes.as_ref() else {
             return Ok(None);
         };
-        let attrs = sley_worktree::standard_attributes_for_path(
-            worktree_root,
-            path,
-            &[b"diff".to_vec()],
-            false,
-        )?;
+        let attrs = attributes.attributes_for_path(path, &[b"diff".to_vec()], false);
         let state = attrs.into_iter().next().and_then(|check| check.state);
         match state {
             None => Ok(None),

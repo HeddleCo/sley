@@ -1022,10 +1022,15 @@ where
 /// Loose object ids under `objects_dir`, sorted by hex, with packed objects
 /// excluded.
 fn loose_object_ids(objects_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
-    let mut oids = HashSet::new();
-    collect_loose_object_ids(objects_dir, format, &mut oids)?;
+    let oids = loose_object_id_set(objects_dir, format)?;
     let mut oids = oids.into_iter().collect::<Vec<_>>();
     oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    Ok(oids)
+}
+
+fn loose_object_id_set(objects_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+    let mut oids = HashSet::new();
+    collect_loose_object_ids(objects_dir, format, &mut oids)?;
     Ok(oids)
 }
 
@@ -2706,6 +2711,40 @@ fn collect_loose_object_ids(
     Ok(())
 }
 
+fn collect_loose_fanout_object_ids(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    fanout: u8,
+    oids: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let fanout_hex = format!("{fanout:02x}");
+    let fanout_dir = objects_dir.join(&fanout_hex);
+    let entries = match fs::read_dir(&fanout_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let hex_len = format.hex_len();
+    for object_entry in entries {
+        let object_entry = object_entry?;
+        let name = object_entry.file_name();
+        let Some(suffix) = name.to_str() else {
+            continue;
+        };
+        if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        oids.insert(ObjectId::from_hex(format, &format!("{fanout_hex}{suffix}"))?);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct LoosePresenceCache {
+    loaded_fanouts: HashSet<u8>,
+    objects: HashSet<ObjectId>,
+}
+
 /// Every object id resolvable through a pack (any `.idx` or the
 /// multi-pack-index) under `objects_dir/pack`. Used by `--unpacked`
 /// filtering: an object is "unpacked" when absent from this set, regardless
@@ -2987,8 +3026,8 @@ impl FileObjectDatabase {
                 return Ok(true);
             }
         }
-        // Reprepare-on-miss: the loose set may predate a sibling write (see
-        // `read_object`). Rescan once before reporting absence.
+        // Reprepare-on-miss: a cached negative loose verdict may predate a
+        // sibling write. Drop it and exact-probe once before reporting absence.
         self.loose.invalidate_cache();
         self.loose.exists(oid)
     }
@@ -3022,8 +3061,8 @@ impl FileObjectDatabase {
                 return Ok(Some(info));
             }
         }
-        // Reprepare-on-miss: rescan the loose set once before reporting absence
-        // (see `read_object`).
+        // Reprepare-on-miss: drop any stale negative loose cache and exact-probe
+        // once before reporting absence (see `read_object`).
         self.loose.invalidate_cache();
         if let Some(disk_size) = self.loose.disk_size(oid)? {
             return Ok(Some(ObjectStorageInfo {
@@ -3108,8 +3147,8 @@ impl FileObjectDatabase {
                 return Ok(Some(header));
             }
         }
-        // Reprepare-on-miss: rescan the loose set once before reporting absence
-        // (see `read_object`).
+        // Reprepare-on-miss: discard any stale negative loose cache and retry an
+        // exact path probe once before reporting absence (see `read_object`).
         self.loose.invalidate_cache();
         if let Some(header) = self.loose.read_header(oid)? {
             return Ok(Some(header));
@@ -3575,14 +3614,11 @@ impl ObjectReader for FileObjectDatabase {
                 Err(err) => return Err(err),
             }
         }
-        // Hard miss against every store. The loose set is consulted before the
-        // filesystem, so an object written loose *after* this handle's set was
-        // scanned — e.g. by a sibling handle or sub-operation within the same
-        // process — would be falsely reported absent. Mirror git's
-        // `oid_object_info_extended` reprepare-on-miss: drop the loose set, rescan,
-        // and retry the loose read once before declaring the object missing. The
-        // rescan only happens on a genuine miss, so the steady-state hot path
-        // (objects found in pack) never pays for it.
+        // Hard miss against every store. If an earlier enumeration built a loose
+        // cache, an object written loose afterward by a sibling handle could have
+        // been skipped above. Mirror git's `oid_object_info_extended`
+        // reprepare-on-miss: drop stale cache state and retry an exact loose path
+        // probe once before declaring the object missing.
         self.loose.invalidate_cache();
         match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),
@@ -3737,14 +3773,14 @@ pub struct LooseObjectStore {
     objects_dir: PathBuf,
     format: ObjectFormat,
     /// Lazily-populated set of loose object ids present on disk, mirroring git's
-    /// `loose_objects_cache` (object-file.c). `None` until the first access scans
-    /// the `objects/XX/` fanout; thereafter reads consult the set and skip the
-    /// per-oid `open()`/`stat()` for ids known to be packed-only. Shared across
+    /// `loose_objects_cache` (object-file.c). A lookup scans the queried
+    /// `objects/XX/` fanout once; afterward misses in that fanout are in-memory
+    /// checks instead of failed exact-path opens. Shared across
     /// `FileObjectDatabase` clones via `Arc` so a write through one handle is
     /// visible to reads through another; cleared by `refresh_read_cache` so
     /// objects installed out-of-band (fetch, repack) become visible. Writes
     /// extend the set in place rather than invalidating it.
-    loose_cache: Arc<Mutex<Option<HashSet<ObjectId>>>>,
+    loose_cache: Arc<Mutex<LoosePresenceCache>>,
 }
 
 impl LooseObjectStore {
@@ -3752,43 +3788,50 @@ impl LooseObjectStore {
         Self {
             objects_dir: objects_dir.into(),
             format,
-            loose_cache: Arc::new(Mutex::new(None)),
+            loose_cache: Arc::new(Mutex::new(LoosePresenceCache::default())),
         }
     }
 
-    /// Whether `oid` is *known* to be present in loose storage according to the
-    /// in-memory cache. Returns `Ok(false)` only when the cache is populated and
-    /// the id is absent — i.e. a definitive "not loose" verdict that lets the
-    /// caller skip the filesystem probe. A poisoned lock falls back to `true`
-    /// (forcing the real filesystem read) so a lock failure never hides an
-    /// on-disk object. The first call populates the cache by scanning the fanout
-    /// once (git's `odb_loose_cache` lazy fill).
-    fn loose_oid_present(&self, oid: &ObjectId) -> bool {
-        let mut guard = match self.loose_cache.lock() {
-            Ok(guard) => guard,
-            // Poisoned lock: don't trust the cache, force the filesystem read.
-            Err(_) => return true,
-        };
-        if guard.is_none() {
-            // Scan the fanout once. A scan error (e.g. a transient readdir
-            // failure) leaves the cache unpopulated and forces filesystem reads
-            // for this call; a later call retries the scan.
-            match loose_object_ids(&self.objects_dir, self.format) {
-                Ok(ids) => *guard = Some(ids.into_iter().collect()),
-                Err(_) => return true,
-            }
+    /// Whether `oid` is present according to the loose-object cache, populating
+    /// the cache on first use. Returns `None` when the lock cannot be trusted or
+    /// the scan fails; callers should fall back to an exact filesystem probe in
+    /// that case so a cache-building problem cannot change read semantics.
+    fn cached_loose_presence(&self, oid: &ObjectId) -> Option<bool> {
+        let mut guard = self.loose_cache.lock().ok()?;
+        let fanout = oid.as_bytes()[0];
+        if !guard.loaded_fanouts.contains(&fanout) {
+            collect_loose_fanout_object_ids(
+                &self.objects_dir,
+                self.format,
+                fanout,
+                &mut guard.objects,
+            )
+            .ok()?;
+            guard.loaded_fanouts.insert(fanout);
         }
-        guard.as_ref().map(|set| set.contains(oid)).unwrap_or(true)
+        Some(guard.objects.contains(oid))
+    }
+
+    /// Populate the loose-object cache and return the sorted ids. This mirrors
+    /// git's `odb_loose_cache` lazy fill and is reserved for operations that
+    /// really need loose-object enumeration.
+    fn loose_object_ids_cached(&self) -> Result<Vec<ObjectId>> {
+        if let Ok(mut guard) = self.loose_cache.lock() {
+            guard.objects = loose_object_id_set(&self.objects_dir, self.format)?;
+            guard.loaded_fanouts = (0..=u8::MAX).collect();
+            let mut ids = guard.objects.iter().copied().collect::<Vec<_>>();
+            ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            return Ok(ids);
+        }
+        loose_object_ids(&self.objects_dir, self.format)
     }
 
     /// Record `oid` as present in loose storage so subsequent reads find it
     /// without a rescan. A no-op when the cache has not been populated yet (the
     /// eventual lazy scan will pick the object up) or the lock is poisoned.
     fn note_loose_write(&self, oid: ObjectId) {
-        if let Ok(mut guard) = self.loose_cache.lock()
-            && let Some(set) = guard.as_mut()
-        {
-            set.insert(oid);
+        if let Ok(mut guard) = self.loose_cache.lock() {
+            guard.objects.insert(oid);
         }
     }
 
@@ -3796,7 +3839,7 @@ impl LooseObjectStore {
     /// by `FileObjectDatabase::refresh_read_cache` after out-of-band installs.
     pub(crate) fn invalidate_cache(&self) {
         if let Ok(mut guard) = self.loose_cache.lock() {
-            *guard = None;
+            *guard = LoosePresenceCache::default();
         }
     }
 
@@ -3818,7 +3861,7 @@ impl LooseObjectStore {
 
     pub fn exists(&self, oid: &ObjectId) -> Result<bool> {
         let path = self.object_path(oid)?;
-        if !self.loose_oid_present(oid) {
+        if self.cached_loose_presence(oid) == Some(false) {
             return Ok(false);
         }
         Ok(path.exists())
@@ -3826,7 +3869,7 @@ impl LooseObjectStore {
 
     pub fn disk_size(&self, oid: &ObjectId) -> Result<Option<u64>> {
         let path = self.object_path(oid)?;
-        if !self.loose_oid_present(oid) {
+        if self.cached_loose_presence(oid) == Some(false) {
             return Ok(None);
         }
         match fs::metadata(path) {
@@ -3842,7 +3885,7 @@ impl LooseObjectStore {
     /// Returns `Ok(None)` when the loose object is absent.
     pub fn read_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
         let path = self.object_path(oid)?;
-        if !self.loose_oid_present(oid) {
+        if self.cached_loose_presence(oid) == Some(false) {
             return Ok(None);
         }
         let mut file = match fs::File::open(&path) {
@@ -3904,7 +3947,7 @@ impl LooseObjectStore {
 
     /// Loose object ids in this store, sorted by hex.
     pub fn object_ids(&self) -> Result<Vec<ObjectId>> {
-        loose_object_ids(&self.objects_dir, self.format)
+        self.loose_object_ids_cached()
     }
 
     /// fsck's loose-object integrity probe, mirroring C git's `read_loose_object`
@@ -3987,9 +4030,10 @@ fn read_full_prefix(file: &mut fs::File, prefix: &mut [u8]) -> Result<usize> {
 impl ObjectReader for LooseObjectStore {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         let path = self.object_path(oid)?;
-        // Skip the `open()` (and its ENOENT) for ids the loose cache knows are
-        // not on disk — the dominant wasted syscall when reading packed objects.
-        if !self.loose_oid_present(oid) {
+        // Skip the `open()` (and its ENOENT) when an already-built loose cache
+        // knows the id is absent. Without a cache, use an exact path probe; a
+        // full fanout scan is far more expensive for one-shot packed-object reads.
+        if self.cached_loose_presence(oid) == Some(false) {
             return Err(GitError::object_not_found_in(
                 *oid,
                 MissingObjectContext::Read,
@@ -4242,6 +4286,27 @@ mod tests {
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_database_loose_cache_observes_same_process_write_after_miss() {
+        let root = temp_root("sley-file-odb-loose-cache-write");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let object = EncodedObject::new(ObjectType::Blob, b"written after miss\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        assert!(matches!(db.read_object(&oid), Err(GitError::NotFound(_))));
+        db.loose()
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+
         assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

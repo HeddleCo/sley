@@ -800,27 +800,6 @@ Disable this message with \"git config set advice.defaultBranchName false\"";
 /// reinitialize-with-different-format guard is applied later in
 /// [`RepositoryBootstrap::init`], once the existing repository format is known.
 
-/// git's `repo_default_branch_name`: `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`
-/// overrides the `init.defaultBranch` configuration (read from the default
-/// config layers: `-c` overrides, then system/global files); the hardcoded
-/// fallback is `master`.
-fn default_initial_branch_name(
-    global_config: &[GlobalConfigOverride],
-    config_git_dir: Option<&Path>,
-) -> Result<String> {
-    if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
-        && !env.is_empty()
-    {
-        return Ok(env);
-    }
-    match init_config_value("init.defaultBranch", global_config, config_git_dir)?
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => Ok(value),
-        None => Ok("master".to_string()),
-    }
-}
-
 fn init_config_value(
     key: &str,
     global_config: &[GlobalConfigOverride],
@@ -2256,13 +2235,6 @@ fn write_diff_patch_entry(
         content.truncate(content.len() - 1);
         content.extend_from_slice(b"-dirty\n");
     }
-    let content_changed = old_content.as_deref() != new_content.as_deref();
-    if old_content.as_deref().is_some_and(is_binary_content)
-        || new_content.as_deref().is_some_and(is_binary_content)
-    {
-        return write_diff_binary_patch_entry(stdout, entry, old_content, new_content, options);
-    }
-
     let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
     let diff_old_path = diff_patch_prefixed_path(options.src_prefix, old_path);
     let diff_path = diff_patch_prefixed_path(options.dst_prefix, &entry.path);
@@ -2271,6 +2243,28 @@ fn write_diff_patch_entry(
     let old_similarity_path = status_quote_path(old_path, false);
     let similarity_path = status_quote_path(&entry.path, false);
     let colors = options.colors;
+    let (old_driver, new_driver) = match options.userdiff {
+        Some(resolver) => (
+            resolver.driver_for_path(old_path)?,
+            resolver.driver_for_path(&entry.path)?,
+        ),
+        None => (None, None),
+    };
+    let binary_override = old_driver
+        .as_ref()
+        .and_then(|driver| driver.binary)
+        .or_else(|| new_driver.as_ref().and_then(|driver| driver.binary));
+    let treat_as_binary = match binary_override {
+        Some(binary) => binary,
+        None => {
+            old_content.as_deref().is_some_and(is_binary_content)
+                || new_content.as_deref().is_some_and(is_binary_content)
+        }
+    };
+    if treat_as_binary {
+        return write_diff_binary_patch_entry(stdout, entry, old_content, new_content, options);
+    }
+    let content_changed = old_content.as_deref() != new_content.as_deref();
     write_diff_meta_line(
         stdout,
         colors,
@@ -2342,13 +2336,6 @@ fn write_diff_patch_entry(
     // funcname pattern comes from the old side's driver, then the new side's,
     // mirroring diff_funcname_pattern(one) ?: diff_funcname_pattern(two);
     // the word regex resolves CLI > old driver > new driver > diff.wordRegex.
-    let (old_driver, new_driver) = match options.userdiff {
-        Some(resolver) => (
-            resolver.driver_for_path(old_path)?,
-            resolver.driver_for_path(&entry.path)?,
-        ),
-        None => (None, None),
-    };
     let funcname = old_driver
         .as_ref()
         .and_then(|driver| driver.funcname.as_ref())
@@ -7825,7 +7812,7 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
     }
     let orig_len = out.len();
     let mut assume_utf8 = true;
-    loop {
+    'retry: loop {
         // (re)try entry point
         let mut pos = 0usize; // index into `text`
         let mut bol = 0usize;
@@ -7836,7 +7823,6 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
             w = -indent;
             space = Some(0);
         }
-        let mut restart = false;
         loop {
             // (skip ANSI escapes — not present in the corpus; omitted.)
             let c = text.get(pos).copied().unwrap_or(0);
@@ -7923,8 +7909,9 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
                     }
                     None => {
                         // broken utf-8: restart in byte mode
-                        restart = true;
-                        break;
+                        assume_utf8 = false;
+                        out.truncate(orig_len);
+                        continue 'retry;
                     }
                 }
             } else {
@@ -7932,12 +7919,6 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
                 pos += 1;
             }
         }
-        if restart {
-            assume_utf8 = false;
-            out.truncate(orig_len);
-            continue;
-        }
-        return;
     }
 }
 

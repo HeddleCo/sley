@@ -48,6 +48,7 @@ mod notes_repo;
 mod objects;
 mod refs;
 mod remote_edit;
+mod status_plan;
 
 #[cfg(feature = "remote")]
 pub mod remote;
@@ -106,23 +107,25 @@ pub use sley_refs::{
 };
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
-    AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, ShortStatusEntry,
-    ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState, write_metadata_file_atomic,
+    AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
+    ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
+    write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;
 pub use config_edit::{
-    ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigSectionEntry,
-    ConfigSnapshot, ConfigSource, ConfigValue, RemoteConfig, RemoteConfigRefusal,
-    RemoteConfigRemove, RemoteConfigSet, RemoteConfigSnapshot, RemoteConfigSource,
-    RemoteConfigValue,
+    ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigRemote, ConfigSectionEntry,
+    ConfigSectionId, ConfigSnapshot, ConfigSource, ConfigStackOptions, ConfigStackView,
+    ConfigValue, RemoteConfig, RemoteConfigRefusal, RemoteConfigRemove, RemoteConfigSet,
+    RemoteConfigSnapshot, RemoteConfigSource, RemoteConfigValue, WorktreeConfig,
 };
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
-pub use objects::LoadedObject;
+pub use objects::{BlobFetchOptions, BlobStore, LoadedObject};
 pub use refs::{
     DeleteRef, RefBatchChange, RefChange, RefChangeResult, RefConflict, RefDeleteExpected,
-    ReflogMessage,
+    RefUpdateOptions, ReflogMessage,
 };
+pub use status_plan::{StatusCacheKey, StatusPlan, StatusPlanBuilder};
 
 /// A resolved reference: its full name plus the target it points at.
 ///
@@ -138,6 +141,27 @@ pub struct Reference {
 }
 
 impl Reference {
+    /// Return this reference's immediate direct object id.
+    ///
+    /// This intentionally does not follow symbolic refs and does not peel
+    /// annotated tags. Use [`Repository::require_reference`] first when absence
+    /// is a hard error, then choose explicit symbolic resolution or object
+    /// peeling at the call site.
+    pub fn direct_target(&self) -> Result<ObjectId> {
+        match &self.target {
+            RefTarget::Direct(oid) => Ok(*oid),
+            RefTarget::Symbolic(target) => Err(GitError::InvalidFormat(format!(
+                "reference {} is symbolic to {target}",
+                self.name
+            ))),
+        }
+    }
+
+    /// Borrow this reference's immediate on-disk target.
+    pub fn immediate_target(&self) -> &RefTarget {
+        &self.target
+    }
+
     /// The object id this reference resolves to, if it is (or chains to) a
     /// direct reference.
     pub fn peeled_oid(&self, repo: &Repository) -> Result<Option<ObjectId>> {
@@ -180,6 +204,50 @@ impl Head {
             .as_ref()
             .map(FullName::as_str)
             .and_then(|name| name.strip_prefix("refs/heads/"))
+    }
+}
+
+/// Repository open behavior for callers that need to distinguish discovery from
+/// exact git-directory opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOptions {
+    exact_path: bool,
+    bare: bool,
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self {
+            exact_path: false,
+            bare: false,
+        }
+    }
+
+    /// When true, `path` must be the git directory itself; no parent discovery is
+    /// performed. When false, `path` is treated like [`Repository::discover`].
+    pub fn exact_path(mut self, exact_path: bool) -> Self {
+        self.exact_path = exact_path;
+        self
+    }
+
+    /// Require the opened repository to be bare.
+    pub fn bare(mut self, bare: bool) -> Self {
+        self.bare = bare;
+        self
+    }
+
+    pub fn is_exact_path(self) -> bool {
+        self.exact_path
+    }
+
+    pub fn requires_bare(self) -> bool {
+        self.bare
+    }
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -227,6 +295,30 @@ impl Repository {
             )));
         }
         Self::from_git_dir(git_dir)
+    }
+
+    /// Open a repository with explicit discovery and bare-worktree policy.
+    ///
+    /// Use `OpenOptions::new().exact_path(true).bare(true)` for scratch bare
+    /// directories where silently discovering a parent checkout would be wrong.
+    pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
+        let repo = if options.exact_path {
+            Self::open(path)
+        } else {
+            Self::discover(path)
+        }?;
+        if options.bare && repo.workdir().is_some() {
+            return Err(GitError::InvalidFormat(format!(
+                "repository is not bare: {}",
+                repo.git_dir.display()
+            )));
+        }
+        Ok(repo)
+    }
+
+    /// Open exactly `git_dir` as a bare repository, never discovering a parent.
+    pub fn open_exact_bare(git_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(git_dir, OpenOptions::new().exact_path(true).bare(true))
     }
 
     /// Discover the repository containing `path` by walking up the directory
@@ -477,6 +569,58 @@ impl Repository {
         Ok(refs
             .read_ref(name.as_str())?
             .map(|target| Reference { name, target }))
+    }
+
+    /// Return whether `name` exists in the ref backend without resolving its
+    /// target or reading the object it names.
+    pub fn reference_exists(&self, name: &str) -> Result<bool> {
+        self.references().raw_ref_exists(name)
+    }
+
+    /// Look up a reference that must exist.
+    pub fn require_reference(&self, name: &str) -> Result<Reference> {
+        self.find_reference(name)?
+            .ok_or_else(|| GitError::reference_not_found(name))
+    }
+
+    /// Peel annotated tags until the referenced non-tag object is reached.
+    ///
+    /// This does not resolve symbolic refs. Use [`Reference::direct_target`] or
+    /// [`Repository::head`] first so the call site is explicit about symbolic
+    /// reference resolution versus object graph peeling.
+    pub fn peel_to_object_oid(&self, oid: ObjectId) -> Result<ObjectId> {
+        const MAX_TAG_DEPTH: usize = 1024;
+        let mut current = oid;
+        for _ in 0..MAX_TAG_DEPTH {
+            let object = self.read_object(&current).map_err(|err| {
+                expect_missing_object_kind(
+                    err,
+                    current,
+                    MissingObjectKind::Object,
+                    MissingObjectContext::Traversal,
+                )
+            })?;
+            if object.object_type != ObjectType::Tag {
+                return Ok(current);
+            }
+            let tag = Tag::parse(self.format, &object.body)?;
+            current = tag.object;
+        }
+        Err(GitError::InvalidObject(format!(
+            "annotated tag chain too deep starting at {oid}"
+        )))
+    }
+
+    /// Peel an object id to the commit it ultimately names.
+    pub fn peel_to_commit_oid(&self, oid: ObjectId) -> Result<ObjectId> {
+        sley_rev::peel_to_commit(self.objects.as_ref(), self.format, &oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                oid,
+                MissingObjectKind::Commit,
+                MissingObjectContext::Traversal,
+            )
+        })
     }
 
     /// Resolve a revision specification (anything `git rev-parse` accepts:
@@ -921,6 +1065,23 @@ mod tests {
     }
 
     #[test]
+    fn open_exact_bare_never_discovers_parent_repo() {
+        let temp = TempDir::new();
+        Repository::init(temp.path()).expect("init parent");
+        let scratch = temp.path().join("nested").join("scratch.git");
+        fs::create_dir_all(&scratch).expect("create scratch path");
+
+        Repository::open_exact_bare(&scratch).expect_err("exact open must not discover parent");
+        let discovered = Repository::discover(&scratch).expect("discover parent repo");
+        assert_eq!(discovered.git_dir(), temp.path().join(".git"));
+
+        let bare = TempDir::new();
+        let bare_repo = Repository::init_bare(bare.path()).expect("init bare");
+        let exact = Repository::open_exact_bare(bare.path()).expect("open exact bare");
+        assert_eq!(exact.git_dir(), bare_repo.git_dir());
+    }
+
+    #[test]
     fn head_is_unborn_after_init() {
         let temp = TempDir::new();
         let repo = Repository::init(temp.path()).expect("init");
@@ -933,6 +1094,84 @@ mod tests {
         assert!(head.is_unborn());
         assert!(!head.is_detached());
         assert_eq!(head.branch_name(), Some("main"));
+    }
+
+    #[test]
+    fn reference_helpers_keep_direct_tag_target_separate_from_peeling() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let commit_oid = seed_commit(&repo);
+        let tag = Tag {
+            object: commit_oid,
+            object_type: ObjectType::Commit,
+            name: b"v1.0".to_vec(),
+            tagger: Some(b"Tester <test@example.com> 1700000001 +0000".to_vec()),
+            message: b"release\n".to_vec(),
+            raw_body: None,
+        };
+        let tag_oid = repo
+            .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
+            .expect("write tag");
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/tags/v1.0", RefTarget::Direct(tag_oid)).expect("valid tag ref")
+        ])
+        .expect("write tag ref");
+
+        assert!(
+            repo.reference_exists("refs/tags/v1.0")
+                .expect("exists check")
+        );
+        let tag_ref = repo
+            .require_reference("refs/tags/v1.0")
+            .expect("require tag ref");
+        assert_eq!(tag_ref.direct_target().expect("direct target"), tag_oid);
+        assert_eq!(
+            repo.peel_to_object_oid(tag_oid).expect("peel object"),
+            commit_oid
+        );
+        assert_eq!(
+            repo.peel_to_commit_oid(tag_oid).expect("peel commit"),
+            commit_oid
+        );
+    }
+
+    #[test]
+    fn blob_boundary_and_status_plan_are_embedder_facing_facades() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let blob_oid = repo.write_blob(b"payload").expect("write blob");
+
+        let bytes = repo
+            .blobs()
+            .read_or_fetch_blocking(blob_oid, BlobFetchOptions::from_remote("origin"))
+            .expect("read local blob");
+        assert_eq!(bytes, b"payload");
+
+        let missing = ObjectId::null(repo.object_format());
+        let err = repo
+            .blobs()
+            .read_or_fetch_blocking(missing, BlobFetchOptions::from_remote("origin"))
+            .expect_err("missing blob");
+        match err.not_found_kind() {
+            Some(NotFoundKind::Object { oid, kind, context }) => {
+                assert_eq!(*oid, missing);
+                assert_eq!(*kind, MissingObjectKind::Blob);
+                assert_eq!(*context, Some(MissingObjectContext::RemoteBoundary));
+            }
+            other => panic!("expected typed missing blob, got {other:?}"),
+        }
+
+        let status = repo
+            .status_plan()
+            .include_untracked(false)
+            .reuse_index_cache("health")
+            .build()
+            .expect("status plan");
+        assert_eq!(
+            status.cache_key().map(StatusCacheKey::as_str),
+            Some("health")
+        );
+        assert!(status.collect().expect("collect status").is_empty());
     }
 
     #[test]

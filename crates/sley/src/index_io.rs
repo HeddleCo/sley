@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use sley_index::{Index, IndexEntry};
 
-use crate::{GitError, IndexStatProbe, Repository};
+use crate::{GitError, IndexStatProbe, IndexStatProbeCache, Repository};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IndexWriteOptions {
@@ -84,6 +84,16 @@ impl Repository {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(IndexError::NotFound),
             Err(err) => Err(IndexError::Io(err)),
         }
+    }
+
+    /// Read this repository's index once and return reusable stat probes.
+    ///
+    /// This is the bulk form of [`IndexStatProbe::from_repository_index`].
+    /// Embedders that verify many worktree paths should prefer this method so
+    /// `.git/index` is parsed once instead of once per path.
+    pub fn index_stat_probes(&self) -> std::result::Result<IndexStatProbeCache, IndexError> {
+        IndexStatProbeCache::from_repository_index(&self.git_dir, self.format)
+            .map_err(IndexError::from_git_error)
     }
 
     /// Write this repository's index through `index.lock` and an atomic rename.
