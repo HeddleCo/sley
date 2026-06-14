@@ -2029,6 +2029,16 @@ fn am_print_conflict_hints() {
     eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
 }
 
+/// The hint block git's `die_user_resolve` prints to stderr when `am
+/// --continue`/`--resolved` refuses (no staged changes, or unmerged paths).
+/// Same lines as the conflict hints minus the "--show-current-patch" pointer.
+fn am_print_resolve_hints() {
+    eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
+    eprintln!("hint: If you prefer to skip this patch, run \"git am --skip\" instead.");
+    eprintln!("hint: To restore the original branch and stop patching, run \"git am --abort\".");
+    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+}
+
 fn am_print_empty_patch_hints() {
     eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
     eprintln!("hint: If you prefer to skip this patch, run \"git am --skip\" instead.");
@@ -2153,15 +2163,46 @@ fn am_continue(
         println!("Applying: {}", patch.subject);
     }
 
-    // Refuse if the index still has unmerged entries (unresolved conflicts).
-    if let Some(index) = read_repository_index(git_dir, format)?
-        && index
+    // git's `am_resolve` validates two preconditions before committing the
+    // user's staged resolution. We must distinguish them because the unmerged
+    // case and the nothing-staged case carry different messages (and the latter
+    // is what cell t4150-am.52 checks).
+    let index = read_repository_index(git_dir, format)?;
+    let has_unmerged = index.as_ref().is_some_and(|index| {
+        index
             .entries
             .iter()
             .any(|entry| (entry.flags >> 12) & 0x3 != 0)
+    });
+
+    // (1) Unmerged paths: refuse with git's "still have unmerged paths" message.
+    // (`write_tree` would fail on an unmerged index, so this is checked before
+    // the no-changes test below — git's `repo_index_has_changes` reports such an
+    // index as *changed*, so it reaches the same unmerged branch.)
+    if has_unmerged {
+        println!("You still have unmerged paths in your index.");
+        println!(
+            "You should 'git add' each file with resolved conflicts to mark them as such."
+        );
+        println!("You might run `git rm` on a file to accept \"deleted by them\" for it.");
+        am_print_resolve_hints();
+        return Err(GitError::Exit(128));
+    }
+
+    // (2) Nothing staged: the index matches HEAD, so there is nothing to commit.
+    // git prints "No changes - did you forget to use 'git add'?" and refuses.
+    let refs = FileRefStore::new(git_dir, format);
+    if let Some(head_oid) = head_commit_oid(&refs)?
+        && !am_index_is_dirty(git_dir, common_git_dir, format, &head_oid)?
     {
-        am_print_conflict_hints();
-        println!("Patch failed at {next:04} {}", patch.subject);
+        println!("No changes - did you forget to use 'git add'?");
+        println!(
+            "If there is nothing left to stage, chances are that something else"
+        );
+        println!(
+            "already introduced the same changes; you might want to skip this patch."
+        );
+        am_print_resolve_hints();
         return Err(GitError::Exit(128));
     }
 
