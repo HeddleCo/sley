@@ -53,10 +53,23 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 setup_not = !setup_not;
                 setup_args.push(arg.clone());
             }
-            "--full-history" | "--reverse" | "--first-parent" | "--no-first-parent"
-            | "--topo-order" | "--date-order" | "--author-date-order" | "--no-walk"
-            | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" | "--all" | "--no-all"
-            | "--branches" | "--tags" | "--remotes" | "--ignore-missing"
+            "--full-history"
+            | "--reverse"
+            | "--first-parent"
+            | "--no-first-parent"
+            | "--topo-order"
+            | "--date-order"
+            | "--author-date-order"
+            | "--no-walk"
+            | "--no-walk=sorted"
+            | "--no-walk=unsorted"
+            | "--do-walk"
+            | "--all"
+            | "--no-all"
+            | "--branches"
+            | "--tags"
+            | "--remotes"
+            | "--ignore-missing"
             | "--no-ignore-missing" => setup_args.push(arg.clone()),
             "--default" | "-n" | "--max-count" | "--skip" | "--max-age" | "--min-age"
             | "--since" | "--after" | "--until" | "--before" | "--glob" | "--exclude"
@@ -561,6 +574,27 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         && max_age.is_none()
         && min_age.is_none()
     {
+        if count
+            && skip_count == 0
+            && max_count.is_none()
+            && excluded.is_empty()
+            && min_parents.is_none()
+            && max_parents.is_none()
+        {
+            let total = if quiet {
+                0
+            } else {
+                sley_rev::count_commit_metadata(
+                    &git_dir,
+                    format,
+                    &db,
+                    include_commits.clone(),
+                    first_parent,
+                )?
+            };
+            println!("{total}");
+            return Ok(());
+        }
         let limit = max_count.map(|max| skip_count.saturating_add(max));
         let metadata = if let Some(limit) = limit.filter(|limit| *limit > 0) {
             sley_rev::walk_commit_metadata_date_ordered_limited(

@@ -1625,6 +1625,38 @@ pub fn walk_commit_metadata<R: ObjectReader>(
     Ok(out)
 }
 
+/// Count commits reachable from `starts` without materializing the walk output.
+///
+/// This is the count-only sibling of [`walk_commit_metadata`]: it uses the same
+/// commit-graph/object fallback lookup and parent traversal, but skips the final
+/// `Vec<CommitMetadata>` allocation that callers such as `rev-list --count` do
+/// not need.
+pub fn count_commit_metadata<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    starts: impl IntoIterator<Item = ObjectId>,
+    first_parent: bool,
+) -> Result<usize> {
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
+    let mut count = 0usize;
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let metadata = commit_metadata_lookup(&mut graph, reader, format, &oid)?;
+        if first_parent {
+            pending.extend(metadata.parents.first().cloned());
+        } else {
+            pending.extend(metadata.parents.iter().cloned());
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Walk history in committer-date order, stopping after `limit` commits. This is
 /// the early-stop counterpart of walking every ancestor and then sorting for
 /// `rev-list`/`log -n`.

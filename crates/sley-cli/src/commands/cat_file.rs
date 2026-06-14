@@ -1,6 +1,6 @@
 //! `git cat-file`: inspect objects and run the batch object-query protocol.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
@@ -741,9 +741,10 @@ impl CatFileBatchRequest {
         let view = RepositoryObjectView::discover()?;
         let apply_replace = self.apply_replace(&view)?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
         let terminator = if self.output_nul { b'\0' } else { b'\n' };
-        let emit = |stdout: &mut io::Stdout, line: &str| -> Result<()> {
+        let emit = |stdout: &mut dyn Write, line: &str| -> Result<()> {
             let (object_name, rest) = cat_file_batch_input(line, batch_format.as_ref());
             print_cat_file_batch_record(
                 stdout,
@@ -792,7 +793,8 @@ impl CatFileBatchRequest {
         let view = RepositoryObjectView::discover()?;
         let apply_replace = self.apply_replace(&view)?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
         let terminator = if self.output_nul { b'\0' } else { b'\n' };
         // In `--buffer` mode, `info`/`contents` commands are queued and only emitted when a
         // `flush` command is read (upstream `batch_objects_command`). Without `--buffer` each
@@ -858,7 +860,7 @@ impl CatFileBatchRequest {
 
     fn run_batch_command(
         &self,
-        stdout: &mut io::Stdout,
+        stdout: &mut dyn Write,
         view: &RepositoryObjectView,
         batch_format: Option<&CatFileBatchFormat<'_>>,
         apply_replace: bool,
@@ -1019,7 +1021,7 @@ struct CatFileBatchRecord<'a> {
 }
 
 fn print_cat_file_batch_record(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: CatFileBatchRecord<'_>,
 ) -> Result<()> {
     let query = ObjectQuery {
@@ -1170,7 +1172,7 @@ fn print_cat_file_batch_record(
 /// `None`) when the object is absent; and aborts the batch with `fatal: invalid object type`
 /// when the object exists but has an unknown-type header (upstream's hard `die`).
 fn batch_object_header(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     query: &ObjectQuery<'_>,
     result: Result<Option<(ObjectType, u64)>>,
@@ -1205,7 +1207,7 @@ fn batch_object_header(
 /// every other absent object reports `<name> missing`. Mirrors upstream's `report_object_status`
 /// dispatch on `S_IFGITLINK`.
 fn report_object_missing(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     query: &ObjectQuery<'_>,
 ) -> Result<()> {
@@ -1225,7 +1227,7 @@ fn report_object_missing(
 /// the unresolvable link remainder for `symlink`. Upstream flushes after each of these
 /// regardless of `--buffer`; mirror that.
 fn print_cat_file_symlink_status(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     status: &str,
     payload: &[u8],
@@ -1241,7 +1243,7 @@ fn print_cat_file_symlink_status(
 /// Report a filter-excluded object. With `--batch-all-objects` upstream simply omits it; for
 /// stdin-driven queries it prints `<name> excluded<terminator>` (the input name, like the
 /// `missing` status line).
-fn print_cat_file_excluded(stdout: &mut io::Stdout, record: &CatFileBatchRecord<'_>) -> Result<()> {
+fn print_cat_file_excluded(stdout: &mut dyn Write, record: &CatFileBatchRecord<'_>) -> Result<()> {
     if record.all_objects {
         return Ok(());
     }
@@ -1273,7 +1275,7 @@ impl ObjectQuery<'_> {
 }
 
 fn print_cat_file_batch_header(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     oid: &ObjectId,
     object_type: ObjectType,
@@ -1385,7 +1387,7 @@ struct CatFileBatchFormatValues<'a> {
 }
 
 fn print_cat_file_batch_format(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     format: &CatFileBatchFormat<'_>,
     values: CatFileBatchFormatValues<'_>,
 ) -> Result<()> {
