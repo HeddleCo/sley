@@ -111,9 +111,8 @@ struct DiffTreeOptions {
     patch_full_index: bool,
     src_prefix: String,
     dst_prefix: String,
-    /// Positional tree-ish/commit arguments (everything that is not an option and
-    /// not a trailing pathspec).
-    revs: Vec<String>,
+    /// Revision/pathspec arguments passed to the shared revision parser.
+    setup_args: Vec<String>,
 }
 
 impl Default for DiffTreeOptions {
@@ -139,7 +138,7 @@ impl Default for DiffTreeOptions {
             patch_full_index: false,
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
-            revs: Vec::new(),
+            setup_args: Vec::new(),
         }
     }
 }
@@ -154,17 +153,40 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             .find_map(|arg| arg.strip_prefix("--pretty="))
             .filter(|fmt| *fmt == "tformat:%s" || *fmt == "format:%s");
         if silent && let Some(_fmt) = pretty {
-            let revs: Vec<&String> = args
+            let setup_args: Vec<String> = args
                 .iter()
                 .filter(|arg| !arg.starts_with('-') || arg.as_str() == "-")
+                .cloned()
                 .collect();
-            if let [rev] = revs.as_slice() {
+            if setup_args.len() == 1 {
                 let cwd = env::current_dir()?;
                 let git_dir = discover_git_dir(&cwd)?;
                 let format = repository_object_format(&git_dir)?;
+                let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                let oid = resolve_revision(&git_dir, format, rev)?;
-                let commit_oid = sley_rev::peel_to_commit(&db, format, &oid)?;
+                let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+                let setup = sley_rev::setup_revisions(
+                    &setup_args,
+                    &sley_rev::RevisionSetupContext {
+                        git_dir: &git_dir,
+                        worktree_root: worktree_root.as_deref(),
+                        cwd: &cwd,
+                        format,
+                        reader: &db,
+                        config: Some(&config),
+                    },
+                )?;
+                if setup.options.positives.len() != 1
+                    || !setup.pathspecs.is_empty()
+                    || !setup.options.negatives.is_empty()
+                    || !setup.options.symmetric_ranges.is_empty()
+                {
+                    return Err(GitError::Unsupported(
+                        "diff-tree pretty/commit-log output is not supported".into(),
+                    ));
+                }
+                let commit_oid =
+                    sley_rev::peel_to_commit(&db, format, &setup.options.positives[0].oid)?;
                 let object = db.read_object(&commit_oid)?;
                 let commit = Commit::parse(format, &object.body)?;
                 println!("{}", commit_subject(&commit.message));
@@ -173,18 +195,20 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         }
     }
     let mut options = DiffTreeOptions::default();
-    let mut pathspecs: Vec<String> = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
         if positional_only {
-            pathspecs.push(arg.clone());
+            options.setup_args.push(arg.clone());
             idx += 1;
             continue;
         }
         match arg.as_str() {
-            "--" => positional_only = true,
+            "--" => {
+                options.setup_args.push(arg.clone());
+                positional_only = true;
+            }
             "-r" | "--recursive" => options.recursive = true,
             "-t" => {
                 options.recursive = true;
@@ -320,7 +344,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             // First non-option token starts the positional (rev/pathspec) list.
             // A leading bare `-` is treated as a positional too.
             _ => {
-                options.revs.push(arg.clone());
+                options.setup_args.push(arg.clone());
                 // Any remaining tokens after we have collected the maximum of two
                 // tree-ish operands are pathspecs. git treats trailing operands
                 // that resolve to paths as pathspecs; we keep parsing options so
@@ -332,14 +356,6 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         idx += 1;
     }
 
-    // We do not implement pathspec filtering for diff-tree; reject it clearly so
-    // we never silently ignore a path restriction.
-    if !pathspecs.is_empty() || options.revs.len() > 2 {
-        return Err(GitError::Unsupported(
-            "diff-tree pathspec filtering is not supported".into(),
-        ));
-    }
-
     if !options.output.any() {
         options.output.raw = true;
     }
@@ -347,6 +363,35 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
+    let setup = sley_rev::setup_revisions(
+        &options.setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir,
+            worktree_root: repo.worktree_root().ok(),
+            cwd: repo.cwd(),
+            format,
+            reader: db,
+            config: Some(repo.config()),
+        },
+    )?;
+    if let Some(leftover) = setup.leftovers.first() {
+        return Err(GitError::Command(format!(
+            "unsupported diff-tree option {leftover}"
+        )));
+    }
+
+    // We do not implement pathspec filtering for diff-tree; reject it clearly so
+    // we never silently ignore a path restriction.
+    if !setup.pathspecs.is_empty() || setup.options.positives.len() > 2 {
+        return Err(GitError::Unsupported(
+            "diff-tree pathspec filtering is not supported".into(),
+        ));
+    }
+    if !setup.options.negatives.is_empty() || !setup.options.symmetric_ranges.is_empty() {
+        return Err(GitError::Unsupported(
+            "diff-tree revision ranges are not supported".into(),
+        ));
+    }
 
     // Resolve the raw-mode abbreviation against core.abbrev only when the user
     // explicitly asked to abbreviate; otherwise diff-tree prints full ids.
@@ -387,11 +432,11 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             }
         }
     } else {
-        if options.revs.is_empty() {
+        if setup.options.positives.is_empty() {
             print_diff_tree_usage();
             return Err(GitError::Exit(129));
         }
-        for request in resolve_arg_request(&repo, db, &options, &options.revs)? {
+        for request in resolve_arg_request(db, &options, &setup.options.positives)? {
             if run_diff_request(&mut stdout, &request_context, &request)? {
                 has_differences = true;
             }
@@ -435,22 +480,21 @@ struct DiffHeader {
 ///     becomes the (suppressible) header.
 ///   * Two operands: diff the two tree-ish objects directly; no header.
 fn resolve_arg_request(
-    repo: &RepositoryContext,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
-    revs: &[String],
+    revs: &[sley_rev::RevisionTip],
 ) -> Result<Vec<DiffRequest>> {
-    let format = repo.format();
+    let format = db.object_format();
     if revs.len() == 1 {
-        let oid = resolve_tree_ish_arg(repo, &revs[0])?;
+        let oid = revs[0].oid;
         // The argument form prints the resolved commit id as its header.
         single_commit_request(format, db, options, &oid, oid.to_hex())
     } else {
         // git only ever uses the first two operands as trees; anything further
         // would be a pathspec, which we reject earlier when it reaches us via
         // `--`. Here we defensively use the first two.
-        let left = resolve_tree_ish_arg(repo, &revs[0])?;
-        let right = resolve_tree_ish_arg(repo, &revs[1])?;
+        let left = revs[0].oid;
+        let right = revs[1].oid;
         let left_tree = sley_rev::peel_to_tree(db, format, &left)?;
         let right_tree = sley_rev::peel_to_tree(db, format, &right)?;
         Ok(vec![DiffRequest {
@@ -684,24 +728,6 @@ fn skip_silent() -> DiffRequest {
         right: None,
         header: None,
         skip: true,
-    }
-}
-
-/// Resolve a single tree-ish/commit spec to an object id, emitting git's
-/// `fatal: ambiguous argument ...` message (exit 128) when it does not name a
-/// known revision.
-fn resolve_tree_ish_arg(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
-    match repo.resolve_revision(spec) {
-        Ok(oid) => Ok(oid),
-        Err(_) => {
-            eprintln!(
-                "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
-            );
-            eprintln!(
-                "Use '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
-            );
-            Err(GitError::Exit(128))
-        }
     }
 }
 

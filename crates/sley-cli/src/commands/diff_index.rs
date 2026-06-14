@@ -61,20 +61,22 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut patch_full_index = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
-    let mut tree_ish: Option<String> = None;
-    let mut path_args: Vec<String> = Vec::new();
+    let mut setup_args: Vec<String> = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
         if positional_only {
-            push_positional(arg, &mut tree_ish, &mut path_args);
+            setup_args.push(arg.clone());
             idx += 1;
             continue;
         }
         match arg.as_str() {
             "-h" | "--help" => return diff_index_help(),
-            "--" => positional_only = true,
+            "--" => {
+                setup_args.push(arg.clone());
+                positional_only = true;
+            }
             "--cached" | "--staged" => cached = true,
             "--quiet" => {
                 quiet = true;
@@ -199,21 +201,36 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             value if value.starts_with('-') && value != "-" => {
                 return diff_index_usage_error();
             }
-            _ => push_positional(arg, &mut tree_ish, &mut path_args),
+            _ => setup_args.push(arg.clone()),
         }
         idx += 1;
     }
-
-    let Some(tree_ish) = tree_ish else {
-        return diff_index_usage_error();
-    };
 
     let repo = RepositoryContext::discover_current()?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
-    let tree_oid = resolve_tree_ish(&repo, &tree_ish)?;
+    let setup = sley_rev::setup_revisions(
+        &setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir,
+            worktree_root: repo.worktree_root().ok(),
+            cwd,
+            format,
+            reader: db,
+            config: Some(repo.config()),
+        },
+    )?;
+    if !setup.leftovers.is_empty()
+        || !setup.options.negatives.is_empty()
+        || !setup.options.symmetric_ranges.is_empty()
+        || setup.options.positives.len() != 1
+    {
+        return diff_index_usage_error();
+    }
+    let tree_tip = &setup.options.positives[0];
+    let tree_oid = resolve_tree_ish_oid(&repo, tree_tip.oid, &tree_tip.rev)?;
 
     // `core.abbrev` (defaulting to 7) is the width used when abbreviation is
     // requested, but unlike porcelain `git diff` the plumbing `diff-index`
@@ -242,14 +259,14 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     } else {
         Some(repo.worktree_root()?)
     };
-    let pathspec = if path_args.is_empty() {
+    let pathspec = if setup.pathspecs.is_empty() {
         DiffPathspec::default()
     } else {
         let worktree_root = match worktree_root {
             Some(worktree_root) => worktree_root,
             None => repo.worktree_root()?,
         };
-        DiffPathspec::new(cwd, worktree_root, &path_args)?
+        DiffPathspec::new(cwd, worktree_root, &setup.pathspecs)?
     };
 
     let base_options = sley_diff_merge::DiffNameStatusOptions {
@@ -539,29 +556,15 @@ fn write_name_only_entry(
     Ok(())
 }
 
-fn push_positional(arg: &str, tree_ish: &mut Option<String>, path_args: &mut Vec<String>) {
-    if tree_ish.is_none() {
-        *tree_ish = Some(arg.to_string());
-    } else {
-        path_args.push(arg.to_string());
-    }
-}
-
 fn take_value<'a>(args: &'a [String], idx: usize, option: &str) -> Result<&'a str> {
     args.get(idx)
         .map(String::as_str)
         .ok_or_else(|| GitError::Command(format!("{option} requires a value")))
 }
 
-/// Resolve a `<tree-ish>` argument to a tree oid, peeling commits/tags. A value
-/// that cannot be resolved produces git's `fatal: ambiguous argument` message on
-/// stderr and exit status 128.
-fn resolve_tree_ish(repo: &RepositoryContext, tree_ish: &str) -> Result<ObjectId> {
+/// Peel a resolved `<tree-ish>` argument to a tree oid.
+fn resolve_tree_ish_oid(repo: &RepositoryContext, oid: ObjectId, rev: &str) -> Result<ObjectId> {
     let format = repo.format();
-    let oid = match repo.resolve_revision(tree_ish) {
-        Ok(oid) => oid,
-        Err(_) => return ambiguous_argument_error(tree_ish),
-    };
     // The canonical empty tree need not be present in the object database; git
     // always accepts it. Skip peeling (which would try to read the object) so
     // `diff-index <empty-tree-sha>` works in a fresh repository.
@@ -569,17 +572,7 @@ fn resolve_tree_ish(repo: &RepositoryContext, tree_ish: &str) -> Result<ObjectId
         return Ok(oid);
     }
     sley_rev::peel_to_tree(repo.objects(), format, &oid)
-        .or_else(|_| ambiguous_argument_error(tree_ish))
-}
-
-fn ambiguous_argument_error<T>(value: &str) -> Result<T> {
-    eprintln!(
-        "fatal: ambiguous argument '{value}': unknown revision or path not in the working tree."
-    );
-    eprintln!(
-        "Use '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
-    );
-    Err(GitError::Exit(128))
+        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
 }
 
 fn parse_diff_index_abbrev(value: &str) -> Result<usize> {

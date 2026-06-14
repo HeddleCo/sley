@@ -583,27 +583,14 @@ fn select_commits(
     Ok(selected)
 }
 
-/// Resolve a revision string to a commit id, emitting git's exact
-/// "ambiguous argument ... unknown revision" fatal (exit 128) when it cannot be
-/// resolved or peeled — the same message `git format-patch <bad-rev>` prints.
+/// Resolve a revision string to a commit id, emitting the canonical unknown
+/// revision/path fatal when it cannot be resolved or peeled.
 fn resolve_format_patch_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
     let oid = repo
         .resolve_revision(rev)
-        .map_err(|_| unknown_revision_error(rev))?;
+        .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
     sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
-        .map_err(|_| unknown_revision_error(rev))
-}
-
-/// Print git's "unknown revision or path" fatal block and return an exit-128
-/// error, matching the stderr `git format-patch <bad-rev>` produces.
-fn unknown_revision_error(spec: &str) -> GitError {
-    eprintln!(
-        "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
-    );
-    eprintln!(
-        "Use '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
-    );
-    GitError::Exit(128)
+        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
 }
 
 /// Build the output file name `NNNN-<slug>.patch` for the patch numbered `seq`.

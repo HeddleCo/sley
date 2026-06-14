@@ -265,14 +265,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 cwd.join(path)
             };
             if !absolute.exists() {
-                eprintln!(
-                    "fatal: ambiguous argument '{}': unknown revision or path not in the working tree.",
-                    path.display()
-                );
-                eprintln!(
-                    "Use '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
-                );
-                return Err(GitError::Exit(128));
+                return Err(sley_rev::ambiguous_argument_error(&path.display().to_string()));
             }
         }
     }
