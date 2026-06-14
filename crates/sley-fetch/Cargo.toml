@@ -1,21 +1,23 @@
 [package]
 name = "sley-fetch"
-version = "0.1.0"
+version = "0.0.1"
+description = "Pack-install and side-band demux glue that lands an upload-pack response into the sley object database."
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
-sley-odb = { path = "../sley-odb" }
-sley-protocol = { path = "../sley-protocol" }
-sley-transport = { path = "../sley-transport" }
+sley-core = { path = "../sley-core", version = "0.0.1" }
+sley-odb = { path = "../sley-odb", version = "0.0.1" }
+sley-protocol = { path = "../sley-protocol", version = "0.0.1" }
+sley-transport = { path = "../sley-transport", version = "0.0.1" }
 
 [dev-dependencies]
-sley-formats = { path = "../sley-formats" }
-sley-object = { path = "../sley-object" }
-sley-pack = { path = "../sley-pack" }
-sley-protocol = { path = "../sley-protocol" }
+sley-formats = { path = "../sley-formats", version = "0.0.1" }
+sley-object = { path = "../sley-object", version = "0.0.1" }
+sley-pack = { path = "../sley-pack", version = "0.0.1" }
+sley-protocol = { path = "../sley-protocol", version = "0.0.1" }
 
 [lints]
 workspace = true

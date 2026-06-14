@@ -1,12 +1,14 @@
 [package]
 name = "sley-config"
-version = "0.1.0"
+version = "0.0.1"
+description = "Native-Rust implementation of Git's configuration system: parsing, serialization, typed values, and include resolution."
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
+sley-core = { path = "../sley-core", version = "0.0.1" }
 
 [lints]
 workspace = true

@@ -1,6 +1,8 @@
 [package]
 name = "sley-mmap"
-version = "0.1.0"
+version = "0.0.1"
+description = "Audited, safe read-only memory maps of pack files — the single home for sley's only unsafe code."
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
