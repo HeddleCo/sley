@@ -74,6 +74,7 @@ pub(crate) struct PathspecFlags {
 }
 
 mod commands;
+mod grep_source;
 mod log_format;
 mod remote;
 mod repo_path;
@@ -2380,9 +2381,9 @@ fn write_diff_patch_entry(
                 });
             word_regex = spec
                 .map(|spec| {
-                    commands::grep::Regex::compile_bytes(
+                    grep_source::Regex::compile_bytes(
                         &spec,
-                        commands::grep::RegexMode::Ere,
+                        grep_source::RegexMode::Ere,
                         false,
                         false,
                     )
@@ -6978,7 +6979,7 @@ struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
     /// `--perl-regexp` patterns compile through the full grep regex engine in
     /// PCRE mode instead of the simple BRE subset above.
-    perl: Option<commands::grep::Regex>,
+    perl: Option<grep_source::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7033,9 +7034,9 @@ enum SimpleLogRegexClassItem {
 impl SimpleLogRegex {
     fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
-            let regex = commands::grep::Regex::compile(
+            let regex = grep_source::Regex::compile(
                 pattern,
-                commands::grep::RegexMode::Pcre,
+                grep_source::RegexMode::Pcre,
                 false,
                 false,
             )?;
@@ -7264,17 +7265,12 @@ fn log_regex_unterminated_class_error(
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    // Default output must be byte-identical to git: glibc's `regcomp` reports an
-    // unbalanced bracket class via `regerror`, which git surfaces verbatim as
-    // "Invalid regular expression". The friendlier "brackets ([ ]) not balanced"
-    // diagnostic is a strict improvement, but only acceptable behind a verbose
-    // mode — sley-cli has no global `-v`/verbosity seam reaching the log
-    // regex-parse path yet (only per-subcommand verbose flags in worktree/etc.).
-    // TODO(verbose): surface detailed regex diagnostics ("brackets ([ ]) not
-    // balanced") under -v once a global verbosity level is plumbed into log.
-    let message = "Invalid regular expression";
-    eprintln!("fatal: {error_context}, '{pattern}': {message}");
-    Err(GitError::Exit(128))
+    Err(grep_source::report_regex_compile_error(
+        error_context,
+        pattern,
+        grep_source::RegexDiagnosticVerbosity::from_env(),
+        grep_source::RegexDiagnosticDetail::UnbalancedBrackets,
+    ))
 }
 
 fn log_author_filters_match(
