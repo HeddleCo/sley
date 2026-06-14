@@ -230,6 +230,15 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
 
     write_am_state_dir(&state_dir, &patches, &options, &head_oid)?;
 
+    // git refuses to start applying onto a dirty index (the index differs from
+    // HEAD). The state dir already exists at this point — cell 4 checks it
+    // survives — and git records `dirtyindex` before dying.
+    if am_index_is_dirty(&git_dir, &common_git_dir, format, &head_oid)? {
+        fs::write(state_dir.join("dirtyindex"), b"t\n")?;
+        eprintln!("Dirty index: cannot apply patches (dirty: )");
+        return Err(GitError::Exit(128));
+    }
+
     run_am_series(
         &git_dir,
         &common_git_dir,
@@ -1265,6 +1274,27 @@ fn prepare_am_commit_message(
 enum ApplyResult {
     Committed,
     Conflict,
+}
+
+/// Whether the index differs from HEAD (git's `repo_index_has_changes`): the
+/// index tree is written and compared to HEAD's tree. `git am` refuses to begin
+/// applying onto such a dirty index. Returns `false` when the index is clean or
+/// cannot be written to a tree (e.g. unmerged entries are handled elsewhere).
+fn am_index_is_dirty(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    head_oid: &ObjectId,
+) -> Result<bool> {
+    let index_tree = match sley_worktree::write_tree_from_index(git_dir, format) {
+        Ok(tree) => tree,
+        // An index that cannot be written to a tree is not the "dirty" case this
+        // guard targets; let the normal apply path surface any real problem.
+        Err(_) => return Ok(false),
+    };
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let head_tree = commit_tree_oid(&db, format, head_oid)?;
+    Ok(index_tree != head_tree)
 }
 
 /// Apply one patch's diff to the worktree+index and create the commit.
