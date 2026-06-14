@@ -42,6 +42,8 @@ struct AmOptions {
     /// (and, with `--committer-date-is-author-date`, the committer) date
     /// (`--ignore-date`).
     ignore_date: bool,
+    /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
+    no_verify: bool,
 }
 
 /// The subset of `AmOptions` that affects how each commit object is built. Read
@@ -53,6 +55,8 @@ struct AmCommitOpts {
     message_id: bool,
     committer_date_is_author_date: bool,
     ignore_date: bool,
+    /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
+    no_verify: bool,
 }
 
 /// A single message extracted from an mbox: identity, message, and raw diff.
@@ -212,6 +216,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         message_id: false,
         committer_date_is_author_date: false,
         ignore_date: false,
+        no_verify: false,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -241,6 +246,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             }
             "--ignore-date" => options.ignore_date = true,
             "--no-ignore-date" => options.ignore_date = false,
+            "-n" | "--no-verify" => options.no_verify = true,
+            "--verify" => options.no_verify = false,
             // Accepted no-ops: these affect mail parsing / cosmetics we already
             // handle or that do not change the resulting commits for the inputs
             // `git format-patch` produces.
@@ -884,6 +891,7 @@ fn write_am_state_dir(
         state_dir.join("ignore-date"),
         bool_flag(options.ignore_date),
     )?;
+    fs::write(state_dir.join("no-verify"), bool_flag(options.no_verify))?;
     fs::write(state_dir.join("utf8"), b"t\n")?;
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
@@ -1024,6 +1032,7 @@ fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
             "committer-date-is-author-date",
         ),
         ignore_date: read_state_bool(state_dir, "ignore-date"),
+        no_verify: read_state_bool(state_dir, "no-verify"),
     }
 }
 
@@ -1054,7 +1063,7 @@ fn run_am_series(
     let mut number = start;
     while number <= last {
         fs::write(state_dir.join("next"), format!("{number}\n"))?;
-        let patch = read_patch_file(state_dir, number)?;
+        let mut patch = read_patch_file(state_dir, number)?;
         write_current_patch_state(state_dir, &patch)?;
 
         // A message that carried no diff stops the series with git's empty-patch
@@ -1064,6 +1073,12 @@ fn run_am_series(
             println!("Patch is empty.");
             return Err(GitError::Exit(128));
         }
+
+        // git runs the applypatch-msg hook BEFORE applying the patch, so a
+        // failing hook leaves HEAD and the worktree untouched (the patch never
+        // lands). The hook may rewrite the message in `final-commit`; we re-read
+        // it so the resulting commit reflects the edit. `--no-verify` skips it.
+        patch.message = prepare_am_commit_message(git_dir, &patch, commit_opts)?;
 
         if !quiet {
             println!("Applying: {}", patch.subject);
@@ -1088,6 +1103,38 @@ fn run_am_series(
     }
 
     finish_am(state_dir)
+}
+
+/// Build the commit message for a patch and run the `applypatch-msg` hook the
+/// way git does — BEFORE the patch is applied. Appends the `Message-ID:` trailer
+/// (when `--message-id`/`am.messageid` is set), writes it to
+/// `.git/rebase-apply/final-commit`, runs `applypatch-msg` (unless
+/// `--no-verify`), and returns the possibly hook-edited message read back from
+/// the file. A non-zero hook exit aborts the whole am run (exit 1) with the
+/// state dir and HEAD left intact, exactly like git's `run_applypatch_msg_hook`.
+fn prepare_am_commit_message(
+    git_dir: &Path,
+    patch: &AmPatch,
+    commit_opts: AmCommitOpts,
+) -> Result<Vec<u8>> {
+    let mut message = patch.message.clone();
+    if commit_opts.message_id
+        && let Some(message_id) = &patch.message_id
+    {
+        am_append_message_id(&mut message, message_id);
+    }
+    let final_commit = git_dir.join("rebase-apply").join("final-commit");
+    fs::write(&final_commit, &message)?;
+    if !commit_opts.no_verify {
+        let arg = final_commit.to_string_lossy().into_owned();
+        // A failing applypatch-msg hook aborts the series; git exits 1 and leaves
+        // the state dir in place so the user can fix the hook and resume.
+        if commands::hooks::run_hook_l("applypatch-msg", &[arg.as_str()]).is_err() {
+            return Err(GitError::Exit(1));
+        }
+    }
+    // Re-read: the hook may have rewritten the message in `final-commit`.
+    Ok(fs::read(&final_commit)?)
 }
 
 /// Outcome of attempting to apply (and commit) a single patch.
@@ -1310,29 +1357,22 @@ fn create_am_commit(
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
     let (author, committer) = am_commit_identities(patch, commit_opts)?;
-    // git's mailinfo appends the `Message-ID:` header to the log message at the
-    // patch break (before --signoff runs), so it lands as the LAST body line and
-    // --signoff (when set) goes after it.
-    let mut base_message = patch.message.clone();
-    if commit_opts.message_id
-        && let Some(message_id) = &patch.message_id
-    {
-        am_append_message_id(&mut base_message, message_id);
-    }
-    let message_path = git_dir.join("rebase-apply").join("final-commit");
-    let message_path = if message_path.exists() {
-        message_path
-    } else {
-        git_dir.join("COMMIT_EDITMSG")
-    };
-    fs::write(&message_path, &base_message)?;
-    let message_arg = message_path.to_string_lossy().into_owned();
-    commands::hooks::run_hook_l("applypatch-msg", &[message_arg.as_str()])?;
-    let mut message = fs::read(&message_path)?;
+    // The message has already been finalised (Message-ID appended + the
+    // applypatch-msg hook run) in `prepare_am_commit_message`, BEFORE the patch
+    // was applied — git's ordering. Here we only append the sign-off, which git
+    // does on `state->msg` just before writing the commit object.
+    let mut message = patch.message.clone();
     if commit_opts.signoff {
         message = am_append_signoff(message, &commit_signoff_from_env()?);
     }
-    commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())?;
+    // pre-applypatch runs after staging, before the commit; a failure aborts the
+    // run (git exits 1). `--no-verify` skips it.
+    if !commit_opts.no_verify
+        && commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())
+            .is_err()
+    {
+        return Err(GitError::Exit(1));
+    }
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let new_oid = sley_sequencer::create_commit(
@@ -1365,7 +1405,10 @@ fn create_am_commit(
     });
     tx.commit()?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
-    commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default())?;
+    // git runs post-applypatch but ignores its exit status — it is purely
+    // informational, run after the commit has already landed (builtin/am.c
+    // calls `run_hooks` without checking the result). Swallow any failure.
+    let _ = commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default());
     Ok(())
 }
 
