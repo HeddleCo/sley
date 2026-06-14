@@ -4,15 +4,44 @@ use sley_odb::ObjectReader;
 use std::collections::{HashSet, VecDeque};
 
 mod connectivity;
+pub mod content;
 
 pub use connectivity::{
     ConnectivityOptions, FsckFinding, FsckFindings, FsckRef, FsckRefTarget, FsckSeverity,
     check_connectivity, check_refs,
 };
+pub use content::SeverityConfig;
+
+/// Whether an issue is a hard error (fails fsck, exit 1) or a warning (printed
+/// but does not by itself fail the check). Both render to stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSeverity {
+    Error,
+    Warning,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsckIssue {
     pub message: String,
+    pub severity: IssueSeverity,
+}
+
+impl FsckIssue {
+    /// A hard error issue (broken link, missing object, parse error, ...).
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            severity: IssueSeverity::Error,
+        }
+    }
+
+    /// A warning issue (does not fail fsck).
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            severity: IssueSeverity::Warning,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,15 +56,23 @@ pub struct FsckReport {
 }
 
 impl FsckReport {
+    /// True if no *error*-severity issue was found. Warning-severity issues do
+    /// not fail fsck (git exits 0 when only warnings are present).
     pub fn is_ok(&self) -> bool {
-        self.issues.is_empty()
+        !self
+            .issues
+            .iter()
+            .any(|i| i.severity == IssueSeverity::Error)
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct FsckOptions {
     pub report_dangling: bool,
     pub report_unreachable: bool,
+    /// `fsck.<msgid>` severity overrides plus `--strict`, applied to
+    /// object-content findings.
+    pub severity: SeverityConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +112,7 @@ where
         format,
         checked: HashSet::new(),
         issues: Vec::new(),
+        severity: options.severity.clone(),
     };
     let roots = roots.into_iter().collect::<Vec<_>>();
     let object_ids = object_ids.into_iter().collect::<Vec<_>>();
@@ -102,6 +140,7 @@ struct FsckChecker<'a, R> {
     format: ObjectFormat,
     checked: HashSet<ObjectId>,
     issues: Vec<FsckIssue>,
+    severity: SeverityConfig,
 }
 
 impl<R> FsckChecker<'_, R>
@@ -117,14 +156,13 @@ where
             }
         };
         if object.object_type != link.object_type {
-            self.issues.push(FsckIssue {
-                message: format!(
-                    "object {} is {}, expected {}",
-                    link.oid,
-                    object.object_type.as_str(),
-                    link.object_type.as_str()
-                ),
-            });
+            // git: "<oid>: object is a <actual>, not a <expected>".
+            self.issues.push(FsckIssue::error(format!(
+                "{} is a {}, not a {}",
+                link.oid,
+                object.object_type.as_str(),
+                link.object_type.as_str()
+            )));
         }
         self.check_loaded_object(link.oid, &object);
     }
@@ -133,9 +171,8 @@ where
         let object = match self.reader.read_object(&oid) {
             Ok(object) => object,
             Err(err) => {
-                self.issues.push(FsckIssue {
-                    message: format!("missing object {oid}: {err}"),
-                });
+                self.issues
+                    .push(FsckIssue::error(format!("missing object {oid}: {err}")));
                 return;
             }
         };
@@ -149,18 +186,49 @@ where
         match object.object_id(self.format) {
             Ok(actual) if actual == oid => {}
             Ok(actual) => {
-                self.issues.push(FsckIssue {
-                    message: format!("object id mismatch: expected {oid}, got {actual}"),
-                });
+                self.issues.push(FsckIssue::error(format!(
+                    "object id mismatch: expected {oid}, got {actual}"
+                )));
                 return;
             }
             Err(err) => {
-                self.issues.push(FsckIssue {
-                    message: format!("invalid object {oid}: {err}"),
-                });
+                self.issues
+                    .push(FsckIssue::error(format!("invalid object {oid}: {err}")));
                 return;
             }
         }
+
+        // Run git's content checker (commit/tree/tag buffer validation). It
+        // emits the exact `error in <type> <oid>: <msgid>: <detail>` /
+        // `warning in ...` lines on stderr, with `fsck.<id>` severity applied.
+        let content_findings =
+            content::check_object_content(object.object_type, &object.body, &self.severity);
+        let had_fatal = content_findings.iter().any(|f| f.fatal);
+        for f in &content_findings {
+            let prefix = match f.severity {
+                content::Severity::Error => "error in",
+                content::Severity::Warn => "warning in",
+                content::Severity::Ignore => continue,
+            };
+            let msg = format!(
+                "{prefix} {} {oid}: {}: {}",
+                object.object_type.as_str(),
+                f.msg_id.camel(),
+                f.detail,
+            );
+            let issue = match f.severity {
+                content::Severity::Error => FsckIssue::error(msg),
+                _ => FsckIssue::warning(msg),
+            };
+            self.issues.push(issue);
+        }
+
+        // If a structural (fatal) content problem stopped parsing, do not also
+        // run the link walk — git aborts the object too.
+        if had_fatal {
+            return;
+        }
+
         match object.object_type {
             ObjectType::Commit => self.check_commit(oid, &object.body),
             ObjectType::Tree => self.check_tree(oid, &object.body),
@@ -170,14 +238,10 @@ where
     }
 
     fn check_commit(&mut self, oid: ObjectId, body: &[u8]) {
-        let commit = match Commit::parse_ref(self.format, body) {
-            Ok(commit) => commit,
-            Err(err) => {
-                self.issues.push(FsckIssue {
-                    message: format!("invalid commit {oid}: {err}"),
-                });
-                return;
-            }
+        // Content checks already ran; for the link walk we tolerate a strict
+        // parse failure (the content checker reported the specifics).
+        let Ok(commit) = Commit::parse_ref(self.format, body) else {
+            return;
         };
         let source = ObjectLink {
             object_type: ObjectType::Commit,
@@ -202,21 +266,22 @@ where
     }
 
     fn check_tree(&mut self, oid: ObjectId, body: &[u8]) {
-        let entries =
-            match TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>() {
-                Ok(entries) => entries,
-                Err(err) => {
-                    self.issues.push(FsckIssue {
-                        message: format!("invalid tree {oid}: {err}"),
-                    });
-                    return;
-                }
-            };
+        let Ok(entries) =
+            TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>()
+        else {
+            // The content checker already reported `badTree`/`nullSha1`/etc.
+            return;
+        };
         let source = ObjectLink {
             object_type: ObjectType::Tree,
             oid,
         };
         for entry in entries {
+            // A null-sha entry is reported by the content checker as a warning;
+            // do not also walk it as a broken link (git skips null entries).
+            if entry.oid.is_null() {
+                continue;
+            }
             self.check_object_link(
                 Some(source.clone()),
                 ObjectLink {
@@ -228,14 +293,9 @@ where
     }
 
     fn check_tag(&mut self, oid: ObjectId, body: &[u8]) {
-        let tag = match Tag::parse_ref(self.format, body) {
-            Ok(tag) => tag,
-            Err(err) => {
-                self.issues.push(FsckIssue {
-                    message: format!("invalid tag {oid}: {err}"),
-                });
-                return;
-            }
+        // Content checks already ran; tolerate a strict parse failure here.
+        let Ok(tag) = Tag::parse_ref(self.format, body) else {
+            return;
         };
         self.check_object_link(
             Some(ObjectLink {
@@ -251,19 +311,19 @@ where
 
     fn report_missing_link(&mut self, source: Option<ObjectLink>, link: ObjectLink) {
         if let Some(source) = source {
-            self.issues.push(FsckIssue {
-                message: format!(
-                    "broken link from  {} {}\n              to    {} {}",
-                    source.object_type.as_str(),
-                    source.oid,
-                    link.object_type.as_str(),
-                    link.oid
-                ),
-            });
+            self.issues.push(FsckIssue::error(format!(
+                "broken link from  {} {}\n              to    {} {}",
+                source.object_type.as_str(),
+                source.oid,
+                link.object_type.as_str(),
+                link.oid
+            )));
         }
-        self.issues.push(FsckIssue {
-            message: format!("missing {} {}", link.object_type.as_str(), link.oid),
-        });
+        self.issues.push(FsckIssue::error(format!(
+            "missing {} {}",
+            link.object_type.as_str(),
+            link.oid
+        )));
     }
 }
 
@@ -517,6 +577,7 @@ mod tests {
             FsckOptions {
                 report_dangling: true,
                 report_unreachable: false,
+                ..Default::default()
             },
         );
 
@@ -572,6 +633,7 @@ mod tests {
             FsckOptions {
                 report_dangling: true,
                 report_unreachable: false,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -589,6 +651,7 @@ mod tests {
             FsckOptions {
                 report_dangling: false,
                 report_unreachable: true,
+                ..Default::default()
             },
         );
         assert_eq!(

@@ -130,6 +130,27 @@ impl GitConfig {
             .and_then(|entry| entry.value.as_deref())
     }
 
+    /// Return every `(key, value)` pair in the `fsck` section (no subsection),
+    /// in file order, with the value resolved to a string.
+    ///
+    /// Used by `git fsck` to enumerate `fsck.<msgid>` severity overrides without
+    /// the caller having to know the message-id universe up front. Keys are
+    /// returned in their original case; a bare boolean-true key yields the
+    /// string `"true"`.
+    pub fn fsck_entries(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for section in &self.sections {
+            if !eq_ignore_ascii_case(&section.name, "fsck") || section.subsection.is_some() {
+                continue;
+            }
+            for entry in &section.entries {
+                let value = entry.value.clone().unwrap_or_else(|| "true".to_string());
+                out.push((entry.key.clone(), value));
+            }
+        }
+        out
+    }
+
     /// Return every value set for `section[.subsection].key`, in file order.
     ///
     /// Multi-valued keys (the same key set several times) are preserved with their

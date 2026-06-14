@@ -1626,6 +1626,11 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let mut progress = true;
     let mut report_dangling = true;
     let mut report_unreachable = false;
+    let mut strict = false;
+    // `--tags` restricts the root set to tags; `--root` additionally pins the
+    // root tree(s). Both default off (a bare `git fsck` walks all refs).
+    let mut only_tags = false;
+    let mut explicit_oids: Vec<String> = Vec::new();
     for arg in args {
         match arg.as_str() {
             "--no-progress" => progress = false,
@@ -1634,19 +1639,59 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             "--no-dangling" => report_dangling = false,
             "--unreachable" => report_unreachable = true,
             "--no-unreachable" => report_unreachable = false,
-            "--full" | "--strict" | "--connectivity-only" | "--name-objects" => {}
-            value => {
+            "--strict" => strict = true,
+            "--no-strict" => strict = false,
+            "--tags" => only_tags = true,
+            // These affect output/perf only; object-content checks are
+            // unconditional in this implementation, so accept and ignore them.
+            "--full" | "--no-full" | "--connectivity-only" | "--name-objects"
+            | "--no-name-objects" | "--root" | "--cache" | "--no-cache" | "--lost-found"
+            | "--references" | "--no-references" => {}
+            value if value.starts_with("--") => {
                 return Err(GitError::Command(format!(
                     "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
                 )));
             }
+            // A positional argument is an explicit object/head to check.
+            value => explicit_oids.push(value.to_string()),
         }
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let roots = fsck_root_oids(&git_dir, format)?;
+
+    // Resolve `fsck.<msgid>` severity overrides from the repo config (folds in
+    // command-line `-c fsck.x=y` via GIT_CONFIG_PARAMETERS).
+    let mut severity = sley_fsck::SeverityConfig::new(strict);
+    if let Ok(config) = read_repo_config(&git_dir) {
+        for (key, value) in config.fsck_entries() {
+            severity.set(&key, &value);
+        }
+    }
+
+    // Explicit object-id arguments override the default ref-walk roots. git
+    // resolves each to an object; an explicit but unknown head is a hard error
+    // and does NOT fall back to all heads (t1450 "bogus head" case).
+    let roots = if !explicit_oids.is_empty() {
+        let mut resolved = Vec::new();
+        for spec in &explicit_oids {
+            match ObjectId::from_hex(format, spec) {
+                Ok(oid) => resolved.push(oid),
+                Err(_) => {
+                    return Err(GitError::Command(format!(
+                        "Invalid object name '{spec}'."
+                    )));
+                }
+            }
+        }
+        resolved
+    } else if only_tags {
+        fsck_tag_root_oids(&git_dir, format)?
+    } else {
+        fsck_root_oids(&git_dir, format)?
+    };
+
     let mut object_ids = repository_object_ids(&git_dir, format)?;
     // Mirror builtin/fsck.c `fsck_loose`: probe every loose object file before the
     // connectivity walk, reporting corrupt or mismatched ones at `error:` level on
@@ -1682,23 +1727,43 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         sley_fsck::FsckOptions {
             report_dangling,
             report_unreachable,
+            severity,
         },
     );
+    // Notices (dangling/unreachable) go to stdout; issues (broken link, missing
+    // object, `error in`/`warning in` content findings) go to stderr — matching
+    // builtin/fsck.c's stream split.
     for notice in &report.notices {
         println!("{}", notice.message);
     }
     for issue in &report.issues {
-        println!("{}", issue.message);
+        eprintln!("{}", issue.message);
     }
-    if !report.is_ok() {
-        Err(GitError::Exit(10))
-    } else if loose_errors {
-        // builtin/fsck.c exits with its `errors_found` bitmask; a corrupt or
-        // misplaced loose object sets ERROR_OBJECT (= 1).
+    // git exits non-zero (1) when any *error*-severity problem is found;
+    // warning-only runs exit 0. A bad loose object also sets ERROR_OBJECT (= 1).
+    if !report.is_ok() || loose_errors {
         Err(GitError::Exit(1))
     } else {
         Ok(())
     }
+}
+
+/// Root oids restricted to `refs/tags/*` (for `git fsck --tags`).
+fn fsck_tag_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    for reference in store.list_refs()? {
+        if !reference.name.starts_with("refs/tags/") {
+            continue;
+        }
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+            && seen.insert(oid)
+        {
+            roots.push(oid);
+        }
+    }
+    Ok(roots)
 }
 
 /// spelling for those shapes and fall back to the absolute path.
