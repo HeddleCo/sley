@@ -195,6 +195,12 @@ struct FormatPatchOptions {
     /// defers to config (default true). Only consulted by the cover subject;
     /// the per-patch subject path is unchanged.
     encode_email_headers: Option<bool>,
+    /// `--thread[=<style>]` / `--no-thread`: message-threading level. `None`
+    /// defers to `format.thread`; `Unset` is `--no-thread`.
+    thread: Option<ThreadLevel>,
+    /// `--in-reply-to=<msgid>`: seed the In-Reply-To/References chain with this
+    /// message id (cleaned of surrounding `<>`/whitespace).
+    in_reply_to: Option<String>,
     /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
     setup_args: Vec<String>,
 }
@@ -244,6 +250,8 @@ impl Default for FormatPatchOptions {
             cover_from_description: None,
             description_file: None,
             encode_email_headers: None,
+            thread: None,
+            in_reply_to: None,
             setup_args: Vec::new(),
         }
     }
@@ -328,6 +336,43 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     };
     let abbrev = patch_index_abbrev(git_dir, format, &options)?;
 
+    // Resolve message threading: the `--thread`/`format.thread` level plus any
+    // `--in-reply-to` seed determine the Message-ID / In-Reply-To / References on
+    // the cover and every patch. The plan is replayed once so the cover (built
+    // before the patches) can carry its own headers.
+    let thread_level = resolve_thread_level(&options, config);
+    let thread_plan = if count > 0
+        && (thread_level != ThreadLevel::Unset || options.in_reply_to.is_some() || cover_letter)
+    {
+        let mid_ident = committer_ident_string(config)?;
+        let mid_email = parse_from_ident(&mid_ident)?.email;
+        let mid_time = message_id_timestamp();
+        let commit_oids: Vec<String> = commits.iter().map(|c| c.oid.to_hex()).collect();
+        Some(build_thread_plan(
+            thread_level,
+            options.in_reply_to.as_deref(),
+            cover_letter,
+            &commit_oids,
+            start_number,
+            mid_time,
+            &mid_email,
+        ))
+    } else {
+        None
+    };
+    let cover_thread = thread_plan
+        .as_ref()
+        .map(|p| p.cover.clone())
+        .unwrap_or_default();
+    let empty_thread = MailThreadHeaders::default();
+    let patch_thread = |idx: usize| -> &MailThreadHeaders {
+        thread_plan
+            .as_ref()
+            .and_then(|p| p.patches.get(idx))
+            .unwrap_or(&empty_thread)
+    };
+    let encode_headers = encode_email_headers_on(&options, config);
+
     // Resolve the cover-letter content once: its synthetic header identity, the
     // subject/blurb (from the branch description / --description-file under the
     // cover-from-description rules), the commit-list body, and the run's cumulative
@@ -342,6 +387,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             diff_pathspec.as_ref(),
             last_number,
             abbrev,
+            &cover_thread,
         )?)
     } else {
         None
@@ -373,6 +419,9 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 numbered,
                 signoff_line: signoff_line.as_deref(),
                 abbrev,
+                thread: patch_thread(idx),
+                encode_headers,
+                config,
             })?;
             stdout.write_all(&buffer)?;
         }
@@ -413,6 +462,9 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             numbered,
             signoff_line: signoff_line.as_deref(),
             abbrev,
+            thread: patch_thread(idx),
+            encode_headers,
+            config,
         })?;
         let file_name = if options.numbered_files {
             seq.to_string()
@@ -470,6 +522,7 @@ fn build_cover_letter(
     diff_pathspec: Option<&DiffPathspec>,
     last_number: usize,
     abbrev: usize,
+    thread: &MailThreadHeaders,
 ) -> Result<Vec<u8>> {
     let _ = abbrev; // the cover never emits index lines; kept for signature parity.
     let format = repo.format();
@@ -489,6 +542,9 @@ fn build_cover_letter(
     }
     out.extend_from_slice(b" Mon Sep 17 00:00:00 2001\n");
 
+    // Message-ID / In-Reply-To / References block, before the identity headers.
+    thread.write(&mut out);
+
     // From:/Date: come from the cover identity (the `--from`/`format.from` ident
     // if set, else the runtime committer) at the current time, exactly like
     // git's `from = cfg->from ? cfg->from : git_committer_info(0)`.
@@ -500,18 +556,18 @@ fn build_cover_letter(
             (parsed.name, parsed.email)
         }
     };
-    out.extend_from_slice(format!("From: {from_name} <{from_email}>\n").as_bytes());
+    let encode = encode_email_headers_on(options, config);
+    write_from_header(&mut out, &from_name, &from_email, encode);
     out.extend_from_slice(format!("Date: {}\n", cover_letter_date()).as_bytes());
 
     // Resolve the cover subject + blurb body from the branch description /
     // --description-file under the cover-from-description rules.
     let (subject, body) = resolve_cover_text(repo, options, config)?;
 
-    // Subject: [PATCH 0/m] <subject>, q-encoded when it carries non-ASCII and
-    // header encoding is on. The cover is patch 0, so it is always numbered.
+    // Subject: [PATCH 0/m] <subject>, RFC 2047-encoded when it carries non-ASCII
+    // and header encoding is on. The cover is patch 0, so it is always numbered.
     let prefix = subject_prefix_label(resolved, 0, last_number, true);
-    let encoded_subject = maybe_encode_email_subject(&subject, options, config);
-    write_folded_subject(&mut out, prefix.as_deref(), &encoded_subject);
+    write_email_subject(&mut out, prefix.as_deref(), subject.as_bytes(), encode);
 
     // Extra headers (custom / To: / Cc:) sit between Subject and the blank line.
     out.extend_from_slice(&resolved.header_block);
@@ -776,36 +832,26 @@ fn pp_remainder(text: &str) -> String {
     out
 }
 
-/// q-encode the cover subject as a single RFC 2047 `=?UTF-8?q?...?=` word when
-/// header encoding is on and the subject needs it (non-ASCII or a literal `=?`).
-/// Otherwise the subject is returned unchanged. Mirrors git's `pp_email_subject`
-/// gate plus `add_rfc2047(..., RFC2047_SUBJECT)`.
-fn maybe_encode_email_subject(
-    subject: &str,
-    options: &FormatPatchOptions,
-    config: &GitConfig,
-) -> String {
-    let encode = options
+/// Whether `--encode-email-headers`/`format.encodeEmailHeaders` is on (default
+/// true). Mirrors git's `rev.encode_email_headers`.
+fn encode_email_headers_on(options: &FormatPatchOptions, config: &GitConfig) -> bool {
+    options
         .encode_email_headers
         .or_else(|| config.get_bool("format", None, "encodeEmailHeaders"))
-        .unwrap_or(true);
-    if !encode || !needs_rfc2047_encoding(subject.as_bytes()) {
-        return subject.to_string();
-    }
-    let mut out = String::from("=?UTF-8?q?");
-    for &byte in subject.as_bytes() {
-        if rfc2047_subject_special(byte) {
-            out.push_str(&format!("={byte:02X}"));
-        } else {
-            out.push(byte as char);
-        }
-    }
-    out.push_str("?=");
-    out
+        .unwrap_or(true)
 }
 
-/// git's `needs_rfc2047_encoding`: a subject needs encoding if it carries any
-/// non-ASCII byte, a newline, or the literal `=?` introducer.
+/// Which RFC 2047 character class governs the special-byte check: `Subject` is
+/// the loose set (git's `RFC2047_SUBJECT`); `Address` is the tighter phrase set
+/// (git's `RFC2047_ADDRESS`, used for `From:`/`To:` display names).
+#[derive(Clone, Copy)]
+enum Rfc2047Type {
+    Subject,
+    Address,
+}
+
+/// git's `needs_rfc2047_encoding`: a header needs RFC 2047 encoding if it carries
+/// any non-ASCII byte, a newline, or the literal `=?` introducer.
 fn needs_rfc2047_encoding(bytes: &[u8]) -> bool {
     for (i, &byte) in bytes.iter().enumerate() {
         if byte >= 0x80 || byte == b'\n' {
@@ -818,13 +864,242 @@ fn needs_rfc2047_encoding(bytes: &[u8]) -> bool {
     false
 }
 
-/// git's `is_rfc2047_special` for `RFC2047_SUBJECT`: a byte must be escaped when
-/// it is non-ASCII, non-printable, whitespace, or one of `=` `?` `_`.
-fn rfc2047_subject_special(byte: u8) -> bool {
-    if byte >= 0x80 || !byte.is_ascii_graphic() && byte != b' ' {
+/// git's `is_rfc2047_special`. A byte must be `=%02X`-escaped inside an encoded
+/// word when it is non-ASCII, non-printable, whitespace, or one of `=` `?` `_`.
+/// For the `Address` (phrase) type the encodable set is further narrowed to
+/// alphanumerics plus `! * + - / = _` (rfc2047 §5.3).
+fn is_rfc2047_special(byte: u8, kind: Rfc2047Type) -> bool {
+    // non-ASCII or non-printable
+    if byte >= 0x80 || !(byte.is_ascii_graphic() || byte == b' ') {
         return true;
     }
-    byte.is_ascii_whitespace() || byte == b'=' || byte == b'?' || byte == b'_'
+    // special printable characters
+    if byte.is_ascii_whitespace() || byte == b'=' || byte == b'?' || byte == b'_' {
+        return true;
+    }
+    match kind {
+        Rfc2047Type::Subject => false,
+        // '=' and '_' were already handled above.
+        Rfc2047Type::Address => {
+            !(byte.is_ascii_alphanumeric()
+                || byte == b'!'
+                || byte == b'*'
+                || byte == b'+'
+                || byte == b'-'
+                || byte == b'/')
+        }
+    }
+}
+
+/// How many bytes are already on the last line of `buf` (git's
+/// `last_line_length`).
+fn last_line_length(buf: &[u8]) -> usize {
+    match buf.iter().rposition(|&b| b == b'\n') {
+        Some(i) => buf.len() - (i + 1),
+        None => buf.len(),
+    }
+}
+
+/// Length of the leading UTF-8 multibyte sequence at `bytes` (git's
+/// `mbs_chrlen` for a UTF-8 encoding). Returns 1 for ASCII / invalid lead bytes,
+/// clamped to the remaining length so we never read past the end.
+fn utf8_seq_len(bytes: &[u8]) -> usize {
+    let lead = match bytes.first() {
+        Some(&b) => b,
+        None => return 0,
+    };
+    let want = if lead < 0x80 {
+        1
+    } else if lead >> 5 == 0b110 {
+        2
+    } else if lead >> 4 == 0b1110 {
+        3
+    } else if lead >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    };
+    want.min(bytes.len())
+}
+
+/// Port of git's `add_rfc2047`: append `line` to `out` as one or more
+/// `=?UTF-8?q?...?=` encoded words, folding at 76 columns. `out` must already
+/// hold the header text up to the insertion point (e.g. `Subject: [PATCH] `),
+/// since the first encoded word's budget is measured from the current last-line
+/// length. Multi-byte UTF-8 characters are never split across encoded words.
+fn add_rfc2047(out: &mut Vec<u8>, line: &[u8], kind: Rfc2047Type) {
+    const ENCODING: &str = "UTF-8";
+    const MAX_ENCODED_LENGTH: usize = 76;
+    let mut line_len = last_line_length(out);
+    out.extend_from_slice(format!("=?{ENCODING}?q?").as_bytes());
+    line_len += ENCODING.len() + 5; // 5 for "=??q?"
+
+    let mut rest = line;
+    while !rest.is_empty() {
+        let chrlen = utf8_seq_len(rest);
+        let (chunk, tail) = rest.split_at(chrlen);
+        let is_special = chrlen > 1 || is_rfc2047_special(chunk[0], kind);
+        let encoded_len = if is_special { 3 * chrlen } else { 1 };
+
+        if line_len + encoded_len + 2 > MAX_ENCODED_LENGTH {
+            // It won't fit with the trailing "?=" — break the line.
+            out.extend_from_slice(format!("?=\n =?{ENCODING}?q?").as_bytes());
+            line_len = ENCODING.len() + 5 + 1; // "=??q?" plus the leading SP
+        }
+
+        if is_special {
+            for &b in chunk {
+                out.extend_from_slice(format!("={b:02X}").as_bytes());
+            }
+        } else {
+            out.push(chunk[0]);
+        }
+        line_len += encoded_len;
+        rest = tail;
+    }
+    out.extend_from_slice(b"?=");
+}
+
+/// git's `is_rfc822_special`: characters that force the display name to be
+/// double-quoted in an address header.
+fn is_rfc822_special(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'(' | b')'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b':'
+            | b';'
+            | b'@'
+            | b','
+            | b'.'
+            | b'"'
+            | b'\\'
+    )
+}
+
+/// git's `needs_rfc822_quoting`: true if any byte is an rfc822 special.
+fn needs_rfc822_quoting(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| is_rfc822_special(b))
+}
+
+/// git's `add_rfc822_quoted`: wrap the name in double quotes, backslash-escaping
+/// embedded `"` and `\`.
+fn add_rfc822_quoted(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    out.push(b'"');
+    for &b in bytes {
+        if b == b'"' || b == b'\\' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out.push(b'"');
+    out
+}
+
+/// Port of git's `strbuf_add_wrapped_text` (the bytes variant), appending `text`
+/// to `out` word-wrapped to `width` columns. `indent1` is the first-line indent;
+/// a *negative* `indent1` means "the first line already has `-indent1` columns of
+/// content" (the leading `From: ` prefix). `indent2` is the continuation-line
+/// indent. Wrapping breaks at ASCII whitespace; UTF-8 display width is honored.
+fn add_wrapped_text(out: &mut Vec<u8>, text: &[u8], indent1: isize, indent2: isize, width: isize) {
+    if width <= 0 {
+        // git falls back to strbuf_add_indented_text; format-patch never calls
+        // this with width<=0, so a plain append is sufficient here.
+        out.extend_from_slice(text);
+        return;
+    }
+
+    let mut indent = indent1;
+    let mut w = indent1;
+    // `bol`/`space` are byte offsets into `text`.
+    let mut bol: usize = 0;
+    let mut space: Option<usize> = None;
+    if indent < 0 {
+        w = -indent1;
+        space = Some(0);
+    }
+
+    // Whether byte at `i` is ASCII whitespace (used when skipping the remembered
+    // break point, matching git's `bol = space + isspace(*space)`).
+    let is_ws = |i: usize| -> usize {
+        usize::from(matches!(text.get(i), Some(&b) if b == b' ' || b == b'\t' || b == b'\n'))
+    };
+
+    let mut pos: usize = 0;
+    loop {
+        let c = text.get(pos).copied();
+        let is_space = matches!(c, Some(b) if b == b' ' || b == b'\t' || b == b'\n');
+        if c.is_none() || is_space {
+            if w <= width || space.is_none() {
+                let start = if let Some(sp) = space {
+                    sp
+                } else {
+                    for _ in 0..indent.max(0) {
+                        out.push(b' ');
+                    }
+                    bol
+                };
+                if c.is_none() && pos == start {
+                    return;
+                }
+                out.extend_from_slice(&text[start..pos]);
+                let ch = match c {
+                    Some(ch) => ch,
+                    None => return,
+                };
+                space = Some(pos);
+                if ch == b'\t' {
+                    w |= 0x07;
+                } else if ch == b'\n' {
+                    // A run of two newlines, or a newline before a non-alnum,
+                    // forces a hard line break; otherwise it becomes a space.
+                    let next = text.get(pos + 1).copied();
+                    let sp = pos + 1;
+                    if next == Some(b'\n')
+                        || !next.map(|b| b.is_ascii_alphanumeric()).unwrap_or(false)
+                    {
+                        // new_line
+                        out.push(b'\n');
+                        pos = sp + is_ws(sp);
+                        bol = pos;
+                        space = None;
+                        w = indent2;
+                        indent = indent2;
+                        continue;
+                    }
+                    out.push(b' ');
+                }
+                w += 1;
+                pos += 1;
+            } else {
+                // new_line: too wide and we have a remembered space — break.
+                out.push(b'\n');
+                let sp = space.unwrap_or(pos);
+                pos = sp + is_ws(sp);
+                bol = pos;
+                space = None;
+                w = indent2;
+                indent = indent2;
+            }
+            continue;
+        }
+        // A non-space character: advance one UTF-8 char, adding its display width.
+        let seq = utf8_seq_len(&text[pos..]);
+        w += utf8_display_width(&text[pos..pos + seq]);
+        pos += seq;
+    }
+}
+
+/// Display width of a single UTF-8 character for header wrapping. ASCII and the
+/// non-ASCII letters exercised by t4014 are width 1; this is deliberately the
+/// simple "1 column per codepoint" model git's `utf8_width` yields for those
+/// ranges (no East-Asian wide handling, which format-patch headers never need).
+fn utf8_display_width(_ch: &[u8]) -> isize {
+    1
 }
 
 /// Resolve the commit-list format used in the cover body: `--commit-list-format`
@@ -1385,6 +1660,12 @@ struct RenderContext<'a> {
     signoff_line: Option<&'a [u8]>,
     /// Abbreviation width for `index` lines.
     abbrev: usize,
+    /// This patch's resolved Message-ID / In-Reply-To / References block.
+    thread: &'a MailThreadHeaders,
+    /// Whether `--encode-email-headers`/`format.encodeEmailHeaders` is on.
+    encode_headers: bool,
+    /// Repo config (for the `--signoff` committer-ident 8-bit CTE check).
+    config: &'a GitConfig,
 }
 
 /// Render one commit into a complete mbox patch byte buffer.
@@ -1401,6 +1682,9 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         numbered,
         signoff_line,
         abbrev,
+        thread,
+        encode_headers,
+        config,
     } = ctx;
 
     let commit = &record.commit;
@@ -1416,15 +1700,18 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     }
     out.extend_from_slice(b" Mon Sep 17 00:00:00 2001\n");
 
+    // Message-ID / In-Reply-To / References block (git's log_write_email_headers,
+    // emitted before the From:/Date:/Subject identity headers).
+    thread.write(&mut out);
+
     // From: header. With `--from`/`format.from` the visible From: is the rewrite
     // identity and the real author moves to an in-body `From:`; otherwise the
-    // author identity is used directly.
+    // author identity is used directly. The display name is RFC 2047-encoded /
+    // RFC 822-quoted / wrapped exactly like git's pp_user_info.
     let (author_name, author_email) = commit_identity_name_email(&commit.author);
     let in_body_from = match &resolved.from_ident {
         Some(from) => {
-            out.extend_from_slice(
-                format!("From: {} <{}>\n", from.name, from.email).as_bytes(),
-            );
+            write_from_header(&mut out, &from.name, &from.email, encode_headers);
             // git keeps the in-body From: only when it differs from the header
             // From: (i.e. the author differs from the rewrite ident), unless
             // --force-in-body-from is set.
@@ -1433,9 +1720,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
                 .then(|| format!("From: {author_name} <{author_email}>\n"))
         }
         None => {
-            out.extend_from_slice(
-                format!("From: {author_name} <{author_email}>\n").as_bytes(),
-            );
+            write_from_header(&mut out, &author_name, &author_email, encode_headers);
             None
         }
     };
@@ -1444,16 +1729,39 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     let date = commit_identity_date(&commit.author, &DateMode::Rfc2822);
     out.extend_from_slice(format!("Date: {date}\n").as_bytes());
 
-    // Subject: [PREFIX n/m] <subject> (or, with -k/--keep-subject, the bare
-    // subject), folded to <=78 columns.
+    // Subject: [PREFIX n/m] <subject>. The subject is the collapsed leading
+    // paragraph (multi-line subjects join with a space), RFC 2047-encoded when
+    // header-encoding is on and it carries non-ASCII, else ASCII-wrapped at 78.
     let prefix = if options.keep_subject {
         None
     } else {
         subject_prefix_label(resolved, seq, last_number, numbered)
     };
-    let subject = commit_subject(&commit.message);
-    write_folded_subject(&mut out, prefix.as_deref(), &subject);
-    let subject_bytes = subject.clone().into_bytes();
+    let subject_bytes = if options.keep_subject {
+        // -k/--keep-subject emits the bare first line verbatim (no encoding,
+        // no paragraph collapse, no 822-atom quoting).
+        commit_subject(&commit.message).into_bytes()
+    } else {
+        format_patch_subject(&commit.message)
+    };
+    write_email_subject(&mut out, prefix.as_deref(), &subject_bytes, encode_headers);
+
+    // Content-Transfer-Encoding: a non-ASCII commit body, a non-ASCII in-body
+    // header, or `--signoff` with a non-ASCII committer ident forces the 8-bit
+    // MIME block. git emits it right after the Subject, before the extra headers.
+    let signoff_non_ascii =
+        signoff_line.is_some() && committer_ident_has_non_ascii(config).unwrap_or(false);
+    let need_8bit_cte = signoff_non_ascii
+        || message_body_has_non_ascii(&commit.message)
+        || in_body_from
+            .as_deref()
+            .map(|h| h.bytes().any(|b| b >= 0x80))
+            .unwrap_or(false);
+    if need_8bit_cte {
+        out.extend_from_slice(
+            b"MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n",
+        );
+    }
 
     // Extra headers (custom `--add-header`/`format.headers`, then `To:`, then
     // `Cc:`) are emitted directly after the Subject, before the blank line.
@@ -1541,56 +1849,301 @@ fn subject_prefix_label(
     Some(format!("[{inner}]"))
 }
 
-/// Append the `Subject:` header, folding so each output line is at most 78
-/// columns (continuation lines are indented by a single space), matching git's
-/// RFC 2822 subject wrapping.
-///
-/// The first line starts with `Subject: <prefix> ` (or just `Subject: ` when
-/// `prefix` is `None`, for `-k`/`--keep-subject`); the subject words are then
-/// packed greedily. A word is moved to a fresh continuation line (indent: one
-/// space) when appending it would push the line past 78 columns *and* the
-/// current line already carries content that can be "left behind" — the prefix
-/// on the first line, or at least one already-placed word on a continuation
-/// line. A single word longer than the budget therefore lands alone on its own
-/// over-long line rather than being split.
-fn write_folded_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &str) {
-    const WRAP: usize = 78;
-    let mut line = match prefix {
-        Some(prefix) => format!("Subject: {prefix} "),
-        None => String::from("Subject: "),
-    };
-    for word in subject.split(' ') {
-        if word.is_empty() {
-            // `split(' ')` yields empty strings for runs of spaces; git does not
-            // preserve those in subjects, so skip them.
-            continue;
+/// Collapse the leading subject paragraph (git's `format_subject` with a single
+/// space separator): consecutive non-blank message lines are trimmed of trailing
+/// whitespace and joined by one space, stopping at the first blank line. This is
+/// what turns a three-line `one\ntwo\nthree` subject into `one two three`.
+fn format_patch_subject(message: &[u8]) -> Vec<u8> {
+    let text = message;
+    let mut out: Vec<u8> = Vec::new();
+    let mut first = true;
+    let mut idx = 0;
+    while idx < text.len() {
+        let nl = text[idx..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| idx + p)
+            .unwrap_or(text.len());
+        let mut line = &text[idx..nl];
+        // Trim trailing CR/space/tab like git's get_one_line/is_blank_line.
+        while let Some(&last) = line.last() {
+            if last == b' ' || last == b'\t' || last == b'\r' {
+                line = &line[..line.len() - 1];
+            } else {
+                break;
+            }
         }
-        // The current line always carries content that can be left behind when a
-        // word wraps — the prefix on the first line, or an already-placed word on
-        // a continuation line — because every wrap immediately appends the word
-        // that triggered it. So a word folds whenever appending it would exceed
-        // the budget; an over-long word that does not fit even at the start of a
-        // line ends up alone on its own (over-long) line.
-        let needs_space = !line.ends_with(' ');
-        let candidate = line.len() + usize::from(needs_space) + word.len();
-        if candidate > WRAP {
-            // Flush the wrapped line verbatim: when only the prefix is present
-            // (the first word is being shed), git keeps the trailing space, so
-            // do not trim flushed lines.
-            out.extend_from_slice(line.as_bytes());
-            out.push(b'\n');
-            // Start a continuation line indented by one space.
-            line = String::from(" ");
+        if line.is_empty() {
+            break;
         }
-        if !line.ends_with(' ') {
-            line.push(' ');
+        if !first {
+            out.push(b' ');
         }
-        line.push_str(word);
+        out.extend_from_slice(line);
+        first = false;
+        idx = nl + 1;
     }
-    // Trim only the final line: an empty subject leaves the prefix line ending
-    // in a space, which git emits without the trailing space.
-    out.extend_from_slice(line.trim_end().as_bytes());
+    out
+}
+
+/// Append the `Subject:` header for one mail. Mirrors git's `pp_email_subject`
+/// plus `fmt_output_email_subject`: writes `Subject: <prefix> `, then either an
+/// RFC 2047 encoded-word sequence (when header-encoding is on and the subject
+/// needs it) or an ASCII word-wrap at 78 columns (continuations indented one
+/// space). The encoded path folds *inside* the encoded word at 76 columns; the
+/// ASCII path measures its first-line budget from the prefix already written.
+fn write_email_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &[u8], encode: bool) {
+    const MAX_LENGTH: isize = 78;
+    let header_start = out.len();
+    match prefix {
+        Some(prefix) => out.extend_from_slice(format!("Subject: {prefix} ").as_bytes()),
+        None => out.extend_from_slice(b"Subject: "),
+    }
+    if encode && needs_rfc2047_encoding(subject) {
+        add_rfc2047(out, subject, Rfc2047Type::Subject);
+    } else {
+        let prefix_cols = (out.len() - header_start) as isize;
+        add_wrapped_text(out, subject, -prefix_cols, 1, MAX_LENGTH);
+    }
     out.push(b'\n');
+}
+
+/// Append a `From: <name> <email>` header, mirroring git's `pp_user_info` mail
+/// branch: the display name is RFC 2047-encoded (when header-encoding is on and
+/// it carries non-ASCII), else RFC 822-quoted if it has specials, else wrapped at
+/// `max_length` columns; the ` <email>` is folded onto its own line when it would
+/// overflow that last line.
+fn write_from_header(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
+    let name_bytes = name.as_bytes();
+    // git: max_length starts at 78, narrows to 76 once the name is rfc2047-encoded.
+    let mut max_length: isize = 78;
+    out.extend_from_slice(b"From: ");
+
+    if encode && needs_rfc2047_encoding(name_bytes) {
+        add_rfc2047(out, name_bytes, Rfc2047Type::Address);
+        max_length = 76;
+    } else if needs_rfc822_quoting(name_bytes) {
+        let quoted = add_rfc822_quoted(name_bytes);
+        let start_cols = last_line_length(out) as isize;
+        add_wrapped_text(out, &quoted, -start_cols, 1, max_length);
+    } else {
+        let start_cols = last_line_length(out) as isize;
+        add_wrapped_text(out, name_bytes, -start_cols, 1, max_length);
+    }
+
+    // git: if the " <email>" won't fit on the current last line, fold it down.
+    let needed = last_line_length(out) as isize + 2 + email.len() as isize + 1;
+    if max_length < needed {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(format!(" <{email}>\n").as_bytes());
+}
+
+/// Per-mail threading headers: the `Message-ID`, the `In-Reply-To` target, and
+/// the ordered `References` chain (oldest → newest). Each id is the bare body
+/// (no angle brackets); the writers add `<...>`.
+#[derive(Default, Clone)]
+struct MailThreadHeaders {
+    message_id: Option<String>,
+    references: Vec<String>,
+}
+
+impl MailThreadHeaders {
+    /// Emit the `Message-ID`/`In-Reply-To`/`References` block. Mirrors git's
+    /// `log_write_email_headers`: In-Reply-To is the *last* reference; References
+    /// lists every reference, one per line, the first prefixed `References: ` and
+    /// the rest indented by a single tab.
+    fn write(&self, out: &mut Vec<u8>) {
+        if let Some(id) = &self.message_id {
+            out.extend_from_slice(format!("Message-ID: <{id}>\n").as_bytes());
+        }
+        if let Some(last) = self.references.last() {
+            out.extend_from_slice(format!("In-Reply-To: <{last}>\n").as_bytes());
+            for (i, r) in self.references.iter().enumerate() {
+                let lead = if i > 0 { "\t" } else { "References: " };
+                out.extend_from_slice(format!("{lead}<{r}>\n").as_bytes());
+            }
+        }
+    }
+}
+
+/// The `--thread[=<style>]` / `format.thread` level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadLevel {
+    Unset,
+    Shallow,
+    Deep,
+}
+
+/// `--thread`/`--thread=shallow`/`--thread=deep`/`--no-thread`/`format.thread`
+/// resolution, mirroring git's `thread_callback` + `git_format_config`:
+/// command-line wins over config; a bare `--thread` (or `format.thread=true`) is
+/// shallow.
+fn resolve_thread_level(options: &FormatPatchOptions, config: &GitConfig) -> ThreadLevel {
+    if let Some(level) = options.thread {
+        return level;
+    }
+    match config.get_entry("format", None, "thread") {
+        Some(Some(value)) if value.eq_ignore_ascii_case("deep") => ThreadLevel::Deep,
+        Some(Some(value)) if value.eq_ignore_ascii_case("shallow") => ThreadLevel::Shallow,
+        Some(value) => {
+            if value.and_then(git_config_bool_str).unwrap_or(true) {
+                ThreadLevel::Shallow
+            } else {
+                ThreadLevel::Unset
+            }
+        }
+        None => ThreadLevel::Unset,
+    }
+}
+
+/// git's `gen_message_id`: `<base>.<timestamp>.git.<email>`. `base` is the cover
+/// keyword `cover` or a commit oid hex; `timestamp` is captured once per run (git
+/// uses `time(NULL)` per call, but a single run-wide value keeps References
+/// byte-identical to the Message-IDs they reference, which is what the test
+/// normalization checks).
+fn gen_message_id(base: &str, timestamp: i64, email: &str) -> String {
+    format!("{base}.{timestamp}.git.{email}")
+}
+
+/// The run-wide timestamp baked into generated Message-IDs (git's `time(NULL)`,
+/// or the pinned `GIT_COMMITTER_DATE` for deterministic test behavior). One value
+/// per run keeps a patch's References byte-identical to the Message-IDs it points
+/// at, which is what the t4014 threading normalization checks.
+fn message_id_timestamp() -> i64 {
+    env::var("GIT_COMMITTER_DATE")
+        .ok()
+        .as_deref()
+        .and_then(parse_committer_date)
+        .map(|(secs, _tz)| secs)
+        .unwrap_or_else(current_unix_seconds)
+}
+
+/// Whether the commit *body* (everything past the header/body split, i.e. after
+/// the first blank line) carries a non-ASCII byte — git's body scan in
+/// `pp_title_line` that drives `need_8bit_cte`.
+fn message_body_has_non_ascii(message: &[u8]) -> bool {
+    let mut in_body = false;
+    let mut i = 0;
+    while i < message.len() {
+        let ch = message[i];
+        if !in_body {
+            if ch == b'\n' && message.get(i + 1) == Some(&b'\n') {
+                in_body = true;
+            }
+        } else if ch >= 0x80 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the runtime committer identity (`Name <email>`) has any non-ASCII
+/// byte — git's `has_non_ascii(fmt_name(WANT_COMMITTER_IDENT))` for the
+/// `--signoff` 8-bit-CTE check.
+fn committer_ident_has_non_ascii(config: &GitConfig) -> Result<bool> {
+    let ident = committer_ident_string(config)?;
+    Ok(ident.bytes().any(|b| b >= 0x80))
+}
+
+/// git's `clean_message_id`: strip leading whitespace + `<`, and trailing
+/// whitespace + `>`, returning the inner id. Used for `--in-reply-to`.
+fn clean_message_id(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && (bytes[start].is_ascii_whitespace() || bytes[start] == b'<') {
+        start += 1;
+    }
+    // Last index that is neither whitespace nor '>'.
+    let mut last = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if !b.is_ascii_whitespace() && b != b'>' {
+            last = Some(i);
+        }
+    }
+    match last {
+        Some(z) => String::from_utf8_lossy(&bytes[start..=z]).into_owned(),
+        None => raw.to_string(),
+    }
+}
+
+/// The resolved threading plan for a whole run: the cover's headers (when a cover
+/// is emitted) and one `MailThreadHeaders` per patch, in emission order. Built by
+/// replaying git's per-mail threading state machine (builtin/log.c).
+struct ThreadPlan {
+    cover: MailThreadHeaders,
+    patches: Vec<MailThreadHeaders>,
+}
+
+/// Replay git's threading state machine to assign Message-ID / In-Reply-To /
+/// References to the cover and each patch. `start_number` is the first patch's
+/// `n` (so `rev.nr` for patch index `i` is `start_number + i`).
+fn build_thread_plan(
+    level: ThreadLevel,
+    in_reply_to: Option<&str>,
+    cover_letter: bool,
+    commit_oids: &[String],
+    start_number: usize,
+    timestamp: i64,
+    email: &str,
+) -> ThreadPlan {
+    let threading = level != ThreadLevel::Unset;
+    // ref_message_ids: the live reference list git mutates as it walks.
+    let mut ref_ids: Vec<String> = Vec::new();
+    if let Some(irt) = in_reply_to {
+        ref_ids.push(clean_message_id(irt));
+    }
+    // rev.message_id: the id assigned to the previously-emitted mail.
+    let mut prev_message_id: Option<String> = None;
+
+    let mut cover = MailThreadHeaders::default();
+    if cover_letter {
+        if threading {
+            let id = gen_message_id("cover", timestamp, email);
+            prev_message_id = Some(id.clone());
+            cover.message_id = Some(id);
+        }
+        // The cover's In-Reply-To/References come from any pre-seeded ref_ids
+        // (i.e. --in-reply-to), captured *before* the cover's own id is pushed.
+        cover.references = ref_ids.clone();
+    }
+
+    let mut patches = Vec::with_capacity(commit_oids.len());
+    for (i, oid) in commit_oids.iter().enumerate() {
+        let rev_nr = start_number + i;
+        if threading {
+            if let Some(prev) = prev_message_id.take() {
+                // SHALLOW: drop the previous id (don't chain) when there is at
+                // least one reference already and we're past the cover's reply.
+                // DEEP: always chain the previous id into references.
+                let shallow_drop = level == ThreadLevel::Shallow
+                    && !ref_ids.is_empty()
+                    && (!cover_letter || rev_nr > 1);
+                if !shallow_drop {
+                    ref_ids.push(prev);
+                }
+            }
+            let id = gen_message_id(oid, timestamp, email);
+            prev_message_id = Some(id.clone());
+            let mut h = MailThreadHeaders {
+                message_id: Some(id),
+                references: ref_ids.clone(),
+            };
+            // The patch's own Message-ID is not part of its References list.
+            let _ = &mut h;
+            patches.push(h);
+        } else {
+            // No threading: only --in-reply-to seeds In-Reply-To/References,
+            // and only when explicitly given (ref_ids non-empty).
+            patches.push(MailThreadHeaders {
+                message_id: None,
+                references: ref_ids.clone(),
+            });
+        }
+    }
+
+    ThreadPlan { cover, patches }
 }
 
 /// Produce the patch body: the commit message with its subject line removed,
@@ -2802,7 +3355,6 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // sley emits for the common path.
             "--no-color"
             | "--color"
-            | "--no-thread"
             | "--minimal"
             | "--patience"
             | "--histogram"
@@ -2815,7 +3367,30 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "-a"
             | "--ita-invisible-in-index" => {}
             value if value.starts_with("--color=") => {}
-            value if value.starts_with("--thread") => {}
+            // Message threading: bare `--thread` is shallow; `--thread=deep` /
+            // `--thread=shallow` pick the style; `--no-thread` clears it.
+            "--no-thread" => options.thread = Some(ThreadLevel::Unset),
+            "--thread" => options.thread = Some(ThreadLevel::Shallow),
+            value if let Some(style) = value.strip_prefix("--thread=") => {
+                options.thread = Some(match style {
+                    "" | "shallow" => ThreadLevel::Shallow,
+                    "deep" => ThreadLevel::Deep,
+                    other => {
+                        eprintln!("fatal: Unknown value for --thread: {other}");
+                        return Err(GitError::Exit(128));
+                    }
+                });
+            }
+            // `--in-reply-to=<msgid>` (and the two-token form) seeds the chain.
+            "--in-reply-to" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--in-reply-to requires a value".into()))?;
+                options.in_reply_to = Some(value.clone());
+            }
+            value if let Some(msgid) = value.strip_prefix("--in-reply-to=") => {
+                options.in_reply_to = Some(msgid.to_string());
+            }
             // Cover-letter family.
             "--cover-letter" => options.cover_letter = Some(true),
             "--no-cover-letter" => options.cover_letter = Some(false),
