@@ -12,7 +12,7 @@ pub use setup::{
 use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
-use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
+use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader, repository_objects_dir};
 use sley_refs::{FileRefStore, PackedRef, RefTarget, resolve_ref_peeled, validate_symref_name};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -1004,12 +1004,14 @@ impl<'a> CommitGraphContext<'a> {
 /// `objects/info/commit-graphs/` are honored; chain layers are merged into a
 /// single map, and any layer that cannot be parsed standalone (e.g. one whose
 /// parent edges cross into a base layer, which this reader does not resolve)
-/// causes the chain to be ignored in favor of the object-reading path.
+/// causes the chain to be ignored in favor of the object-reading path. Linked
+/// worktrees are resolved through the common object directory, matching normal
+/// object reads.
 fn load_commit_graph_map(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
 ) -> HashMap<ObjectId, GraphCommit> {
-    let info = git_dir.join("objects").join("info");
+    let info = repository_objects_dir(git_dir).join("info");
     let single = info.join("commit-graph");
     if single.exists() {
         // A read/parse failure degrades to "no graph" (empty map) so callers
@@ -5249,6 +5251,18 @@ mod tests {
             merge_bases(&git_dir, format, &PanicReader, &mid, &tip)
                 .expect("test operation should succeed"),
             vec![mid.clone()]
+        );
+
+        // Linked worktrees keep commit-graphs in the common object directory,
+        // not under the per-worktree gitdir. The graph fast path must find that
+        // common location too, otherwise linked worktrees silently fall back to
+        // packed commit reads.
+        let linked = git_dir.join("worktrees").join("linked");
+        fs::create_dir_all(&linked).expect("test operation should succeed");
+        fs::write(linked.join("commondir"), "../..\n").expect("test operation should succeed");
+        assert!(
+            is_ancestor(&linked, format, &PanicReader, &root, &tip)
+                .expect("test operation should succeed")
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
