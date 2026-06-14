@@ -3215,6 +3215,7 @@ fn collect_status_untracked_paths(
     let ignore_len = context.ignores.patterns.len();
     read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
     let result = (|| -> Result<()> {
+        let mut git_path = dir_git_path.to_vec();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
@@ -3223,44 +3224,51 @@ fn collect_status_untracked_paths(
             }
             let file_type = entry.file_type()?;
             let is_dir = file_type.is_dir();
-            let git_path = git_path_append_component(dir_git_path, &file_name);
-            if context.ignores.is_ignored(&git_path, is_dir) {
-                continue;
-            }
-            if is_dir {
-                let path = entry.path();
-                if is_same_path(&path, context.git_dir) {
-                    continue;
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<()> {
+                if context.ignores.is_ignored(&git_path, is_dir) {
+                    return Ok(());
                 }
-                if context.stat_cache.gitlink_entry(&git_path).is_some() {
-                    continue;
-                }
-                match context.untracked_mode {
-                    StatusUntrackedMode::All => {
-                        if !context.tracked_dirs.contains(&git_path)
-                            && is_nested_repository_boundary(&path)
-                        {
-                            insert_untracked_directory(paths, &git_path);
-                        } else {
-                            collect_status_untracked_paths(context, &path, &git_path, paths)?;
-                        }
+                if is_dir {
+                    let path = entry.path();
+                    if is_same_path(&path, context.git_dir) {
+                        return Ok(());
                     }
-                    StatusUntrackedMode::Normal => {
-                        if context.tracked_dirs.contains(&git_path) {
-                            collect_status_untracked_paths(context, &path, &git_path, paths)?;
-                        } else if is_nested_repository_boundary(&path) {
-                            insert_untracked_directory(paths, &git_path);
-                        } else if status_untracked_directory_has_file(context, &path, &git_path)? {
-                            insert_untracked_directory(paths, &git_path);
-                        }
+                    if context.stat_cache.gitlink_entry(&git_path).is_some() {
+                        return Ok(());
                     }
-                    StatusUntrackedMode::None => {}
+                    match context.untracked_mode {
+                        StatusUntrackedMode::All => {
+                            if !context.tracked_dirs.contains(git_path.as_slice())
+                                && is_nested_repository_boundary(&path)
+                            {
+                                insert_untracked_directory(paths, &git_path);
+                            } else {
+                                collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                            }
+                        }
+                        StatusUntrackedMode::Normal => {
+                            if context.tracked_dirs.contains(git_path.as_slice()) {
+                                collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                            } else if is_nested_repository_boundary(&path) {
+                                insert_untracked_directory(paths, &git_path);
+                            } else if status_untracked_directory_has_file(
+                                context, &path, &git_path,
+                            )? {
+                                insert_untracked_directory(paths, &git_path);
+                            }
+                        }
+                        StatusUntrackedMode::None => {}
+                    }
+                } else if (file_type.is_file() || file_type.is_symlink())
+                    && !context.stat_cache.contains(&git_path)
+                {
+                    paths.insert(git_path.clone());
                 }
-            } else if (file_type.is_file() || file_type.is_symlink())
-                && !context.stat_cache.contains(&git_path)
-            {
-                paths.insert(git_path);
-            }
+                Ok(())
+            })();
+            git_path.truncate(path_len);
+            entry_result?;
         }
         Ok(())
     })();
@@ -3296,6 +3304,7 @@ fn status_untracked_directory_has_file(
     let ignore_len = context.ignores.patterns.len();
     read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
     let result = (|| -> Result<bool> {
+        let mut git_path = dir_git_path.to_vec();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
@@ -3304,24 +3313,31 @@ fn status_untracked_directory_has_file(
             }
             let file_type = entry.file_type()?;
             let is_dir = file_type.is_dir();
-            let git_path = git_path_append_component(dir_git_path, &file_name);
-            if context.ignores.is_ignored(&git_path, is_dir) {
-                continue;
-            }
-            if file_type.is_file() || file_type.is_symlink() {
-                return Ok(!context.stat_cache.contains(&git_path));
-            }
-            if is_dir {
-                let path = entry.path();
-                if is_same_path(&path, context.git_dir) {
-                    continue;
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<Option<bool>> {
+                if context.ignores.is_ignored(&git_path, is_dir) {
+                    return Ok(None);
                 }
-                if is_nested_repository_boundary(&path) {
-                    return Ok(true);
+                if file_type.is_file() || file_type.is_symlink() {
+                    return Ok(Some(!context.stat_cache.contains(&git_path)));
                 }
-                if status_untracked_directory_has_file(context, &path, &git_path)? {
-                    return Ok(true);
+                if is_dir {
+                    let path = entry.path();
+                    if is_same_path(&path, context.git_dir) {
+                        return Ok(None);
+                    }
+                    if is_nested_repository_boundary(&path) {
+                        return Ok(Some(true));
+                    }
+                    if status_untracked_directory_has_file(context, &path, &git_path)? {
+                        return Ok(Some(true));
+                    }
                 }
+                Ok(None)
+            })();
+            git_path.truncate(path_len);
+            if let Some(has_file) = entry_result? {
+                return Ok(has_file);
             }
         }
         Ok(false)
@@ -8688,6 +8704,16 @@ fn git_path_append_component(parent: &[u8], component: &std::ffi::OsStr) -> Vec<
     }
     path.extend_from_slice(component.as_ref());
     path
+}
+
+fn git_path_push_component(path: &mut Vec<u8>, component: &std::ffi::OsStr) -> usize {
+    let original_len = path.len();
+    let component = os_str_component_bytes(component);
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(component.as_ref());
+    original_len
 }
 
 #[cfg(unix)]
