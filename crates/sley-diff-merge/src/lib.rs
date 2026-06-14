@@ -1678,8 +1678,18 @@ fn augment_with_stat_dirty_entries(
         if !(metadata.is_file() || metadata.file_type().is_symlink()) {
             continue;
         }
-        if !stat_cache.index_entry_worktree_stat_dirty(cached, &metadata) {
-            continue;
+        match stat_cache.index_entry_worktree_stat_verdict(cached, &metadata) {
+            sley_index::StatVerdict::Clean => continue,
+            sley_index::StatVerdict::Dirty => {}
+            // A racily-clean entry must be resolved by content: git re-hashes it
+            // (`ce_compare_data`) and only reports `M` when the worktree bytes
+            // actually differ from the cached oid — so a `touch`ed-then-re-`add`ed
+            // file (same-second mtime as the index) stays clean.
+            sley_index::StatVerdict::RacyNeedsContentCheck => {
+                if worktree_oid_matches_index(worktree_root, git_path, &metadata, tracked, format)? {
+                    continue;
+                }
+            }
         }
         extras.push(NameStatusEntry {
             status: NameStatus::Modified,
@@ -1693,9 +1703,37 @@ fn augment_with_stat_dirty_entries(
     }
     if !extras.is_empty() {
         content_changes.extend(extras);
-        content_changes.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+        content_changes
+            .sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
     }
     Ok(content_changes)
+}
+
+/// Whether the worktree file at `git_path` hashes to the index entry's oid (mode
+/// included). Used to resolve a racily-clean `diff-files` entry: git re-hashes the
+/// content and only reports it changed when the bytes truly differ. Mirrors the
+/// worktree-oid computation in [`worktree_entry_for_path`].
+fn worktree_oid_matches_index(
+    worktree_root: &Path,
+    git_path: &[u8],
+    metadata: &fs::Metadata,
+    index_entry: &TrackedEntry,
+    format: ObjectFormat,
+) -> Result<bool> {
+    let file_type = metadata.file_type();
+    let path = worktree_root.join(repo_path_to_path(git_path));
+    let body = if file_type.is_symlink() {
+        symlink_target_bytes(&path)?
+    } else {
+        fs::read(&path)?
+    };
+    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+    let mode = if file_type.is_symlink() {
+        0o120000
+    } else {
+        file_mode(metadata)
+    };
+    Ok(oid == index_entry.oid && mode == index_entry.mode)
 }
 
 pub fn diff_name_status_trees_with_options(

@@ -981,6 +981,26 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     die_on_pathspec_inside_submodule(&cwd, &worktree_root, &git_dir, format, &paths)?;
+    // git's `add` re-stats every tracked path it touches, including ones whose
+    // content is unchanged (a `touch`ed file): `builtin/add.c` calls
+    // `refresh_index` over the pathspec before/after staging, so the cached stat
+    // matches the worktree and `git diff-files` stays clean (t2200 "touch and then
+    // add"). sley's action resolver only stages content-changed paths, so a
+    // content-clean-but-stat-dirty tracked entry would otherwise keep its stale
+    // stat. Capture the pathspec so we can run that refresh after staging; an empty
+    // pathspec (bare `add -u`/`-A`) refreshes every tracked entry, matching git.
+    //
+    // `--chmod` is the one case we must NOT refresh: it deliberately sets an index
+    // mode that diverges from the worktree file's mode (e.g. stage 100755 while the
+    // file is 100644), and a stat refresh would re-stamp the mode from the worktree
+    // and clobber the chmod. git keeps the explicit mode; so do we, by skipping the
+    // refresh entirely when a chmod was requested.
+    let refresh_paths: Vec<PathBuf> = if dry_run || chmod.is_some() {
+        Vec::new()
+    } else {
+        paths.clone()
+    };
+    let do_refresh = !dry_run && chmod.is_none();
     if update || all {
         let actions = resolve_add_update_actions(
             &cwd,
@@ -1004,7 +1024,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             let config = read_repo_config(&git_dir)?;
             sley_worktree::update_index_paths_filtered(
                 &worktree_root,
-                git_dir,
+                &git_dir,
                 format,
                 &action_paths,
                 sley_worktree::UpdateIndexOptions {
@@ -1017,6 +1037,9 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 },
                 &config,
             )?;
+        }
+        if do_refresh {
+            refresh_index_after_add(&worktree_root, &git_dir, format, &refresh_paths)?;
         }
         if verbose {
             print_add_actions(&worktree_root, &actions)?;
@@ -1077,9 +1100,53 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         )?;
         warn_on_embedded_repos(&git_dir, &worktree_root, &actions, &previously_tracked)?;
     }
+    if do_refresh {
+        refresh_index_after_add(&worktree_root, &git_dir, format, &refresh_paths)?;
+    }
     if verbose {
         print_add_actions(&worktree_root, &actions)?;
     }
+    Ok(())
+}
+
+/// Re-stat the index entries `git add` touched so the cached stat matches the
+/// worktree (git's `refresh_index` over the pathspec): a tracked path whose
+/// content is unchanged but whose stat is dirty (e.g. it was `touch`ed) is
+/// stamped clean, so `git diff-files` reports nothing. An empty pathspec (bare
+/// `add -u`/`-A`) refreshes every tracked entry. Quiet + tolerant of missing
+/// files (content mismatches are genuine worktree changes, not a refresh error).
+fn refresh_index_after_add(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    refresh_paths: &[PathBuf],
+) -> Result<()> {
+    // Pathspecs here may be directories or `.`; refresh_index_paths matches by
+    // exact entry path, so a directory pathspec would refresh nothing. To stay
+    // faithful to git (refresh everything the pathspec covers) we pass the empty
+    // set — refreshing all tracked entries — whenever a non-file pathspec is
+    // present; a pure set of file pathspecs refreshes just those entries.
+    let only_files = !refresh_paths.is_empty()
+        && refresh_paths.iter().all(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            fs::symlink_metadata(&absolute)
+                .map(|metadata| metadata.file_type().is_file() || metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        });
+    let selected: &[PathBuf] = if only_files { refresh_paths } else { &[] };
+    sley_worktree::refresh_index_paths(
+        worktree_root,
+        git_dir,
+        format,
+        selected,
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
     Ok(())
 }
 

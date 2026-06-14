@@ -160,6 +160,7 @@ jobs:
             t6300-for-each-ref.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
+            t7102-reset.sh
             t7400-submodule-basic.sh
             t7506-status-submodule.sh
             t7508-status.sh
