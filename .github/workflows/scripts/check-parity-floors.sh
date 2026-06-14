@@ -158,7 +158,7 @@ declare -A FLOOR=(
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=86
     [t4027-diff-submodule.sh]=18
-    [t7102-reset.sh]=35
+    [t7102-reset.sh]=36
 )
 
 fail=0
