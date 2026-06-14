@@ -136,6 +136,24 @@
 # t3000-ls-files-others=15; unfloored held: t2200-add-update=17, t3903-stash=22,
 # t4006-diff-mode=7, t4011-diff-symlink=0, t7060-wtstatus=7, t7063-status-untracked-
 # cache=14. No workspace test regressed (2171/0).
+# status submodule-summary wave (2026-06-14, parity/statussub): t7508-status
+# 86->113 (+27 — built the `Submodule changes to be committed:` (HEAD↔index) and
+# `Submodules changed but not updated:` (index↔worktree) long-status sections,
+# gated on status.submodulesummary, in sley-cli workspace.rs cmd_status. Each
+# changed gitlink renders `* <path> <old7>...<new7> (N):` + `  > subj` / `  < subj`
+# lines via a date-priority first-parent symmetric-difference walk of the
+# submodule's own ODB (git submodule summary --cached/--files --for-status
+# format), with the 0000000 add/remove single-tip forms. Honours
+# --ignore-submodules[=<when>], submodule.<name>.ignore (.git/config over
+# .gitmodules), and diff.ignoreSubmodules at the resolved precedence, applied to
+# the worktree-side detail; CLI =all also drops the staged gitlink line + the
+# whole summary, per-submodule =all only drops the summary. Side gains in the
+# cluster: commit-dry-run divergence-advice suppression (#67) and commit -u<mode>
+# threading to the dry-run preview (#108). Residual #70 (commit --amend --dry-run)
+# needs the staged section diffed against HEAD^ — a separate commit-amend-preview
+# feature, NOT a summary gap; the summary itself is HEAD^-correct. Neighbors held:
+# t7506-status-submodule=28, t2020-checkout-detach=16, t7400-submodule-basic=70.
+# No workspace test regressed (all crates 0 failed).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -216,7 +234,7 @@ declare -A FLOOR=(
     [t0008-ignores.sh]=306
     [t7400-submodule-basic.sh]=70
     [t7506-status-submodule.sh]=28
-    [t7508-status.sh]=86
+    [t7508-status.sh]=113
     [t4027-diff-submodule.sh]=18
     [t7102-reset.sh]=37
 )
