@@ -130,10 +130,20 @@ jobs:
             echo "::group::$crate @ $VERSION"
 
             if [ "$DRY_RUN" = "true" ]; then
-              echo "Dry-run publishing $crate"
-              cargo publish -p "$crate" --dry-run
+              # A dependent cannot be `cargo publish --dry-run`'d before its deps
+              # are on crates.io — the manifest dep-resolution step fails with
+              # "no matching package named sley-* found" (verified; --no-verify
+              # does NOT skip it). So the dry run validates each crate's package
+              # manifest + assembled file set via `cargo package --list` (no
+              # registry resolution). The runtime topo-order assertion above and
+              # the green workspace build are the rest of the pre-publish gate;
+              # per-tarball build verification happens at real-publish time only
+              # for the leaves (the real loop uses --no-verify, matching standard
+              # workspace-publish tooling, to avoid the propagation race).
+              echo "Dry-run (cargo package --list) $crate"
+              cargo package -p "$crate" --list >/dev/null
               echo "::endgroup::"
-              PUBLISHED+=("$crate (dry-run)")
+              PUBLISHED+=("$crate (package --list ok)")
               continue
             fi
 
