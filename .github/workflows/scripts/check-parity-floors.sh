@@ -61,6 +61,20 @@
 # --ignore-if-in-upstream chain (cells #3/4/6/7) that leaves rebuild-1 empty —
 # they are NOT a cover-letter gap. No diff/log floor regressed (t4013/t4015/
 # t4018/t4202/t4034/t4045/t4047/t4027 all held; render.rs untouched).
+# fsck wave (2026-06-14, parity/fsck): t1450-fsck added at 67 (was 22 — built
+# the object-content checker in sley-fsck/content.rs, mirroring git's fsck.c
+# commit/tree/tag buffer validation: fsck_ident, verify_headers, the tree
+# name/mode/dup checks [incl. the verify_ordered d/f-conflict candidate stack],
+# tag header structure, and the fsck.<msgid> severity table + config overrides
+# [--strict promotion, fsck.largePathname=<sev>:<len>]). Also: the stdout/stderr
+# split [content findings→stderr, broken-link/missing/dangling→stdout], git's
+# exit-code bitmask [ERROR_OBJECT/REACHABLE/REFS], --tags root scoping,
+# explicit-oid roots [no fallback-to-all-heads], NTFS '.git\' detection, and the
+# loose-object 'unable to parse type from header <hdr>' message. Neighbors held:
+# t1006-cat-file=290, t1007-hash-object=40. Remaining 29 fails are feature-gap
+# sprawl (ref/HEAD validation, --connectivity-only/--cache/--name-objects,
+# pack-object fsck, gitattributes blob checks, rev-list --verify-objects,
+# worktree-index fsck), not content-checker gaps — see the ranked backlog.
 # reset wave (2026-06-14, parity/reset): t7102-reset added at 35 (was 13 — banked
 # six clusters in cmd_reset/sley-worktree/sley-index: (a) parse-options errors —
 # `--no-{soft,mixed,hard,merge,keep}`/`--other`/`-o` now emit `error: unknown
@@ -97,6 +111,7 @@ declare -A FLOOR=(
     [t1300-config.sh]=497
     [t1400-update-ref.sh]=175
     [t1401-symbolic-ref.sh]=25
+    [t1450-fsck.sh]=67
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=165
     [t3070-wildmatch.sh]=1861

@@ -3990,7 +3990,17 @@ impl LooseObjectStore {
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         }
         let Ok(object) = parse_framed_object(&framed) else {
-            eprintln!("error: unable to parse header of {display_path}");
+            // Distinguish git's two header-parse failures: a structurally valid
+            // `"<word> <size>\0"` header whose *type word* is not a known object
+            // type yields `unable to parse type from header '<header>'`, while a
+            // genuinely malformed header yields `unable to parse header`.
+            if let Some(header) = loose_header_with_unknown_type(&framed) {
+                eprintln!(
+                    "error: unable to parse type from header '{header}' of {display_path}"
+                );
+            } else {
+                eprintln!("error: unable to parse header of {display_path}");
+            }
             return Ok(Some(LooseObjectIntegrity::Corrupt));
         };
         let actual = object.object_id(self.format)?;
@@ -4009,6 +4019,28 @@ fn framed_loose_header_terminated(framed: &[u8]) -> bool {
         .iter()
         .take(MAX_LOOSE_HEADER_LEN)
         .any(|byte| *byte == 0)
+}
+
+/// If the framing has a structurally valid `"<word> <size>\0"` header whose body
+/// length matches `<size>` but whose `<word>` is not a known object type, return
+/// the header string (the bytes before the NUL). Mirrors git's
+/// `parse_loose_header` reporting `unable to parse type from header '<header>'`.
+fn loose_header_with_unknown_type(framed: &[u8]) -> Option<String> {
+    let nul = framed.iter().position(|&b| b == 0)?;
+    let header = std::str::from_utf8(&framed[..nul]).ok()?;
+    let (kind, size) = header.split_once(' ')?;
+    let size: usize = size.parse().ok()?;
+    // Body length must match the declared size (otherwise it is a different
+    // corruption, handled by the generic path).
+    if framed.len() - (nul + 1) != size {
+        return None;
+    }
+    // A known type word would have parsed successfully upstream; only return
+    // when the word is genuinely unknown.
+    if kind.parse::<ObjectType>().is_ok() {
+        return None;
+    }
+    Some(header.to_string())
 }
 
 /// Read up to `prefix.len()` bytes from the start of `file`, returning how many
