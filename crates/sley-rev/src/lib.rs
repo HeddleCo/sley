@@ -1059,6 +1059,22 @@ struct RawCommitGraph {
     edge: Option<Range<usize>>,
 }
 
+struct RawCommitGraphCountState {
+    seen: Vec<u64>,
+    pending: Vec<usize>,
+    parents: Vec<usize>,
+}
+
+impl RawCommitGraphCountState {
+    fn new(commit_count: usize) -> Self {
+        Self {
+            seen: vec![0u64; commit_count.div_ceil(64)],
+            pending: Vec::new(),
+            parents: Vec::new(),
+        }
+    }
+}
+
 enum RawCommitGraphBytes {
     Owned(Vec<u8>),
     Mapped(sley_mmap::MappedFile),
@@ -1264,6 +1280,33 @@ impl RawCommitGraph {
         }))
     }
 
+    fn count_reachable_indices(
+        &self,
+        starts: &[usize],
+        first_parent: bool,
+        state: &mut RawCommitGraphCountState,
+    ) -> Result<usize> {
+        state.pending.extend(starts.iter().copied());
+        let mut count = 0usize;
+        while let Some(idx) = state.pending.pop() {
+            if idx >= self.commit_count {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph traversal index points past table".into(),
+                ));
+            }
+            let word = idx / 64;
+            let bit = 1u64 << (idx % 64);
+            if state.seen[word] & bit != 0 {
+                continue;
+            }
+            state.seen[word] |= bit;
+            count += 1;
+            self.parent_indices_for_entry(idx, first_parent, &mut state.parents)?;
+            state.pending.extend(state.parents.iter().copied());
+        }
+        Ok(count)
+    }
+
     fn find_index(&self, oid: &ObjectId) -> Result<Option<usize>> {
         let first = oid.as_bytes()[0] as usize;
         let mut low = if first == 0 {
@@ -1336,6 +1379,66 @@ impl RawCommitGraph {
             .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))
     }
 
+    fn parent_indices_for_entry(
+        &self,
+        idx: usize,
+        first_parent: bool,
+        out: &mut Vec<usize>,
+    ) -> Result<()> {
+        out.clear();
+        let entry = self.cdat_entry(idx)?;
+        let hash_len = self.format.raw_len();
+        let parent_one = read_u32_be(&entry[hash_len..hash_len + 4]);
+        let parent_two = read_u32_be(&entry[hash_len + 4..hash_len + 8]);
+        if parent_one != RAW_COMMIT_GRAPH_PARENT_NONE {
+            validate_raw_commit_graph_parent(parent_one, self.commit_count)?;
+            out.push(parent_one as usize);
+        }
+        if first_parent || parent_two == RAW_COMMIT_GRAPH_PARENT_NONE {
+            return Ok(());
+        }
+        if parent_two & RAW_COMMIT_GRAPH_EXTRA_EDGE == 0 {
+            validate_raw_commit_graph_parent(parent_two, self.commit_count)?;
+            out.push(parent_two as usize);
+            return Ok(());
+        }
+
+        let Some(edge) = &self.edge else {
+            return Err(GitError::InvalidFormat(
+                "commit-graph octopus edge missing EDGE chunk".into(),
+            ));
+        };
+        let mut edge_idx = (parent_two & RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK) as usize;
+        loop {
+            let start = edge
+                .start
+                .checked_add(edge_idx.checked_mul(4).ok_or_else(|| {
+                    GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+                })?)
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+                })?;
+            let end = start.checked_add(4).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+            })?;
+            let Some(bytes) = self.bytes.as_ref().get(start..end) else {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph EDGE entry points past chunk".into(),
+                ));
+            };
+            let raw = read_u32_be(bytes);
+            let parent = raw & RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK;
+            validate_raw_commit_graph_parent(parent, self.commit_count)?;
+            out.push(parent as usize);
+            if raw & RAW_COMMIT_GRAPH_EXTRA_EDGE != 0 {
+                return Ok(());
+            }
+            edge_idx = edge_idx.checked_add(1).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+            })?;
+        }
+    }
+
     fn parent_oids(&self, parent_one: u32, parent_two: u32) -> Result<Vec<ObjectId>> {
         let mut parents = Vec::new();
         if parent_one != RAW_COMMIT_GRAPH_PARENT_NONE {
@@ -1405,6 +1508,51 @@ impl<'a> CommitGraphContext<'a> {
         self.direct_graph
             .as_ref()
             .expect("direct commit graph load state initialized")
+    }
+
+    fn count_reachable_direct(
+        &mut self,
+        starts: &[ObjectId],
+        first_parent: bool,
+    ) -> Result<Option<usize>> {
+        let format = self.format;
+        let DirectCommitGraph::Raw(graph) = self.direct_graph() else {
+            return Ok(None);
+        };
+        let mut indices = Vec::with_capacity(starts.len());
+        for oid in starts {
+            if oid.format() != format {
+                return Ok(None);
+            }
+            let Some(idx) = graph.find_index(oid)? else {
+                return Ok(None);
+            };
+            indices.push(idx);
+        }
+        let mut state = RawCommitGraphCountState::new(graph.commit_count);
+        graph
+            .count_reachable_indices(&indices, first_parent, &mut state)
+            .map(Some)
+    }
+
+    fn count_reachable_graph_oid(
+        &mut self,
+        oid: &ObjectId,
+        first_parent: bool,
+        state: &mut Option<RawCommitGraphCountState>,
+    ) -> Result<Option<usize>> {
+        let format = self.format;
+        let DirectCommitGraph::Raw(graph) = self.direct_graph() else {
+            return Ok(None);
+        };
+        if oid.format() != format {
+            return Ok(None);
+        }
+        let Some(idx) = graph.find_index(oid)? else {
+            return Ok(None);
+        };
+        let state = state.get_or_insert_with(|| RawCommitGraphCountState::new(graph.commit_count));
+        graph.count_reachable_indices(&[idx], first_parent, state).map(Some)
     }
 
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
@@ -2223,8 +2371,39 @@ pub fn count_commit_metadata<R: ObjectReader>(
     first_parent: bool,
 ) -> Result<usize> {
     let mut graph = CommitGraphContext::load(git_dir, format);
+    let starts = starts.into_iter().collect::<Vec<_>>();
+    if !reader.has_shallow_grafts()
+        && let Some(count) = graph.count_reachable_direct(&starts, first_parent)?
+    {
+        return Ok(count);
+    }
+    if !reader.has_shallow_grafts() {
+        let mut graph_count_state = None;
+        let mut seen_objects = HashSet::new();
+        let mut pending: VecDeque<ObjectId> = starts.into();
+        let mut count = 0usize;
+        while let Some(oid) = pending.pop_front() {
+            if let Some(graph_count) =
+                graph.count_reachable_graph_oid(&oid, first_parent, &mut graph_count_state)?
+            {
+                count += graph_count;
+                continue;
+            }
+            if !seen_objects.insert(oid) {
+                continue;
+            }
+            let parents = commit_parents(reader, format, &oid)?;
+            if first_parent {
+                pending.extend(parents.into_iter().next());
+            } else {
+                pending.extend(parents);
+            }
+            count += 1;
+        }
+        return Ok(count);
+    }
     let mut seen = HashSet::new();
-    let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
+    let mut pending: VecDeque<ObjectId> = starts.into();
     let mut count = 0usize;
     while let Some(oid) = pending.pop_front() {
         if !seen.insert(oid) {
@@ -3933,6 +4112,7 @@ mod tests {
     use sley_object::EncodedObject;
     use sley_odb::{ObjectDatabase, ObjectWriter};
     use sley_refs::{RefTarget, RefUpdate, ReflogEntry};
+    use std::cell::Cell;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5426,6 +5606,27 @@ mod tests {
         }
     }
 
+    struct CountingReader<'a> {
+        inner: &'a FileObjectDatabase,
+        reads: Cell<usize>,
+    }
+
+    impl<'a> CountingReader<'a> {
+        fn new(inner: &'a FileObjectDatabase) -> Self {
+            Self {
+                inner,
+                reads: Cell::new(0),
+            }
+        }
+    }
+
+    impl ObjectReader for CountingReader<'_> {
+        fn read_object(&self, oid: &ObjectId) -> Result<std::sync::Arc<EncodedObject>> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read_object(oid)
+        }
+    }
+
     /// Compute topological generation numbers for `parents` (a child -> parents
     /// map). A root commit has generation 1; every other commit is one greater
     /// than the maximum generation among its parents -- exactly git's definition.
@@ -5879,6 +6080,26 @@ mod tests {
         assert!(
             is_ancestor(&linked, format, &PanicReader, &root, &tip)
                 .expect("test operation should succeed")
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn count_commit_metadata_uses_partial_direct_commit_graph() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let commits = build_linear_history(&git_dir, 5);
+        write_commit_graph_file(&git_dir, format, &db, &commits[..3]);
+
+        let reader = CountingReader::new(&db);
+        let count = count_commit_metadata(&git_dir, format, &reader, [commits[4]], false)
+            .expect("count should succeed");
+        assert_eq!(count, 5);
+        assert_eq!(
+            reader.reads.get(),
+            2,
+            "only commits newer than the partial graph should be object-read"
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

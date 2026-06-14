@@ -34,6 +34,13 @@ pub trait ObjectReader {
     fn is_shallow_graft(&self, _oid: &ObjectId) -> bool {
         false
     }
+
+    /// Whether this reader has any shallow/graft boundaries at all. Walkers can
+    /// use this to choose dense graph-only traversal when no boundary can cut
+    /// parent edges.
+    fn has_shallow_grafts(&self) -> bool {
+        false
+    }
 }
 
 fn implied_empty_tree_object(format: ObjectFormat, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
@@ -3900,6 +3907,22 @@ fn alternate_object_dirs(objects_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl ObjectReader for FileObjectDatabase {
+    fn has_shallow_grafts(&self) -> bool {
+        !self
+            .shallow_grafts
+            .get_or_init(|| {
+                let shallow_file = self
+                    .objects_dir
+                    .parent()
+                    .map(|git_dir| git_dir.join("shallow"));
+                match shallow_file {
+                    Some(path) => read_shallow_grafts(&path, self.format),
+                    None => HashSet::new(),
+                }
+            })
+            .is_empty()
+    }
+
     fn is_shallow_graft(&self, oid: &ObjectId) -> bool {
         self.shallow_grafts
             .get_or_init(|| {
