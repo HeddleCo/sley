@@ -1571,7 +1571,6 @@ pub struct RevWalk<'a, R: ObjectReader> {
     started: bool,
     seen: HashSet<ObjectId>,
     heap: std::collections::BinaryHeap<RevWalkHeapEntry>,
-    records: HashMap<ObjectId, CommitMetadata>,
     emitted: usize,
     skipped: usize,
 }
@@ -1582,12 +1581,12 @@ pub struct RevWalk<'a, R: ObjectReader> {
 /// `(commit_time, Reverse(oid))`).
 struct RevWalkHeapEntry {
     key: i64,
-    oid: ObjectId,
+    metadata: CommitMetadata,
 }
 
 impl PartialEq for RevWalkHeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.oid == other.oid
+        self.key == other.key && self.metadata.oid == other.metadata.oid
     }
 }
 impl Eq for RevWalkHeapEntry {}
@@ -1597,7 +1596,7 @@ impl Ord for RevWalkHeapEntry {
         // times, the SMALLER oid first — so reverse the oid comparison.
         self.key
             .cmp(&other.key)
-            .then_with(|| other.oid.cmp(&self.oid))
+            .then_with(|| other.metadata.oid.cmp(&self.metadata.oid))
     }
 }
 impl PartialOrd for RevWalkHeapEntry {
@@ -1628,7 +1627,6 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
             started: false,
             seen: HashSet::new(),
             heap: std::collections::BinaryHeap::new(),
-            records: HashMap::new(),
             emitted: 0,
             skipped: 0,
         }
@@ -1696,9 +1694,7 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
 
     fn push(&mut self, metadata: CommitMetadata) {
         let key = self.order_key(&metadata);
-        let oid = metadata.oid;
-        self.records.insert(oid, metadata);
-        self.heap.push(RevWalkHeapEntry { key, oid });
+        self.heap.push(RevWalkHeapEntry { key, metadata });
     }
 
     fn init(&mut self) -> Result<()> {
@@ -1753,9 +1749,7 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
             let Some(entry) = self.heap.pop() else {
                 return Ok(None);
             };
-            let Some(metadata) = self.records.remove(&entry.oid) else {
-                continue;
-            };
+            let metadata = entry.metadata;
             // Descend regardless of the date window's upper bound: a commit
             // newer than `--until` is dropped from output but its ancestors
             // may still fall in-window. The lower bound, however, prunes the
