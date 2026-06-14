@@ -3226,10 +3226,17 @@ fn collect_status_untracked_paths(
             let is_dir = file_type.is_dir();
             let path_len = git_path_push_component(&mut git_path, &file_name);
             let entry_result = (|| -> Result<()> {
-                if context.ignores.is_ignored(&git_path, is_dir) {
+                if file_type.is_file() || file_type.is_symlink() {
+                    if !context.stat_cache.contains(&git_path)
+                        && !context.ignores.is_ignored(&git_path, false)
+                    {
+                        paths.insert(git_path.clone());
+                    }
                     return Ok(());
-                }
-                if is_dir {
+                } else if is_dir {
+                    if context.ignores.is_ignored(&git_path, true) {
+                        return Ok(());
+                    }
                     let path = entry.path();
                     if is_same_path(&path, context.git_dir) {
                         return Ok(());
@@ -3260,10 +3267,6 @@ fn collect_status_untracked_paths(
                         }
                         StatusUntrackedMode::None => {}
                     }
-                } else if (file_type.is_file() || file_type.is_symlink())
-                    && !context.stat_cache.contains(&git_path)
-                {
-                    paths.insert(git_path.clone());
                 }
                 Ok(())
             })();
