@@ -4,7 +4,7 @@
 //! `diff_words_fill`, `emit_hunk_header`).
 
 use crate::*;
-use commands::grep::Regex;
+use crate::grep_source::Regex;
 
 /// ANSI palette for colored diff output. Each slot holds the escape sequence
 /// (empty when color is disabled), mirroring `diff_get_color`.

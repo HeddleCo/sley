@@ -99,8 +99,8 @@ struct ShowOptions {
     /// pretty format or `--no-notes` suppresses them, `--notes`/`--show-notes`
     /// forces them on.
     show_notes: bool,
-    /// Object/revision arguments to show.
-    specs: Vec<String>,
+    /// Revision/pathspec arguments passed to the shared revision parser.
+    setup_args: Vec<String>,
 }
 
 struct ShowContext<'a> {
@@ -110,6 +110,7 @@ struct ShowContext<'a> {
     config: &'a GitConfig,
     options: &'a ShowOptions,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
+    diff_pathspec: Option<&'a DiffPathspec>,
 }
 
 struct CommitTrailerLayout {
@@ -145,7 +146,7 @@ impl Default for ShowOptions {
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
-            specs: Vec::new(),
+            setup_args: Vec::new(),
         }
     }
 }
@@ -209,10 +210,29 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         log_decoration_map(git_dir, db, format, decoration_mode)?
     };
 
-    let specs = if options.specs.is_empty() {
-        vec!["HEAD".to_string()]
+    let mut setup_args = vec!["--default".to_string(), "HEAD".to_string()];
+    setup_args.extend(options.setup_args.iter().cloned());
+    let setup = sley_rev::setup_revisions(
+        &setup_args,
+        &sley_rev::RevisionSetupContext {
+            git_dir,
+            worktree_root: repo.worktree_root().ok(),
+            cwd: repo.cwd(),
+            format,
+            reader: db,
+            config: Some(config),
+        },
+    )?;
+    if let Some(leftover) = setup.leftovers.first() {
+        return Err(GitError::Command(format!(
+            "unsupported show option {leftover}"
+        )));
+    }
+    let diff_pathspec = if setup.pathspecs.is_empty() {
+        None
     } else {
-        options.specs.clone()
+        let worktree_root = repo.worktree_root()?;
+        Some(DiffPathspec::new(repo.cwd(), worktree_root, &setup.pathspecs)?)
     };
 
     let mut shown_one = false;
@@ -224,13 +244,17 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         config,
         options: &options,
         decorations: &decorations,
+        diff_pathspec: diff_pathspec.as_ref(),
     };
-    for spec in &specs {
-        let oid = match repo.resolve_revision(spec) {
-            Ok(oid) => oid,
-            Err(_) => return show_unknown_revision(spec),
-        };
-        show_object(&mut stdout, &context, spec, &oid, &mut shown_one, false)?;
+    for tip in &setup.options.positives {
+        show_object(
+            &mut stdout,
+            &context,
+            &tip.rev,
+            &tip.oid,
+            &mut shown_one,
+            false,
+        )?;
     }
     stdout.flush()?;
     Ok(())
@@ -417,7 +441,13 @@ fn show_commit(
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
     // a root) is computed for merges too, because git's default renders the stat
     // family for them even though the patch/raw/name listings are suppressed.
-    let entries = commit_diff_entries(context.db, context.format, options, commit)?;
+    let entries = commit_diff_entries(
+        context.db,
+        context.format,
+        options,
+        context.diff_pathspec,
+        commit,
+    )?;
 
     write_commit_trailer(
         stdout,
@@ -571,6 +601,7 @@ fn commit_diff_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     options: &ShowOptions,
+    pathspec: Option<&DiffPathspec>,
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     let base = sley_diff_merge::DiffNameStatusOptions {
@@ -585,7 +616,7 @@ fn commit_diff_entries(
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
     };
-    match commit.parents.first() {
+    let entries = match commit.parents.first() {
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
@@ -603,7 +634,11 @@ fn commit_diff_entries(
             &commit.tree,
             rename_options,
         ),
-    }
+    }?;
+    Ok(match pathspec {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    })
 }
 
 /// Emit the diff body (stat/raw/summary/numstat/shortstat/patch or the
@@ -799,18 +834,6 @@ fn show_tree(stdout: &mut io::Stdout, format: ObjectFormat, name: &str, body: &[
     Ok(())
 }
 
-/// Emit git's "unknown revision or path" fatal error and exit 128, matching the
-/// stderr `git show <bad-rev>` produces.
-fn show_unknown_revision(spec: &str) -> Result<()> {
-    eprintln!(
-        "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
-    );
-    eprintln!(
-        "Use '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
-    );
-    Err(GitError::Exit(128))
-}
-
 /// Whether colorized diff output is enabled. `git show` to a non-tty (the
 /// interop scenario, and the only context this CLI runs in) defaults to no
 /// color; color is only forced when `color.diff`/`color.ui` is set to `always`.
@@ -825,19 +848,22 @@ fn diff_color_enabled(config: &GitConfig) -> bool {
 }
 
 /// Parse `git show` arguments into [`ShowOptions`]. Recognises the common
-/// formatting and diff-control flags; `--` forces the remaining arguments to be
-/// treated as object specs.
+/// formatting and diff-control flags; `--` is preserved for the shared
+/// revision/pathspec parser.
 fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
     let mut options = ShowOptions::default();
     let mut positional_only = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if positional_only {
-            options.specs.push(arg.clone());
+            options.setup_args.push(arg.clone());
             continue;
         }
         match arg.as_str() {
-            "--" => positional_only = true,
+            "--" => {
+                options.setup_args.push(arg.clone());
+                positional_only = true;
+            }
             // --- output selection ------------------------------------------------
             "-s" | "--no-patch" => options.suppress_diff(),
             "-p" | "-u" | "--patch" => {
@@ -1018,7 +1044,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                     "unsupported show option {value}"
                 )));
             }
-            value => options.specs.push(value.to_string()),
+            value => options.setup_args.push(value.to_string()),
         }
     }
     Ok(options)

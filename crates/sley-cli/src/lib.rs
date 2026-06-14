@@ -74,6 +74,7 @@ pub(crate) struct PathspecFlags {
 }
 
 mod commands;
+mod grep_source;
 mod log_format;
 mod remote;
 mod repo_path;
@@ -2367,9 +2368,9 @@ fn write_diff_patch_entry(
                 });
             word_regex = spec
                 .map(|spec| {
-                    commands::grep::Regex::compile_bytes(
+                    grep_source::Regex::compile_bytes(
                         &spec,
-                        commands::grep::RegexMode::Ere,
+                        grep_source::RegexMode::Ere,
                         false,
                         false,
                     )
@@ -6219,21 +6220,6 @@ fn log_date_requires_value_error() -> GitError {
     GitError::Exit(128)
 }
 
-fn log_max_age_requires_value_error() -> GitError {
-    eprintln!("fatal: Option '--max-age' requires a value");
-    GitError::Exit(128)
-}
-
-fn log_min_age_requires_value_error() -> GitError {
-    eprintln!("fatal: Option '--min-age' requires a value");
-    GitError::Exit(128)
-}
-
-fn log_date_cutoff_requires_value_error(option: &str) -> GitError {
-    eprintln!("fatal: Option '{option}' requires a value");
-    GitError::Exit(128)
-}
-
 fn log_author_requires_value_error() -> GitError {
     eprintln!("fatal: Option '--author' requires a value");
     GitError::Exit(128)
@@ -6859,273 +6845,6 @@ fn add_rev_list_revision_arg(
     Ok(())
 }
 
-enum RevListRefSelector {
-    All {
-        not: bool,
-        excludes: Vec<String>,
-        hidden: Option<RevListHiddenRefsSection>,
-    },
-    Glob {
-        not: bool,
-        pattern: String,
-        excludes: Vec<String>,
-        hidden: Option<RevListHiddenRefsSection>,
-    },
-    Branches {
-        not: bool,
-        patterns: Vec<String>,
-        include_all: bool,
-        excludes: Vec<String>,
-        hidden: Option<RevListHiddenRefsSection>,
-    },
-    Tags {
-        not: bool,
-        patterns: Vec<String>,
-        include_all: bool,
-        excludes: Vec<String>,
-        hidden: Option<RevListHiddenRefsSection>,
-    },
-    Remotes {
-        not: bool,
-        patterns: Vec<String>,
-        include_all: bool,
-        excludes: Vec<String>,
-        hidden: Option<RevListHiddenRefsSection>,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RevListHiddenRefsSection {
-    Fetch,
-    Receive,
-    Uploadpack,
-}
-
-#[derive(Default)]
-struct RevListHiddenRefs {
-    transfer: Vec<String>,
-    fetch: Vec<String>,
-    receive: Vec<String>,
-    uploadpack: Vec<String>,
-}
-
-impl RevListHiddenRefs {
-    fn from_config(config: &GitConfig) -> Self {
-        Self {
-            transfer: config_section_values(config, "transfer", None, "hideRefs"),
-            fetch: config_section_values(config, "fetch", None, "hideRefs"),
-            receive: config_section_values(config, "receive", None, "hideRefs"),
-            uploadpack: config_section_values(config, "uploadpack", None, "hideRefs"),
-        }
-    }
-
-    fn section_patterns(&self, section: RevListHiddenRefsSection) -> &[String] {
-        match section {
-            RevListHiddenRefsSection::Fetch => &self.fetch,
-            RevListHiddenRefsSection::Receive => &self.receive,
-            RevListHiddenRefsSection::Uploadpack => &self.uploadpack,
-        }
-    }
-}
-
-fn config_section_values(
-    config: &GitConfig,
-    section: &str,
-    subsection: Option<&str>,
-    key: &str,
-) -> Vec<String> {
-    config
-        .sections
-        .iter()
-        .filter(|candidate| {
-            candidate.name.eq_ignore_ascii_case(section)
-                && candidate.subsection.as_deref() == subsection
-        })
-        .flat_map(|candidate| candidate.entries.iter())
-        .filter(|entry| entry.key.eq_ignore_ascii_case(key))
-        .filter_map(|entry| entry.value.clone())
-        .collect()
-}
-
-fn rev_list_ref_selection(
-    refname: &str,
-    selectors: &[RevListRefSelector],
-    hidden_refs: &RevListHiddenRefs,
-) -> (bool, bool) {
-    let mut include = false;
-    let mut exclude = false;
-    for selector in selectors {
-        let (not, selected) = match selector {
-            RevListRefSelector::All {
-                not,
-                excludes,
-                hidden,
-            } => (
-                *not,
-                !rev_list_ref_excluded(refname, excludes, None)
-                    && !rev_list_ref_hidden(refname, *hidden, hidden_refs),
-            ),
-            RevListRefSelector::Glob {
-                not,
-                pattern,
-                excludes,
-                hidden,
-            } => (
-                *not,
-                rev_list_glob_ref_selector_matches(pattern, refname)
-                    && !rev_list_ref_excluded(refname, excludes, None)
-                    && !rev_list_ref_hidden(refname, *hidden, hidden_refs),
-            ),
-            RevListRefSelector::Branches {
-                not,
-                patterns,
-                include_all,
-                excludes,
-                hidden,
-            } => (
-                *not,
-                rev_list_ref_selector_matches(refname, "refs/heads/", *include_all, patterns)
-                    && !rev_list_ref_excluded(refname, excludes, Some("refs/heads/"))
-                    && !rev_list_ref_hidden(refname, *hidden, hidden_refs),
-            ),
-            RevListRefSelector::Tags {
-                not,
-                patterns,
-                include_all,
-                excludes,
-                hidden,
-            } => (
-                *not,
-                rev_list_ref_selector_matches(refname, "refs/tags/", *include_all, patterns)
-                    && !rev_list_ref_excluded(refname, excludes, Some("refs/tags/"))
-                    && !rev_list_ref_hidden(refname, *hidden, hidden_refs),
-            ),
-            RevListRefSelector::Remotes {
-                not,
-                patterns,
-                include_all,
-                excludes,
-                hidden,
-            } => (
-                *not,
-                rev_list_ref_selector_matches(refname, "refs/remotes/", *include_all, patterns)
-                    && !rev_list_ref_excluded(refname, excludes, Some("refs/remotes/"))
-                    && !rev_list_ref_hidden(refname, *hidden, hidden_refs),
-            ),
-        };
-        if selected {
-            if not {
-                exclude = true;
-            } else {
-                include = true;
-            }
-        }
-    }
-    (include, exclude)
-}
-
-fn rev_list_ref_selector_matches(
-    name: &str,
-    namespace: &str,
-    include_all: bool,
-    patterns: &[String],
-) -> bool {
-    let Some(short_name) = name.strip_prefix(namespace) else {
-        return false;
-    };
-    include_all
-        || patterns
-            .iter()
-            .any(|pattern| rev_list_ref_selector_pattern_matches(pattern, short_name))
-}
-
-fn rev_list_ref_selector_pattern_matches(pattern: &str, name: &str) -> bool {
-    if pattern
-        .bytes()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-    {
-        refname_pattern_matches(pattern, name)
-    } else {
-        name.starts_with(&format!("{pattern}/"))
-    }
-}
-
-fn rev_list_glob_ref_selector_matches(pattern: &str, refname: &str) -> bool {
-    let normalized = if pattern.starts_with("refs/") {
-        pattern.to_string()
-    } else {
-        format!("refs/{pattern}")
-    };
-    if normalized
-        .bytes()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-    {
-        refname_pattern_matches(&normalized, refname)
-    } else if normalized.ends_with('/') {
-        refname.starts_with(&normalized)
-    } else {
-        refname.starts_with(&format!("{normalized}/"))
-    }
-}
-
-fn rev_list_ref_excluded(refname: &str, patterns: &[String], namespace: Option<&str>) -> bool {
-    patterns.iter().any(|pattern| {
-        rev_list_ref_exclude_pattern_matches(pattern, refname)
-            || namespace.is_some_and(|namespace| {
-                refname
-                    .strip_prefix(namespace)
-                    .is_some_and(|name| rev_list_ref_exclude_pattern_matches(pattern, name))
-            })
-    })
-}
-
-fn rev_list_ref_exclude_pattern_matches(pattern: &str, name: &str) -> bool {
-    if pattern
-        .bytes()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-    {
-        refname_pattern_matches(pattern, name)
-    } else {
-        name == pattern || name.starts_with(&format!("{pattern}/"))
-    }
-}
-
-fn rev_list_ref_hidden(
-    refname: &str,
-    section: Option<RevListHiddenRefsSection>,
-    hidden_refs: &RevListHiddenRefs,
-) -> bool {
-    let Some(section) = section else {
-        return false;
-    };
-    let mut hidden = false;
-    for pattern in hidden_refs
-        .transfer
-        .iter()
-        .chain(hidden_refs.section_patterns(section))
-    {
-        if let Some(pattern) = pattern.strip_prefix('!') {
-            if rev_list_hidden_ref_pattern_matches(pattern, refname) {
-                hidden = false;
-            }
-        } else if rev_list_hidden_ref_pattern_matches(pattern, refname) {
-            hidden = true;
-        }
-    }
-    hidden
-}
-
-fn rev_list_hidden_ref_pattern_matches(pattern: &str, refname: &str) -> bool {
-    let pattern = pattern.strip_prefix('^').unwrap_or(pattern);
-    !pattern.is_empty()
-        && (refname == pattern
-            || refname.starts_with(&format!("{pattern}/"))
-            || pattern
-                .bytes()
-                .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-                && refname_pattern_matches(pattern, refname))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogDecorationMode {
     Off,
@@ -7233,28 +6952,6 @@ fn print_log_decorations(oid: &ObjectId, decorations: &HashMap<ObjectId, Vec<Str
     }
 }
 
-fn parse_log_count(value: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
-        .map_err(|_| GitError::Command(format!("invalid max-count {value}")))
-}
-
-fn parse_rev_list_exclude_hidden(value: &str) -> Result<RevListHiddenRefsSection> {
-    match value {
-        "fetch" => Ok(RevListHiddenRefsSection::Fetch),
-        "receive" => Ok(RevListHiddenRefsSection::Receive),
-        "uploadpack" => Ok(RevListHiddenRefsSection::Uploadpack),
-        _ => Err(GitError::Command(format!(
-            "unsupported section for hidden refs: {value}"
-        ))),
-    }
-}
-
-fn rev_list_exclude_hidden_selector_error(selector: &str) -> Result<()> {
-    eprintln!("error: options '--exclude-hidden' and '{selector}' cannot be used together");
-    Err(GitError::Exit(129))
-}
-
 fn commit_author_identity(raw: &[u8]) -> String {
     let author = String::from_utf8_lossy(raw);
     author
@@ -7269,7 +6966,7 @@ struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
     /// `--perl-regexp` patterns compile through the full grep regex engine in
     /// PCRE mode instead of the simple BRE subset above.
-    perl: Option<commands::grep::Regex>,
+    perl: Option<grep_source::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7324,9 +7021,9 @@ enum SimpleLogRegexClassItem {
 impl SimpleLogRegex {
     fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
-            let regex = commands::grep::Regex::compile(
+            let regex = grep_source::Regex::compile(
                 pattern,
-                commands::grep::RegexMode::Pcre,
+                grep_source::RegexMode::Pcre,
                 false,
                 false,
             )?;
@@ -7555,17 +7252,12 @@ fn log_regex_unterminated_class_error(
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    // Default output must be byte-identical to git: glibc's `regcomp` reports an
-    // unbalanced bracket class via `regerror`, which git surfaces verbatim as
-    // "Invalid regular expression". The friendlier "brackets ([ ]) not balanced"
-    // diagnostic is a strict improvement, but only acceptable behind a verbose
-    // mode — sley-cli has no global `-v`/verbosity seam reaching the log
-    // regex-parse path yet (only per-subcommand verbose flags in worktree/etc.).
-    // TODO(verbose): surface detailed regex diagnostics ("brackets ([ ]) not
-    // balanced") under -v once a global verbosity level is plumbed into log.
-    let message = "Invalid regular expression";
-    eprintln!("fatal: {error_context}, '{pattern}': {message}");
-    Err(GitError::Exit(128))
+    Err(grep_source::report_regex_compile_error(
+        error_context,
+        pattern,
+        grep_source::RegexDiagnosticVerbosity::from_env(),
+        grep_source::RegexDiagnosticDetail::UnbalancedBrackets,
+    ))
 }
 
 fn log_author_filters_match(
@@ -7745,8 +7437,6 @@ fn emit_compiled_log_format(
     let author_timestamp = commit_identity_timestamp(&record.commit.author);
     let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
 
-    let tokens = &compiled.tokens[token_range];
-    let mut pending_pad: Option<log_format::PaddingSpec> = None;
     // Wrap state (git's `format_commit_context`): width/indents plus the offset in
     // `out` where the current wrap region began. A `%w` directive (or end-of-
     // format) flushes the pending region through the word-wrapper.
@@ -7754,115 +7444,41 @@ fn emit_compiled_log_format(
     let mut wrap_indent1 = 0i32;
     let mut wrap_indent2 = 0i32;
     let mut wrap_start = out.len();
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        if let FormatToken::Wrap(spec) = token {
-            let new_w = spec.width as i32;
-            let new_i1 = spec.indent1 as i32;
-            let new_i2 = spec.indent2 as i32;
-            if (new_w, new_i1, new_i2) != (wrap_width, wrap_indent1, wrap_indent2) {
-                if wrap_start < out.len() {
-                    log_rewrap(out, wrap_start, wrap_width, wrap_indent1, wrap_indent2);
-                }
-                wrap_start = out.len();
-                wrap_width = new_w;
-                wrap_indent1 = new_i1;
-                wrap_indent2 = new_i2;
-            }
-            idx += 1;
-            continue;
-        }
-        // A magic prefix (`%-`/`%+`/`% `) wraps the *next* placeholder: it adds a
-        // leading newline/space when the placeholder is non-empty, or deletes a
-        // preceding newline when it is empty (git's `format_commit_item`).
-        if let FormatToken::Magic(magic) = token {
-            idx += 1;
-            if idx >= tokens.len() {
-                continue;
-            }
-            let mut captured = Vec::new();
-            emit_log_one_token(
-                &tokens[idx],
-                record,
-                context,
-                &mut captured,
-                &author_name,
-                &author_email,
-                &committer_name,
-                &committer_email,
-                &author_timestamp,
-                &committer_timestamp,
-            )?;
-            idx += 1;
-            match magic {
-                log_format::MagicPrefix::DelLfBeforeEmpty if captured.is_empty() => {
-                    while out.last() == Some(&b'\n') {
-                        out.pop();
+    let mut resolver = LogFormatAtomResolver {
+        record,
+        context,
+        author_name: &author_name,
+        author_email: &author_email,
+        committer_name: &committer_name,
+        committer_email: &committer_email,
+        author_timestamp: &author_timestamp,
+        committer_timestamp: &committer_timestamp,
+    };
+    let segment_range = compiled.segment_range_for_tokens(token_range);
+    compiled.expand.append_range_to_with_atom(
+        out,
+        segment_range,
+        &mut resolver,
+        |out, token, value| {
+            if let FormatToken::Wrap(spec) = token {
+                let new_w = spec.width as i32;
+                let new_i1 = spec.indent1 as i32;
+                let new_i2 = spec.indent2 as i32;
+                if (new_w, new_i1, new_i2) != (wrap_width, wrap_indent1, wrap_indent2) {
+                    if wrap_start < out.len() {
+                        log_rewrap(out, wrap_start, wrap_width, wrap_indent1, wrap_indent2);
                     }
+                    wrap_start = out.len();
+                    wrap_width = new_w;
+                    wrap_indent1 = new_i1;
+                    wrap_indent2 = new_i2;
                 }
-                log_format::MagicPrefix::AddLfBeforeNonEmpty if !captured.is_empty() => {
-                    out.push(b'\n');
-                    out.extend_from_slice(&captured);
-                }
-                log_format::MagicPrefix::AddSpBeforeNonEmpty if !captured.is_empty() => {
-                    out.push(b' ');
-                    out.extend_from_slice(&captured);
-                }
-                _ => out.extend_from_slice(&captured),
+            } else {
+                out.extend_from_slice(value);
             }
-            continue;
-        }
-        // A padding directive captures the *next* token group (any leading
-        // color modifiers plus one content placeholder), pads it, and appends.
-        if let FormatToken::Padding(spec) = token {
-            pending_pad = Some(*spec);
-            idx += 1;
-            continue;
-        }
-        if let Some(spec) = pending_pad.take() {
-            // Capture the chain: color modifiers followed by one placeholder.
-            let mut captured = Vec::new();
-            loop {
-                let t = &tokens[idx];
-                let is_modifier = matches!(
-                    t,
-                    FormatToken::ColorParen | FormatToken::ColorName(_) | FormatToken::ColorAuto
-                );
-                emit_log_one_token(
-                    t,
-                    record,
-                    context,
-                    &mut captured,
-                    &author_name,
-                    &author_email,
-                    &committer_name,
-                    &committer_email,
-                    &author_timestamp,
-                    &committer_timestamp,
-                )?;
-                idx += 1;
-                if !is_modifier || idx >= tokens.len() {
-                    break;
-                }
-            }
-            apply_padding(out, &captured, spec);
-            continue;
-        }
-        emit_log_one_token(
-            token,
-            record,
-            context,
-            out,
-            &author_name,
-            &author_email,
-            &committer_name,
-            &committer_email,
-            &author_timestamp,
-            &committer_timestamp,
-        )?;
-        idx += 1;
-    }
+            Ok(())
+        },
+    )?;
     // git's final `rewrap_message_tail(sb, c, 0, 0, 0)`: flush the tail region if
     // a non-trivial wrap width is active.
     if (wrap_width, wrap_indent1, wrap_indent2) != (0, 0, 0) && wrap_start < out.len() {
@@ -7875,6 +7491,41 @@ fn emit_compiled_log_format(
 fn log_rewrap(out: &mut Vec<u8>, pos: usize, width: i32, indent1: i32, indent2: i32) {
     let region = out.split_off(pos);
     log_wrap_text(out, &region, indent1, indent2, width);
+}
+
+struct LogFormatAtomResolver<'a, 'b> {
+    record: &'a sley_rev::CommitRecord,
+    context: &'a LogFormatContext<'b>,
+    author_name: &'a str,
+    author_email: &'a str,
+    committer_name: &'a str,
+    committer_email: &'a str,
+    author_timestamp: &'a str,
+    committer_timestamp: &'a str,
+}
+
+impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_, '_> {
+    fn resolve_atom(&mut self, out: &mut Vec<u8>, atom: &FormatToken) -> Result<()> {
+        emit_log_one_token(
+            atom,
+            self.record,
+            self.context,
+            out,
+            self.author_name,
+            self.author_email,
+            self.committer_name,
+            self.committer_email,
+            self.author_timestamp,
+            self.committer_timestamp,
+        )
+    }
+
+    fn is_modifier_atom(&self, atom: &FormatToken) -> bool {
+        matches!(
+            atom,
+            FormatToken::ColorParen | FormatToken::ColorName(_) | FormatToken::ColorAuto
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8271,26 +7922,6 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
     }
 }
 
-/// Display width of a UTF-8 byte slice, mirroring git's `utf8_strnwidth`:
-/// control chars contribute 0; invalid UTF-8 falls back to byte length.
-fn log_display_width(bytes: &[u8]) -> usize {
-    let mut width = 0usize;
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        match log_pick_utf8(bytes, idx) {
-            Some((cp, len)) => {
-                let w = log_wcwidth(cp);
-                if w > 0 {
-                    width += w as usize;
-                }
-                idx += len;
-            }
-            None => return bytes.len(),
-        }
-    }
-    width
-}
-
 /// git `git_wcwidth`.
 fn log_wcwidth(ch: u32) -> i32 {
     if ch == 0 {
@@ -8353,113 +7984,6 @@ fn log_pick_utf8(bytes: &[u8], idx: usize) -> Option<(u32, usize)> {
         ))
     } else {
         None
-    }
-}
-
-/// Port of utf8.c `strbuf_utf8_replace`: replace the glyphs occupying display
-/// columns `[pos, pos+width)` of `src` with `subst` (once), preserving control
-/// characters and ANSI escapes verbatim. We don't ship escape parsing here; the
-/// padded corpus never mixes truncation with ANSI.
-fn log_utf8_replace(src: &[u8], pos: usize, width: usize, subst: &str) -> Vec<u8> {
-    let mut dst = Vec::with_capacity(src.len());
-    let mut w = 0usize;
-    let mut idx = 0usize;
-    let mut subst_done = false;
-    while idx < src.len() {
-        let (cp, len) = match log_pick_utf8(src, idx) {
-            Some(v) => v,
-            None => return src.to_vec(), // broken utf-8: do nothing
-        };
-        let mut gw = log_wcwidth(cp);
-        if gw < 0 {
-            gw = 0;
-        }
-        let gw = gw as usize;
-        if gw != 0 && w >= pos && w < pos + width {
-            if !subst_done {
-                dst.extend_from_slice(subst.as_bytes());
-                subst_done = true;
-            }
-        } else {
-            dst.extend_from_slice(&src[idx..idx + len]);
-        }
-        w += gw;
-        idx += len;
-    }
-    dst
-}
-
-/// Apply a `%<`/`%>`/`%><` padding directive to `captured` and append to `out`,
-/// mirroring pretty.c `format_and_pad_commit`.
-fn apply_padding(out: &mut Vec<u8>, captured: &[u8], spec: log_format::PaddingSpec) {
-    use log_format::{PaddingFlush, PaddingTrunc};
-    let mut padding = spec.padding;
-    if padding < 0 {
-        // Pad to the given column: subtract what's already on the current line.
-        let start = match out.iter().rposition(|b| *b == b'\n') {
-            Some(p) => p + 1,
-            None => 0,
-        };
-        let occupied = log_display_width(&out[start..]) as i64;
-        padding = (-padding) - occupied;
-    }
-    let len = log_display_width(captured) as i64;
-
-    let mut flush = spec.flush;
-    let mut captured = captured.to_vec();
-    if flush == PaddingFlush::LeftAndSteal {
-        // Steal trailing spaces from `out` to make room (no ANSI handling).
-        let mut pad = padding;
-        while len > pad {
-            match out.last() {
-                Some(b' ') => {
-                    out.pop();
-                    pad += 1;
-                }
-                _ => break,
-            }
-        }
-        padding = pad;
-        flush = PaddingFlush::Left;
-    }
-
-    if len > padding {
-        match spec.trunc {
-            PaddingTrunc::Left => {
-                captured = log_utf8_replace(&captured, 0, (len - (padding - 2)) as usize, "..");
-            }
-            PaddingTrunc::Middle => {
-                captured = log_utf8_replace(
-                    &captured,
-                    (padding / 2 - 1) as usize,
-                    (len - (padding - 2)) as usize,
-                    "..",
-                );
-            }
-            PaddingTrunc::Right => {
-                captured = log_utf8_replace(
-                    &captured,
-                    (padding - 2) as usize,
-                    (len - (padding - 2)) as usize,
-                    "..",
-                );
-            }
-            PaddingTrunc::None => {}
-        }
-        out.extend_from_slice(&captured);
-    } else {
-        let offset = match flush {
-            PaddingFlush::Left => (padding - len) as usize,
-            PaddingFlush::Both => ((padding - len) / 2) as usize,
-            _ => 0,
-        };
-        // Convert column padding back to bytes: total spaces == padding-len, then
-        // the captured bytes are placed at `offset` columns in.
-        let total_pad = (padding - len) as usize;
-        out.extend(std::iter::repeat_n(b' ', total_pad));
-        // Insert captured at the offset (offset is in columns == spaces here).
-        let insert_at = out.len() - total_pad + offset;
-        out.splice(insert_at..insert_at, captured.iter().copied());
     }
 }
 

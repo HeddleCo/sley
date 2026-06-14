@@ -7,7 +7,8 @@ use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 pub use sley_core::BString;
 pub use setup::{
     NoWalkMode, RevisionOrder, RevisionOptions, RevisionSetupContext, RevisionSymmetricRange,
-    RevisionTip, SetupRevisions, ambiguous_argument_message, setup_revisions, setup_revisions_os,
+    RevisionTip, SetupRevisions, ambiguous_argument_error, ambiguous_argument_message,
+    setup_revisions, setup_revisions_os,
 };
 use sley_formats::CommitGraph;
 use sley_index::Index;

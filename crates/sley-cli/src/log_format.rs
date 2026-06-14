@@ -5,6 +5,10 @@
 //! Command fast paths consult the tier instead of hand-maintained string guards.
 
 use sley_core::{GitError, Result};
+use sley_strbuf_expand::{
+    AtomSyntax, AtomTable, ExpandFormat, ExpandOptions, ExpandSegment, LiteralHex,
+};
+use std::cell::Cell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogFormatDialect {
@@ -186,32 +190,8 @@ pub(crate) enum MagicPrefix {
     AddSpBeforeNonEmpty,
 }
 
-/// Flush direction for a `%<`/`%>`/`%><`/`%>>` padding directive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PaddingFlush {
-    Left,
-    Right,
-    Both,
-    LeftAndSteal,
-}
-
-/// Truncation mode for a padding directive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PaddingTrunc {
-    None,
-    Left,
-    Middle,
-    Right,
-}
-
 /// A parsed `%<`/`%>`/... padding placeholder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PaddingSpec {
-    pub flush: PaddingFlush,
-    pub trunc: PaddingTrunc,
-    /// Positive = fixed width; negative = "pad to that column" (`%<|`).
-    pub padding: i64,
-}
+pub(crate) type PaddingSpec = sley_strbuf_expand::PaddingSpec;
 
 /// A parsed `%w(width,indent1,indent2)` wrap directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,167 +258,32 @@ pub(crate) struct CompiledLogFormat {
     pub tokens: Vec<FormatToken>,
     pub fields: FormatFields,
     pub dialect: LogFormatDialect,
+    pub(crate) expand: ExpandFormat<FormatToken>,
+    token_segments: Vec<usize>,
 }
 
 impl CompiledLogFormat {
     pub(crate) fn compile(format: &str, dialect: LogFormatDialect) -> Result<Self> {
-        let mut tokens = Vec::new();
-        let mut fields = FormatFields::default();
-        let mut chars = format.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch != '%' {
-                push_literal(&mut tokens, ch);
-                continue;
-            }
-            // A magic prefix (`%-`/`%+`/`% `) applies to the *following*
-            // placeholder. `%+w()`/`% w()`/`%-w()` are refused by git (the magic
-            // cannot reorder wrap output), so a following `w(` falls back to a
-            // verbatim `%`.
-            if let Some(&magic_ch) = chars.peek()
-                && matches!(magic_ch, '-' | '+' | ' ')
-            {
-                let mut after = chars.clone();
-                after.next(); // skip the magic char
-                if after.peek() == Some(&'w') {
-                    // `%±w(...)` — git refuses; emit a verbatim '%'.
-                    push_literal(&mut tokens, '%');
-                    continue;
-                }
-                let prefix = match magic_ch {
-                    '-' => MagicPrefix::DelLfBeforeEmpty,
-                    '+' => MagicPrefix::AddLfBeforeNonEmpty,
-                    _ => MagicPrefix::AddSpBeforeNonEmpty,
-                };
-                tokens.push(FormatToken::Magic(prefix));
-                chars.next(); // consume the magic char; placeholder follows
-            }
-            // Complex directives (`%<`, `%>`, `%w(`, `%(...)`) need byte-accurate
-            // slicing of the remainder, so peek the rest of the format and parse
-            // it directly; on success advance the char iterator past it.
-            {
-                let rest: String = chars.clone().collect();
-                if let Some((token, consumed_bytes)) =
-                    parse_complex_directive(&rest, dialect, &mut fields)?
-                {
-                    let consumed_chars = rest[..consumed_bytes].chars().count();
-                    for _ in 0..consumed_chars {
-                        chars.next();
-                    }
-                    if let Some(token) = token {
-                        tokens.push(token);
-                    }
-                    continue;
-                }
-            }
-            match chars.next() {
-                Some('%') => tokens.push(FormatToken::Percent),
-                Some('H') => {
-                    fields = fields | FormatFields::OID;
-                    tokens.push(FormatToken::OidFull);
-                }
-                Some('h') => {
-                    fields |= FormatFields::OID;
-                    tokens.push(FormatToken::OidAbbrev);
-                }
-                Some('T') => {
-                    fields |= FormatFields::TREE;
-                    tokens.push(FormatToken::TreeFull);
-                }
-                Some('t') => {
-                    fields |= FormatFields::TREE;
-                    tokens.push(FormatToken::TreeAbbrev);
-                }
-                Some('P') => {
-                    fields |= FormatFields::PARENTS;
-                    tokens.push(FormatToken::ParentsFull);
-                }
-                Some('p') => {
-                    fields |= FormatFields::PARENTS;
-                    tokens.push(FormatToken::ParentsAbbrev);
-                }
-                Some('m') => tokens.push(FormatToken::Marker),
-                Some('s') => {
-                    fields |= FormatFields::SUBJECT;
-                    tokens.push(FormatToken::Subject);
-                }
-                Some('f') => {
-                    fields |= FormatFields::SUBJECT;
-                    tokens.push(FormatToken::SanitizedSubject);
-                }
-                Some('e') => {
-                    fields |= FormatFields::ENCODING;
-                    tokens.push(FormatToken::Encoding);
-                }
-                Some('N') => tokens.push(FormatToken::NoteName),
-                Some('S') => {
-                    fields |= FormatFields::REV_SOURCE;
-                    tokens.push(FormatToken::RevisionSource);
-                }
-                Some('C') => {
-                    consume_color(&mut chars, &mut tokens)?;
-                }
-                Some('b') => {
-                    fields |= FormatFields::BODY;
-                    tokens.push(FormatToken::Body);
-                }
-                Some('B') => {
-                    fields |= FormatFields::BODY;
-                    tokens.push(FormatToken::FullMessage);
-                }
-                Some('d') if dialect == LogFormatDialect::Stash => {
-                    tokens.push(FormatToken::StashDecoParen);
-                }
-                Some('d') => {
-                    fields |= FormatFields::DECORATIONS;
-                    tokens.push(FormatToken::DecorationsParen);
-                }
-                Some('D') if dialect == LogFormatDialect::Stash => {
-                    tokens.push(FormatToken::StashDecoBare);
-                }
-                Some('D') => {
-                    fields |= FormatFields::DECORATIONS;
-                    tokens.push(FormatToken::DecorationsBare);
-                }
-                Some('G') => consume_g_placeholder(&mut chars, &mut tokens)?,
-                Some('g') if matches!(dialect, LogFormatDialect::Stash | LogFormatDialect::Log) => {
-                    consume_reflog_g_placeholder(&mut chars, &mut tokens)?;
-                }
-                Some('g') => consume_g_date_placeholder(&mut chars, &mut tokens)?,
-                Some('a') => {
-                    consume_identity_placeholder(&mut chars, &mut tokens, &mut fields, true)?
-                }
-                Some('c') => {
-                    consume_identity_placeholder(&mut chars, &mut tokens, &mut fields, false)?
-                }
-                Some('n') => tokens.push(FormatToken::Newline),
-                Some('x') => {
-                    let mut lookahead = chars.clone();
-                    if let (Some(high), Some(low)) = (lookahead.next(), lookahead.next())
-                        && let (Some(high), Some(low)) = (high.to_digit(16), low.to_digit(16))
-                    {
-                        chars = lookahead;
-                        tokens.push(FormatToken::HexByte(((high << 4) | low) as u8));
-                    } else {
-                        push_literal(&mut tokens, '%');
-                        push_literal(&mut tokens, 'x');
-                    }
-                }
-                Some(other) => {
-                    return Err(GitError::Command(format!(
-                        "unsupported log format placeholder %{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Command(
-                        "unterminated log format placeholder %".into(),
-                    ));
-                }
-            }
-        }
+        let table = LogFormatAtomTable {
+            dialect,
+            fields: Cell::new(FormatFields::default()),
+        };
+        let expand = ExpandFormat::parse_with_options(
+            format,
+            &table,
+            ExpandOptions {
+                atom_syntax: AtomSyntax::Prefixed,
+                literal_hex: LiteralHex::None,
+            },
+        )?;
+        let fields = table.fields.get();
+        let (tokens, token_segments) = tokens_from_expand(&expand);
         Ok(Self {
             tokens,
             fields,
             dialect,
+            expand,
+            token_segments,
         })
     }
 
@@ -488,6 +333,7 @@ impl CompiledLogFormat {
                         .insert(index + 1, FormatToken::Literal(" ".into()));
                     self.tokens.insert(index + 2, FormatToken::ParentsFull);
                     self.fields |= FormatFields::PARENTS;
+                    self.rebuild_expand_from_tokens();
                     return;
                 }
                 FormatToken::OidAbbrev => {
@@ -495,11 +341,31 @@ impl CompiledLogFormat {
                         .insert(index + 1, FormatToken::Literal(" ".into()));
                     self.tokens.insert(index + 2, FormatToken::ParentsAbbrev);
                     self.fields |= FormatFields::PARENTS;
+                    self.rebuild_expand_from_tokens();
                     return;
                 }
                 _ => {}
             }
         }
+    }
+
+    fn rebuild_expand_from_tokens(&mut self) {
+        self.expand = expand_from_tokens(&self.tokens);
+        self.token_segments = token_segments_from_expand(&self.expand);
+    }
+
+    pub(crate) fn segment_range_for_tokens(&self, token_range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let start = self
+            .token_segments
+            .get(token_range.start)
+            .copied()
+            .unwrap_or(self.expand.segments().len());
+        let end = self
+            .token_segments
+            .get(token_range.end)
+            .copied()
+            .unwrap_or(self.expand.segments().len());
+        start..end
     }
 
     /// Pre-size a line buffer for one emission pass.
@@ -535,206 +401,451 @@ impl CompiledLogFormat {
     }
 }
 
+struct LogFormatAtomTable {
+    dialect: LogFormatDialect,
+    fields: Cell<FormatFields>,
+}
+
+impl LogFormatAtomTable {
+    fn add_fields(&self, fields: FormatFields) {
+        let mut current = self.fields.get();
+        current |= fields;
+        self.fields.set(current);
+    }
+}
+
+impl AtomTable for LogFormatAtomTable {
+    type Atom = FormatToken;
+
+    fn parse_atom(&self, value: &str) -> Result<Self::Atom> {
+        Ok(FormatToken::Literal(format!("%({value})")))
+    }
+
+    fn parse_prefix_atom(&self, value: &str) -> Result<Option<(Self::Atom, usize)>> {
+        let Some(first) = value.chars().next() else {
+            return Err(GitError::Command(
+                "unterminated log format placeholder %".into(),
+            ));
+        };
+        if first == '(' {
+            return Ok(parse_parenthesized_atom(value, self)?);
+        }
+        if first == '<' || first == '>' {
+            return Ok(None);
+        }
+        if first == 'w' {
+            if value.as_bytes().get(1) != Some(&b'(') {
+                return Err(GitError::Command(
+                    "unsupported log format placeholder %w".into(),
+                ));
+            }
+            return Ok(parse_wrap_placeholder(value)
+                .map(|(spec, consumed)| (FormatToken::Wrap(spec), consumed)));
+        }
+        if first == 'x' {
+            let bytes = value.as_bytes();
+            if let (Some(high), Some(low)) = (bytes.get(1), bytes.get(2))
+                && let (Some(high), Some(low)) = (
+                    (*high as char).to_digit(16),
+                    (*low as char).to_digit(16),
+                )
+            {
+                return Ok(Some((FormatToken::HexByte(((high << 4) | low) as u8), 3)));
+            }
+            return Ok(Some((FormatToken::Literal("%x".into()), 1)));
+        }
+        let token = match first {
+            'H' => {
+                self.add_fields(FormatFields::OID);
+                FormatToken::OidFull
+            }
+            'h' => {
+                self.add_fields(FormatFields::OID);
+                FormatToken::OidAbbrev
+            }
+            'T' => {
+                self.add_fields(FormatFields::TREE);
+                FormatToken::TreeFull
+            }
+            't' => {
+                self.add_fields(FormatFields::TREE);
+                FormatToken::TreeAbbrev
+            }
+            'P' => {
+                self.add_fields(FormatFields::PARENTS);
+                FormatToken::ParentsFull
+            }
+            'p' => {
+                self.add_fields(FormatFields::PARENTS);
+                FormatToken::ParentsAbbrev
+            }
+            'm' => FormatToken::Marker,
+            's' => {
+                self.add_fields(FormatFields::SUBJECT);
+                FormatToken::Subject
+            }
+            'f' => {
+                self.add_fields(FormatFields::SUBJECT);
+                FormatToken::SanitizedSubject
+            }
+            'e' => {
+                self.add_fields(FormatFields::ENCODING);
+                FormatToken::Encoding
+            }
+            'N' => FormatToken::NoteName,
+            'S' => {
+                self.add_fields(FormatFields::REV_SOURCE);
+                FormatToken::RevisionSource
+            }
+            'C' => return parse_color_atom(value).map(Some),
+            'b' => {
+                self.add_fields(FormatFields::BODY);
+                FormatToken::Body
+            }
+            'B' => {
+                self.add_fields(FormatFields::BODY);
+                FormatToken::FullMessage
+            }
+            'd' if self.dialect == LogFormatDialect::Stash => FormatToken::StashDecoParen,
+            'd' => {
+                self.add_fields(FormatFields::DECORATIONS);
+                FormatToken::DecorationsParen
+            }
+            'D' if self.dialect == LogFormatDialect::Stash => FormatToken::StashDecoBare,
+            'D' => {
+                self.add_fields(FormatFields::DECORATIONS);
+                FormatToken::DecorationsBare
+            }
+            'G' => return parse_g_atom(value).map(Some),
+            'g' if matches!(self.dialect, LogFormatDialect::Stash | LogFormatDialect::Log) => {
+                return parse_reflog_g_atom(value).map(Some);
+            }
+            'g' => return parse_g_date_atom(value).map(Some),
+            'a' => return parse_identity_atom(value, self, true).map(Some),
+            'c' => return parse_identity_atom(value, self, false).map(Some),
+            'n' => FormatToken::Newline,
+            other => {
+                return Err(GitError::Command(format!(
+                    "unsupported log format placeholder %{other}"
+                )));
+            }
+        };
+        Ok(Some((token, first.len_utf8())))
+    }
+}
+
+fn parse_parenthesized_atom(
+    value: &str,
+    table: &LogFormatAtomTable,
+) -> Result<Option<(FormatToken, usize)>> {
+    let Some(end) = value.find(')') else {
+        return Ok(None);
+    };
+    let inner = &value[1..end];
+    let consumed = end + 1;
+    let literal = || Some((FormatToken::Literal(format!("%({inner})")), consumed));
+    if let Some(opts) = inner.strip_prefix("trailers") {
+        let opts = opts.strip_prefix(':').unwrap_or("");
+        if !(inner == "trailers" || inner.starts_with("trailers:"))
+            || (!opts.is_empty()
+                && crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts).is_err())
+        {
+            return Ok(literal());
+        }
+        table.add_fields(FormatFields::BODY);
+        Ok(Some((FormatToken::Trailers(opts.to_string()), consumed)))
+    } else if inner == "decorate" || inner.starts_with("decorate:") {
+        let opts = inner.strip_prefix("decorate").unwrap_or("");
+        let opts = opts.strip_prefix(':').unwrap_or("");
+        match parse_decorate_spec(opts) {
+            Some(spec) => {
+                table.add_fields(FormatFields::DECORATIONS);
+                Ok(Some((FormatToken::Decorate(spec), consumed)))
+            }
+            None => Ok(literal()),
+        }
+    } else if inner == "describe" || inner.starts_with("describe:") {
+        let opts = inner.strip_prefix("describe").unwrap_or("");
+        let opts = opts.strip_prefix(':').unwrap_or("");
+        match parse_describe_spec(opts) {
+            Some(spec) => {
+                table.add_fields(FormatFields::BODY);
+                Ok(Some((FormatToken::Describe(spec), consumed)))
+            }
+            None => Ok(literal()),
+        }
+    } else {
+        Ok(literal())
+    }
+}
+
+fn parse_color_atom(value: &str) -> Result<(FormatToken, usize)> {
+    if value.as_bytes().get(1) == Some(&b'(') {
+        let Some(end) = value.find(')') else {
+            return Err(GitError::Command(
+                "unterminated log format placeholder %C".into(),
+            ));
+        };
+        // Ported from sley#75: `%C(auto)` resolves to ColorAuto so padding is
+        // still flushed; every other `%C(...)` stays ColorParen.
+        if &value[2..end] == "auto" {
+            return Ok((FormatToken::ColorAuto, end + 1));
+        }
+        return Ok((FormatToken::ColorParen, end + 1));
+    }
+    for name in [
+        "reset", "normal", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+        "bold", "dim", "ul", "blink", "reverse", "italic", "strike",
+    ] {
+        if value[1..].starts_with(name) {
+            return Ok((FormatToken::ColorName(name), 1 + name.len()));
+        }
+    }
+    Err(GitError::Command(
+        "unsupported log format placeholder %C".into(),
+    ))
+}
+
+fn parse_g_atom(value: &str) -> Result<(FormatToken, usize)> {
+    let token = match value.chars().nth(1) {
+        Some('?') => FormatToken::GRefname,
+        Some('T') => FormatToken::GTrailers,
+        Some('G') => FormatToken::GPlaceholder,
+        Some('S') => FormatToken::GSignature,
+        Some('K') => FormatToken::GKey,
+        Some('F') => FormatToken::GFingerprint,
+        Some('P') => FormatToken::GPassthrough,
+        Some(other) => {
+            return Err(GitError::Command(format!(
+                "unsupported log format placeholder %G{other}"
+            )));
+        }
+        None => {
+            return Err(GitError::Command(
+                "unterminated log format placeholder %G".into(),
+            ));
+        }
+    };
+    Ok((token, 2))
+}
+
+fn parse_reflog_g_atom(value: &str) -> Result<(FormatToken, usize)> {
+    let token = match value.chars().nth(1) {
+        Some('d') => FormatToken::ReflogGd,
+        Some('D') => FormatToken::ReflogGD,
+        Some('n') | Some('N') => FormatToken::ReflogGn,
+        Some('e') | Some('E') => FormatToken::ReflogGe,
+        Some('s') => FormatToken::ReflogGs,
+        Some(other) => {
+            return Err(GitError::Command(format!(
+                "unsupported stash list format placeholder %g{other}"
+            )));
+        }
+        None => {
+            return Err(GitError::Command(
+                "unterminated stash list format placeholder %g".into(),
+            ));
+        }
+    };
+    Ok((token, 2))
+}
+
+fn parse_g_date_atom(value: &str) -> Result<(FormatToken, usize)> {
+    let token = match value.chars().nth(1) {
+        Some('D') => FormatToken::GDate,
+        Some('d') => FormatToken::GDateShort,
+        Some('n') | Some('N') => FormatToken::GDateIso,
+        Some('e') | Some('E') => FormatToken::GDateIsoStrict,
+        Some('s') => FormatToken::GDateRfc2822,
+        Some(other) => {
+            return Err(GitError::Command(format!(
+                "unsupported log format placeholder %g{other}"
+            )));
+        }
+        None => {
+            return Err(GitError::Command(
+                "unterminated log format placeholder %g".into(),
+            ));
+        }
+    };
+    Ok((token, 2))
+}
+
+fn parse_identity_atom(
+    value: &str,
+    table: &LogFormatAtomTable,
+    author: bool,
+) -> Result<(FormatToken, usize)> {
+    table.add_fields(if author {
+        FormatFields::AUTHOR
+    } else {
+        FormatFields::COMMITTER
+    });
+    let token = match value.chars().nth(1) {
+        Some('n') | Some('N') if author => FormatToken::AuthorName,
+        Some('n') | Some('N') => FormatToken::CommitterName,
+        Some('e') | Some('E') if author => FormatToken::AuthorEmail,
+        Some('e') | Some('E') => FormatToken::CommitterEmail,
+        Some('l') | Some('L') if author => FormatToken::AuthorEmailLocal,
+        Some('l') | Some('L') => FormatToken::CommitterEmailLocal,
+        Some('t') if author => FormatToken::AuthorTimestamp,
+        Some('t') => FormatToken::CommitterTimestamp,
+        Some('d') if author => FormatToken::AuthorDate,
+        Some('d') => FormatToken::CommitterDate,
+        Some('i') if author => FormatToken::AuthorDateIso,
+        Some('i') => FormatToken::CommitterDateIso,
+        Some('I') if author => FormatToken::AuthorDateIsoStrict,
+        Some('I') => FormatToken::CommitterDateIsoStrict,
+        Some('s') if author => FormatToken::AuthorDateShort,
+        Some('s') => FormatToken::CommitterDateShort,
+        Some('D') if author => FormatToken::AuthorDateRfc2822,
+        Some('D') => FormatToken::CommitterDateRfc2822,
+        Some(other) => {
+            let prefix = if author { 'a' } else { 'c' };
+            return Err(GitError::Command(format!(
+                "unsupported log format placeholder %{prefix}{other}"
+            )));
+        }
+        None => {
+            let prefix = if author { 'a' } else { 'c' };
+            return Err(GitError::Command(format!(
+                "unterminated log format placeholder %{prefix}"
+            )));
+        }
+    };
+    Ok((token, 2))
+}
+
+fn tokens_from_expand(
+    expand: &ExpandFormat<FormatToken>,
+) -> (Vec<FormatToken>, Vec<usize>) {
+    let mut tokens = Vec::new();
+    let mut token_segments = Vec::new();
+    for (segment_index, segment) in expand.segments().iter().enumerate() {
+        match segment {
+            ExpandSegment::Literal(literal) => {
+                push_literal_bytes(&mut tokens, &mut token_segments, literal, segment_index);
+            }
+            ExpandSegment::Padding(spec) => {
+                tokens.push(FormatToken::Padding(*spec));
+                token_segments.push(segment_index);
+            }
+            ExpandSegment::Atom(atom) => {
+                if let Some(magic) = token_magic(atom.magic) {
+                    tokens.push(FormatToken::Magic(magic));
+                    token_segments.push(segment_index);
+                }
+                tokens.push(atom.atom.clone());
+                token_segments.push(segment_index);
+            }
+        }
+    }
+    (tokens, token_segments)
+}
+
+fn token_segments_from_expand(expand: &ExpandFormat<FormatToken>) -> Vec<usize> {
+    tokens_from_expand(expand).1
+}
+
+fn push_literal_bytes(
+    tokens: &mut Vec<FormatToken>,
+    token_segments: &mut Vec<usize>,
+    literal: &[u8],
+    segment_index: usize,
+) {
+    let mut start = 0usize;
+    for (idx, byte) in literal.iter().enumerate() {
+        if *byte != b'%' {
+            continue;
+        }
+        push_literal_chunk(tokens, token_segments, &literal[start..idx], segment_index);
+        tokens.push(FormatToken::Percent);
+        token_segments.push(segment_index);
+        start = idx + 1;
+    }
+    push_literal_chunk(tokens, token_segments, &literal[start..], segment_index);
+}
+
+fn push_literal_chunk(
+    tokens: &mut Vec<FormatToken>,
+    token_segments: &mut Vec<usize>,
+    chunk: &[u8],
+    segment_index: usize,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    match std::str::from_utf8(chunk) {
+        Ok(text) => {
+            tokens.push(FormatToken::Literal(text.to_string()));
+            token_segments.push(segment_index);
+        }
+        Err(_) => {
+            for byte in chunk {
+                tokens.push(FormatToken::HexByte(*byte));
+                token_segments.push(segment_index);
+            }
+        }
+    }
+}
+
+fn expand_from_tokens(tokens: &[FormatToken]) -> ExpandFormat<FormatToken> {
+    let mut segments = Vec::new();
+    let mut magic = sley_strbuf_expand::MagicPrefix::None;
+    for token in tokens {
+        match token {
+            FormatToken::Literal(text) => push_expand_literal(&mut segments, text.as_bytes()),
+            FormatToken::Percent => push_expand_literal(&mut segments, b"%"),
+            FormatToken::HexByte(byte) => push_expand_literal(&mut segments, &[*byte]),
+            FormatToken::Padding(spec) => segments.push(ExpandSegment::Padding(*spec)),
+            FormatToken::Magic(prefix) => magic = expand_magic(*prefix),
+            other => {
+                segments.push(ExpandSegment::Atom(sley_strbuf_expand::ExpandAtom {
+                    magic,
+                    atom: other.clone(),
+                }));
+                magic = sley_strbuf_expand::MagicPrefix::None;
+            }
+        }
+    }
+    ExpandFormat::from_segments(segments)
+}
+
+fn push_expand_literal(segments: &mut Vec<ExpandSegment<FormatToken>>, literal: &[u8]) {
+    if literal.is_empty() {
+        return;
+    }
+    if let Some(ExpandSegment::Literal(previous)) = segments.last_mut() {
+        previous.extend_from_slice(literal);
+    } else {
+        segments.push(ExpandSegment::Literal(literal.to_vec()));
+    }
+}
+
+fn token_magic(prefix: sley_strbuf_expand::MagicPrefix) -> Option<MagicPrefix> {
+    match prefix {
+        sley_strbuf_expand::MagicPrefix::None => None,
+        sley_strbuf_expand::MagicPrefix::AddLfBeforeNonEmpty => {
+            Some(MagicPrefix::AddLfBeforeNonEmpty)
+        }
+        sley_strbuf_expand::MagicPrefix::DeleteLfBeforeEmpty => Some(MagicPrefix::DelLfBeforeEmpty),
+        sley_strbuf_expand::MagicPrefix::AddSpaceBeforeNonEmpty => {
+            Some(MagicPrefix::AddSpBeforeNonEmpty)
+        }
+    }
+}
+
+fn expand_magic(prefix: MagicPrefix) -> sley_strbuf_expand::MagicPrefix {
+    match prefix {
+        MagicPrefix::DelLfBeforeEmpty => sley_strbuf_expand::MagicPrefix::DeleteLfBeforeEmpty,
+        MagicPrefix::AddLfBeforeNonEmpty => sley_strbuf_expand::MagicPrefix::AddLfBeforeNonEmpty,
+        MagicPrefix::AddSpBeforeNonEmpty => sley_strbuf_expand::MagicPrefix::AddSpaceBeforeNonEmpty,
+    }
+}
+
 /// Limit padding/wrap widths the way git's FORMATTING_LIMIT does, so an
 /// overflowing directive is rejected (emitted verbatim) instead of allocating.
 const FORMATTING_LIMIT: i64 = 1 << 30;
-
-/// Try to parse a complex directive (`%<`/`%>`/`%w(`/`%(...)`) from `rest`,
-/// which is the format string *after* the leading `%`. Returns:
-/// - `Ok(None)` if `rest` doesn't start a complex directive — fall through.
-/// - `Ok(Some((Some(token), n)))` to push `token` and consume `n` chars.
-/// - `Ok(Some((Some(Literal("%")), 0)))` to emit a verbatim `%` (git's
-///   "unknown/invalid placeholder" fallback) without consuming the rest.
-#[allow(clippy::type_complexity)]
-fn parse_complex_directive(
-    rest: &str,
-    dialect: LogFormatDialect,
-    fields: &mut FormatFields,
-) -> Result<Option<(Option<FormatToken>, usize)>> {
-    let first = match rest.chars().next() {
-        Some(ch) => ch,
-        None => return Ok(None),
-    };
-    match first {
-        '<' | '>' => {
-            // A padding directive — or a verbatim `%`/`%>` if it doesn't parse.
-            if let Some((spec, consumed)) = parse_padding_placeholder(rest) {
-                Ok(Some((Some(FormatToken::Padding(spec)), consumed)))
-            } else {
-                // git emits a verbatim '%' and rescans from the flush char.
-                Ok(Some((Some(FormatToken::Literal("%".into())), 0)))
-            }
-        }
-        'w' => {
-            // `%w(...)`; a bare `%w` (no paren) is not ours.
-            if rest.as_bytes().get(1) != Some(&b'(') {
-                return Ok(None);
-            }
-            if let Some((spec, consumed)) = parse_wrap_placeholder(rest) {
-                Ok(Some((Some(FormatToken::Wrap(spec)), consumed)))
-            } else {
-                Ok(Some((Some(FormatToken::Literal("%".into())), 0)))
-            }
-        }
-        '(' => {
-            // `%(trailers...)`, `%(decorate...)`, `%(describe...)`.
-            let Some(end) = rest.find(')') else {
-                return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
-            };
-            let inner = &rest[1..end];
-            let consumed = end + 1; // include '(' .. ')'
-            if let Some(opts) = inner.strip_prefix("trailers") {
-                let opts = opts.strip_prefix(':').unwrap_or("");
-                // Validate the option string; a bad option means git emits the
-                // placeholder verbatim (return 0).
-                if !inner.starts_with("trailers")
-                    || (!opts.is_empty()
-                        && crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts)
-                            .is_err())
-                {
-                    // `%(trailers:key)` (no value) etc. — verbatim.
-                    return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
-                }
-                // Accept `trailers` and `trailers:<opts>` only (not `trailersX`).
-                if !(inner == "trailers" || inner.starts_with("trailers:")) {
-                    return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
-                }
-                *fields |= FormatFields::BODY;
-                Ok(Some((
-                    Some(FormatToken::Trailers(opts.to_string())),
-                    consumed,
-                )))
-            } else if inner == "decorate" || inner.starts_with("decorate:") {
-                let opts = inner.strip_prefix("decorate").unwrap_or("");
-                let opts = opts.strip_prefix(':').unwrap_or("");
-                match parse_decorate_spec(opts) {
-                    Some(spec) => {
-                        *fields |= FormatFields::DECORATIONS;
-                        Ok(Some((Some(FormatToken::Decorate(spec)), consumed)))
-                    }
-                    None => Ok(Some((Some(FormatToken::Literal("%".into())), 0))),
-                }
-            } else if inner == "describe" || inner.starts_with("describe:") {
-                let opts = inner.strip_prefix("describe").unwrap_or("");
-                let opts = opts.strip_prefix(':').unwrap_or("");
-                match parse_describe_spec(opts) {
-                    Some(spec) => {
-                        *fields |= FormatFields::BODY;
-                        Ok(Some((Some(FormatToken::Describe(spec)), consumed)))
-                    }
-                    None => Ok(Some((Some(FormatToken::Literal("%".into())), 0))),
-                }
-            } else {
-                let _ = dialect;
-                // Unknown `%(...)` — verbatim.
-                Ok(Some((Some(FormatToken::Literal("%".into())), 0)))
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Port of pretty.c `parse_padding_placeholder`. `rest` begins at the flush
-/// char (`<`/`>`). Returns the spec and the number of chars consumed.
-fn parse_padding_placeholder(rest: &str) -> Option<(PaddingSpec, usize)> {
-    let bytes = rest.as_bytes();
-    let mut idx = 0usize;
-    let flush = match bytes.first()? {
-        b'<' => {
-            idx += 1;
-            PaddingFlush::Right
-        }
-        b'>' => {
-            idx += 1;
-            match bytes.get(1) {
-                Some(b'<') => {
-                    idx += 1;
-                    PaddingFlush::Both
-                }
-                Some(b'>') => {
-                    idx += 1;
-                    PaddingFlush::LeftAndSteal
-                }
-                _ => PaddingFlush::Left,
-            }
-        }
-        _ => return None,
-    };
-    let mut to_column = false;
-    if bytes.get(idx) == Some(&b'|') {
-        to_column = true;
-        idx += 1;
-    }
-    if bytes.get(idx) != Some(&b'(') {
-        return None;
-    }
-    idx += 1;
-    let start = idx;
-    // strcspn(start, ",)")
-    let num_end = rest[start..]
-        .find([',', ')'])
-        .map(|off| start + off)
-        .unwrap_or(rest.len());
-    if num_end >= rest.len() || num_end == start {
-        // !*end || end == start
-        return None;
-    }
-    // strtol
-    let (width, num_consumed) = parse_leading_i64(&rest[start..]);
-    if num_consumed == 0 {
-        return None;
-    }
-    if !(-FORMATTING_LIMIT..=FORMATTING_LIMIT).contains(&width) {
-        return None;
-    }
-    if width == 0 {
-        return None;
-    }
-    let mut width = width;
-    if width < 0 {
-        if to_column {
-            width += term_columns();
-        }
-        if width < 0 {
-            return None;
-        }
-    }
-    let padding = if to_column { -width } else { width };
-    let mut trunc = PaddingTrunc::None;
-    let end_byte = bytes[num_end];
-    let consumed_end;
-    if end_byte == b',' {
-        let tstart = num_end + 1;
-        let close = rest[tstart..].find(')').map(|off| tstart + off)?;
-        if close == tstart {
-            return None;
-        }
-        let modifier = &rest[tstart..];
-        trunc = if modifier.starts_with("trunc)") {
-            PaddingTrunc::Right
-        } else if modifier.starts_with("ltrunc)") {
-            PaddingTrunc::Left
-        } else if modifier.starts_with("mtrunc)") {
-            PaddingTrunc::Middle
-        } else {
-            return None;
-        };
-        consumed_end = close;
-    } else {
-        consumed_end = num_end;
-    }
-    // git returns `end - placeholder + 1`; here that's consumed_end + 1 chars
-    // measured from the flush char. Since the directive is all ASCII, char
-    // count == byte count.
-    Some((
-        PaddingSpec {
-            flush,
-            trunc,
-            padding,
-        },
-        consumed_end + 1,
-    ))
-}
 
 /// Port of pretty.c `parse_wrap_args`/`%w(...)`. `rest` begins at `w`.
 fn parse_wrap_placeholder(rest: &str) -> Option<(WrapSpec, usize)> {
@@ -897,193 +1008,7 @@ fn expand_decorate_value(arg: &str) -> String {
 
 /// git `term_columns()`: respects COLUMNS env, defaults to 80.
 pub(crate) fn term_columns() -> i64 {
-    if let Ok(cols) = std::env::var("COLUMNS")
-        && let Ok(n) = cols.trim().parse::<i64>()
-        && n > 0
-    {
-        return n;
-    }
-    80
-}
-
-fn push_literal(tokens: &mut Vec<FormatToken>, ch: char) {
-    if let Some(FormatToken::Literal(last)) = tokens.last_mut() {
-        last.push(ch);
-    } else {
-        tokens.push(FormatToken::Literal(ch.to_string()));
-    }
-}
-
-fn consume_literal(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, literal: &str) -> bool {
-    let mut lookahead = chars.clone();
-    for expected in literal.chars() {
-        if lookahead.next() != Some(expected) {
-            return false;
-        }
-    }
-    *chars = lookahead;
-    true
-}
-
-fn consume_color(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    tokens: &mut Vec<FormatToken>,
-) -> Result<()> {
-    if chars.peek().copied() == Some('(') {
-        chars.next();
-        let mut spec = String::new();
-        for ch in chars.by_ref() {
-            if ch == ')' {
-                if spec == "auto" {
-                    tokens.push(FormatToken::ColorAuto);
-                } else {
-                    tokens.push(FormatToken::ColorParen);
-                }
-                return Ok(());
-            }
-            spec.push(ch);
-        }
-        return Err(GitError::Command(
-            "unterminated log format placeholder %C".into(),
-        ));
-    }
-    for name in [
-        "reset", "normal", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-        "bold", "dim", "ul", "blink", "reverse", "italic", "strike",
-    ] {
-        if consume_literal(chars, name) {
-            tokens.push(FormatToken::ColorName(name));
-            return Ok(());
-        }
-    }
-    Err(GitError::Command(
-        "unsupported log format placeholder %C".into(),
-    ))
-}
-
-fn consume_g_placeholder(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    tokens: &mut Vec<FormatToken>,
-) -> Result<()> {
-    let token = match chars.next() {
-        Some('?') => FormatToken::GRefname,
-        Some('T') => FormatToken::GTrailers,
-        Some('G') => FormatToken::GPlaceholder,
-        Some('S') => FormatToken::GSignature,
-        Some('K') => FormatToken::GKey,
-        Some('F') => FormatToken::GFingerprint,
-        Some('P') => FormatToken::GPassthrough,
-        Some(other) => {
-            return Err(GitError::Command(format!(
-                "unsupported log format placeholder %G{other}"
-            )));
-        }
-        None => {
-            return Err(GitError::Command(
-                "unterminated log format placeholder %G".into(),
-            ));
-        }
-    };
-    tokens.push(token);
-    Ok(())
-}
-
-fn consume_reflog_g_placeholder(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    tokens: &mut Vec<FormatToken>,
-) -> Result<()> {
-    let token = match chars.next() {
-        Some('d') => FormatToken::ReflogGd,
-        Some('D') => FormatToken::ReflogGD,
-        Some('n') | Some('N') => FormatToken::ReflogGn,
-        Some('e') | Some('E') => FormatToken::ReflogGe,
-        Some('s') => FormatToken::ReflogGs,
-        Some(other) => {
-            return Err(GitError::Command(format!(
-                "unsupported stash list format placeholder %g{other}"
-            )));
-        }
-        None => {
-            return Err(GitError::Command(
-                "unterminated stash list format placeholder %g".into(),
-            ));
-        }
-    };
-    tokens.push(token);
-    Ok(())
-}
-
-fn consume_g_date_placeholder(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    tokens: &mut Vec<FormatToken>,
-) -> Result<()> {
-    let token = match chars.next() {
-        Some('D') => FormatToken::GDate,
-        Some('d') => FormatToken::GDateShort,
-        Some('n') | Some('N') => FormatToken::GDateIso,
-        Some('e') | Some('E') => FormatToken::GDateIsoStrict,
-        Some('s') => FormatToken::GDateRfc2822,
-        Some(other) => {
-            return Err(GitError::Command(format!(
-                "unsupported log format placeholder %g{other}"
-            )));
-        }
-        None => {
-            return Err(GitError::Command(
-                "unterminated log format placeholder %g".into(),
-            ));
-        }
-    };
-    tokens.push(token);
-    Ok(())
-}
-
-fn consume_identity_placeholder(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    tokens: &mut Vec<FormatToken>,
-    fields: &mut FormatFields,
-    author: bool,
-) -> Result<()> {
-    let field = if author {
-        FormatFields::AUTHOR
-    } else {
-        FormatFields::COMMITTER
-    };
-    *fields |= field;
-    let token = match chars.next() {
-        Some('n') | Some('N') if author => FormatToken::AuthorName,
-        Some('n') | Some('N') => FormatToken::CommitterName,
-        Some('e') | Some('E') if author => FormatToken::AuthorEmail,
-        Some('e') | Some('E') => FormatToken::CommitterEmail,
-        Some('l') | Some('L') if author => FormatToken::AuthorEmailLocal,
-        Some('l') | Some('L') => FormatToken::CommitterEmailLocal,
-        Some('t') if author => FormatToken::AuthorTimestamp,
-        Some('t') => FormatToken::CommitterTimestamp,
-        Some('d') if author => FormatToken::AuthorDate,
-        Some('d') => FormatToken::CommitterDate,
-        Some('i') if author => FormatToken::AuthorDateIso,
-        Some('i') => FormatToken::CommitterDateIso,
-        Some('I') if author => FormatToken::AuthorDateIsoStrict,
-        Some('I') => FormatToken::CommitterDateIsoStrict,
-        Some('s') if author => FormatToken::AuthorDateShort,
-        Some('s') => FormatToken::CommitterDateShort,
-        Some('D') if author => FormatToken::AuthorDateRfc2822,
-        Some('D') => FormatToken::CommitterDateRfc2822,
-        Some(other) => {
-            let prefix = if author { 'a' } else { 'c' };
-            return Err(GitError::Command(format!(
-                "unsupported log format placeholder %{prefix}{other}"
-            )));
-        }
-        None => {
-            let prefix = if author { 'a' } else { 'c' };
-            return Err(GitError::Command(format!(
-                "unterminated log format placeholder %{prefix}"
-            )));
-        }
-    };
-    tokens.push(token);
-    Ok(())
+    sley_strbuf_expand::term_columns() as i64
 }
 
 pub(crate) mod presets {
