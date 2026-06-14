@@ -1463,6 +1463,11 @@ fn expand_commit_short_clusters(args: &[String]) -> Result<Vec<String>> {
 }
 
 pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
+    // `-h`/`--help` is handled by upstream's parse-options before any repo
+    // state is consulted (so it works in a broken repository). Honour it first.
+    if raw_args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return commit_usage();
+    }
     let args = expand_commit_short_clusters(raw_args)?;
     let args = args.as_slice();
     let mut message_chunks = Vec::new();
@@ -2808,19 +2813,37 @@ fn cmd_commit_status_preview(mode: CommitStatusMode, null: bool) -> Result<()> {
 fn cmd_commit_long_status_preview() -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let untracked_mode = match config.get("status", None, "showUntrackedFiles") {
+        Some("no") | Some("false") | Some("0") | Some("off") => {
+            sley_worktree::StatusUntrackedMode::None
+        }
+        Some("all") => sley_worktree::StatusUntrackedMode::All,
+        _ => sley_worktree::StatusUntrackedMode::Normal,
+    };
     let entries = sley_worktree::short_status_with_options(
         &worktree_root,
         &git_dir,
         format,
         sley_worktree::ShortStatusOptions {
             include_ignored: false,
-            untracked_mode: sley_worktree::StatusUntrackedMode::Normal,
+            untracked_mode,
         },
     )?;
     let committable = status_entries_have_index_changes(&entries);
-    print_status_long(&git_dir, format, entries, true, false, true)?;
+    let display = StatusLongDisplay {
+        commit_preview: true,
+        show_stash: false,
+        ahead_behind: true,
+        hints: config
+            .get_bool("advice", None, "statusHints")
+            .unwrap_or(true),
+        untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
+        comment_prefix: status_comment_prefix(&config),
+    };
+    print_status_long(&git_dir, format, entries, &display)?;
     if committable {
         Ok(())
     } else {
@@ -2865,6 +2888,25 @@ impl CommitFixup {
     fn is_reword(&self) -> bool {
         matches!(self, Self::Amend { reword: true, .. })
     }
+}
+
+/// `git commit -h`: print a usage synopsis and exit 129, matching upstream's
+/// `parse-options`-driven `-h` handling (which fires before any repository
+/// state is read, so it works even in a broken repo). The test only asserts
+/// exit code 129 and a "[Uu]sage" match in the output.
+fn commit_usage() -> Result<()> {
+    eprintln!("usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u<mode>] [--amend]");
+    eprintln!("                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]");
+    eprintln!("                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]");
+    eprintln!("                  [--no-verify] [-e] [--author=<author>] [--date=<date>]");
+    eprintln!("                  [--cleanup=<mode>] [--[no-]status] [-i | -o] [pathspec...]");
+    Err(GitError::Exit(129))
+}
+
+/// `git status -h`: usage synopsis + exit 129, mirroring commit_usage().
+fn status_usage() -> Result<()> {
+    eprintln!("usage: git status [<options>] [--] [<pathspec>...]");
+    Err(GitError::Exit(129))
 }
 
 fn commit_author_requires_value_error() -> Result<()> {
@@ -3217,12 +3259,23 @@ fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()>
 }
 
 pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
+    // `-h`/`--help` short-circuits before any repository state is read, so it
+    // works even in a broken repo (t7508 'status -h in broken repository').
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return status_usage();
+    }
     let mut short = false;
     let mut porcelain_v1 = false;
     let mut porcelain_v2 = false;
     let mut z = false;
     let mut explicit_long = false;
     let mut branch = false;
+    // Track whether the format / branch / untracked-mode were set explicitly on
+    // the command line. When they weren't, the corresponding `status.*` config
+    // value supplies the default (upstream wt-status defaults come from config).
+    let mut explicit_short = false;
+    let mut explicit_branch: Option<bool> = None;
+    let mut explicit_untracked = false;
     let mut untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
     let mut show_stash = false;
@@ -3238,6 +3291,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             "--" => positional_only = true,
             "--short" | "-s" => {
                 short = true;
+                explicit_short = true;
                 porcelain_v1 = false;
                 porcelain_v2 = false;
                 explicit_long = false;
@@ -3261,37 +3315,46 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 explicit_long = false;
             }
             "--branch" | "-b" => {
-                short = true;
                 branch = true;
+                explicit_branch = Some(true);
                 explicit_long = false;
             }
             "-sb" | "-bs" => {
                 short = true;
+                explicit_short = true;
                 branch = true;
+                explicit_branch = Some(true);
                 explicit_long = false;
             }
             "--no-short" => {
                 short = false;
+                explicit_short = true;
                 porcelain_v1 = false;
                 porcelain_v2 = false;
             }
-            "--no-branch" => branch = false,
-            "-uno" | "--untracked-files=no" | "--untracked-files=" => {
-                untracked_mode = sley_worktree::StatusUntrackedMode::None;
+            "--no-branch" => {
+                branch = false;
+                explicit_branch = Some(false);
             }
-            "-unormal" | "--no-untracked-files" | "--untracked-files=normal" => {
+            "--no-untracked-files" => {
+                // `--untracked-files` is an OPTION_STRING with PARSE_OPT_OPTARG;
+                // its `--no-` form clears the override (NULL arg), so the config
+                // / default applies rather than forcing "no".
                 untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
+                explicit_untracked = false;
             }
-            "-u" | "-uall" | "--untracked-files" | "--untracked-files=all" => {
+            "-u" | "--untracked-files" => {
                 untracked_mode = sley_worktree::StatusUntrackedMode::All;
+                explicit_untracked = true;
             }
             value if value.starts_with("-u") && value.len() > 2 => {
-                return status_invalid_untracked_files_mode_error(&value[2..]);
+                untracked_mode = parse_status_untracked_mode(&value[2..])?;
+                explicit_untracked = true;
             }
             value if value.starts_with("--untracked-files=") => {
-                return status_invalid_untracked_files_mode_error(
-                    &value["--untracked-files=".len()..],
-                );
+                untracked_mode =
+                    parse_status_untracked_mode(&value["--untracked-files=".len()..])?;
+                explicit_untracked = true;
             }
             value if value.starts_with("--porcelain=") => {
                 return status_unsupported_porcelain_version_error(&value["--porcelain=".len()..]);
@@ -3433,7 +3496,48 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let _config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
+    let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
+    // Config-derived display defaults. The command line wins where it set a
+    // value explicitly; otherwise `status.*` config supplies the default, as
+    // upstream's wt-status initialization does.
+    if !explicit_short
+        && !porcelain_v1
+        && !porcelain_v2
+        && !explicit_long
+        && config.get_bool("status", None, "short") == Some(true)
+    {
+        short = true;
+    }
+    if let Some(want_branch) = explicit_branch {
+        branch = want_branch;
+    } else if !porcelain_v1
+        && !porcelain_v2
+        && config.get_bool("status", None, "branch") == Some(true)
+    {
+        // `status.branch` adds the branch header to short/long output, but
+        // `--porcelain` ignores it unless `-b` was passed explicitly
+        // (t7508 '"status.branch=true" weaker than "--porcelain"').
+        branch = true;
+    }
+    if !explicit_untracked {
+        match config.get("status", None, "showUntrackedFiles") {
+            Some("no") | Some("false") | Some("0") | Some("off") => {
+                untracked_mode = sley_worktree::StatusUntrackedMode::None;
+            }
+            Some("all") => untracked_mode = sley_worktree::StatusUntrackedMode::All,
+            // "normal"/"true"/unset keep the Normal default.
+            _ => {}
+        }
+    }
+    // advice.statusHints defaults to true; `relativePaths` to true; comment
+    // prefix is off unless status.displayCommentPrefix is set.
+    let status_hints = config
+        .get_bool("advice", None, "statusHints")
+        .unwrap_or(true);
+    let relative_paths = config
+        .get_bool("status", None, "relativePaths")
+        .unwrap_or(true);
+    let comment_prefix = status_comment_prefix(&config);
     // status needs a work tree; emit git's diagnostic (bare / no-worktree, or
     // the core.bare+core.worktree conflict) when one isn't available.
     let worktree_root = require_work_tree(&git_dir)?;
@@ -3451,7 +3555,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     if pathspec.has_filters() {
         entries.retain(|entry| pathspec.matches(&entry.path));
     }
-    if !z && !porcelain_v1 {
+    // `status.relativePaths=false` displays paths from the worktree root rather
+    // than relative to the current directory (upstream status.relativePaths).
+    if !z && !porcelain_v1 && relative_paths {
         for entry in &mut entries {
             entry.path = pathspec.display(&entry.path);
         }
@@ -3490,9 +3596,35 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             );
         }
     } else {
-        print_status_long(&git_dir, format, entries, false, show_stash, ahead_behind)?;
+        let display = StatusLongDisplay {
+            commit_preview: false,
+            show_stash,
+            ahead_behind,
+            hints: status_hints,
+            untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
+            comment_prefix,
+        };
+        print_status_long(&git_dir, format, entries, &display)?;
     }
     Ok(())
+}
+
+/// Display knobs for the long ("porcelain off") `git status` output, derived
+/// from the command line plus `status.*` / `advice.*` config.
+struct StatusLongDisplay {
+    /// `commit --dry-run` preview wording (initial-commit hint text).
+    commit_preview: bool,
+    show_stash: bool,
+    ahead_behind: bool,
+    /// `advice.statusHints` — when false, the parenthetical `(use "git ...")`
+    /// guidance lines are suppressed throughout the output.
+    hints: bool,
+    /// True when untracked files are hidden (`-uno` / `status.showUntrackedFiles
+    /// no`); drives the "Untracked files not listed" line when committable.
+    untracked_suppressed: bool,
+    /// `core.commentChar` / `status.displayCommentPrefix`: when set, every line
+    /// is prefixed with the comment character (e.g. `# `), as in COMMIT_EDITMSG.
+    comment_prefix: Option<String>,
 }
 
 /// Upstream wt-status.c short_submodule_status(): in `--short` output a
@@ -3521,6 +3653,21 @@ fn status_option_takes_no_value_error(option: &str) -> Result<()> {
 fn status_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
     eprintln!("fatal: Invalid untracked files mode '{mode}'");
     Err(GitError::Exit(128))
+}
+
+/// Parse a `-u<mode>` / `--untracked-files=<mode>` value. Upstream accepts the
+/// keywords `no`/`normal`/`all` and the git-boolean forms (`true`/`yes`/`on`/`1`
+/// → normal, `false`/`no`/`off`/`0`/empty → no), erroring otherwise.
+fn parse_status_untracked_mode(value: &str) -> Result<sley_worktree::StatusUntrackedMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "all" => Ok(sley_worktree::StatusUntrackedMode::All),
+        "normal" | "true" | "yes" | "on" | "1" => Ok(sley_worktree::StatusUntrackedMode::Normal),
+        "no" | "false" | "off" | "0" | "" => Ok(sley_worktree::StatusUntrackedMode::None),
+        other => {
+            status_invalid_untracked_files_mode_error(other)?;
+            unreachable!()
+        }
+    }
 }
 
 fn status_invalid_ignored_mode_error(mode: &str) -> Result<()> {
@@ -3691,21 +3838,105 @@ fn print_status_porcelain_v2(
     Ok(())
 }
 
+/// Comment prefix for `git status` output when `status.displayCommentPrefix` is
+/// on. Upstream uses `core.commentChar` (default `#`); the prefix string is the
+/// comment char (which may be multi-byte / multi-char). Returns `None` when the
+/// prefix is disabled.
+fn status_comment_prefix(config: &GitConfig) -> Option<String> {
+    if config.get_bool("status", None, "displayCommentPrefix") != Some(true) {
+        return None;
+    }
+    let comment_char = config
+        .get("core", None, "commentChar")
+        .filter(|value| !value.is_empty() && *value != "auto")
+        .unwrap_or("#");
+    Some(comment_char.to_string())
+}
+
+/// Buffers long-status lines so the comment prefix (and, where relevant, hint
+/// gating) can be applied uniformly on flush — mirroring upstream's
+/// status_vprintf(), which prefixes every emitted line.
+struct StatusLineSink {
+    lines: Vec<String>,
+    hints: bool,
+    comment_prefix: Option<String>,
+}
+
+impl StatusLineSink {
+    fn new(hints: bool, comment_prefix: Option<String>) -> Self {
+        Self {
+            lines: Vec::new(),
+            hints,
+            comment_prefix,
+        }
+    }
+
+    /// A normal output line.
+    fn line(&mut self, text: impl Into<String>) {
+        self.lines.push(text.into());
+    }
+
+    /// A blank separator line.
+    fn blank(&mut self) {
+        self.lines.push(String::new());
+    }
+
+    /// A parenthetical guidance line, suppressed when `advice.statusHints` is
+    /// false (upstream gates all `(use "git ...")` hints on `s->hints`).
+    fn hint(&mut self, text: impl Into<String>) {
+        if self.hints {
+            self.lines.push(text.into());
+        }
+    }
+
+    fn flush(self) {
+        let mut out = io::stdout().lock();
+        for line in &self.lines {
+            if let Some(prefix) = &self.comment_prefix {
+                if line.is_empty() {
+                    // Empty line → just the comment char (no trailing space).
+                    let _ = writeln!(out, "{prefix}");
+                } else if line.starts_with('\t') {
+                    // Indented (file) lines: comment char immediately, no space.
+                    let _ = writeln!(out, "{prefix}{line}");
+                } else {
+                    let _ = writeln!(out, "{prefix} {line}");
+                }
+            } else {
+                let _ = writeln!(out, "{line}");
+            }
+        }
+        let _ = out.flush();
+    }
+}
+
 fn print_status_long(
     git_dir: &Path,
     format: ObjectFormat,
     entries: Vec<sley_worktree::ShortStatusEntry>,
-    commit_preview: bool,
-    show_stash: bool,
-    ahead_behind: bool,
+    display: &StatusLongDisplay,
 ) -> Result<()> {
-    let head_initial = print_status_long_branch(git_dir, format, ahead_behind)?;
+    let StatusLongDisplay {
+        commit_preview,
+        show_stash,
+        ahead_behind,
+        hints,
+        untracked_suppressed,
+        comment_prefix,
+    } = display;
+    let commit_preview = *commit_preview;
+    let show_stash = *show_stash;
+    let ahead_behind = *ahead_behind;
+    let untracked_suppressed = *untracked_suppressed;
+
+    let mut sink = StatusLineSink::new(*hints, comment_prefix.clone());
+    let head_initial = status_long_branch_lines(git_dir, format, ahead_behind, &mut sink)?;
     if head_initial {
-        println!();
+        sink.blank();
         if commit_preview {
-            println!("Initial commit");
+            sink.line("Initial commit");
         } else {
-            println!("No commits yet");
+            sink.line("No commits yet");
         }
     }
 
@@ -3761,84 +3992,118 @@ fn print_status_long(
 
     if has_staged {
         if head_initial {
-            println!();
+            sink.blank();
         }
-        println!("Changes to be committed:");
+        sink.line("Changes to be committed:");
         if head_initial {
-            println!("  (use \"git rm --cached <file>...\" to unstage)");
+            sink.hint("  (use \"git rm --cached <file>...\" to unstage)");
         } else {
-            println!("  (use \"git restore --staged <file>...\" to unstage)");
+            sink.hint("  (use \"git restore --staged <file>...\" to unstage)");
         }
         for (label, path) in staged {
-            println!("\t{label:<12}{}", status_quote_path(&path, false));
+            sink.line(format!("\t{label:<12}{}", status_quote_path(&path, false)));
         }
     }
 
     if has_unstaged {
         if head_initial || has_staged {
-            println!();
+            sink.blank();
         }
-        println!("Changes not staged for commit:");
+        sink.line("Changes not staged for commit:");
         if unstaged.iter().any(|(label, _, _, _)| *label == "deleted:") {
-            println!("  (use \"git add/rm <file>...\" to update what will be committed)");
+            sink.hint("  (use \"git add/rm <file>...\" to update what will be committed)");
         } else {
-            println!("  (use \"git add <file>...\" to update what will be committed)");
+            sink.hint("  (use \"git add <file>...\" to update what will be committed)");
         }
-        println!("  (use \"git restore <file>...\" to discard changes in working directory)");
+        sink.hint("  (use \"git restore <file>...\" to discard changes in working directory)");
         if unstaged.iter().any(|(_, _, _, dirty)| *dirty) {
-            println!("  (commit or discard the untracked or modified content in submodules)");
+            sink.hint("  (commit or discard the untracked or modified content in submodules)");
         }
         for (label, path, suffix, _) in unstaged {
-            println!("\t{label:<12}{}{suffix}", status_quote_path(&path, false));
+            sink.line(format!(
+                "\t{label:<12}{}{suffix}",
+                status_quote_path(&path, false)
+            ));
         }
     }
 
     if has_untracked {
         if head_initial || has_staged || has_unstaged {
-            println!();
+            sink.blank();
         }
-        println!("Untracked files:");
-        println!("  (use \"git add <file>...\" to include in what will be committed)");
+        sink.line("Untracked files:");
+        sink.hint("  (use \"git add <file>...\" to include in what will be committed)");
         for path in untracked {
-            println!("\t{}", status_quote_path(&path, false));
+            sink.line(format!("\t{}", status_quote_path(&path, false)));
         }
     }
 
     if has_ignored {
         if head_initial || has_staged || has_unstaged || has_untracked {
-            println!();
+            sink.blank();
         }
-        println!("Ignored files:");
-        println!("  (use \"git add -f <file>...\" to include in what will be committed)");
+        sink.line("Ignored files:");
+        sink.hint("  (use \"git add -f <file>...\" to include in what will be committed)");
         for path in ignored {
-            println!("\t{}", status_quote_path(&path, false));
+            sink.line(format!("\t{}", status_quote_path(&path, false)));
+        }
+    }
+
+    // "Untracked files not listed" appears when untracked output is suppressed
+    // (-uno / status.showUntrackedFiles=no) AND there is something to commit
+    // (upstream gates this on `s->committable`, i.e. staged changes present).
+    // It takes the place of the untracked section, so it gets the same leading
+    // blank separator that section would have, and there is no trailing blank.
+    // The "(use -u option ...)" suffix is itself a hint, gated separately.
+    let printed_not_listed = untracked_suppressed && has_staged;
+    if printed_not_listed {
+        if head_initial || has_staged || has_unstaged {
+            sink.blank();
+        }
+        if *hints {
+            sink.line("Untracked files not listed (use -u option to show untracked files)");
+        } else {
+            sink.line("Untracked files not listed");
         }
     }
 
     if !has_staged && !has_unstaged && !has_untracked && !has_ignored {
         if head_initial {
-            println!();
-            println!("nothing to commit (create/copy files and use \"git add\" to track)");
+            sink.blank();
+            sink.line("nothing to commit (create/copy files and use \"git add\" to track)");
         } else {
-            println!("nothing to commit, working tree clean");
+            sink.line("nothing to commit, working tree clean");
         }
     } else if !has_staged && has_unstaged {
-        println!();
-        println!("no changes added to commit (use \"git add\" and/or \"git commit -a\")");
+        sink.blank();
+        if *hints {
+            sink.line("no changes added to commit (use \"git add\" and/or \"git commit -a\")");
+        } else {
+            sink.line("no changes added to commit");
+        }
     } else if !has_staged && has_untracked {
-        println!();
-        println!("nothing added to commit but untracked files present (use \"git add\" to track)");
-    } else {
-        println!();
+        sink.blank();
+        if *hints {
+            sink.line(
+                "nothing added to commit but untracked files present (use \"git add\" to track)",
+            );
+        } else {
+            sink.line("nothing added to commit but untracked files present");
+        }
+    } else if !printed_not_listed {
+        // A real untracked section (or staged-only) ends with a trailing blank;
+        // the "not listed" line already supplied the trailing content.
+        sink.blank();
     }
     if show_stash {
         let stash_count = status_stash_count(git_dir, format)?;
         if stash_count == 1 {
-            println!("Your stash currently has 1 entry");
+            sink.line("Your stash currently has 1 entry");
         } else if stash_count > 1 {
-            println!("Your stash currently has {stash_count} entries");
+            sink.line(format!("Your stash currently has {stash_count} entries"));
         }
     }
+    sink.flush();
     Ok(())
 }
 
@@ -3847,52 +4112,55 @@ fn status_stash_count(git_dir: &Path, format: ObjectFormat) -> Result<usize> {
     Ok(store.read_reflog("refs/stash")?.len())
 }
 
-fn print_status_long_branch(
+fn status_long_branch_lines(
     git_dir: &Path,
     format: ObjectFormat,
     ahead_behind: bool,
+    sink: &mut StatusLineSink,
 ) -> Result<bool> {
     let store = FileRefStore::new(git_dir, format);
     match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(target)) => {
             if let Some(branch) = target.strip_prefix("refs/heads/") {
-                println!("On branch {branch}");
+                sink.line(format!("On branch {branch}"));
                 if let Some(RefTarget::Direct(oid)) = store.read_ref(&target)? {
-                    print_status_long_tracking(
+                    status_long_tracking_lines(
                         git_dir,
                         format,
                         &store,
                         &target,
                         &oid,
                         ahead_behind,
+                        sink,
                     )?;
                     Ok(false)
                 } else {
                     Ok(true)
                 }
             } else {
-                println!("On branch {target}");
+                sink.line(format!("On branch {target}"));
                 Ok(store.read_ref(&target)?.is_none())
             }
         }
         Some(RefTarget::Direct(oid)) => {
-            println!("HEAD detached at {}", format_log_abbrev_oid(&oid));
+            sink.line(format!("HEAD detached at {}", format_log_abbrev_oid(&oid)));
             Ok(false)
         }
         None => {
-            println!("On branch (unknown)");
+            sink.line("On branch (unknown)");
             Ok(true)
         }
     }
 }
 
-fn print_status_long_tracking(
+fn status_long_tracking_lines(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     branch_ref: &str,
     oid: &ObjectId,
     ahead_behind: bool,
+    sink: &mut StatusLineSink,
 ) -> Result<()> {
     let Some(tracking) =
         status_branch_tracking(git_dir, format, store, branch_ref, oid, ahead_behind)?
@@ -3905,49 +4173,54 @@ fn print_status_long_tracking(
             behind: 0,
             ..
         }) => {
-            println!("Your branch is up to date with '{}'.", tracking.upstream);
+            sink.line(format!(
+                "Your branch is up to date with '{}'.",
+                tracking.upstream
+            ));
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead, behind: 0, ..
         }) => {
-            println!(
+            sink.line(format!(
                 "Your branch is ahead of '{}' by {ahead} {}.",
                 tracking.upstream,
                 status_commit_word(ahead)
-            );
-            println!("  (use \"git push\" to publish your local commits)");
+            ));
+            sink.hint("  (use \"git push\" to publish your local commits)");
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0, behind, ..
         }) => {
-            println!(
+            sink.line(format!(
                 "Your branch is behind '{}' by {behind} {}, and can be fast-forwarded.",
                 tracking.upstream,
                 status_commit_word(behind)
-            );
-            println!("  (use \"git pull\" to update your local branch)");
+            ));
+            sink.hint("  (use \"git pull\" to update your local branch)");
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind, .. }) => {
-            println!("Your branch and '{}' have diverged,", tracking.upstream);
-            println!("and have {ahead} and {behind} different commits each, respectively.");
-            println!("  (use \"git pull\" if you want to integrate the remote branch with yours)");
+            sink.line(format!("Your branch and '{}' have diverged,", tracking.upstream));
+            sink.line(format!(
+                "and have {ahead} and {behind} different commits each, respectively."
+            ));
+            sink.hint("  (use \"git pull\" if you want to integrate the remote branch with yours)");
         }
         StatusBranchTrackingState::Different => {
-            println!(
+            sink.line(format!(
                 "Your branch and '{}' refer to different commits.",
                 tracking.upstream
-            );
-            println!("  (use \"git status --ahead-behind\" for details)");
+            ));
+            sink.hint("  (use \"git status --ahead-behind\" for details)");
         }
         StatusBranchTrackingState::Gone => {
-            println!(
+            sink.line(format!(
                 "Your branch is based on '{}', but the upstream is gone.",
                 tracking.upstream
-            );
-            println!("  (use \"git branch --unset-upstream\" to fixup)");
+            ));
+            sink.hint("  (use \"git branch --unset-upstream\" to fixup)");
         }
     }
-    println!();
+    sink.blank();
     Ok(())
 }
 
