@@ -199,36 +199,68 @@ pub struct ContentFinding {
     pub fatal: bool,
 }
 
+/// git's default `max_tree_entry_len` (the `largePathname` threshold).
+pub const DEFAULT_LARGE_PATHNAME_LEN: usize = 4096;
+
 /// Resolves a message id's effective severity from `fsck.<id>` config plus the
 /// `--strict` flag. Built from the repo config by the caller.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct SeverityConfig {
     /// `(camelCasedId, severity)` overrides parsed from `fsck.<id>=<sev>`.
     overrides: Vec<(String, Severity)>,
     /// `--strict`: promotes warnings (and infos) to errors.
     pub strict: bool,
+    /// The `largePathname` threshold: a tree entry name longer than this trips
+    /// `FSCK_MSG_LARGE_PATHNAME`. Set via `fsck.largePathname=<sev>:<len>`.
+    pub large_pathname_len: usize,
+}
+
+impl Default for SeverityConfig {
+    fn default() -> Self {
+        Self {
+            overrides: Vec::new(),
+            strict: false,
+            large_pathname_len: DEFAULT_LARGE_PATHNAME_LEN,
+        }
+    }
 }
 
 impl SeverityConfig {
     pub fn new(strict: bool) -> Self {
         Self {
-            overrides: Vec::new(),
             strict,
+            ..Default::default()
         }
     }
 
     /// Record a single `fsck.<id>=<value>` override. `value` is one of
     /// `error`, `warn`, `ignore` (case-insensitive); unknown values are ignored
     /// (git errors, but for parity we only need the recognised set).
+    ///
+    /// `fsck.largePathname` additionally accepts a `<sev>:<len>` form that sets
+    /// the maximum tree-entry length (git's `max_tree_entry_len`).
     pub fn set(&mut self, id: &str, value: &str) {
-        let severity = match value.to_ascii_lowercase().as_str() {
+        let lower_id = id.to_ascii_lowercase();
+        // largePathname carries an optional `:<len>` threshold suffix.
+        let sev_str = if lower_id == "largepathname" {
+            if let Some((sev, len)) = value.split_once(':') {
+                if let Ok(parsed) = len.trim().parse::<usize>() {
+                    self.large_pathname_len = parsed;
+                }
+                sev
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        let severity = match sev_str.trim().to_ascii_lowercase().as_str() {
             "error" => Severity::Error,
             "warn" | "warning" => Severity::Warn,
             "ignore" => Severity::Ignore,
             _ => return,
         };
-        // Match the camelCased canonical id case-insensitively.
-        self.overrides.push((id.to_ascii_lowercase(), severity));
+        self.overrides.push((lower_id, severity));
     }
 
     /// Effective severity for `msg_id`, applying overrides then `--strict`.
@@ -268,7 +300,7 @@ pub fn check_object_content(
     let mut raw = match object_type {
         ObjectType::Commit => check_commit(body),
         ObjectType::Tag => check_tag(body),
-        ObjectType::Tree => check_tree(body),
+        ObjectType::Tree => check_tree(body, config.large_pathname_len),
         ObjectType::Blob => Vec::new(),
     };
     // Resolve severities and drop ignored findings, preserving order.
@@ -745,7 +777,7 @@ fn check_tag(body: &[u8]) -> Vec<ContentFinding> {
     out
 }
 
-fn check_tree(body: &[u8]) -> Vec<ContentFinding> {
+fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
     // Walk raw tree entries: "<mode> <name>\0<20-or-32-byte-oid>".
     let oid_len = guess_oid_len(body);
     let mut out = Vec::new();
@@ -760,10 +792,14 @@ fn check_tree(body: &[u8]) -> Vec<ContentFinding> {
     let mut has_bad_modes = false;
     let mut has_dup_entries = false;
     let mut not_sorted = false;
+    let mut has_large_name = false;
 
     let mut pos = 0usize;
     let mut prev: Option<(u32, Vec<u8>)> = None;
     let mut malformed = false;
+    // git's `df_dup_candidates`: non-directory names awaiting a later directory
+    // that would collide via the implicitly-added '/'.
+    let mut df_candidates: Vec<Vec<u8>> = Vec::new();
 
     while pos < body.len() {
         // mode: octal digits up to a space
@@ -825,9 +861,13 @@ fn check_tree(body: &[u8]) -> Vec<ContentFinding> {
         if is_dotgit_name(name) {
             has_dotgit = true;
         }
-        // NTFS-style backslash segments: each "\\<seg>" can also be .git.
+        // NTFS treats `\` as a path separator, so every backslash-delimited
+        // segment (including the leading one) can independently be `.git`:
+        // `.git\foobar` and `foo\.git` both trip the check. git's
+        // `is_ntfs_dotgit` inspects the name up to the first `\`, then its
+        // caller re-checks each subsequent segment.
         if name.contains(&b'\\') {
-            for seg in name.split(|&b| b == b'\\').skip(1) {
+            for seg in name.split(|&b| b == b'\\') {
                 if is_dotgit_name(seg) {
                     has_dotgit = true;
                 }
@@ -836,10 +876,14 @@ fn check_tree(body: &[u8]) -> Vec<ContentFinding> {
         if !is_valid_mode(mode) {
             has_bad_modes = true;
         }
+        if name.len() > large_pathname_len {
+            has_large_name = true;
+        }
 
-        // ordering / duplicate detection against the previous entry
+        // ordering / duplicate detection against the previous entry, using
+        // git's `verify_ordered` (with the d/f-conflict candidate stack).
         if let Some((p_mode, p_name)) = prev.as_ref() {
-            match compare_tree_entries(*p_mode, p_name, mode, name) {
+            match verify_ordered(*p_mode, p_name, mode, name, &mut df_candidates) {
                 Ordering2::Equal => has_dup_entries = true,
                 Ordering2::Unordered => not_sorted = true,
                 Ordering2::Ordered => {}
@@ -890,6 +934,13 @@ fn check_tree(body: &[u8]) -> Vec<ContentFinding> {
     }
     if not_sorted {
         out.push(finding(MsgId::TreeNotSorted, "not properly sorted", false));
+    }
+    if has_large_name {
+        out.push(finding(
+            MsgId::LargePathname,
+            "contains excessively large pathname",
+            false,
+        ));
     }
     if malformed {
         out.push(finding(MsgId::BadTree, "cannot be parsed as a tree", false));
@@ -1073,26 +1124,75 @@ enum Ordering2 {
     Unordered,
 }
 
-/// Compare two consecutive tree entries the way git's `verify_ordered` does:
-/// trees sort as if directory names had a trailing '/'.
-fn compare_tree_entries(a_mode: u32, a_name: &[u8], b_mode: u32, b_name: &[u8]) -> Ordering2 {
-    let a = tree_sort_key(a_mode, a_name);
-    let b = tree_sort_key(b_mode, b_name);
-    if a == b {
-        Ordering2::Equal
-    } else if a < b {
+fn is_dir_mode(mode: u32) -> bool {
+    mode == 0o040000
+}
+
+/// git's `is_less_than_slash`: a byte in `(0x00, '/')`.
+fn is_less_than_slash(c: u8) -> bool {
+    c > 0 && c < b'/'
+}
+
+/// Faithful port of git's `verify_ordered`. Trees sort in *path* order: a
+/// directory entry sorts as if its name had a trailing '/'. Detects both
+/// out-of-order entries and (possibly non-consecutive) duplicates created by
+/// the implicit slash, via the `candidates` stack.
+fn verify_ordered(
+    mode1: u32,
+    name1: &[u8],
+    mode2: u32,
+    name2: &[u8],
+    candidates: &mut Vec<Vec<u8>>,
+) -> Ordering2 {
+    let len = name1.len().min(name2.len());
+    match name1[..len].cmp(&name2[..len]) {
+        std::cmp::Ordering::Less => return Ordering2::Ordered,
+        std::cmp::Ordering::Greater => return Ordering2::Unordered,
+        std::cmp::Ordering::Equal => {}
+    }
+
+    // First `len` bytes equal; order the next byte, turning a name-end ('\0')
+    // into '/' for a directory entry.
+    let mut c1 = name1.get(len).copied().unwrap_or(0);
+    let mut c2 = name2.get(len).copied().unwrap_or(0);
+    if c1 == 0 && c2 == 0 {
+        // Same name, one blob one tree (or identical) => duplicate.
+        return Ordering2::Equal;
+    }
+    if c1 == 0 && is_dir_mode(mode1) {
+        c1 = b'/';
+    }
+    if c2 == 0 && is_dir_mode(mode2) {
+        c2 = b'/';
+    }
+
+    // Non-consecutive duplicate handling via the d/f candidate stack.
+    if c1 == 0 && is_less_than_slash(c2) {
+        candidates.push(name1.to_vec());
+    } else if c2 == b'/' && is_less_than_slash(c1) {
+        loop {
+            let Some(f_name) = candidates.pop() else {
+                break;
+            };
+            // skip_prefix(name2, f_name)
+            let Some(rest) = name2.strip_prefix(f_name.as_slice()) else {
+                continue;
+            };
+            if rest.is_empty() {
+                return Ordering2::Equal;
+            }
+            if is_less_than_slash(rest[0]) {
+                candidates.push(f_name);
+                break;
+            }
+        }
+    }
+
+    if c1 < c2 {
         Ordering2::Ordered
     } else {
         Ordering2::Unordered
     }
-}
-
-fn tree_sort_key(mode: u32, name: &[u8]) -> Vec<u8> {
-    let mut key = name.to_vec();
-    if mode == 0o040000 {
-        key.push(b'/');
-    }
-    key
 }
 
 #[cfg(test)]
