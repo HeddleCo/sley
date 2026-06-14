@@ -1138,6 +1138,7 @@ dependencies = [
  "sley-remote",
  "sley-rev",
  "sley-sequencer",
+ "sley-strbuf-expand",
  "sley-testkit",
  "sley-transport",
  "sley-worktree",

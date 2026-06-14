@@ -7454,8 +7454,6 @@ fn emit_compiled_log_format(
     let author_timestamp = commit_identity_timestamp(&record.commit.author);
     let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
 
-    let tokens = &compiled.tokens[token_range];
-    let mut pending_pad: Option<log_format::PaddingSpec> = None;
     // Wrap state (git's `format_commit_context`): width/indents plus the offset in
     // `out` where the current wrap region began. A `%w` directive (or end-of-
     // format) flushes the pending region through the word-wrapper.
@@ -7463,115 +7461,41 @@ fn emit_compiled_log_format(
     let mut wrap_indent1 = 0i32;
     let mut wrap_indent2 = 0i32;
     let mut wrap_start = out.len();
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        if let FormatToken::Wrap(spec) = token {
-            let new_w = spec.width as i32;
-            let new_i1 = spec.indent1 as i32;
-            let new_i2 = spec.indent2 as i32;
-            if (new_w, new_i1, new_i2) != (wrap_width, wrap_indent1, wrap_indent2) {
-                if wrap_start < out.len() {
-                    log_rewrap(out, wrap_start, wrap_width, wrap_indent1, wrap_indent2);
-                }
-                wrap_start = out.len();
-                wrap_width = new_w;
-                wrap_indent1 = new_i1;
-                wrap_indent2 = new_i2;
-            }
-            idx += 1;
-            continue;
-        }
-        // A magic prefix (`%-`/`%+`/`% `) wraps the *next* placeholder: it adds a
-        // leading newline/space when the placeholder is non-empty, or deletes a
-        // preceding newline when it is empty (git's `format_commit_item`).
-        if let FormatToken::Magic(magic) = token {
-            idx += 1;
-            if idx >= tokens.len() {
-                continue;
-            }
-            let mut captured = Vec::new();
-            emit_log_one_token(
-                &tokens[idx],
-                record,
-                context,
-                &mut captured,
-                &author_name,
-                &author_email,
-                &committer_name,
-                &committer_email,
-                &author_timestamp,
-                &committer_timestamp,
-            )?;
-            idx += 1;
-            match magic {
-                log_format::MagicPrefix::DelLfBeforeEmpty if captured.is_empty() => {
-                    while out.last() == Some(&b'\n') {
-                        out.pop();
+    let mut resolver = LogFormatAtomResolver {
+        record,
+        context,
+        author_name: &author_name,
+        author_email: &author_email,
+        committer_name: &committer_name,
+        committer_email: &committer_email,
+        author_timestamp: &author_timestamp,
+        committer_timestamp: &committer_timestamp,
+    };
+    let segment_range = compiled.segment_range_for_tokens(token_range);
+    compiled.expand.append_range_to_with_atom(
+        out,
+        segment_range,
+        &mut resolver,
+        |out, token, value| {
+            if let FormatToken::Wrap(spec) = token {
+                let new_w = spec.width as i32;
+                let new_i1 = spec.indent1 as i32;
+                let new_i2 = spec.indent2 as i32;
+                if (new_w, new_i1, new_i2) != (wrap_width, wrap_indent1, wrap_indent2) {
+                    if wrap_start < out.len() {
+                        log_rewrap(out, wrap_start, wrap_width, wrap_indent1, wrap_indent2);
                     }
+                    wrap_start = out.len();
+                    wrap_width = new_w;
+                    wrap_indent1 = new_i1;
+                    wrap_indent2 = new_i2;
                 }
-                log_format::MagicPrefix::AddLfBeforeNonEmpty if !captured.is_empty() => {
-                    out.push(b'\n');
-                    out.extend_from_slice(&captured);
-                }
-                log_format::MagicPrefix::AddSpBeforeNonEmpty if !captured.is_empty() => {
-                    out.push(b' ');
-                    out.extend_from_slice(&captured);
-                }
-                _ => out.extend_from_slice(&captured),
+            } else {
+                out.extend_from_slice(value);
             }
-            continue;
-        }
-        // A padding directive captures the *next* token group (any leading
-        // color modifiers plus one content placeholder), pads it, and appends.
-        if let FormatToken::Padding(spec) = token {
-            pending_pad = Some(*spec);
-            idx += 1;
-            continue;
-        }
-        if let Some(spec) = pending_pad.take() {
-            // Capture the chain: color modifiers followed by one placeholder.
-            let mut captured = Vec::new();
-            loop {
-                let t = &tokens[idx];
-                let is_modifier = matches!(
-                    t,
-                    FormatToken::ColorParen | FormatToken::ColorName(_) | FormatToken::ColorAuto
-                );
-                emit_log_one_token(
-                    t,
-                    record,
-                    context,
-                    &mut captured,
-                    &author_name,
-                    &author_email,
-                    &committer_name,
-                    &committer_email,
-                    &author_timestamp,
-                    &committer_timestamp,
-                )?;
-                idx += 1;
-                if !is_modifier || idx >= tokens.len() {
-                    break;
-                }
-            }
-            apply_padding(out, &captured, spec);
-            continue;
-        }
-        emit_log_one_token(
-            token,
-            record,
-            context,
-            out,
-            &author_name,
-            &author_email,
-            &committer_name,
-            &committer_email,
-            &author_timestamp,
-            &committer_timestamp,
-        )?;
-        idx += 1;
-    }
+            Ok(())
+        },
+    )?;
     // git's final `rewrap_message_tail(sb, c, 0, 0, 0)`: flush the tail region if
     // a non-trivial wrap width is active.
     if (wrap_width, wrap_indent1, wrap_indent2) != (0, 0, 0) && wrap_start < out.len() {
@@ -7584,6 +7508,41 @@ fn emit_compiled_log_format(
 fn log_rewrap(out: &mut Vec<u8>, pos: usize, width: i32, indent1: i32, indent2: i32) {
     let region = out.split_off(pos);
     log_wrap_text(out, &region, indent1, indent2, width);
+}
+
+struct LogFormatAtomResolver<'a, 'b> {
+    record: &'a sley_rev::CommitRecord,
+    context: &'a LogFormatContext<'b>,
+    author_name: &'a str,
+    author_email: &'a str,
+    committer_name: &'a str,
+    committer_email: &'a str,
+    author_timestamp: &'a str,
+    committer_timestamp: &'a str,
+}
+
+impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_, '_> {
+    fn resolve_atom(&mut self, out: &mut Vec<u8>, atom: &FormatToken) -> Result<()> {
+        emit_log_one_token(
+            atom,
+            self.record,
+            self.context,
+            out,
+            self.author_name,
+            self.author_email,
+            self.committer_name,
+            self.committer_email,
+            self.author_timestamp,
+            self.committer_timestamp,
+        )
+    }
+
+    fn is_modifier_atom(&self, atom: &FormatToken) -> bool {
+        matches!(
+            atom,
+            FormatToken::ColorParen | FormatToken::ColorName(_) | FormatToken::ColorAuto
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7986,26 +7945,6 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
     }
 }
 
-/// Display width of a UTF-8 byte slice, mirroring git's `utf8_strnwidth`:
-/// control chars contribute 0; invalid UTF-8 falls back to byte length.
-fn log_display_width(bytes: &[u8]) -> usize {
-    let mut width = 0usize;
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        match log_pick_utf8(bytes, idx) {
-            Some((cp, len)) => {
-                let w = log_wcwidth(cp);
-                if w > 0 {
-                    width += w as usize;
-                }
-                idx += len;
-            }
-            None => return bytes.len(),
-        }
-    }
-    width
-}
-
 /// git `git_wcwidth`.
 fn log_wcwidth(ch: u32) -> i32 {
     if ch == 0 {
@@ -8068,113 +8007,6 @@ fn log_pick_utf8(bytes: &[u8], idx: usize) -> Option<(u32, usize)> {
         ))
     } else {
         None
-    }
-}
-
-/// Port of utf8.c `strbuf_utf8_replace`: replace the glyphs occupying display
-/// columns `[pos, pos+width)` of `src` with `subst` (once), preserving control
-/// characters and ANSI escapes verbatim. We don't ship escape parsing here; the
-/// padded corpus never mixes truncation with ANSI.
-fn log_utf8_replace(src: &[u8], pos: usize, width: usize, subst: &str) -> Vec<u8> {
-    let mut dst = Vec::with_capacity(src.len());
-    let mut w = 0usize;
-    let mut idx = 0usize;
-    let mut subst_done = false;
-    while idx < src.len() {
-        let (cp, len) = match log_pick_utf8(src, idx) {
-            Some(v) => v,
-            None => return src.to_vec(), // broken utf-8: do nothing
-        };
-        let mut gw = log_wcwidth(cp);
-        if gw < 0 {
-            gw = 0;
-        }
-        let gw = gw as usize;
-        if gw != 0 && w >= pos && w < pos + width {
-            if !subst_done {
-                dst.extend_from_slice(subst.as_bytes());
-                subst_done = true;
-            }
-        } else {
-            dst.extend_from_slice(&src[idx..idx + len]);
-        }
-        w += gw;
-        idx += len;
-    }
-    dst
-}
-
-/// Apply a `%<`/`%>`/`%><` padding directive to `captured` and append to `out`,
-/// mirroring pretty.c `format_and_pad_commit`.
-fn apply_padding(out: &mut Vec<u8>, captured: &[u8], spec: log_format::PaddingSpec) {
-    use log_format::{PaddingFlush, PaddingTrunc};
-    let mut padding = spec.padding;
-    if padding < 0 {
-        // Pad to the given column: subtract what's already on the current line.
-        let start = match out.iter().rposition(|b| *b == b'\n') {
-            Some(p) => p + 1,
-            None => 0,
-        };
-        let occupied = log_display_width(&out[start..]) as i64;
-        padding = (-padding) - occupied;
-    }
-    let len = log_display_width(captured) as i64;
-
-    let mut flush = spec.flush;
-    let mut captured = captured.to_vec();
-    if flush == PaddingFlush::LeftAndSteal {
-        // Steal trailing spaces from `out` to make room (no ANSI handling).
-        let mut pad = padding;
-        while len > pad {
-            match out.last() {
-                Some(b' ') => {
-                    out.pop();
-                    pad += 1;
-                }
-                _ => break,
-            }
-        }
-        padding = pad;
-        flush = PaddingFlush::Left;
-    }
-
-    if len > padding {
-        match spec.trunc {
-            PaddingTrunc::Left => {
-                captured = log_utf8_replace(&captured, 0, (len - (padding - 2)) as usize, "..");
-            }
-            PaddingTrunc::Middle => {
-                captured = log_utf8_replace(
-                    &captured,
-                    (padding / 2 - 1) as usize,
-                    (len - (padding - 2)) as usize,
-                    "..",
-                );
-            }
-            PaddingTrunc::Right => {
-                captured = log_utf8_replace(
-                    &captured,
-                    (padding - 2) as usize,
-                    (len - (padding - 2)) as usize,
-                    "..",
-                );
-            }
-            PaddingTrunc::None => {}
-        }
-        out.extend_from_slice(&captured);
-    } else {
-        let offset = match flush {
-            PaddingFlush::Left => (padding - len) as usize,
-            PaddingFlush::Both => ((padding - len) / 2) as usize,
-            _ => 0,
-        };
-        // Convert column padding back to bytes: total spaces == padding-len, then
-        // the captured bytes are placed at `offset` columns in.
-        let total_pad = (padding - len) as usize;
-        out.extend(std::iter::repeat_n(b' ', total_pad));
-        // Insert captured at the offset (offset is in columns == spaces here).
-        let insert_at = out.len() - total_pad + offset;
-        out.splice(insert_at..insert_at, captured.iter().copied());
     }
 }
 
