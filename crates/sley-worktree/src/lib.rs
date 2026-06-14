@@ -1896,13 +1896,15 @@ pub fn short_status_with_options(
         );
     } else if let Some(head) = head.as_ref() {
         collect_status_entries_with_head(
-            head,
-            &index,
-            &worktree,
-            &tracked_presence,
-            &submodule_dirt_map,
+            StatusComparisonInputs {
+                head,
+                index: &index,
+                worktree: &worktree,
+                tracked_presence: &tracked_presence,
+                submodule_dirt_map: &submodule_dirt_map,
+                ignores: &ignores,
+            },
             options.untracked_mode,
-            &ignores,
             &mut entries,
         );
     }
@@ -2043,36 +2045,41 @@ fn collect_status_entries_parsed_index_head_matches(
     }
 }
 
+struct StatusComparisonInputs<'a> {
+    head: &'a BTreeMap<Vec<u8>, TrackedEntry>,
+    index: &'a BTreeMap<Vec<u8>, TrackedEntry>,
+    worktree: &'a BTreeMap<Vec<u8>, TrackedEntry>,
+    tracked_presence: &'a HashSet<Vec<u8>>,
+    submodule_dirt_map: &'a BTreeMap<Vec<u8>, u8>,
+    ignores: &'a IgnoreMatcher,
+}
+
 fn collect_status_entries_with_head(
-    head: &BTreeMap<Vec<u8>, TrackedEntry>,
-    index: &BTreeMap<Vec<u8>, TrackedEntry>,
-    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
-    tracked_presence: &HashSet<Vec<u8>>,
-    submodule_dirt_map: &BTreeMap<Vec<u8>, u8>,
+    inputs: StatusComparisonInputs<'_>,
     untracked_mode: StatusUntrackedMode,
-    ignores: &IgnoreMatcher,
     entries: &mut Vec<ShortStatusEntry>,
 ) {
     let mut paths = BTreeSet::new();
-    paths.extend(head.keys().cloned());
-    paths.extend(index.keys().cloned());
+    paths.extend(inputs.head.keys().cloned());
+    paths.extend(inputs.index.keys().cloned());
     paths.extend(
-        worktree
+        inputs
+            .worktree
             .keys()
-            .filter(|path| index.contains_key(*path))
+            .filter(|path| inputs.index.contains_key(*path))
             .cloned(),
     );
 
     for path in paths {
-        let head_entry = head.get(&path);
-        let index_entry = index.get(&path);
-        let worktree_entry = worktree.get(&path);
+        let head_entry = inputs.head.get(&path);
+        let index_entry = inputs.index.get(&path);
+        let worktree_entry = inputs.worktree.get(&path);
         let worktree_present =
-            worktree_entry.is_some() || tracked_presence.contains(path.as_slice());
+            worktree_entry.is_some() || inputs.tracked_presence.contains(path.as_slice());
         if head_entry.is_none()
             && index_entry.is_none()
             && worktree_entry.is_some()
-            && ignores.is_ignored(&path, false)
+            && inputs.ignores.is_ignored(&path, false)
         {
             continue;
         }
@@ -2081,7 +2088,7 @@ fn collect_status_entries_with_head(
                 &path,
                 index_entry,
                 worktree_entry,
-                submodule_dirt_map,
+                inputs.submodule_dirt_map,
                 untracked_mode,
             ),
             None => None,
@@ -7753,6 +7760,14 @@ fn worktree_entries_with_stat_cache(
 /// tracked gitlink path whose submodule working tree is dirty.
 type WorktreeEntriesWithDirt = (BTreeMap<Vec<u8>, TrackedEntry>, BTreeMap<Vec<u8>, u8>);
 
+/// Status worktree snapshot: tracked/untracked entries, gitlink dirt masks, and
+/// tracked paths observed in the worktree.
+type StatusWorktreeSnapshot = (
+    BTreeMap<Vec<u8>, TrackedEntry>,
+    BTreeMap<Vec<u8>, u8>,
+    HashSet<Vec<u8>>,
+);
+
 /// Like [`worktree_entries_with_stat_cache`], but also reports, for every
 /// tracked gitlink path whose submodule working tree is dirty, the dirt mask
 /// ([`DIRTY_SUBMODULE_MODIFIED`] / [`DIRTY_SUBMODULE_UNTRACKED`]).
@@ -7803,11 +7818,7 @@ fn status_worktree_entries_with_submodule_dirt(
     stat_cache: &IndexStatCache,
     tracked_paths: Option<&BTreeSet<Vec<u8>>>,
     ignores: Option<&mut IgnoreMatcher>,
-) -> Result<(
-    BTreeMap<Vec<u8>, TrackedEntry>,
-    BTreeMap<Vec<u8>, u8>,
-    HashSet<Vec<u8>>,
-)> {
+) -> Result<StatusWorktreeSnapshot> {
     let mut entries = BTreeMap::new();
     let mut submodule_dirt_map = BTreeMap::new();
     let mut tracked_presence = HashSet::new();
@@ -8548,7 +8559,7 @@ fn repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
     {
         use std::os::unix::ffi::OsStrExt;
 
-        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
     }
 
     #[cfg(not(unix))]

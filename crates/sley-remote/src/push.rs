@@ -276,7 +276,6 @@ enum PushExecution {
         remote_url: RemoteUrl,
         features: ReceivePackFeatures,
         advertisements: Vec<RefAdvertisement>,
-        command_forces: Vec<(ReceivePackCommand, bool)>,
         pack_objects: Vec<ObjectId>,
     },
     Ssh(crate::ssh::SshPushPlan),
@@ -436,7 +435,6 @@ pub fn plan_push_actions(
                     remote_url: remote_url.clone(),
                     features,
                     advertisements: advertisement_set.refs,
-                    command_forces,
                     pack_objects: request.plan.pack_objects.clone(),
                 }
             };
@@ -540,7 +538,6 @@ pub fn execute_push_plan(
             remote_url,
             features,
             advertisements,
-            command_forces,
             pack_objects,
         } => execute_push_http(
             request,
@@ -549,7 +546,6 @@ pub fn execute_push_plan(
             remote_url,
             features,
             advertisements,
-            command_forces,
             pack_objects,
         ),
         PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan),
@@ -651,7 +647,6 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
             remote_url: remote_url.clone(),
             features,
             advertisements: advertisement_set.refs,
-            command_forces,
             pack_objects: Vec::new(),
         }
     };
@@ -669,7 +664,6 @@ fn execute_push_http(
     remote_url: RemoteUrl,
     features: ReceivePackFeatures,
     advertisements: Vec<RefAdvertisement>,
-    _command_forces: Vec<(ReceivePackCommand, bool)>,
     pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
     let client = crate::http::new_http_client();

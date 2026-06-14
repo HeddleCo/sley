@@ -931,11 +931,17 @@ fn consume_color(
 ) -> Result<()> {
     if chars.peek().copied() == Some('(') {
         chars.next();
+        let mut spec = String::new();
         for ch in chars.by_ref() {
             if ch == ')' {
-                tokens.push(FormatToken::ColorParen);
+                if spec == "auto" {
+                    tokens.push(FormatToken::ColorAuto);
+                } else {
+                    tokens.push(FormatToken::ColorParen);
+                }
                 return Ok(());
             }
+            spec.push(ch);
         }
         return Err(GitError::Command(
             "unterminated log format placeholder %C".into(),

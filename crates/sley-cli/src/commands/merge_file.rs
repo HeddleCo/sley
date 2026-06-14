@@ -861,7 +861,7 @@ fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8])
     if options.object_id {
         let git_dir = discover_git_dir(env::current_dir()?)?;
         let format = repository_object_format(&git_dir)?;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.to_vec()))?;
         println!("{oid}");
         return Ok(());

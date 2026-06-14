@@ -1,7 +1,7 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 
 pub use sley_core::BString;
-use sley_index::Index;
+use sley_index::{Index, IndexStatCache};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget};
@@ -1270,13 +1270,17 @@ pub fn diff_name_status_head_worktree_with_options(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
-    let index = read_index_entries(git_dir, format)?;
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
     let worktree = worktree_entries_for_paths(
         worktree_root,
         format,
         head.keys().chain(index.keys()),
         &index_gitlinks,
+        Some(&stat_cache),
     )?;
     let changes =
         diff_name_status_maps(&head, &worktree, head.keys().chain(index.keys()), options)?;
@@ -1298,13 +1302,17 @@ pub fn diff_name_status_head_worktree_with_rename_options(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
-    let index = read_index_entries(git_dir, format)?;
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
     let worktree = worktree_entries_for_paths(
         worktree_root,
         format,
         head.keys().chain(index.keys()),
         &index_gitlinks,
+        Some(&stat_cache),
     )?;
     let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
     let changes = diff_name_status_maps_with_renames(
@@ -1442,13 +1450,17 @@ pub fn diff_name_status_tree_worktree_with_options(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
-    let index = read_index_entries(git_dir, format)?;
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
     let worktree = worktree_entries_for_paths(
         worktree_root,
         format,
         tree.keys().chain(index.keys()),
         &index_gitlinks,
+        Some(&stat_cache),
     )?;
     let changes =
         diff_name_status_maps(&tree, &worktree, tree.keys().chain(index.keys()), options)?;
@@ -1473,13 +1485,17 @@ pub fn diff_name_status_tree_worktree_with_rename_options(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
-    let index = read_index_entries(git_dir, format)?;
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
     let worktree = worktree_entries_for_paths(
         worktree_root,
         format,
         tree.keys().chain(index.keys()),
         &index_gitlinks,
+        Some(&stat_cache),
     )?;
     let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
     let changes = diff_name_status_maps_with_renames(
@@ -1515,10 +1531,18 @@ pub fn diff_name_status_index_worktree_with_options(
 ) -> Result<Vec<NameStatusEntry>> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let index = read_index_entries(git_dir, format)?;
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree =
-        worktree_entries_for_paths(worktree_root, format, index.keys(), &index_gitlinks)?;
+    let worktree = worktree_entries_for_paths(
+        worktree_root,
+        format,
+        index.keys(),
+        &index_gitlinks,
+        Some(&stat_cache),
+    )?;
     diff_name_status_maps(&index, &worktree, index.keys(), options)
 }
 
@@ -1534,10 +1558,18 @@ pub fn diff_name_status_index_worktree_with_rename_options(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let index = read_index_entries(git_dir, format)?;
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree =
-        worktree_entries_for_paths(worktree_root, format, index.keys(), &index_gitlinks)?;
+    let worktree = worktree_entries_for_paths(
+        worktree_root,
+        format,
+        index.keys(),
+        &index_gitlinks,
+        Some(&stat_cache),
+    )?;
     let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
     diff_name_status_maps_with_renames(&index, &worktree, index.keys(), options, |oid| {
         cache_or_odb_blob(&cache, &db, oid)
@@ -2319,16 +2351,34 @@ type TrackedEntryMap = BTreeMap<Vec<u8>, TrackedEntry>;
 /// The `(left, right)` sides produced by a tree-vs-tree comparison.
 type TrackedEntryPair = (TrackedEntryMap, TrackedEntryMap);
 
+struct IndexSnapshot {
+    entries: BTreeMap<Vec<u8>, TrackedEntry>,
+    stat_cache: IndexStatCache,
+}
+
 fn read_index_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
-    let index_path = git_dir.join("index");
-    if !index_path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let index = Index::parse(&fs::read(index_path)?, format)?;
-    Ok(index
+    Ok(read_index_snapshot(git_dir, format)?.entries)
+}
+
+fn read_index_snapshot(git_dir: &Path, format: ObjectFormat) -> Result<IndexSnapshot> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IndexSnapshot {
+                entries: BTreeMap::new(),
+                stat_cache: IndexStatCache::default(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let stat_cache =
+        IndexStatCache::from_index_mtime(&index, sley_index::file_mtime_parts(&index_metadata));
+    let entries = index
         .entries
         .into_iter()
         .map(|entry| {
@@ -2340,7 +2390,18 @@ fn read_index_entries(
                 },
             )
         })
-        .collect())
+        .collect();
+    Ok(IndexSnapshot {
+        entries,
+        stat_cache,
+    })
+}
+
+fn tracked_entry_from_index(entry: &sley_index::IndexEntry) -> TrackedEntry {
+    TrackedEntry {
+        mode: entry.mode,
+        oid: entry.oid,
+    }
 }
 
 fn head_tree_entries(
@@ -2649,12 +2710,13 @@ fn worktree_entries_for_paths<'a>(
     format: ObjectFormat,
     candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
     index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
+    stat_cache: Option<&IndexStatCache>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
     let candidates: BTreeSet<Vec<u8>> = candidate_paths.cloned().collect();
     for git_path in candidates {
         if let Some(entry) =
-            worktree_entry_for_path(worktree_root, format, &git_path, index_gitlinks)?
+            worktree_entry_for_path(worktree_root, format, &git_path, index_gitlinks, stat_cache)?
         {
             entries.insert(git_path, entry);
         }
@@ -2667,6 +2729,7 @@ fn worktree_entry_for_path(
     format: ObjectFormat,
     git_path: &[u8],
     index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
+    stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<TrackedEntry>> {
     let path = worktree_root.join(repo_path_to_path(git_path));
     let metadata = match fs::symlink_metadata(&path) {
@@ -2695,6 +2758,9 @@ fn worktree_entry_for_path(
     }
     if !(metadata.is_file() || file_type.is_symlink()) {
         return Ok(None);
+    }
+    if let Some(entry) = stat_cache.and_then(|cache| cache.reusable_entry(git_path, &metadata)) {
+        return Ok(Some(tracked_entry_from_index(entry)));
     }
     let body = if file_type.is_symlink() {
         symlink_target_bytes(&path)?
@@ -4810,6 +4876,60 @@ mod tests {
         )
         .expect("untracked dangling symlink should be ignored");
         assert!(changes.is_empty());
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn index_worktree_diff_trusts_non_racy_stat_cache() {
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
+        let worktree_path = root.join("tracked.txt");
+        fs::write(&worktree_path, b"clean\n").expect("test operation should succeed");
+        let metadata = fs::symlink_metadata(&worktree_path).expect("test operation should succeed");
+        let (mtime_seconds, mtime_nanoseconds) =
+            sley_index::file_mtime_parts(&metadata).expect("test operation should succeed");
+        let bogus_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test operation should succeed");
+        let index = Index {
+            version: 2,
+            entries: vec![sley_index::IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: mtime_seconds as u32,
+                mtime_nanoseconds: mtime_nanoseconds as u32,
+                dev: 0,
+                ino: 0,
+                mode: sley_index::worktree_metadata_mode(&metadata),
+                uid: 0,
+                gid: 0,
+                size: metadata.len() as u32,
+                oid: bogus_oid,
+                flags: "tracked.txt".len() as u16,
+                flags_extended: 0,
+                path: BString::from(b"tracked.txt"),
+            }],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(
+            layout.git_dir.join("index"),
+            index
+                .write_v2_sha1()
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
+
+        let changes = diff_name_status_index_worktree(&root, &layout.git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        assert!(
+            changes.is_empty(),
+            "a clean non-racy stat match must reuse the cached index oid"
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

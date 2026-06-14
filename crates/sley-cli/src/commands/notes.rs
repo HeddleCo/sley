@@ -689,7 +689,7 @@ fn write_note_or_remove(
         }
         return Ok(());
     }
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
     let mut notes = list_notes(git_dir, format, store, &handle)?;
     upsert_note(&mut notes, target, blob);
@@ -1210,7 +1210,7 @@ fn notes_copy_from_stdin(
             };
             let combined = combine_notes(mode, cur_bytes.as_deref(), &new_bytes);
 
-            let mut db_w = FileObjectDatabase::from_git_dir(git_dir, format);
+            let db_w = FileObjectDatabase::from_git_dir(git_dir, format);
             let blob = if combined == new_bytes {
                 from_blob
             } else {

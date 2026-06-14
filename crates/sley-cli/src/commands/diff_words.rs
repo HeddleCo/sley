@@ -366,12 +366,12 @@ impl WordDiffBuffers {
         let mut plus_idx = 0usize;
         let mut pending_del = 0usize;
         let mut pending_ins = 0usize;
-        let mut emit_change = |out: &mut Vec<u8>,
-                               minus_first: usize,
-                               minus_len: usize,
-                               plus_first: usize,
-                               plus_len: usize,
-                               current_plus: &mut usize| {
+        let emit_change = |out: &mut Vec<u8>,
+                           minus_first: usize,
+                           minus_len: usize,
+                           plus_first: usize,
+                           plus_len: usize,
+                           current_plus: &mut usize| {
             let (minus_begin, minus_end) = if minus_len > 0 {
                 (
                     minus_words[minus_first].begin,
