@@ -13,6 +13,7 @@ members = [
     "crates/sley-rev",
     "crates/sley-worktree",
     "crates/sley-diff-merge",
+    "crates/sley-unpack-trees",
     "crates/sley-sequencer",
     "crates/sley-submodule",
     "crates/sley-pack",

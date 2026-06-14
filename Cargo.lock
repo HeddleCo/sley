@@ -1144,6 +1144,7 @@ dependencies = [
  "sley-submodule",
  "sley-testkit",
  "sley-transport",
+ "sley-unpack-trees",
  "sley-worktree",
 ]
 
@@ -1383,6 +1384,13 @@ dependencies = [
  "sley-core",
  "sley-protocol",
  "ureq",
+]
+
+[[package]]
+name = "sley-unpack-trees"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
 ]
 
 [[package]]
