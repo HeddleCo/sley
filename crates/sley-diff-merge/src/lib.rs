@@ -1657,10 +1657,10 @@ fn diff_name_status_index_worktree_changes_for_entry_chunk(
     stat_cache: &IndexStatCache,
 ) -> Result<Vec<NameStatusEntry>> {
     let mut changes = Vec::new();
+    let mut path = PathBuf::from(worktree_root);
     for entry in entries {
-        if let Some(change) =
-            index_worktree_change_for_entry(worktree_root, format, entry, &stat_cache)?
-        {
+        worktree_path_for_repo_path_into(&mut path, worktree_root, entry.path.as_bytes());
+        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, &stat_cache)? {
             changes.push(change);
         }
     }
@@ -3157,14 +3157,13 @@ fn worktree_entry_for_path(
 }
 
 fn index_worktree_change_for_entry(
-    worktree_root: &Path,
+    path: &Path,
     format: ObjectFormat,
     index_entry: &sley_index::IndexEntry,
     stat_cache: &IndexStatCache,
 ) -> Result<Option<NameStatusEntry>> {
     let git_path = index_entry.path.as_bytes();
-    let path = worktree_path_for_repo_path(worktree_root, git_path);
-    let metadata = match fs::symlink_metadata(&path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Some(index_worktree_deleted_entry(index_entry)));
@@ -3174,12 +3173,12 @@ fn index_worktree_change_for_entry(
     let file_type = metadata.file_type();
     let right = if metadata.is_dir() {
         if index_entry.mode == 0o160000 {
-            let oid = gitlink_head_oid(&path, format).unwrap_or(index_entry.oid);
+            let oid = gitlink_head_oid(path, format).unwrap_or(index_entry.oid);
             Some(TrackedEntry {
                 mode: 0o160000,
                 oid,
             })
-        } else if let Some(oid) = gitlink_head_oid(&path, format) {
+        } else if let Some(oid) = gitlink_head_oid(path, format) {
             Some(TrackedEntry {
                 mode: 0o160000,
                 oid,
@@ -3193,9 +3192,9 @@ fn index_worktree_change_for_entry(
             return Ok(None);
         }
         let body = if file_type.is_symlink() {
-            symlink_target_bytes(&path)?
+            symlink_target_bytes(path)?
         } else {
-            fs::read(&path)?
+            fs::read(path)?
         };
         let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
         let mode = if file_type.is_symlink() {
@@ -3342,9 +3341,34 @@ fn worktree_path_for_repo_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
     out
 }
 
+#[cfg(unix)]
+fn worktree_path_for_repo_path_into(
+    out: &mut PathBuf,
+    worktree_root: &Path,
+    path: &[u8],
+) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    out.clear();
+    out.push(worktree_root);
+    out.push(OsStr::from_bytes(path));
+}
+
 #[cfg(not(unix))]
 fn worktree_path_for_repo_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
     worktree_root.join(repo_path_to_path(path))
+}
+
+#[cfg(not(unix))]
+fn worktree_path_for_repo_path_into(
+    out: &mut PathBuf,
+    worktree_root: &Path,
+    path: &[u8],
+) {
+    out.clear();
+    out.push(worktree_root);
+    out.push(repo_path_to_path(path));
 }
 
 #[cfg(not(unix))]
