@@ -7375,6 +7375,26 @@ fn format_log_oid(oid: &ObjectId, abbrev_len: Option<usize>) -> String {
     }
 }
 
+fn append_log_oid(out: &mut Vec<u8>, oid: &ObjectId, abbrev_len: Option<usize>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let width = abbrev_len
+        .map(|width| oid.abbrev_hex_len(width))
+        .unwrap_or_else(|| oid.as_bytes().len() * 2);
+    let mut written = 0usize;
+    for byte in oid.as_bytes() {
+        if written >= width {
+            break;
+        }
+        out.push(HEX[(byte >> 4) as usize]);
+        written += 1;
+        if written >= width {
+            break;
+        }
+        out.push(HEX[(byte & 0x0f) as usize]);
+        written += 1;
+    }
+}
+
 fn format_log_commit_header_oid(
     oid: &ObjectId,
     abbrev_commit: bool,
@@ -8100,12 +8120,19 @@ fn log_describe_placeholder(
     Ok(result.unwrap_or_default())
 }
 
+fn append_metadata_parent_oids(out: &mut Vec<u8>, parents: &[ObjectId], abbrev_len: Option<usize>) {
+    for (idx, oid) in parents.iter().enumerate() {
+        if idx > 0 {
+            out.push(b' ');
+        }
+        append_log_oid(out, oid, abbrev_len);
+    }
+}
+
 fn format_metadata_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
-    parents
-        .iter()
-        .map(|oid| format_log_oid(oid, abbrev_len))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = Vec::with_capacity(parents.len().saturating_mul(41));
+    append_metadata_parent_oids(&mut out, parents, abbrev_len);
+    String::from_utf8(out).expect("object ids are always ASCII hex")
 }
 
 fn emit_compiled_log_format_metadata(
@@ -8126,26 +8153,11 @@ fn emit_compiled_log_format_metadata(
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
-            FormatToken::OidFull => write!(out, "{}", record.oid).map_err(io::Error::from)?,
-            FormatToken::OidAbbrev => {
-                write!(out, "{}", format_log_oid(&record.oid, abbrev_len))
-                    .map_err(io::Error::from)?;
-            }
-            FormatToken::ParentsFull => {
-                write!(
-                    out,
-                    "{}",
-                    format_metadata_parent_oids(&record.parents, None)
-                )
-                .map_err(io::Error::from)?;
-            }
+            FormatToken::OidFull => append_log_oid(out, &record.oid, None),
+            FormatToken::OidAbbrev => append_log_oid(out, &record.oid, abbrev_len),
+            FormatToken::ParentsFull => append_metadata_parent_oids(out, &record.parents, None),
             FormatToken::ParentsAbbrev => {
-                write!(
-                    out,
-                    "{}",
-                    format_metadata_parent_oids(&record.parents, abbrev_len)
-                )
-                .map_err(io::Error::from)?;
+                append_metadata_parent_oids(out, &record.parents, abbrev_len);
             }
             FormatToken::Marker => out.push(marker as u8),
             FormatToken::NoteName if dialect == LogFormatDialect::Log => {}

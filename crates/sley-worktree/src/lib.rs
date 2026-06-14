@@ -1823,6 +1823,7 @@ pub fn short_status_with_options(
             &index,
             &stat_cache,
             head_matches_index,
+            StatusUntrackedMode::None,
         );
     }
     // Parse the index once: the stat cache lets the worktree walk skip
@@ -1834,35 +1835,25 @@ pub fn short_status_with_options(
         read_index_with_stat_cache(git_dir, format, &db)?;
     if head_matches_index && !options.include_ignored {
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-        let (worktree, submodule_dirt_map, tracked_presence) =
-            status_worktree_entries_with_submodule_dirt(
-                worktree_root,
-                git_dir,
-                format,
-                &stat_cache,
-                None,
-                Some(&mut ignores),
-            )?;
-        let mut entries = Vec::new();
-        collect_status_entries_parsed_index_head_matches(
+        let entries = short_status_tracked_only(
+            worktree_root,
+            git_dir,
+            format,
+            &db,
             &parsed_index,
-            &worktree,
-            &tracked_presence,
-            &submodule_dirt_map,
+            &stat_cache,
+            true,
             options.untracked_mode,
-            &mut entries,
         );
-        let untracked_paths: Vec<Vec<u8>> = match options.untracked_mode {
-            StatusUntrackedMode::All => worktree
-                .keys()
-                .filter(|path| !stat_cache.contains(path) && !ignores.is_ignored(path, false))
-                .cloned()
-                .collect(),
-            StatusUntrackedMode::Normal => {
-                normal_untracked_paths_from_worktree_stat_cache(&worktree, &stat_cache, &ignores)
-            }
-            StatusUntrackedMode::None => Vec::new(),
-        };
+        let mut entries = entries?;
+        let untracked_paths = status_untracked_paths_from_index(
+            worktree_root,
+            git_dir,
+            &parsed_index,
+            &stat_cache,
+            &mut ignores,
+            options.untracked_mode,
+        )?;
         for path in untracked_paths {
             entries.push(ShortStatusEntry {
                 index: b'?',
@@ -2007,56 +1998,11 @@ fn collect_status_entries_head_matches_index(
                 path: path.clone(),
                 head_mode: Some(index_entry.mode),
                 index_mode: Some(index_entry.mode),
-                worktree_mode: status_worktree_mode(Some(index_entry), worktree_entry, worktree_present),
-                head_oid: Some(index_entry.oid),
-                index_oid: Some(index_entry.oid),
-                submodule: submodule.filter(|sub| sub.any()),
-            });
-        }
-    }
-}
-
-fn collect_status_entries_parsed_index_head_matches(
-    index: &Index,
-    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
-    tracked_presence: &HashSet<Vec<u8>>,
-    submodule_dirt_map: &BTreeMap<Vec<u8>, u8>,
-    untracked_mode: StatusUntrackedMode,
-    entries: &mut Vec<ShortStatusEntry>,
-) {
-    for entry in index
-        .entries
-        .iter()
-        .filter(|entry| entry.stage() == Stage::Normal)
-    {
-        let path = entry.path.as_bytes();
-        let index_entry = TrackedEntry {
-            mode: entry.mode,
-            oid: entry.oid,
-        };
-        let worktree_entry = worktree.get(path);
-        let worktree_present = worktree_entry.is_some() || tracked_presence.contains(path);
-        let submodule = status_submodule_from_entries(
-            path,
-            &index_entry,
-            worktree_entry,
-            submodule_dirt_map,
-            untracked_mode,
-        );
-        let worktree_code = match worktree_entry {
-            None if !worktree_present => b'D',
-            Some(worktree_entry) if *worktree_entry != index_entry => b'M',
-            _ if submodule.is_some_and(|sub| sub.any()) => b'M',
-            _ => b' ',
-        };
-        if worktree_code != b' ' {
-            entries.push(ShortStatusEntry {
-                index: b' ',
-                worktree: worktree_code,
-                path: path.to_vec(),
-                head_mode: Some(index_entry.mode),
-                index_mode: Some(index_entry.mode),
-                worktree_mode: status_worktree_mode(Some(&index_entry), worktree_entry, worktree_present),
+                worktree_mode: status_worktree_mode(
+                    Some(index_entry),
+                    worktree_entry,
+                    worktree_present,
+                ),
                 head_oid: Some(index_entry.oid),
                 index_oid: Some(index_entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
@@ -2153,9 +2099,11 @@ fn status_worktree_mode(
     worktree_entry: Option<&TrackedEntry>,
     worktree_present: bool,
 ) -> Option<u32> {
-    worktree_entry
-        .map(|entry| entry.mode)
-        .or_else(|| worktree_present.then(|| index_entry.map(|entry| entry.mode)).flatten())
+    worktree_entry.map(|entry| entry.mode).or_else(|| {
+        worktree_present
+            .then(|| index_entry.map(|entry| entry.mode))
+            .flatten()
+    })
 }
 
 fn status_submodule_from_entries(
@@ -2186,6 +2134,7 @@ fn short_status_tracked_only(
     index: &Index,
     stat_cache: &IndexStatCache,
     head_matches_index: bool,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
     let normal_entry_count = index
         .entries
@@ -2199,6 +2148,7 @@ fn short_status_tracked_only(
             format,
             index,
             stat_cache,
+            untracked_mode,
         );
     }
     let head = if head_matches_index {
@@ -2215,6 +2165,7 @@ fn short_status_tracked_only(
                 index,
                 stat_cache,
                 head,
+                untracked_mode,
             );
         }
     }
@@ -2248,6 +2199,7 @@ fn short_status_tracked_only(
             path,
             &index_entry,
             worktree_entry.as_ref(),
+            untracked_mode,
         )?;
         let index_code = match head_entry {
             None => b'A',
@@ -2325,6 +2277,7 @@ fn short_status_tracked_only_head_matches_index_parallel(
     format: ObjectFormat,
     index: &Index,
     stat_cache: &IndexStatCache,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
     let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
 
@@ -2367,6 +2320,7 @@ fn short_status_tracked_only_head_matches_index_parallel(
                     path,
                     &index_entry,
                     worktree_entry.as_ref(),
+                    untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
                     None => b'D',
@@ -2405,6 +2359,7 @@ fn short_status_tracked_only_with_head_parallel(
     index: &Index,
     stat_cache: &IndexStatCache,
     head: &BTreeMap<Vec<u8>, TrackedEntry>,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
     let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
     let mut precheck_cursor = 0usize;
@@ -2426,14 +2381,17 @@ fn short_status_tracked_only_with_head_parallel(
             Some(head_entry) if *head_entry != index_entry => b'M',
             _ => b' ',
         };
-        let precheck = prechecks.get(precheck_cursor).copied().and_then(|precheck| {
-            if tracked_only_precheck_index(precheck) == idx {
-                precheck_cursor += 1;
-                Some(precheck)
-            } else {
-                None
-            }
-        });
+        let precheck = prechecks
+            .get(precheck_cursor)
+            .copied()
+            .and_then(|precheck| {
+                if tracked_only_precheck_index(precheck) == idx {
+                    precheck_cursor += 1;
+                    Some(precheck)
+                } else {
+                    None
+                }
+            });
         let (worktree_code, worktree_mode, submodule) = match precheck {
             None => (b' ', Some(index_entry.mode), None),
             Some(TrackedOnlyPrecheck::Deleted(_)) => (b'D', None, None),
@@ -2451,6 +2409,7 @@ fn short_status_tracked_only_with_head_parallel(
                     path,
                     &index_entry,
                     worktree_entry.as_ref(),
+                    untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
                     None => b'D',
@@ -2644,6 +2603,7 @@ fn tracked_only_submodule_status(
     path: &[u8],
     index_entry: &TrackedEntry,
     worktree_entry: Option<&TrackedEntry>,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Option<SubmoduleStatus>> {
     let Some(worktree_entry) = worktree_entry else {
         return Ok(None);
@@ -2660,7 +2620,8 @@ fn tracked_only_submodule_status(
     Ok(Some(SubmoduleStatus {
         new_commits: index_entry.oid != worktree_entry.oid,
         modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-        untracked_content: false,
+        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
+            && !matches!(untracked_mode, StatusUntrackedMode::None),
     }))
 }
 
@@ -3210,30 +3171,148 @@ fn normal_untracked_paths_from_worktree(
     paths.into_iter().collect()
 }
 
-fn normal_untracked_paths_from_worktree_stat_cache(
-    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
+fn status_untracked_paths_from_index(
+    root: &Path,
+    git_dir: &Path,
+    index: &Index,
     stat_cache: &IndexStatCache,
-    ignores: &IgnoreMatcher,
-) -> Vec<Vec<u8>> {
-    let mut paths = BTreeSet::new();
-    let mut index_paths = None;
-    for (path, entry) in worktree {
-        if stat_cache.contains(path) || ignores.is_ignored(path, false) {
-            continue;
-        }
-        if entry.mode == 0o040000 && entry.oid.is_null() {
-            insert_untracked_directory(&mut paths, path);
-            continue;
-        }
-        let index_paths = index_paths
-            .get_or_insert_with(|| stat_cache.entries.keys().cloned().collect::<BTreeSet<_>>());
-        paths.insert(untracked_normal_rollup_path_from_paths(
-            path,
-            index_paths,
-            ignores,
-        ));
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Vec<Vec<u8>>> {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(Vec::new());
     }
-    paths.into_iter().collect()
+    let mut paths = BTreeSet::new();
+    let mut context = StatusUntrackedWalk {
+        git_dir,
+        index,
+        stat_cache,
+        ignores,
+        untracked_mode,
+    };
+    collect_status_untracked_paths(&mut context, root, &[], &mut paths)?;
+    Ok(paths.into_iter().collect())
+}
+
+struct StatusUntrackedWalk<'a> {
+    git_dir: &'a Path,
+    index: &'a Index,
+    stat_cache: &'a IndexStatCache,
+    ignores: &'a mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+}
+
+fn collect_status_untracked_paths(
+    context: &mut StatusUntrackedWalk<'_>,
+    dir: &Path,
+    dir_git_path: &[u8],
+    paths: &mut BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    if is_same_path(dir, context.git_dir) {
+        return Ok(());
+    }
+    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == std::ffi::OsStr::new(".git") {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let is_dir = file_type.is_dir();
+        let git_path = git_path_append_component(dir_git_path, &file_name);
+        if context.ignores.is_ignored(&git_path, is_dir) {
+            continue;
+        }
+        if is_dir {
+            let path = entry.path();
+            if is_same_path(&path, context.git_dir) {
+                continue;
+            }
+            if context.stat_cache.gitlink_entry(&git_path).is_some() {
+                continue;
+            }
+            match context.untracked_mode {
+                StatusUntrackedMode::All => {
+                    if !index_has_stage0_path_under(context.index, &git_path)
+                        && is_nested_repository_boundary(&path)
+                    {
+                        insert_untracked_directory(paths, &git_path);
+                    } else {
+                        collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                    }
+                }
+                StatusUntrackedMode::Normal => {
+                    if index_has_stage0_path_under(context.index, &git_path) {
+                        collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                    } else if is_nested_repository_boundary(&path) {
+                        insert_untracked_directory(paths, &git_path);
+                    } else if status_untracked_directory_has_file(context, &path, &git_path)? {
+                        insert_untracked_directory(paths, &git_path);
+                    }
+                }
+                StatusUntrackedMode::None => {}
+            }
+        } else if (file_type.is_file() || file_type.is_symlink())
+            && !context.stat_cache.contains(&git_path)
+        {
+            paths.insert(git_path);
+        }
+    }
+    Ok(())
+}
+
+fn status_untracked_directory_has_file(
+    context: &mut StatusUntrackedWalk<'_>,
+    dir: &Path,
+    dir_git_path: &[u8],
+) -> Result<bool> {
+    if is_same_path(dir, context.git_dir) {
+        return Ok(false);
+    }
+    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == std::ffi::OsStr::new(".git") {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let is_dir = file_type.is_dir();
+        let git_path = git_path_append_component(dir_git_path, &file_name);
+        if context.ignores.is_ignored(&git_path, is_dir) {
+            continue;
+        }
+        if file_type.is_file() || file_type.is_symlink() {
+            return Ok(!context.stat_cache.contains(&git_path));
+        }
+        if is_dir {
+            let path = entry.path();
+            if is_same_path(&path, context.git_dir) {
+                continue;
+            }
+            if is_nested_repository_boundary(&path) {
+                return Ok(true);
+            }
+            if status_untracked_directory_has_file(context, &path, &git_path)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn index_has_stage0_path_under(index: &Index, directory: &[u8]) -> bool {
+    let mut prefix = Vec::with_capacity(directory.len() + 1);
+    prefix.extend_from_slice(directory);
+    prefix.push(b'/');
+    let idx = index
+        .entries
+        .partition_point(|entry| entry.path.as_bytes() < prefix.as_slice());
+    index.entries[idx..]
+        .iter()
+        .take_while(|entry| entry.path.as_bytes().starts_with(&prefix))
+        .any(|entry| entry.stage() == Stage::Normal)
 }
 
 fn untracked_normal_rollup_path(
@@ -3255,36 +3334,6 @@ fn untracked_normal_rollup_path(
         }
         prefix.extend_from_slice(segment);
         if index_has_path_under(index, &prefix) {
-            break;
-        }
-        if !ignores.is_ignored(&prefix, true) {
-            let mut directory = prefix;
-            directory.push(b'/');
-            return directory;
-        }
-    }
-    file_path.to_vec()
-}
-
-fn untracked_normal_rollup_path_from_paths(
-    file_path: &[u8],
-    index_paths: &BTreeSet<Vec<u8>>,
-    ignores: &IgnoreMatcher,
-) -> Vec<u8> {
-    let segments = file_path
-        .split(|byte| *byte == b'/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() <= 1 {
-        return file_path.to_vec();
-    }
-    let mut prefix = Vec::new();
-    for segment in &segments[..segments.len() - 1] {
-        if !prefix.is_empty() {
-            prefix.push(b'/');
-        }
-        prefix.extend_from_slice(segment);
-        if tracked_paths_may_contain(index_paths, &prefix) {
             break;
         }
         if !ignores.is_ignored(&prefix, true) {
@@ -8203,12 +8252,9 @@ fn read_index_with_stat_cache_entries(
         IndexStatCache::from_index_mtime_only(index_mtime)
     };
     let head_matches_index = match resolve_head_tree_oid(git_dir, format, db)? {
-        Some(head_tree_oid) => head_matches_index_from_cache_tree(
-            &index,
-            format,
-            &head_tree_oid,
-            stage0_entry_count,
-        )?,
+        Some(head_tree_oid) => {
+            head_matches_index_from_cache_tree(&index, format, &head_tree_oid, stage0_entry_count)?
+        }
         None => false,
     };
     Ok((index, stat_cache, head_matches_index))
@@ -9550,11 +9596,8 @@ mod tests {
         let work = root.join("work");
         let git_dir = work.join(".git");
         fs::create_dir_all(&git_dir).expect("create non-bare git dir");
-        fs::write(
-            git_dir.join("config"),
-            b"[core]\n\tbare = false\n",
-        )
-        .expect("write non-bare config");
+        fs::write(git_dir.join("config"), b"[core]\n\tbare = false\n")
+            .expect("write non-bare config");
 
         assert_eq!(
             worktree_root_for_git_dir(&git_dir).expect("resolve non-bare worktree root"),
@@ -9900,14 +9943,15 @@ mod tests {
     #[test]
     fn standard_attribute_matcher_matches_per_path_lookup() {
         let root = temp_root();
-        fs::create_dir_all(root.join(".git").join("info"))
-            .expect("test operation should succeed");
-        fs::create_dir_all(root.join("src").join("nested"))
-            .expect("test operation should succeed");
+        fs::create_dir_all(root.join(".git").join("info")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("src").join("nested")).expect("test operation should succeed");
         fs::write(root.join(".gitattributes"), b"*.rs diff=rust\n")
             .expect("test operation should succeed");
-        fs::write(root.join("src").join(".gitattributes"), b"*.rs diff=python\n")
-            .expect("test operation should succeed");
+        fs::write(
+            root.join("src").join(".gitattributes"),
+            b"*.rs diff=python\n",
+        )
+        .expect("test operation should succeed");
         fs::write(
             root.join(".git").join("info").join("attributes"),
             b"src/nested/*.rs diff=java\n",
