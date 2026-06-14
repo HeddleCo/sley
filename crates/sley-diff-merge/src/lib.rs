@@ -1545,21 +1545,12 @@ pub fn diff_name_status_index_worktree_with_options(
     format: ObjectFormat,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
-    let IndexSnapshot {
-        entries: index,
-        stat_cache,
-    } = read_index_snapshot(git_dir, format)?;
-    let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_unique_paths(
-        worktree_root,
+    let changes = diff_name_status_index_worktree_changes(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
         format,
-        index.keys(),
-        &index_gitlinks,
-        Some(&stat_cache),
     )?;
-    diff_name_status_maps_for_unique_paths(&index, &worktree, index.keys(), options)
+    apply_name_status_options_to_index_worktree_changes(changes, options)
 }
 
 /// Index-vs-worktree name-status with full rename/copy options, including inexact
@@ -1571,35 +1562,165 @@ pub fn diff_name_status_index_worktree_with_rename_options(
     format: ObjectFormat,
     options: RenameDetectionOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let changes = diff_name_status_index_worktree_changes(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+    )?;
+    // Index-vs-worktree diffs only consider tracked index paths; untracked
+    // worktree files are not additions, so rename/copy detection has no add
+    // destinations to pair. Apply the base options for completeness.
+    apply_name_status_options_to_index_worktree_changes(changes, options.base)
+}
+
+fn diff_name_status_index_worktree_changes(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<NameStatusEntry>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    if index
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != sley_index::Stage::Normal)
+    {
+        return diff_name_status_index_worktree_changes_from_snapshot(
+            worktree_root,
+            git_dir,
+            format,
+        );
+    }
+    let stat_cache = IndexStatCache::from_index_mtime_only(sley_index::file_mtime_parts(
+        &index_metadata,
+    ));
+    diff_name_status_index_worktree_changes_for_entries(
+        worktree_root,
+        format,
+        &index.entries,
+        &stat_cache,
+    )
+}
+
+fn diff_name_status_index_worktree_changes_for_entries(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    entries: &[sley_index::IndexEntry],
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<NameStatusEntry>> {
+    const PARALLEL_SCAN_MIN_ENTRIES: usize = 2048;
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8);
+    if workers <= 1 || entries.len() < PARALLEL_SCAN_MIN_ENTRIES {
+        return diff_name_status_index_worktree_changes_for_entry_chunk(
+            worktree_root,
+            format,
+            entries,
+            stat_cache,
+        );
+    }
+    let chunk_size = entries.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in entries.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                diff_name_status_index_worktree_changes_for_entry_chunk(
+                    worktree_root,
+                    format,
+                    chunk,
+                    stat_cache,
+                )
+            }));
+        }
+        let mut changes = Vec::new();
+        for handle in handles {
+            let chunk_changes = handle
+                .join()
+                .map_err(|_| GitError::Command("diff worker panicked".into()))??;
+            changes.extend(chunk_changes);
+        }
+        Ok(changes)
+    })
+}
+
+fn diff_name_status_index_worktree_changes_for_entry_chunk(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    entries: &[sley_index::IndexEntry],
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut changes = Vec::new();
+    for entry in entries {
+        if let Some(change) =
+            index_worktree_change_for_entry(worktree_root, format, entry, &stat_cache)?
+        {
+            changes.push(change);
+        }
+    }
+    Ok(changes)
+}
+
+fn diff_name_status_index_worktree_changes_from_snapshot(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<NameStatusEntry>> {
     let IndexSnapshot {
         entries: index,
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_unique_paths(
-        worktree_root,
-        format,
-        index.keys(),
-        &index_gitlinks,
-        Some(&stat_cache),
-    )?;
-    let cache = worktree_blob_cache_for_unique_paths(
-        worktree_root,
-        &index,
-        &worktree,
-        index.keys(),
-        options,
-    )?;
-    diff_name_status_maps_with_renames_for_unique_paths(
-        &index,
-        &worktree,
-        index.keys(),
-        options,
-        |oid| cache_or_odb_blob(&cache, &db, oid),
-    )
+    let mut changes = Vec::new();
+    for (git_path, left) in &index {
+        let right = worktree_entry_for_path(
+            worktree_root,
+            format,
+            git_path,
+            &index_gitlinks,
+            Some(&stat_cache),
+        )?;
+        let Some(right) = right else {
+            changes.push(NameStatusEntry {
+                status: NameStatus::Deleted,
+                path: git_path.clone().into(),
+                old_path: None,
+                old_mode: Some(left.mode),
+                new_mode: None,
+                old_oid: Some(left.oid),
+                new_oid: None,
+            });
+            continue;
+        };
+        if right != *left {
+            changes.push(NameStatusEntry {
+                status: NameStatus::Modified,
+                path: git_path.clone().into(),
+                old_path: None,
+                old_mode: Some(left.mode),
+                new_mode: Some(right.mode),
+                old_oid: Some(left.oid),
+                new_oid: Some(right.oid),
+            });
+        }
+    }
+    Ok(changes)
+}
+
+fn apply_name_status_options_to_index_worktree_changes(
+    mut changes: Vec<NameStatusEntry>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    if options.detect_renames || options.detect_copies {
+        changes.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    }
+    Ok(changes)
 }
 
 /// Index-vs-worktree name-status for **`git diff-files`** (plumbing), which
@@ -2990,7 +3111,7 @@ fn worktree_entry_for_path(
     index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<TrackedEntry>> {
-    let path = worktree_root.join(repo_path_to_path(git_path));
+    let path = worktree_path_for_repo_path(worktree_root, git_path);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3033,6 +3154,87 @@ fn worktree_entry_for_path(
         file_mode(&metadata)
     };
     Ok(Some(TrackedEntry { mode, oid }))
+}
+
+fn index_worktree_change_for_entry(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    index_entry: &sley_index::IndexEntry,
+    stat_cache: &IndexStatCache,
+) -> Result<Option<NameStatusEntry>> {
+    let git_path = index_entry.path.as_bytes();
+    let path = worktree_path_for_repo_path(worktree_root, git_path);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(index_worktree_deleted_entry(index_entry)));
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let file_type = metadata.file_type();
+    let right = if metadata.is_dir() {
+        if index_entry.mode == 0o160000 {
+            let oid = gitlink_head_oid(&path, format).unwrap_or(index_entry.oid);
+            Some(TrackedEntry {
+                mode: 0o160000,
+                oid,
+            })
+        } else if let Some(oid) = gitlink_head_oid(&path, format) {
+            Some(TrackedEntry {
+                mode: 0o160000,
+                oid,
+            })
+        } else {
+            None
+        }
+    } else if metadata.is_file() || file_type.is_symlink() {
+        if let Some(entry) = stat_cache.reusable_index_entry(index_entry, &metadata) {
+            debug_assert_eq!(entry.path, index_entry.path);
+            return Ok(None);
+        }
+        let body = if file_type.is_symlink() {
+            symlink_target_bytes(&path)?
+        } else {
+            fs::read(&path)?
+        };
+        let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+        let mode = if file_type.is_symlink() {
+            0o120000
+        } else {
+            file_mode(&metadata)
+        };
+        Some(TrackedEntry { mode, oid })
+    } else {
+        None
+    };
+    let Some(right) = right else {
+        return Ok(Some(index_worktree_deleted_entry(index_entry)));
+    };
+    let left = tracked_entry_from_index(index_entry);
+    if right == left {
+        return Ok(None);
+    }
+    Ok(Some(NameStatusEntry {
+        status: NameStatus::Modified,
+        path: git_path.to_vec().into(),
+        old_path: None,
+        old_mode: Some(left.mode),
+        new_mode: Some(right.mode),
+        old_oid: Some(left.oid),
+        new_oid: Some(right.oid),
+    }))
+}
+
+fn index_worktree_deleted_entry(index_entry: &sley_index::IndexEntry) -> NameStatusEntry {
+    NameStatusEntry {
+        status: NameStatus::Deleted,
+        path: index_entry.path.as_bytes().to_vec().into(),
+        old_path: None,
+        old_mode: Some(index_entry.mode),
+        new_mode: None,
+        old_oid: Some(index_entry.oid),
+        new_oid: None,
+    }
 }
 
 fn worktree_blob_cache_for_path_set(
@@ -3106,7 +3308,7 @@ fn worktree_blob_cache_for_unique_paths<'a>(
         if entry.mode == 0o160000 || !candidate_oids.contains(&entry.oid) {
             continue;
         }
-        let path = worktree_root.join(repo_path_to_path(git_path));
+        let path = worktree_path_for_repo_path(worktree_root, git_path);
         let body = if entry.mode == 0o120000 {
             symlink_target_bytes(&path)?
         } else {
@@ -3131,17 +3333,18 @@ fn cache_or_odb_blob(
 }
 
 #[cfg(unix)]
-fn repo_path_to_path(path: &[u8]) -> PathBuf {
+fn worktree_path_for_repo_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    let mut out = PathBuf::new();
-    for component in path.split(|byte| *byte == b'/') {
-        if !component.is_empty() {
-            out.push(OsStr::from_bytes(component));
-        }
-    }
+    let mut out = PathBuf::from(worktree_root);
+    out.push(OsStr::from_bytes(path));
     out
+}
+
+#[cfg(not(unix))]
+fn worktree_path_for_repo_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
+    worktree_root.join(repo_path_to_path(path))
 }
 
 #[cfg(not(unix))]

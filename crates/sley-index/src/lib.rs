@@ -613,6 +613,15 @@ impl IndexStatCache {
         }
     }
 
+    /// Build a stat cache that can validate caller-provided index entries
+    /// against worktree metadata without owning its own path lookup table.
+    pub fn from_index_mtime_only(index_mtime: Option<(u64, u64)>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            index_mtime,
+        }
+    }
+
     /// Read and parse an index file into a stat cache. A missing index returns
     /// an empty cache.
     pub fn from_index_file(index_path: impl AsRef<Path>, format: ObjectFormat) -> Result<Self> {
