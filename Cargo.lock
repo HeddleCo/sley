@@ -1325,6 +1325,7 @@ dependencies = [
  "sley-diff-merge",
  "sley-formats",
  "sley-index",
+ "sley-mmap",
  "sley-object",
  "sley-odb",
  "sley-pathspec",

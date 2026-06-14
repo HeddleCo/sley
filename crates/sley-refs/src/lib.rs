@@ -143,6 +143,36 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
     Ok(refs)
 }
 
+fn packed_refs_have_prefix(format: ObjectFormat, bytes: &[u8], prefix: &str) -> Result<bool> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let mut found = false;
+    let mut saw_ref = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(peeled) = line.strip_prefix('^') {
+            ObjectId::from_hex(format, peeled)?;
+            if !saw_ref {
+                return Err(GitError::InvalidFormat(
+                    "peeled packed ref without preceding ref".into(),
+                ));
+            }
+            continue;
+        }
+        let (oid, name) = line
+            .split_once(' ')
+            .ok_or_else(|| GitError::InvalidFormat("invalid packed ref line".into()))?;
+        validate_ref_name(name)?;
+        ObjectId::from_hex(format, oid)?;
+        saw_ref = true;
+        found |= name.starts_with(prefix);
+    }
+    Ok(found)
+}
+
 pub fn write_packed_refs(refs: &[PackedRef]) -> Result<Vec<u8>> {
     let mut refs = refs.to_vec();
     refs.sort_by(|left, right| left.reference.name.cmp(&right.reference.name));
@@ -622,18 +652,40 @@ impl FileRefStore {
         if self.uses_reftable()? {
             return self.list_reftable_refs();
         }
-        let mut refs = BTreeMap::new();
+        let mut refs = Vec::new();
         let packed_path = self.common_dir.join("packed-refs");
         if packed_path.exists() {
             for packed in parse_packed_refs(self.format, &fs::read(packed_path)?)? {
-                refs.insert(packed.reference.name.clone(), packed.reference);
+                refs.push(packed.reference);
             }
         }
         let refs_dir = self.common_dir.join("refs");
+        let mut loose_refs = BTreeMap::new();
         if refs_dir.exists() {
-            self.collect_loose_refs(&refs_dir, "refs", &mut refs)?;
+            self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
         }
-        Ok(refs.into_values().collect())
+        if !loose_refs.is_empty() {
+            refs.retain(|reference| !loose_refs.contains_key(&reference.name));
+            refs.extend(loose_refs.into_values());
+        }
+        refs.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(refs)
+    }
+
+    pub fn has_refs_with_prefix(&self, prefix: &str) -> Result<bool> {
+        if self.uses_reftable()? {
+            return Ok(self
+                .list_reftable_refs()?
+                .iter()
+                .any(|reference| reference.name.starts_with(prefix)));
+        }
+        let packed_path = self.common_dir.join("packed-refs");
+        if packed_path.exists()
+            && packed_refs_have_prefix(self.format, &fs::read(&packed_path)?, prefix)?
+        {
+            return Ok(true);
+        }
+        self.loose_refs_have_prefix(prefix)
     }
 
     pub fn write_packed_refs(&self, refs: &[PackedRef]) -> Result<()> {
@@ -1321,6 +1373,27 @@ impl FileRefStore {
             }
         }
         Ok(())
+    }
+
+    fn loose_refs_have_prefix(&self, prefix: &str) -> Result<bool> {
+        if !prefix.starts_with("refs/") || !prefix.ends_with('/') {
+            return Ok(self
+                .list_refs()?
+                .iter()
+                .any(|reference| reference.name.starts_with(prefix)));
+        }
+        let loose_prefix = prefix.trim_end_matches('/');
+        let dir = self.common_dir.join(loose_prefix);
+        match fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {
+                let mut refs = BTreeMap::new();
+                self.collect_loose_refs(&dir, loose_prefix, &mut refs)?;
+                Ok(!refs.is_empty())
+            }
+            Ok(_) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn write_loose_ref(&self, reference: &Ref) -> Result<()> {
@@ -4336,6 +4409,59 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert_eq!(refs[0].target, RefTarget::Direct(oid));
         assert!(git_dir.join("packed-refs").exists());
         assert!(!git_dir.join("packed-refs.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_checks_ref_prefix_in_packed_refs() {
+        let git_dir = temp_git_dir();
+        fs::write(
+            git_dir.join("packed-refs"),
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 refs/heads/main\n\
+              ce013625030ba8dba906f756967f9e9ca394464a refs/replace/e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n",
+        )
+        .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert!(
+            store
+                .has_refs_with_prefix("refs/replace/")
+                .expect("test operation should succeed")
+        );
+        assert!(
+            !store
+                .has_refs_with_prefix("refs/notes/")
+                .expect("test operation should succeed")
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_checks_ref_prefix_in_loose_refs() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/replace/e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+        assert!(
+            store
+                .has_refs_with_prefix("refs/replace/")
+                .expect("test operation should succeed")
+        );
+        assert!(
+            !store
+                .has_refs_with_prefix("refs/notes/")
+                .expect("test operation should succeed")
+        );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 

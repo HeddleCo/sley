@@ -1707,6 +1707,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut status_mode = CommitStatusMode::Normal;
     let mut status_null = false;
     let mut null_implied_status = false;
+    // `commit -u<mode>` / `--untracked-files=<mode>` overrides
+    // `status.showUntrackedFiles` for the dry-run / status preview. `None` means
+    // the flag was not given, so config / default applies.
+    let mut commit_untracked: Option<sley_worktree::StatusUntrackedMode> = None;
     let mut dry_run = false;
     let mut no_verify = false;
     let mut no_post_rewrite = false;
@@ -2129,18 +2133,26 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             value if value.starts_with("--no-verbose=") => {
                 return commit_option_takes_no_value_error("no-verbose");
             }
-            "-u" | "-uno" | "-unormal" | "-uall" | "--untracked-files" => {}
+            "-u" | "-unormal" | "--untracked-files" => {
+                commit_untracked = Some(sley_worktree::StatusUntrackedMode::Normal);
+            }
+            "-uno" => commit_untracked = Some(sley_worktree::StatusUntrackedMode::None),
+            "-uall" => commit_untracked = Some(sley_worktree::StatusUntrackedMode::All),
             value if value.starts_with("-u") && value.len() > 2 => {
                 return commit_invalid_untracked_files_mode_error(&value[2..]);
             }
             value if value.starts_with("--untracked-files=") => {
                 let mode = &value["--untracked-files=".len()..];
-                match mode {
-                    "no" | "normal" | "all" => {}
+                commit_untracked = Some(match mode {
+                    "no" => sley_worktree::StatusUntrackedMode::None,
+                    "normal" => sley_worktree::StatusUntrackedMode::Normal,
+                    "all" => sley_worktree::StatusUntrackedMode::All,
                     _ => return commit_invalid_untracked_files_mode_error(mode),
-                }
+                });
             }
-            "--no-untracked-files" => {}
+            "--no-untracked-files" => {
+                commit_untracked = Some(sley_worktree::StatusUntrackedMode::None);
+            }
             value if value.starts_with("--no-untracked-files=") => {
                 return commit_option_takes_no_value_error("no-untracked-files");
             }
@@ -2334,10 +2346,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if status_mode != CommitStatusMode::Normal {
-        return cmd_commit_status_preview(status_mode, status_null);
+        return cmd_commit_status_preview(status_mode, status_null, amend, commit_untracked);
     }
     if dry_run {
-        return cmd_commit_long_status_preview();
+        return cmd_commit_long_status_preview(amend, commit_untracked);
     }
     if gpg_sign {
         return Err(GitError::Unsupported(
@@ -3011,43 +3023,80 @@ enum CommitStatusMode {
     Long,
 }
 
-fn cmd_commit_status_preview(mode: CommitStatusMode, null: bool) -> Result<()> {
+fn cmd_commit_status_preview(
+    mode: CommitStatusMode,
+    null: bool,
+    amend: bool,
+    untracked: Option<sley_worktree::StatusUntrackedMode>,
+) -> Result<()> {
     let mut args = Vec::new();
     match mode {
         CommitStatusMode::Normal => {}
         CommitStatusMode::Short => args.push("--short".to_string()),
         CommitStatusMode::Porcelain => args.push("--porcelain".to_string()),
-        CommitStatusMode::Long => return cmd_commit_long_status_preview(),
+        CommitStatusMode::Long => return cmd_commit_long_status_preview(amend, untracked),
     }
     if null {
         args.push("-z".to_string());
     }
+    if let Some(mode) = untracked {
+        args.push(match mode {
+            sley_worktree::StatusUntrackedMode::None => "--untracked-files=no".to_string(),
+            sley_worktree::StatusUntrackedMode::Normal => "--untracked-files=normal".to_string(),
+            sley_worktree::StatusUntrackedMode::All => "--untracked-files=all".to_string(),
+        });
+    }
     cmd_status(&args)
 }
 
-fn cmd_commit_long_status_preview() -> Result<()> {
+fn cmd_commit_long_status_preview(
+    amend: bool,
+    untracked_override: Option<sley_worktree::StatusUntrackedMode>,
+) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let untracked_mode = match config.get("status", None, "showUntrackedFiles") {
-        Some("no") | Some("false") | Some("0") | Some("off") => {
-            sley_worktree::StatusUntrackedMode::None
+    // `commit -u<mode>` wins over `status.showUntrackedFiles`; otherwise config
+    // (then the normal default) applies.
+    let untracked_mode = untracked_override.unwrap_or_else(|| {
+        match config.get("status", None, "showUntrackedFiles") {
+            Some("no") | Some("false") | Some("0") | Some("off") => {
+                sley_worktree::StatusUntrackedMode::None
+            }
+            Some("all") => sley_worktree::StatusUntrackedMode::All,
+            _ => sley_worktree::StatusUntrackedMode::Normal,
         }
-        Some("all") => sley_worktree::StatusUntrackedMode::All,
-        _ => sley_worktree::StatusUntrackedMode::Normal,
-    };
-    let entries = sley_worktree::short_status_with_options(
+    });
+    let mut entries = sley_worktree::short_status_with_options(
         &worktree_root,
         &git_dir,
         format,
         sley_worktree::ShortStatusOptions {
             include_ignored: false,
+            ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
             untracked_mode,
         },
     )?;
     let committable = status_entries_have_index_changes(&entries);
+    // `commit --dry-run` carries no `--ignore-submodules` flag, so the resolver
+    // reflects only config; apply it so submodule worktree detail honours
+    // `submodule.<name>.ignore` / `diff.ignoreSubmodules` the same as `status`.
+    let ignore_resolver = SubmoduleIgnoreResolver::load(&git_dir, &config, None)?;
+    apply_submodule_ignore(&mut entries, &ignore_resolver);
+    // The staged summary compares against HEAD (or HEAD^ when amending, since the
+    // amend commit replaces HEAD) — wt-status.c passes `s->amend ? "HEAD^" :
+    // "HEAD"` to `git submodule summary --cached`.
+    let base_ref = if amend { "HEAD^" } else { "HEAD" };
+    let submodule_summary = status_submodule_summary(
+        &git_dir,
+        &worktree_root,
+        format,
+        &config,
+        base_ref,
+        &ignore_resolver,
+    )?;
     let display = StatusLongDisplay {
         commit_preview: true,
         show_stash: false,
@@ -3057,6 +3106,7 @@ fn cmd_commit_long_status_preview() -> Result<()> {
             .unwrap_or(true),
         untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
         comment_prefix: status_comment_prefix(&config),
+        submodule_summary,
     };
     print_status_long(&git_dir, format, entries, &display)?;
     if committable {
@@ -3493,8 +3543,14 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut explicit_untracked = false;
     let mut untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
+    let mut ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
     let mut show_stash = false;
     let mut ahead_behind = true;
+    // `--ignore-submodules[=<when>]` from the command line, the highest-priority
+    // source for the per-submodule ignore resolution (above `.git/config`,
+    // `.gitmodules`, and `diff.ignoreSubmodules`). `None` means the flag was not
+    // given; the bare flag resolves to `All` exactly as git's parse-options does.
+    let mut ignore_submodules_arg: Option<IgnoreSubmodules> = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
     for arg in args {
@@ -3579,10 +3635,18 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 z = true;
             }
             "--no-null" => z = false,
-            "--ignored" | "--ignored=traditional" | "--ignored=matching" => {
+            "--ignored" | "--ignored=traditional" => {
                 show_ignored = true;
+                ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
             }
-            "--ignored=no" | "--no-ignored" => show_ignored = false,
+            "--ignored=matching" => {
+                show_ignored = true;
+                ignored_mode = sley_worktree::StatusIgnoredMode::Matching;
+            }
+            "--ignored=no" | "--no-ignored" => {
+                show_ignored = false;
+                ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
+            }
             value if value.starts_with("--ignored=") => {
                 return status_invalid_ignored_mode_error(&value["--ignored=".len()..]);
             }
@@ -3614,13 +3678,25 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             | "--column=column"
             | "--column=row"
             | "--column=dense"
-            | "--column=nodense"
-            | "--ignore-submodules"
-            | "--ignore-submodules=none"
-            | "--ignore-submodules=untracked"
-            | "--ignore-submodules=dirty"
-            | "--ignore-submodules=all"
-            | "--no-ignore-submodules" => {}
+            | "--column=nodense" => {}
+            // `--ignore-submodules[=<when>]` (builtin/commit.c's OPT_CALLBACK
+            // with PARSE_OPT_OPTARG): the bare flag means "all"; `--no-` clears
+            // any prior selection back to the config/default.
+            "--ignore-submodules" | "--ignore-submodules=all" => {
+                ignore_submodules_arg = Some(IgnoreSubmodules::All);
+            }
+            "--ignore-submodules=dirty" => {
+                ignore_submodules_arg = Some(IgnoreSubmodules::Dirty);
+            }
+            "--ignore-submodules=untracked" => {
+                ignore_submodules_arg = Some(IgnoreSubmodules::Untracked);
+            }
+            "--ignore-submodules=none" => {
+                ignore_submodules_arg = Some(IgnoreSubmodules::None);
+            }
+            "--no-ignore-submodules" => {
+                ignore_submodules_arg = None;
+            }
             "--ahead-behind" => ahead_behind = true,
             "--no-ahead-behind" => ahead_behind = false,
             "--show-stash" => show_stash = true,
@@ -3763,6 +3839,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         format,
         sley_worktree::ShortStatusOptions {
             include_ignored: show_ignored,
+            ignored_mode,
             untracked_mode,
         },
     )?;
@@ -3770,6 +3847,29 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     if pathspec.has_filters() {
         entries.retain(|entry| pathspec.matches(&entry.path));
     }
+    // Resolve the per-submodule ignore setting (command line > `.git/config` >
+    // `.gitmodules` > `diff.ignoreSubmodules`) and apply it to the worktree-side
+    // submodule change detail, exactly as git's handle_ignore_submodules_arg ahead
+    // of the diff. Computed before the relativePaths display rewrite so gitlink
+    // lookups use worktree-root-relative paths.
+    let ignore_resolver = SubmoduleIgnoreResolver::load(&git_dir, &config, ignore_submodules_arg)?;
+    apply_submodule_ignore(&mut entries, &ignore_resolver);
+    // The long-format `Submodule changes to be committed:` /
+    // `Submodules changed but not updated:` sections (status.submodulesummary).
+    // Only the long output renders them; compute before the display rewrite so
+    // the gitlink paths still address the worktree.
+    let submodule_summary = if !short && !porcelain_v1 && !porcelain_v2 && !z {
+        status_submodule_summary(
+            &git_dir,
+            &worktree_root,
+            format,
+            &config,
+            "HEAD",
+            &ignore_resolver,
+        )?
+    } else {
+        SubmoduleSummarySections::default()
+    };
     // `status.relativePaths=false` displays paths from the worktree root rather
     // than relative to the current directory (upstream status.relativePaths).
     if !z && !porcelain_v1 && relative_paths {
@@ -3818,6 +3918,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             hints: status_hints,
             untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
             comment_prefix,
+            submodule_summary,
         };
         print_status_long(&git_dir, format, entries, &display)?;
     }
@@ -3840,6 +3941,9 @@ struct StatusLongDisplay {
     /// `core.commentChar` / `status.displayCommentPrefix`: when set, every line
     /// is prefixed with the comment character (e.g. `# `), as in COMMIT_EDITMSG.
     comment_prefix: Option<String>,
+    /// Rendered `Submodule changes to be committed:` /
+    /// `Submodules changed but not updated:` sections (status.submodulesummary).
+    submodule_summary: SubmoduleSummarySections,
 }
 
 /// Upstream wt-status.c short_submodule_status(): in `--short` output a
@@ -4053,6 +4157,642 @@ fn print_status_porcelain_v2(
     Ok(())
 }
 
+/// The `--ignore-submodules[=<when>]` / `submodule.<name>.ignore` /
+/// `diff.ignoreSubmodules` levels, mirroring git's `enum submodule_ignore` and
+/// the `dirty`/`untracked`/`all`/`none` keywords. Ordered by how much they hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoreSubmodules {
+    /// `none`: show every kind of submodule change (the default).
+    None,
+    /// `untracked`: hide submodules whose only change is untracked content.
+    Untracked,
+    /// `dirty`: additionally hide modified (tracked) content; new commits still
+    /// show.
+    Dirty,
+    /// `all`: hide the submodule entirely, including its summary section.
+    All,
+}
+
+impl IgnoreSubmodules {
+    /// Parse a `dirty`/`untracked`/`all`/`none` config/CLI keyword. Unknown
+    /// values are treated as `None` (git's `parse_submodule_ignore` rejects them
+    /// with a warning; for status purposes the safe fallback is to show
+    /// everything).
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "untracked" => Some(Self::Untracked),
+            "dirty" => Some(Self::Dirty),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves the effective per-submodule ignore setting from the four layered
+/// sources, in git's precedence order: the `--ignore-submodules` command line
+/// (applies to every submodule) wins over `submodule.<name>.ignore` in
+/// `.git/config`, which wins over the same key in `.gitmodules`, which wins over
+/// the global `diff.ignoreSubmodules`.
+struct SubmoduleIgnoreResolver {
+    /// `--ignore-submodules[=<when>]`; `Some` overrides every other source.
+    cli: Option<IgnoreSubmodules>,
+    /// `diff.ignoreSubmodules` — the all-submodule fallback.
+    diff_default: Option<IgnoreSubmodules>,
+    /// `submodule.<name>.ignore` read from `.git/config` (repo-local), keyed by
+    /// the bound submodule path. Overrides the `.gitmodules` value.
+    by_path_repo: BTreeMap<Vec<u8>, IgnoreSubmodules>,
+    /// `submodule.<name>.ignore` read from `.gitmodules`, keyed by bound path.
+    by_path_gitmodules: BTreeMap<Vec<u8>, IgnoreSubmodules>,
+}
+
+impl SubmoduleIgnoreResolver {
+    fn load(
+        git_dir: &Path,
+        config: &GitConfig,
+        cli: Option<IgnoreSubmodules>,
+    ) -> Result<Self> {
+        let diff_default = config
+            .get("diff", None, "ignoreSubmodules")
+            .and_then(IgnoreSubmodules::parse);
+        // `.git/config`'s `submodule.<name>.ignore` + `.path` (the repo-local
+        // override). `read_repo_config` already merges global+repo, but the
+        // submodule sections we want are repo-local; read the raw repo config.
+        let by_path_repo = submodule_ignore_by_path(config);
+        // `.gitmodules` lives in the worktree root.
+        let by_path_gitmodules = match worktree_root_for_git_dir(git_dir) {
+            Ok(root) => GitConfig::read(root.join(".gitmodules"))
+                .map(|cfg| submodule_ignore_by_path(&cfg))
+                .unwrap_or_default(),
+            Err(_) => BTreeMap::new(),
+        };
+        Ok(Self {
+            cli,
+            diff_default,
+            by_path_repo,
+            by_path_gitmodules,
+        })
+    }
+
+    /// The effective ignore for the submodule bound at `path`.
+    fn for_path(&self, path: &[u8]) -> IgnoreSubmodules {
+        if let Some(cli) = self.cli {
+            return cli;
+        }
+        if let Some(value) = self.by_path_repo.get(path) {
+            return *value;
+        }
+        if let Some(value) = self.by_path_gitmodules.get(path) {
+            return *value;
+        }
+        self.diff_default.unwrap_or(IgnoreSubmodules::None)
+    }
+
+    /// Whether the whole summary is suppressed by the command line. git gates the
+    /// summary block on `!ignore_submodule_arg || strcmp(arg, "all")`, so a
+    /// `--ignore-submodules=all` on the CLI hides both summary sections wholesale
+    /// (per-submodule `all` is handled inside the summary instead).
+    fn cli_suppresses_summary(&self) -> bool {
+        self.cli == Some(IgnoreSubmodules::All)
+    }
+}
+
+/// Extract `submodule.<name>.ignore` keyed by the submodule's bound `.path`,
+/// from a single config source (`.git/config` or `.gitmodules`). Names without a
+/// `.path` are dropped — without a path binding there is nothing to match a
+/// status entry against.
+fn submodule_ignore_by_path(config: &GitConfig) -> BTreeMap<Vec<u8>, IgnoreSubmodules> {
+    let set = sley_submodule::SubmoduleConfigSet::parse(config);
+    let mut map = BTreeMap::new();
+    for sub in set.iter() {
+        let (Some(path), Some(ignore)) = (
+            sub.path.as_deref(),
+            sub.ignore.as_deref().and_then(IgnoreSubmodules::parse),
+        ) else {
+            continue;
+        };
+        map.insert(path.as_bytes().to_vec(), ignore);
+    }
+    map
+}
+
+/// Apply the resolved per-submodule ignore to the worktree-side change detail of
+/// each status entry, mirroring git's `handle_ignore_submodules_arg` before the
+/// diff: `untracked` clears untracked-content, `dirty` additionally clears
+/// modified-content, `all` clears every worktree change (the gitlink's `M`
+/// worktree code and all three detail bits). New commits survive `dirty`/
+/// `untracked` and are only hidden by `all`.
+fn apply_submodule_ignore(
+    entries: &mut Vec<sley_worktree::ShortStatusEntry>,
+    resolver: &SubmoduleIgnoreResolver,
+) {
+    // A bare `--ignore-submodules=all` on the COMMAND LINE sets the diffopt
+    // ignore_submodules flag for the whole status run, hiding even the *staged*
+    // gitlink change (`modified: sm` under "Changes to be committed"). A
+    // per-submodule `ignore=all` from `.git/config`/`.gitmodules` does NOT — it
+    // only touches the worktree-side detail and the summary (cells #93/#94 keep
+    // the staged line).
+    let cli_all = resolver.cli == Some(IgnoreSubmodules::All);
+    entries.retain_mut(|entry| {
+        let is_gitlink = entry.head_mode == Some(0o160000)
+            || entry.index_mode == Some(0o160000)
+            || entry.worktree_mode == Some(0o160000);
+        if cli_all && is_gitlink {
+            return false;
+        }
+        let Some(submodule) = entry.submodule.as_mut() else {
+            return true;
+        };
+        let ignore = resolver.for_path(&entry.path);
+        match ignore {
+            IgnoreSubmodules::None => {}
+            IgnoreSubmodules::Untracked => {
+                submodule.untracked_content = false;
+            }
+            IgnoreSubmodules::Dirty => {
+                submodule.untracked_content = false;
+                submodule.modified_content = false;
+            }
+            IgnoreSubmodules::All => {
+                submodule.new_commits = false;
+                submodule.modified_content = false;
+                submodule.untracked_content = false;
+            }
+        }
+        if !submodule.any() {
+            // No worktree-side submodule change survives the ignore. The gitlink
+            // may still carry a *staged* (index) change; keep the entry only if
+            // its index column is non-empty, and clear the worktree column so the
+            // "Changes not staged" section drops it.
+            entry.submodule = None;
+            entry.worktree = b' ';
+            return entry.index != b' ';
+        }
+        true
+    });
+}
+
+/// The two rendered long-status submodule-summary sections. Each `Vec<String>`
+/// holds the lines of one section (header, blank, `* path old...new (N):`, and
+/// the `  > subject` / `  < subject` lines), or is empty when that section has no
+/// content. Empty by default (summary disabled or no gitlink changes).
+#[derive(Default)]
+struct SubmoduleSummarySections {
+    staged: Vec<String>,
+    unstaged: Vec<String>,
+}
+
+/// Build the `Submodule changes to be committed:` (HEAD↔index) and `Submodules
+/// changed but not updated:` (index↔worktree) sections for the long status,
+/// gated on `status.submodulesummary`. `base_ref` is the commit whose tree
+/// supplies the staged comparison's "old" gitlinks (`HEAD`, or `HEAD^` for a
+/// `commit --amend --dry-run`). A faithful port of wt-status.c's
+/// `wt_longstatus_print_submodule_summary` → `git submodule summary
+/// --cached/--files --for-status`.
+fn status_submodule_summary(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    base_ref: &str,
+    resolver: &SubmoduleIgnoreResolver,
+) -> Result<SubmoduleSummarySections> {
+    let mut sections = SubmoduleSummarySections::default();
+    let Some(limit) = status_submodule_summary_limit(config) else {
+        return Ok(sections);
+    };
+    // `--ignore-submodules=all` on the command line drops the whole summary.
+    if resolver.cli_suppresses_summary() {
+        return Ok(sections);
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    // "old" gitlinks: the base commit's tree (HEAD / HEAD^).
+    let base_gitlinks = match sley_rev::resolve_revision(git_dir, format, base_ref) {
+        Ok(commit_oid) => {
+            let tree = sley_rev::peel_to_tree(&db, format, &commit_oid)?;
+            tree_gitlinks(&db, format, &tree)?
+        }
+        // No base commit yet (unborn HEAD): every staged gitlink is "added".
+        Err(_) => BTreeMap::new(),
+    };
+    // "index" gitlinks: what is staged right now.
+    let index_gitlinks = index_gitlinks(git_dir, format)?;
+    // "worktree" gitlinks: the commit each populated submodule actually has
+    // checked out (its HEAD).
+    let worktree_gitlinks = worktree_gitlinks(worktree_root, &index_gitlinks);
+
+    // Staged: base-tree → index.
+    let staged_pairs = gitlink_change_pairs(&base_gitlinks, &index_gitlinks);
+    sections.staged = render_summary_section(
+        worktree_root,
+        format,
+        resolver,
+        limit,
+        SUMMARY_HEADER_STAGED,
+        &staged_pairs,
+    )?;
+    // Unstaged: index → worktree HEAD.
+    let unstaged_pairs = gitlink_change_pairs(&index_gitlinks, &worktree_gitlinks);
+    sections.unstaged = render_summary_section(
+        worktree_root,
+        format,
+        resolver,
+        limit,
+        SUMMARY_HEADER_UNSTAGED,
+        &unstaged_pairs,
+    )?;
+    Ok(sections)
+}
+
+const SUMMARY_HEADER_STAGED: &str = "Submodule changes to be committed:";
+const SUMMARY_HEADER_UNSTAGED: &str = "Submodules changed but not updated:";
+
+/// `status.submodulesummary` → the summary limit, or `None` when disabled. git
+/// stores it as an int (`git_config_int`) with the boolean shorthand mapping
+/// true→-1 (unlimited) and false/0→off. A positive N caps the `>`/`<` lines per
+/// submodule; `-1` (true) means unlimited. `diff.submoduleSummary` does NOT
+/// enable the *status* summary — only `status.submodulesummary` does.
+fn status_submodule_summary_limit(config: &GitConfig) -> Option<i64> {
+    let value = config.get("status", None, "submodulesummary")?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(-1),
+        "false" | "no" | "off" | "" => None,
+        other => match other.parse::<i64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => None,
+        },
+    }
+}
+
+/// Flatten a tree and keep only its gitlink (mode 160000) entries, path → oid.
+fn tree_gitlinks(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<BTreeMap<Vec<u8>, ObjectId>> {
+    let flat = sley_diff_merge::flatten_tree(db, format, tree_oid)?;
+    Ok(flat
+        .into_iter()
+        .filter(|(_, (mode, _))| *mode == 0o160000)
+        .map(|(path, (_, oid))| (path, oid))
+        .collect())
+}
+
+/// The gitlink entries in the index (stage-0), path → staged commit oid.
+fn index_gitlinks(git_dir: &Path, format: ObjectFormat) -> Result<BTreeMap<Vec<u8>, ObjectId>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    Ok(index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal && entry.mode == 0o160000)
+        .map(|entry| (entry.path.to_vec(), entry.oid))
+        .collect())
+}
+
+/// For each index gitlink, the commit its checked-out worktree actually has at
+/// HEAD. A submodule whose worktree is absent / not a repository falls back to
+/// the index oid (no unstaged change), matching git treating an unpopulated
+/// gitlink as unchanged.
+fn worktree_gitlinks(
+    worktree_root: &Path,
+    index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
+) -> BTreeMap<Vec<u8>, ObjectId> {
+    let mut map = BTreeMap::new();
+    for (path, index_oid) in index_gitlinks {
+        let Ok(path_str) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let sub_root = worktree_root.join(path_str);
+        // The submodule's repo always uses the super-repo's hash for its gitlink
+        // oids in this corpus; read its HEAD with the same format.
+        let oid = sley_diff_merge::gitlink_head_oid(&sub_root, ObjectFormat::Sha1)
+            .or_else(|| sley_diff_merge::gitlink_head_oid(&sub_root, ObjectFormat::Sha256))
+            .unwrap_or(*index_oid);
+        map.insert(path.clone(), oid);
+    }
+    map
+}
+
+/// A gitlink change between two oid maps: paths present in both with differing
+/// oids, plus pure additions (old null) and removals (new null). Returns
+/// (path, old_oid_or_null, new_oid_or_null) sorted by path. `None` oid encodes
+/// git's `null_oid` (a fresh / removed gitlink).
+fn gitlink_change_pairs(
+    old: &BTreeMap<Vec<u8>, ObjectId>,
+    new: &BTreeMap<Vec<u8>, ObjectId>,
+) -> Vec<(Vec<u8>, Option<ObjectId>, Option<ObjectId>)> {
+    let mut out = Vec::new();
+    let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
+    paths.extend(old.keys());
+    paths.extend(new.keys());
+    for path in paths {
+        let old_oid = old.get(path).copied();
+        let new_oid = new.get(path).copied();
+        if old_oid == new_oid {
+            continue;
+        }
+        out.push((path.clone(), old_oid, new_oid));
+    }
+    out
+}
+
+/// Render one summary section's lines for the given header and change pairs.
+/// Returns an empty vec (no header) when nothing renders, so the caller can skip
+/// the whole block — git only prints the header `if (cmd_stdout.len)`.
+fn render_summary_section(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    resolver: &SubmoduleIgnoreResolver,
+    limit: i64,
+    header: &str,
+    pairs: &[(Vec<u8>, Option<ObjectId>, Option<ObjectId>)],
+) -> Result<Vec<String>> {
+    let mut bodies: Vec<String> = Vec::new();
+    for (path, old_oid, new_oid) in pairs {
+        // Per-submodule `ignore=all` (from .git/config or .gitmodules, NOT the
+        // CLI which already short-circuited) skips this submodule's summary
+        // unless it is a pure addition — git's prepare_submodule_summary keeps
+        // status 'A' even under ignore=all.
+        let is_addition = old_oid.is_none();
+        if !is_addition && resolver.for_path(path) == IgnoreSubmodules::All {
+            continue;
+        }
+        let Some(body) = render_one_submodule(worktree_root, format, limit, path, *old_oid, *new_oid)?
+        else {
+            continue;
+        };
+        bodies.push(body);
+    }
+    if bodies.is_empty() {
+        return Ok(Vec::new());
+    }
+    // header, blank, then each submodule body (already multi-line, no trailing
+    // newline). The caller separates this whole block from neighbours.
+    let mut lines = vec![header.to_string(), String::new()];
+    for body in bodies {
+        for line in body.lines() {
+            lines.push(line.to_string());
+        }
+    }
+    Ok(lines)
+}
+
+/// Render `* <path> <old7>...<new7> (N):` plus up to `limit` `> subject` /
+/// `< subject` lines for one changed gitlink. `None` when the submodule's repo is
+/// not populated (git only summarises checked-out submodules) — the caller drops
+/// it. A faithful port of `generate_submodule_summary` for the gitlink→gitlink
+/// case (type changes to/from a blob do not occur for a status gitlink change).
+fn render_one_submodule(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    limit: i64,
+    path: &[u8],
+    old_oid: Option<ObjectId>,
+    new_oid: Option<ObjectId>,
+) -> Result<Option<String>> {
+    let Ok(path_str) = std::str::from_utf8(path) else {
+        return Ok(None);
+    };
+    let sub_root = worktree_root.join(path_str);
+    // git: `prepare_submodule_summary` only summarises submodules whose worktree
+    // is a non-bare repository (is_nonbare_repository_dir); skip otherwise.
+    let Some(sub_git_dir) = sley_diff_merge::gitlink_git_dir(&sub_root) else {
+        return Ok(None);
+    };
+    let sub_db = FileObjectDatabase::from_git_dir(&sub_git_dir, format);
+
+    let null = ObjectId::null(format);
+    let old = old_oid.unwrap_or(null);
+    let new = new_oid.unwrap_or(null);
+    let src_abbrev = abbrev7(&old);
+    let dst_abbrev = abbrev7(&new);
+    // git treats a null oid as "not a gitlink" (mode 0): the source of a fresh
+    // submodule add, or the dest of a removal. Both sides being gitlinks is the
+    // common case; a null side switches to the single-tip rendering.
+    let src_is_gitlink = old_oid.is_some();
+    let dst_is_gitlink = new_oid.is_some();
+
+    // Whether each *gitlink* side's commit is present in the submodule's object
+    // store (git's verify_submodule_committish). A null side is never "missing".
+    let src_present = !src_is_gitlink || sub_db.read_object(&old).is_ok();
+    let dst_present = !dst_is_gitlink || sub_db.read_object(&new).is_ok();
+
+    if !src_present || !dst_present {
+        // git only warns when the destination is still a gitlink (it is here).
+        let warn = if !src_present && !dst_present {
+            format!(
+                "  Warn: {path_str} doesn't contain commits {} and {}\n",
+                old.to_hex(),
+                new.to_hex()
+            )
+        } else {
+            let missing = if !src_present { &old } else { &new };
+            format!("  Warn: {path_str} doesn't contain commit {}\n", missing.to_hex())
+        };
+        return Ok(Some(format!(
+            "* {path_str} {src_abbrev}...{dst_abbrev}:\n{warn}"
+        )));
+    }
+
+    let (total, marked) = if src_is_gitlink && dst_is_gitlink {
+        // Symmetric first-parent difference, marked + date-ordered like
+        // `git log --first-parent --pretty="  %m %s" src...dst`. The count is
+        // `rev-list --first-parent --count src...dst`.
+        let marked = submodule_summary_log(&sub_db, format, &old, &new)?;
+        (marked.len(), marked)
+    } else if dst_is_gitlink {
+        // Fresh submodule add: count = `rev-list --first-parent --count dst`; one
+        // `> dst` line (git uses `--pretty="  > %s" -1 dst`).
+        let chain = first_parent_chain(&sub_db, format, &new)?;
+        let subject = chain.first().map(|c| c.subject.clone()).unwrap_or_default();
+        (chain.len(), vec![('>', subject)])
+    } else {
+        // Submodule removal: count = first-parent commits from src; one `< src`.
+        let chain = first_parent_chain(&sub_db, format, &old)?;
+        let subject = chain.first().map(|c| c.subject.clone()).unwrap_or_default();
+        (chain.len(), vec![('<', subject)])
+    };
+
+    let mut body = format!("* {path_str} {src_abbrev}...{dst_abbrev} ({total}):\n");
+    // The single-tip add/remove forms always show their one line (git's `-1`);
+    // only the gitlink↔gitlink form honours the summary limit.
+    let shown = if src_is_gitlink && dst_is_gitlink && limit > 0 {
+        (limit as usize).min(marked.len())
+    } else {
+        marked.len()
+    };
+    for (marker, subject) in marked.iter().take(shown) {
+        body.push_str(&format!("  {marker} {subject}\n"));
+    }
+    Ok(Some(body))
+}
+
+/// `git rev-parse --short <oid>^0` for the tiny submodule repos in the corpus is
+/// a fixed 7-char abbreviation (git's own fallback `xstrndup(oid_to_hex, 7)`).
+fn abbrev7(oid: &ObjectId) -> String {
+    oid.to_hex()[..7].to_string()
+}
+
+/// Walk the symmetric first-parent difference `src...dst` in the submodule's
+/// object store and return `(marker, subject)` pairs in git's log order: a
+/// commit-date priority walk from both tips, marking `<` for the src side and
+/// `>` for the dst side, following only first parents, stopping where the two
+/// histories meet. Equivalent to
+/// `git log --first-parent --pretty="  %m %s" src...dst` over the gitlink commits.
+fn submodule_summary_log(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    src: &ObjectId,
+    dst: &ObjectId,
+) -> Result<Vec<(char, String)>> {
+    // First-parent ancestor chains of each tip.
+    let src_chain = first_parent_chain(db, format, src)?;
+    let dst_chain = first_parent_chain(db, format, dst)?;
+    let src_set: HashSet<ObjectId> = src_chain.iter().map(|c| c.oid).collect();
+    let dst_set: HashSet<ObjectId> = dst_chain.iter().map(|c| c.oid).collect();
+
+    // A commit-date max-heap seeded with each tip, tagged with its side. As each
+    // commit is emitted we push its first parent (lazily), so a child always
+    // precedes its parent and ties resolve to the newer date first — exactly the
+    // pop order of git's `src...dst` walk.
+    let mut by_oid: HashMap<ObjectId, FpCommit> = HashMap::new();
+    for c in src_chain.into_iter().chain(dst_chain.into_iter()) {
+        by_oid.entry(c.oid).or_insert(c);
+    }
+
+    // Marker per emitted oid: `<` if only in src, `>` if only in dst. Commits in
+    // BOTH are the common base and are never emitted (uninteresting boundary).
+    let marker_for = |oid: &ObjectId| -> Option<char> {
+        let in_src = src_set.contains(oid);
+        let in_dst = dst_set.contains(oid);
+        match (in_src, in_dst) {
+            (true, false) => Some('<'),
+            (false, true) => Some('>'),
+            _ => None,
+        }
+    };
+
+    let mut heap: std::collections::BinaryHeap<SummaryHeapEntry> = Default::default();
+    let mut pushed: HashSet<ObjectId> = HashSet::new();
+    for tip in [src, dst] {
+        if let Some(c) = by_oid.get(tip) {
+            if pushed.insert(*tip) {
+                heap.push(SummaryHeapEntry {
+                    time: c.commit_time,
+                    oid: *tip,
+                });
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    while let Some(entry) = heap.pop() {
+        let Some(commit) = by_oid.get(&entry.oid) else {
+            continue;
+        };
+        let first_parent = commit.first_parent;
+        if let Some(marker) = marker_for(&entry.oid) {
+            out.push((marker, commit.subject.clone()));
+        }
+        // Push the first parent so the chain continues toward the merge base.
+        if let Some(parent) = first_parent {
+            if let Some(pc) = by_oid.get(&parent) {
+                if pushed.insert(parent) {
+                    heap.push(SummaryHeapEntry {
+                        time: pc.commit_time,
+                        oid: parent,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One commit's first-parent-walk metadata for the summary log.
+struct FpCommit {
+    oid: ObjectId,
+    first_parent: Option<ObjectId>,
+    commit_time: i64,
+    subject: String,
+}
+
+/// The chain of commits reachable from `tip` by following ONLY first parents,
+/// reading each commit's subject + committer time.
+fn first_parent_chain(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tip: &ObjectId,
+) -> Result<Vec<FpCommit>> {
+    let mut chain = Vec::new();
+    let mut cursor = Some(*tip);
+    let mut seen = HashSet::new();
+    while let Some(oid) = cursor {
+        if !seen.insert(oid) {
+            break;
+        }
+        let object = db.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            break;
+        }
+        let commit = sley_object::Commit::parse(format, &object.body)?;
+        let first_parent = commit.parents.first().copied();
+        chain.push(FpCommit {
+            oid,
+            first_parent,
+            commit_time: commit_committer_time(&commit.committer),
+            subject: commit_subject(&commit.message),
+        });
+        cursor = first_parent;
+    }
+    Ok(chain)
+}
+
+/// Parse the committer timestamp (seconds since epoch) from a commit's committer
+/// identity line (`Name <email> <secs> <tz>`). Falls back to 0 when unparsable —
+/// the corpus always carries a well-formed timestamp.
+fn commit_committer_time(committer: &[u8]) -> i64 {
+    let text = String::from_utf8_lossy(committer);
+    let mut parts = text.rsplit(' ');
+    let _tz = parts.next();
+    parts
+        .next()
+        .and_then(|secs| secs.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Max-heap entry for the summary's date-priority walk: newest commit-time pops
+/// first; ties break on the SMALLER oid (matching sley's RevWalk heap and git's
+/// `(time, Reverse(oid))` ordering).
+struct SummaryHeapEntry {
+    time: i64,
+    oid: ObjectId,
+}
+impl PartialEq for SummaryHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.time == other.time && self.oid == other.oid
+    }
+}
+impl Eq for SummaryHeapEntry {}
+impl Ord for SummaryHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time
+            .cmp(&other.time)
+            .then_with(|| other.oid.cmp(&self.oid))
+    }
+}
+impl PartialOrd for SummaryHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Comment prefix for `git status` output when `status.displayCommentPrefix` is
 /// on. Upstream uses `core.commentChar` (default `#`); the prefix string is the
 /// comment char (which may be multi-byte / multi-char). Returns `None` when the
@@ -4138,6 +4878,7 @@ fn print_status_long(
         hints,
         untracked_suppressed,
         comment_prefix,
+        submodule_summary,
     } = display;
     let commit_preview = *commit_preview;
     let show_stash = *show_stash;
@@ -4145,7 +4886,12 @@ fn print_status_long(
     let untracked_suppressed = *untracked_suppressed;
 
     let mut sink = StatusLineSink::new(*hints, comment_prefix.clone());
-    let head_initial = status_long_branch_lines(git_dir, format, ahead_behind, &mut sink)?;
+    // `commit --dry-run`/template previews suppress the upstream-divergence
+    // advice hints (`(use "git pull" ...)`) — wt-status passes `!commit_template`
+    // as `show_divergence_advice` to format_tracking_info. The branch state lines
+    // themselves still print.
+    let head_initial =
+        status_long_branch_lines(git_dir, format, ahead_behind, commit_preview, &mut sink)?;
     if head_initial {
         sink.blank();
         if commit_preview {
@@ -4242,8 +4988,28 @@ fn print_status_long(
         }
     }
 
+    // `Submodule changes to be committed:` then `Submodules changed but not
+    // updated:` (wt-status.c calls both summaries right after print_changed).
+    // Each non-empty section is separated from what precedes it by one blank
+    // line; the trailing blank before "Untracked files" is supplied by that
+    // section's own leading-blank logic (see `has_summary` below).
+    let mut printed_anything = head_initial || has_staged || has_unstaged;
+    for section in [&submodule_summary.staged, &submodule_summary.unstaged] {
+        if section.is_empty() {
+            continue;
+        }
+        if printed_anything {
+            sink.blank();
+        }
+        for line in section {
+            sink.line(line.clone());
+        }
+        printed_anything = true;
+    }
+    let has_summary = !submodule_summary.staged.is_empty() || !submodule_summary.unstaged.is_empty();
+
     if has_untracked {
-        if head_initial || has_staged || has_unstaged {
+        if head_initial || has_staged || has_unstaged || has_summary {
             sink.blank();
         }
         sink.line("Untracked files:");
@@ -4254,7 +5020,7 @@ fn print_status_long(
     }
 
     if has_ignored {
-        if head_initial || has_staged || has_unstaged || has_untracked {
+        if head_initial || has_staged || has_unstaged || has_summary || has_untracked {
             sink.blank();
         }
         sink.line("Ignored files:");
@@ -4272,7 +5038,7 @@ fn print_status_long(
     // The "(use -u option ...)" suffix is itself a hint, gated separately.
     let printed_not_listed = untracked_suppressed && has_staged;
     if printed_not_listed {
-        if head_initial || has_staged || has_unstaged {
+        if head_initial || has_staged || has_unstaged || has_summary {
             sink.blank();
         }
         if *hints {
@@ -4331,6 +5097,7 @@ fn status_long_branch_lines(
     git_dir: &Path,
     format: ObjectFormat,
     ahead_behind: bool,
+    suppress_divergence_advice: bool,
     sink: &mut StatusLineSink,
 ) -> Result<bool> {
     let store = FileRefStore::new(git_dir, format);
@@ -4346,6 +5113,7 @@ fn status_long_branch_lines(
                         &target,
                         &oid,
                         ahead_behind,
+                        suppress_divergence_advice,
                         sink,
                     )?;
                     Ok(false)
@@ -4375,12 +5143,22 @@ fn status_long_tracking_lines(
     branch_ref: &str,
     oid: &ObjectId,
     ahead_behind: bool,
+    suppress_divergence_advice: bool,
     sink: &mut StatusLineSink,
 ) -> Result<()> {
     let Some(tracking) =
         status_branch_tracking(git_dir, format, store, branch_ref, oid, ahead_behind)?
     else {
         return Ok(());
+    };
+    // git's format_tracking_info gates the ahead/behind/diverged *advice* hints on
+    // `show_divergence_advice` (false for commit-template previews); the state
+    // lines always print. Route the advice hints through this so a dry-run drops
+    // only the `(use "git pull" ...)` style guidance.
+    let advice = |sink: &mut StatusLineSink, text: &str| {
+        if !suppress_divergence_advice {
+            sink.hint(text);
+        }
     };
     match tracking.state {
         StatusBranchTrackingState::Counts(ForEachRefTrack {
@@ -4401,7 +5179,7 @@ fn status_long_tracking_lines(
                 tracking.upstream,
                 status_commit_word(ahead)
             ));
-            sink.hint("  (use \"git push\" to publish your local commits)");
+            advice(sink, "  (use \"git push\" to publish your local commits)");
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0, behind, ..
@@ -4411,28 +5189,31 @@ fn status_long_tracking_lines(
                 tracking.upstream,
                 status_commit_word(behind)
             ));
-            sink.hint("  (use \"git pull\" to update your local branch)");
+            advice(sink, "  (use \"git pull\" to update your local branch)");
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind, .. }) => {
             sink.line(format!("Your branch and '{}' have diverged,", tracking.upstream));
             sink.line(format!(
                 "and have {ahead} and {behind} different commits each, respectively."
             ));
-            sink.hint("  (use \"git pull\" if you want to integrate the remote branch with yours)");
+            advice(
+                sink,
+                "  (use \"git pull\" if you want to integrate the remote branch with yours)",
+            );
         }
         StatusBranchTrackingState::Different => {
             sink.line(format!(
                 "Your branch and '{}' refer to different commits.",
                 tracking.upstream
             ));
-            sink.hint("  (use \"git status --ahead-behind\" for details)");
+            advice(sink, "  (use \"git status --ahead-behind\" for details)");
         }
         StatusBranchTrackingState::Gone => {
             sink.line(format!(
                 "Your branch is based on '{}', but the upstream is gone.",
                 tracking.upstream
             ));
-            sink.hint("  (use \"git branch --unset-upstream\" to fixup)");
+            advice(sink, "  (use \"git branch --unset-upstream\" to fixup)");
         }
     }
     sink.blank();

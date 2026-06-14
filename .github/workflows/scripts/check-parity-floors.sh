@@ -61,6 +61,25 @@
 # --ignore-if-in-upstream chain (cells #3/4/6/7) that leaves rebuild-1 empty —
 # they are NOT a cover-letter gap. No diff/log floor regressed (t4013/t4015/
 # t4018/t4202/t4034/t4045/t4047/t4027 all held; render.rs untouched).
+# header-encoding + threading wave (2026-06-14, parity/fmtencode):
+# t4014-format-patch 113->142 (+29 — built the email header-encoding + message-
+# threading paths in format_patch.rs). Encoding (15 cells, #106/107/109-118/121/
+# 141/142): a git-faithful add_rfc2047 (Q-encoded =?UTF-8?q?...?= words folded at
+# 76 cols, multibyte never split) for Subject (RFC2047_SUBJECT) and From display
+# names (RFC2047_ADDRESS); RFC 822 quoting (needs_rfc822_quoting/add_rfc822_quoted)
+# + strbuf_add_wrapped_text-equivalent folding of long ASCII/quoted From names;
+# multi-line subject collapse (format_subject); the 8-bit Content-Transfer-Encoding
+# block (non-ASCII body / in-body From / --signoff committer-ident). Threading
+# (14 cells, #55-67/78): Message-ID generation (<oid>.<ts>.git.<email>), the
+# In-Reply-To/References chain, --thread[=shallow|deep]/--no-thread/format.thread,
+# --in-reply-to=<msgid> (clean_message_id), replaying git's per-mail
+# shallow-vs-deep ref state machine (build_thread_plan). All work is contained in
+# crates/sley-cli/src/commands/format_patch.rs. The remaining #161-185 cover-from-
+# description / #197-208 --base / #214-220 interdiff / #191-196 outputDirectory /
+# #49-53 reroll cells are pre-existing, out-of-scope backlog; #16/20/21/23/24 are
+# upstream `# TODO known breakage` (rfc822/rfc2047 To/Cc wrapping). No diff/log
+# floor regressed (t4013=133/t4015=55/t4018=287/t4052=76/t4202=56/t4034=64/
+# t4045=29/t4047=41/t4027=18 all held; render.rs/diff paths untouched).
 # fsck wave (2026-06-14, parity/fsck): t1450-fsck added at 67 (was 22 — built
 # the object-content checker in sley-fsck/content.rs, mirroring git's fsck.c
 # commit/tree/tag buffer validation: fsck_ident, verify_headers, the tree
@@ -117,6 +136,39 @@
 # t3000-ls-files-others=15; unfloored held: t2200-add-update=17, t3903-stash=22,
 # t4006-diff-mode=7, t4011-diff-symlink=0, t7060-wtstatus=7, t7063-status-untracked-
 # cache=14. No workspace test regressed (2171/0).
+# status submodule-summary wave (2026-06-14, parity/statussub): t7508-status
+# 86->113 (+27 — built the `Submodule changes to be committed:` (HEAD↔index) and
+# `Submodules changed but not updated:` (index↔worktree) long-status sections,
+# gated on status.submodulesummary, in sley-cli workspace.rs cmd_status. Each
+# changed gitlink renders `* <path> <old7>...<new7> (N):` + `  > subj` / `  < subj`
+# lines via a date-priority first-parent symmetric-difference walk of the
+# submodule's own ODB (git submodule summary --cached/--files --for-status
+# format), with the 0000000 add/remove single-tip forms. Honours
+# --ignore-submodules[=<when>], submodule.<name>.ignore (.git/config over
+# .gitmodules), and diff.ignoreSubmodules at the resolved precedence, applied to
+# the worktree-side detail; CLI =all also drops the staged gitlink line + the
+# whole summary, per-submodule =all only drops the summary. Side gains in the
+# cluster: commit-dry-run divergence-advice suppression (#67) and commit -u<mode>
+# threading to the dry-run preview (#108). Residual #70 (commit --amend --dry-run)
+# needs the staged section diffed against HEAD^ — a separate commit-amend-preview
+# feature, NOT a summary gap; the summary itself is HEAD^-correct. Neighbors held:
+# t7506-status-submodule=28, t2020-checkout-detach=16, t7400-submodule-basic=70.
+# No workspace test regressed (all crates 0 failed).
+# compare-release-timings perf wave (2026-06-14, codex/compare-release-timings,
+# PR #98): banks the perf-branch parity GAINs into the floors — t4202-log 56->57,
+# t5310-pack-bitmaps 218->221, t5326-multi-pack-bitmaps 336->342,
+# t5327-multi-pack-bitmaps-rev 308->314 (the perf commits' rev-list/bitmap fast
+# paths produced these and they reproduce at the branch tip). Same wave fixes a
+# t0008-ignores regression introduced by the status-ignore perf commits (57e8c5e/
+# 20175d0/9bcb5cc): `matches_directory` over-matched — a NEGATED directory-only
+# pattern (`!data/**/`) wrongly matched a *file* via an ancestor directory and
+# un-ignored it, dropping cell #388 ("directories and ** matches", `data/**` +
+# `!data/**/` must keep `data/data1/file1` ignored) and t0008 305<306. Fix gates
+# the anchored-glob ancestor-prefix file match on `!self.negated` in
+# crates/sley-worktree/src/lib.rs (git: a negated dir-only pattern re-includes
+# *directories* but never the files inside them — `!dir/` still needs `!dir/*` to
+# reach files), restoring t0008 to 306 with its failing-cell set IDENTICAL to
+# main and the 57e8c5e directory-glob gain preserved. t0008 floor stays 306.
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -160,8 +212,8 @@ declare -A FLOOR=(
     [t4214-log-graph-octopus.sh]=17
     [t4215-log-skewed-merges.sh]=9
     [t6030-bisect-porcelain.sh]=95
-    [t5310-pack-bitmaps.sh]=218
-    [t5326-multi-pack-bitmaps.sh]=336
+    [t5310-pack-bitmaps.sh]=221
+    [t5326-multi-pack-bitmaps.sh]=342
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     [t2020-checkout-detach.sh]=16
@@ -172,7 +224,7 @@ declare -A FLOOR=(
     [t5318-commit-graph.sh]=38
     [t3432-rebase-fast-forward.sh]=144
     [t3600-rm.sh]=50
-    [t4202-log.sh]=56
+    [t4202-log.sh]=57
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
@@ -180,10 +232,10 @@ declare -A FLOOR=(
     [t3406-rebase-message.sh]=9
     [t3418-rebase-continue.sh]=11
     [t3420-rebase-autostash.sh]=30
-    [t5327-multi-pack-bitmaps-rev.sh]=308
+    [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
-    [t4014-format-patch.sh]=113
+    [t4014-format-patch.sh]=142
     [t4150-am.sh]=41
     [t4052-stat-output.sh]=76
     [t4045-diff-relative.sh]=29
@@ -198,7 +250,7 @@ declare -A FLOOR=(
     [t0008-ignores.sh]=306
     [t7400-submodule-basic.sh]=70
     [t7506-status-submodule.sh]=28
-    [t7508-status.sh]=86
+    [t7508-status.sh]=113
     [t4027-diff-submodule.sh]=18
     [t7102-reset.sh]=37
 )

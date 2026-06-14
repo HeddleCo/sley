@@ -1,6 +1,7 @@
 //! `git cat-file`: inspect objects and run the batch object-query protocol.
 
-use std::io::{self, BufRead, Write};
+use std::fmt::Write as _;
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
@@ -377,42 +378,61 @@ impl CatFileCmdMode {
 }
 
 struct RepositoryObjectView {
-    repo: RepositoryContext,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+    format: ObjectFormat,
+    db: FileObjectDatabase,
+    refs: FileRefStore,
 }
 
 impl RepositoryObjectView {
     fn discover() -> Result<Self> {
+        let git_dir = discover_git_dir(env::current_dir()?)?;
+        let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+        let format = repository_object_format(&common_git_dir)?;
         Ok(Self {
-            repo: RepositoryContext::discover_current()?,
+            db: FileObjectDatabase::from_git_dir(&common_git_dir, format),
+            refs: FileRefStore::new(&git_dir, format),
+            git_dir,
+            common_git_dir,
+            format,
         })
     }
 
     fn common_git_dir(&self) -> &Path {
-        self.repo.common_git_dir()
+        &self.common_git_dir
     }
 
     fn format(&self) -> ObjectFormat {
-        self.repo.format()
+        self.format
     }
 
     fn db(&self) -> &FileObjectDatabase {
-        self.repo.objects()
+        &self.db
+    }
+
+    fn refs(&self) -> &FileRefStore {
+        &self.refs
     }
 
     fn resolve(&self, name: &str) -> Result<ObjectId> {
-        self.repo.resolve_revision(name)
+        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, name);
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).resolve(name)
     }
 
     fn replacement_oid(&self, oid: &ObjectId) -> Result<ObjectId> {
-        apply_replace_object(self.repo.refs(), oid)
+        apply_replace_object(&self.refs, oid)
     }
 
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
-        self.repo.resolve_path(rev, path)
+        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).resolve_path(rev, path)
     }
 
     fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
-        self.repo.resolve_path_follow_symlinks(rev, path)
+        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
+            .resolve_path_follow_symlinks(rev, path)
     }
 
     fn all_object_ids(&self) -> Result<Vec<ObjectId>> {
@@ -734,16 +754,17 @@ impl CatFileBatchRequest {
         if self.batch_all_objects {
             return Ok(false);
         }
-        replace_objects_active(view.repo.refs())
+        replace_objects_active(view.refs())
     }
 
     fn run_batch(&self, check_only: bool) -> Result<()> {
         let view = RepositoryObjectView::discover()?;
         let apply_replace = self.apply_replace(&view)?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
         let terminator = if self.output_nul { b'\0' } else { b'\n' };
-        let emit = |stdout: &mut io::Stdout, line: &str| -> Result<()> {
+        let emit = |stdout: &mut dyn Write, line: &str| -> Result<()> {
             let (object_name, rest) = cat_file_batch_input(line, batch_format.as_ref());
             print_cat_file_batch_record(
                 stdout,
@@ -769,8 +790,11 @@ impl CatFileBatchRequest {
             Ok(())
         };
         if self.batch_all_objects {
+            let mut object_name = String::with_capacity(view.format().hex_len());
             for oid in view.all_object_ids()? {
-                emit(&mut stdout, &oid.to_string())?;
+                object_name.clear();
+                write!(&mut object_name, "{oid}").expect("writing an object id cannot fail");
+                emit(&mut stdout, &object_name)?;
             }
         } else {
             // Stream stdin record-by-record so each response is emitted before the next read,
@@ -779,9 +803,13 @@ impl CatFileBatchRequest {
             let input_delim = if self.input_nul { b'\0' } else { b'\n' };
             let stdin = io::stdin();
             let mut reader = stdin.lock();
+            let mut input = Vec::new();
             // Strip a trailing CR only in line mode (NUL-framed records are taken verbatim).
-            while let Some(line) = read_batch_record(&mut reader, input_delim, !self.input_nul)? {
-                emit(&mut stdout, &line)?;
+            while let Some(record) =
+                read_batch_record(&mut reader, input_delim, !self.input_nul, &mut input)?
+            {
+                let line = String::from_utf8_lossy(record);
+                emit(&mut stdout, line.as_ref())?;
             }
         }
         stdout.flush()?;
@@ -792,7 +820,8 @@ impl CatFileBatchRequest {
         let view = RepositoryObjectView::discover()?;
         let apply_replace = self.apply_replace(&view)?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
         let terminator = if self.output_nul { b'\0' } else { b'\n' };
         // In `--buffer` mode, `info`/`contents` commands are queued and only emitted when a
         // `flush` command is read (upstream `batch_objects_command`). Without `--buffer` each
@@ -805,8 +834,12 @@ impl CatFileBatchRequest {
         let input_delim = if self.input_nul { b'\0' } else { b'\n' };
         let stdin = io::stdin();
         let mut reader = stdin.lock();
-        while let Some(line) = read_batch_record(&mut reader, input_delim, !self.input_nul)? {
-            let command = parse_batch_command(&line)?;
+        let mut input = Vec::new();
+        while let Some(record) =
+            read_batch_record(&mut reader, input_delim, !self.input_nul, &mut input)?
+        {
+            let line = String::from_utf8_lossy(record);
+            let command = parse_batch_command(line.as_ref())?;
             match command {
                 BatchCommand::Flush => {
                     if !self.buffer {
@@ -858,7 +891,7 @@ impl CatFileBatchRequest {
 
     fn run_batch_command(
         &self,
-        stdout: &mut io::Stdout,
+        stdout: &mut dyn Write,
         view: &RepositoryObjectView,
         batch_format: Option<&CatFileBatchFormat<'_>>,
         apply_replace: bool,
@@ -924,18 +957,19 @@ impl OwnedBatchCommand {
     }
 }
 
-/// Read one delimiter-terminated record from `reader`, returning `None` at EOF (so a trailing
-/// delimiter does not yield a phantom empty record). Mirrors upstream's `strbuf_getdelim`
-/// loop: the delimiter is stripped, and in line mode (`strip_cr`) a trailing `\r` is removed
-/// too (the CRLF handling of `strbuf_getline_lf`/`strbuf_getdelim_strip_crlf`).
-fn read_batch_record<R: BufRead>(
+/// Read one delimiter-terminated record into `buffer`, returning `None` at EOF (so a trailing
+/// delimiter does not yield a phantom empty record). Mirrors upstream's `strbuf_getdelim` loop:
+/// the delimiter is stripped, and in line mode (`strip_cr`) a trailing `\r` is removed too (the
+/// CRLF handling of `strbuf_getline_lf`/`strbuf_getdelim_strip_crlf`).
+fn read_batch_record<'a, R: BufRead>(
     reader: &mut R,
     delimiter: u8,
     strip_cr: bool,
-) -> Result<Option<String>> {
-    let mut buffer = Vec::new();
+    buffer: &'a mut Vec<u8>,
+) -> Result<Option<&'a [u8]>> {
+    buffer.clear();
     let read = reader
-        .read_until(delimiter, &mut buffer)
+        .read_until(delimiter, buffer)
         .map_err(|err| GitError::Io(err.to_string()))?;
     if read == 0 {
         return Ok(None);
@@ -946,7 +980,7 @@ fn read_batch_record<R: BufRead>(
     if strip_cr && buffer.last() == Some(&b'\r') {
         buffer.pop();
     }
-    Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
+    Ok(Some(buffer.as_slice()))
 }
 
 /// Parse a single `--batch-command` line exactly as upstream's `batch_objects_command` does,
@@ -1019,7 +1053,7 @@ struct CatFileBatchRecord<'a> {
 }
 
 fn print_cat_file_batch_record(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: CatFileBatchRecord<'_>,
 ) -> Result<()> {
     let query = ObjectQuery {
@@ -1170,7 +1204,7 @@ fn print_cat_file_batch_record(
 /// `None`) when the object is absent; and aborts the batch with `fatal: invalid object type`
 /// when the object exists but has an unknown-type header (upstream's hard `die`).
 fn batch_object_header(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     query: &ObjectQuery<'_>,
     result: Result<Option<(ObjectType, u64)>>,
@@ -1205,7 +1239,7 @@ fn batch_object_header(
 /// every other absent object reports `<name> missing`. Mirrors upstream's `report_object_status`
 /// dispatch on `S_IFGITLINK`.
 fn report_object_missing(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     query: &ObjectQuery<'_>,
 ) -> Result<()> {
@@ -1225,7 +1259,7 @@ fn report_object_missing(
 /// the unresolvable link remainder for `symlink`. Upstream flushes after each of these
 /// regardless of `--buffer`; mirror that.
 fn print_cat_file_symlink_status(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     status: &str,
     payload: &[u8],
@@ -1241,7 +1275,7 @@ fn print_cat_file_symlink_status(
 /// Report a filter-excluded object. With `--batch-all-objects` upstream simply omits it; for
 /// stdin-driven queries it prints `<name> excluded<terminator>` (the input name, like the
 /// `missing` status line).
-fn print_cat_file_excluded(stdout: &mut io::Stdout, record: &CatFileBatchRecord<'_>) -> Result<()> {
+fn print_cat_file_excluded(stdout: &mut dyn Write, record: &CatFileBatchRecord<'_>) -> Result<()> {
     if record.all_objects {
         return Ok(());
     }
@@ -1273,7 +1307,7 @@ impl ObjectQuery<'_> {
 }
 
 fn print_cat_file_batch_header(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     record: &CatFileBatchRecord<'_>,
     oid: &ObjectId,
     object_type: ObjectType,
@@ -1303,7 +1337,10 @@ fn print_cat_file_batch_header(
             },
         )?;
     } else {
-        write!(stdout, "{} {} {}", oid, object_type.as_str(), size)?;
+        write_object_id_hex(stdout, oid, None)?;
+        stdout.write_all(b" ")?;
+        stdout.write_all(object_type.as_str().as_bytes())?;
+        write!(stdout, " {size}")?;
     }
     stdout.write_all(&[record.terminator])?;
     Ok(())
@@ -1385,7 +1422,7 @@ struct CatFileBatchFormatValues<'a> {
 }
 
 fn print_cat_file_batch_format(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     format: &CatFileBatchFormat<'_>,
     values: CatFileBatchFormatValues<'_>,
 ) -> Result<()> {

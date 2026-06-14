@@ -3,7 +3,7 @@ use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_fo
 pub mod render;
 
 pub use sley_core::BString;
-use sley_index::{Index, IndexStatCache};
+use sley_index::{BorrowedIndex, Index, IndexStatCache};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget};
@@ -1277,15 +1277,15 @@ pub fn diff_name_status_head_worktree_with_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(head.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let changes =
-        diff_name_status_maps(&head, &worktree, head.keys().chain(index.keys()), options)?;
+    let changes = diff_name_status_maps_for_path_set(&head, &worktree, &candidate_paths, options)?;
     Ok(mark_unstaged_worktree_oids_unresolved(
         changes, &index, &worktree,
     ))
@@ -1309,18 +1309,25 @@ pub fn diff_name_status_head_worktree_with_rename_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(head.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
-    let changes = diff_name_status_maps_with_renames(
+    let cache = worktree_blob_cache_for_path_set(
+        worktree_root,
         &head,
         &worktree,
-        head.keys().chain(index.keys()),
+        &candidate_paths,
+        options,
+    )?;
+    let changes = diff_name_status_maps_with_renames_for_path_set(
+        &head,
+        &worktree,
+        &candidate_paths,
         options,
         |oid| cache_or_odb_blob(&cache, &db, oid),
     )?;
@@ -1457,15 +1464,15 @@ pub fn diff_name_status_tree_worktree_with_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(tree.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let changes =
-        diff_name_status_maps(&tree, &worktree, tree.keys().chain(index.keys()), options)?;
+    let changes = diff_name_status_maps_for_path_set(&tree, &worktree, &candidate_paths, options)?;
     Ok(mark_unstaged_worktree_oids_unresolved(
         changes, &index, &worktree,
     ))
@@ -1492,18 +1499,25 @@ pub fn diff_name_status_tree_worktree_with_rename_options(
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
+    let candidate_paths = candidate_path_set(tree.keys().chain(index.keys()));
+    let worktree = worktree_entries_for_path_set(
         worktree_root,
         format,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
         &index_gitlinks,
         Some(&stat_cache),
     )?;
-    let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
-    let changes = diff_name_status_maps_with_renames(
+    let cache = worktree_blob_cache_for_path_set(
+        worktree_root,
         &tree,
         &worktree,
-        tree.keys().chain(index.keys()),
+        &candidate_paths,
+        options,
+    )?;
+    let changes = diff_name_status_maps_with_renames_for_path_set(
+        &tree,
+        &worktree,
+        &candidate_paths,
         options,
         |oid| cache_or_odb_blob(&cache, &db, oid),
     )?;
@@ -1531,21 +1545,9 @@ pub fn diff_name_status_index_worktree_with_options(
     format: ObjectFormat,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
-    let IndexSnapshot {
-        entries: index,
-        stat_cache,
-    } = read_index_snapshot(git_dir, format)?;
-    let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
-        worktree_root,
-        format,
-        index.keys(),
-        &index_gitlinks,
-        Some(&stat_cache),
-    )?;
-    diff_name_status_maps(&index, &worktree, index.keys(), options)
+    let changes =
+        diff_name_status_index_worktree_changes(worktree_root.as_ref(), git_dir.as_ref(), format)?;
+    apply_name_status_options_to_index_worktree_changes(changes, options)
 }
 
 /// Index-vs-worktree name-status with full rename/copy options, including inexact
@@ -1557,25 +1559,243 @@ pub fn diff_name_status_index_worktree_with_rename_options(
     format: ObjectFormat,
     options: RenameDetectionOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let changes =
+        diff_name_status_index_worktree_changes(worktree_root.as_ref(), git_dir.as_ref(), format)?;
+    // Index-vs-worktree diffs only consider tracked index paths; untracked
+    // worktree files are not additions, so rename/copy detection has no add
+    // destinations to pair. Apply the base options for completeness.
+    apply_name_status_options_to_index_worktree_changes(changes, options.base)
+}
+
+fn diff_name_status_index_worktree_changes(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<NameStatusEntry>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let index_bytes = fs::read(&index_path)?;
+    if let Ok(index) = BorrowedIndex::parse(&index_bytes, format) {
+        if index
+            .entries
+            .iter()
+            .any(|entry| entry.stage() != sley_index::Stage::Normal)
+        {
+            return diff_name_status_index_worktree_changes_from_snapshot(
+                worktree_root,
+                git_dir,
+                format,
+            );
+        }
+        let stat_cache =
+            IndexStatCache::from_index_mtime_only(sley_index::file_mtime_parts(&index_metadata));
+        return diff_name_status_index_worktree_changes_for_borrowed_entries(
+            worktree_root,
+            format,
+            &index.entries,
+            &stat_cache,
+        );
+    }
+    let index = Index::parse(&index_bytes, format)?;
+    if index
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != sley_index::Stage::Normal)
+    {
+        return diff_name_status_index_worktree_changes_from_snapshot(
+            worktree_root,
+            git_dir,
+            format,
+        );
+    }
+    let stat_cache =
+        IndexStatCache::from_index_mtime_only(sley_index::file_mtime_parts(&index_metadata));
+    diff_name_status_index_worktree_changes_for_entries(
+        worktree_root,
+        format,
+        &index.entries,
+        &stat_cache,
+    )
+}
+
+fn diff_name_status_index_worktree_changes_for_borrowed_entries(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    entries: &[sley_index::IndexEntryRef<'_>],
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<NameStatusEntry>> {
+    const PARALLEL_SCAN_MIN_ENTRIES: usize = 2048;
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8);
+    if workers <= 1 || entries.len() < PARALLEL_SCAN_MIN_ENTRIES {
+        return diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
+            worktree_root,
+            format,
+            entries,
+            stat_cache,
+        );
+    }
+    let chunk_size = entries.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in entries.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
+                    worktree_root,
+                    format,
+                    chunk,
+                    stat_cache,
+                )
+            }));
+        }
+        let mut changes = Vec::new();
+        for handle in handles {
+            let chunk_changes = handle
+                .join()
+                .map_err(|_| GitError::Command("diff worker panicked".into()))??;
+            changes.extend(chunk_changes);
+        }
+        Ok(changes)
+    })
+}
+
+fn diff_name_status_index_worktree_changes_for_entries(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    entries: &[sley_index::IndexEntry],
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<NameStatusEntry>> {
+    const PARALLEL_SCAN_MIN_ENTRIES: usize = 2048;
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8);
+    if workers <= 1 || entries.len() < PARALLEL_SCAN_MIN_ENTRIES {
+        return diff_name_status_index_worktree_changes_for_entry_chunk(
+            worktree_root,
+            format,
+            entries,
+            stat_cache,
+        );
+    }
+    let chunk_size = entries.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in entries.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                diff_name_status_index_worktree_changes_for_entry_chunk(
+                    worktree_root,
+                    format,
+                    chunk,
+                    stat_cache,
+                )
+            }));
+        }
+        let mut changes = Vec::new();
+        for handle in handles {
+            let chunk_changes = handle
+                .join()
+                .map_err(|_| GitError::Command("diff worker panicked".into()))??;
+            changes.extend(chunk_changes);
+        }
+        Ok(changes)
+    })
+}
+
+fn diff_name_status_index_worktree_changes_for_entry_chunk(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    entries: &[sley_index::IndexEntry],
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut changes = Vec::new();
+    let mut path = PathBuf::from(worktree_root);
+    for entry in entries {
+        worktree_path_for_repo_path_into(&mut path, worktree_root, entry.path.as_bytes());
+        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, &stat_cache)? {
+            changes.push(change);
+        }
+    }
+    Ok(changes)
+}
+
+fn diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    entries: &[sley_index::IndexEntryRef<'_>],
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut changes = Vec::new();
+    let mut path = PathBuf::from(worktree_root);
+    for entry in entries {
+        worktree_path_for_repo_path_into(&mut path, worktree_root, entry.path);
+        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, &stat_cache)? {
+            changes.push(change);
+        }
+    }
+    Ok(changes)
+}
+
+fn diff_name_status_index_worktree_changes_from_snapshot(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<NameStatusEntry>> {
     let IndexSnapshot {
         entries: index,
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
-    let worktree = worktree_entries_for_paths(
-        worktree_root,
-        format,
-        index.keys(),
-        &index_gitlinks,
-        Some(&stat_cache),
-    )?;
-    let cache = worktree_blob_cache_for_entries(worktree_root, &worktree, options)?;
-    diff_name_status_maps_with_renames(&index, &worktree, index.keys(), options, |oid| {
-        cache_or_odb_blob(&cache, &db, oid)
-    })
+    let mut changes = Vec::new();
+    for (git_path, left) in &index {
+        let right = worktree_entry_for_path(
+            worktree_root,
+            format,
+            git_path,
+            &index_gitlinks,
+            Some(&stat_cache),
+        )?;
+        let Some(right) = right else {
+            changes.push(NameStatusEntry {
+                status: NameStatus::Deleted,
+                path: git_path.clone().into(),
+                old_path: None,
+                old_mode: Some(left.mode),
+                new_mode: None,
+                old_oid: Some(left.oid),
+                new_oid: None,
+            });
+            continue;
+        };
+        if right != *left {
+            changes.push(NameStatusEntry {
+                status: NameStatus::Modified,
+                path: git_path.clone().into(),
+                old_path: None,
+                old_mode: Some(left.mode),
+                new_mode: Some(right.mode),
+                old_oid: Some(left.oid),
+                new_oid: Some(right.oid),
+            });
+        }
+    }
+    Ok(changes)
+}
+
+fn apply_name_status_options_to_index_worktree_changes(
+    mut changes: Vec<NameStatusEntry>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    if options.detect_renames || options.detect_copies {
+        changes.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    }
+    Ok(changes)
 }
 
 /// Index-vs-worktree name-status for **`git diff-files`** (plumbing), which
@@ -1669,7 +1889,7 @@ fn augment_with_stat_dirty_entries(
         if tracked.mode == 0o160000 {
             continue;
         }
-        let path = worktree_root.join(repo_path_to_path(git_path));
+        let path = worktree_path_for_repo_path(worktree_root, git_path);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             // A missing worktree file is a deletion, which the content diff
             // already reports; nothing to add here.
@@ -1721,7 +1941,7 @@ fn worktree_oid_matches_index(
     format: ObjectFormat,
 ) -> Result<bool> {
     let file_type = metadata.file_type();
-    let path = worktree_root.join(repo_path_to_path(git_path));
+    let path = worktree_path_for_repo_path(worktree_root, git_path);
     let body = if file_type.is_symlink() {
         symlink_target_bytes(&path)?
     } else {
@@ -1842,18 +2062,15 @@ fn read_blob_bytes(db: &FileObjectDatabase, oid: &ObjectId) -> Option<Vec<u8>> {
 
 /// Build the raw per-path add/delete/modify change list (before any rename or
 /// copy detection) from the two entry maps and the candidate path set.
-fn raw_name_status_changes<'a>(
+fn raw_name_status_changes_for_unique_paths<'a>(
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
-    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    paths: impl Iterator<Item = &'a Vec<u8>>,
 ) -> Vec<NameStatusEntry> {
-    let mut paths = BTreeSet::new();
-    paths.extend(candidate_paths.cloned());
-
     let mut changes = Vec::new();
     for path in paths {
-        let left = left_entries.get(&path);
-        let right = right_entries.get(&path);
+        let left = left_entries.get(path);
+        let right = right_entries.get(path);
         let status = match (left, right) {
             (None, Some(_)) => Some(NameStatus::Added),
             (Some(_), None) => Some(NameStatus::Deleted),
@@ -1863,7 +2080,7 @@ fn raw_name_status_changes<'a>(
         if let Some(status) = status {
             changes.push(NameStatusEntry {
                 status,
-                path: path.into(),
+                path: path.clone().into(),
                 old_path: None,
                 old_mode: left.map(|entry| entry.mode),
                 new_mode: right.map(|entry| entry.mode),
@@ -1881,7 +2098,32 @@ fn diff_name_status_maps<'a>(
     candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    let paths = candidate_path_set(candidate_paths);
+    diff_name_status_maps_for_path_set(left_entries, right_entries, &paths, options)
+}
+
+fn diff_name_status_maps_for_path_set(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: &BTreeSet<Vec<u8>>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    diff_name_status_maps_for_unique_paths(
+        left_entries,
+        right_entries,
+        candidate_paths.iter(),
+        options,
+    )
+}
+
+fn diff_name_status_maps_for_unique_paths<'a>(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut changes =
+        raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if options.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, options.rename_empty);
     }
@@ -1912,8 +2154,42 @@ fn diff_name_status_maps_with_renames<'a>(
     options: RenameDetectionOptions,
     fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
 ) -> Result<Vec<NameStatusEntry>> {
+    let paths = candidate_path_set(candidate_paths);
+    diff_name_status_maps_with_renames_for_path_set(
+        left_entries,
+        right_entries,
+        &paths,
+        options,
+        fetch_blob,
+    )
+}
+
+fn diff_name_status_maps_with_renames_for_path_set(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: &BTreeSet<Vec<u8>>,
+    options: RenameDetectionOptions,
+    fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Result<Vec<NameStatusEntry>> {
+    diff_name_status_maps_with_renames_for_unique_paths(
+        left_entries,
+        right_entries,
+        candidate_paths.iter(),
+        options,
+        fetch_blob,
+    )
+}
+
+fn diff_name_status_maps_with_renames_for_unique_paths<'a>(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    options: RenameDetectionOptions,
+    fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Result<Vec<NameStatusEntry>> {
     let base = options.base;
-    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    let mut changes =
+        raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if base.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, base.rename_empty);
     }
@@ -2557,10 +2833,53 @@ fn read_index_snapshot(git_dir: &Path, format: ObjectFormat) -> Result<IndexSnap
     })
 }
 
-fn tracked_entry_from_index(entry: &sley_index::IndexEntry) -> TrackedEntry {
+trait WorktreeIndexEntry {
+    fn git_path(&self) -> &[u8];
+    fn mode(&self) -> u32;
+    fn oid(&self) -> ObjectId;
+    fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool;
+}
+
+impl WorktreeIndexEntry for sley_index::IndexEntry {
+    fn git_path(&self) -> &[u8] {
+        self.path.as_bytes()
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn oid(&self) -> ObjectId {
+        self.oid
+    }
+
+    fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool {
+        stat_cache.reusable_index_entry(self, metadata).is_some()
+    }
+}
+
+impl WorktreeIndexEntry for sley_index::IndexEntryRef<'_> {
+    fn git_path(&self) -> &[u8] {
+        self.path
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn oid(&self) -> ObjectId {
+        self.oid
+    }
+
+    fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool {
+        stat_cache.reusable_index_entry_ref(self, metadata)
+    }
+}
+
+fn tracked_entry_from_index(entry: &impl WorktreeIndexEntry) -> TrackedEntry {
     TrackedEntry {
-        mode: entry.mode,
-        oid: entry.oid,
+        mode: entry.mode(),
+        oid: entry.oid(),
     }
 }
 
@@ -2865,20 +3184,39 @@ fn index_gitlinks(index: &BTreeMap<Vec<u8>, TrackedEntry>) -> BTreeMap<Vec<u8>, 
         .collect()
 }
 
-fn worktree_entries_for_paths<'a>(
+fn candidate_path_set<'a>(candidate_paths: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<Vec<u8>> {
+    candidate_paths.cloned().collect()
+}
+
+fn worktree_entries_for_path_set(
     worktree_root: &Path,
     format: ObjectFormat,
-    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    candidates: &BTreeSet<Vec<u8>>,
+    index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
+    stat_cache: Option<&IndexStatCache>,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    worktree_entries_for_unique_paths(
+        worktree_root,
+        format,
+        candidates.iter(),
+        index_gitlinks,
+        stat_cache,
+    )
+}
+
+fn worktree_entries_for_unique_paths<'a>(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    candidates: impl Iterator<Item = &'a Vec<u8>>,
     index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
-    let candidates: BTreeSet<Vec<u8>> = candidate_paths.cloned().collect();
     for git_path in candidates {
         if let Some(entry) =
             worktree_entry_for_path(worktree_root, format, &git_path, index_gitlinks, stat_cache)?
         {
-            entries.insert(git_path, entry);
+            entries.insert(git_path.clone(), entry);
         }
     }
     Ok(entries)
@@ -2891,7 +3229,7 @@ fn worktree_entry_for_path(
     index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<TrackedEntry>> {
-    let path = worktree_root.join(repo_path_to_path(git_path));
+    let path = worktree_path_for_repo_path(worktree_root, git_path);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2936,20 +3274,157 @@ fn worktree_entry_for_path(
     Ok(Some(TrackedEntry { mode, oid }))
 }
 
-fn worktree_blob_cache_for_entries(
+fn index_worktree_change_for_entry(
+    path: &Path,
+    format: ObjectFormat,
+    index_entry: &impl WorktreeIndexEntry,
+    stat_cache: &IndexStatCache,
+) -> Result<Option<NameStatusEntry>> {
+    let git_path = index_entry.git_path();
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(index_worktree_deleted_entry(index_entry)));
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let file_type = metadata.file_type();
+    let right = if metadata.is_dir() {
+        if index_entry.mode() == 0o160000 {
+            let oid = gitlink_head_oid(path, format).unwrap_or(index_entry.oid());
+            Some(TrackedEntry {
+                mode: 0o160000,
+                oid,
+            })
+        } else if let Some(oid) = gitlink_head_oid(path, format) {
+            Some(TrackedEntry {
+                mode: 0o160000,
+                oid,
+            })
+        } else {
+            None
+        }
+    } else if metadata.is_file() || file_type.is_symlink() {
+        if index_entry.reusable_with(stat_cache, &metadata) {
+            return Ok(None);
+        }
+        let body = if file_type.is_symlink() {
+            symlink_target_bytes(path)?
+        } else {
+            fs::read(path)?
+        };
+        let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+        let mode = if file_type.is_symlink() {
+            0o120000
+        } else {
+            file_mode(&metadata)
+        };
+        Some(TrackedEntry { mode, oid })
+    } else {
+        None
+    };
+    let Some(right) = right else {
+        return Ok(Some(index_worktree_deleted_entry(index_entry)));
+    };
+    let left = tracked_entry_from_index(index_entry);
+    if right == left {
+        return Ok(None);
+    }
+    Ok(Some(NameStatusEntry {
+        status: NameStatus::Modified,
+        path: git_path.to_vec().into(),
+        old_path: None,
+        old_mode: Some(left.mode),
+        new_mode: Some(right.mode),
+        old_oid: Some(left.oid),
+        new_oid: Some(right.oid),
+    }))
+}
+
+fn index_worktree_deleted_entry(index_entry: &impl WorktreeIndexEntry) -> NameStatusEntry {
+    NameStatusEntry {
+        status: NameStatus::Deleted,
+        path: index_entry.git_path().to_vec().into(),
+        old_path: None,
+        old_mode: Some(index_entry.mode()),
+        new_mode: None,
+        old_oid: Some(index_entry.oid()),
+        new_oid: None,
+    }
+}
+
+fn worktree_blob_cache_for_path_set(
     worktree_root: &Path,
-    entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: &BTreeSet<Vec<u8>>,
+    options: RenameDetectionOptions,
+) -> Result<HashMap<ObjectId, Vec<u8>>> {
+    worktree_blob_cache_for_unique_paths(
+        worktree_root,
+        left_entries,
+        right_entries,
+        candidate_paths.iter(),
+        options,
+    )
+}
+
+fn worktree_blob_cache_for_unique_paths<'a>(
+    worktree_root: &Path,
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
     options: RenameDetectionOptions,
 ) -> Result<HashMap<ObjectId, Vec<u8>>> {
     if !options.detect_inexact || !(options.base.detect_renames || options.base.detect_copies) {
         return Ok(HashMap::new());
     }
+    let base = options.base;
+    let mut changes =
+        raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
+    if base.detect_renames {
+        changes = detect_exact_renames(changes, left_entries, right_entries, base.rename_empty);
+    }
+    if base.detect_copies {
+        changes = detect_exact_copies(
+            changes,
+            left_entries,
+            right_entries,
+            base.find_copies_harder,
+            base.rename_empty,
+        );
+    }
+    let has_rename_source = base.detect_renames
+        && changes.iter().any(|entry| {
+            entry.status == NameStatus::Deleted
+                && entry
+                    .old_oid
+                    .as_ref()
+                    .is_some_and(|oid| base.rename_empty || !is_empty_blob_oid(oid))
+        });
+    let has_copy_source = base.detect_copies
+        && (base.find_copies_harder
+            || changes
+                .iter()
+                .any(|entry| matches!(entry.status, NameStatus::Deleted | NameStatus::Modified)));
+    if !has_rename_source && !has_copy_source {
+        return Ok(HashMap::new());
+    }
+    let candidate_oids = changes
+        .iter()
+        .filter(|entry| entry.status == NameStatus::Added)
+        .filter_map(|entry| entry.new_oid)
+        .filter(|oid| base.rename_empty || !is_empty_blob_oid(oid))
+        .collect::<BTreeSet<_>>();
+    if candidate_oids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let mut cache = HashMap::new();
-    for (git_path, entry) in entries {
-        if entry.mode == 0o160000 {
+    for (git_path, entry) in right_entries {
+        if entry.mode == 0o160000 || !candidate_oids.contains(&entry.oid) {
             continue;
         }
-        let path = worktree_root.join(repo_path_to_path(git_path));
+        let path = worktree_path_for_repo_path(worktree_root, git_path);
         let body = if entry.mode == 0o120000 {
             symlink_target_bytes(&path)?
         } else {
@@ -2974,17 +3449,35 @@ fn cache_or_odb_blob(
 }
 
 #[cfg(unix)]
-fn repo_path_to_path(path: &[u8]) -> PathBuf {
+fn worktree_path_for_repo_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    let mut out = PathBuf::new();
-    for component in path.split(|byte| *byte == b'/') {
-        if !component.is_empty() {
-            out.push(OsStr::from_bytes(component));
-        }
-    }
+    let mut out = PathBuf::from(worktree_root);
+    out.push(OsStr::from_bytes(path));
     out
+}
+
+#[cfg(unix)]
+fn worktree_path_for_repo_path_into(out: &mut PathBuf, worktree_root: &Path, path: &[u8]) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    out.clear();
+    out.push(worktree_root);
+    out.push(OsStr::from_bytes(path));
+}
+
+#[cfg(not(unix))]
+fn worktree_path_for_repo_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
+    worktree_root.join(repo_path_to_path(path))
+}
+
+#[cfg(not(unix))]
+fn worktree_path_for_repo_path_into(out: &mut PathBuf, worktree_root: &Path, path: &[u8]) {
+    out.clear();
+    out.push(worktree_root);
+    out.push(repo_path_to_path(path));
 }
 
 #[cfg(not(unix))]

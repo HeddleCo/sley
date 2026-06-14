@@ -669,6 +669,40 @@ pub struct CommitGraphEntry {
     pub corrected_commit_date_offset: Option<u64>,
 }
 
+impl CommitGraphEntry {
+    /// Borrowed parent positions into the containing commit-graph's sorted commit
+    /// table.
+    pub fn parent_indices(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.parents.iter().copied()
+    }
+
+    pub fn first_parent_index(&self) -> Option<u32> {
+        self.parents.first().copied()
+    }
+}
+
+/// Borrowed iterator over a commit-graph entry's parent object ids.
+pub struct CommitGraphParentOids<'a> {
+    graph: &'a CommitGraph,
+    parents: std::slice::Iter<'a, u32>,
+}
+
+impl Iterator for CommitGraphParentOids<'_> {
+    type Item = ObjectId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let parent = *self.parents.next()?;
+        let idx = usize::try_from(parent).ok()?;
+        self.graph.commits.get(idx).map(|entry| entry.oid)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.parents.size_hint()
+    }
+}
+
+impl ExactSizeIterator for CommitGraphParentOids<'_> {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitGraphChunk {
     pub id: [u8; 4],
@@ -883,6 +917,31 @@ impl CommitGraph {
             .binary_search_by(|entry| entry.oid.as_bytes().cmp(oid.as_bytes()))
             .ok()
             .map(|idx| &self.commits[idx])
+    }
+
+    /// Borrow parent object ids for `entry` without allocating a `Vec`.
+    ///
+    /// The parser validates parent indices while reading `CDAT`/`EDGE`, but this
+    /// method rechecks them so callers using manually constructed graphs get a
+    /// structured error instead of a truncated iterator.
+    pub fn parent_oids<'a>(
+        &'a self,
+        entry: &'a CommitGraphEntry,
+    ) -> Result<CommitGraphParentOids<'a>> {
+        for parent in entry.parent_indices() {
+            let idx = usize::try_from(parent).map_err(|_| {
+                GitError::InvalidFormat("commit-graph parent index overflow".into())
+            })?;
+            if idx >= self.commits.len() {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph parent points past commit table".into(),
+                ));
+            }
+        }
+        Ok(CommitGraphParentOids {
+            graph: self,
+            parents: entry.parents.iter(),
+        })
     }
 }
 

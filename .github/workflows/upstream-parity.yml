@@ -107,6 +107,7 @@ jobs:
             t1300-config.sh
             t1400-update-ref.sh
             t1401-symbolic-ref.sh
+            t1450-fsck.sh
             t1461-refs-list.sh
             t1462-refs-exists.sh
             t1500-rev-parse.sh
@@ -130,7 +131,9 @@ jobs:
             t3505-cherry-pick-empty.sh
             t3507-cherry-pick-conflict.sh
             t3510-cherry-pick-sequence.sh
+            t3600-rm.sh
             t4013-diff-various.sh
+            t4014-format-patch.sh
             t4015-diff-whitespace.sh
             t4018-diff-funcname.sh
             t4027-diff-submodule.sh

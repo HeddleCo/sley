@@ -192,6 +192,7 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
         format,
         ShortStatusOptions {
             include_ignored: false,
+            ignored_mode: StatusIgnoredMode::Traditional,
             untracked_mode: StatusUntrackedMode::Normal,
         },
     ) else {
@@ -217,8 +218,16 @@ pub enum StatusUntrackedMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusIgnoredMode {
+    #[default]
+    Traditional,
+    Matching,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ShortStatusOptions {
     pub include_ignored: bool,
+    pub ignored_mode: StatusIgnoredMode,
     pub untracked_mode: StatusUntrackedMode,
 }
 
@@ -1814,7 +1823,7 @@ pub fn short_status_with_options(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     if options.untracked_mode == StatusUntrackedMode::None && !options.include_ignored {
         let (index, stat_cache, head_matches_index) =
-            read_index_with_stat_cache(git_dir, format, &db)?;
+            read_index_with_stat_cache_entries(git_dir, format, &db, false)?;
         return short_status_tracked_only(
             worktree_root,
             git_dir,
@@ -1823,6 +1832,7 @@ pub fn short_status_with_options(
             &index,
             &stat_cache,
             head_matches_index,
+            StatusUntrackedMode::None,
         );
     }
     // Parse the index once: the stat cache lets the worktree walk skip
@@ -1834,35 +1844,25 @@ pub fn short_status_with_options(
         read_index_with_stat_cache(git_dir, format, &db)?;
     if head_matches_index && !options.include_ignored {
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-        let (worktree, submodule_dirt_map, tracked_presence) =
-            status_worktree_entries_with_submodule_dirt(
-                worktree_root,
-                git_dir,
-                format,
-                &stat_cache,
-                None,
-                Some(&mut ignores),
-            )?;
-        let mut entries = Vec::new();
-        collect_status_entries_parsed_index_head_matches(
+        let entries = short_status_tracked_only(
+            worktree_root,
+            git_dir,
+            format,
+            &db,
             &parsed_index,
-            &worktree,
-            &tracked_presence,
-            &submodule_dirt_map,
+            &stat_cache,
+            true,
             options.untracked_mode,
-            &mut entries,
         );
-        let untracked_paths: Vec<Vec<u8>> = match options.untracked_mode {
-            StatusUntrackedMode::All => worktree
-                .keys()
-                .filter(|path| !stat_cache.contains(path) && !ignores.is_ignored(path, false))
-                .cloned()
-                .collect(),
-            StatusUntrackedMode::Normal => {
-                normal_untracked_paths_from_worktree_stat_cache(&worktree, &stat_cache, &ignores)
-            }
-            StatusUntrackedMode::None => Vec::new(),
-        };
+        let mut entries = entries?;
+        let untracked_paths = status_untracked_paths_from_index(
+            worktree_root,
+            git_dir,
+            &parsed_index,
+            &stat_cache,
+            &mut ignores,
+            options.untracked_mode,
+        )?;
         for path in untracked_paths {
             entries.push(ShortStatusEntry {
                 index: b'?',
@@ -1929,7 +1929,22 @@ pub fn short_status_with_options(
         );
     }
     if options.include_ignored {
-        for path in ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)? {
+        let ignored_paths = ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)?;
+        let ignored_paths: Vec<Vec<u8>> = match options.ignored_mode {
+            StatusIgnoredMode::Matching => ignored_paths,
+            StatusIgnoredMode::Traditional => {
+                let mut rolled = BTreeSet::new();
+                for path in ignored_paths {
+                    let path = untracked_normal_rollup_path(&path, &index, &ignores);
+                    if ignored_traditional_path_is_empty_directory(worktree_root, &path)? {
+                        continue;
+                    }
+                    rolled.insert(path);
+                }
+                rolled.into_iter().collect()
+            }
+        };
+        for path in ignored_paths {
             entries.push(ShortStatusEntry {
                 index: b'!',
                 worktree: b'!',
@@ -2007,56 +2022,11 @@ fn collect_status_entries_head_matches_index(
                 path: path.clone(),
                 head_mode: Some(index_entry.mode),
                 index_mode: Some(index_entry.mode),
-                worktree_mode: status_worktree_mode(Some(index_entry), worktree_entry, worktree_present),
-                head_oid: Some(index_entry.oid),
-                index_oid: Some(index_entry.oid),
-                submodule: submodule.filter(|sub| sub.any()),
-            });
-        }
-    }
-}
-
-fn collect_status_entries_parsed_index_head_matches(
-    index: &Index,
-    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
-    tracked_presence: &HashSet<Vec<u8>>,
-    submodule_dirt_map: &BTreeMap<Vec<u8>, u8>,
-    untracked_mode: StatusUntrackedMode,
-    entries: &mut Vec<ShortStatusEntry>,
-) {
-    for entry in index
-        .entries
-        .iter()
-        .filter(|entry| entry.stage() == Stage::Normal)
-    {
-        let path = entry.path.as_bytes();
-        let index_entry = TrackedEntry {
-            mode: entry.mode,
-            oid: entry.oid,
-        };
-        let worktree_entry = worktree.get(path);
-        let worktree_present = worktree_entry.is_some() || tracked_presence.contains(path);
-        let submodule = status_submodule_from_entries(
-            path,
-            &index_entry,
-            worktree_entry,
-            submodule_dirt_map,
-            untracked_mode,
-        );
-        let worktree_code = match worktree_entry {
-            None if !worktree_present => b'D',
-            Some(worktree_entry) if *worktree_entry != index_entry => b'M',
-            _ if submodule.is_some_and(|sub| sub.any()) => b'M',
-            _ => b' ',
-        };
-        if worktree_code != b' ' {
-            entries.push(ShortStatusEntry {
-                index: b' ',
-                worktree: worktree_code,
-                path: path.to_vec(),
-                head_mode: Some(index_entry.mode),
-                index_mode: Some(index_entry.mode),
-                worktree_mode: status_worktree_mode(Some(&index_entry), worktree_entry, worktree_present),
+                worktree_mode: status_worktree_mode(
+                    Some(index_entry),
+                    worktree_entry,
+                    worktree_present,
+                ),
                 head_oid: Some(index_entry.oid),
                 index_oid: Some(index_entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
@@ -2153,9 +2123,11 @@ fn status_worktree_mode(
     worktree_entry: Option<&TrackedEntry>,
     worktree_present: bool,
 ) -> Option<u32> {
-    worktree_entry
-        .map(|entry| entry.mode)
-        .or_else(|| worktree_present.then(|| index_entry.map(|entry| entry.mode)).flatten())
+    worktree_entry.map(|entry| entry.mode).or_else(|| {
+        worktree_present
+            .then(|| index_entry.map(|entry| entry.mode))
+            .flatten()
+    })
 }
 
 fn status_submodule_from_entries(
@@ -2186,14 +2158,21 @@ fn short_status_tracked_only(
     index: &Index,
     stat_cache: &IndexStatCache,
     head_matches_index: bool,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
-    if head_matches_index && stat_cache.entries.len() >= 512 {
+    let normal_entry_count = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .count();
+    if head_matches_index && normal_entry_count >= 512 {
         return short_status_tracked_only_head_matches_index_parallel(
             worktree_root,
             git_dir,
             format,
             index,
             stat_cache,
+            untracked_mode,
         );
     }
     let head = if head_matches_index {
@@ -2201,6 +2180,19 @@ fn short_status_tracked_only(
     } else {
         Some(head_tree_entries(git_dir, format, db)?)
     };
+    if !head_matches_index && normal_entry_count >= 512 {
+        if let Some(head) = head.as_ref() {
+            return short_status_tracked_only_with_head_parallel(
+                worktree_root,
+                git_dir,
+                format,
+                index,
+                stat_cache,
+                head,
+                untracked_mode,
+            );
+        }
+    }
     let mut clean_filter = None;
     let mut entries = Vec::new();
     for entry in index
@@ -2231,6 +2223,7 @@ fn short_status_tracked_only(
             path,
             &index_entry,
             worktree_entry.as_ref(),
+            untracked_mode,
         )?;
         let index_code = match head_entry {
             None => b'A',
@@ -2289,7 +2282,7 @@ fn short_status_tracked_only(
     Ok(entries)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum TrackedOnlyPrecheck {
     Deleted(usize),
     Slow(usize),
@@ -2308,51 +2301,9 @@ fn short_status_tracked_only_head_matches_index_parallel(
     format: ObjectFormat,
     index: &Index,
     stat_cache: &IndexStatCache,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
-    let normal_indices = index
-        .entries
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| (entry.stage() == Stage::Normal).then_some(idx))
-        .collect::<Vec<_>>();
-    let max_workers = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(8);
-    let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
-    let chunk_size = normal_indices.len().div_ceil(worker_count);
-    let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
-        let mut handles = Vec::new();
-        for chunk in normal_indices.chunks(chunk_size) {
-            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
-                let mut prechecks = Vec::new();
-                for &idx in chunk {
-                    let entry = &index.entries[idx];
-                    match tracked_only_stat_precheck(worktree_root, entry, stat_cache)? {
-                        TrackedOnlyPrecheckOutcome::Clean => {}
-                        TrackedOnlyPrecheckOutcome::Deleted => {
-                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
-                        }
-                        TrackedOnlyPrecheckOutcome::Slow => {
-                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
-                        }
-                    }
-                }
-                Ok(prechecks)
-            }));
-        }
-        let mut prechecks = Vec::new();
-        for handle in handles {
-            let mut chunk = handle
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
-            prechecks.append(&mut chunk);
-        }
-        Ok(prechecks)
-    })?;
-    prechecks.sort_by_key(|precheck| match precheck {
-        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => *idx,
-    });
+    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
 
     let mut clean_filter = None;
     let mut entries = Vec::new();
@@ -2393,6 +2344,7 @@ fn short_status_tracked_only_head_matches_index_parallel(
                     path,
                     &index_entry,
                     worktree_entry.as_ref(),
+                    untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
                     None => b'D',
@@ -2424,16 +2376,198 @@ fn short_status_tracked_only_head_matches_index_parallel(
     Ok(entries)
 }
 
+fn short_status_tracked_only_with_head_parallel(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+    stat_cache: &IndexStatCache,
+    head: &BTreeMap<Vec<u8>, TrackedEntry>,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Vec<ShortStatusEntry>> {
+    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let mut precheck_cursor = 0usize;
+    let mut clean_filter = None;
+    let mut entries = Vec::new();
+
+    for (idx, entry) in index.entries.iter().enumerate() {
+        if entry.stage() != Stage::Normal {
+            continue;
+        }
+        let path = entry.path.as_bytes();
+        let index_entry = TrackedEntry {
+            mode: entry.mode,
+            oid: entry.oid,
+        };
+        let head_entry = head.get(path);
+        let index_code = match head_entry {
+            None => b'A',
+            Some(head_entry) if *head_entry != index_entry => b'M',
+            _ => b' ',
+        };
+        let precheck = prechecks
+            .get(precheck_cursor)
+            .copied()
+            .and_then(|precheck| {
+                if tracked_only_precheck_index(precheck) == idx {
+                    precheck_cursor += 1;
+                    Some(precheck)
+                } else {
+                    None
+                }
+            });
+        let (worktree_code, worktree_mode, submodule) = match precheck {
+            None => (b' ', Some(index_entry.mode), None),
+            Some(TrackedOnlyPrecheck::Deleted(_)) => (b'D', None, None),
+            Some(TrackedOnlyPrecheck::Slow(_)) => {
+                let worktree_entry = worktree_entry_for_index_entry_with_attributes(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    stat_cache,
+                    &mut clean_filter,
+                )?;
+                let submodule = tracked_only_submodule_status(
+                    worktree_root,
+                    path,
+                    &index_entry,
+                    worktree_entry.as_ref(),
+                    untracked_mode,
+                )?;
+                let worktree_code = match worktree_entry.as_ref() {
+                    None => b'D',
+                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    _ if submodule.is_some_and(|sub| sub.any()) => b'M',
+                    _ => b' ',
+                };
+                (
+                    worktree_code,
+                    worktree_entry.as_ref().map(|entry| entry.mode),
+                    submodule.filter(|sub| sub.any()),
+                )
+            }
+        };
+        if index_code != b' ' || worktree_code != b' ' {
+            entries.push(ShortStatusEntry {
+                index: index_code,
+                worktree: worktree_code,
+                path: path.to_vec(),
+                head_mode: head_entry.map(|entry| entry.mode),
+                index_mode: Some(index_entry.mode),
+                worktree_mode,
+                head_oid: head_entry.map(|entry| entry.oid),
+                index_oid: Some(index_entry.oid),
+                submodule,
+            });
+        }
+    }
+
+    let index_paths = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<HashSet<_>>();
+    for (path, head_entry) in head {
+        if index_paths.contains(path.as_slice()) {
+            continue;
+        }
+        entries.push(ShortStatusEntry {
+            index: b'D',
+            worktree: b' ',
+            path: path.clone(),
+            head_mode: Some(head_entry.mode),
+            index_mode: None,
+            worktree_mode: None,
+            head_oid: Some(head_entry.oid),
+            index_oid: None,
+            submodule: None,
+        });
+    }
+    entries.sort_by(|left, right| {
+        status_sort_category(left)
+            .cmp(&status_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+fn tracked_only_precheck_index(precheck: TrackedOnlyPrecheck) -> usize {
+    match precheck {
+        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => idx,
+    }
+}
+
+fn tracked_only_non_clean_prechecks_parallel(
+    worktree_root: &Path,
+    index: &Index,
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<TrackedOnlyPrecheck>> {
+    let normal_indices = index
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| (entry.stage() == Stage::Normal).then_some(idx))
+        .collect::<Vec<_>>();
+    let max_workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(16);
+    let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
+    let chunk_size = normal_indices.len().div_ceil(worker_count);
+    let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
+        let mut handles = Vec::new();
+        for chunk in normal_indices.chunks(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
+                let mut prechecks = Vec::new();
+                let mut absolute = PathBuf::new();
+                for &idx in chunk {
+                    let entry = &index.entries[idx];
+                    match tracked_only_stat_precheck(
+                        worktree_root,
+                        entry,
+                        stat_cache,
+                        &mut absolute,
+                    )? {
+                        TrackedOnlyPrecheckOutcome::Clean => {}
+                        TrackedOnlyPrecheckOutcome::Deleted => {
+                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                        }
+                        TrackedOnlyPrecheckOutcome::Slow => {
+                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                        }
+                    }
+                }
+                Ok(prechecks)
+            }));
+        }
+        let mut prechecks = Vec::new();
+        for handle in handles {
+            let mut chunk = handle
+                .join()
+                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            prechecks.append(&mut chunk);
+        }
+        Ok(prechecks)
+    })?;
+    prechecks.sort_by_key(|precheck| match precheck {
+        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => *idx,
+    });
+    Ok(prechecks)
+}
+
 fn tracked_only_stat_precheck(
     worktree_root: &Path,
     index_entry: &IndexEntry,
     stat_cache: &IndexStatCache,
+    absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     if index_entry.mode == 0o160000 {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     let git_path = index_entry.path.as_bytes();
-    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    set_worktree_path_from_repo_path(worktree_root, git_path, absolute)?;
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
         Err(err)
@@ -2460,11 +2594,40 @@ fn tracked_only_stat_precheck(
     }
 }
 
+fn set_worktree_path_from_repo_path(
+    worktree_root: &Path,
+    git_path: &[u8],
+    out: &mut PathBuf,
+) -> Result<()> {
+    out.clear();
+    out.push(worktree_root);
+    push_repo_path(out, git_path)
+}
+
+#[cfg(unix)]
+fn push_repo_path(out: &mut PathBuf, path: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    out.push(Path::new(std::ffi::OsStr::from_bytes(path)));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn push_repo_path(out: &mut PathBuf, path: &[u8]) -> Result<()> {
+    let path = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidPath("index path is not utf8".into()))?;
+    for component in path.split('/') {
+        out.push(component);
+    }
+    Ok(())
+}
+
 fn tracked_only_submodule_status(
     worktree_root: &Path,
     path: &[u8],
     index_entry: &TrackedEntry,
     worktree_entry: Option<&TrackedEntry>,
+    untracked_mode: StatusUntrackedMode,
 ) -> Result<Option<SubmoduleStatus>> {
     let Some(worktree_entry) = worktree_entry else {
         return Ok(None);
@@ -2481,7 +2644,8 @@ fn tracked_only_submodule_status(
     Ok(Some(SubmoduleStatus {
         new_commits: index_entry.oid != worktree_entry.oid,
         modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-        untracked_content: false,
+        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
+            && !matches!(untracked_mode, StatusUntrackedMode::None),
     }))
 }
 
@@ -3031,30 +3195,182 @@ fn normal_untracked_paths_from_worktree(
     paths.into_iter().collect()
 }
 
-fn normal_untracked_paths_from_worktree_stat_cache(
-    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
+fn status_untracked_paths_from_index(
+    root: &Path,
+    git_dir: &Path,
+    index: &Index,
     stat_cache: &IndexStatCache,
-    ignores: &IgnoreMatcher,
-) -> Vec<Vec<u8>> {
-    let mut paths = BTreeSet::new();
-    let mut index_paths = None;
-    for (path, entry) in worktree {
-        if stat_cache.contains(path) || ignores.is_ignored(path, false) {
-            continue;
-        }
-        if entry.mode == 0o040000 && entry.oid.is_null() {
-            insert_untracked_directory(&mut paths, path);
-            continue;
-        }
-        let index_paths = index_paths
-            .get_or_insert_with(|| stat_cache.entries.keys().cloned().collect::<BTreeSet<_>>());
-        paths.insert(untracked_normal_rollup_path_from_paths(
-            path,
-            index_paths,
-            ignores,
-        ));
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Vec<Vec<u8>>> {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(Vec::new());
     }
-    paths.into_iter().collect()
+    let mut paths = BTreeSet::new();
+    let tracked_dirs = stage0_tracked_directories(index);
+    let mut context = StatusUntrackedWalk {
+        git_dir,
+        stat_cache,
+        tracked_dirs: &tracked_dirs,
+        ignores,
+        untracked_mode,
+    };
+    collect_status_untracked_paths(&mut context, root, &[], &mut paths)?;
+    Ok(paths.into_iter().collect())
+}
+
+struct StatusUntrackedWalk<'a> {
+    git_dir: &'a Path,
+    stat_cache: &'a IndexStatCache,
+    tracked_dirs: &'a HashSet<Vec<u8>>,
+    ignores: &'a mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+}
+
+fn collect_status_untracked_paths(
+    context: &mut StatusUntrackedWalk<'_>,
+    dir: &Path,
+    dir_git_path: &[u8],
+    paths: &mut BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    if is_same_path(dir, context.git_dir) {
+        return Ok(());
+    }
+    let ignore_len = context.ignores.patterns.len();
+    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    let result = (|| -> Result<()> {
+        let mut git_path = dir_git_path.to_vec();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let is_dir = file_type.is_dir();
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<()> {
+                if file_type.is_file() || file_type.is_symlink() {
+                    if !context.stat_cache.contains(&git_path)
+                        && !context.ignores.is_ignored(&git_path, false)
+                    {
+                        paths.insert(git_path.clone());
+                    }
+                    return Ok(());
+                } else if is_dir {
+                    if context.ignores.is_ignored(&git_path, true) {
+                        return Ok(());
+                    }
+                    let path = entry.path();
+                    if is_same_path(&path, context.git_dir) {
+                        return Ok(());
+                    }
+                    if context.stat_cache.gitlink_entry(&git_path).is_some() {
+                        return Ok(());
+                    }
+                    match context.untracked_mode {
+                        StatusUntrackedMode::All => {
+                            if !context.tracked_dirs.contains(git_path.as_slice())
+                                && is_nested_repository_boundary(&path)
+                            {
+                                insert_untracked_directory(paths, &git_path);
+                            } else {
+                                collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                            }
+                        }
+                        StatusUntrackedMode::Normal => {
+                            if context.tracked_dirs.contains(git_path.as_slice()) {
+                                collect_status_untracked_paths(context, &path, &git_path, paths)?;
+                            } else if is_nested_repository_boundary(&path) {
+                                insert_untracked_directory(paths, &git_path);
+                            } else if status_untracked_directory_has_file(
+                                context, &path, &git_path,
+                            )? {
+                                insert_untracked_directory(paths, &git_path);
+                            }
+                        }
+                        StatusUntrackedMode::None => {}
+                    }
+                }
+                Ok(())
+            })();
+            git_path.truncate(path_len);
+            entry_result?;
+        }
+        Ok(())
+    })();
+    context.ignores.patterns.truncate(ignore_len);
+    result
+}
+
+fn stage0_tracked_directories(index: &Index) -> HashSet<Vec<u8>> {
+    let mut directories = HashSet::new();
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+    {
+        let path = entry.path.as_bytes();
+        for (idx, byte) in path.iter().enumerate() {
+            if *byte == b'/' && idx > 0 {
+                directories.insert(path[..idx].to_vec());
+            }
+        }
+    }
+    directories
+}
+
+fn status_untracked_directory_has_file(
+    context: &mut StatusUntrackedWalk<'_>,
+    dir: &Path,
+    dir_git_path: &[u8],
+) -> Result<bool> {
+    if is_same_path(dir, context.git_dir) {
+        return Ok(false);
+    }
+    let ignore_len = context.ignores.patterns.len();
+    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    let result = (|| -> Result<bool> {
+        let mut git_path = dir_git_path.to_vec();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let is_dir = file_type.is_dir();
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<Option<bool>> {
+                if context.ignores.is_ignored(&git_path, is_dir) {
+                    return Ok(None);
+                }
+                if file_type.is_file() || file_type.is_symlink() {
+                    return Ok(Some(!context.stat_cache.contains(&git_path)));
+                }
+                if is_dir {
+                    let path = entry.path();
+                    if is_same_path(&path, context.git_dir) {
+                        return Ok(None);
+                    }
+                    if is_nested_repository_boundary(&path) {
+                        return Ok(Some(true));
+                    }
+                    if status_untracked_directory_has_file(context, &path, &git_path)? {
+                        return Ok(Some(true));
+                    }
+                }
+                Ok(None)
+            })();
+            git_path.truncate(path_len);
+            if let Some(has_file) = entry_result? {
+                return Ok(has_file);
+            }
+        }
+        Ok(false)
+    })();
+    context.ignores.patterns.truncate(ignore_len);
+    result
 }
 
 fn untracked_normal_rollup_path(
@@ -3076,36 +3392,6 @@ fn untracked_normal_rollup_path(
         }
         prefix.extend_from_slice(segment);
         if index_has_path_under(index, &prefix) {
-            break;
-        }
-        if !ignores.is_ignored(&prefix, true) {
-            let mut directory = prefix;
-            directory.push(b'/');
-            return directory;
-        }
-    }
-    file_path.to_vec()
-}
-
-fn untracked_normal_rollup_path_from_paths(
-    file_path: &[u8],
-    index_paths: &BTreeSet<Vec<u8>>,
-    ignores: &IgnoreMatcher,
-) -> Vec<u8> {
-    let segments = file_path
-        .split(|byte| *byte == b'/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() <= 1 {
-        return file_path.to_vec();
-    }
-    let mut prefix = Vec::new();
-    for segment in &segments[..segments.len() - 1] {
-        if !prefix.is_empty() {
-            prefix.push(b'/');
-        }
-        prefix.extend_from_slice(segment);
-        if tracked_paths_may_contain(index_paths, &prefix) {
             break;
         }
         if !ignores.is_ignored(&prefix, true) {
@@ -3213,6 +3499,20 @@ fn ignored_untracked_paths(
     Ok(paths.into_iter().collect())
 }
 
+fn ignored_traditional_path_is_empty_directory(root: &Path, path: &[u8]) -> Result<bool> {
+    let Some(path) = path.strip_suffix(b"/") else {
+        return Ok(false);
+    };
+    let mut absolute = PathBuf::new();
+    set_worktree_path_from_repo_path(root, path, &mut absolute)?;
+    match fs::read_dir(&absolute) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
 struct IgnoredUntrackedContext<'a> {
     root: &'a Path,
     git_dir: &'a Path,
@@ -3246,9 +3546,6 @@ fn collect_ignored_untracked_paths(
         })?;
         let git_path = git_path_bytes(relative)?;
         if metadata.is_dir() {
-            if is_nested_repository_boundary(&path) {
-                continue;
-            }
             let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
             if ignored && !index_has_path_under(context.index, &git_path) {
                 if context.directory {
@@ -3259,6 +3556,9 @@ fn collect_ignored_untracked_paths(
                     collect_ignored_untracked_paths(context, &path, true, paths)?;
                 }
             } else {
+                if is_nested_repository_boundary(&path) {
+                    continue;
+                }
                 collect_ignored_untracked_paths(context, &path, ignored, paths)?;
             }
         } else if !context.index.contains_key(&git_path)
@@ -3404,23 +3704,23 @@ impl IgnoreMatcher {
     }
 
     fn is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
-        let mut ignored = false;
-        for pattern in &self.patterns {
-            if pattern.matches(path, is_dir) {
-                ignored = !pattern.negated;
+        let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        for pattern in self.patterns.iter().rev() {
+            if pattern.matches_with_basename(path, basename, is_dir) {
+                return !pattern.negated;
             }
         }
-        ignored
+        false
     }
 
     fn match_for(&self, path: &[u8], is_dir: bool) -> Option<&IgnorePattern> {
-        let mut matched = None;
-        for pattern in &self.patterns {
-            if pattern.matches(path, is_dir) {
-                matched = Some(pattern);
+        let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        for pattern in self.patterns.iter().rev() {
+            if pattern.matches_with_basename(path, basename, is_dir) {
+                return Some(pattern);
             }
         }
-        matched
+        None
     }
 }
 
@@ -3788,6 +4088,11 @@ impl IgnorePattern {
     }
 
     fn matches(&self, path: &[u8], is_dir: bool) -> bool {
+        let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+        self.matches_with_basename(path, basename, is_dir)
+    }
+
+    fn matches_with_basename(&self, path: &[u8], basename: &[u8], is_dir: bool) -> bool {
         let path = if self.base.is_empty() {
             path
         } else {
@@ -3805,43 +4110,66 @@ impl IgnorePattern {
         if self.anchored || self.has_slash {
             return self.match_segment(path);
         }
-        path.rsplit(|byte| *byte == b'/')
-            .next()
-            .is_some_and(|basename| self.match_segment(basename))
+        self.match_segment(basename)
     }
 
     fn matches_directory(&self, path: &[u8], is_dir: bool) -> bool {
         if self.anchored || self.has_slash {
-            return path == self.pattern
-                || path
-                    .strip_prefix(self.pattern.as_slice())
-                    .and_then(|rest| rest.strip_prefix(b"/"))
-                    .is_some();
+            if is_dir && self.match_path(path) {
+                return true;
+            }
+            // For a *file* path, a directory-only pattern can only apply
+            // through an *ancestor* directory of the file: the leaf is matched
+            // only because it lives inside a directory the pattern excludes
+            // (e.g. `/tmp-*/` excludes `tmp-info-only`, so `tmp-info-only/x`
+            // is excluded too). Upstream git models this through directory
+            // traversal — `last_matching_pattern` skips a MUSTBEDIR pattern for
+            // a non-directory leaf (`dtype != DT_DIR`), and a file is excluded
+            // only when one of its parent directories is excluded.
+            //
+            // A *negated* directory-only pattern (`!data/**/`) re-includes a
+            // directory but, per git, does NOT re-include the files inside it
+            // (git's docs: "it is not possible to re-include a file if a parent
+            // directory of that file is excluded" — re-including the dir with
+            // `!dir/` still requires an explicit `!dir/*` to reach its files).
+            // So a negated directory-only pattern must never match a file via
+            // its ancestor, otherwise it wrongly wins the leaf scan and
+            // un-ignores a file that an earlier positive pattern ignored
+            // (t0008-ignores "directories and ** matches": `data/**` +
+            // `!data/**/` must leave `data/data1/file1` ignored).
+            if self.negated {
+                return false;
+            }
+            return path
+                .iter()
+                .enumerate()
+                .any(|(idx, byte)| *byte == b'/' && self.match_path(&path[..idx]));
         }
-        path.split(|byte| *byte == b'/')
-            .enumerate()
-            .any(|(index, component)| {
-                self.match_segment(component)
-                    && (is_dir || index + 1 < path.split(|byte| *byte == b'/').count())
-            })
+        let mut components = path.split(|byte| *byte == b'/').peekable();
+        while let Some(component) = components.next() {
+            if self.match_segment(component) && (is_dir || components.peek().is_some()) {
+                return true;
+            }
+        }
+        false
     }
 
-    /// Match a slash-free `value` (a basename or path component) against this
-    /// pattern. Literal and simple `*X`/`X*` patterns resolve with a direct
-    /// comparison; only complex globs pay for the allocating wildcard engine.
-    fn match_segment(&self, value: &[u8]) -> bool {
+    fn match_path(&self, value: &[u8]) -> bool {
         match self.match_kind {
             MatchKind::Literal => self.pattern == value,
-            // `*X` ≡ ends_with(X) and `X*` ≡ starts_with(X), but only on a
-            // slash-free segment: `*` never crosses `/`, so an anchored `/*.log`
-            // applied to a multi-segment path must not match (the slash guard
-            // rejects it). Basename/component call sites are slash-free already.
             MatchKind::Suffix => !value.contains(&b'/') && value.ends_with(&self.pattern[1..]),
             MatchKind::Prefix => {
                 !value.contains(&b'/') && value.starts_with(&self.pattern[..self.pattern.len() - 1])
             }
             MatchKind::Glob => wildcard_path_matches(&self.pattern, value),
         }
+    }
+
+    /// Match a slash-free `value` (a basename or path component) against this
+    /// pattern. Literal and simple `*X`/`X*` patterns resolve with a direct
+    /// comparison; only complex globs pay for the allocating wildcard engine.
+    fn match_segment(&self, value: &[u8]) -> bool {
+        self.match_path(value)
     }
 }
 
@@ -7760,6 +8088,13 @@ impl IndexStatCache {
         }
     }
 
+    fn from_index_mtime_only(index_mtime: Option<(u64, u64)>) -> Self {
+        IndexStatCache {
+            entries: HashMap::new(),
+            index_mtime,
+        }
+    }
+
     /// Whether `entry` is "racily clean" in git's sense: its cached mtime is not
     /// strictly older than the index file's mtime, so a same-timestamp write
     /// could have changed the content without moving the stat. Such entries must
@@ -7978,6 +8313,15 @@ fn read_index_with_stat_cache(
     format: ObjectFormat,
     db: &FileObjectDatabase,
 ) -> Result<(Index, IndexStatCache, bool)> {
+    read_index_with_stat_cache_entries(git_dir, format, db, true)
+}
+
+fn read_index_with_stat_cache_entries(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    include_entries: bool,
+) -> Result<(Index, IndexStatCache, bool)> {
     let index_path = repository_index_path(git_dir);
     let index_metadata = match fs::metadata(&index_path) {
         Ok(metadata) => metadata,
@@ -7996,14 +8340,21 @@ fn read_index_with_stat_cache(
         Err(err) => return Err(err.into()),
     };
     let index = Index::parse(&fs::read(&index_path)?, format)?;
-    let stat_cache = IndexStatCache::from_index_mtime(&index, file_mtime_parts(&index_metadata));
+    let index_mtime = file_mtime_parts(&index_metadata);
+    let stage0_entry_count = index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .count();
+    let stat_cache = if include_entries {
+        IndexStatCache::from_index_mtime(&index, index_mtime)
+    } else {
+        IndexStatCache::from_index_mtime_only(index_mtime)
+    };
     let head_matches_index = match resolve_head_tree_oid(git_dir, format, db)? {
-        Some(head_tree_oid) => head_matches_index_from_cache_tree(
-            &index,
-            format,
-            &head_tree_oid,
-            stat_cache.entries.len(),
-        )?,
+        Some(head_tree_oid) => {
+            head_matches_index_from_cache_tree(&index, format, &head_tree_oid, stage0_entry_count)?
+        }
         None => false,
     };
     Ok((index, stat_cache, head_matches_index))
@@ -8418,6 +8769,16 @@ fn git_path_append_component(parent: &[u8], component: &std::ffi::OsStr) -> Vec<
     }
     path.extend_from_slice(component.as_ref());
     path
+}
+
+fn git_path_push_component(path: &mut Vec<u8>, component: &std::ffi::OsStr) -> usize {
+    let original_len = path.len();
+    let component = os_str_component_bytes(component);
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(component.as_ref());
+    original_len
 }
 
 #[cfg(unix)]
@@ -9137,6 +9498,39 @@ mod tests {
     }
 
     #[test]
+    fn ignore_anchored_directory_glob_matches_root_directory() {
+        let matcher = ignore_matcher(&[b"/tmp-*/"]);
+        assert!(matcher.is_ignored(b"tmp-info-only", true));
+        assert!(matcher.is_ignored(b"tmp-info-only/file.txt", false));
+        assert!(!matcher.is_ignored(b"nested/tmp-info-only", true));
+        assert!(!matcher.is_ignored(b"tmp-info-only", false));
+    }
+
+    #[test]
+    fn ignore_negated_directory_glob_does_not_reinclude_files() {
+        // t0008-ignores "directories and ** matches": a negated directory-only
+        // pattern re-includes *directories* but never the *files* inside them
+        // (git: re-including a dir with `!dir/` still needs an explicit
+        // `!dir/*` to reach its files). Verified against git 2.54 check-ignore:
+        //   data/file              -> data/**           (ignored)
+        //   data/data1/file1       -> data/**           (ignored, NOT !data/**/)
+        //   data/data1/file1.txt   -> !data/**/*.txt    (re-included)
+        //   data/data1   (dir)     -> !data/**/         (re-included)
+        let matcher = ignore_matcher(&[b"data/**", b"!data/**/", b"!data/**/*.txt"]);
+        // Files stay ignored: `!data/**/` must not win the file leaf scan.
+        assert!(matcher.is_ignored(b"data/file", false));
+        assert!(matcher.is_ignored(b"data/data1/file1", false));
+        assert!(matcher.is_ignored(b"data/data2/file2", false));
+        // `.txt` files are re-included by the explicit non-dir negation.
+        assert!(!matcher.is_ignored(b"data/data1/file1.txt", false));
+        assert!(!matcher.is_ignored(b"data/data2/file2.txt", false));
+        // Directories ARE re-included by `!data/**/` (the directory-glob gain
+        // from `fix: match git status ignored directory globs`).
+        assert!(!matcher.is_ignored(b"data/data1", true));
+        assert!(!matcher.is_ignored(b"data/data2", true));
+    }
+
+    #[test]
     fn ignore_double_star_prefix_collapses_to_basename() {
         // `**/X` ≡ `X` for slash-free X (verified against `git check-ignore`).
         let matcher = ignore_matcher(&[b"**/Pods"]);
@@ -9345,11 +9739,8 @@ mod tests {
         let work = root.join("work");
         let git_dir = work.join(".git");
         fs::create_dir_all(&git_dir).expect("create non-bare git dir");
-        fs::write(
-            git_dir.join("config"),
-            b"[core]\n\tbare = false\n",
-        )
-        .expect("write non-bare config");
+        fs::write(git_dir.join("config"), b"[core]\n\tbare = false\n")
+            .expect("write non-bare config");
 
         assert_eq!(
             worktree_root_for_git_dir(&git_dir).expect("resolve non-bare worktree root"),
@@ -9695,14 +10086,15 @@ mod tests {
     #[test]
     fn standard_attribute_matcher_matches_per_path_lookup() {
         let root = temp_root();
-        fs::create_dir_all(root.join(".git").join("info"))
-            .expect("test operation should succeed");
-        fs::create_dir_all(root.join("src").join("nested"))
-            .expect("test operation should succeed");
+        fs::create_dir_all(root.join(".git").join("info")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("src").join("nested")).expect("test operation should succeed");
         fs::write(root.join(".gitattributes"), b"*.rs diff=rust\n")
             .expect("test operation should succeed");
-        fs::write(root.join("src").join(".gitattributes"), b"*.rs diff=python\n")
-            .expect("test operation should succeed");
+        fs::write(
+            root.join("src").join(".gitattributes"),
+            b"*.rs diff=python\n",
+        )
+        .expect("test operation should succeed");
         fs::write(
             root.join(".git").join("info").join("attributes"),
             b"src/nested/*.rs diff=java\n",
