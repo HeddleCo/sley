@@ -30,8 +30,62 @@ struct AmOptions {
     signoff: bool,
     /// Fall back to a 3-way merge when straight application fails (`-3`).
     three_way: bool,
-    /// Keep non-empty commits whose patch is empty rather than erroring.
+    /// Keep non-empty commits whose patch is empty rather than erroring
+    /// (`-k`/`--keep` / `--keep-non-patch`).
     keep_non_patch: bool,
+    /// Keep the subject line verbatim, skipping all mailinfo cleanup
+    /// (`-k`/`--keep`).
+    keep_subject: bool,
+    /// Strip `[PATCH]`-style brackets but keep other `[…]` brackets in the
+    /// subject (`-b`/`--keep-non-patch`).
+    keep_non_patch_brackets: bool,
+    /// Append the patch's `Message-ID:` header to each commit message
+    /// (`-m`/`--message-id`, or `am.messageid`).
+    message_id: bool,
+    /// Use each patch's author date as the committer date too
+    /// (`--committer-date-is-author-date`).
+    committer_date_is_author_date: bool,
+    /// Ignore the patch's `Date:` header, using the current time for the author
+    /// (and, with `--committer-date-is-author-date`, the committer) date
+    /// (`--ignore-date`).
+    ignore_date: bool,
+    /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
+    no_verify: bool,
+    /// Keep CR at the end of mail lines instead of stripping it (`--keep-cr`).
+    /// Default (false / `--no-keep-cr`) strips the CR a CRLF transport added.
+    keep_cr: bool,
+}
+
+impl AmOptions {
+    fn subject_cleanup(&self) -> SubjectCleanup {
+        SubjectCleanup {
+            keep_subject: self.keep_subject,
+            keep_non_patch_brackets: self.keep_non_patch_brackets,
+        }
+    }
+}
+
+/// How a patch's `Subject:` header should be cleaned, mirroring git's mailinfo
+/// `keep_subject` (`-k`) and `keep_non_patch_brackets_in_subject` (`-b`).
+#[derive(Clone, Copy, Default)]
+struct SubjectCleanup {
+    /// `-k`/`--keep`: keep the subject verbatim, no cleanup at all.
+    keep_subject: bool,
+    /// `-b`/`--keep-non-patch`: strip `[PATCH]` brackets but keep other `[…]`.
+    keep_non_patch_brackets: bool,
+}
+
+/// The subset of `AmOptions` that affects how each commit object is built. Read
+/// back from the state directory for each patch so `--continue` reproduces the
+/// same commits an uninterrupted run would have.
+#[derive(Clone, Copy)]
+struct AmCommitOpts {
+    signoff: bool,
+    message_id: bool,
+    committer_date_is_author_date: bool,
+    ignore_date: bool,
+    /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
+    no_verify: bool,
 }
 
 /// A single message extracted from an mbox: identity, message, and raw diff.
@@ -50,6 +104,10 @@ struct AmPatch {
     subject: String,
     /// Full commit message (subject + blank line + body), newline-terminated.
     message: Vec<u8>,
+    /// The raw `Message-ID:` header value (including the surrounding angle
+    /// brackets, e.g. `<...@example.com>`), if the message carried one. Appended
+    /// to the commit message when `--message-id`/`am.messageid` is set.
+    message_id: Option<String>,
     /// The unified diff body (everything from the first `diff`/`---` onward).
     diff: Vec<u8>,
 }
@@ -64,7 +122,11 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
 
     // Resume sub-operations are mutually exclusive and take no mbox arguments.
+    // `--show-current-patch[=raw|=diff]` is a "command mode" like git's
+    // OPT_CMDMODE: setting two *different* modes is an error, but repeating the
+    // *same* mode is accepted (t4150 "accepts repeated --show-current-patch").
     let mut resume = None;
+    let mut show_patch: Option<ShowPatchMode> = None;
     let mut option_args = Vec::new();
     for arg in args {
         match arg.as_str() {
@@ -77,8 +139,24 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                     other => other,
                 });
             }
+            "--show-current-patch" => set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?,
+            "--show-current-patch=raw" => {
+                set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?
+            }
+            "--show-current-patch=diff" => {
+                set_show_patch_mode(&mut show_patch, ShowPatchMode::Diff)?
+            }
+            value if value.starts_with("--show-current-patch=") => {
+                let arg = &value["--show-current-patch=".len()..];
+                eprintln!("error: invalid value for '--show-current-patch': '{arg}'");
+                return Err(GitError::Exit(129));
+            }
             other => option_args.push(other.to_string()),
         }
+    }
+
+    if let Some(mode) = show_patch {
+        return am_show_current_patch(&state_dir, mode);
     }
 
     if let Some(resume) = resume {
@@ -103,7 +181,13 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         };
     }
 
-    let options = parse_am_options(&option_args)?;
+    let mut options = parse_am_options(&option_args)?;
+
+    // git seeds am.messageid / am.threeWay from config, then lets the
+    // command-line flag (handled in parse_am_options) override. parse_am_options
+    // leaves an unspecified flag at false, so OR the config default in only when
+    // the user did not pass an explicit `--[no-]…` form.
+    apply_am_config_defaults(&git_dir, &option_args, &mut options);
 
     // Starting a new run while one is unfinished is an error in git.
     if state_dir.exists() {
@@ -114,7 +198,13 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let input = read_am_input(&options.mboxes)?;
+    let mut input = read_am_input(&options.mboxes)?;
+    // git's mailsplit strips a trailing CR from each line by default; only
+    // `--keep-cr` keeps it. Normalising CRLF -> LF here lets a CRLF mail apply
+    // and commit byte-identically to its LF original.
+    if !options.keep_cr {
+        input = strip_cr(&input);
+    }
 
     // git treats explicit mbox files and stdin differently. A file must pass
     // patch-format detection: if it does not look like a mailbox, a mail, or a
@@ -126,7 +216,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let patches = parse_mbox(&input)?;
+    let patches = parse_mbox(&input, options.subject_cleanup())?;
     // No messages at all (empty/whitespace stdin) — nothing to do.
     if patches.is_empty() {
         return Ok(());
@@ -139,6 +229,15 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     })?;
 
     write_am_state_dir(&state_dir, &patches, &options, &head_oid)?;
+
+    // git refuses to start applying onto a dirty index (the index differs from
+    // HEAD). The state dir already exists at this point — cell 4 checks it
+    // survives — and git records `dirtyindex` before dying.
+    if am_index_is_dirty(&git_dir, &common_git_dir, format, &head_oid)? {
+        fs::write(state_dir.join("dirtyindex"), b"t\n")?;
+        eprintln!("Dirty index: cannot apply patches (dirty: )");
+        return Err(GitError::Exit(128));
+    }
 
     run_am_series(
         &git_dir,
@@ -158,6 +257,13 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         signoff: false,
         three_way: false,
         keep_non_patch: false,
+        keep_subject: false,
+        keep_non_patch_brackets: false,
+        message_id: false,
+        committer_date_is_author_date: false,
+        ignore_date: false,
+        no_verify: false,
+        keep_cr: false,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -176,24 +282,37 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-signoff" => options.signoff = false,
             "-3" | "--3way" => options.three_way = true,
             "--no-3way" => options.three_way = false,
-            "-k" | "--keep" | "--keep-non-patch" => options.keep_non_patch = true,
+            "-k" | "--keep" => {
+                options.keep_non_patch = true;
+                options.keep_subject = true;
+            }
+            "-b" | "--keep-non-patch" => {
+                options.keep_non_patch = true;
+                options.keep_non_patch_brackets = true;
+            }
+            "-m" | "--message-id" => options.message_id = true,
+            "--no-message-id" => options.message_id = false,
+            "--committer-date-is-author-date" => {
+                options.committer_date_is_author_date = true
+            }
+            "--no-committer-date-is-author-date" => {
+                options.committer_date_is_author_date = false
+            }
+            "--ignore-date" => options.ignore_date = true,
+            "--no-ignore-date" => options.ignore_date = false,
+            "-n" | "--no-verify" => options.no_verify = true,
+            "--verify" => options.no_verify = false,
+            "--keep-cr" => options.keep_cr = true,
+            "--no-keep-cr" => options.keep_cr = false,
             // Accepted no-ops: these affect mail parsing / cosmetics we already
             // handle or that do not change the resulting commits for the inputs
             // `git format-patch` produces.
             "-u"
             | "--utf8"
             | "--no-utf8"
-            | "-m"
-            | "--message-id"
-            | "--no-message-id"
             | "-c"
             | "--scissors"
             | "--no-scissors"
-            | "--keep-cr"
-            | "--no-keep-cr"
-            | "--committer-date-is-author-date"
-            | "--no-committer-date-is-author-date"
-            | "--ignore-date"
             | "--ignore-whitespace"
             | "--no-ignore-whitespace"
             | "--whitespace"
@@ -220,6 +339,44 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
     Ok(options)
 }
 
+/// Apply `am.messageid` / `am.threeWay` config defaults, but only for a flag the
+/// command line did not explicitly set (an explicit `--[no-]message-id` /
+/// `--[no-]3way` wins over config, matching git's parse order: config first,
+/// then the command-line override).
+fn apply_am_config_defaults(git_dir: &Path, args: &[String], options: &mut AmOptions) {
+    let has = |needles: &[&str]| args.iter().any(|a| needles.contains(&a.as_str()));
+    if !has(&["-m", "--message-id", "--no-message-id"])
+        && let Some(value) = am_config_bool(git_dir, "messageid")
+    {
+        options.message_id = value;
+    }
+    if !has(&["-3", "--3way", "--no-3way"])
+        && let Some(value) = am_config_bool(git_dir, "threeWay")
+    {
+        options.three_way = value;
+    }
+}
+
+/// Read a boolean `am.<key>` value from the effective config (repo + global +
+/// `-c`/env overrides), returning `None` when unset or unparsable.
+fn am_config_bool(git_dir: &Path, key: &str) -> Option<bool> {
+    let value = if let Some(config) = commands::merge_rebase::effective_config_with_overrides()
+        && let Some(value) = config.get("am", None, key)
+    {
+        value.to_string()
+    } else {
+        commands::remote_cmds::read_repo_config(git_dir)
+            .ok()?
+            .get("am", None, key)?
+            .to_string()
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" | "" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn am_usage() {
     eprintln!("usage: git am [--signoff] [--keep] [-q | --quiet] [-3 | --3way] [<mbox>...]");
     eprintln!("   or: git am (--continue | --skip | --abort | --quit)");
@@ -228,6 +385,85 @@ fn am_usage() {
 fn am_incompatible_resume_error(existing: &str, new: &str) -> Result<()> {
     eprintln!("fatal: options '{existing}' and '{new}' cannot be used together");
     Err(GitError::Exit(128))
+}
+
+/// Which artifact `git am --show-current-patch` dumps to stdout.
+#[derive(Clone, Copy, PartialEq)]
+enum ShowPatchMode {
+    /// `--show-current-patch` (default) / `=raw`: the raw mbox message
+    /// (`.git/rebase-apply/NNNN`).
+    Raw,
+    /// `--show-current-patch=diff`: the extracted diff (`.git/rebase-apply/patch`).
+    Diff,
+}
+
+/// Record a `--show-current-patch` command-mode like git's `OPT_CMDMODE`:
+/// repeating the *same* mode is accepted; selecting a second *different* mode is
+/// an error (matching git's "... is incompatible with ..." command-mode check).
+fn set_show_patch_mode(slot: &mut Option<ShowPatchMode>, mode: ShowPatchMode) -> Result<()> {
+    match slot {
+        Some(existing) if *existing != mode => {
+            eprintln!(
+                "error: --show-current-patch={} is incompatible with --show-current-patch={}",
+                show_patch_arg(mode),
+                show_patch_arg(*existing),
+            );
+            Err(GitError::Exit(129))
+        }
+        _ => {
+            *slot = Some(mode);
+            Ok(())
+        }
+    }
+}
+
+fn show_patch_arg(mode: ShowPatchMode) -> &'static str {
+    match mode {
+        ShowPatchMode::Raw => "raw",
+        ShowPatchMode::Diff => "diff",
+    }
+}
+
+/// Implement `git am --show-current-patch[=raw|=diff]`: dump the current paused
+/// patch to stdout. `raw` prints the raw mbox message for the current patch
+/// number (`.git/rebase-apply/NNNN`); `diff` prints the extracted diff
+/// (`.git/rebase-apply/patch`). With no resolve in progress git fails.
+fn am_show_current_patch(state_dir: &Path, mode: ShowPatchMode) -> Result<()> {
+    if !state_dir.exists() {
+        eprintln!("fatal: Resolve operation not in progress, we are not resuming.");
+        return Err(GitError::Exit(128));
+    }
+    let path = match mode {
+        ShowPatchMode::Raw => {
+            // The current patch number is recorded in `next` (1-based), stored
+            // as the zero-padded `NNNN` filename git uses (e.g. `0001`). A
+            // missing/garbled `next` falls back to the first patch.
+            let next = read_state_usize(state_dir, "next").unwrap_or(1);
+            state_dir.join(format!("{next:04}"))
+        }
+        ShowPatchMode::Diff => state_dir.join("patch"),
+    };
+    let data = fs::read(&path).map_err(|err| {
+        eprintln!("fatal: failed to read '{}': {err}", path.display());
+        GitError::Exit(128)
+    })?;
+    io::stdout().write_all(&data)?;
+    Ok(())
+}
+
+/// Strip a trailing CR from every CRLF in the buffer (git's default
+/// `--no-keep-cr` mailsplit behaviour). Only `\r` immediately before a `\n` is
+/// removed, so a lone `\r` mid-line (rare in mail) is preserved.
+fn strip_cr(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut iter = input.iter().peekable();
+    while let Some(&byte) = iter.next() {
+        if byte == b'\r' && iter.peek() == Some(&&b'\n') {
+            continue;
+        }
+        out.push(byte);
+    }
+    out
 }
 
 /// Read every mbox file (or stdin when none are given) into one buffer.
@@ -254,7 +490,10 @@ fn read_am_input(mboxes: &[String]) -> Result<Vec<u8>> {
 fn looks_like_patch_input(input: &[u8]) -> bool {
     for line in split_keep_newline(input) {
         let line = trim_trailing_newline(&line);
-        if line.is_empty() {
+        // git's mailsplit treats leading all-whitespace lines as blank and skips
+        // them before locating the first header (the t4150 "preceding
+        // whitespace" patch leads with 255 spaces).
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         if line.starts_with(b"From ") || is_diff_start(line) {
@@ -282,7 +521,7 @@ fn looks_like_patch_input(input: &[u8]) -> bool {
 /// messages (the caller treats that as a no-op). A message that turns out to
 /// carry no diff is still returned so the series driver can report the exact
 /// "Patch is empty." behaviour git uses (including its hint block).
-fn parse_mbox(input: &[u8]) -> Result<Vec<AmPatch>> {
+fn parse_mbox(input: &[u8], cleanup: SubjectCleanup) -> Result<Vec<AmPatch>> {
     if input.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Ok(Vec::new());
     }
@@ -296,29 +535,42 @@ fn parse_mbox(input: &[u8]) -> Result<Vec<AmPatch>> {
     }
     if starts.is_empty() {
         // No separator: the whole buffer is one message.
-        return Ok(vec![parse_message(&lines)?]);
+        return Ok(vec![parse_message(&lines, cleanup)?]);
     }
     let mut patches = Vec::new();
     for (position, &start) in starts.iter().enumerate() {
         let end = starts.get(position + 1).copied().unwrap_or(lines.len());
         // Skip the leading "From " separator line itself.
         let body = &lines[start + 1..end];
-        patches.push(parse_message(body)?);
+        patches.push(parse_message(body, cleanup)?);
     }
     Ok(patches)
 }
 
 /// Parse a single message (headers + blank line + body + diff).
-fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
+fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> {
     let mut author_name = String::new();
     let mut author_email = String::new();
     let mut author_date = None;
     let mut author_date_raw = None;
     let mut subject = String::new();
+    let mut message_id = None;
+
+    // Skip any leading all-whitespace lines before the headers (git's mailinfo
+    // ignores blank/whitespace lines preceding the first header; the t4150
+    // "preceding whitespace" patch leads with a 255-space line).
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = trim_trailing_newline(&lines[idx]);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
 
     // Phase 1: RFC822-style headers, ending at the first blank line. Continuation
     // lines (leading whitespace) extend the previous header value.
-    let mut idx = 0;
     let mut last_header: Option<String> = None;
     let mut header_values: Vec<(String, String)> = Vec::new();
     while idx < lines.len() {
@@ -361,7 +613,8 @@ fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
                 author_date_raw = Some(value.clone());
                 author_date = parse_rfc2822_date(value);
             }
-            "subject" => subject = clean_subject(value),
+            "subject" => subject = clean_subject(value, cleanup),
+            "message-id" if !value.is_empty() => message_id = Some(value.clone()),
             _ => {}
         }
     }
@@ -422,6 +675,7 @@ fn parse_message(lines: &[Vec<u8>]) -> Result<AmPatch> {
         author_date_raw,
         subject,
         message,
+        message_id,
         diff,
     })
 }
@@ -442,23 +696,59 @@ fn parse_from_header(value: &str) -> (String, String) {
     (addr.clone(), addr)
 }
 
-/// Strip a leading `[PATCH …]`/`[PATCH]` bracket prefix and surrounding space
-/// from a subject, and decode a possible MIME encoded-word.
-fn clean_subject(value: &str) -> String {
+/// Clean a `Subject:` value the way git's mailinfo `cleanup_subject` does:
+/// repeatedly strip a leading `Re:` (case-insensitive), leading spaces / tabs /
+/// colons, and `[…]` brackets, then trim. A `[…]` bracket is removed unless
+/// `keep_non_patch_brackets` (`-b`/`--keep-non-patch`) is set AND the bracket is
+/// ≥7 chars and does NOT contain `PATCH` — those non-patch brackets (e.g.
+/// `[foo]`) are kept, along with one following space. With `keep_subject`
+/// (`-k`/`--keep`) the subject is kept verbatim (only MIME-decoded + trimmed).
+fn clean_subject(value: &str, cleanup: SubjectCleanup) -> String {
     let decoded = decode_mime_word(value);
-    let mut subject = decoded.trim();
-    // Remove one or more leading `[...]` brackets (e.g. `[PATCH 1/3]`, `[RFC]`).
-    loop {
-        let trimmed = subject.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('[')
-            && let Some(close) = rest.find(']')
-        {
-            subject = rest[close + 1..].trim_start();
-            continue;
-        }
-        break;
+    if cleanup.keep_subject {
+        return decoded.trim().to_string();
     }
-    subject.trim().to_string()
+    let keep_non_patch = cleanup.keep_non_patch_brackets;
+    let mut bytes = decoded.trim().as_bytes().to_vec();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'r' | b'R' => {
+                // A leading "Re:" (any case) is dropped.
+                if at + 3 <= bytes.len()
+                    && (bytes[at + 1] == b'e' || bytes[at + 1] == b'E')
+                    && bytes[at + 2] == b':'
+                {
+                    bytes.drain(at..at + 3);
+                    continue;
+                }
+                break;
+            }
+            b' ' | b'\t' | b':' => {
+                bytes.remove(at);
+                continue;
+            }
+            b'[' => {
+                let Some(rel) = bytes[at..].iter().position(|&b| b == b']') else {
+                    break;
+                };
+                let remove = rel + 1; // length of "[...]"
+                let contains_patch =
+                    remove >= 7 && bytes[at..at + remove].windows(5).any(|w| w == b"PATCH");
+                if !keep_non_patch || contains_patch {
+                    bytes.drain(at..at + remove);
+                } else {
+                    at += remove;
+                    if bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+                        at += 1;
+                    }
+                }
+                continue;
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 /// Best-effort decode of a single RFC 2047 encoded-word for UTF-8/Q or B
@@ -708,6 +998,16 @@ fn write_am_state_dir(
     fs::write(state_dir.join("sign"), bool_flag(options.signoff))?;
     fs::write(state_dir.join("threeway"), bool_flag(options.three_way))?;
     fs::write(state_dir.join("keep"), bool_flag(options.keep_non_patch))?;
+    fs::write(state_dir.join("messageid"), bool_flag(options.message_id))?;
+    fs::write(
+        state_dir.join("committer-date-is-author-date"),
+        bool_flag(options.committer_date_is_author_date),
+    )?;
+    fs::write(
+        state_dir.join("ignore-date"),
+        bool_flag(options.ignore_date),
+    )?;
+    fs::write(state_dir.join("no-verify"), bool_flag(options.no_verify))?;
     fs::write(state_dir.join("utf8"), b"t\n")?;
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
@@ -739,7 +1039,16 @@ fn encode_patch_file(patch: &AmPatch) -> Vec<u8> {
         out.extend_from_slice(date.as_bytes());
         out.push(b'\n');
     }
-    out.extend_from_slice(b"Subject: [PATCH] ");
+    if let Some(message_id) = &patch.message_id {
+        out.extend_from_slice(b"Message-ID: ");
+        out.extend_from_slice(message_id.as_bytes());
+        out.push(b'\n');
+    }
+    // Store the already-cleaned subject verbatim (no `[PATCH]` re-prefix): it has
+    // had mailinfo cleanup applied once at parse time, so `read_patch_file`
+    // re-parses with `keep_subject` to keep it byte-identical across the
+    // store/resume round-trip.
+    out.extend_from_slice(b"Subject: ");
     out.extend_from_slice(patch.subject.as_bytes());
     out.extend_from_slice(b"\n\n");
     // Body (message minus the subject's first line).
@@ -815,7 +1124,16 @@ fn read_patch_file(state_dir: &Path, number: usize) -> Result<AmPatch> {
     let path = state_dir.join(format!("{number:04}"));
     let content = fs::read(&path)?;
     let lines = split_keep_newline(&content);
-    parse_message(&lines)
+    // The stored subject was already cleaned at the first parse (see
+    // `encode_patch_file`), so re-parse it verbatim — re-running cleanup would
+    // double-strip brackets the original `-k`/`-b` run deliberately kept.
+    parse_message(
+        &lines,
+        SubjectCleanup {
+            keep_subject: true,
+            keep_non_patch_brackets: false,
+        },
+    )
 }
 
 fn read_state_usize(state_dir: &Path, name: &str) -> Result<usize> {
@@ -830,6 +1148,21 @@ fn read_state_bool(state_dir: &Path, name: &str) -> bool {
     fs::read_to_string(state_dir.join(name))
         .map(|content| content.trim() == "t")
         .unwrap_or(false)
+}
+
+/// Read the commit-affecting flags back from the state directory so a resumed
+/// (`--continue`/`--skip`) run builds identical commits to an uninterrupted one.
+fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
+    AmCommitOpts {
+        signoff: read_state_bool(state_dir, "sign"),
+        message_id: read_state_bool(state_dir, "messageid"),
+        committer_date_is_author_date: read_state_bool(
+            state_dir,
+            "committer-date-is-author-date",
+        ),
+        ignore_date: read_state_bool(state_dir, "ignore-date"),
+        no_verify: read_state_bool(state_dir, "no-verify"),
+    }
 }
 
 // ===========================================================================
@@ -852,14 +1185,14 @@ fn run_am_series(
 ) -> Result<()> {
     let last = read_state_usize(state_dir, "last")?;
     let quiet = read_state_bool(state_dir, "quiet");
-    let signoff = read_state_bool(state_dir, "sign");
     let three_way = read_state_bool(state_dir, "threeway");
     let keep_non_patch = read_state_bool(state_dir, "keep");
+    let commit_opts = read_am_commit_opts(state_dir);
 
     let mut number = start;
     while number <= last {
         fs::write(state_dir.join("next"), format!("{number}\n"))?;
-        let patch = read_patch_file(state_dir, number)?;
+        let mut patch = read_patch_file(state_dir, number)?;
         write_current_patch_state(state_dir, &patch)?;
 
         // A message that carried no diff stops the series with git's empty-patch
@@ -869,6 +1202,12 @@ fn run_am_series(
             println!("Patch is empty.");
             return Err(GitError::Exit(128));
         }
+
+        // git runs the applypatch-msg hook BEFORE applying the patch, so a
+        // failing hook leaves HEAD and the worktree untouched (the patch never
+        // lands). The hook may rewrite the message in `final-commit`; we re-read
+        // it so the resulting commit reflects the edit. `--no-verify` skips it.
+        patch.message = prepare_am_commit_message(git_dir, &patch, commit_opts)?;
 
         if !quiet {
             println!("Applying: {}", patch.subject);
@@ -880,7 +1219,7 @@ fn run_am_series(
             worktree_root,
             format,
             &patch,
-            signoff,
+            commit_opts,
             three_way,
         )? {
             ApplyResult::Committed => number += 1,
@@ -895,10 +1234,63 @@ fn run_am_series(
     finish_am(state_dir)
 }
 
+/// Build the commit message for a patch and run the `applypatch-msg` hook the
+/// way git does — BEFORE the patch is applied. Appends the `Message-ID:` trailer
+/// (when `--message-id`/`am.messageid` is set), writes it to
+/// `.git/rebase-apply/final-commit`, runs `applypatch-msg` (unless
+/// `--no-verify`), and returns the possibly hook-edited message read back from
+/// the file. A non-zero hook exit aborts the whole am run (exit 1) with the
+/// state dir and HEAD left intact, exactly like git's `run_applypatch_msg_hook`.
+fn prepare_am_commit_message(
+    git_dir: &Path,
+    patch: &AmPatch,
+    commit_opts: AmCommitOpts,
+) -> Result<Vec<u8>> {
+    let mut message = patch.message.clone();
+    if commit_opts.message_id
+        && let Some(message_id) = &patch.message_id
+    {
+        am_append_message_id(&mut message, message_id);
+    }
+    let final_commit = git_dir.join("rebase-apply").join("final-commit");
+    fs::write(&final_commit, &message)?;
+    if !commit_opts.no_verify {
+        let arg = final_commit.to_string_lossy().into_owned();
+        // A failing applypatch-msg hook aborts the series; git exits 1 and leaves
+        // the state dir in place so the user can fix the hook and resume.
+        if commands::hooks::run_hook_l("applypatch-msg", &[arg.as_str()]).is_err() {
+            return Err(GitError::Exit(1));
+        }
+    }
+    // Re-read: the hook may have rewritten the message in `final-commit`.
+    Ok(fs::read(&final_commit)?)
+}
+
 /// Outcome of attempting to apply (and commit) a single patch.
 enum ApplyResult {
     Committed,
     Conflict,
+}
+
+/// Whether the index differs from HEAD (git's `repo_index_has_changes`): the
+/// index tree is written and compared to HEAD's tree. `git am` refuses to begin
+/// applying onto such a dirty index. Returns `false` when the index is clean or
+/// cannot be written to a tree (e.g. unmerged entries are handled elsewhere).
+fn am_index_is_dirty(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    head_oid: &ObjectId,
+) -> Result<bool> {
+    let index_tree = match sley_worktree::write_tree_from_index(git_dir, format) {
+        Ok(tree) => tree,
+        // An index that cannot be written to a tree is not the "dirty" case this
+        // guard targets; let the normal apply path surface any real problem.
+        Err(_) => return Ok(false),
+    };
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let head_tree = commit_tree_oid(&db, format, head_oid)?;
+    Ok(index_tree != head_tree)
 }
 
 /// Apply one patch's diff to the worktree+index and create the commit.
@@ -913,7 +1305,7 @@ fn apply_one_patch(
     worktree_root: &Path,
     format: ObjectFormat,
     patch: &AmPatch,
-    signoff: bool,
+    commit_opts: AmCommitOpts,
     three_way: bool,
 ) -> Result<ApplyResult> {
     let file_patches = sley_diff_merge::parse_unified_patch(&patch.diff)?;
@@ -928,7 +1320,7 @@ fn apply_one_patch(
                 format,
                 patch,
                 &actions,
-                signoff,
+                commit_opts,
             )?;
             Ok(ApplyResult::Committed)
         }
@@ -942,7 +1334,7 @@ fn apply_one_patch(
                     format,
                     patch,
                     &file_patches,
-                    signoff,
+                    commit_opts,
                 );
             }
             for file in &file_patches {
@@ -1042,7 +1434,7 @@ fn stage_and_commit(
     format: ObjectFormat,
     patch: &AmPatch,
     actions: &[ApplyFileAction],
-    signoff: bool,
+    commit_opts: AmCommitOpts,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut index = read_repository_index(git_dir, format)?.unwrap_or(Index {
@@ -1081,7 +1473,7 @@ fn stage_and_commit(
         worktree_root,
         format,
         patch,
-        signoff,
+        commit_opts,
     )
 }
 
@@ -1107,29 +1499,30 @@ fn create_am_commit(
     worktree_root: &Path,
     format: ObjectFormat,
     patch: &AmPatch,
-    signoff: bool,
+    commit_opts: AmCommitOpts,
 ) -> Result<()> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
-    let author = am_author_identity(patch)?;
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let message_path = git_dir.join("rebase-apply").join("final-commit");
-    let message_path = if message_path.exists() {
-        message_path
-    } else {
-        git_dir.join("COMMIT_EDITMSG")
-    };
-    fs::write(&message_path, &patch.message)?;
-    let message_arg = message_path.to_string_lossy().into_owned();
-    commands::hooks::run_hook_l("applypatch-msg", &[message_arg.as_str()])?;
-    let mut message = fs::read(&message_path)?;
-    if signoff {
-        message = commit_message_with_signoff(message, &commit_signoff_from_env()?);
+    let (author, committer) = am_commit_identities(patch, commit_opts)?;
+    // The message has already been finalised (Message-ID appended + the
+    // applypatch-msg hook run) in `prepare_am_commit_message`, BEFORE the patch
+    // was applied — git's ordering. Here we only append the sign-off, which git
+    // does on `state->msg` just before writing the commit object.
+    let mut message = patch.message.clone();
+    if commit_opts.signoff {
+        message = am_append_signoff(message, &commit_signoff_from_env()?);
     }
-    commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())?;
+    // pre-applypatch runs after staging, before the commit; a failure aborts the
+    // run (git exits 1). `--no-verify` skips it.
+    if !commit_opts.no_verify
+        && commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())
+            .is_err()
+    {
+        return Err(GitError::Exit(1));
+    }
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let new_oid = sley_sequencer::create_commit(
@@ -1162,18 +1555,174 @@ fn create_am_commit(
     });
     tx.commit()?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
-    commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default())?;
+    // git runs post-applypatch but ignores its exit status — it is purely
+    // informational, run after the commit has already landed (builtin/am.c
+    // calls `run_hooks` without checking the result). Swallow any failure.
+    let _ = commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default());
     Ok(())
 }
 
-/// Build the author identity bytes from the patch headers, falling back to the
-/// environment author date when the email had no parsable `Date:`.
-fn am_author_identity(patch: &AmPatch) -> Result<Vec<u8>> {
-    let date = patch
-        .author_date
-        .clone()
-        .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
-    sley_sequencer::format_commit_identity(&patch.author_name, &patch.author_email, &date)
+/// Build the author and committer identity bytes for an am commit, honouring
+/// `--ignore-date` and `--committer-date-is-author-date` exactly as builtin/am.c
+/// does:
+///
+///   - author date: the patch's `Date:`; with `--ignore-date`, the current time
+///     (git passes `NULL` to `fmt_ident`, which uses "now").
+///   - committer: normally the environment committer (name/email/date the same
+///     way `git commit` resolves them). With `--committer-date-is-author-date`,
+///     the committer *date* is set to the author date (or "now" under
+///     `--ignore-date`), keeping the committer name/email from the environment.
+fn am_commit_identities(patch: &AmPatch, opts: AmCommitOpts) -> Result<(Vec<u8>, Vec<u8>)> {
+    // The author date: the patch's Date:, the env author date, or "now".
+    let author_date = if opts.ignore_date {
+        am_now_date()
+    } else {
+        patch
+            .author_date
+            .clone()
+            .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| am_now_date()))
+    };
+    let author =
+        sley_sequencer::format_commit_identity(&patch.author_name, &patch.author_email, &author_date)?;
+
+    let committer = if opts.committer_date_is_author_date {
+        commit_identity_from_env_with_date("COMMITTER", &author_date)?
+    } else {
+        commit_identity_from_env("COMMITTER")?
+    };
+    Ok((author, committer))
+}
+
+/// The current wall-clock time formatted as git's raw `<seconds> <±HHMM>`. Used
+/// when `--ignore-date` discards the patch's `Date:` (git passes `NULL` to
+/// `fmt_ident`, which fills in "now"). Mirrors git's behaviour in the t4150
+/// `--ignore-date` test, which runs with a `+0000` (UTC) environment.
+fn am_now_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("@{secs} +0000")
+}
+
+/// Append a `Message-ID: <value>` line to the commit message body, matching
+/// git's mailinfo: the header value is emitted verbatim as the final body line.
+fn am_append_message_id(message: &mut Vec<u8>, message_id: &str) {
+    if !message.is_empty() && !message.ends_with(b"\n") {
+        message.push(b'\n');
+    }
+    message.extend_from_slice(b"Message-ID: ");
+    message.extend_from_slice(message_id.as_bytes());
+    message.push(b'\n');
+}
+
+/// Append a `Signed-off-by:` trailer to an am commit message, faithfully
+/// mirroring git's `append_signoff(msgbuf, 0, 0)` as called from
+/// `am_append_signoff` in builtin/am.c. Two behaviours distinguish this from
+/// `commit -s` (which passes `APPEND_SIGNOFF_DEDUP`):
+///
+///   1. **No de-duplication.** `git am --signoff` always appends the trailer
+///      even when an identical `Signed-off-by:` already appears earlier in the
+///      message (t4150 cells "duplicates Signed-off-by: if it is not the last
+///      one" / "adds Signed-off-by: if another author is preset").
+///   2. **Conforming-footer-aware blank line.** A blank line is inserted before
+///      the trailer only when the message does NOT already end with a trailer
+///      block; when the last paragraph is a conforming footer (e.g. ends with a
+///      `Reported-by:`/`Signed-off-by:` line), the new trailer is appended
+///      directly, with no separating blank line.
+fn am_append_signoff(mut message: Vec<u8>, signoff: &[u8]) -> Vec<u8> {
+    // `signoff` is the full "Signed-off-by: name <email>" line (no newline).
+    let mut sob = signoff.to_vec();
+    sob.push(b'\n');
+
+    // git's strbuf_complete_line: ensure the buffer ends with a newline.
+    if !message.is_empty() && !message.ends_with(b"\n") {
+        message.push(b'\n');
+    }
+
+    // git's append_signoff: if the whole buffer equals the sob, has_footer is 3;
+    // otherwise classify the trailing trailer block (0/1/2/3).
+    let has_footer = if message == sob {
+        3
+    } else {
+        am_conforming_footer_state(&message, &sob)
+    };
+
+    if has_footer == 0 {
+        let len = message.len();
+        if len == 0 {
+            message.extend_from_slice(b"\n\n");
+        } else if len == 1 {
+            // Buffer is a single newline.
+            message.push(b'\n');
+        } else if message[len - 2] != b'\n' {
+            // Buffer ends with a single newline; add another for the blank line.
+            message.push(b'\n');
+        } // else already ends with two newlines.
+    }
+
+    // builtin/am.c passes flag 0 (no DEDUP), so git's gate reduces to
+    // `has_footer != 3`: append unless the sob is already the LAST trailer.
+    if has_footer != 3 {
+        message.extend_from_slice(&sob);
+    }
+    message
+}
+
+/// Port of git's `has_conforming_footer` 3-state result for the final paragraph
+/// of `message`, given the target `sob` line (with trailing newline):
+///   0 — the last paragraph is not a conforming trailer block;
+///   1 — it is a trailer block, but contains no line equal to `sob`;
+///   2 — it contains `sob`, but `sob` is not the last trailer;
+///   3 — `sob` is the last trailer line.
+fn am_conforming_footer_state(message: &[u8], sob: &[u8]) -> u8 {
+    let text = String::from_utf8_lossy(message);
+    let trimmed = text.trim_end_matches('\n');
+    let last_para = match trimmed.rfind("\n\n") {
+        Some(pos) => &trimmed[pos + 2..],
+        None => trimmed,
+    };
+    if last_para.is_empty() {
+        return 0;
+    }
+    let lines: Vec<&str> = last_para.lines().collect();
+    if !lines.iter().all(|line| is_trailer_line(line)) {
+        return 0;
+    }
+    let sob_line = String::from_utf8_lossy(sob);
+    let sob_line = sob_line.trim_end_matches('\n');
+    let mut found_sob = None;
+    for (i, line) in lines.iter().enumerate() {
+        if *line == sob_line {
+            found_sob = Some(i);
+        }
+    }
+    match found_sob {
+        None => 1,
+        Some(i) if i + 1 == lines.len() => 3,
+        Some(_) => 2,
+    }
+}
+
+/// A single trailer line: `Token<sep> value`, where the token is non-empty and
+/// contains no whitespace, and the separator is `:` or `#` (git's default
+/// trailer separators), optionally followed by whitespace + value. Also accepts
+/// the cherry-pick footer line git's trailer parser tolerates.
+fn is_trailer_line(line: &str) -> bool {
+    if line.starts_with("(cherry picked from commit ") {
+        return true;
+    }
+    let Some(sep) = line.find([':', '#']) else {
+        return false;
+    };
+    let key = &line[..sep];
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return false;
+    }
+    // For a `:` separator git requires the value to be space-separated; `#`
+    // (e.g. `Bug #1234`) is also a recognised trailer separator.
+    let rest = &line[sep + 1..];
+    line.as_bytes()[sep] == b'#' || rest.is_empty() || rest.starts_with(' ')
 }
 
 /// Best-effort 3-way application: reconstruct the pre-image from the index's
@@ -1186,7 +1735,7 @@ fn apply_three_way(
     format: ObjectFormat,
     patch: &AmPatch,
     file_patches: &[sley_diff_merge::FilePatch],
-    signoff: bool,
+    commit_opts: AmCommitOpts,
 ) -> Result<ApplyResult> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
@@ -1290,7 +1839,7 @@ fn apply_three_way(
             worktree_root,
             format,
             patch,
-            signoff,
+            commit_opts,
         )?;
         Ok(ApplyResult::Committed)
     } else {
@@ -1595,7 +2144,7 @@ fn am_continue(
     state_dir: &Path,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
-    let signoff = read_state_bool(state_dir, "sign");
+    let commit_opts = read_am_commit_opts(state_dir);
     let quiet = read_state_bool(state_dir, "quiet");
     let next = read_state_usize(state_dir, "next")?;
     let patch = read_patch_file(state_dir, next)?;
@@ -1622,7 +2171,7 @@ fn am_continue(
         worktree_root,
         format,
         &patch,
-        signoff,
+        commit_opts,
     )?;
     run_am_series(
         git_dir,

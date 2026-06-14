@@ -141,6 +141,7 @@ jobs:
             t4045-diff-relative.sh
             t4047-diff-dirstat.sh
             t4052-stat-output.sh
+            t4150-am.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh
             t4216-log-bloom.sh
