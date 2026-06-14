@@ -7588,8 +7588,9 @@ fn head_matches_index_from_cache_tree(
     head_tree_oid: &ObjectId,
     stage0_entry_count: usize,
 ) -> Result<bool> {
-    let Some(cache_tree) = index.cache_tree(format)? else {
-        return Ok(false);
+    let cache_tree = match index.cache_tree(format) {
+        Ok(Some(cache_tree)) => cache_tree,
+        Ok(None) | Err(_) => return Ok(false),
     };
     if !cache_tree_is_valid(&cache_tree) {
         return Ok(false);
