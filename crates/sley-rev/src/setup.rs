@@ -52,6 +52,7 @@ pub struct RevisionOptions {
     pub show_pulls: bool,
     pub ignore_missing: bool,
     pub had_ref_selector: bool,
+    pub author_patterns: Vec<String>,
 }
 
 impl RevisionOptions {
@@ -293,6 +294,18 @@ where
                     self.setup.options.date_window.max_time = Some(parse_date_cutoff(
                         value.strip_prefix("--before=").expect("prefix matched"),
                     )?);
+                }
+                "--author" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| GitError::Command("--author requires a value".into()))?;
+                    self.setup.options.author_patterns.push(value.clone());
+                }
+                value if value.starts_with("--author=") => {
+                    self.setup
+                        .options
+                        .author_patterns
+                        .push(value["--author=".len()..].to_string());
                 }
                 value if value.starts_with("-n") && value.len() > 2 => {
                     self.setup.options.max_count = Some(parse_max_count(&value[2..])?);
