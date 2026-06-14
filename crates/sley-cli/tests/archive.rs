@@ -271,3 +271,76 @@ fn archive_missing_pathspec_errors_match_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// `git archive` runs `convert_to_working_tree` on every regular-file blob, so
+/// with `core.autocrlf=true` the LF-normalized committed blob is smudged back to
+/// CRLF in the archive (upstream t0024-crlf-archive). The archived bytes must
+/// match oracle git byte-for-byte, including that symlinks are left unconverted.
+#[test]
+#[cfg(unix)]
+fn archive_tar_applies_autocrlf_smudge_like_upstream() {
+    let root = unique_temp_dir("archive-autocrlf");
+    fs::create_dir_all(&root).expect("create fixture dir");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Example User"]);
+        git(&root, &["config", "user.email", "example@example.invalid"]);
+        git(&root, &["config", "core.autocrlf", "true"]);
+        // Commit CRLF content; the clean filter normalizes it to LF in the blob,
+        // and archive smudges it back to CRLF.
+        fs::write(root.join("sample"), b"CRLF line ending\r\nAnd another\r\n")
+            .expect("write crlf file");
+        // A blob git treats as binary (lone CR / NUL) must pass through unchanged.
+        fs::write(root.join("binary"), b"\x00\x01\r\x02").expect("write binary file");
+        unix_fs::symlink("sample", root.join("link")).expect("create symlink");
+        git(&root, &["add", "."]);
+        run_with_env(
+            sley_testkit::oracle_git(),
+            &root,
+            &["commit", "-m", "initial", "-q"],
+            &[
+                ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+                ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+            ],
+        );
+
+        let expected = git(&root, &["archive", "--format=tar", "HEAD"]);
+        let actual = git_rs(&root, &["archive", "--format=tar", "HEAD"]);
+        assert_eq!(actual, expected);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Conversion attributes for `git archive` are read from the *archived tree*'s
+/// `.gitattributes` (upstream sets `GIT_ATTR_INDEX`), so an `eol=crlf` rule
+/// committed into the tree drives the smudge even with default config. The
+/// archived bytes must match oracle git byte-for-byte.
+#[test]
+fn archive_tar_applies_gitattributes_eol_from_tree() {
+    let root = unique_temp_dir("archive-attr-eol");
+    fs::create_dir_all(&root).expect("create fixture dir");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Example User"]);
+        git(&root, &["config", "user.email", "example@example.invalid"]);
+        fs::write(root.join(".gitattributes"), b"*.txt text eol=crlf\n")
+            .expect("write gitattributes");
+        fs::write(root.join("a.txt"), b"one\ntwo\nthree\n").expect("write text file");
+        fs::write(root.join("raw.bin"), b"one\ntwo\n").expect("write unattributed file");
+        git(&root, &["add", "."]);
+        run_with_env(
+            sley_testkit::oracle_git(),
+            &root,
+            &["commit", "-m", "initial", "-q"],
+            &[
+                ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+                ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+            ],
+        );
+
+        let expected = git(&root, &["archive", "--format=tar", "HEAD"]);
+        let actual = git_rs(&root, &["archive", "--format=tar", "HEAD"]);
+        assert_eq!(actual, expected);
+    };
+    let _ = fs::remove_dir_all(&root);
+}

@@ -1096,10 +1096,12 @@ dependencies = [
 name = "sley-archive"
 version = "0.1.0"
 dependencies = [
+ "sley-config",
  "sley-core",
  "sley-formats",
  "sley-object",
  "sley-odb",
+ "sley-worktree",
 ]
 
 [[package]]
