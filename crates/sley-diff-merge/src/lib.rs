@@ -1,5 +1,7 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 
+pub mod render;
+
 pub use sley_core::BString;
 use sley_index::{Index, IndexStatCache};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};

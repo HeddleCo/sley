@@ -107,16 +107,28 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         commit_id,
         pathspecs,
     };
+
+    // Content conversion (smudge: EOL + filter drivers) per the archived tree's
+    // `.gitattributes`, matching `git archive`'s `convert_to_working_tree`. The
+    // attribute root is the worktree (when non-bare) or the git dir (bare); the
+    // git dir locates `info/attributes`. TODO(convert): `--worktree-attributes`
+    // (read live `.gitattributes`) and `export-subst`/`ident` are not wired yet.
+    let config = read_repo_config(&git_dir)?;
+    let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+        .unwrap_or_else(|| git_dir.to_path_buf());
+    let convert =
+        sley_archive::ArchiveConvert::from_tree(&attr_root, &git_dir, &config, &db, format, &tree_oid)?;
+
     if let Some(path) = output {
         let mut file = fs::File::create(path)?;
-        handle_archive_result(sley_archive::write_tar_archive(
-            &mut file, &db, format, &tree_oid, options,
+        handle_archive_result(sley_archive::write_tar_archive_with_convert(
+            &mut file, &db, format, &tree_oid, options, &convert,
         ))
     } else {
         let stdout = io::stdout();
         let mut lock = stdout.lock();
-        handle_archive_result(sley_archive::write_tar_archive(
-            &mut lock, &db, format, &tree_oid, options,
+        handle_archive_result(sley_archive::write_tar_archive_with_convert(
+            &mut lock, &db, format, &tree_oid, options, &convert,
         ))?;
         lock.flush()?;
         Ok(())

@@ -124,6 +124,18 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
 
     // Turn the cwd-relative path into a repository-root-relative path the way
     // git's pathspec handling does, then locate the blob at the start commit.
+    //
+    // TODO(convert): blame's only convert step in upstream is `convert_to_git`
+    // (clean) in `setup_scoreboard`, applied to *working-tree*-sourced content
+    // (a dirty worktree copy or `--contents <file>`) to normalize it before
+    // diffing against committed blobs. Committed blobs read from the object
+    // store (`fill_origin_blob`) are NOT converted — they are already in
+    // git-normalized form. sley's blame always reads its final image from
+    // committed blobs (the working-tree overlay and `--contents` are
+    // unimplemented; see the module doc), so there is nothing to convert here
+    // and applying smudge would diverge from git. When the working-tree overlay
+    // lands, route that worktree-sourced content through
+    // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
     let repo_path = blame_repo_relative_path(cwd, git_dir, &options.path)?;
     let final_blob = match read_path_blob(db, format, &start_commit, &repo_path)? {
         Some(blob) => blob,

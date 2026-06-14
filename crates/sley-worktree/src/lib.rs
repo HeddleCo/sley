@@ -4955,6 +4955,77 @@ impl WorktreeAttributes {
     }
 }
 
+/// A reusable handle that captures a *tree's* `.gitattributes` chain once so
+/// repeated smudge-filter calls (e.g. `git archive` streaming every blob in a
+/// tree) resolve attributes from the tree being processed rather than the live
+/// worktree.
+///
+/// This is the attribute direction `git archive` uses: upstream unpacks the
+/// archived tree into a scratch index and sets `GIT_ATTR_INDEX`, so the
+/// `.gitattributes` that govern conversion come from the *archived tree* (plus
+/// the global/`core.attributesFile` chain and `$GIT_DIR/info/attributes`), not
+/// from whatever happens to be checked out. `--worktree-attributes` callers
+/// should use [`WorktreeAttributes`] instead.
+///
+/// Build it once with [`TreeAttributes::from_tree`], then call
+/// [`TreeAttributes::apply_smudge_filter`] per blob. Behaviourally this mirrors
+/// [`apply_smudge_filter`] except the attribute source is the supplied tree and
+/// the expensive source scan is amortized across calls.
+pub struct TreeAttributes {
+    matcher: AttributeMatcher,
+}
+
+impl TreeAttributes {
+    /// Read the attribute sources for `tree_oid` once: the global /
+    /// `core.attributesFile` chain, every `.gitattributes` blob found while
+    /// walking `tree_oid`, and `$GIT_DIR/info/attributes`.
+    ///
+    /// `attr_root` locates the global config (`read_configured_attributes`);
+    /// pass the worktree root for a non-bare repo, or the git dir for a bare
+    /// one. `git_dir` locates `info/attributes` directly (so this works for bare
+    /// repos, where there is no nested `.git`). No worktree `.gitattributes`
+    /// files are read — use [`WorktreeAttributes`] for the
+    /// `--worktree-attributes` direction.
+    pub fn from_tree(
+        attr_root: impl AsRef<Path>,
+        git_dir: impl AsRef<Path>,
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+        tree_oid: &ObjectId,
+    ) -> Result<Self> {
+        let attr_root = attr_root.as_ref();
+        let mut matcher = AttributeMatcher::default();
+        if !matcher.read_configured_attributes(attr_root) {
+            matcher.read_default_global_attributes();
+        }
+        collect_attribute_patterns_from_tree(db, format, tree_oid, Vec::new(), &mut matcher)?;
+        read_attribute_patterns(
+            git_dir.as_ref().join("info").join("attributes"),
+            &mut matcher,
+            &[],
+            b"info/attributes",
+        );
+        Ok(Self { matcher })
+    }
+
+    /// Apply the smudge conversion (blob -> worktree: EOL `LF`->`CRLF` plus any
+    /// configured `filter.<name>.smudge` driver) to `content` for `path`,
+    /// reusing the cached attribute chain. Behaviourally identical to
+    /// [`apply_smudge_filter`] except attributes come from the tree this handle
+    /// was built from.
+    pub fn apply_smudge_filter(
+        &self,
+        config: &GitConfig,
+        path: &[u8],
+        content: &[u8],
+    ) -> Result<Vec<u8>> {
+        let checks = self
+            .matcher
+            .attributes_for_path(path, &filter_attribute_names(), false);
+        apply_smudge_filter_with_attributes(config, &checks, path, content)
+    }
+}
+
 /// Like [`apply_clean_filter`] but takes already-resolved attribute checks,
 /// letting callers that have computed attributes once reuse them.
 pub fn apply_clean_filter_with_attributes(

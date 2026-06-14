@@ -34,6 +34,7 @@ sley-remote = { path = "../sley-remote" }
 sley-rev = { path = "../sley-rev" }
 sley-sequencer = { path = "../sley-sequencer" }
 sley-strbuf-expand = { path = "../sley-strbuf-expand" }
+sley-submodule = { path = "../sley-submodule" }
 sley-testkit = { path = "../sley-testkit" }
 sley-transport = { path = "../sley-transport", features = ["http-client", "tls-rustls"] }
 sley-unpack-trees = { path = "../sley-unpack-trees" }

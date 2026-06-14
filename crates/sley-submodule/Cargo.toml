@@ -1,0 +1,13 @@
+[package]
+name = "sley-submodule"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-core = { path = "../sley-core" }
+sley-config = { path = "../sley-config" }
+
+[lints]
+workspace = true
