@@ -643,9 +643,14 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         }
         let mut stdout = io::stdout();
         let effective_abbrev_len = abbrev_commit.then_some(abbrev_len).flatten();
+        let mut line = metadata_format
+            .map(|compiled| Vec::with_capacity(compiled.estimated_line_capacity()));
         for record in &selected {
             if let Some(compiled) = metadata_format {
-                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                let line = line
+                    .as_mut()
+                    .expect("metadata line buffer initialized with metadata format");
+                line.clear();
                 emit_compiled_log_format_metadata(
                     record,
                     compiled,
@@ -661,9 +666,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         color: false,
                         output_encoding: "UTF-8",
                     },
-                    &mut line,
+                    line,
                 )?;
-                stdout.write_all(&line)?;
+                stdout.write_all(line)?;
                 if parents && !compiled.uses_parents() {
                     for parent in &record.parents {
                         write!(stdout, " {parent}")?;

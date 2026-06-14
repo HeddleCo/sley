@@ -372,6 +372,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         1 => !cached,
         _ => !cached && !head,
     };
+    let plain_index_worktree_diff = diff_trees.is_empty() && !cached && !head;
     // The new side's *content* comes from the worktree only when there is no second
     // tree and we're not diffing the index (`--cached`). A two-tree `diff A B` takes
     // its new content from tree B's blobs, never the worktree.
@@ -581,8 +582,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // a stat-clean file keeps its index oid in raw output. The
             // worktree entries carry the freshly-hashed content oid, so
             // matching it against the index entry reproduces that rule.
-            let needs_index_oids =
-                zero_worktree_oids && entries.iter().any(|entry| entry.new_oid.is_some());
+            let zero_all_worktree_oids = zero_worktree_oids && plain_index_worktree_diff;
+            let needs_index_oids = zero_worktree_oids
+                && !zero_all_worktree_oids
+                && entries.iter().any(|entry| entry.new_oid.is_some());
             let index_oids: HashMap<Vec<u8>, ObjectId> = if needs_index_oids {
                 let index_path = sley_worktree::repository_index_path(&git_dir);
                 match fs::read(&index_path) {
@@ -597,11 +600,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 HashMap::new()
             };
             for entry in &entries {
-                let zero_entry = zero_worktree_oids
-                    && entry
-                        .new_oid
-                        .as_ref()
-                        .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid));
+                let zero_entry = zero_all_worktree_oids
+                    || (zero_worktree_oids
+                        && entry
+                            .new_oid
+                            .as_ref()
+                            .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)));
                 write_diff_raw_entry(&mut stdout, entry, z, zero_entry, raw_abbrev, format)?;
             }
         }

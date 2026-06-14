@@ -1285,13 +1285,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         };
         let mut stdout = io::stdout();
         let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
+        let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
         for (index, record) in selected.iter().enumerate() {
             // `--pretty=format:` separates entries with a newline (none trailing);
             // `--format=`/`tformat:`/oneline terminate each entry with one.
             if index > 0 && !final_newline {
                 stdout.write_all(term)?;
             }
-            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+            line.clear();
             emit_compiled_log_format_metadata(
                 record,
                 compiled,
@@ -1376,11 +1377,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         if reverse {
             selected.reverse();
         }
+        let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
         for (index, metadata) in selected.iter().enumerate() {
             if index > 0 && !final_newline {
                 stdout.write_all(term)?;
             }
-            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+            line.clear();
             emit_compiled_log_format_limited_commit(
                 &db,
                 metadata,
