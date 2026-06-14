@@ -586,6 +586,11 @@ fn parse_color_atom(value: &str) -> Result<(FormatToken, usize)> {
                 "unterminated log format placeholder %C".into(),
             ));
         };
+        // Ported from sley#75: `%C(auto)` resolves to ColorAuto so padding is
+        // still flushed; every other `%C(...)` stays ColorParen.
+        if &value[2..end] == "auto" {
+            return Ok((FormatToken::ColorAuto, end + 1));
+        }
         return Ok((FormatToken::ColorParen, end + 1));
     }
     for name in [

@@ -7,6 +7,11 @@
 //! write.
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
+use std::{env, fs};
 
 pub use sley_core::BString;
 
@@ -432,6 +437,359 @@ impl Stage {
             Self::Theirs => 3,
         }
     }
+}
+
+/// Resolve the index path for a repository, honoring `GIT_INDEX_FILE`.
+pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
+    env::var_os("GIT_INDEX_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| git_dir.as_ref().join("index"))
+}
+
+/// The file's modification time split into whole seconds and nanoseconds,
+/// matching how git stores mtimes in index entries.
+pub fn file_mtime_parts(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some((duration.as_secs(), u64::from(duration.subsec_nanos())))
+}
+
+/// Git file mode for the filesystem entry described by `metadata`.
+pub fn worktree_metadata_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.file_type().is_symlink() {
+        0o120000
+    } else if metadata.is_dir() {
+        0o040000
+    } else {
+        worktree_file_mode(metadata)
+    }
+}
+
+#[cfg(unix)]
+fn worktree_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(not(unix))]
+fn worktree_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o100644
+}
+
+/// Reusable stage-0 index entries plus the index file mtime used for racy-git
+/// stat validation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexStatCache {
+    entries: HashMap<Vec<u8>, IndexEntry>,
+    index_mtime: Option<(u64, u64)>,
+}
+
+impl IndexStatCache {
+    /// Build a stat cache from a parsed index and the index file path on disk.
+    pub fn from_index(index: &Index, index_path: impl AsRef<Path>) -> Self {
+        let index_mtime = fs::metadata(index_path.as_ref())
+            .ok()
+            .and_then(|metadata| file_mtime_parts(&metadata));
+        Self::from_index_mtime(index, index_mtime)
+    }
+
+    /// Build a stat cache from a parsed index and an already captured index
+    /// file mtime.
+    pub fn from_index_mtime(index: &Index, index_mtime: Option<(u64, u64)>) -> Self {
+        Self {
+            entries: stage0_index_entries(index),
+            index_mtime,
+        }
+    }
+
+    /// Read and parse an index file into a stat cache. A missing index returns
+    /// an empty cache.
+    pub fn from_index_file(index_path: impl AsRef<Path>, format: ObjectFormat) -> Result<Self> {
+        let index_path = index_path.as_ref();
+        let metadata = match fs::metadata(index_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err.into()),
+        };
+        Self::from_index_file_with_metadata(index_path, format, file_mtime_parts(&metadata))
+    }
+
+    fn from_index_file_with_metadata(
+        index_path: &Path,
+        format: ObjectFormat,
+        index_mtime: Option<(u64, u64)>,
+    ) -> Result<Self> {
+        let bytes = fs::read(index_path)?;
+        let index = Index::parse(&bytes, format)?;
+        Ok(Self::from_index_mtime(&index, index_mtime))
+    }
+
+    /// Read this repository's index into a reusable stat cache.
+    pub fn from_repository_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<Self> {
+        Self::from_index_file(repository_index_path(git_dir), format)
+    }
+
+    /// Return the cached stage-0 entry for `git_path`, if one exists.
+    pub fn entry_for_git_path(&self, git_path: &[u8]) -> Option<&IndexEntry> {
+        self.entries.get(git_path)
+    }
+
+    /// Whether this cache has a stage-0 entry for `git_path`.
+    pub fn contains_git_path(&self, git_path: &[u8]) -> bool {
+        self.entries.contains_key(git_path)
+    }
+
+    /// Number of stage-0 entries in this cache.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this cache has no stage-0 entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The index file mtime used as the racy-clean reference.
+    pub fn index_mtime(&self) -> Option<(u64, u64)> {
+        self.index_mtime
+    }
+
+    /// Whether `entry` is racily clean in git's sense.
+    pub fn is_racily_clean(&self, entry: &IndexEntry) -> bool {
+        index_entry_is_racily_clean(entry, self.index_mtime)
+    }
+
+    /// Return the cached entry for `git_path` only when `metadata` proves the
+    /// worktree file is unchanged and not racily clean.
+    pub fn reusable_entry<'a>(
+        &'a self,
+        git_path: &[u8],
+        worktree_metadata: &fs::Metadata,
+    ) -> Option<&'a IndexEntry> {
+        let entry = self.entries.get(git_path)?;
+        self.reusable_index_entry(entry, worktree_metadata)
+    }
+
+    /// Return `entry` only when `metadata` proves the worktree file is unchanged
+    /// and not racily clean.
+    pub fn reusable_index_entry<'a>(
+        &'a self,
+        entry: &'a IndexEntry,
+        worktree_metadata: &fs::Metadata,
+    ) -> Option<&'a IndexEntry> {
+        if entry.mode != worktree_metadata_mode(worktree_metadata) {
+            return None;
+        }
+        if !index_entry_stat_is_uptodate(entry, worktree_metadata) {
+            return None;
+        }
+        if self.is_racily_clean(entry) {
+            return None;
+        }
+        Some(entry)
+    }
+}
+
+/// Stage-0 index stat data that can prove a worktree path clean without
+/// re-reading and re-hashing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStatProbe {
+    entry: IndexEntry,
+    index_mtime: Option<(u64, u64)>,
+}
+
+impl IndexStatProbe {
+    /// Build a probe from a parsed stage-0 index entry and the index file's
+    /// mtime split as `(seconds, nanoseconds)`.
+    pub fn from_index_entry(entry: IndexEntry, index_mtime: Option<(u64, u64)>) -> Self {
+        Self { entry, index_mtime }
+    }
+
+    /// Build a probe from a parsed index entry and the path of the index file on
+    /// disk, using that file's mtime as the racy-clean reference timestamp.
+    pub fn from_index_entry_and_index_path(
+        entry: IndexEntry,
+        index_path: impl AsRef<Path>,
+    ) -> Self {
+        let index_mtime = fs::metadata(index_path.as_ref())
+            .ok()
+            .and_then(|metadata| file_mtime_parts(&metadata));
+        Self { entry, index_mtime }
+    }
+
+    /// Read this repository's index and return a probe for `git_path` when a
+    /// stage-0 entry exists.
+    pub fn from_repository_index(
+        git_dir: impl AsRef<Path>,
+        format: ObjectFormat,
+        git_path: &[u8],
+    ) -> Result<Option<Self>> {
+        let index_path = repository_index_path(git_dir);
+        cached_repository_index_stat_probe(&index_path, format, git_path)
+    }
+
+    /// The parsed index entry this probe was built from.
+    pub fn entry(&self) -> &IndexEntry {
+        &self.entry
+    }
+
+    /// The index file mtime used as the racy-clean reference timestamp.
+    pub fn index_mtime(&self) -> Option<(u64, u64)> {
+        self.index_mtime
+    }
+}
+
+/// Reusable stage-0 index stat probes for many worktree paths.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexStatProbeCache {
+    stat_cache: IndexStatCache,
+}
+
+impl IndexStatProbeCache {
+    /// Build a reusable probe cache from an already parsed index and index-file
+    /// mtime.
+    pub fn from_index(index: &Index, index_mtime: Option<(u64, u64)>) -> Self {
+        Self {
+            stat_cache: IndexStatCache::from_index_mtime(index, index_mtime),
+        }
+    }
+
+    /// Read this repository's index once and build reusable stat probes.
+    pub fn from_repository_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<Self> {
+        Ok(Self {
+            stat_cache: IndexStatCache::from_repository_index(git_dir, format)?,
+        })
+    }
+
+    /// Return a per-path probe for a stage-0 entry, if present.
+    pub fn probe_for_git_path(&self, git_path: &[u8]) -> Option<IndexStatProbe> {
+        self.stat_cache
+            .entry_for_git_path(git_path)
+            .cloned()
+            .map(|entry| IndexStatProbe {
+                entry,
+                index_mtime: self.stat_cache.index_mtime,
+            })
+    }
+
+    /// Whether this cache has a stage-0 entry for `git_path`.
+    pub fn contains_git_path(&self, git_path: &[u8]) -> bool {
+        self.stat_cache.contains_git_path(git_path)
+    }
+
+    /// Number of stage-0 entries in the cache.
+    pub fn len(&self) -> usize {
+        self.stat_cache.len()
+    }
+
+    /// Whether the cache has no stage-0 entries.
+    pub fn is_empty(&self) -> bool {
+        self.stat_cache.is_empty()
+    }
+
+    /// The index file mtime used as the racy-clean reference timestamp.
+    pub fn index_mtime(&self) -> Option<(u64, u64)> {
+        self.stat_cache.index_mtime()
+    }
+}
+
+#[derive(Clone)]
+struct CachedRepositoryIndexStatProbes {
+    index_path: PathBuf,
+    format: ObjectFormat,
+    len: u64,
+    mtime: Option<(u64, u64)>,
+    probes: IndexStatProbeCache,
+}
+
+static REPOSITORY_INDEX_STAT_PROBES: OnceLock<Mutex<Option<CachedRepositoryIndexStatProbes>>> =
+    OnceLock::new();
+
+fn cached_repository_index_stat_probe(
+    index_path: &Path,
+    format: ObjectFormat,
+    git_path: &[u8],
+) -> Result<Option<IndexStatProbe>> {
+    let metadata = match fs::metadata(index_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(cache) = REPOSITORY_INDEX_STAT_PROBES.get()
+                && let Ok(mut guard) = cache.lock()
+            {
+                *guard = None;
+            }
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let len = metadata.len();
+    let mtime = file_mtime_parts(&metadata);
+    let cache = REPOSITORY_INDEX_STAT_PROBES.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.index_path == index_path
+        && cached.format == format
+        && cached.len == len
+        && cached.mtime == mtime
+    {
+        return Ok(cached.probes.probe_for_git_path(git_path));
+    }
+
+    let stat_cache = IndexStatCache::from_index_file_with_metadata(index_path, format, mtime)?;
+    let probes = IndexStatProbeCache { stat_cache };
+    let probe = probes.probe_for_git_path(git_path);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedRepositoryIndexStatProbes {
+            index_path: index_path.to_path_buf(),
+            format,
+            len,
+            mtime,
+            probes,
+        });
+    }
+    Ok(probe)
+}
+
+fn stage0_index_entries(index: &Index) -> HashMap<Vec<u8>, IndexEntry> {
+    let mut entries = HashMap::new();
+    for entry in &index.entries {
+        if entry.stage() == Stage::Normal {
+            entries.insert(entry.path.as_bytes().to_vec(), entry.clone());
+        }
+    }
+    entries
+}
+
+fn index_entry_is_racily_clean(entry: &IndexEntry, index_mtime: Option<(u64, u64)>) -> bool {
+    let Some(index_mtime) = index_mtime else {
+        return true;
+    };
+    if index_mtime == (0, 0) {
+        return true;
+    }
+    let entry_mtime = (
+        u64::from(entry.mtime_seconds),
+        u64::from(entry.mtime_nanoseconds),
+    );
+    if entry_mtime == (0, 0) {
+        return true;
+    }
+    index_mtime <= entry_mtime
+}
+
+fn index_entry_stat_is_uptodate(entry: &IndexEntry, metadata: &fs::Metadata) -> bool {
+    if u64::from(entry.size) != metadata.len() {
+        return false;
+    }
+    let Some((mtime_seconds, mtime_nanoseconds)) = file_mtime_parts(metadata) else {
+        return false;
+    };
+    u64::from(entry.mtime_seconds) == mtime_seconds
+        && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
 }
 
 /// The cache-tree (`TREE`) extension: a recursive cache of the tree object ids

@@ -86,7 +86,7 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
         Err(err) => return Err(err),
     };
     let format = repo.format();
-    let mut db = repo.objects().clone();
+    let db = repo.objects().clone();
 
     // Read the entire payload. mktag is binary-safe: the buffer is stored exactly
     // as received once it passes validation.

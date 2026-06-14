@@ -1,11 +1,14 @@
 //! Ref-transaction helpers on top of [`sley_refs::FileRefTransaction`].
 
 use std::collections::HashSet;
+use std::env;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_refs::{
     DeleteRef as StoreDeleteRef, RefDeleteError,
     RefDeletePrecondition as StoreRefDeletePrecondition, RefTarget, RefUpdate, ReflogEntry,
+    branch_ref_name,
 };
 
 use crate::{FullName, GitError, ObjectId, Repository, Result};
@@ -51,6 +54,38 @@ impl ReflogMessage {
         Self {
             message: message.into(),
         }
+    }
+}
+
+/// Options for porcelain-style checked ref updates.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RefUpdateOptions {
+    expected_old: Option<ObjectId>,
+    reflog: Option<Vec<u8>>,
+    reflog_committer: Option<Vec<u8>>,
+}
+
+impl RefUpdateOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Require the updated direct ref to still point at `oid`.
+    pub fn expect_old(mut self, oid: ObjectId) -> Self {
+        self.expected_old = Some(oid);
+        self
+    }
+
+    /// Reflog message to write on the updated ref and mirrored HEAD reflog.
+    pub fn reflog(mut self, message: impl Into<Vec<u8>>) -> Self {
+        self.reflog = Some(message.into());
+        self
+    }
+
+    /// Override the reflog committer ident (`Name <email> seconds +0000`).
+    pub fn reflog_committer(mut self, committer: impl Into<Vec<u8>>) -> Self {
+        self.reflog_committer = Some(committer.into());
+        self
     }
 }
 
@@ -264,6 +299,95 @@ impl Repository {
         tx.commit().map_err(RefConflict::from_git_error)
     }
 
+    /// Advance the currently checked-out branch and mirror Git porcelain's
+    /// direct `HEAD` reflog entry.
+    ///
+    /// `branch` may be either a short branch name (`main`) or its full
+    /// `refs/heads/main` name. `HEAD` must be symbolically attached to that
+    /// branch. The branch update is checked against the object id read for the
+    /// reflog entry, even when no explicit `expect_old` is supplied, so a race
+    /// cannot leave a misleading old/new reflog pair behind.
+    pub fn update_branch_checked_out_as_head(
+        &self,
+        branch: &str,
+        new_oid: ObjectId,
+        options: RefUpdateOptions,
+    ) -> RefChangeResult<()> {
+        let branch_name = branch_ref_name(branch).map_err(RefConflict::from_git_error)?;
+        let refs = self.references();
+        match refs.read_ref("HEAD").map_err(RefConflict::from_git_error)? {
+            Some(RefTarget::Symbolic(target)) if target == branch_name => {}
+            Some(RefTarget::Symbolic(target)) => {
+                return Err(RefConflict::new(
+                    "HEAD",
+                    format!("HEAD is attached to {target}, not {branch_name}"),
+                ));
+            }
+            Some(RefTarget::Direct(_)) => {
+                return Err(RefConflict::new("HEAD", "HEAD is detached"));
+            }
+            None => return Err(RefConflict::new("HEAD", "HEAD is missing")),
+        }
+
+        let current = refs
+            .read_ref(&branch_name)
+            .map_err(RefConflict::from_git_error)?;
+        let old_oid = match current {
+            Some(RefTarget::Direct(oid)) => oid,
+            Some(RefTarget::Symbolic(target)) => {
+                return Err(RefConflict::new(
+                    branch_name,
+                    format!("checked-out branch is symbolic to {target}"),
+                ));
+            }
+            None => {
+                return Err(RefConflict::new(
+                    branch_name,
+                    "checked-out branch is unborn",
+                ));
+            }
+        };
+        if let Some(expected_old) = options.expected_old
+            && expected_old != old_oid
+        {
+            return Err(RefConflict::new(
+                branch_name,
+                format!("expected old oid {expected_old}, found {old_oid}"),
+            ));
+        }
+
+        let reflog = match options.reflog {
+            Some(message) => {
+                let committer = options.reflog_committer.unwrap_or_else(|| {
+                    self.default_reflog_committer()
+                        .unwrap_or_else(|_| b"sley <sley@example.invalid> 0 +0000".to_vec())
+                });
+                Some(ReflogEntry {
+                    old_oid,
+                    new_oid,
+                    committer,
+                    message,
+                })
+            }
+            None => None,
+        };
+
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: branch_name.clone(),
+            expected: Some(RefTarget::Direct(old_oid)),
+            new: RefTarget::Direct(new_oid),
+            reflog: reflog.clone(),
+        });
+        tx.update(RefUpdate {
+            name: "HEAD".to_string(),
+            expected: Some(RefTarget::Symbolic(branch_name.clone())),
+            new: RefTarget::Symbolic(branch_name),
+            reflog,
+        });
+        tx.commit().map_err(RefConflict::from_git_error)
+    }
+
     fn verify_delete_expected(
         &self,
         _name: &str,
@@ -303,6 +427,36 @@ impl Repository {
                 })
             }
         }
+    }
+
+    fn default_reflog_committer(&self) -> Result<Vec<u8>> {
+        let config = self.config().ok();
+        let name = env::var("GIT_COMMITTER_NAME")
+            .ok()
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|config| config.get("user", None, "name").map(str::to_owned))
+            })
+            .unwrap_or_else(|| "sley".to_string());
+        let email = env::var("GIT_COMMITTER_EMAIL")
+            .ok()
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|config| config.get("user", None, "email").map(str::to_owned))
+            })
+            .unwrap_or_else(|| "sley@example.invalid".to_string());
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| GitError::InvalidFormat(err.to_string()))?
+            .as_secs();
+        Ok(format!(
+            "{} <{}> {seconds} +0000",
+            reflog_ident_component(&name),
+            reflog_ident_component(&email)
+        )
+        .into_bytes())
     }
 }
 
@@ -346,6 +500,16 @@ impl RefTargetExt for RefTarget {
             RefTarget::Symbolic(_) => None,
         }
     }
+}
+
+fn reflog_ident_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\n' | '\r' | '<' | '>' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -621,6 +785,57 @@ mod tests {
             .expect_err("duplicate");
 
         assert_eq!(err.ref_name, "refs/heads/main");
+    }
+
+    #[test]
+    fn repository_update_branch_checked_out_as_head_mirrors_head_reflog() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let a = write_commit(&repo, None);
+        let committer = b"Heddle <actor@example.invalid> 7 +0000".to_vec();
+        repo.references()
+            .create_branch(
+                "main",
+                a,
+                committer.clone(),
+                b"commit (initial): initial".to_vec(),
+            )
+            .expect("seed main");
+        let b = write_commit(&repo, Some(&a));
+
+        repo.update_branch_checked_out_as_head(
+            "main",
+            b,
+            RefUpdateOptions::new()
+                .expect_old(a)
+                .reflog(b"heddle: checkpoint".to_vec())
+                .reflog_committer(committer.clone()),
+        )
+        .expect("porcelain branch update");
+
+        assert_eq!(
+            repo.find_reference("refs/heads/main")
+                .expect("lookup main")
+                .expect("main")
+                .target,
+            RefTarget::Direct(b)
+        );
+        assert_eq!(
+            repo.references().read_ref("HEAD").expect("read HEAD"),
+            Some(RefTarget::Symbolic("refs/heads/main".into()))
+        );
+        let branch_log = repo
+            .references()
+            .read_reflog("refs/heads/main")
+            .expect("branch reflog");
+        let head_log = repo.references().read_reflog("HEAD").expect("HEAD reflog");
+        let branch_last = branch_log.last().expect("branch reflog entry");
+        let head_last = head_log.last().expect("HEAD reflog entry");
+        assert_eq!(branch_last.old_oid, a);
+        assert_eq!(branch_last.new_oid, b);
+        assert_eq!(branch_last.committer, committer);
+        assert_eq!(branch_last.message, b"heddle: checkpoint");
+        assert_eq!(head_last, branch_last);
     }
 
     #[test]
