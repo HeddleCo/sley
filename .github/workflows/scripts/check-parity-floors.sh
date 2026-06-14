@@ -112,7 +112,7 @@ declare -A FLOOR=(
     [t0008-ignores.sh]=306
     [t7400-submodule-basic.sh]=70
     [t7506-status-submodule.sh]=28
-    [t7508-status.sh]=66
+    [t7508-status.sh]=86
     [t4027-diff-submodule.sh]=18
 )
 
