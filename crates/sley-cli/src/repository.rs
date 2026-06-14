@@ -21,7 +21,6 @@ use crate::{
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
     git_dir: PathBuf,
-    common_git_dir: PathBuf,
     format: ObjectFormat,
     config: GitConfig,
     objects: FileObjectDatabase,
@@ -50,7 +49,6 @@ impl RepositoryContext {
         Ok(Self {
             cwd,
             git_dir,
-            common_git_dir,
             format,
             config,
             objects,
@@ -66,10 +64,6 @@ impl RepositoryContext {
 
     pub(crate) fn git_dir(&self) -> &Path {
         &self.git_dir
-    }
-
-    pub(crate) fn common_git_dir(&self) -> &Path {
-        &self.common_git_dir
     }
 
     pub(crate) fn format(&self) -> ObjectFormat {
@@ -121,18 +115,6 @@ impl RepositoryContext {
     pub(crate) fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
         self.revision_resolver().resolve_path(rev, path)
-    }
-
-    /// `<rev>:<path>` resolution that follows in-tree symlinks (the
-    /// `cat-file --follow-symlinks` walk).
-    pub(crate) fn resolve_path_follow_symlinks(
-        &self,
-        rev: &str,
-        path: &str,
-    ) -> sley_rev::SymlinkedTreePath {
-        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
-        self.revision_resolver()
-            .resolve_path_follow_symlinks(rev, path)
     }
 
     pub(crate) fn revision_resolver(&self) -> sley_rev::RevisionResolver<'_, FileObjectDatabase> {

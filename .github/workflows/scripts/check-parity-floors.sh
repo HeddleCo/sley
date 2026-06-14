@@ -154,6 +154,21 @@
 # feature, NOT a summary gap; the summary itself is HEAD^-correct. Neighbors held:
 # t7506-status-submodule=28, t2020-checkout-detach=16, t7400-submodule-basic=70.
 # No workspace test regressed (all crates 0 failed).
+# compare-release-timings perf wave (2026-06-14, codex/compare-release-timings,
+# PR #98): banks the perf-branch parity GAINs into the floors — t4202-log 56->57,
+# t5310-pack-bitmaps 218->221, t5326-multi-pack-bitmaps 336->342,
+# t5327-multi-pack-bitmaps-rev 308->314 (the perf commits' rev-list/bitmap fast
+# paths produced these and they reproduce at the branch tip). Same wave fixes a
+# t0008-ignores regression introduced by the status-ignore perf commits (57e8c5e/
+# 20175d0/9bcb5cc): `matches_directory` over-matched — a NEGATED directory-only
+# pattern (`!data/**/`) wrongly matched a *file* via an ancestor directory and
+# un-ignored it, dropping cell #388 ("directories and ** matches", `data/**` +
+# `!data/**/` must keep `data/data1/file1` ignored) and t0008 305<306. Fix gates
+# the anchored-glob ancestor-prefix file match on `!self.negated` in
+# crates/sley-worktree/src/lib.rs (git: a negated dir-only pattern re-includes
+# *directories* but never the files inside them — `!dir/` still needs `!dir/*` to
+# reach files), restoring t0008 to 306 with its failing-cell set IDENTICAL to
+# main and the 57e8c5e directory-glob gain preserved. t0008 floor stays 306.
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -197,8 +212,8 @@ declare -A FLOOR=(
     [t4214-log-graph-octopus.sh]=17
     [t4215-log-skewed-merges.sh]=9
     [t6030-bisect-porcelain.sh]=95
-    [t5310-pack-bitmaps.sh]=218
-    [t5326-multi-pack-bitmaps.sh]=336
+    [t5310-pack-bitmaps.sh]=221
+    [t5326-multi-pack-bitmaps.sh]=342
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     [t2020-checkout-detach.sh]=16
@@ -209,7 +224,7 @@ declare -A FLOOR=(
     [t5318-commit-graph.sh]=38
     [t3432-rebase-fast-forward.sh]=144
     [t3600-rm.sh]=50
-    [t4202-log.sh]=56
+    [t4202-log.sh]=57
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
@@ -217,7 +232,7 @@ declare -A FLOOR=(
     [t3406-rebase-message.sh]=9
     [t3418-rebase-continue.sh]=11
     [t3420-rebase-autostash.sh]=30
-    [t5327-multi-pack-bitmaps-rev.sh]=308
+    [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
     [t4014-format-patch.sh]=142

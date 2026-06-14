@@ -896,13 +896,8 @@ fn count_objects_stats(git_dir: &Path, format: ObjectFormat) -> Result<CountObje
     } else {
         objects_dir.parent().unwrap_or(&objects_dir)
     };
-    let mut packed_oids = HashSet::new();
-    count_pack_objects(
-        &objects_dir.join("pack"),
-        format,
-        &mut stats,
-        &mut packed_oids,
-    )?;
+    let pack_indexes = count_pack_objects(&objects_dir.join("pack"), format, &mut stats)?;
+    let mut packed_lookup = CountPackedObjectLookup::new(format, pack_indexes);
     let hex_len = format.hex_len();
     for entry in fs::read_dir(&objects_dir)? {
         let entry = entry?;
@@ -922,7 +917,7 @@ fn count_objects_stats(git_dir: &Path, format: ObjectFormat) -> Result<CountObje
                 &name,
                 format,
                 hex_len,
-                &packed_oids,
+                &mut packed_lookup,
                 &mut stats,
             )?;
         }
@@ -961,7 +956,7 @@ fn count_loose_object_directory(
     fanout: &str,
     format: ObjectFormat,
     hex_len: usize,
-    packed_oids: &HashSet<ObjectId>,
+    packed_lookup: &mut CountPackedObjectLookup,
     stats: &mut CountObjectsStats,
 ) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -976,7 +971,7 @@ fn count_loose_object_directory(
             let oid = ObjectId::from_hex(format, &format!("{fanout}{name}"))?;
             stats.count += 1;
             stats.size_kib += filesystem_size_kib(&metadata);
-            if packed_oids.contains(&oid) {
+            if packed_lookup.contains(&oid)? {
                 stats.prune_packable += 1;
             }
         } else {
@@ -996,10 +991,10 @@ fn count_pack_objects(
     pack_dir: &Path,
     format: ObjectFormat,
     stats: &mut CountObjectsStats,
-    packed_oids: &mut HashSet<ObjectId>,
-) -> Result<()> {
+) -> Result<Vec<CountPackIndexSummary>> {
+    let mut pack_indexes = Vec::new();
     if !pack_dir.exists() {
-        return Ok(());
+        return Ok(pack_indexes);
     }
     for entry in fs::read_dir(pack_dir)? {
         let entry = entry?;
@@ -1010,15 +1005,350 @@ fn count_pack_objects(
             stats.size_pack_bytes += metadata.len();
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("idx")
-            && let Ok(index) = PackIndex::parse(&fs::read(path)?, format)
-        {
-            stats.size_pack_bytes += metadata.len();
-            stats.in_pack += index.entries.len() as u64;
-            packed_oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+        if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
+            let summary = count_pack_index_summary(&path, &metadata, format)?;
+            if let Some(summary) = summary {
+                stats.size_pack_bytes += metadata.len();
+                stats.in_pack += u64::from(summary.object_count);
+                pack_indexes.push(summary);
+            }
         }
     }
-    Ok(())
+    Ok(pack_indexes)
+}
+
+#[derive(Debug, Clone)]
+struct CountPackIndexSummary {
+    path: PathBuf,
+    object_count: u32,
+}
+
+#[derive(Debug)]
+struct CountPackedObjectLookup {
+    format: ObjectFormat,
+    summaries: Vec<CountPackIndexSummary>,
+    indexes: Option<Vec<CountPackIndexLookup>>,
+}
+
+impl CountPackedObjectLookup {
+    fn new(format: ObjectFormat, summaries: Vec<CountPackIndexSummary>) -> Self {
+        Self {
+            format,
+            summaries,
+            indexes: None,
+        }
+    }
+
+    fn contains(&mut self, oid: &ObjectId) -> Result<bool> {
+        if self.summaries.is_empty() {
+            return Ok(false);
+        }
+        if self.indexes.is_none() {
+            self.indexes = Some(load_count_pack_index_lookups(
+                self.format,
+                self.summaries.as_slice(),
+            )?);
+        }
+        Ok(self
+            .indexes
+            .as_ref()
+            .expect("count pack indexes are loaded")
+            .iter()
+            .any(|index| index.contains(oid)))
+    }
+}
+
+#[derive(Debug)]
+struct CountPackIndexLookup {
+    format: ObjectFormat,
+    fanout: [u32; 256],
+    bytes: Vec<u8>,
+    layout: CountPackIndexLayout,
+}
+
+#[derive(Debug)]
+enum CountPackIndexLayout {
+    V1 {
+        entry_table_start: usize,
+        entry_len: usize,
+    },
+    V2 {
+        oid_table_start: usize,
+    },
+}
+
+impl CountPackIndexLookup {
+    fn parse(bytes: Vec<u8>, format: ObjectFormat) -> Result<Self> {
+        let metadata = count_pack_index_metadata(&bytes, format)?;
+        if count_pack_index_min_len(&metadata, format)? > bytes.len() {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        Ok(Self {
+            format,
+            fanout: metadata.fanout,
+            bytes,
+            layout: metadata.layout,
+        })
+    }
+
+    fn contains(&self, oid: &ObjectId) -> bool {
+        if oid.format() != self.format {
+            return false;
+        }
+        let oid_bytes = oid.as_bytes();
+        let bucket = usize::from(oid_bytes[0]);
+        let start = if bucket == 0 {
+            0
+        } else {
+            self.fanout[bucket - 1] as usize
+        };
+        let end = self.fanout[bucket] as usize;
+        if start == end {
+            return false;
+        }
+        let mut low = start;
+        let mut high = end;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match self.oid_at(mid).cmp(oid_bytes) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Greater => high = mid,
+            }
+        }
+        false
+    }
+
+    fn oid_at(&self, idx: usize) -> &[u8] {
+        match self.layout {
+            CountPackIndexLayout::V1 {
+                entry_table_start,
+                entry_len,
+            } => {
+                let start = entry_table_start + idx * entry_len + 4;
+                &self.bytes[start..start + self.format.raw_len()]
+            }
+            CountPackIndexLayout::V2 { oid_table_start } => {
+                let start = oid_table_start + idx * self.format.raw_len();
+                &self.bytes[start..start + self.format.raw_len()]
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CountPackIndexMetadata {
+    object_count: u32,
+    fanout: [u32; 256],
+    layout: CountPackIndexLayout,
+}
+
+fn count_pack_index_summary(
+    path: &Path,
+    metadata: &fs::Metadata,
+    format: ObjectFormat,
+) -> Result<Option<CountPackIndexSummary>> {
+    let len = usize::try_from(metadata.len())
+        .map_err(|_| GitError::InvalidFormat("pack index is too large".into()))?;
+    let prefix_len = if len >= 4 && count_pack_index_has_v2_magic(path)? {
+        8 + 256 * 4
+    } else {
+        256 * 4
+    };
+    if len < prefix_len {
+        return Ok(None);
+    }
+    let mut file = fs::File::open(path)?;
+    let mut prefix = vec![0u8; prefix_len];
+    match io::Read::read_exact(&mut file, &mut prefix) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    match count_pack_index_prefix_metadata(&prefix, format) {
+        Ok(index) if count_pack_index_min_len(&index, format)? <= len => {
+            Ok(Some(CountPackIndexSummary {
+                path: path.to_path_buf(),
+                object_count: index.object_count,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn count_pack_index_has_v2_magic(path: &Path) -> Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0u8; 4];
+    match io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) => Ok(magic == [0xff, b't', b'O', b'c']),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn load_count_pack_index_lookups(
+    format: ObjectFormat,
+    summaries: &[CountPackIndexSummary],
+) -> Result<Vec<CountPackIndexLookup>> {
+    let mut indexes = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let bytes = fs::read(&summary.path)?;
+        if let Ok(index) = CountPackIndexLookup::parse(bytes, format) {
+            indexes.push(index);
+        }
+    }
+    Ok(indexes)
+}
+
+fn count_pack_index_metadata(bytes: &[u8], format: ObjectFormat) -> Result<CountPackIndexMetadata> {
+    let hash_len = format.raw_len();
+    if bytes.len() < 4 {
+        return Err(GitError::InvalidFormat("pack index too short".into()));
+    }
+    if bytes[..4] == [0xff, b't', b'O', b'c'] {
+        if bytes.len() < 8 + 256 * 4 {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        let version = count_u32_be(&bytes[4..8]);
+        if version != 2 {
+            return Err(GitError::Unsupported(format!(
+                "pack index version {version}"
+            )));
+        }
+        let (fanout, object_count) = count_pack_index_fanout(&bytes[8..8 + 256 * 4])?;
+        let oid_table_start = 8 + 256 * 4;
+        let oid_table = count_checked_range(oid_table_start, object_count as usize, hash_len)?;
+        let crc_table = count_checked_range(oid_table.end, object_count as usize, 4)?;
+        let small_offset_table = count_checked_range(crc_table.end, object_count as usize, 4)?;
+        if bytes.len() < small_offset_table.end {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        return Ok(CountPackIndexMetadata {
+            object_count,
+            fanout,
+            layout: CountPackIndexLayout::V2 { oid_table_start },
+        });
+    }
+
+    if bytes.len() < 256 * 4 {
+        return Err(GitError::InvalidFormat("pack index too short".into()));
+    }
+    let (fanout, object_count) = count_pack_index_fanout(&bytes[..256 * 4])?;
+    let entry_table_start = 256 * 4;
+    let entry_len = hash_len
+        .checked_add(4)
+        .ok_or_else(|| GitError::InvalidFormat("pack index entry length overflow".into()))?;
+    let entry_table = count_checked_range(entry_table_start, object_count as usize, entry_len)?;
+    if bytes.len() < entry_table.end {
+        return Err(GitError::InvalidFormat("pack index too short".into()));
+    }
+    Ok(CountPackIndexMetadata {
+        object_count,
+        fanout,
+        layout: CountPackIndexLayout::V1 {
+            entry_table_start,
+            entry_len,
+        },
+    })
+}
+
+fn count_pack_index_prefix_metadata(
+    bytes: &[u8],
+    format: ObjectFormat,
+) -> Result<CountPackIndexMetadata> {
+    if bytes.len() < 4 {
+        return Err(GitError::InvalidFormat("pack index too short".into()));
+    }
+    if bytes[..4] == [0xff, b't', b'O', b'c'] {
+        if bytes.len() < 8 + 256 * 4 {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        let version = count_u32_be(&bytes[4..8]);
+        if version != 2 {
+            return Err(GitError::Unsupported(format!(
+                "pack index version {version}"
+            )));
+        }
+        let (fanout, object_count) = count_pack_index_fanout(&bytes[8..8 + 256 * 4])?;
+        return Ok(CountPackIndexMetadata {
+            object_count,
+            fanout,
+            layout: CountPackIndexLayout::V2 {
+                oid_table_start: 8 + 256 * 4,
+            },
+        });
+    }
+
+    if bytes.len() < 256 * 4 {
+        return Err(GitError::InvalidFormat("pack index too short".into()));
+    }
+    let (fanout, object_count) = count_pack_index_fanout(&bytes[..256 * 4])?;
+    let entry_len = format
+        .raw_len()
+        .checked_add(4)
+        .ok_or_else(|| GitError::InvalidFormat("pack index entry length overflow".into()))?;
+    Ok(CountPackIndexMetadata {
+        object_count,
+        fanout,
+        layout: CountPackIndexLayout::V1 {
+            entry_table_start: 256 * 4,
+            entry_len,
+        },
+    })
+}
+
+fn count_pack_index_min_len(index: &CountPackIndexMetadata, format: ObjectFormat) -> Result<usize> {
+    let hash_len = format.raw_len();
+    match index.layout {
+        CountPackIndexLayout::V1 {
+            entry_table_start,
+            entry_len,
+        } => count_checked_range(entry_table_start, index.object_count as usize, entry_len)?
+            .end
+            .checked_add(hash_len * 2)
+            .ok_or_else(|| GitError::InvalidFormat("pack index length overflow".into())),
+        CountPackIndexLayout::V2 { oid_table_start } => {
+            let oid_table =
+                count_checked_range(oid_table_start, index.object_count as usize, hash_len)?;
+            let crc_table = count_checked_range(oid_table.end, index.object_count as usize, 4)?;
+            let small_offset_table =
+                count_checked_range(crc_table.end, index.object_count as usize, 4)?;
+            small_offset_table
+                .end
+                .checked_add(hash_len * 2)
+                .ok_or_else(|| GitError::InvalidFormat("pack index length overflow".into()))
+        }
+    }
+}
+
+fn count_pack_index_fanout(bytes: &[u8]) -> Result<([u32; 256], u32)> {
+    let mut fanout = [0u32; 256];
+    let mut previous = 0u32;
+    for (idx, slot) in fanout.iter_mut().enumerate() {
+        let start = idx * 4;
+        *slot = count_u32_be(&bytes[start..start + 4]);
+        if *slot < previous {
+            return Err(GitError::InvalidFormat(
+                "pack index fanout is not monotonic".into(),
+            ));
+        }
+        previous = *slot;
+    }
+    Ok((fanout, fanout[255]))
+}
+
+fn count_checked_range(start: usize, count: usize, width: usize) -> Result<std::ops::Range<usize>> {
+    let len = count
+        .checked_mul(width)
+        .ok_or_else(|| GitError::InvalidFormat("pack index table length overflow".into()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| GitError::InvalidFormat("pack index table offset overflow".into()))?;
+    Ok(start..end)
+}
+
+fn count_u32_be(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[derive(Debug)]

@@ -1,7 +1,8 @@
 //! The single, isolated home for sley's only `unsafe`: read-only memory maps of
-//! pack files. Every other crate in the workspace keeps `unsafe_code = "forbid"`;
-//! this crate exists so that the one unavoidable unsafe call (mapping a file) lives
-//! behind a small, audited, safe API instead of being scattered.
+//! immutable git files. Every other crate in the workspace keeps
+//! `unsafe_code = "forbid"`; this crate exists so that the one unavoidable unsafe
+//! call (mapping a file) lives behind a small, audited, safe API instead of being
+//! scattered.
 //!
 //! # Why mmap is `unsafe`
 //!
@@ -11,12 +12,12 @@
 //!
 //! # Safety invariant sley relies on
 //!
-//! sley only maps **pack files** (`*.pack` / `*.idx`). Those are written by atomic
-//! rename of a fully-written temporary (see `write_pack_component`) and are never
-//! truncated or rewritten in place — a repack/gc replaces a pack by writing a new
-//! file and renaming, and unlinking a file that is still mapped keeps the inode
-//! (and the mapping) valid on Unix. So the backing bytes never shrink under a live
-//! map, which is the condition `Mmap::map` requires.
+//! sley only maps git files that are written by atomic rename of a fully-written
+//! temporary and are never truncated or rewritten in place: pack/index files and
+//! commit-graph files. A repack/gc or commit-graph write replaces the file by
+//! writing a new one and renaming it into place, and unlinking a still-mapped file
+//! keeps the inode (and the mapping) valid on Unix. So the backing bytes never
+//! shrink under a live map, which is the condition `Mmap::map` requires.
 
 use std::fs::File;
 use std::io;
@@ -89,6 +90,36 @@ impl MappedFile {
         unsafe { Self::open(path) }
     }
 
+    /// Memory-map a git **commit-graph file** read-only.
+    ///
+    /// This accepts the monolithic `objects/info/commit-graph` file and split
+    /// graph layers named `graph-<hash>.graph`. Git writes these files by creating
+    /// a new file and atomically renaming it into place, so an existing mapped
+    /// inode is not truncated under readers. Symlinks and non-regular files are
+    /// rejected; callers that need legacy symlink behavior can fall back to
+    /// `std::fs::read`.
+    pub fn open_commit_graph(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "commit-graph path is not a regular file",
+            ));
+        }
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        let is_commit_graph = file_name == Some("commit-graph")
+            || file_name.is_some_and(|name| name.starts_with("graph-") && name.ends_with(".graph"));
+        if !is_commit_graph {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "commit-graph path must be commit-graph or graph-*.graph",
+            ));
+        }
+        // SAFETY: `path` is a git commit-graph file, which git writes by atomic
+        // replacement rather than in-place truncation.
+        unsafe { Self::open(path) }
+    }
+
     /// The mapped bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -142,5 +173,20 @@ mod tests {
         let err = MappedFile::open_pack(&path).expect_err("reject non-pack path");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn maps_commit_graph_name() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("sley-mmap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("commit-graph");
+        {
+            let mut file = std::fs::File::create(&path).expect("create temp file");
+            file.write_all(b"CGPH bytes").expect("write payload");
+        }
+        let mapped = MappedFile::open_commit_graph(&path).expect("map commit-graph");
+        assert_eq!(mapped.as_bytes(), b"CGPH bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

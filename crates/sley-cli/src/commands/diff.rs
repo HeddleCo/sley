@@ -253,10 +253,17 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         match value.trim().to_ascii_lowercase().as_str() {
             "false" | "no" | "off" | "0" => {
                 detect_renames = false;
+                detect_copies = false;
                 inexact_renames = false;
             }
             "copies" | "copy" => {
+                detect_renames = true;
                 detect_copies = true;
+                inexact_renames = true;
+            }
+            "true" | "yes" | "on" | "1" | "renames" => {
+                detect_renames = true;
+                inexact_renames = true;
             }
             _ => {}
         }
@@ -307,7 +314,26 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let (diff_trees, mut path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
     path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
-    let repository_abbrev = repository_abbrev(&git_dir, format)?;
+    let no_output_mode = !raw
+        && !stat
+        && !compact_summary
+        && !numstat
+        && !shortstat
+        && !summary
+        && dirstat.is_none()
+        && !name_status
+        && !name_only;
+    let output_may_show_oids = !quiet && !no_patch && !name_only && !name_status;
+    let needs_raw_abbrev = output_may_show_oids && raw && raw_abbrev.is_none();
+    let needs_patch_abbrev = output_may_show_oids
+        && (patch || no_output_mode)
+        && !patch_full_index
+        && patch_abbrev.is_none();
+    let repository_abbrev = if needs_raw_abbrev || needs_patch_abbrev {
+        repository_abbrev(&git_dir, format)?
+    } else {
+        None
+    };
     let raw_abbrev = match raw_abbrev {
         Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
         // `git diff` is porcelain: raw oids abbreviate by default (unlike the
@@ -346,6 +372,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         1 => !cached,
         _ => !cached && !head,
     };
+    let plain_index_worktree_diff = diff_trees.is_empty() && !cached && !head;
     // The new side's *content* comes from the worktree only when there is no second
     // tree and we're not diffing the index (`--cached`). A two-tree `diff A B` takes
     // its new content from tree B's blobs, never the worktree.
@@ -548,15 +575,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let show_numstat = numstat && !name_only && !name_status;
         let show_stat = (stat || compact_summary) && !name_only && !name_status;
         let show_shortstat = shortstat && !name_only && !name_status;
-        let no_output_mode = !raw
-            && !stat
-            && !compact_summary
-            && !numstat
-            && !shortstat
-            && !summary
-            && dirstat.is_none()
-            && !name_status
-            && !name_only;
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
         if show_raw {
@@ -564,7 +582,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // a stat-clean file keeps its index oid in raw output. The
             // worktree entries carry the freshly-hashed content oid, so
             // matching it against the index entry reproduces that rule.
-            let index_oids: HashMap<Vec<u8>, ObjectId> = if zero_worktree_oids {
+            let zero_all_worktree_oids = zero_worktree_oids && plain_index_worktree_diff;
+            let needs_index_oids = zero_worktree_oids
+                && !zero_all_worktree_oids
+                && entries.iter().any(|entry| entry.new_oid.is_some());
+            let index_oids: HashMap<Vec<u8>, ObjectId> = if needs_index_oids {
                 let index_path = sley_worktree::repository_index_path(&git_dir);
                 match fs::read(&index_path) {
                     Ok(bytes) => Index::parse(&bytes, format)?
@@ -578,11 +600,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 HashMap::new()
             };
             for entry in &entries {
-                let zero_entry = zero_worktree_oids
-                    && entry
-                        .new_oid
-                        .as_ref()
-                        .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid));
+                let zero_entry = zero_all_worktree_oids
+                    || (zero_worktree_oids
+                        && entry
+                            .new_oid
+                            .as_ref()
+                            .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)));
                 write_diff_raw_entry(&mut stdout, entry, z, zero_entry, raw_abbrev, format)?;
             }
         }

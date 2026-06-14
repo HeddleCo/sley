@@ -246,6 +246,32 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
     cmd_log_impl(&filtered, true)
 }
 
+fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
+    !compiled.tokens.is_empty()
+        && compiled.uses_oid()
+        && !compiled.uses_decorations()
+        && !compiled.uses_source()
+        && compiled.tokens.iter().all(|token| {
+            matches!(
+                token,
+                FormatToken::Literal(_)
+                    | FormatToken::Percent
+                    | FormatToken::OidFull
+                    | FormatToken::OidAbbrev
+                    | FormatToken::ParentsFull
+                    | FormatToken::ParentsAbbrev
+                    | FormatToken::Marker
+                    | FormatToken::Subject
+                    | FormatToken::SanitizedSubject
+                    | FormatToken::NoteName
+                    | FormatToken::ColorParen
+                    | FormatToken::ColorName(_)
+                    | FormatToken::Newline
+                    | FormatToken::HexByte(_)
+            )
+        })
+}
+
 fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut setup_not = false;
@@ -265,6 +291,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut show_children = false;
     let mut abbrev_commit = false;
     let mut abbrev_len = Some(7usize);
+    let mut abbrev_len_explicit = false;
     let mut decoration = LogDecorationMode::Off;
     let mut read_stdin = false;
     let mut author_patterns = Vec::new();
@@ -318,8 +345,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--children" => show_children = true,
             "--abbrev-commit" => abbrev_commit = true,
             "--no-abbrev-commit" => abbrev_commit = false,
-            "--abbrev" => abbrev_len = Some(7),
-            "--no-abbrev" => abbrev_len = None,
+            "--abbrev" => {
+                abbrev_len = Some(7);
+                abbrev_len_explicit = true;
+            }
+            "--no-abbrev" => {
+                abbrev_len = None;
+                abbrev_len_explicit = true;
+            }
             "--glob" | "--exclude" | "--exclude-hidden" => {
                 setup_args.push(arg.clone());
                 setup_args.push(
@@ -512,6 +545,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             value if value.starts_with("--abbrev=") => {
                 abbrev_len = Some(log_parse_abbrev_width(&value["--abbrev=".len()..]));
+                abbrev_len_explicit = true;
             }
             value if value.starts_with("--unpacked=") => {
                 eprintln!("fatal: --unpacked=<packfile> no longer supported");
@@ -1129,6 +1163,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     {
         *compiled_children = show_children;
     }
+    if !abbrev_len_explicit && log_output_needs_abbrev(&output, abbrev_commit, show_children) {
+        abbrev_len = repository_abbrev(&git_dir, format)?;
+    }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let committer_filters =
@@ -1248,13 +1285,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         };
         let mut stdout = io::stdout();
         let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
+        let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
         for (index, record) in selected.iter().enumerate() {
             // `--pretty=format:` separates entries with a newline (none trailing);
             // `--format=`/`tformat:`/oneline terminate each entry with one.
             if index > 0 && !final_newline {
                 stdout.write_all(term)?;
             }
-            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+            line.clear();
             emit_compiled_log_format_metadata(
                 record,
                 compiled,
@@ -1273,6 +1311,87 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 &mut line,
             )?;
             stdout.write_all(&line)?;
+            if final_newline {
+                stdout.write_all(term)?;
+            }
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+    if walk
+        && !graph
+        && line_prefix.is_none()
+        && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && pathspecs.is_empty()
+        && !full_history
+        && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
+            if log_limited_commit_format_supported(compiled))
+        && decoration == LogDecorationMode::Off
+        && !show_children
+        && excluded.is_empty()
+        && author_filters.is_none()
+        && committer_filters.is_none()
+        && grep_filters.is_none()
+        && max_age.is_none()
+        && min_age.is_none()
+        && min_parents.is_none()
+        && max_parents.is_none()
+        && let Some(limit) = max_count.map(|max| skip.saturating_add(max))
+        && limit > 0
+    {
+        let (compiled, final_newline) = match &output {
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => (compiled, *final_newline),
+            _ => unreachable!("limited commit fast path requires compiled output"),
+        };
+        let mut stdout = io::stdout();
+        let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
+        let context = LogFormatContext {
+            abbrev_len,
+            decorations: &HashMap::new(),
+            marker: '>',
+            dialect: LogFormatDialect::Log,
+            source: log_format_source.as_deref(),
+            date_mode: &date_mode,
+            source_oid: None,
+            describe: None,
+            color: false,
+            output_encoding: &output_encoding,
+        };
+        let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
+            &git_dir,
+            format,
+            &db,
+            starts.clone(),
+            first_parent,
+            limit,
+        )?;
+        let mut selected = metadata.into_iter().collect::<Vec<_>>();
+        if skip > 0 {
+            selected = selected.into_iter().skip(skip).collect();
+        }
+        selected.truncate(max_count.expect("limited log path requires max-count"));
+        if reverse {
+            selected.reverse();
+        }
+        let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+        for (index, metadata) in selected.iter().enumerate() {
+            if index > 0 && !final_newline {
+                stdout.write_all(term)?;
+            }
+            line.clear();
+            emit_compiled_log_format_limited_commit(
+                &db,
+                metadata,
+                compiled,
+                &context,
+                &mut line,
+            )?;
+            let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
+            stdout.write_all(&out)?;
             if final_newline {
                 stdout.write_all(term)?;
             }
@@ -2422,6 +2541,27 @@ enum LogOutput {
         /// (oneline presets only; custom `--format=` ignores `--children`).
         inline_children: bool,
     },
+}
+
+fn log_output_needs_abbrev(
+    output: &LogOutput,
+    abbrev_commit: bool,
+    show_children: bool,
+) -> bool {
+    match output {
+        LogOutput::Default(_) => abbrev_commit,
+        LogOutput::Compiled { compiled, .. } => {
+            show_children
+                || compiled.tokens.iter().any(|token| {
+                    matches!(
+                        token,
+                        FormatToken::OidAbbrev
+                            | FormatToken::TreeAbbrev
+                            | FormatToken::ParentsAbbrev
+                    )
+                })
+        }
+    }
 }
 
 fn log_age_filters_match(

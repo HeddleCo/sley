@@ -37,7 +37,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -708,10 +708,7 @@ pub(crate) fn replace_objects_active(refs: &FileRefStore) -> Result<bool> {
     if !global_replace_objects() {
         return Ok(false);
     }
-    Ok(refs
-        .list_refs()?
-        .iter()
-        .any(|reference| reference.name.starts_with("refs/replace/")))
+    refs.has_refs_with_prefix("refs/replace/")
 }
 
 pub(crate) fn apply_replace_object(refs: &FileRefStore, oid: &ObjectId) -> Result<ObjectId> {
@@ -1427,6 +1424,25 @@ fn print_tree(
     print_tree_with_prefix(db, format, body, b"", options)
 }
 
+fn write_object_id_hex<W: Write + ?Sized>(
+    writer: &mut W,
+    oid: &ObjectId,
+    width: Option<usize>,
+) -> Result<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex_len = oid.format().hex_len();
+    let width = width
+        .map(|width| width.clamp(4, hex_len))
+        .unwrap_or(hex_len);
+    let mut out = [0u8; 64];
+    for (index, byte) in oid.as_bytes().iter().copied().enumerate() {
+        out[index * 2] = HEX[(byte >> 4) as usize];
+        out[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    writer.write_all(&out[..width])?;
+    Ok(())
+}
+
 fn print_tree_with_prefix(
     db: Option<&FileObjectDatabase>,
     format: ObjectFormat,
@@ -1434,16 +1450,18 @@ fn print_tree_with_prefix(
     prefix: &[u8],
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
+    let mut path = prefix.to_vec();
     for entry in TreeEntries::new(format, body) {
         let entry = entry?;
         if options.tree_only && entry.mode != 0o040000 {
             continue;
         }
-        let mut path = Vec::with_capacity(prefix.len() + entry.name.len());
-        path.extend_from_slice(prefix);
+        let path_len = path.len();
         path.extend_from_slice(entry.name);
         print_tree_entry_to_writer(&mut stdout, db, &entry, &path, options)?;
+        path.truncate(path_len);
     }
     stdout.flush()?;
     Ok(())
@@ -1466,11 +1484,11 @@ fn print_tree_entry_to_writer(
         let object_type = tree_entry_object_type(entry.mode());
         write!(
             writer,
-            "{:06o} {} {}",
+            "{:06o} {} ",
             entry.mode(),
-            object_type.as_str(),
-            format_tree_oid(entry.oid(), options)
+            object_type.as_str()
         )?;
+        write_tree_oid(writer, entry.oid(), options)?;
         if options.long {
             let size = tree_entry_size_field(db, object_type, entry.oid())?;
             write!(writer, " {size:>7}")?;
@@ -1494,17 +1512,9 @@ fn write_tree_path(
     if options.nul {
         writer.write_all(path)?;
     } else {
-        writer.write_all(status_quote_path(path, false).as_bytes())?;
+        write_status_quoted_path(writer, path, false)?;
     }
     Ok(())
-}
-
-fn format_tree_oid(oid: &ObjectId, options: TreePrintOptions<'_>) -> String {
-    let hex = oid.to_hex();
-    let Some(width) = options.oid_abbrev else {
-        return hex;
-    };
-    hex[..width.clamp(4, oid.format().hex_len())].to_string()
 }
 
 fn write_tree_oid(
@@ -1512,8 +1522,7 @@ fn write_tree_oid(
     oid: &ObjectId,
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    writer.write_all(format_tree_oid(oid, options).as_bytes())?;
-    Ok(())
+    write_object_id_hex(writer, oid, options.oid_abbrev)
 }
 
 fn write_tree_entry_format(
@@ -1629,6 +1638,9 @@ fn tree_entry_size_field(
     }
     let db =
         db.ok_or_else(|| GitError::Command("ls-tree --long requires an object database".into()))?;
+    if let Some((_, size)) = db.read_object_header(oid)? {
+        return Ok(size.to_string());
+    }
     Ok(db.read_object(oid)?.body.len().to_string())
 }
 
@@ -5304,7 +5316,7 @@ fn write_for_each_ref_typed_atom(
             };
             if let Some(oid) = oid {
                 match abbrev {
-                    None => write!(stdout, "{oid}")?,
+                    None => write_object_id_hex(stdout, oid, None)?,
                     Some(0) => stdout.write_all(
                         for_each_ref_abbrev_oid(
                             oid,
@@ -7363,6 +7375,26 @@ fn format_log_oid(oid: &ObjectId, abbrev_len: Option<usize>) -> String {
     }
 }
 
+fn append_log_oid(out: &mut Vec<u8>, oid: &ObjectId, abbrev_len: Option<usize>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let width = abbrev_len
+        .map(|width| oid.abbrev_hex_len(width))
+        .unwrap_or_else(|| oid.as_bytes().len() * 2);
+    let mut written = 0usize;
+    for byte in oid.as_bytes() {
+        if written >= width {
+            break;
+        }
+        out.push(HEX[(byte >> 4) as usize]);
+        written += 1;
+        if written >= width {
+            break;
+        }
+        out.push(HEX[(byte & 0x0f) as usize]);
+        written += 1;
+    }
+}
+
 fn format_log_commit_header_oid(
     oid: &ObjectId,
     abbrev_commit: bool,
@@ -8088,12 +8120,19 @@ fn log_describe_placeholder(
     Ok(result.unwrap_or_default())
 }
 
+fn append_metadata_parent_oids(out: &mut Vec<u8>, parents: &[ObjectId], abbrev_len: Option<usize>) {
+    for (idx, oid) in parents.iter().enumerate() {
+        if idx > 0 {
+            out.push(b' ');
+        }
+        append_log_oid(out, oid, abbrev_len);
+    }
+}
+
 fn format_metadata_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
-    parents
-        .iter()
-        .map(|oid| format_log_oid(oid, abbrev_len))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = Vec::with_capacity(parents.len().saturating_mul(41));
+    append_metadata_parent_oids(&mut out, parents, abbrev_len);
+    String::from_utf8(out).expect("object ids are always ASCII hex")
 }
 
 fn emit_compiled_log_format_metadata(
@@ -8101,6 +8140,78 @@ fn emit_compiled_log_format_metadata(
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
+) -> Result<()> {
+    emit_compiled_log_format_metadata_inner(record, compiled, context, out, None)
+}
+
+fn emit_compiled_log_format_metadata_with_message(
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    message: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    emit_compiled_log_format_metadata_inner(record, compiled, context, out, Some(message))
+}
+
+fn emit_compiled_log_format_limited_commit(
+    db: &FileObjectDatabase,
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let object = db.read_object(&record.oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            record.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let (message, encoding) = commit_object_message_and_encoding(&object.body);
+    let utf8_message = log_reencode_message(message, encoding.as_ref(), "UTF-8");
+    emit_compiled_log_format_metadata_with_message(record, compiled, context, &utf8_message, out)
+}
+
+fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'_, str>) {
+    let mut encoding = None;
+    let mut offset = 0usize;
+    while offset < body.len() {
+        let line_end = body[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| offset + idx)
+            .unwrap_or(body.len());
+        let line = &body[offset..line_end];
+        if line.is_empty() {
+            let message_start = line_end.saturating_add(1).min(body.len());
+            return (
+                &body[message_start..],
+                encoding.unwrap_or(std::borrow::Cow::Borrowed("")),
+            );
+        }
+        if let Some(value) = line.strip_prefix(b"encoding ") {
+            encoding = Some(
+                std::str::from_utf8(value)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(value)),
+            );
+        }
+        if line_end == body.len() {
+            break;
+        }
+        offset = line_end + 1;
+    }
+    (&[], encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
+}
+
+fn emit_compiled_log_format_metadata_inner(
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+    message: Option<&[u8]>,
 ) -> Result<()> {
     let LogFormatContext {
         abbrev_len,
@@ -8114,26 +8225,11 @@ fn emit_compiled_log_format_metadata(
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
-            FormatToken::OidFull => write!(out, "{}", record.oid).map_err(io::Error::from)?,
-            FormatToken::OidAbbrev => {
-                write!(out, "{}", format_log_oid(&record.oid, abbrev_len))
-                    .map_err(io::Error::from)?;
-            }
-            FormatToken::ParentsFull => {
-                write!(
-                    out,
-                    "{}",
-                    format_metadata_parent_oids(&record.parents, None)
-                )
-                .map_err(io::Error::from)?;
-            }
+            FormatToken::OidFull => append_log_oid(out, &record.oid, None),
+            FormatToken::OidAbbrev => append_log_oid(out, &record.oid, abbrev_len),
+            FormatToken::ParentsFull => append_metadata_parent_oids(out, &record.parents, None),
             FormatToken::ParentsAbbrev => {
-                write!(
-                    out,
-                    "{}",
-                    format_metadata_parent_oids(&record.parents, abbrev_len)
-                )
-                .map_err(io::Error::from)?;
+                append_metadata_parent_oids(out, &record.parents, abbrev_len);
             }
             FormatToken::Marker => out.push(marker as u8),
             FormatToken::NoteName if dialect == LogFormatDialect::Log => {}
@@ -8145,6 +8241,12 @@ fn emit_compiled_log_format_metadata(
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
             FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::Subject if let Some(message) = message => {
+                out.extend_from_slice(commit_subject_bytes(message));
+            }
+            FormatToken::SanitizedSubject if let Some(message) = message => {
+                write!(out, "{}", log_sanitized_subject(message)).map_err(io::Error::from)?;
+            }
             FormatToken::GRefname => out.push(b'N'),
             FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
             FormatToken::GPlaceholder
@@ -8842,15 +8944,7 @@ fn symbolic_ref_cannot_delete(name: &str) -> Result<()> {
 }
 
 pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
-    let needs_quotes = path.iter().any(|&byte| {
-        byte == b'"'
-            || byte == b'\\'
-            || byte == b'\n'
-            || byte == b'\t'
-            || !(0x20..0x7f).contains(&byte)
-            || (quote_space && byte == b' ')
-    });
-    if !needs_quotes {
+    if !status_path_needs_quotes(path, quote_space) {
         return String::from_utf8_lossy(path).into_owned();
     }
     let mut out = String::from("\"");
@@ -8866,6 +8960,41 @@ pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
     }
     out.push('"');
     out
+}
+
+pub(crate) fn write_status_quoted_path(
+    writer: &mut impl Write,
+    path: &[u8],
+    quote_space: bool,
+) -> Result<()> {
+    if !status_path_needs_quotes(path, quote_space) {
+        writer.write_all(path)?;
+        return Ok(());
+    }
+    writer.write_all(b"\"")?;
+    for &byte in path {
+        match byte {
+            b'"' => writer.write_all(br#"\""#)?,
+            b'\\' => writer.write_all(br#"\\"#)?,
+            b'\n' => writer.write_all(br#"\n"#)?,
+            b'\t' => writer.write_all(br#"\t"#)?,
+            0x20..=0x7e => writer.write_all(&[byte])?,
+            _ => write!(writer, "\\{byte:03o}")?,
+        }
+    }
+    writer.write_all(b"\"")?;
+    Ok(())
+}
+
+fn status_path_needs_quotes(path: &[u8], quote_space: bool) -> bool {
+    path.iter().any(|&byte| {
+        byte == b'"'
+            || byte == b'\\'
+            || byte == b'\n'
+            || byte == b'\t'
+            || !(0x20..0x7f).contains(&byte)
+            || (quote_space && byte == b' ')
+    })
 }
 
 fn refname_pattern_matches(pattern: &str, name: &str) -> bool {
@@ -9106,24 +9235,28 @@ fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
 
 fn repository_abbrev(git_dir: &Path, format: ObjectFormat) -> Result<Option<usize>> {
     if let Some(value) = global_config_value("core.abbrev")? {
-        return parse_repository_abbrev_value(format, &value);
+        return parse_repository_abbrev_value(git_dir, format, &value);
     }
     let config_path = git_dir.join("config");
     let Ok(config) = GitConfig::read(config_path) else {
-        return Ok(Some(7));
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };
     let Some(value) = config.get("core", None, "abbrev") else {
-        return Ok(Some(7));
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };
-    parse_repository_abbrev_value(format, value)
+    parse_repository_abbrev_value(git_dir, format, value)
 }
 
-fn parse_repository_abbrev_value(format: ObjectFormat, value: &str) -> Result<Option<usize>> {
+fn parse_repository_abbrev_value(
+    git_dir: &Path,
+    format: ObjectFormat,
+    value: &str,
+) -> Result<Option<usize>> {
     if value.eq_ignore_ascii_case("no") {
         return Ok(None);
     }
     if value.eq_ignore_ascii_case("auto") {
-        return Ok(Some(7));
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     }
     let width = value
         .parse::<usize>()
@@ -9134,6 +9267,91 @@ fn parse_repository_abbrev_value(format: ObjectFormat, value: &str) -> Result<Op
         )));
     }
     Ok(Some(width.min(format.hex_len())))
+}
+
+fn repository_auto_abbrev_width(git_dir: &Path, format: ObjectFormat) -> Result<usize> {
+    let object_count = repository_approx_object_count(git_dir, format)?;
+    if object_count == 0 {
+        return Ok(7.min(format.hex_len()));
+    }
+    let bits = u64::BITS as usize - object_count.saturating_sub(1).leading_zeros() as usize;
+    Ok(((bits + 1) / 2).max(7).min(format.hex_len()))
+}
+
+fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Result<u64> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let mut count = repository_loose_object_count(&objects_dir, format)?;
+    let pack_dir = objects_dir.join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(count);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("idx")) {
+            continue;
+        }
+        count = count.saturating_add(u64::from(pack_index_object_count(&path)?));
+    }
+    Ok(count)
+}
+
+fn repository_loose_object_count(objects_dir: &Path, format: ObjectFormat) -> Result<u64> {
+    let mut count = 0u64;
+    let Ok(entries) = fs::read_dir(objects_dir) else {
+        return Ok(0);
+    };
+    let filename_len = format.hex_len().saturating_sub(2);
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in files {
+            let file = file?;
+            let name = file.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.len() == filename_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn pack_index_object_count(path: &Path) -> Result<u32> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 8 + 256 * 4];
+    file.read_exact(&mut header[..8]).map_err(|_| {
+        GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
+    })?;
+    let fanout_offset = if header[..8].starts_with(&[0xff, b't', b'O', b'c']) {
+        file.read_exact(&mut header[8..]).map_err(|_| {
+            GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
+        })?;
+        8
+    } else {
+        file.read_exact(&mut header[8..256 * 4]).map_err(|_| {
+            GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
+        })?;
+        0
+    };
+    let offset = fanout_offset + 255 * 4;
+    Ok(u32::from_be_bytes([
+        header[offset],
+        header[offset + 1],
+        header[offset + 2],
+        header[offset + 3],
+    ]))
 }
 
 fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {

@@ -3075,6 +3075,7 @@ fn cmd_commit_long_status_preview(
         format,
         sley_worktree::ShortStatusOptions {
             include_ignored: false,
+            ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
             untracked_mode,
         },
     )?;
@@ -3542,6 +3543,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut explicit_untracked = false;
     let mut untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
+    let mut ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
     let mut show_stash = false;
     let mut ahead_behind = true;
     // `--ignore-submodules[=<when>]` from the command line, the highest-priority
@@ -3633,10 +3635,18 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 z = true;
             }
             "--no-null" => z = false,
-            "--ignored" | "--ignored=traditional" | "--ignored=matching" => {
+            "--ignored" | "--ignored=traditional" => {
                 show_ignored = true;
+                ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
             }
-            "--ignored=no" | "--no-ignored" => show_ignored = false,
+            "--ignored=matching" => {
+                show_ignored = true;
+                ignored_mode = sley_worktree::StatusIgnoredMode::Matching;
+            }
+            "--ignored=no" | "--no-ignored" => {
+                show_ignored = false;
+                ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
+            }
             value if value.starts_with("--ignored=") => {
                 return status_invalid_ignored_mode_error(&value["--ignored=".len()..]);
             }
@@ -3829,6 +3839,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         format,
         sley_worktree::ShortStatusOptions {
             include_ignored: show_ignored,
+            ignored_mode,
             untracked_mode,
         },
     )?;
