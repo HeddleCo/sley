@@ -1141,6 +1141,7 @@ dependencies = [
  "sley-rev",
  "sley-sequencer",
  "sley-strbuf-expand",
+ "sley-submodule",
  "sley-testkit",
  "sley-transport",
  "sley-worktree",
@@ -1346,6 +1347,14 @@ dependencies = [
 name = "sley-strbuf-expand"
 version = "0.1.0"
 dependencies = [
+ "sley-core",
+]
+
+[[package]]
+name = "sley-submodule"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
  "sley-core",
 ]
 

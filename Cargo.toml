@@ -14,6 +14,7 @@ members = [
     "crates/sley-worktree",
     "crates/sley-diff-merge",
     "crates/sley-sequencer",
+    "crates/sley-submodule",
     "crates/sley-pack",
     "crates/sley-mmap",
     "crates/sley-transport",
