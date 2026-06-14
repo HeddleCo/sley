@@ -445,15 +445,22 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         copy_threshold: o.copy_threshold,
     };
 
+    // `git diff-files` selects changed paths by the cached *stat*, not by content:
+    // it does NOT refresh the index, so a stat-dirty entry whose content is
+    // unchanged (a `touch`ed file, or a freshly `rm --cached`-then-`reset
+    // --no-refresh` entry with a zeroed cached stat) is still reported `M`. The
+    // dedicated diff-files engine layers that stat-based selection over the
+    // content diff; porcelain `git diff` (which refreshes first) keeps the plain
+    // content engine.
     let entries = if o.inexact_renames {
-        sley_diff_merge::diff_name_status_index_worktree_with_rename_options(
+        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_rename_options(
             worktree_root,
             git_dir,
             format,
             rename_options,
         )?
     } else {
-        sley_diff_merge::diff_name_status_index_worktree_with_options(
+        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
             worktree_root,
             git_dir,
             format,
@@ -552,15 +559,38 @@ fn render_diff_files_entries(
             )?;
         }
     }
+    // Stat-family output (numstat/stat/shortstat) reflects *content*, so — like
+    // git's diffcore, which drops unmodified pairs before the stat walk — the
+    // stat-dirty-but-content-identical entries (a `touch`ed / `reset
+    // --no-refresh`-restored file: shown `M` in raw/name-status, empty in stat)
+    // must be excluded. The raw and name output keep the full set.
+    let content_entries: Vec<sley_diff_merge::NameStatusEntry> =
+        if show_numstat || show_stat || show_shortstat {
+            entries
+                .iter()
+                .filter(|entry| {
+                    diff_files_entry_has_content_change(
+                        entry,
+                        db,
+                        worktree_root,
+                        use_worktree_new,
+                    )
+                    .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
     if show_numstat {
-        for entry in entries {
+        for entry in &content_entries {
             write_diff_numstat_entry(&mut stdout, entry, o.z, db, worktree_root, use_worktree_new)?;
         }
     }
     if show_stat {
         write_diff_stat(
             &mut stdout,
-            entries,
+            &content_entries,
             db,
             worktree_root,
             use_worktree_new,
@@ -572,7 +602,7 @@ fn render_diff_files_entries(
         )?;
     }
     if show_shortstat {
-        write_diff_shortstat(&mut stdout, entries, db, worktree_root, use_worktree_new)?;
+        write_diff_shortstat(&mut stdout, &content_entries, db, worktree_root, use_worktree_new)?;
     }
     if show_summary {
         for entry in entries {
@@ -609,6 +639,33 @@ fn render_diff_files_entries(
         }
     }
     Ok(())
+}
+
+/// Whether `entry` is a real content/mode change for the purpose of stat-family
+/// output — i.e. NOT one of the unmodified pairs git's diffcore drops before the
+/// stat walk. A plain `Modified` entry whose old/new content and mode are
+/// identical (a stat-dirty-but-content-unchanged `diff-files` entry) returns
+/// `false`; every other entry (adds, deletes, real modifies, renames, copies, or
+/// mode flips) returns `true`. Mirrors the suppression in `write_diff_patch_entry`.
+fn diff_files_entry_has_content_change(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+) -> Result<bool> {
+    if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) {
+        return Ok(true);
+    }
+    let mode_unchanged = match (entry.old_mode, entry.new_mode) {
+        (Some(old_mode), Some(new_mode)) => old_mode == new_mode,
+        _ => true,
+    };
+    if !mode_unchanged {
+        return Ok(true);
+    }
+    let old_content = diff_entry_old_content(entry, db)?;
+    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+    Ok(old_content.as_deref() != new_content.as_deref())
 }
 
 /// Render a single entry for `--name-only` / `--name-status`, honouring `-z`

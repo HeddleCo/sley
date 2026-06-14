@@ -1578,6 +1578,126 @@ pub fn diff_name_status_index_worktree_with_rename_options(
     })
 }
 
+/// Index-vs-worktree name-status for **`git diff-files`** (plumbing), which
+/// selects changed paths by the cached *stat* rather than by content.
+///
+/// This is the crucial difference from [`diff_name_status_index_worktree_with_options`]
+/// (the engine behind porcelain `git diff`): porcelain `git diff` refreshes the
+/// index first, so a stat-dirty-but-content-identical entry (a `touch`ed file, or
+/// a freshly `rm --cached`-then-`reset --no-refresh` entry with a zeroed cached
+/// stat) is re-stamped clean and suppressed. `git diff-files` does **not** refresh
+/// — it reports every entry whose cached stat fails to prove it clean as `M`,
+/// without re-hashing the content to "rescue" it (`builtin/diff.c` →
+/// `run_diff_files` → `ie_match_stat`). The raw / name-only / name-status output
+/// and the `--quiet`/`--exit-code` status therefore list such entries even when
+/// the content is byte-identical; patch/stat output, which diffs actual content,
+/// renders them as an empty hunk.
+///
+/// We layer that stat-based selection on top of the content-based diff: the
+/// content diff already catches adds/deletes/genuine-content modifies (with
+/// rename detection), and we then append a `Modified` entry for any stage-0 path
+/// whose worktree file is present and whose cached stat is dirty per
+/// [`IndexStatCache::index_entry_worktree_stat_dirty`] but which the content diff
+/// did not already report. Content-identical stat-dirty entries cannot be rename
+/// sources/targets (their content is unchanged), so they never interact with the
+/// rename machinery — they are plain `M`.
+pub fn diff_name_status_index_worktree_for_diff_files_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let changes =
+        diff_name_status_index_worktree_with_options(worktree_root, git_dir, format, options)?;
+    augment_with_stat_dirty_entries(worktree_root, git_dir, format, changes)
+}
+
+/// As [`diff_name_status_index_worktree_for_diff_files_with_options`], but with
+/// full rename/copy options (the `git diff-files -M/-C` path). The stat-dirty
+/// augmentation is identical; only the underlying content diff differs.
+pub fn diff_name_status_index_worktree_for_diff_files_with_rename_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let changes = diff_name_status_index_worktree_with_rename_options(
+        worktree_root,
+        git_dir,
+        format,
+        options,
+    )?;
+    augment_with_stat_dirty_entries(worktree_root, git_dir, format, changes)
+}
+
+/// Append a `Modified` entry for every stage-0 index path whose worktree file is
+/// present and whose cached stat is dirty (`ce_match_stat` "changed") but which
+/// `content_changes` did not already report. The result is re-sorted by path so
+/// the merged set keeps git's diff-queue ordering. New-side oids on the added
+/// entries are left `None` (rendered as zeros in raw output), matching git, which
+/// reports the worktree blob oid only for entries it has hashed.
+fn augment_with_stat_dirty_entries(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    mut content_changes: Vec<NameStatusEntry>,
+) -> Result<Vec<NameStatusEntry>> {
+    let IndexSnapshot {
+        entries: index,
+        stat_cache,
+    } = read_index_snapshot(git_dir, format)?;
+    // Paths the content diff already accounts for (by new-side path, the position
+    // git queues a pair at — a rename's destination, a modify/add/delete's path).
+    let already_reported: BTreeSet<&[u8]> = content_changes
+        .iter()
+        .map(|entry| entry.path.as_bytes())
+        .collect();
+    let mut extras = Vec::new();
+    for (git_path, tracked) in &index {
+        if already_reported.contains(git_path.as_slice()) {
+            continue;
+        }
+        let Some(cached) = stat_cache.entry_for_git_path(git_path) else {
+            continue;
+        };
+        // Gitlinks (submodules) have their own dirtiness model and are not stat-
+        // compared here; the content diff already handles changed gitlink oids.
+        if tracked.mode == 0o160000 {
+            continue;
+        }
+        let path = worktree_root.join(repo_path_to_path(git_path));
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            // A missing worktree file is a deletion, which the content diff
+            // already reports; nothing to add here.
+            continue;
+        };
+        if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+            continue;
+        }
+        if !stat_cache.index_entry_worktree_stat_dirty(cached, &metadata) {
+            continue;
+        }
+        extras.push(NameStatusEntry {
+            status: NameStatus::Modified,
+            path: git_path.clone().into(),
+            old_path: None,
+            old_mode: Some(tracked.mode),
+            new_mode: Some(tracked.mode),
+            old_oid: Some(tracked.oid),
+            new_oid: None,
+        });
+    }
+    if !extras.is_empty() {
+        content_changes.extend(extras);
+        content_changes.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    }
+    Ok(content_changes)
+}
+
 pub fn diff_name_status_trees_with_options(
     db: &FileObjectDatabase,
     format: ObjectFormat,

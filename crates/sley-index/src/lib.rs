@@ -403,6 +403,12 @@ impl Index {
     }
 }
 
+/// The `CE_VALID`/assume-unchanged bit in [`IndexEntry::flags`] (git's
+/// `CE_VALID`). When set, git trusts the cached stat unconditionally and never
+/// re-checks the worktree file: `ce_match_stat` short-circuits to "unchanged"
+/// regardless of the on-disk stat (see `git update-index --assume-unchanged`).
+pub const INDEX_FLAG_VALID: u16 = 0x8000;
+
 /// The `extended` bit in [`IndexEntry::flags`]: when set, a second
 /// [`IndexEntry::flags_extended`] `u16` follows on disk (index v3+).
 pub const INDEX_FLAG_EXTENDED: u16 = 0x4000;
@@ -605,6 +611,32 @@ impl IndexStatCache {
             return None;
         }
         Some(entry)
+    }
+
+    /// Whether `entry`'s cached stat fails to prove the worktree file unchanged —
+    /// git's `ce_match_stat` "changed" verdict, used by `diff-files` to decide
+    /// which entries to *select* without re-hashing their content.
+    ///
+    /// Precedence (mirrors `read-cache.c:ie_match_stat`):
+    ///   1. `CE_VALID`/assume-unchanged set  → never dirty (git trusts the cache
+    ///      blindly), regardless of the on-disk stat.
+    ///   2. otherwise compare mode + cached stat. A zeroed/invalid cached stat
+    ///      (e.g. a freshly `rm --cached`-then-`reset --no-refresh` entry, whose
+    ///      ctime/mtime are all zero) fails the stat-uptodate check and so is
+    ///      reported **dirty** — git does NOT re-hash the content to "rescue" it.
+    ///   3. a racily-clean entry (stat matches but mtime is at/after the index's)
+    ///      is treated as dirty so a same-second edit is not missed.
+    ///
+    /// Crucially this never reads or hashes the file: it is a pure stat verdict.
+    pub fn index_entry_worktree_stat_dirty(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+    ) -> bool {
+        if entry.flags & INDEX_FLAG_VALID != 0 {
+            return false;
+        }
+        self.reusable_index_entry(entry, worktree_metadata).is_none()
     }
 }
 
