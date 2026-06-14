@@ -75,6 +75,22 @@
 # sprawl (ref/HEAD validation, --connectivity-only/--cache/--name-objects,
 # pack-object fsck, gitattributes blob checks, rev-list --verify-objects,
 # worktree-index fsck), not content-checker gaps — see the ranked backlog.
+# reset wave (2026-06-14, parity/reset): t7102-reset added at 35 (was 13 — banked
+# six clusters in cmd_reset/sley-worktree/sley-index: (a) parse-options errors —
+# `--no-{soft,mixed,hard,merge,keep}`/`--other`/`-o` now emit `error: unknown
+# option ...` + usage, exit 129; (b) ORIG_HEAD written on every whole-tree reset
+# (soft/hard/mixed, incl. bare `git reset`), cascade-unblocked cells 15-23; (c)
+# `--soft` refused mid-merge ("Cannot do a soft reset in the middle of a merge.",
+# exit 128) on MERGE_HEAD or any unmerged index entry; (d) `reset HEAD <path>`
+# disambiguation fixed by not swallowing the `HEAD` positional; (e) `-N`/
+# --intent-to-add re-records un-staged adds as ITA (write_tree_from_index now skips
+# CE_INTENT_TO_ADD, matching cache_tree_update); (f) `--mixed` preserves the
+# skip-worktree bit (reset_index_to_commit carries it forward) so skip-worktree
+# paths are omitted from the post-reset summary; plus the "HEAD is now at" subject
+# is re-encoded commit→logOutputEncoding (cells 7/8). Backlog (out of reset scope):
+# cell 14 (checkout -m dep), 23 (pull FF ORIG_HEAD), 28 (--no-refresh needs
+# diff-files to honor the stat-cache dirty flag). Neighbors held: t7508-status=86,
+# t2020-checkout-detach=16, t7060-wtstatus=7. No workspace test regressed (2171/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -157,6 +173,7 @@ declare -A FLOOR=(
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=86
     [t4027-diff-submodule.sh]=18
+    [t7102-reset.sh]=36
 )
 
 fail=0

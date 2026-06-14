@@ -1275,11 +1275,22 @@ fn print_reset_hard_head(
         )));
     }
     let commit = Commit::parse_ref(format, &object.body)?;
-    println!(
-        "HEAD is now at {} {}",
-        format_log_abbrev_oid(commit_oid),
-        commit_subject(commit.message)
-    );
+    // git's "HEAD is now at" line re-encodes the subject from the commit's stored
+    // `encoding` header to the log output encoding (i18n.logOutputEncoding, else
+    // i18n.commitEncoding, else UTF-8) — t7102 cells 7/8. Write the result as raw
+    // bytes since a non-UTF-8 output encoding (e.g. ISO8859-1) is not valid UTF-8.
+    let config = read_repo_config(git_dir)?;
+    let from = commit
+        .encoding
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    let to = log_output_encoding(&config);
+    let reencoded = log_reencode_message(commit.message, &from, &to);
+    let subject = commit_subject_bytes(&reencoded);
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "HEAD is now at {} ", format_log_abbrev_oid(commit_oid))?;
+    stdout.write_all(subject)?;
+    writeln!(stdout)?;
     Ok(())
 }
 

@@ -1635,7 +1635,17 @@ pub fn write_tree_from_index_with_options(
         },
         Err(err) => return Err(err.into()),
     };
-    let entries = write_tree_entries_for_prefix(&index.entries, options.prefix.as_deref())?;
+    // intent-to-add entries (`git add -N`, `git reset -N`) are placeholders that do
+    // NOT belong in a written tree — git's cache_tree_update skips CE_INTENT_TO_ADD.
+    // Drop them before building, so `write-tree` succeeds and the tree omits them
+    // (their empty-blob oid is also typically absent from the odb).
+    let tracked: Vec<IndexEntry> = index
+        .entries
+        .iter()
+        .filter(|entry| !entry.is_intent_to_add())
+        .cloned()
+        .collect();
+    let entries = write_tree_entries_for_prefix(&tracked, options.prefix.as_deref())?;
     let mut root = TreeNode::default();
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     if !options.missing_ok {
@@ -6407,21 +6417,37 @@ pub fn reset_index_to_commit(
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    // git's `reset --mixed` preserves the skip-worktree bit on entries that survive
+    // the reset (t7102 "--mixed preserves skip-worktree"): carry it forward from the
+    // pre-reset index keyed by path, so reconstructed entries keep CE_SKIP_WORKTREE.
+    let index_path = repository_index_path(git_dir);
+    let prior_skip_worktree: BTreeSet<Vec<u8>> = match fs::read(&index_path) {
+        Ok(bytes) => Index::parse(&bytes, format)?
+            .entries
+            .iter()
+            .filter(|entry| entry.is_skip_worktree())
+            .map(|entry| entry.path.as_bytes().to_vec())
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(err) => return Err(err.into()),
+    };
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        index_entries.push(restored_head_index_entry(worktree_root, &db, path, entry)?);
+        let mut restored = restored_head_index_entry(worktree_root, &db, path, entry)?;
+        if prior_skip_worktree.contains(path) {
+            restored.set_skip_worktree(true);
+        }
+        index_entries.push(restored);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(
-        repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries: index_entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries: index_entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(format)?)?;
     Ok(RestoreResult {
         restored: target_entries.len(),
     })

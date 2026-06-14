@@ -1094,6 +1094,10 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // Fast-forward: HEAD is an ancestor of other.
     let can_fast_forward = bases.iter().any(|base| base == &head_oid);
     if can_fast_forward && !options.no_ff {
+        // Record the pre-merge HEAD in ORIG_HEAD before moving HEAD, exactly as
+        // git does for every merge/pull including fast-forwards — so that
+        // `reset --hard ORIG_HEAD` can undo a fast-forward pull/merge.
+        fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
         let target_ref = match refs.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),

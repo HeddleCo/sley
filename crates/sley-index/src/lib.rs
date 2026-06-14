@@ -97,6 +97,20 @@ impl IndexEntry {
         }
     }
 
+    /// Set or clear the skip-worktree bit, keeping the `extended` flag in sync.
+    /// (The writer only emits extended entries for index version 3+.)
+    pub fn set_skip_worktree(&mut self, skip: bool) {
+        if skip {
+            self.flags_extended |= INDEX_EXTENDED_FLAG_SKIP_WORKTREE;
+            self.flags |= INDEX_FLAG_EXTENDED;
+        } else {
+            self.flags_extended &= !INDEX_EXTENDED_FLAG_SKIP_WORKTREE;
+            if self.flags_extended == 0 {
+                self.flags &= !INDEX_FLAG_EXTENDED;
+            }
+        }
+    }
+
     /// Re-encode the name-length bits (low 12 bits of `flags`, capped at
     /// `0xfff`) from `path`, matching what git stores.
     pub fn refresh_name_length(&mut self) {

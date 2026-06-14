@@ -4,6 +4,15 @@
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
+/// git's `git reset --help`-derived usage block, printed after an `error:` line
+/// when parse-options rejects an argument (matches builtin/reset.c's usage).
+const RESET_USAGE: &str = "\
+usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
+   or: git reset [-q] [<tree-ish>] [--] <pathspec>...
+   or: git reset [-q] [--pathspec-from-file [--pathspec-file-nul]] [<tree-ish>]
+   or: git reset --patch [<tree-ish>] [--] [<pathspec>...]
+";
+
 pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut positionals = Vec::new();
     let mut quiet = false;
@@ -13,6 +22,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut separator_index = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
+    let mut intent_to_add = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if !parsing_options {
@@ -33,6 +43,11 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             }
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "-N" | "--intent-to-add" => intent_to_add = true,
+            "--no-intent-to-add" => intent_to_add = false,
+            // sley's diff-files compares content rather than trusting the cached
+            // stat, so --[no-]refresh is accepted but has no observable effect
+            // (the post-reset index is already content-accurate). Tracked: cell 28.
             "--refresh" | "--no-refresh" | "--no-recurse-submodules" => {}
             "--mixed" => mode = ResetMode::Mixed,
             "--soft" => mode = ResetMode::Soft,
@@ -53,11 +68,24 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 })?;
                 pathspec_from_file = Some(PathBuf::from(value));
             }
-            "HEAD" => {}
+            "--end-of-options" => {
+                // Everything after `--end-of-options` is a positional (commit-ish
+                // or pathspec), even if it begins with a dash. git's parse-options
+                // uses this to disambiguate a ref like `--foo` from an option.
+                parsing_options = false;
+            }
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported reset option {value}"
-                )));
+                // Mirror git's parse-options error for an unrecognized flag:
+                // `error: unknown option `<name>'` (long options drop the leading
+                // `--`; a short cluster like `-o` keeps its single dash stripped),
+                // followed by the usage block, exiting with parse-options' code 129.
+                let name = value
+                    .strip_prefix("--")
+                    .or_else(|| value.strip_prefix('-'))
+                    .unwrap_or(value);
+                eprintln!("error: unknown option `{name}'");
+                eprint!("{RESET_USAGE}");
+                return Err(GitError::Exit(129));
             }
             value => {
                 if pathspec_from_file.is_some() {
@@ -126,6 +154,17 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(128));
             }
         };
+        // git refuses a `--soft` reset while a merge is in progress or the index
+        // carries unmerged entries: a soft reset only moves HEAD, so leaving the
+        // half-merged index behind would silently strand the conflict state.
+        // builtin/reset.c: `reset_type == SOFT && (merge in progress || unmerged)`
+        // → "Cannot do a soft reset in the middle of a merge." (exit 128).
+        if mode == ResetMode::Soft
+            && reset_soft_blocked_by_merge(&git_dir, format)?
+        {
+            eprintln!("fatal: Cannot do a soft reset in the middle of a merge.");
+            return Err(GitError::Exit(128));
+        }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let old_head = match resolve_revision(&git_dir, format, "HEAD") {
             Ok(oid) => oid,
@@ -162,6 +201,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         }
         let target_oid = resolve_revision(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        write_reset_orig_head(&git_dir, &old_head, format)?;
         if mode == ResetMode::Hard {
             sley_worktree::reset_index_and_worktree_to_commit(
                 worktree_root.clone(),
@@ -195,12 +235,24 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             Err(_) => zero_oid(format)?,
         };
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        // For `git reset -N` capture the paths the *current* index tracks that the
+        // target tree does NOT, so they can be re-recorded as intent-to-add after
+        // the index is reset (git: removed paths "will be added later").
+        let ita_candidates = if intent_to_add {
+            reset_intent_to_add_candidates(&git_dir, &db, format, &target_commit)?
+        } else {
+            Vec::new()
+        };
+        write_reset_orig_head(&git_dir, &old_head, format)?;
         sley_worktree::reset_index_to_commit(
             worktree_root.clone(),
             git_dir.clone(),
             format,
             &target_commit,
         )?;
+        if intent_to_add && !ita_candidates.is_empty() {
+            apply_reset_intent_to_add(&git_dir, format, &ita_candidates)?;
+        }
         update_reset_head_ref(
             &git_dir,
             format,
@@ -296,12 +348,128 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         )?;
     }
     if no_explicit_paths {
+        // A bare `git reset` (whole-tree mixed reset to HEAD) records ORIG_HEAD
+        // just like the explicit-commit whole-tree paths. Pathspec resets do not.
+        if let Ok(old_head) = resolve_revision(&git_dir, format, "HEAD") {
+            write_reset_orig_head(&git_dir, &old_head, format)?;
+        }
         sley_sequencer::replay::remove_branch_state(&git_dir);
     }
     if !quiet {
         print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
     }
     Ok(())
+}
+
+/// Record the pre-reset HEAD in `.git/ORIG_HEAD`, exactly as `git reset` does for
+/// every whole-tree reset (all modes). Pathspec resets do NOT update ORIG_HEAD, so
+/// this is only called on the whole-tree code paths. A null/unborn old HEAD writes
+/// nothing — git leaves ORIG_HEAD untouched when there is no commit to record.
+fn write_reset_orig_head(git_dir: &Path, old_head: &ObjectId, format: ObjectFormat) -> Result<()> {
+    if *old_head == ObjectId::null(format) {
+        return Ok(());
+    }
+    fs::write(git_dir.join("ORIG_HEAD"), format!("{old_head}\n"))?;
+    Ok(())
+}
+
+/// The worktree-relative paths a `git reset -N` should re-record as intent-to-add:
+/// stage-0 paths the *current* index tracks that the target tree does NOT (i.e. the
+/// adds being un-staged by the reset). git keeps these as intent-to-add so the file
+/// still shows in `git diff` but is absent from the written tree.
+fn reset_intent_to_add_candidates(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    target_commit: &ObjectId,
+) -> Result<Vec<BString>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let target_tree = sley_rev::peel_to_tree(db, format, target_commit)?;
+    let target_index = sley_worktree::index_from_tree(db, format, &target_tree)?;
+    let target_paths: std::collections::BTreeSet<BString> = target_index
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    Ok(index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.stage() == sley_index::Stage::Normal && !target_paths.contains(&entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect())
+}
+
+/// Insert intent-to-add placeholders into the (already reset) index for the given
+/// paths, matching `git reset -N`. Each becomes an ITA stage-0 entry, so the path
+/// is reported by `git diff` yet excluded from `git write-tree`'s output.
+fn apply_reset_intent_to_add(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[BString],
+) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let existing: std::collections::BTreeSet<BString> =
+        index.entries.iter().map(|entry| entry.path.clone()).collect();
+    for path in paths {
+        if existing.contains(path) {
+            continue;
+        }
+        index
+            .entries
+            .push(IndexEntry::intent_to_add(format, path.clone()));
+    }
+    index.entries.sort_by(|left, right| left.path.cmp(&right.path));
+    // intent-to-add entries carry extended flags, which the v2 index writer cannot
+    // encode; bump to v3 when needed (mirrors `git add -N`'s index upgrade).
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(format)?)?;
+    Ok(())
+}
+
+/// The byte paths of every index entry carrying the skip-worktree bit, so the
+/// post-reset "Unstaged changes" summary can exclude them (git never lists a
+/// skip-worktree path there). Empty when the index is absent.
+fn reset_skip_worktree_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    Ok(index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_skip_worktree())
+        .map(|entry| entry.path.to_vec())
+        .collect())
+}
+
+/// Whether a `--soft` reset must be refused because a merge is in flight. git's
+/// builtin/reset.c blocks a soft reset when `MERGE_HEAD` exists OR the index holds
+/// any unmerged (stage != 0) entry — a soft reset only moves HEAD, so it would
+/// otherwise abandon the half-resolved index. Returns true in either case.
+fn reset_soft_blocked_by_merge(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    if git_dir.join("MERGE_HEAD").is_file() {
+        return Ok(true);
+    }
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(false);
+    }
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    Ok(index
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != sley_index::Stage::Normal))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,6 +498,13 @@ fn print_reset_unstaged_changes(
 ) -> Result<()> {
     let mut entries = sley_worktree::short_status(worktree_root, git_dir, format)?;
     entries.retain(|entry| matches!(entry.worktree, b'M' | b'D'));
+    // git's post-reset summary omits skip-worktree paths: `update_index_refresh`
+    // never marks a CE_SKIP_WORKTREE entry stat-dirty, so it never appears in the
+    // "Unstaged changes after reset:" list (t7102 cell 29). Drop those paths.
+    let skip_worktree = reset_skip_worktree_paths(git_dir, format)?;
+    if !skip_worktree.is_empty() {
+        entries.retain(|entry| !skip_worktree.contains(entry.path.as_slice()));
+    }
     if entries.is_empty() {
         return Ok(());
     }
