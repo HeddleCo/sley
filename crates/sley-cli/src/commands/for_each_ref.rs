@@ -359,12 +359,22 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     } else {
         HashMap::new()
     };
-    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let config = if needs.config || for_each_ref_sorts_need_config(&sorts) {
+        GitConfig::read(git_dir.join("config")).unwrap_or_default()
+    } else {
+        GitConfig::default()
+    };
     // git resolves `%(...:mailmap)` atoms against the repository .mailmap plus
-    // mailmap.{file,blob} config; load it once up front (cheap when absent).
-    let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
+    // mailmap.{file,blob} config. Avoid probing those paths for formats that
+    // never request mailmap rewriting.
+    let mailmap = if needs.mailmap {
+        commands::utility::Mailmap::load_default(&git_dir, format)?
+    } else {
+        commands::utility::Mailmap::default()
+    };
     let mut object_headers = ForEachRefObjectHeaderCache::new();
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
     let mut emitted = 0usize;
     let mut refs = store.list_refs()?;
     if include_root_refs && let Some(target) = store.read_ref("HEAD")? {
@@ -733,6 +743,10 @@ struct ForEachRefNeeds {
     /// `%(objectname:short...)` / `%(*objectname:short...)` — needs the ambiguity
     /// candidate set (the full object-id enumeration).
     candidates: bool,
+    /// `%(...:mailmap)` — needs repository and configured mailmap sources.
+    mailmap: bool,
+    /// `%(upstream*)` / `%(push*)` — needs branch config.
+    config: bool,
 }
 
 impl ForEachRefNeeds {
@@ -743,12 +757,23 @@ impl ForEachRefNeeds {
                 continue;
             };
             match atom {
-                ForEachRefAtom::Raw(placeholder) => needs.note_raw(placeholder),
+                ForEachRefAtom::Raw(placeholder) => {
+                    if placeholder.contains("mailmap") {
+                        needs.mailmap = true;
+                    }
+                    needs.note_raw(placeholder);
+                }
                 ForEachRefAtom::Color(_) => {}
                 ForEachRefAtom::RefName { source, .. } => match source {
                     ForEachRefNameSource::Ref => {}
-                    ForEachRefNameSource::Upstream => needs.upstream = true,
-                    ForEachRefNameSource::Push => needs.push = true,
+                    ForEachRefNameSource::Upstream => {
+                        needs.upstream = true;
+                        needs.config = true;
+                    }
+                    ForEachRefNameSource::Push => {
+                        needs.push = true;
+                        needs.config = true;
+                    }
                 },
                 ForEachRefAtom::ObjectName { peeled, abbrev } => {
                     if abbrev.is_some() {
@@ -868,6 +893,7 @@ impl ForEachRefNeeds {
         match atom {
             "upstream" | "upstream:short" | "upstream:remotename" | "upstream:remoteref" => {
                 self.upstream = true;
+                self.config = true;
             }
             "upstream:track"
             | "upstream:track,nobracket"
@@ -875,13 +901,16 @@ impl ForEachRefNeeds {
             | "upstream:trackshort" => {
                 self.upstream = true;
                 self.upstream_track = true;
+                self.config = true;
             }
             "push" | "push:short" | "push:remotename" | "push:remoteref" => {
                 self.push = true;
+                self.config = true;
             }
             "push:track" | "push:track,nobracket" | "push:nobracket,track" | "push:trackshort" => {
                 self.push = true;
                 self.push_track = true;
+                self.config = true;
             }
             other
                 if other.starts_with("upstream:lstrip=")
@@ -889,6 +918,7 @@ impl ForEachRefNeeds {
                     || other.starts_with("upstream:rstrip=") =>
             {
                 self.upstream = true;
+                self.config = true;
             }
             other
                 if other.starts_with("push:lstrip=")
@@ -896,6 +926,7 @@ impl ForEachRefNeeds {
                     || other.starts_with("push:rstrip=") =>
             {
                 self.push = true;
+                self.config = true;
             }
             _ => {}
         }
@@ -1578,6 +1609,20 @@ impl ForEachRefSort {
                 | ForEachRefSort::VersionRefnameDescending
         )
     }
+
+    fn needs_config(self) -> bool {
+        matches!(
+            self,
+            ForEachRefSort::Upstream
+                | ForEachRefSort::UpstreamDescending
+                | ForEachRefSort::Push
+                | ForEachRefSort::PushDescending
+        )
+    }
+}
+
+fn for_each_ref_sorts_need_config(sorts: &[ForEachRefSort]) -> bool {
+    sorts.iter().any(|sort| sort.needs_config())
 }
 
 fn for_each_ref_object_header(

@@ -889,7 +889,7 @@ pub struct CacheTree {
     pub entry_count: i32,
     /// The cached tree object id, present iff `entry_count >= 0`.
     pub oid: Option<ObjectId>,
-    /// Immediate child directories, in the order git stores them (sorted).
+    /// Immediate child directories, in the order git stores them.
     pub subtrees: Vec<CacheTreeChild>,
 }
 
@@ -1029,10 +1029,9 @@ fn parse_cache_tree_node(
     };
 
     let mut subtrees = Vec::with_capacity(subtree_count);
-    let mut previous_name: Option<&[u8]> = None;
     for _ in 0..subtree_count {
-        // Peek the child's name so we can validate sort order while still
-        // delegating the NUL handling to the recursive call.
+        // Peek the child's name while still delegating the NUL handling to the
+        // recursive call.
         let child_name_start = *offset;
         let mut scan = *offset;
         while body.get(scan).copied() != Some(0) {
@@ -1049,13 +1048,6 @@ fn parse_cache_tree_node(
                 "cache-tree subtree has empty name".into(),
             ));
         }
-        if let Some(previous) = previous_name
-            && previous >= child_name.as_slice()
-        {
-            return Err(GitError::InvalidFormat(
-                "cache-tree subtrees are not sorted".into(),
-            ));
-        }
         let (child_entry_count, child_oid, grandchildren) =
             parse_cache_tree_node(format, body, offset, &child_name)?;
         subtrees.push(CacheTreeChild {
@@ -1066,7 +1058,6 @@ fn parse_cache_tree_node(
                 subtrees: grandchildren,
             },
         });
-        previous_name = subtrees.last().map(|child| child.name.as_slice());
     }
 
     Ok((entry_count, oid, subtrees))
@@ -1098,17 +1089,7 @@ fn write_cache_tree_node(tree: &CacheTree, name: &[u8], out: &mut Vec<u8>) -> Re
             ));
         }
     }
-    // git keeps subtrees sorted by name; enforce it so output is canonical.
-    let mut previous: Option<&[u8]> = None;
     for child in &tree.subtrees {
-        if let Some(previous) = previous
-            && previous >= child.name.as_slice()
-        {
-            return Err(GitError::InvalidFormat(
-                "cache-tree subtrees must be sorted by name".into(),
-            ));
-        }
-        previous = Some(child.name.as_slice());
         write_cache_tree_node(&child.tree, &child.name, out)?;
     }
     Ok(())
@@ -1588,6 +1569,38 @@ mod tests {
             subtrees: Vec::new(),
         };
         assert!(bad.write().is_err());
+    }
+
+    #[test]
+    fn cache_tree_preserves_git_subtree_order_without_requiring_sort() {
+        let root_oid = oid("332618ff1401e7c767abab9efc710c66525befdc");
+        let bin_oid = oid("7134efad6424a13f600061d98cec36fedfcbfee8");
+        let dot_oid = oid("299beb4d195a743a1f82dfd7a0264289da06e00e");
+        let mut body = Vec::new();
+        body.push(0);
+        body.extend_from_slice(b"3 2\n");
+        body.extend_from_slice(root_oid.as_bytes());
+        body.extend_from_slice(b"bin\0");
+        body.extend_from_slice(b"1 0\n");
+        body.extend_from_slice(bin_oid.as_bytes());
+        body.extend_from_slice(b".gemini\0");
+        body.extend_from_slice(b"1 0\n");
+        body.extend_from_slice(dot_oid.as_bytes());
+
+        let cache_tree =
+            CacheTree::parse(ObjectFormat::Sha1, &body).expect("test operation should succeed");
+        assert_eq!(
+            cache_tree
+                .subtrees
+                .iter()
+                .map(|child| child.name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"bin".as_slice(), b".gemini".as_slice()]
+        );
+        assert_eq!(
+            cache_tree.write().expect("test operation should succeed"),
+            body
+        );
     }
 
     #[test]

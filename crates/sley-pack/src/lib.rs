@@ -9,6 +9,8 @@ use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,10 +178,75 @@ pub struct PackIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackIndexView<'a> {
+    pub version: u32,
+    pub count: usize,
+    pub fanout: [u32; 256],
+    pub pack_checksum: ObjectId,
+    pub index_checksum: ObjectId,
+    bytes: &'a [u8],
+    format: ObjectFormat,
+    tables: PackIndexViewTables,
+}
+
+pub trait PackIndexByteSource: fmt::Debug + Send + Sync {
+    fn as_bytes(&self) -> &[u8];
+}
+
+impl<T> PackIndexByteSource for T
+where
+    T: AsRef<[u8]> + fmt::Debug + Send + Sync + ?Sized,
+{
+    fn as_bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+#[derive(Debug)]
+struct SharedIndexBytes(Arc<[u8]>);
+
+impl PackIndexByteSource for SharedIndexBytes {
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PackIndexViewData {
+    pub version: u32,
+    pub count: usize,
+    pub fanout: [u32; 256],
+    pub pack_checksum: ObjectId,
+    pub index_checksum: ObjectId,
+    bytes: Arc<dyn PackIndexByteSource>,
+    format: ObjectFormat,
+    tables: PackIndexViewTables,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackIndexEntry {
     pub oid: ObjectId,
     pub crc32: u32,
     pub offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackIndexLookup {
+    pub crc32: u32,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackIndexViewTables {
+    V1 {
+        entry_table: Range<usize>,
+    },
+    V2 {
+        oid_table: Range<usize>,
+        crc_table: Range<usize>,
+        small_offset_table: Range<usize>,
+        large_offset_table: Range<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -682,6 +749,415 @@ impl PackFile {
             index,
             checksum,
             entries: index_entries,
+        })
+    }
+}
+
+impl<'a> PackIndexView<'a> {
+    pub fn parse_v2_sha1(bytes: &'a [u8]) -> Result<Self> {
+        Self::parse(bytes, ObjectFormat::Sha1)
+    }
+
+    pub fn parse(bytes: &'a [u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, true, true)
+    }
+
+    /// Parse and validate the index layout without recomputing the trailing
+    /// index checksum. The checksum stored in the file is still exposed via
+    /// [`PackIndexView::index_checksum`].
+    pub fn parse_without_checksum(bytes: &'a [u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, false, true)
+    }
+
+    /// Parse a local/trusted pack index without recomputing the trailing index
+    /// checksum or walking every entry for canonical-order validation.
+    ///
+    /// This still validates the table layout and all lookup paths remain
+    /// bounds-checked, but it avoids O(number-of-objects) startup validation for
+    /// repository-owned `.idx` files in hot read paths.
+    pub fn parse_trusted_without_checksum(bytes: &'a [u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, false, false)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn fanout(&self) -> &[u32; 256] {
+        &self.fanout
+    }
+
+    pub fn find(&self, oid: &ObjectId) -> Option<PackIndexLookup> {
+        if oid.format() != self.format {
+            return None;
+        }
+        let bucket = usize::from(oid.as_bytes()[0]);
+        let mut start = if bucket == 0 {
+            0
+        } else {
+            self.fanout[bucket - 1] as usize
+        };
+        let mut end = self.fanout[bucket] as usize;
+        let target = oid.as_bytes();
+
+        while start < end {
+            let mid = start + (end - start) / 2;
+            match self.oid_bytes_at(mid).cmp(target) {
+                std::cmp::Ordering::Less => start = mid + 1,
+                std::cmp::Ordering::Equal => return self.lookup_at(mid),
+                std::cmp::Ordering::Greater => end = mid,
+            }
+        }
+        None
+    }
+
+    fn parse_impl(
+        bytes: &'a [u8],
+        format: ObjectFormat,
+        verify_checksum: bool,
+        validate_entries: bool,
+    ) -> Result<Self> {
+        let hash_len = format.raw_len();
+        if bytes.len() < 4 {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        if bytes[..4] != [0xff, b't', b'O', b'c'] {
+            return Self::parse_v1_impl(bytes, format, verify_checksum, validate_entries);
+        }
+        if bytes.len() < 8 + 256 * 4 + 2 * hash_len {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        let version = u32_be(&bytes[4..8]);
+        if version != 2 {
+            return Err(GitError::Unsupported(format!(
+                "pack index version {version}"
+            )));
+        }
+        let index_checksum_offset = bytes.len() - hash_len;
+        let index_checksum = ObjectId::from_raw(format, &bytes[index_checksum_offset..])?;
+        if verify_checksum {
+            let actual_index_checksum =
+                sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
+            if actual_index_checksum != index_checksum {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
+                )));
+            }
+        }
+
+        let mut offset = 8usize;
+        let fanout = read_pack_index_fanout(bytes, &mut offset)?;
+        let count = fanout[255] as usize;
+        let oid_table = checked_range(offset, count, hash_len, bytes.len())?;
+        offset = oid_table.end;
+        let crc_table = checked_range(offset, count, 4, bytes.len())?;
+        offset = crc_table.end;
+        let small_offset_table = checked_range(offset, count, 4, bytes.len())?;
+        offset = small_offset_table.end;
+
+        let large_offset_count = (0..count)
+            .filter(|idx| {
+                let start = small_offset_table.start + idx * 4;
+                u32_be(&bytes[start..start + 4]) & 0x8000_0000 != 0
+            })
+            .count();
+        let large_offset_table = checked_range(offset, large_offset_count, 8, bytes.len())?;
+        offset = large_offset_table.end;
+
+        let expected_trailer_offset = bytes.len() - hash_len * 2;
+        if offset != expected_trailer_offset {
+            return Err(GitError::InvalidFormat(format!(
+                "pack index has {} unexpected bytes before trailer",
+                expected_trailer_offset.saturating_sub(offset)
+            )));
+        }
+        let pack_checksum = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
+
+        let view = Self {
+            version,
+            count,
+            fanout,
+            pack_checksum,
+            index_checksum,
+            bytes,
+            format,
+            tables: PackIndexViewTables::V2 {
+                oid_table,
+                crc_table,
+                small_offset_table,
+                large_offset_table,
+            },
+        };
+        if validate_entries {
+            view.validate_v2_entries()?;
+        }
+        Ok(view)
+    }
+
+    fn parse_v1_impl(
+        bytes: &'a [u8],
+        format: ObjectFormat,
+        verify_checksum: bool,
+        validate_entries: bool,
+    ) -> Result<Self> {
+        let hash_len = format.raw_len();
+        if bytes.len() < 256 * 4 + 2 * hash_len {
+            return Err(GitError::InvalidFormat("pack index too short".into()));
+        }
+        let index_checksum_offset = bytes.len() - hash_len;
+        let index_checksum = ObjectId::from_raw(format, &bytes[index_checksum_offset..])?;
+        if verify_checksum {
+            let actual_index_checksum =
+                sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
+            if actual_index_checksum != index_checksum {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
+                )));
+            }
+        }
+
+        let mut offset = 0usize;
+        let fanout = read_pack_index_fanout(bytes, &mut offset)?;
+        let count = fanout[255] as usize;
+        let entry_len = hash_len
+            .checked_add(4)
+            .ok_or_else(|| GitError::InvalidFormat("pack index entry length overflow".into()))?;
+        let entry_table = checked_range(offset, count, entry_len, bytes.len())?;
+        offset = entry_table.end;
+        let expected_trailer_offset = bytes.len() - hash_len * 2;
+        if offset != expected_trailer_offset {
+            return Err(GitError::InvalidFormat(format!(
+                "pack index has {} unexpected bytes before trailer",
+                expected_trailer_offset.saturating_sub(offset)
+            )));
+        }
+        let pack_checksum = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
+
+        let view = Self {
+            version: 1,
+            count,
+            fanout,
+            pack_checksum,
+            index_checksum,
+            bytes,
+            format,
+            tables: PackIndexViewTables::V1 { entry_table },
+        };
+        if validate_entries {
+            view.validate_v1_entries()?;
+        }
+        Ok(view)
+    }
+
+    fn validate_v2_entries(&self) -> Result<()> {
+        let PackIndexViewTables::V2 {
+            oid_table,
+            small_offset_table,
+            large_offset_table,
+            ..
+        } = &self.tables
+        else {
+            unreachable!("v2 validation only runs for v2 views");
+        };
+        let oid_table = self.slice(oid_table.clone());
+        let small_offset_table = self.slice(small_offset_table.clone());
+        let large_offset_table = self.slice(large_offset_table.clone());
+        let hash_len = self.format.raw_len();
+        for idx in 0..self.count {
+            let oid_start = idx * hash_len;
+            let oid_bytes = &oid_table[oid_start..oid_start + hash_len];
+            if idx > 0 && oid_bytes <= &oid_table[oid_start - hash_len..oid_start] {
+                return Err(GitError::InvalidFormat(
+                    "pack index object ids are not strictly ascending".into(),
+                ));
+            }
+            validate_pack_index_oid_fanout(idx, oid_bytes, &self.fanout)?;
+
+            let offset_start = idx * 4;
+            let raw_offset = u32_be(&small_offset_table[offset_start..offset_start + 4]);
+            pack_index_v2_offset(raw_offset, large_offset_table)?;
+        }
+        Ok(())
+    }
+
+    fn validate_v1_entries(&self) -> Result<()> {
+        let PackIndexViewTables::V1 { entry_table } = &self.tables else {
+            unreachable!("v1 validation only runs for v1 views");
+        };
+        let entry_table = self.slice(entry_table.clone());
+        let hash_len = self.format.raw_len();
+        let entry_len = hash_len
+            .checked_add(4)
+            .ok_or_else(|| GitError::InvalidFormat("pack index entry length overflow".into()))?;
+        for idx in 0..self.count {
+            let start = idx * entry_len;
+            let oid_start = start + 4;
+            let oid_bytes = &entry_table[oid_start..start + entry_len];
+            if idx > 0 {
+                let previous_oid_start = oid_start - entry_len;
+                let previous_oid = &entry_table[previous_oid_start..previous_oid_start + hash_len];
+                if previous_oid >= oid_bytes {
+                    return Err(GitError::InvalidFormat(
+                        "pack index object ids are not strictly sorted".into(),
+                    ));
+                }
+            }
+            validate_pack_index_oid_fanout(idx, oid_bytes, &self.fanout)?;
+        }
+        Ok(())
+    }
+
+    fn oid_bytes_at(&self, idx: usize) -> &'a [u8] {
+        let hash_len = self.format.raw_len();
+        match &self.tables {
+            PackIndexViewTables::V1 { entry_table } => {
+                let entry_table = self.slice(entry_table.clone());
+                let entry_len = hash_len + 4;
+                let start = idx * entry_len + 4;
+                &entry_table[start..start + hash_len]
+            }
+            PackIndexViewTables::V2 { oid_table, .. } => {
+                let oid_table = self.slice(oid_table.clone());
+                let start = idx * hash_len;
+                &oid_table[start..start + hash_len]
+            }
+        }
+    }
+
+    fn lookup_at(&self, idx: usize) -> Option<PackIndexLookup> {
+        if idx >= self.count {
+            return None;
+        }
+        let hash_len = self.format.raw_len();
+        match &self.tables {
+            PackIndexViewTables::V1 { entry_table } => {
+                let entry_table = self.slice(entry_table.clone());
+                let entry_len = hash_len + 4;
+                let start = idx * entry_len;
+                Some(PackIndexLookup {
+                    crc32: 0,
+                    offset: u64::from(u32_be(&entry_table[start..start + 4])),
+                })
+            }
+            PackIndexViewTables::V2 {
+                crc_table,
+                small_offset_table,
+                large_offset_table,
+                ..
+            } => {
+                let crc_table = self.slice(crc_table.clone());
+                let small_offset_table = self.slice(small_offset_table.clone());
+                let large_offset_table = self.slice(large_offset_table.clone());
+                let crc_start = idx * 4;
+                let raw_offset = u32_be(&small_offset_table[crc_start..crc_start + 4]);
+                Some(PackIndexLookup {
+                    crc32: u32_be(&crc_table[crc_start..crc_start + 4]),
+                    offset: pack_index_v2_offset(raw_offset, large_offset_table).ok()?,
+                })
+            }
+        }
+    }
+
+    fn slice(&self, range: Range<usize>) -> &'a [u8] {
+        &self.bytes[range]
+    }
+}
+
+impl PackIndexViewData {
+    pub fn parse(bytes: Arc<[u8]>, format: ObjectFormat) -> Result<Self> {
+        Self::parse_source(Arc::new(SharedIndexBytes(bytes)), format)
+    }
+
+    /// Parse and validate an owned index view without recomputing the trailing
+    /// index checksum. The stored checksum is still exposed via
+    /// [`PackIndexViewData::index_checksum`].
+    pub fn parse_without_checksum(bytes: Arc<[u8]>, format: ObjectFormat) -> Result<Self> {
+        Self::parse_source_without_checksum(Arc::new(SharedIndexBytes(bytes)), format)
+    }
+
+    /// Parse a local/trusted owned index view without the checksum or full-entry
+    /// validation passes.
+    pub fn parse_trusted_without_checksum(bytes: Arc<[u8]>, format: ObjectFormat) -> Result<Self> {
+        Self::parse_trusted_source_without_checksum(Arc::new(SharedIndexBytes(bytes)), format)
+    }
+
+    pub fn parse_source(
+        bytes: Arc<dyn PackIndexByteSource>,
+        format: ObjectFormat,
+    ) -> Result<Self> {
+        Self::parse_impl(bytes, format, true, true)
+    }
+
+    pub fn parse_source_without_checksum(
+        bytes: Arc<dyn PackIndexByteSource>,
+        format: ObjectFormat,
+    ) -> Result<Self> {
+        Self::parse_impl(bytes, format, false, true)
+    }
+
+    pub fn parse_trusted_source_without_checksum(
+        bytes: Arc<dyn PackIndexByteSource>,
+        format: ObjectFormat,
+    ) -> Result<Self> {
+        Self::parse_impl(bytes, format, false, false)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    pub fn fanout(&self) -> &[u32; 256] {
+        &self.fanout
+    }
+
+    pub fn find(&self, oid: &ObjectId) -> Option<PackIndexLookup> {
+        self.as_view().find(oid)
+    }
+
+    pub fn as_view(&self) -> PackIndexView<'_> {
+        PackIndexView {
+            version: self.version,
+            count: self.count,
+            fanout: self.fanout,
+            pack_checksum: self.pack_checksum,
+            index_checksum: self.index_checksum,
+            bytes: self.bytes.as_bytes(),
+            format: self.format,
+            tables: self.tables.clone(),
+        }
+    }
+
+    fn parse_impl(
+        bytes: Arc<dyn PackIndexByteSource>,
+        format: ObjectFormat,
+        verify_checksum: bool,
+        validate_entries: bool,
+    ) -> Result<Self> {
+        let (version, count, fanout, pack_checksum, index_checksum, tables) = {
+            let view = PackIndexView::parse_impl(
+                bytes.as_bytes(),
+                format,
+                verify_checksum,
+                validate_entries,
+            )?;
+            (
+                view.version,
+                view.count,
+                view.fanout,
+                view.pack_checksum,
+                view.index_checksum,
+                view.tables,
+            )
+        };
+        Ok(Self {
+            version,
+            count,
+            fanout,
+            pack_checksum,
+            index_checksum,
+            bytes,
+            format,
+            tables,
         })
     }
 }
@@ -3310,6 +3786,55 @@ fn u64_be(bytes: &[u8]) -> u64 {
     ])
 }
 
+fn read_pack_index_fanout(bytes: &[u8], offset: &mut usize) -> Result<[u32; 256]> {
+    let mut fanout = [0u32; 256];
+    let mut previous = 0u32;
+    for slot in &mut fanout {
+        *slot = u32_be(&bytes[*offset..*offset + 4]);
+        if *slot < previous {
+            return Err(GitError::InvalidFormat(
+                "pack index fanout is not monotonic".into(),
+            ));
+        }
+        previous = *slot;
+        *offset += 4;
+    }
+    Ok(fanout)
+}
+
+fn validate_pack_index_oid_fanout(idx: usize, oid_bytes: &[u8], fanout: &[u32; 256]) -> Result<()> {
+    let expected_min = if oid_bytes[0] == 0 {
+        0
+    } else {
+        fanout[usize::from(oid_bytes[0] - 1)]
+    };
+    if (idx as u32) < expected_min || (idx as u32) >= fanout[usize::from(oid_bytes[0])] {
+        return Err(GitError::InvalidFormat(
+            "pack index object id is outside its fanout bucket".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn pack_index_v2_offset(raw_offset: u32, large_offset_table: &[u8]) -> Result<u64> {
+    if raw_offset & 0x8000_0000 == 0 {
+        return Ok(u64::from(raw_offset));
+    }
+    let large_idx = (raw_offset & 0x7fff_ffff) as usize;
+    let large_start = large_idx
+        .checked_mul(8)
+        .ok_or_else(|| GitError::InvalidFormat("pack index large offset overflow".into()))?;
+    let large_end = large_start
+        .checked_add(8)
+        .ok_or_else(|| GitError::InvalidFormat("pack index large offset overflow".into()))?;
+    if large_end > large_offset_table.len() {
+        return Err(GitError::InvalidFormat(
+            "pack index large offset points past table".into(),
+        ));
+    }
+    Ok(u64_be(&large_offset_table[large_start..large_end]))
+}
+
 fn checked_range(
     start: usize,
     count: usize,
@@ -4521,6 +5046,37 @@ mod tests {
         assert!(PackFile::parse_bundle(&bundle).is_err());
     }
 
+    fn assert_pack_index_view_matches_owned(index: &[u8], format: ObjectFormat) {
+        let owned = PackIndex::parse(index, format).expect("test operation should succeed");
+        let view = PackIndexView::parse(index, format).expect("test operation should succeed");
+        let owned_view =
+            PackIndexViewData::parse(Arc::from(index.to_vec().into_boxed_slice()), format)
+                .expect("test operation should succeed");
+
+        assert_eq!(view.version, owned.version);
+        assert_eq!(view.count, owned.entries.len());
+        assert_eq!(view.count(), owned.entries.len());
+        assert_eq!(view.fanout(), &owned.fanout);
+        assert_eq!(view.pack_checksum, owned.pack_checksum);
+        assert_eq!(view.index_checksum, owned.index_checksum);
+        assert_eq!(owned_view.version, owned.version);
+        assert_eq!(owned_view.count(), owned.entries.len());
+        assert_eq!(owned_view.fanout(), &owned.fanout);
+        assert_eq!(owned_view.pack_checksum, owned.pack_checksum);
+        assert_eq!(owned_view.index_checksum, owned.index_checksum);
+        for entry in &owned.entries {
+            let owned_found = owned
+                .find(&entry.oid)
+                .expect("test operation should succeed");
+            let expected = Some(PackIndexLookup {
+                crc32: owned_found.crc32,
+                offset: owned_found.offset,
+            });
+            assert_eq!(view.find(&entry.oid), expected);
+            assert_eq!(owned_view.find(&entry.oid), expected);
+        }
+    }
+
     #[test]
     fn writes_pack_and_index_that_round_trip() {
         let object = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec());
@@ -4541,6 +5097,32 @@ mod tests {
                 .offset,
             12
         );
+    }
+
+    #[test]
+    fn pack_index_view_matches_owned_index_for_generated_sha1_pack() {
+        let objects = (0..8)
+            .map(|idx| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("borrowed pack index view sha1 object {idx}\n").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let written = PackFile::write_packed(&objects, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        assert_pack_index_view_matches_owned(&written.index, ObjectFormat::Sha1);
+
+        let view =
+            PackIndexView::parse_v2_sha1(&written.index).expect("test operation should succeed");
+        let missing = sley_core::object_id_for_bytes(
+            ObjectFormat::Sha1,
+            "blob",
+            b"not present in borrowed index\n",
+        )
+        .expect("test operation should succeed");
+        assert_eq!(view.find(&missing), None);
     }
 
     #[test]
@@ -4567,6 +5149,22 @@ mod tests {
                 .offset,
             12
         );
+    }
+
+    #[test]
+    fn pack_index_view_matches_owned_index_for_generated_sha256_pack() {
+        let objects = (0..4)
+            .map(|idx| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("borrowed pack index view sha256 object {idx}\n").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let written = PackFile::write_undeltified(&objects, ObjectFormat::Sha256)
+            .expect("test operation should succeed");
+
+        assert_pack_index_view_matches_owned(&written.index, ObjectFormat::Sha256);
     }
 
     #[test]
@@ -5011,6 +5609,7 @@ mod tests {
                 .crc32,
             0x1234_5678
         );
+        assert_pack_index_view_matches_owned(&index, ObjectFormat::Sha1);
     }
 
     #[test]
@@ -5043,6 +5642,7 @@ mod tests {
                 .crc32,
             0
         );
+        assert_pack_index_view_matches_owned(&index, ObjectFormat::Sha1);
     }
 
     #[test]
@@ -5058,6 +5658,81 @@ mod tests {
         let last = index.len() - 1;
         index[last] ^= 1;
         assert!(PackIndex::parse(&index, ObjectFormat::Sha1).is_err());
+    }
+
+    #[test]
+    fn pack_index_view_reads_v2_large_offsets() {
+        let first = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"large offset a\n")
+            .expect("test operation should succeed");
+        let second =
+            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"large offset b\n")
+                .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
+        let entries = vec![
+            PackIndexEntry {
+                oid: first,
+                crc32: 0x1111_2222,
+                offset: 0x8000_0000,
+            },
+            PackIndexEntry {
+                oid: second,
+                crc32: 0x3333_4444,
+                offset: 0x1_0000_0042,
+            },
+        ];
+        let index = PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack_checksum)
+            .expect("test operation should succeed");
+
+        assert_pack_index_view_matches_owned(&index, ObjectFormat::Sha1);
+        let view = PackIndexView::parse(&index, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        for entry in entries {
+            assert_eq!(
+                view.find(&entry.oid),
+                Some(PackIndexLookup {
+                    crc32: entry.crc32,
+                    offset: entry.offset,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn pack_index_view_default_parse_checks_index_checksum() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
+        let mut index = single_entry_index(ObjectFormat::Sha1, oid, 0x1234_5678, 12, pack_checksum);
+        let last = index.len() - 1;
+        index[last] ^= 1;
+
+        assert!(PackIndexView::parse(&index, ObjectFormat::Sha1).is_err());
+        let view = PackIndexView::parse_without_checksum(&index, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let trusted_view = PackIndexViewData::parse_trusted_without_checksum(
+            Arc::from(index.clone().into_boxed_slice()),
+            ObjectFormat::Sha1,
+        )
+        .expect("test operation should succeed");
+        assert_eq!(
+            view.find(&oid),
+            Some(PackIndexLookup {
+                crc32: 0x1234_5678,
+                offset: 12,
+            })
+        );
+        assert_eq!(
+            trusted_view.find(&oid),
+            Some(PackIndexLookup {
+                crc32: 0x1234_5678,
+                offset: 12,
+            })
+        );
     }
 
     #[test]
@@ -5787,6 +6462,7 @@ mod tests {
             0x1234_5678
         );
         assert_eq!(parsed.index_checksum.format(), ObjectFormat::Sha256);
+        assert_pack_index_view_matches_owned(&index, ObjectFormat::Sha256);
     }
 
     #[test]

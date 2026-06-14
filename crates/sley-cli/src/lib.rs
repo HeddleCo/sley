@@ -37,7 +37,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -708,10 +708,7 @@ pub(crate) fn replace_objects_active(refs: &FileRefStore) -> Result<bool> {
     if !global_replace_objects() {
         return Ok(false);
     }
-    Ok(refs
-        .list_refs()?
-        .iter()
-        .any(|reference| reference.name.starts_with("refs/replace/")))
+    refs.has_refs_with_prefix("refs/replace/")
 }
 
 pub(crate) fn apply_replace_object(refs: &FileRefStore, oid: &ObjectId) -> Result<ObjectId> {
@@ -1427,6 +1424,25 @@ fn print_tree(
     print_tree_with_prefix(db, format, body, b"", options)
 }
 
+fn write_object_id_hex<W: Write + ?Sized>(
+    writer: &mut W,
+    oid: &ObjectId,
+    width: Option<usize>,
+) -> Result<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex_len = oid.format().hex_len();
+    let width = width
+        .map(|width| width.clamp(4, hex_len))
+        .unwrap_or(hex_len);
+    let mut out = [0u8; 64];
+    for (index, byte) in oid.as_bytes().iter().copied().enumerate() {
+        out[index * 2] = HEX[(byte >> 4) as usize];
+        out[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    writer.write_all(&out[..width])?;
+    Ok(())
+}
+
 fn print_tree_with_prefix(
     db: Option<&FileObjectDatabase>,
     format: ObjectFormat,
@@ -1434,16 +1450,18 @@ fn print_tree_with_prefix(
     prefix: &[u8],
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
+    let mut path = prefix.to_vec();
     for entry in TreeEntries::new(format, body) {
         let entry = entry?;
         if options.tree_only && entry.mode != 0o040000 {
             continue;
         }
-        let mut path = Vec::with_capacity(prefix.len() + entry.name.len());
-        path.extend_from_slice(prefix);
+        let path_len = path.len();
         path.extend_from_slice(entry.name);
         print_tree_entry_to_writer(&mut stdout, db, &entry, &path, options)?;
+        path.truncate(path_len);
     }
     stdout.flush()?;
     Ok(())
@@ -1466,11 +1484,11 @@ fn print_tree_entry_to_writer(
         let object_type = tree_entry_object_type(entry.mode());
         write!(
             writer,
-            "{:06o} {} {}",
+            "{:06o} {} ",
             entry.mode(),
-            object_type.as_str(),
-            format_tree_oid(entry.oid(), options)
+            object_type.as_str()
         )?;
+        write_tree_oid(writer, entry.oid(), options)?;
         if options.long {
             let size = tree_entry_size_field(db, object_type, entry.oid())?;
             write!(writer, " {size:>7}")?;
@@ -1494,17 +1512,9 @@ fn write_tree_path(
     if options.nul {
         writer.write_all(path)?;
     } else {
-        writer.write_all(status_quote_path(path, false).as_bytes())?;
+        write_status_quoted_path(writer, path, false)?;
     }
     Ok(())
-}
-
-fn format_tree_oid(oid: &ObjectId, options: TreePrintOptions<'_>) -> String {
-    let hex = oid.to_hex();
-    let Some(width) = options.oid_abbrev else {
-        return hex;
-    };
-    hex[..width.clamp(4, oid.format().hex_len())].to_string()
 }
 
 fn write_tree_oid(
@@ -1512,8 +1522,7 @@ fn write_tree_oid(
     oid: &ObjectId,
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    writer.write_all(format_tree_oid(oid, options).as_bytes())?;
-    Ok(())
+    write_object_id_hex(writer, oid, options.oid_abbrev)
 }
 
 fn write_tree_entry_format(
@@ -1629,6 +1638,9 @@ fn tree_entry_size_field(
     }
     let db =
         db.ok_or_else(|| GitError::Command("ls-tree --long requires an object database".into()))?;
+    if let Some((_, size)) = db.read_object_header(oid)? {
+        return Ok(size.to_string());
+    }
     Ok(db.read_object(oid)?.body.len().to_string())
 }
 
@@ -5304,7 +5316,7 @@ fn write_for_each_ref_typed_atom(
             };
             if let Some(oid) = oid {
                 match abbrev {
-                    None => write!(stdout, "{oid}")?,
+                    None => write_object_id_hex(stdout, oid, None)?,
                     Some(0) => stdout.write_all(
                         for_each_ref_abbrev_oid(
                             oid,
@@ -8842,15 +8854,7 @@ fn symbolic_ref_cannot_delete(name: &str) -> Result<()> {
 }
 
 pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
-    let needs_quotes = path.iter().any(|&byte| {
-        byte == b'"'
-            || byte == b'\\'
-            || byte == b'\n'
-            || byte == b'\t'
-            || !(0x20..0x7f).contains(&byte)
-            || (quote_space && byte == b' ')
-    });
-    if !needs_quotes {
+    if !status_path_needs_quotes(path, quote_space) {
         return String::from_utf8_lossy(path).into_owned();
     }
     let mut out = String::from("\"");
@@ -8866,6 +8870,41 @@ pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
     }
     out.push('"');
     out
+}
+
+pub(crate) fn write_status_quoted_path(
+    writer: &mut impl Write,
+    path: &[u8],
+    quote_space: bool,
+) -> Result<()> {
+    if !status_path_needs_quotes(path, quote_space) {
+        writer.write_all(path)?;
+        return Ok(());
+    }
+    writer.write_all(b"\"")?;
+    for &byte in path {
+        match byte {
+            b'"' => writer.write_all(br#"\""#)?,
+            b'\\' => writer.write_all(br#"\\"#)?,
+            b'\n' => writer.write_all(br#"\n"#)?,
+            b'\t' => writer.write_all(br#"\t"#)?,
+            0x20..=0x7e => writer.write_all(&[byte])?,
+            _ => write!(writer, "\\{byte:03o}")?,
+        }
+    }
+    writer.write_all(b"\"")?;
+    Ok(())
+}
+
+fn status_path_needs_quotes(path: &[u8], quote_space: bool) -> bool {
+    path.iter().any(|&byte| {
+        byte == b'"'
+            || byte == b'\\'
+            || byte == b'\n'
+            || byte == b'\t'
+            || !(0x20..0x7f).contains(&byte)
+            || (quote_space && byte == b' ')
+    })
 }
 
 fn refname_pattern_matches(pattern: &str, name: &str) -> bool {

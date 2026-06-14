@@ -181,11 +181,13 @@ fn print_tree_recursive(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     body: &[u8],
-    prefix: &str,
+    prefix: &[u8],
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    let mut stdout = io::stdout();
-    print_tree_recursive_to_writer(&mut stdout, db, format, body, prefix, options)?;
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
+    let mut path = prefix.to_vec();
+    print_tree_recursive_to_writer(&mut stdout, db, format, body, &mut path, options)?;
     stdout.flush()?;
     Ok(())
 }
@@ -232,14 +234,16 @@ fn print_tree_pathspecs(
                 )));
             }
             let prefix = if display_path.is_empty() {
-                String::new()
+                Vec::new()
             } else {
-                format!("{display_path}/")
+                let mut prefix = display_path.as_bytes().to_vec();
+                prefix.push(b'/');
+                prefix
             };
             if recursive {
                 print_tree_recursive(db, format, &object.body, &prefix, options)?;
             } else {
-                print_tree_with_prefix(Some(db), format, &object.body, prefix.as_bytes(), options)?;
+                print_tree_with_prefix(Some(db), format, &object.body, &prefix, options)?;
             }
         } else {
             let mut stdout = io::stdout();
@@ -266,7 +270,7 @@ fn print_ls_tree_current_scope(
 ) -> Result<()> {
     if path_context.prefix.is_empty() {
         if recursive {
-            print_tree_recursive(db, format, root_body, "", options)
+            print_tree_recursive(db, format, root_body, b"", options)
         } else {
             print_tree(Some(db), format, root_body, options)
         }
@@ -288,7 +292,7 @@ fn print_ls_tree_current_scope(
         }
         let display_prefix = path_context.display_prefix();
         if recursive {
-            print_tree_recursive(db, format, &object.body, &display_prefix, options)
+            print_tree_recursive(db, format, &object.body, display_prefix.as_bytes(), options)
         } else {
             print_tree_with_prefix(
                 Some(db),
@@ -382,16 +386,16 @@ fn print_tree_recursive_to_writer(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     body: &[u8],
-    prefix: &str,
+    path: &mut Vec<u8>,
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
     for entry in TreeEntries::new(format, body) {
         let entry = entry?;
-        let name = String::from_utf8_lossy(entry.name);
-        let path = format!("{prefix}{name}");
+        let path_len = path.len();
+        path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
             if options.show_trees || options.tree_only {
-                print_tree_entry_to_writer(writer, Some(db), &entry, path.as_bytes(), options)?;
+                print_tree_entry_to_writer(writer, Some(db), &entry, path, options)?;
             }
             let object = db.read_object(&entry.oid)?;
             if object.object_type != ObjectType::Tree {
@@ -401,19 +405,15 @@ fn print_tree_recursive_to_writer(
                     object.object_type.as_str()
                 )));
             }
-            print_tree_recursive_to_writer(
-                writer,
-                db,
-                format,
-                &object.body,
-                &format!("{path}/"),
-                options,
-            )?;
+            path.push(b'/');
+            print_tree_recursive_to_writer(writer, db, format, &object.body, path, options)?;
         } else if options.tree_only {
+            path.truncate(path_len);
             continue;
         } else {
-            print_tree_entry_to_writer(writer, Some(db), &entry, path.as_bytes(), options)?;
+            print_tree_entry_to_writer(writer, Some(db), &entry, path, options)?;
         }
+        path.truncate(path_len);
     }
     Ok(())
 }

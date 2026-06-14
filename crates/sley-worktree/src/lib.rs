@@ -1814,7 +1814,7 @@ pub fn short_status_with_options(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     if options.untracked_mode == StatusUntrackedMode::None && !options.include_ignored {
         let (index, stat_cache, head_matches_index) =
-            read_index_with_stat_cache(git_dir, format, &db)?;
+            read_index_with_stat_cache_entries(git_dir, format, &db, false)?;
         return short_status_tracked_only(
             worktree_root,
             git_dir,
@@ -2187,7 +2187,12 @@ fn short_status_tracked_only(
     stat_cache: &IndexStatCache,
     head_matches_index: bool,
 ) -> Result<Vec<ShortStatusEntry>> {
-    if head_matches_index && stat_cache.entries.len() >= 512 {
+    let normal_entry_count = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .count();
+    if head_matches_index && normal_entry_count >= 512 {
         return short_status_tracked_only_head_matches_index_parallel(
             worktree_root,
             git_dir,
@@ -2201,6 +2206,18 @@ fn short_status_tracked_only(
     } else {
         Some(head_tree_entries(git_dir, format, db)?)
     };
+    if !head_matches_index && normal_entry_count >= 512 {
+        if let Some(head) = head.as_ref() {
+            return short_status_tracked_only_with_head_parallel(
+                worktree_root,
+                git_dir,
+                format,
+                index,
+                stat_cache,
+                head,
+            );
+        }
+    }
     let mut clean_filter = None;
     let mut entries = Vec::new();
     for entry in index
@@ -2289,7 +2306,7 @@ fn short_status_tracked_only(
     Ok(entries)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum TrackedOnlyPrecheck {
     Deleted(usize),
     Slow(usize),
@@ -2309,50 +2326,7 @@ fn short_status_tracked_only_head_matches_index_parallel(
     index: &Index,
     stat_cache: &IndexStatCache,
 ) -> Result<Vec<ShortStatusEntry>> {
-    let normal_indices = index
-        .entries
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| (entry.stage() == Stage::Normal).then_some(idx))
-        .collect::<Vec<_>>();
-    let max_workers = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(8);
-    let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
-    let chunk_size = normal_indices.len().div_ceil(worker_count);
-    let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
-        let mut handles = Vec::new();
-        for chunk in normal_indices.chunks(chunk_size) {
-            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
-                let mut prechecks = Vec::new();
-                for &idx in chunk {
-                    let entry = &index.entries[idx];
-                    match tracked_only_stat_precheck(worktree_root, entry, stat_cache)? {
-                        TrackedOnlyPrecheckOutcome::Clean => {}
-                        TrackedOnlyPrecheckOutcome::Deleted => {
-                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
-                        }
-                        TrackedOnlyPrecheckOutcome::Slow => {
-                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
-                        }
-                    }
-                }
-                Ok(prechecks)
-            }));
-        }
-        let mut prechecks = Vec::new();
-        for handle in handles {
-            let mut chunk = handle
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
-            prechecks.append(&mut chunk);
-        }
-        Ok(prechecks)
-    })?;
-    prechecks.sort_by_key(|precheck| match precheck {
-        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => *idx,
-    });
+    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
 
     let mut clean_filter = None;
     let mut entries = Vec::new();
@@ -2424,16 +2398,193 @@ fn short_status_tracked_only_head_matches_index_parallel(
     Ok(entries)
 }
 
+fn short_status_tracked_only_with_head_parallel(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+    stat_cache: &IndexStatCache,
+    head: &BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<Vec<ShortStatusEntry>> {
+    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let mut precheck_cursor = 0usize;
+    let mut clean_filter = None;
+    let mut entries = Vec::new();
+
+    for (idx, entry) in index.entries.iter().enumerate() {
+        if entry.stage() != Stage::Normal {
+            continue;
+        }
+        let path = entry.path.as_bytes();
+        let index_entry = TrackedEntry {
+            mode: entry.mode,
+            oid: entry.oid,
+        };
+        let head_entry = head.get(path);
+        let index_code = match head_entry {
+            None => b'A',
+            Some(head_entry) if *head_entry != index_entry => b'M',
+            _ => b' ',
+        };
+        let precheck = prechecks.get(precheck_cursor).copied().and_then(|precheck| {
+            if tracked_only_precheck_index(precheck) == idx {
+                precheck_cursor += 1;
+                Some(precheck)
+            } else {
+                None
+            }
+        });
+        let (worktree_code, worktree_mode, submodule) = match precheck {
+            None => (b' ', Some(index_entry.mode), None),
+            Some(TrackedOnlyPrecheck::Deleted(_)) => (b'D', None, None),
+            Some(TrackedOnlyPrecheck::Slow(_)) => {
+                let worktree_entry = worktree_entry_for_index_entry_with_attributes(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    stat_cache,
+                    &mut clean_filter,
+                )?;
+                let submodule = tracked_only_submodule_status(
+                    worktree_root,
+                    path,
+                    &index_entry,
+                    worktree_entry.as_ref(),
+                )?;
+                let worktree_code = match worktree_entry.as_ref() {
+                    None => b'D',
+                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    _ if submodule.is_some_and(|sub| sub.any()) => b'M',
+                    _ => b' ',
+                };
+                (
+                    worktree_code,
+                    worktree_entry.as_ref().map(|entry| entry.mode),
+                    submodule.filter(|sub| sub.any()),
+                )
+            }
+        };
+        if index_code != b' ' || worktree_code != b' ' {
+            entries.push(ShortStatusEntry {
+                index: index_code,
+                worktree: worktree_code,
+                path: path.to_vec(),
+                head_mode: head_entry.map(|entry| entry.mode),
+                index_mode: Some(index_entry.mode),
+                worktree_mode,
+                head_oid: head_entry.map(|entry| entry.oid),
+                index_oid: Some(index_entry.oid),
+                submodule,
+            });
+        }
+    }
+
+    let index_paths = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<HashSet<_>>();
+    for (path, head_entry) in head {
+        if index_paths.contains(path.as_slice()) {
+            continue;
+        }
+        entries.push(ShortStatusEntry {
+            index: b'D',
+            worktree: b' ',
+            path: path.clone(),
+            head_mode: Some(head_entry.mode),
+            index_mode: None,
+            worktree_mode: None,
+            head_oid: Some(head_entry.oid),
+            index_oid: None,
+            submodule: None,
+        });
+    }
+    entries.sort_by(|left, right| {
+        status_sort_category(left)
+            .cmp(&status_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+fn tracked_only_precheck_index(precheck: TrackedOnlyPrecheck) -> usize {
+    match precheck {
+        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => idx,
+    }
+}
+
+fn tracked_only_non_clean_prechecks_parallel(
+    worktree_root: &Path,
+    index: &Index,
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<TrackedOnlyPrecheck>> {
+    let normal_indices = index
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| (entry.stage() == Stage::Normal).then_some(idx))
+        .collect::<Vec<_>>();
+    let max_workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(16);
+    let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
+    let chunk_size = normal_indices.len().div_ceil(worker_count);
+    let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
+        let mut handles = Vec::new();
+        for chunk in normal_indices.chunks(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
+                let mut prechecks = Vec::new();
+                let mut absolute = PathBuf::new();
+                for &idx in chunk {
+                    let entry = &index.entries[idx];
+                    match tracked_only_stat_precheck(
+                        worktree_root,
+                        entry,
+                        stat_cache,
+                        &mut absolute,
+                    )? {
+                        TrackedOnlyPrecheckOutcome::Clean => {}
+                        TrackedOnlyPrecheckOutcome::Deleted => {
+                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                        }
+                        TrackedOnlyPrecheckOutcome::Slow => {
+                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                        }
+                    }
+                }
+                Ok(prechecks)
+            }));
+        }
+        let mut prechecks = Vec::new();
+        for handle in handles {
+            let mut chunk = handle
+                .join()
+                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            prechecks.append(&mut chunk);
+        }
+        Ok(prechecks)
+    })?;
+    prechecks.sort_by_key(|precheck| match precheck {
+        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => *idx,
+    });
+    Ok(prechecks)
+}
+
 fn tracked_only_stat_precheck(
     worktree_root: &Path,
     index_entry: &IndexEntry,
     stat_cache: &IndexStatCache,
+    absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     if index_entry.mode == 0o160000 {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     let git_path = index_entry.path.as_bytes();
-    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    set_worktree_path_from_repo_path(worktree_root, git_path, absolute)?;
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
         Err(err)
@@ -2458,6 +2609,34 @@ fn tracked_only_stat_precheck(
     } else {
         Ok(TrackedOnlyPrecheckOutcome::Slow)
     }
+}
+
+fn set_worktree_path_from_repo_path(
+    worktree_root: &Path,
+    git_path: &[u8],
+    out: &mut PathBuf,
+) -> Result<()> {
+    out.clear();
+    out.push(worktree_root);
+    push_repo_path(out, git_path)
+}
+
+#[cfg(unix)]
+fn push_repo_path(out: &mut PathBuf, path: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    out.push(Path::new(std::ffi::OsStr::from_bytes(path)));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn push_repo_path(out: &mut PathBuf, path: &[u8]) -> Result<()> {
+    let path = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidPath("index path is not utf8".into()))?;
+    for component in path.split('/') {
+        out.push(component);
+    }
+    Ok(())
 }
 
 fn tracked_only_submodule_status(
@@ -7760,6 +7939,13 @@ impl IndexStatCache {
         }
     }
 
+    fn from_index_mtime_only(index_mtime: Option<(u64, u64)>) -> Self {
+        IndexStatCache {
+            entries: HashMap::new(),
+            index_mtime,
+        }
+    }
+
     /// Whether `entry` is "racily clean" in git's sense: its cached mtime is not
     /// strictly older than the index file's mtime, so a same-timestamp write
     /// could have changed the content without moving the stat. Such entries must
@@ -7978,6 +8164,15 @@ fn read_index_with_stat_cache(
     format: ObjectFormat,
     db: &FileObjectDatabase,
 ) -> Result<(Index, IndexStatCache, bool)> {
+    read_index_with_stat_cache_entries(git_dir, format, db, true)
+}
+
+fn read_index_with_stat_cache_entries(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    include_entries: bool,
+) -> Result<(Index, IndexStatCache, bool)> {
     let index_path = repository_index_path(git_dir);
     let index_metadata = match fs::metadata(&index_path) {
         Ok(metadata) => metadata,
@@ -7996,13 +8191,23 @@ fn read_index_with_stat_cache(
         Err(err) => return Err(err.into()),
     };
     let index = Index::parse(&fs::read(&index_path)?, format)?;
-    let stat_cache = IndexStatCache::from_index_mtime(&index, file_mtime_parts(&index_metadata));
+    let index_mtime = file_mtime_parts(&index_metadata);
+    let stage0_entry_count = index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .count();
+    let stat_cache = if include_entries {
+        IndexStatCache::from_index_mtime(&index, index_mtime)
+    } else {
+        IndexStatCache::from_index_mtime_only(index_mtime)
+    };
     let head_matches_index = match resolve_head_tree_oid(git_dir, format, db)? {
         Some(head_tree_oid) => head_matches_index_from_cache_tree(
             &index,
             format,
             &head_tree_oid,
-            stat_cache.entries.len(),
+            stage0_entry_count,
         )?,
         None => false,
     };

@@ -4,12 +4,12 @@ mod setup;
 use sley_config::GitConfig;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
-pub use sley_core::BString;
 pub use setup::{
-    NoWalkMode, RevisionOrder, RevisionOptions, RevisionSetupContext, RevisionSymmetricRange,
+    NoWalkMode, RevisionOptions, RevisionOrder, RevisionSetupContext, RevisionSymmetricRange,
     RevisionTip, SetupRevisions, ambiguous_argument_error, ambiguous_argument_message,
     setup_revisions, setup_revisions_os,
 };
+pub use sley_core::BString;
 use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
@@ -851,18 +851,157 @@ fn apply_revision_suffix<R: ObjectReader>(
 /// data; treated as "unknown" so it never drives pruning.
 const GENERATION_NUMBER_ZERO: u32 = 0;
 
+/// Parent object ids resolved from a commit-graph entry.
+///
+/// Most commits have zero, one, or two parents. Keeping those cases inline
+/// avoids a heap allocation per graph commit while preserving a `Vec` escape
+/// hatch for octopus merges.
+#[derive(Debug, Clone)]
+enum GraphParents {
+    None,
+    One(ObjectId),
+    Two([ObjectId; 2]),
+    Many(Vec<ObjectId>),
+}
+
+impl GraphParents {
+    fn from_oids<I>(parents: I) -> Self
+    where
+        I: IntoIterator<Item = ObjectId>,
+    {
+        let mut parents = parents.into_iter();
+        let Some(first) = parents.next() else {
+            return Self::None;
+        };
+        let Some(second) = parents.next() else {
+            return Self::One(first);
+        };
+        let Some(third) = parents.next() else {
+            return Self::Two([first, second]);
+        };
+        let (lower, _) = parents.size_hint();
+        let mut many = Vec::with_capacity(3 + lower);
+        many.push(first);
+        many.push(second);
+        many.push(third);
+        many.extend(parents);
+        Self::Many(many)
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    fn first(&self) -> Option<ObjectId> {
+        match self {
+            Self::None => None,
+            Self::One(parent) => Some(*parent),
+            Self::Two(parents) => Some(parents[0]),
+            Self::Many(parents) => parents.first().copied(),
+        }
+    }
+
+    fn iter(&self) -> GraphParentIter<'_> {
+        match self {
+            Self::None => GraphParentIter::Empty,
+            Self::One(parent) => GraphParentIter::One(Some(*parent)),
+            Self::Two(parents) => GraphParentIter::Slice(parents.iter().copied()),
+            Self::Many(parents) => GraphParentIter::Slice(parents.iter().copied()),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<ObjectId> {
+        match self {
+            Self::None => Vec::new(),
+            Self::One(parent) => vec![*parent],
+            Self::Two(parents) => parents.to_vec(),
+            Self::Many(parents) => parents.clone(),
+        }
+    }
+
+    fn grafted_vec<R: ObjectReader>(&self, reader: &R, oid: &ObjectId) -> Vec<ObjectId> {
+        if reader.is_shallow_graft(oid) {
+            Vec::new()
+        } else {
+            self.to_vec()
+        }
+    }
+}
+
+enum GraphParentIter<'a> {
+    Empty,
+    One(Option<ObjectId>),
+    Slice(std::iter::Copied<std::slice::Iter<'a, ObjectId>>),
+}
+
+impl Iterator for GraphParentIter<'_> {
+    type Item = ObjectId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(parent) => parent.take(),
+            Self::Slice(parents) => parents.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Empty => (0, Some(0)),
+            Self::One(Some(_)) => (1, Some(1)),
+            Self::One(None) => (0, Some(0)),
+            Self::Slice(parents) => parents.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for GraphParentIter<'_> {}
+
+enum CommitParentIds<'a> {
+    Empty,
+    Borrowed(GraphParentIter<'a>),
+    Owned(std::vec::IntoIter<ObjectId>),
+}
+
+impl<'a> CommitParentIds<'a> {
+    fn borrowed(parents: &'a GraphParents) -> Self {
+        Self::Borrowed(parents.iter())
+    }
+
+    fn owned(parents: Vec<ObjectId>) -> Self {
+        Self::Owned(parents.into_iter())
+    }
+}
+
+impl Iterator for CommitParentIds<'_> {
+    type Item = ObjectId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::Borrowed(parents) => parents.next(),
+            Self::Owned(parents) => parents.next(),
+        }
+    }
+}
+
 /// Commit metadata resolved from the commit-graph: parents (already mapped from
 /// graph indices to object ids), generation number, and committer date.
 #[derive(Debug, Clone)]
 struct GraphCommit {
-    parents: Vec<ObjectId>,
+    parents: GraphParents,
     generation: u32,
     commit_time: u64,
 }
 
+struct GraphCommitMetadata<'a> {
+    parents: &'a GraphParents,
+    commit_time: i64,
+}
+
 #[derive(Debug, Clone)]
 struct GraphBloomCommit {
-    parents: Vec<ObjectId>,
+    parents: GraphParents,
     filter: Vec<u8>,
     settings: sley_formats::CommitGraphBloomSettings,
 }
@@ -918,16 +1057,15 @@ impl<'a> CommitGraphContext<'a> {
     }
 
     /// Parents of `oid` from the graph, or `None` when it is not present.
-    fn parents(&mut self, oid: &ObjectId) -> Option<Vec<ObjectId>> {
-        self.lookup(oid).map(|commit| commit.parents.clone())
+    fn parents(&mut self, oid: &ObjectId) -> Option<&GraphParents> {
+        self.lookup(oid).map(|commit| &commit.parents)
     }
 
     /// First parent of `oid` from the graph. The outer `None` means the commit is
     /// not present in the graph; the inner `None` means the commit is present but
     /// root/unborn with no parents.
     fn first_parent(&mut self, oid: &ObjectId) -> Option<Option<ObjectId>> {
-        self.lookup(oid)
-            .map(|commit| commit.parents.first().cloned())
+        self.lookup(oid).map(|commit| commit.parents.first())
     }
 
     /// Generation number of `oid`, or `None` when it is not present in the graph
@@ -960,10 +1098,29 @@ impl<'a> CommitGraphContext<'a> {
         if reader.is_shallow_graft(oid) {
             return Ok(Vec::new());
         }
+        let format = self.format;
         if let Some(parents) = self.parents(oid) {
-            return Ok(parents);
+            return Ok(parents.to_vec());
         }
-        commit_parents(reader, self.format, oid)
+        commit_parents(reader, format, oid)
+    }
+
+    /// Parent ids of `oid` for callers that only need to enqueue them. Graph
+    /// parents are borrowed from the parsed graph cache; object fallback parents
+    /// are owned by the iterator.
+    fn commit_parent_ids<R: ObjectReader>(
+        &mut self,
+        reader: &R,
+        oid: &ObjectId,
+    ) -> Result<CommitParentIds<'_>> {
+        if reader.is_shallow_graft(oid) {
+            return Ok(CommitParentIds::Empty);
+        }
+        let format = self.format;
+        if let Some(parents) = self.parents(oid) {
+            return Ok(CommitParentIds::borrowed(parents));
+        }
+        Ok(CommitParentIds::owned(commit_parents(reader, format, oid)?))
     }
 
     /// First parent of `oid`: from the graph when present, otherwise read+parsed
@@ -976,20 +1133,19 @@ impl<'a> CommitGraphContext<'a> {
         if reader.is_shallow_graft(oid) {
             return Ok(None);
         }
+        let format = self.format;
         if let Some(parent) = self.first_parent(oid) {
             return Ok(parent);
         }
-        Ok(commit_parents(reader, self.format, oid)?.into_iter().next())
+        Ok(commit_parents(reader, format, oid)?.into_iter().next())
     }
 
     /// `oid`'s parents and committer time from the graph in one lookup, or `None`
     /// when the commit is not represented (the caller then reads the object).
-    fn metadata(&mut self, oid: &ObjectId) -> Option<(Vec<ObjectId>, i64)> {
-        self.lookup(oid).map(|commit| {
-            (
-                commit.parents.clone(),
-                i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
-            )
+    fn metadata(&mut self, oid: &ObjectId) -> Option<GraphCommitMetadata<'_>> {
+        self.lookup(oid).map(|commit| GraphCommitMetadata {
+            parents: &commit.parents,
+            commit_time: i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
         })
     }
 }
@@ -1070,16 +1226,7 @@ fn load_commit_graph_chain(
 fn graph_to_map(graph: &CommitGraph) -> Result<HashMap<ObjectId, GraphCommit>> {
     let mut map = HashMap::with_capacity(graph.commits.len());
     for entry in &graph.commits {
-        let mut parents = Vec::with_capacity(entry.parents.len());
-        for parent in &entry.parents {
-            let parent = usize::try_from(*parent).map_err(|_| {
-                GitError::InvalidFormat("commit-graph parent index overflow".into())
-            })?;
-            let parent_entry = graph.commits.get(parent).ok_or_else(|| {
-                GitError::InvalidFormat("commit-graph parent points past commit table".into())
-            })?;
-            parents.push(parent_entry.oid);
-        }
+        let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
         map.insert(
             entry.oid,
             GraphCommit {
@@ -1119,16 +1266,7 @@ fn graph_to_bloom_map(graph: &CommitGraph) -> Result<HashMap<ObjectId, GraphBloo
     };
     let mut map = HashMap::with_capacity(graph.commits.len());
     for (idx, entry) in graph.commits.iter().enumerate() {
-        let mut parents = Vec::with_capacity(entry.parents.len());
-        for parent in &entry.parents {
-            let parent = usize::try_from(*parent).map_err(|_| {
-                GitError::InvalidFormat("commit-graph parent index overflow".into())
-            })?;
-            let parent_entry = graph.commits.get(parent).ok_or_else(|| {
-                GitError::InvalidFormat("commit-graph parent points past commit table".into())
-            })?;
-            parents.push(parent_entry.oid);
-        }
+        let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
         if let Some(filter) = filters.filter_for_commit(idx) {
             map.insert(
                 entry.oid,
@@ -1510,12 +1648,17 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
     }
 
     fn enqueue_parents(&mut self, metadata: &CommitMetadata) -> Result<()> {
-        let parents: Vec<ObjectId> = if self.first_parent {
-            metadata.parents.first().cloned().into_iter().collect()
-        } else {
-            metadata.parents.clone()
-        };
-        for parent in parents {
+        if self.first_parent {
+            if let Some(parent) = metadata.parents.first().copied() {
+                if self.seen.insert(parent) {
+                    let parent_metadata =
+                        commit_metadata_lookup(&mut self.graph, self.reader, self.format, &parent)?;
+                    self.push(parent_metadata);
+                }
+            }
+            return Ok(());
+        }
+        for parent in metadata.parents.iter().copied() {
             if !self.seen.insert(parent) {
                 continue;
             }
@@ -1542,7 +1685,7 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
             let Some(entry) = self.heap.pop() else {
                 return Ok(None);
             };
-            let Some(metadata) = self.records.get(&entry.oid).cloned() else {
+            let Some(metadata) = self.records.remove(&entry.oid) else {
                 continue;
             };
             // Descend regardless of the date window's upper bound: a commit
@@ -1616,9 +1759,9 @@ pub fn walk_commit_metadata<R: ObjectReader>(
         // `--first-parent` follows only the first parent of each commit; otherwise
         // every parent is enqueued (matching `walk_commits`).
         if first_parent {
-            pending.extend(metadata.parents.first().cloned());
+            pending.extend(metadata.parents.first().copied());
         } else {
-            pending.extend(metadata.parents.iter().cloned());
+            pending.extend(metadata.parents.iter().copied());
         }
         out.push(metadata);
     }
@@ -1646,11 +1789,12 @@ pub fn count_commit_metadata<R: ObjectReader>(
         if !seen.insert(oid) {
             continue;
         }
-        let metadata = commit_metadata_lookup(&mut graph, reader, format, &oid)?;
         if first_parent {
-            pending.extend(metadata.parents.first().cloned());
+            pending.extend(graph.commit_first_parent(reader, &oid)?);
         } else {
-            pending.extend(metadata.parents.iter().cloned());
+            for parent in graph.commit_parent_ids(reader, &oid)? {
+                pending.push_back(parent);
+            }
         }
         count += 1;
     }
@@ -1689,13 +1833,17 @@ fn commit_metadata_lookup<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<CommitMetadata> {
-    let (parents, commit_time) = match graph.metadata(oid) {
-        Some(metadata) => metadata,
-        None => commit_metadata_from_object(reader, format, oid)?,
-    };
+    if let Some(metadata) = graph.metadata(oid) {
+        return Ok(CommitMetadata {
+            oid: *oid,
+            parents: metadata.parents.grafted_vec(reader, oid),
+            commit_time: metadata.commit_time,
+        });
+    }
+    let (parents, commit_time) = commit_metadata_from_object(reader, format, oid)?;
     Ok(CommitMetadata {
         oid: *oid,
-        parents: sley_odb::grafted_parents(reader, oid, parents),
+        parents,
         commit_time,
     })
 }
@@ -1926,7 +2074,7 @@ fn commit_graph_bloom_consult(
     };
     match parent {
         Some(parent) => {
-            if bloom.parents.first() != Some(parent) {
+            if bloom.parents.first() != Some(*parent) {
                 return GraphBloomConsult::NotPresent;
             }
         }
@@ -3080,11 +3228,9 @@ impl ResolvedRevisionSelection {
                 out.push(oid);
                 continue;
             }
-            let (parents, _) = match graph.metadata(&oid) {
-                Some(metadata) => metadata,
-                None => commit_metadata_from_object(reader, format, &oid)?,
-            };
-            pending.extend(sley_odb::grafted_parents(reader, &oid, parents));
+            for parent in graph.commit_parent_ids(reader, &oid)? {
+                pending.push_back(parent);
+            }
             out.push(oid);
         }
         Ok(out)

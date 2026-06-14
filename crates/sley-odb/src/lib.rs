@@ -9,8 +9,8 @@ use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
 use sley_pack::{
-    MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
-    PackInput, PackWrite,
+    MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexByteSource,
+    PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2342,6 +2342,19 @@ fn load_pack_data(pack_path: &Path) -> Result<PackData> {
     Ok(PackData::Heap(fs::read(pack_path)?))
 }
 
+#[cfg(feature = "mmap")]
+fn load_pack_index_data(index_path: &Path) -> Result<Arc<dyn PackIndexByteSource>> {
+    match sley_mmap::MappedFile::open_pack(index_path) {
+        Ok(mapped) => Ok(Arc::new(mapped)),
+        Err(_) => Ok(Arc::new(fs::read(index_path)?)),
+    }
+}
+
+#[cfg(not(feature = "mmap"))]
+fn load_pack_index_data(index_path: &Path) -> Result<Arc<dyn PackIndexByteSource>> {
+    Ok(Arc::new(fs::read(index_path)?))
+}
+
 /// Memory-capped LRU of recently decoded objects, shared across cloned handles,
 /// so hot delta bases and repeated reads during a walk aren't re-decoded. The
 /// cache is bounded by an approximate byte budget (not a fixed object count) so
@@ -2637,9 +2650,10 @@ impl sley_pack::HeaderTypeCache for PackHeaderTypeCacheAdapter<'_> {
     }
 }
 
-/// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. Caches
-/// the index parse so locating a packed object doesn't re-parse every `.idx` on
-/// each read.
+/// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. This
+/// remains for MIDX and path-only fallback lookups; normal pack-directory scans
+/// use [`PackRegistrySnapshot`] so the lookup hot path can walk already-parsed
+/// pack records directly.
 type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
 
 /// Parsed multi-pack-index files keyed by path, shared across cloned handles.
@@ -2647,30 +2661,177 @@ type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
 /// reparsing the same fanout/object tables for every read.
 type MultiPackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<MultiPackIndex>>>>;
 
-/// A `.idx`/`.pack` pair discovered in a pack directory.
-#[derive(Debug, Clone)]
-struct DiscoveredPack {
+/// One registered `.idx`/`.pack` pair from a pack directory. The index is parsed
+/// when the registry snapshot is built; pack bytes and per-pack decode/header
+/// caches hang directly off this record so repeated object lookups do not bounce
+/// through path-keyed maps.
+#[derive(Debug)]
+struct RegisteredPack {
     idx: PathBuf,
     pack: PathBuf,
+    index: Mutex<Option<Arc<PackIndexViewData>>>,
+    data: Mutex<Option<Arc<PackData>>>,
+    delta_cache: Arc<Mutex<LruOffsetCache>>,
+    header_type_cache: PackHeaderTypeCache,
 }
 
-/// The discovered `.idx`/`.pack` pairs in each pack directory, keyed by the pack
-/// directory and shared across cloned handles. Caches the directory scan so a
-/// bulk read (e.g. `cat-file --batch`) does not `read_dir` the pack directory on
-/// every object lookup. New packs are still found: a lookup that misses every
-/// cached pack re-scans the directory once before concluding the object is absent
-/// (see [`FileObjectDatabase::find_pack_containing`]).
-type PackListingCache = Arc<Mutex<HashMap<PathBuf, Arc<Vec<DiscoveredPack>>>>>;
+impl RegisteredPack {
+    fn new(idx: PathBuf, pack: PathBuf) -> Self {
+        Self {
+            idx,
+            pack,
+            index: Mutex::new(None),
+            data: Mutex::new(None),
+            delta_cache: Arc::new(Mutex::new(LruOffsetCache::new(delta_base_cache_budget()))),
+            header_type_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 
-/// Last successful pack slot for a pack directory/listing pair. Object streams
-/// usually have strong pack locality, so trying the previous hit first avoids
-/// probing every pack without constructing a full oid table.
-type PackHintCache = Arc<Mutex<HashMap<PathBuf, PackHint>>>;
+    fn index(&self, format: ObjectFormat) -> Result<Arc<PackIndexViewData>> {
+        if let Ok(cache) = self.index.lock()
+            && let Some(index) = cache.as_ref()
+        {
+            return Ok(Arc::clone(index));
+        }
+        let index_bytes = load_pack_index_data(&self.idx)?;
+        let index = Arc::new(PackIndexViewData::parse_trusted_source_without_checksum(
+            index_bytes,
+            format,
+        )?);
+        if let Ok(mut cache) = self.index.lock() {
+            *cache = Some(Arc::clone(&index));
+        }
+        Ok(index)
+    }
 
+    fn bytes(&self, pack_bytes: &PackBytesCache) -> Result<Arc<PackData>> {
+        if let Ok(cache) = self.data.lock()
+            && let Some(bytes) = cache.as_ref()
+        {
+            return Ok(Arc::clone(bytes));
+        }
+        if let Ok(cache) = pack_bytes.lock()
+            && let Some(bytes) = cache.get(&self.pack)
+        {
+            let bytes = Arc::clone(bytes);
+            if let Ok(mut local_cache) = self.data.lock() {
+                *local_cache = Some(Arc::clone(&bytes));
+            }
+            return Ok(bytes);
+        }
+        let bytes = Arc::new(load_pack_data(&self.pack)?);
+        if let Ok(mut local_cache) = self.data.lock() {
+            *local_cache = Some(Arc::clone(&bytes));
+        }
+        if let Ok(mut cache) = pack_bytes.lock() {
+            cache.insert(self.pack.clone(), Arc::clone(&bytes));
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackDirFingerprint {
+    modified: Option<std::time::SystemTime>,
+    idx_count: usize,
+    pack_count: usize,
+}
+
+/// Snapshot of a pack directory's lookup state, shared across cloned handles.
+/// New packs are still found: a lookup that misses every cached pack re-scans the
+/// directory once before concluding the object is absent (see
+/// [`FileObjectDatabase::find_pack_containing`]).
 #[derive(Debug)]
-struct PackHint {
-    listing: Arc<Vec<DiscoveredPack>>,
-    pack_index: usize,
+struct PackRegistrySnapshot {
+    fingerprint: PackDirFingerprint,
+    packs: Vec<Arc<RegisteredPack>>,
+    recent_pack: Mutex<Option<usize>>,
+}
+
+impl PackRegistrySnapshot {
+    fn new(fingerprint: PackDirFingerprint, packs: Vec<Arc<RegisteredPack>>) -> Self {
+        Self {
+            fingerprint,
+            packs,
+            recent_pack: Mutex::new(None),
+        }
+    }
+
+    fn cached_hint(&self) -> Option<usize> {
+        self.recent_pack
+            .lock()
+            .ok()
+            .and_then(|hint| *hint)
+            .filter(|pack_index| *pack_index < self.packs.len())
+    }
+
+    fn remember_hint(&self, pack_index: usize) {
+        if let Ok(mut hint) = self.recent_pack.lock() {
+            *hint = Some(pack_index);
+        }
+    }
+}
+
+/// Cached pack-registry snapshot for this object directory, shared across cloned
+/// handles. A `FileObjectDatabase` owns exactly one object directory, so this is
+/// an `Option` instead of another path-keyed map.
+type PackRegistryCache = Arc<Mutex<Option<Arc<PackRegistrySnapshot>>>>;
+
+#[derive(Debug, Clone)]
+struct PackLookup {
+    pack: PathBuf,
+    registered: Option<Arc<RegisteredPack>>,
+    offset: u64,
+}
+
+impl PackLookup {
+    fn from_registered(pack: Arc<RegisteredPack>, offset: u64) -> Self {
+        Self {
+            pack: pack.pack.clone(),
+            registered: Some(pack),
+            offset,
+        }
+    }
+
+    fn from_path(pack: PathBuf, offset: u64) -> Self {
+        Self {
+            pack,
+            registered: None,
+            offset,
+        }
+    }
+
+    fn pack_path(&self) -> &Path {
+        &self.pack
+    }
+
+    fn pack_bytes(&self, database: &FileObjectDatabase) -> Result<Arc<PackData>> {
+        match &self.registered {
+            Some(pack) => pack.bytes(&database.pack_bytes),
+            None => database.cached_pack_bytes(&self.pack),
+        }
+    }
+
+    fn pack_index(&self, database: &FileObjectDatabase) -> Result<Arc<PackIndex>> {
+        match &self.registered {
+            Some(pack) => database.cached_pack_index(&pack.idx),
+            None => database.cached_pack_index(&self.pack.with_extension("idx")),
+        }
+    }
+
+    fn delta_cache(&self, database: &FileObjectDatabase) -> Option<Arc<Mutex<LruOffsetCache>>> {
+        match &self.registered {
+            Some(pack) => Some(Arc::clone(&pack.delta_cache)),
+            None => database.pack_delta_cache(&self.pack),
+        }
+    }
+
+    fn header_type_cache(&self, database: &FileObjectDatabase) -> Option<PackHeaderTypeCache> {
+        match &self.registered {
+            Some(pack) => Some(Arc::clone(&pack.header_type_cache)),
+            None => database.pack_header_type_cache(&self.pack),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2682,8 +2843,7 @@ pub struct FileObjectDatabase {
     pack_bytes: PackBytesCache,
     pack_indexes: PackIndexCache,
     multi_pack_indexes: MultiPackIndexCache,
-    pack_listing: PackListingCache,
-    pack_hints: PackHintCache,
+    pack_registry: PackRegistryCache,
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
     pack_header_types: PackHeaderTypeCaches,
@@ -2884,8 +3044,7 @@ impl FileObjectDatabase {
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
-            pack_listing: Arc::new(Mutex::new(HashMap::new())),
-            pack_hints: Arc::new(Mutex::new(HashMap::new())),
+            pack_registry: Arc::new(Mutex::new(None)),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
@@ -2903,8 +3062,7 @@ impl FileObjectDatabase {
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
-            pack_listing: Arc::new(Mutex::new(HashMap::new())),
-            pack_hints: Arc::new(Mutex::new(HashMap::new())),
+            pack_registry: Arc::new(Mutex::new(None)),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
@@ -2916,21 +3074,18 @@ impl FileObjectDatabase {
         Self::new(repository_objects_dir(git_dir), format)
     }
 
-    /// Drop cached pack listings, indexes, and decoded objects so the next read
+    /// Drop cached pack registries, indexes, and decoded objects so the next read
     /// sees packs/objects installed after this handle was created (e.g. after
     /// `fetch` or `install_pack`). Long-lived [`Repository`] sessions call this
     /// via the owning repository's `refresh_objects` hook.
     pub fn refresh_read_cache(&self) {
-        if let Ok(mut cache) = self.pack_listing.lock() {
-            cache.clear();
+        if let Ok(mut cache) = self.pack_registry.lock() {
+            *cache = None;
         }
         if let Ok(mut cache) = self.pack_indexes.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.multi_pack_indexes.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.pack_hints.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.pack_bytes.lock() {
@@ -3195,13 +3350,13 @@ impl FileObjectDatabase {
         if let Some(header) = self.loose.read_header(oid)? {
             return Ok(Some(header));
         }
-        if let Some(pack_paths) = self.find_pack_containing(oid)? {
-            let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
+        if let Some(pack_lookup) = self.find_pack_containing(oid)? {
+            let bytes = pack_lookup.pack_bytes(self)?;
             // Per-pack offset->type memo so the ofs-delta chain walk that resolves
             // a packed object's type runs at most once per chain across the batch,
             // instead of re-walking (and re-inflating each link's leading varints)
             // on every header read — the sley#26 super-linear cat-file --batch-check.
-            let type_cache = self.pack_header_type_cache(&pack_paths.pack);
+            let type_cache = pack_lookup.header_type_cache(self);
             let resolve_ref_base = |base: &ObjectId| {
                 self.read_object_header(base)
                     .map(|header| header.map(|(t, _)| t))
@@ -3211,7 +3366,7 @@ impl FileObjectDatabase {
                     let mut adapter = PackHeaderTypeCacheAdapter(cache);
                     sley_pack::read_object_header_at_with_cache(
                         &bytes,
-                        pack_paths.offset,
+                        pack_lookup.offset,
                         self.format,
                         resolve_ref_base,
                         &mut adapter,
@@ -3219,7 +3374,7 @@ impl FileObjectDatabase {
                 }
                 None => sley_pack::read_object_header_at(
                     &bytes,
-                    pack_paths.offset,
+                    pack_lookup.offset,
                     self.format,
                     resolve_ref_base,
                 )?,
@@ -3250,15 +3405,15 @@ impl FileObjectDatabase {
         {
             return Ok(Some(object));
         }
-        let Some(pack_paths) = self.find_pack_containing(oid)? else {
+        let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
-        let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
+        let bytes = pack_lookup.pack_bytes(self)?;
         // Per-pack delta-base cache (keyed by in-pack offset). Resolving an
         // ofs-delta chain reuses already-decoded bases instead of re-inflating the
         // whole chain on every read. Scoped to this pack's path so an offset key is
         // never applied to the wrong pack's bytes.
-        let delta_cache = self.pack_delta_cache(&pack_paths.pack);
+        let delta_cache = pack_lookup.delta_cache(self);
         let delta_adapter = delta_cache.as_ref().map(PackDeltaCacheAdapter);
         // Decode only this object at its offset (plus its delta-base chain). A
         // ref-delta base resolves through the full store (loose / other packs) and
@@ -3269,14 +3424,14 @@ impl FileObjectDatabase {
         let object = match &delta_adapter {
             Some(adapter) => sley_pack::read_object_at_with_cache_arc(
                 &bytes,
-                pack_paths.offset,
+                pack_lookup.offset,
                 self.format,
                 resolve_ref_base,
                 adapter,
             )?,
             None => sley_pack::read_object_at_arc(
                 &bytes,
-                pack_paths.offset,
+                pack_lookup.offset,
                 self.format,
                 resolve_ref_base,
             )?,
@@ -3372,129 +3527,68 @@ impl FileObjectDatabase {
         Ok(Some(midx))
     }
 
-    /// The discovered `.idx`/`.pack` pairs in `pack_dir`, cached and shared across
-    /// clones. With `force_rescan`, the directory is re-read; the freshly scanned
-    /// listing is only stored (and returned as a new `Arc`) when its set of `.idx`
-    /// files actually differs from the cached one, so an unchanged directory keeps
-    /// the same `Arc` (letting callers detect "nothing new" cheaply). On a poisoned
-    /// lock it scans without caching, preserving correctness.
-    fn cached_pack_listing(
+    /// Registry snapshot for this database's pack directory. With `force_rescan`,
+    /// the directory is re-read; when the fingerprint and pack set match the
+    /// cached snapshot, the same `Arc` is returned so miss handling can tell that
+    /// no new packs appeared.
+    fn cached_pack_registry(
         &self,
         pack_dir: &Path,
         force_rescan: bool,
-    ) -> Result<Arc<Vec<DiscoveredPack>>> {
-        if !force_rescan
-            && let Ok(cache) = self.pack_listing.lock()
-            && let Some(listing) = cache.get(pack_dir)
-        {
-            return Ok(Arc::clone(listing));
+    ) -> Result<Arc<PackRegistrySnapshot>> {
+        if !force_rescan && let Some(registry) = self.cached_loaded_pack_registry(pack_dir)? {
+            return Ok(registry);
         }
-        let scanned = Arc::new(scan_pack_listing(pack_dir)?);
-        if let Ok(mut cache) = self.pack_listing.lock() {
-            match cache.get(pack_dir) {
-                // Keep the existing Arc when the scan found the same set of packs,
-                // so repeated misses don't churn the cache or callers' pointers.
-                Some(existing) if same_pack_set(existing, &scanned) => {
+        let scanned = Arc::new(scan_pack_registry(pack_dir, self.format)?);
+        if let Ok(mut cache) = self.pack_registry.lock() {
+            match cache.as_ref() {
+                Some(existing)
+                    if existing.fingerprint == scanned.fingerprint
+                        && same_registered_pack_set(&existing.packs, &scanned.packs) =>
+                {
                     return Ok(Arc::clone(existing));
                 }
                 _ => {
-                    cache.insert(pack_dir.to_path_buf(), Arc::clone(&scanned));
+                    *cache = Some(Arc::clone(&scanned));
                 }
             }
         }
         Ok(scanned)
     }
 
-    fn cached_pack_hint(
+    fn find_in_pack_registry(
         &self,
-        pack_dir: &Path,
-        listing: &Arc<Vec<DiscoveredPack>>,
-    ) -> Option<usize> {
-        let cache = self.pack_hints.lock().ok()?;
-        let hint = cache.get(pack_dir)?;
-        Arc::ptr_eq(&hint.listing, listing)
-            .then_some(hint.pack_index)
-            .filter(|pack_index| *pack_index < listing.len())
-    }
-
-    fn remember_pack_hint(
-        &self,
-        pack_dir: &Path,
-        listing: &Arc<Vec<DiscoveredPack>>,
-        pack_index: usize,
-    ) {
-        if let Ok(mut cache) = self.pack_hints.lock() {
-            cache.insert(
-                pack_dir.to_path_buf(),
-                PackHint {
-                    listing: Arc::clone(listing),
-                    pack_index,
-                },
-            );
+        registry: Arc<PackRegistrySnapshot>,
+        oid: &ObjectId,
+    ) -> Result<Option<PackLookup>> {
+        let hinted_pack_index = registry.cached_hint();
+        if let Some(pack_index) = hinted_pack_index {
+            let pack = &registry.packs[pack_index];
+            let index = pack.index(self.format)?;
+            if let Some(entry) = index.find(oid) {
+                return Ok(Some(PackLookup::from_registered(
+                    Arc::clone(pack),
+                    entry.offset,
+                )));
+            }
         }
-    }
-
-    fn find_in_pack_hint(
-        &self,
-        pack_dir: &Path,
-        listing: &Arc<Vec<DiscoveredPack>>,
-        oid: &ObjectId,
-    ) -> Result<Option<(usize, PackPaths)>> {
-        let Some(pack_index) = self.cached_pack_hint(pack_dir, listing) else {
-            return Ok(None);
-        };
-        let pack = &listing[pack_index];
-        let index = self.cached_pack_index(&pack.idx)?;
-        Ok(index.find(oid).map(|entry| {
-            (
-                pack_index,
-                PackPaths {
-                    pack: pack.pack.clone(),
-                    offset: entry.offset,
-                },
-            )
-        }))
-    }
-
-    fn find_in_pack_lookup(
-        &self,
-        pack_dir: &Path,
-        listing: Arc<Vec<DiscoveredPack>>,
-        oid: &ObjectId,
-    ) -> Result<Option<PackPaths>> {
-        let hinted_pack_index =
-            if let Some((_, pack_paths)) = self.find_in_pack_hint(pack_dir, &listing, oid)? {
-                return Ok(Some(pack_paths));
-            } else {
-                self.cached_pack_hint(pack_dir, &listing)
-            };
-        self.find_in_pack_listing_with_hint(pack_dir, &listing, oid, hinted_pack_index)
-    }
-
-    fn find_in_pack_listing_with_hint(
-        &self,
-        pack_dir: &Path,
-        listing: &Arc<Vec<DiscoveredPack>>,
-        oid: &ObjectId,
-        skip_pack_index: Option<usize>,
-    ) -> Result<Option<PackPaths>> {
-        for (pack_index, pack) in listing.iter().enumerate() {
-            if Some(pack_index) == skip_pack_index {
+        for (pack_index, pack) in registry.packs.iter().enumerate() {
+            if Some(pack_index) == hinted_pack_index {
                 continue;
             }
-            let index = self.cached_pack_index(&pack.idx)?;
+            let index = pack.index(self.format)?;
             if let Some(entry) = index.find(oid) {
-                self.remember_pack_hint(pack_dir, listing, pack_index);
-                return Ok(Some(PackPaths {
-                    pack: pack.pack.clone(),
-                    offset: entry.offset,
-                }));
+                registry.remember_hint(pack_index);
+                return Ok(Some(PackLookup::from_registered(
+                    Arc::clone(pack),
+                    entry.offset,
+                )));
             }
         }
         Ok(None)
     }
 
-    fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackPaths>> {
+    fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackLookup>> {
         if oid.format() != self.format {
             return Err(GitError::InvalidObjectId(format!(
                 "object {oid} uses {}, store uses {}",
@@ -3503,19 +3597,17 @@ impl FileObjectDatabase {
             )));
         }
         let pack_dir = self.objects_dir.join("pack");
-        // Hot path: a previously cached pack listing or multi-pack-index already
+        // Hot path: a previously cached pack registry or multi-pack-index already
         // names every pack, and locating `oid` in them is pure in-memory index
-        // work (no directory I/O). Try that first so a warm handle doesn't stat
-        // the pack dir / multi-pack-index on every single lookup — that redundant
-        // per-object FS probing is what made `cat-file --batch-check` scale poorly
-        // versus git, which resolves through its in-memory index (sley#26).
+        // work. Try that first so a warm handle does not parse indexes or hash
+        // pack paths on every lookup.
         if let Some(midx) = self.cached_loaded_multi_pack_index()
             && let Some(pack_paths) = self.midx_pack_paths(&pack_dir, &midx, oid)?
         {
             return Ok(Some(pack_paths));
         }
-        if let Some(listing) = self.cached_loaded_pack_listing(&pack_dir)
-            && let Some(pack_paths) = self.find_in_pack_lookup(&pack_dir, listing, oid)?
+        if let Some(registry) = self.cached_loaded_pack_registry(&pack_dir)?
+            && let Some(pack_paths) = self.find_in_pack_registry(registry, oid)?
         {
             return Ok(Some(pack_paths));
         }
@@ -3526,42 +3618,45 @@ impl FileObjectDatabase {
         if let Some(pack_paths) = self.find_midx_pack_containing(&pack_dir, oid)? {
             return Ok(Some(pack_paths));
         }
-        // Search the cached directory listing first. On a complete miss, re-scan
-        // the directory once (picking up any pack added since the listing was
+        // Search the cached registry first. On a complete miss, re-scan the
+        // directory once (picking up any pack added since the registry was
         // cached) and search again, so newly written packs are still found.
-        let listing = self.cached_pack_listing(&pack_dir, false)?;
-        if let Some(pack_paths) = self.find_in_pack_lookup(&pack_dir, Arc::clone(&listing), oid)? {
+        let registry = self.cached_pack_registry(&pack_dir, false)?;
+        if let Some(pack_paths) = self.find_in_pack_registry(Arc::clone(&registry), oid)? {
             return Ok(Some(pack_paths));
         }
-        let refreshed = self.cached_pack_listing(&pack_dir, true)?;
-        if Arc::ptr_eq(&listing, &refreshed) {
-            // The re-scan produced the same listing, so nothing new appeared.
+        let refreshed = self.cached_pack_registry(&pack_dir, true)?;
+        if Arc::ptr_eq(&registry, &refreshed) {
+            // The re-scan produced the same registry, so nothing new appeared.
             return Ok(None);
         }
-        self.find_in_pack_lookup(&pack_dir, refreshed, oid)
+        self.find_in_pack_registry(refreshed, oid)
     }
 
     fn packed_object_storage_info(&self, oid: &ObjectId) -> Result<Option<ObjectStorageInfo>> {
-        let Some(pack_paths) = self.find_pack_containing(oid)? else {
+        let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
-        let pack_len = fs::metadata(&pack_paths.pack)?.len();
+        let pack_len = fs::metadata(pack_lookup.pack_path())?.len();
         let trailer_offset = pack_len
             .checked_sub(self.format.raw_len() as u64)
             .ok_or_else(|| GitError::InvalidFormat("pack file shorter than checksum".into()))?;
-        let index_path = pack_paths.pack.with_extension("idx");
-        let index = self.cached_pack_index(&index_path)?;
-        let pack = self.cached_pack_bytes(&pack_paths.pack)?;
-        let delta_base = pack_entry_delta_base(self.format, &pack, pack_paths.offset)?;
+        let index = pack_lookup.pack_index(self)?;
+        let pack = pack_lookup.pack_bytes(self)?;
+        let delta_base = pack_entry_delta_base(self.format, &pack, pack_lookup.offset)?;
         let delta_base_offset = match &delta_base {
             Some(PackDeltaBase::Offset(offset)) => Some(*offset),
             Some(PackDeltaBase::Ref(_)) | None => None,
         };
-        let offset_info =
-            scan_pack_index_offsets(&index, pack_paths.offset, trailer_offset, delta_base_offset)?;
+        let offset_info = scan_pack_index_offsets(
+            &index,
+            pack_lookup.offset,
+            trailer_offset,
+            delta_base_offset,
+        )?;
         let disk_size = offset_info
             .end_offset
-            .checked_sub(pack_paths.offset)
+            .checked_sub(pack_lookup.offset)
             .ok_or_else(|| GitError::InvalidFormat("pack index offsets are not sorted".into()))?;
         let deltabase = match delta_base {
             Some(PackDeltaBase::Offset(_)) => offset_info.delta_base_oid.ok_or_else(|| {
@@ -3585,7 +3680,7 @@ impl FileObjectDatabase {
         &self,
         pack_dir: &Path,
         oid: &ObjectId,
-    ) -> Result<Option<PackPaths>> {
+    ) -> Result<Option<PackLookup>> {
         let midx_path = pack_dir.join("multi-pack-index");
         let Some(midx) = self.cached_multi_pack_index(&midx_path)? else {
             return Ok(None);
@@ -3604,7 +3699,7 @@ impl FileObjectDatabase {
         pack_dir: &Path,
         midx: &MultiPackIndex,
         oid: &ObjectId,
-    ) -> Result<Option<PackPaths>> {
+    ) -> Result<Option<PackLookup>> {
         let Some(entry) = midx.find(oid) else {
             return Ok(None);
         };
@@ -3618,10 +3713,7 @@ impl FileObjectDatabase {
             .map(|stem| format!("{stem}.pack"))
             .unwrap_or_else(|| pack_name.clone());
         let pack = pack_dir.join(pack_file_name);
-        Ok(Some(PackPaths {
-            pack,
-            offset: entry.offset,
-        }))
+        Ok(Some(PackLookup::from_path(pack, entry.offset)))
     }
 
     /// The multi-pack-index for this object store *only if already parsed and
@@ -3633,14 +3725,20 @@ impl FileObjectDatabase {
         cache.get(&midx_path).map(Arc::clone)
     }
 
-    /// The discovered pack listing for `pack_dir` *only if already scanned and
-    /// cached* — never touches the filesystem. Used by the lookup hot path to skip
-    /// the per-call pack-dir existence stat when a handle is warm. A cold cache (or
-    /// a poisoned lock) returns `None`, so the caller falls back to the scanning
-    /// path that establishes the cache and preserves the new-pack rescan semantics.
-    fn cached_loaded_pack_listing(&self, pack_dir: &Path) -> Option<Arc<Vec<DiscoveredPack>>> {
-        let cache = self.pack_listing.lock().ok()?;
-        cache.get(pack_dir).map(Arc::clone)
+    /// The pack registry for `pack_dir` *only if already scanned and cached* —
+    /// never touches the filesystem. Used by the lookup hot path to skip
+    /// per-object pack-dir metadata checks once a handle is warm. A cold cache
+    /// returns `None`, so the caller falls back to the scanning path. A complete
+    /// miss still forces one rescan, preserving the new-pack discovery semantics.
+    fn cached_loaded_pack_registry(
+        &self,
+        _pack_dir: &Path,
+    ) -> Result<Option<Arc<PackRegistrySnapshot>>> {
+        let cache = match self.pack_registry.lock() {
+            Ok(cache) => cache,
+            Err(_) => return Ok(None),
+        };
+        Ok(cache.as_ref().map(Arc::clone))
     }
 }
 
@@ -3669,34 +3767,100 @@ fn object_id_matches_prefix(oid: &ObjectId, prefix: &str) -> bool {
         .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
 }
 
-/// Scan `pack_dir` for `.idx` files that have a matching `.pack` sibling,
-/// returning the discovered pairs. An `.idx` without its `.pack` is skipped (an
-/// orphan index cannot serve objects), matching the prior per-read behavior.
-fn scan_pack_listing(pack_dir: &Path) -> Result<Vec<DiscoveredPack>> {
-    let mut packs = Vec::new();
-    for entry in fs::read_dir(pack_dir)? {
-        let entry = entry?;
-        let idx = entry.path();
-        if idx.extension().and_then(|ext| ext.to_str()) != Some("idx") {
-            continue;
-        }
-        let Some(stem) = idx.file_stem() else {
-            continue;
-        };
-        let pack = idx.with_file_name(format!("{}.pack", stem.to_string_lossy()));
-        if !pack.exists() {
-            continue;
-        }
-        packs.push(DiscoveredPack { idx, pack });
+fn pack_dir_modified(pack_dir: &Path) -> Result<Option<std::time::SystemTime>> {
+    match fs::metadata(pack_dir) {
+        Ok(metadata) => Ok(metadata.modified().ok()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(GitError::Io(err.to_string())),
     }
-    // Deterministic order so lookups and set comparison are stable.
-    packs.sort_by(|left, right| left.idx.cmp(&right.idx));
-    Ok(packs)
 }
 
-/// Whether two pack listings reference the same set of `.idx` files (order is
-/// already normalized by [`scan_pack_listing`]).
-fn same_pack_set(left: &[DiscoveredPack], right: &[DiscoveredPack]) -> bool {
+/// Scan `pack_dir` for `.idx` files that have a matching `.pack` sibling and
+/// parse each index into a registered pack. An `.idx` without its `.pack` is
+/// skipped (an orphan index cannot serve objects), matching the prior per-read
+/// behavior.
+fn scan_pack_registry(pack_dir: &Path, _format: ObjectFormat) -> Result<PackRegistrySnapshot> {
+    let modified = pack_dir_modified(pack_dir)?;
+    let entries = match fs::read_dir(pack_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PackRegistrySnapshot::new(
+                PackDirFingerprint {
+                    modified,
+                    idx_count: 0,
+                    pack_count: 0,
+                },
+                Vec::new(),
+            ));
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+
+    let mut idx_paths = Vec::new();
+    let mut idx_count = 0;
+    let mut pack_count = 0;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("idx") => {
+                idx_count += 1;
+                idx_paths.push(path);
+            }
+            Some("pack") => {
+                pack_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut packs = Vec::new();
+    for idx in idx_paths {
+        let pack = idx.with_extension("pack");
+        let Ok(metadata) = fs::metadata(&pack) else {
+            continue;
+        };
+        let modified = pack_sort_modified(&metadata);
+        packs.push((modified, metadata.len(), Arc::new(RegisteredPack::new(idx, pack))));
+    }
+    // Git keeps a most-recently-used pack order; seed ours with newer/larger
+    // packs before falling back to the path. In repositories with many packs,
+    // this avoids parsing a long run of unrelated `.idx` files before the first
+    // lookup establishes the recent-pack hint.
+    packs.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.idx.cmp(&right.2.idx))
+    });
+    let packs = packs.into_iter().map(|(_, _, pack)| pack).collect();
+    Ok(PackRegistrySnapshot::new(
+        PackDirFingerprint {
+            modified,
+            idx_count,
+            pack_count,
+        },
+        packs,
+    ))
+}
+
+fn pack_sort_modified(metadata: &fs::Metadata) -> (u64, u32) {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| {
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Whether two pack registries reference the same pack/index paths (order is
+/// already normalized by [`scan_pack_registry`]).
+fn same_registered_pack_set(left: &[Arc<RegisteredPack>], right: &[Arc<RegisteredPack>]) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -3801,12 +3965,6 @@ impl ObjectWriter for FileObjectDatabase {
         }
         self.loose.write_object(object)
     }
-}
-
-#[derive(Debug, Clone)]
-struct PackPaths {
-    pack: PathBuf,
-    offset: u64,
 }
 
 fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -4003,7 +4161,7 @@ impl LooseObjectStore {
         Self::new(repository_objects_dir(git_dir), format)
     }
 
-    pub fn object_path(&self, oid: &ObjectId) -> Result<PathBuf> {
+    fn validate_oid_format(&self, oid: &ObjectId) -> Result<()> {
         if oid.format() != self.format {
             return Err(GitError::InvalidObjectId(format!(
                 "object {oid} uses {}, store uses {}",
@@ -4011,23 +4169,30 @@ impl LooseObjectStore {
                 self.format.name()
             )));
         }
+        Ok(())
+    }
+
+    pub fn object_path(&self, oid: &ObjectId) -> Result<PathBuf> {
+        self.validate_oid_format(oid)?;
         let hex = oid.to_hex();
         Ok(self.objects_dir.join(&hex[..2]).join(&hex[2..]))
     }
 
     pub fn exists(&self, oid: &ObjectId) -> Result<bool> {
-        let path = self.object_path(oid)?;
+        self.validate_oid_format(oid)?;
         if self.cached_loose_presence(oid) == Some(false) {
             return Ok(false);
         }
+        let path = self.object_path(oid)?;
         Ok(path.exists())
     }
 
     pub fn disk_size(&self, oid: &ObjectId) -> Result<Option<u64>> {
-        let path = self.object_path(oid)?;
+        self.validate_oid_format(oid)?;
         if self.cached_loose_presence(oid) == Some(false) {
             return Ok(None);
         }
+        let path = self.object_path(oid)?;
         match fs::metadata(path) {
             Ok(metadata) => Ok(Some(metadata.len())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -4040,10 +4205,11 @@ impl LooseObjectStore {
     /// reads keep miniz from inflating past the header even for large objects.
     /// Returns `Ok(None)` when the loose object is absent.
     pub fn read_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
-        let path = self.object_path(oid)?;
+        self.validate_oid_format(oid)?;
         if self.cached_loose_presence(oid) == Some(false) {
             return Ok(None);
         }
+        let path = self.object_path(oid)?;
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -4217,7 +4383,7 @@ fn read_full_prefix(file: &mut fs::File, prefix: &mut [u8]) -> Result<usize> {
 
 impl ObjectReader for LooseObjectStore {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
-        let path = self.object_path(oid)?;
+        self.validate_oid_format(oid)?;
         // Skip the `open()` (and its ENOENT) when an already-built loose cache
         // knows the id is absent. Without a cache, use an exact path probe; a
         // full fanout scan is far more expensive for one-shot packed-object reads.
@@ -4227,6 +4393,7 @@ impl ObjectReader for LooseObjectStore {
                 MissingObjectContext::Read,
             ));
         }
+        let path = self.object_path(oid)?;
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -5321,16 +5488,16 @@ mod tests {
     }
 
     #[test]
-    fn file_database_finds_pack_added_after_listing_was_cached() {
-        // Regression guard for the cached pack-directory listing: a pack written
-        // after the listing was first cached (via a prior read) must still be
+    fn file_database_finds_pack_added_after_registry_was_cached() {
+        // Regression guard for the cached pack-directory registry: a pack written
+        // after the registry was first cached (via a prior read) must still be
         // discovered by the same handle, because a miss triggers a re-scan.
         let root = temp_root("sley-file-odb-pack-added-late");
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
 
-        // First pack + object; reading it populates the listing cache.
+        // First pack + object; reading it populates the registry cache.
         let first = EncodedObject::new(ObjectType::Blob, b"first late\n".to_vec());
         let first_oid = first
             .object_id(ObjectFormat::Sha1)
@@ -5341,7 +5508,7 @@ mod tests {
             .expect("test operation should succeed");
         assert_eq!(read_object_for_assert(&db, &first_oid), first);
 
-        // A second object that the cached listing does not yet know about.
+        // A second object that the cached registry does not yet know about.
         let second = EncodedObject::new(ObjectType::Blob, b"second late\n".to_vec());
         let second_oid = second
             .object_id(ObjectFormat::Sha1)
@@ -5353,7 +5520,7 @@ mod tests {
         ));
 
         // Install its pack through the same handle; the next read must find it via
-        // a re-scan, not be masked by the stale listing.
+        // a re-scan, not be masked by the stale registry.
         let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second))
             .expect("test operation should succeed");
         db.install_pack(&second_pack)
@@ -5370,9 +5537,97 @@ mod tests {
     }
 
     #[test]
+    fn file_database_pack_registry_loads_indexes_lazily_and_refreshes_after_count_change() {
+        let root = temp_root("sley-file-odb-pack-registry-refresh");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let first = EncodedObject::new(ObjectType::Blob, b"registry first\n".to_vec());
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first))
+            .expect("test operation should succeed");
+        db.install_pack(&first_pack)
+            .expect("test operation should succeed");
+
+        let first_registry = db
+            .cached_pack_registry(&pack_dir, false)
+            .expect("test operation should succeed");
+        assert_eq!(first_registry.fingerprint.idx_count, 1);
+        assert_eq!(first_registry.fingerprint.pack_count, 1);
+        assert_eq!(first_registry.packs.len(), 1);
+        assert!(
+            first_registry.packs[0]
+                .index
+                .lock()
+                .expect("test operation should succeed")
+                .is_none()
+        );
+        assert!(
+            first_registry.packs[0]
+                .data
+                .lock()
+                .expect("test operation should succeed")
+                .is_none()
+        );
+
+        // Existence checks use the parsed index directly and do not load pack
+        // bytes; a full read fills the registry-owned pack data handle.
+        assert!(
+            db.contains(&first_oid)
+                .expect("test operation should succeed")
+        );
+        assert!(
+            first_registry.packs[0]
+                .index
+                .lock()
+                .expect("test operation should succeed")
+                .is_some()
+        );
+        assert!(
+            first_registry.packs[0]
+                .data
+                .lock()
+                .expect("test operation should succeed")
+                .is_none()
+        );
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
+        assert!(
+            first_registry.packs[0]
+                .data
+                .lock()
+                .expect("test operation should succeed")
+                .is_some()
+        );
+
+        let second = EncodedObject::new(ObjectType::Blob, b"registry second\n".to_vec());
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second))
+            .expect("test operation should succeed");
+        db.install_pack(&second_pack)
+            .expect("test operation should succeed");
+
+        let refreshed = db
+            .cached_pack_registry(&pack_dir, true)
+            .expect("test operation should succeed");
+        assert!(!Arc::ptr_eq(&first_registry, &refreshed));
+        assert_eq!(refreshed.fingerprint.idx_count, 2);
+        assert_eq!(refreshed.fingerprint.pack_count, 2);
+        assert_eq!(refreshed.packs.len(), 2);
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_database_pack_search_hint_rebuilds_after_pack_added() {
         // Regression guard for the recent-pack search hint: it is tied to the
-        // cached pack listing, so a miss followed by a changed listing must not
+        // cached pack registry, so a miss followed by a changed registry must not
         // hide newly-added packs.
         let root = temp_root("sley-file-odb-pack-lookup-added-late");
         let git_dir = root.join(".git");
@@ -5401,7 +5656,7 @@ mod tests {
         db.install_pack(&second_pack)
             .expect("test operation should succeed");
 
-        // With two packs, these reads establish a cached listing and pack hint.
+        // With two packs, these reads establish a cached registry and pack hint.
         assert_eq!(read_object_for_assert(&db, &first_oid), first);
         assert_eq!(read_object_for_assert(&db, &second_oid), second);
         assert!(matches!(
