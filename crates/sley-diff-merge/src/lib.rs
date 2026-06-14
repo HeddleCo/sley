@@ -1889,7 +1889,7 @@ fn augment_with_stat_dirty_entries(
         if tracked.mode == 0o160000 {
             continue;
         }
-        let path = worktree_root.join(repo_path_to_path(git_path));
+        let path = worktree_path_for_repo_path(worktree_root, git_path);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             // A missing worktree file is a deletion, which the content diff
             // already reports; nothing to add here.
@@ -1941,7 +1941,7 @@ fn worktree_oid_matches_index(
     format: ObjectFormat,
 ) -> Result<bool> {
     let file_type = metadata.file_type();
-    let path = worktree_root.join(repo_path_to_path(git_path));
+    let path = worktree_path_for_repo_path(worktree_root, git_path);
     let body = if file_type.is_symlink() {
         symlink_target_bytes(&path)?
     } else {
