@@ -17,6 +17,7 @@ use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader, reposit
 use sley_refs::{FileRefStore, PackedRef, RefTarget, resolve_ref_peeled, validate_symref_name};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1045,7 +1046,336 @@ struct CommitGraphContext<'a> {
 enum DirectCommitGraph {
     Missing,
     Invalid,
-    Graph(CommitGraph),
+    Raw(RawCommitGraph),
+}
+
+struct RawCommitGraph {
+    bytes: Vec<u8>,
+    format: ObjectFormat,
+    fanout: [u32; 256],
+    commit_count: usize,
+    oidl: Range<usize>,
+    cdat: Range<usize>,
+    edge: Option<Range<usize>>,
+}
+
+impl RawCommitGraph {
+    fn parse(bytes: Vec<u8>, format: ObjectFormat) -> Result<Self> {
+        let hash_len = format.raw_len();
+        if bytes.len() < 8 + 12 + hash_len {
+            return Err(GitError::InvalidFormat(
+                "commit-graph file too short".into(),
+            ));
+        }
+        if &bytes[..4] != b"CGPH" {
+            return Err(GitError::InvalidFormat(
+                "missing commit-graph signature".into(),
+            ));
+        }
+        let version = bytes[4];
+        if version != 1 {
+            return Err(GitError::Unsupported(format!(
+                "commit-graph version {version}"
+            )));
+        }
+        let hash_id = bytes[5];
+        if u32::from(hash_id) != commit_graph_hash_function_id(format) {
+            return Err(GitError::InvalidFormat(format!(
+                "commit-graph hash id {hash_id} does not match {}",
+                format.name()
+            )));
+        }
+        if bytes[7] != 0 {
+            return Err(GitError::Unsupported(
+                "split commit-graph direct lookup".into(),
+            ));
+        }
+        let chunk_count = bytes[6] as usize;
+        let lookup_len = (chunk_count + 1)
+            .checked_mul(12)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph lookup overflow".into()))?;
+        let data_start = 8usize
+            .checked_add(lookup_len)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph lookup overflow".into()))?;
+        let checksum_offset = bytes.len() - hash_len;
+        if data_start > checksum_offset {
+            return Err(GitError::InvalidFormat(
+                "truncated commit-graph chunk lookup".into(),
+            ));
+        }
+        let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+        let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+        if actual_checksum != checksum {
+            return Err(GitError::InvalidFormat(format!(
+                "commit-graph checksum mismatch: expected {checksum}, got {actual_checksum}"
+            )));
+        }
+
+        let mut lookup = Vec::with_capacity(chunk_count + 1);
+        let mut offset = 8usize;
+        for _ in 0..=chunk_count {
+            let id = [
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ];
+            let chunk_offset = read_u64_be(&bytes[offset + 4..offset + 12]);
+            lookup.push((id, chunk_offset));
+            offset += 12;
+        }
+        let Some((terminator_id, terminator_offset)) = lookup.last().copied() else {
+            return Err(GitError::InvalidFormat(
+                "commit-graph chunk lookup is empty".into(),
+            ));
+        };
+        if terminator_id != [0, 0, 0, 0] {
+            return Err(GitError::InvalidFormat(
+                "commit-graph chunk lookup missing terminator".into(),
+            ));
+        }
+        if terminator_offset != checksum_offset as u64 {
+            return Err(GitError::InvalidFormat(
+                "commit-graph terminator does not point at checksum".into(),
+            ));
+        }
+
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut previous_offset = data_start;
+        for pair in lookup.windows(2) {
+            let (id, chunk_offset) = pair[0];
+            let (_next_id, next_offset) = pair[1];
+            if id == [0, 0, 0, 0] {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph chunk id is zero before terminator".into(),
+                ));
+            }
+            if chunks
+                .iter()
+                .any(|(seen, _): &([u8; 4], Range<usize>)| *seen == id)
+            {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph chunk id is duplicated".into(),
+                ));
+            }
+            let start = usize::try_from(chunk_offset).map_err(|_| {
+                GitError::InvalidFormat("commit-graph chunk offset overflow".into())
+            })?;
+            let end = usize::try_from(next_offset).map_err(|_| {
+                GitError::InvalidFormat("commit-graph chunk offset overflow".into())
+            })?;
+            if start < data_start || start < previous_offset || end < start || end > checksum_offset
+            {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph chunk length is invalid".into(),
+                ));
+            }
+            chunks.push((id, start..end));
+            previous_offset = start;
+        }
+
+        let oidf = raw_commit_graph_chunk(&chunks, *b"OIDF")
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph missing OIDF chunk".into()))?;
+        if oidf.len() != 256 * 4 {
+            return Err(GitError::InvalidFormat(
+                "commit-graph OIDF chunk has invalid length".into(),
+            ));
+        }
+        let mut fanout = [0u32; 256];
+        let mut previous = 0u32;
+        for (idx, slot) in fanout.iter_mut().enumerate() {
+            let start = oidf.start + idx * 4;
+            *slot = read_u32_be(&bytes[start..start + 4]);
+            if *slot < previous {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph OIDF fanout is not monotonic".into(),
+                ));
+            }
+            previous = *slot;
+        }
+        let commit_count = fanout[255] as usize;
+        let oidl = raw_commit_graph_chunk(&chunks, *b"OIDL")
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph missing OIDL chunk".into()))?;
+        let expected_oidl_len = commit_count
+            .checked_mul(hash_len)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL chunk overflow".into()))?;
+        if oidl.len() != expected_oidl_len {
+            return Err(GitError::InvalidFormat(
+                "commit-graph OIDL chunk has invalid length".into(),
+            ));
+        }
+        let cdat = raw_commit_graph_chunk(&chunks, *b"CDAT")
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph missing CDAT chunk".into()))?;
+        let entry_len = raw_commit_graph_entry_len(format)?;
+        let expected_cdat_len = commit_count
+            .checked_mul(entry_len)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT chunk overflow".into()))?;
+        if cdat.len() != expected_cdat_len {
+            return Err(GitError::InvalidFormat(
+                "commit-graph CDAT chunk has invalid length".into(),
+            ));
+        }
+        let edge = raw_commit_graph_chunk(&chunks, *b"EDGE");
+        if let Some(edge) = &edge
+            && edge.len() % 4 != 0
+        {
+            return Err(GitError::InvalidFormat(
+                "commit-graph EDGE chunk has invalid length".into(),
+            ));
+        }
+
+        Ok(Self {
+            bytes,
+            format,
+            fanout,
+            commit_count,
+            oidl,
+            cdat,
+            edge,
+        })
+    }
+
+    fn metadata(&self, oid: &ObjectId) -> Result<Option<CommitMetadata>> {
+        if oid.format() != self.format {
+            return Ok(None);
+        }
+        let Some(idx) = self.find_index(oid)? else {
+            return Ok(None);
+        };
+        let entry = self.cdat_entry(idx)?;
+        let hash_len = self.format.raw_len();
+        let parent_one = read_u32_be(&entry[hash_len..hash_len + 4]);
+        let parent_two = read_u32_be(&entry[hash_len + 4..hash_len + 8]);
+        let generation_and_time_high = read_u32_be(&entry[hash_len + 8..hash_len + 12]);
+        let time_low = read_u32_be(&entry[hash_len + 12..hash_len + 16]);
+        let commit_time = (u64::from(generation_and_time_high & 0x3) << 32) | u64::from(time_low);
+        Ok(Some(CommitMetadata {
+            oid: *oid,
+            parents: self.parent_oids(parent_one, parent_two)?,
+            commit_time: i64::try_from(commit_time).unwrap_or(i64::MAX),
+        }))
+    }
+
+    fn find_index(&self, oid: &ObjectId) -> Result<Option<usize>> {
+        let first = oid.as_bytes()[0] as usize;
+        let mut low = if first == 0 {
+            0
+        } else {
+            self.fanout[first - 1] as usize
+        };
+        let mut high = self.fanout[first] as usize;
+        let needle = oid.as_bytes();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match self.oid_bytes(mid)?.cmp(needle) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn oid_bytes(&self, idx: usize) -> Result<&[u8]> {
+        if idx >= self.commit_count {
+            return Err(GitError::InvalidFormat(
+                "commit-graph oid index points past table".into(),
+            ));
+        }
+        let hash_len = self.format.raw_len();
+        let start = self
+            .oidl
+            .start
+            .checked_add(idx.checked_mul(hash_len).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph OIDL index overflow".into())
+            })?)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL index overflow".into()))?;
+        let end = start
+            .checked_add(hash_len)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL index overflow".into()))?;
+        self.bytes
+            .get(start..end)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL index overflow".into()))
+    }
+
+    fn oid_at(&self, idx: u32) -> Result<ObjectId> {
+        let idx = usize::try_from(idx)
+            .map_err(|_| GitError::InvalidFormat("commit-graph parent index overflow".into()))?;
+        ObjectId::from_raw(self.format, self.oid_bytes(idx)?)
+    }
+
+    fn cdat_entry(&self, idx: usize) -> Result<&[u8]> {
+        if idx >= self.commit_count {
+            return Err(GitError::InvalidFormat(
+                "commit-graph CDAT index points past table".into(),
+            ));
+        }
+        let entry_len = raw_commit_graph_entry_len(self.format)?;
+        let start = self
+            .cdat
+            .start
+            .checked_add(idx.checked_mul(entry_len).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph CDAT index overflow".into())
+            })?)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))?;
+        let end = start
+            .checked_add(entry_len)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))?;
+        self.bytes
+            .get(start..end)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))
+    }
+
+    fn parent_oids(&self, parent_one: u32, parent_two: u32) -> Result<Vec<ObjectId>> {
+        let mut parents = Vec::new();
+        if parent_one != RAW_COMMIT_GRAPH_PARENT_NONE {
+            validate_raw_commit_graph_parent(parent_one, self.commit_count)?;
+            parents.push(self.oid_at(parent_one)?);
+        }
+        if parent_two == RAW_COMMIT_GRAPH_PARENT_NONE {
+            return Ok(parents);
+        }
+        if parent_two & RAW_COMMIT_GRAPH_EXTRA_EDGE == 0 {
+            validate_raw_commit_graph_parent(parent_two, self.commit_count)?;
+            parents.push(self.oid_at(parent_two)?);
+            return Ok(parents);
+        }
+
+        let Some(edge) = &self.edge else {
+            return Err(GitError::InvalidFormat(
+                "commit-graph octopus edge missing EDGE chunk".into(),
+            ));
+        };
+        let mut edge_idx = (parent_two & RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK) as usize;
+        loop {
+            let start = edge
+                .start
+                .checked_add(edge_idx.checked_mul(4).ok_or_else(|| {
+                    GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+                })?)
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+                })?;
+            let end = start.checked_add(4).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+            })?;
+            let Some(bytes) = self.bytes.get(start..end) else {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph EDGE entry points past chunk".into(),
+                ));
+            };
+            let raw = read_u32_be(bytes);
+            let parent = raw & RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK;
+            validate_raw_commit_graph_parent(parent, self.commit_count)?;
+            parents.push(self.oid_at(parent)?);
+            if raw & RAW_COMMIT_GRAPH_EXTRA_EDGE != 0 {
+                return Ok(parents);
+            }
+            edge_idx = edge_idx.checked_add(1).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph EDGE index overflow".into())
+            })?;
+        }
+    }
 }
 
 impl<'a> CommitGraphContext<'a> {
@@ -1175,20 +1505,14 @@ impl<'a> CommitGraphContext<'a> {
         oid: &ObjectId,
     ) -> Result<Option<CommitMetadata>> {
         match self.direct_graph() {
-            DirectCommitGraph::Graph(graph) => {
-                let Some(entry) = graph.find(oid) else {
+            DirectCommitGraph::Raw(graph) => {
+                let Some(mut metadata) = graph.metadata(oid).unwrap_or(None) else {
                     return Ok(None);
                 };
-                let parents = if reader.is_shallow_graft(oid) {
-                    Vec::new()
-                } else {
-                    graph.parent_oids(entry)?.collect()
-                };
-                return Ok(Some(CommitMetadata {
-                    oid: *oid,
-                    parents,
-                    commit_time: i64::try_from(entry.commit_time).unwrap_or(i64::MAX),
-                }));
+                if reader.is_shallow_graft(oid) {
+                    metadata.parents.clear();
+                }
+                return Ok(Some(metadata));
             }
             DirectCommitGraph::Invalid => return Ok(None),
             DirectCommitGraph::Missing => {}
@@ -1235,10 +1559,7 @@ fn load_commit_graph_map(
     load_commit_graph_chain(&info, &chain, format).unwrap_or_default()
 }
 
-fn load_direct_commit_graph(
-    git_dir: &Path,
-    format: sley_core::ObjectFormat,
-) -> DirectCommitGraph {
+fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> DirectCommitGraph {
     let path = repository_objects_dir(git_dir)
         .join("info")
         .join("commit-graph");
@@ -1247,9 +1568,52 @@ fn load_direct_commit_graph(
     }
     fs::read(&path)
         .map_err(|err| GitError::Io(err.to_string()))
-        .and_then(|bytes| CommitGraph::parse(&bytes, format))
-        .map(DirectCommitGraph::Graph)
+        .and_then(|bytes| RawCommitGraph::parse(bytes, format))
+        .map(DirectCommitGraph::Raw)
         .unwrap_or(DirectCommitGraph::Invalid)
+}
+
+const RAW_COMMIT_GRAPH_PARENT_NONE: u32 = 0x7000_0000;
+const RAW_COMMIT_GRAPH_EXTRA_EDGE: u32 = 0x8000_0000;
+const RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK: u32 = 0x7fff_ffff;
+
+fn raw_commit_graph_chunk(chunks: &[([u8; 4], Range<usize>)], id: [u8; 4]) -> Option<Range<usize>> {
+    chunks
+        .iter()
+        .find_map(|(chunk_id, range)| (*chunk_id == id).then(|| range.clone()))
+}
+
+fn raw_commit_graph_entry_len(format: ObjectFormat) -> Result<usize> {
+    format
+        .raw_len()
+        .checked_add(16)
+        .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT entry overflow".into()))
+}
+
+fn validate_raw_commit_graph_parent(parent: u32, commit_count: usize) -> Result<()> {
+    if parent as usize >= commit_count {
+        return Err(GitError::InvalidFormat(
+            "commit-graph parent points past commit table".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn commit_graph_hash_function_id(format: ObjectFormat) -> u32 {
+    match format {
+        ObjectFormat::Sha1 => 1,
+        ObjectFormat::Sha256 => 2,
+    }
+}
+
+fn read_u32_be(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn read_u64_be(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 /// Load every layer named in a split-graph chain file and merge them.

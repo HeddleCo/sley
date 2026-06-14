@@ -314,7 +314,26 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let (diff_trees, mut path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
     path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
-    let repository_abbrev = repository_abbrev(&git_dir, format)?;
+    let no_output_mode = !raw
+        && !stat
+        && !compact_summary
+        && !numstat
+        && !shortstat
+        && !summary
+        && dirstat.is_none()
+        && !name_status
+        && !name_only;
+    let output_may_show_oids = !quiet && !no_patch && !name_only && !name_status;
+    let needs_raw_abbrev = output_may_show_oids && raw && raw_abbrev.is_none();
+    let needs_patch_abbrev = output_may_show_oids
+        && (patch || no_output_mode)
+        && !patch_full_index
+        && patch_abbrev.is_none();
+    let repository_abbrev = if needs_raw_abbrev || needs_patch_abbrev {
+        repository_abbrev(&git_dir, format)?
+    } else {
+        None
+    };
     let raw_abbrev = match raw_abbrev {
         Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
         // `git diff` is porcelain: raw oids abbreviate by default (unlike the
@@ -555,15 +574,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let show_numstat = numstat && !name_only && !name_status;
         let show_stat = (stat || compact_summary) && !name_only && !name_status;
         let show_shortstat = shortstat && !name_only && !name_status;
-        let no_output_mode = !raw
-            && !stat
-            && !compact_summary
-            && !numstat
-            && !shortstat
-            && !summary
-            && dirstat.is_none()
-            && !name_status
-            && !name_only;
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
         if show_raw {
@@ -571,7 +581,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // a stat-clean file keeps its index oid in raw output. The
             // worktree entries carry the freshly-hashed content oid, so
             // matching it against the index entry reproduces that rule.
-            let index_oids: HashMap<Vec<u8>, ObjectId> = if zero_worktree_oids {
+            let needs_index_oids =
+                zero_worktree_oids && entries.iter().any(|entry| entry.new_oid.is_some());
+            let index_oids: HashMap<Vec<u8>, ObjectId> = if needs_index_oids {
                 let index_path = sley_worktree::repository_index_path(&git_dir);
                 match fs::read(&index_path) {
                     Ok(bytes) => Index::parse(&bytes, format)?
