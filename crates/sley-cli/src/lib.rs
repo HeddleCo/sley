@@ -7265,17 +7265,12 @@ fn log_regex_unterminated_class_error(
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    // Default output must be byte-identical to git: glibc's `regcomp` reports an
-    // unbalanced bracket class via `regerror`, which git surfaces verbatim as
-    // "Invalid regular expression". The friendlier "brackets ([ ]) not balanced"
-    // diagnostic is a strict improvement, but only acceptable behind a verbose
-    // mode — sley-cli has no global `-v`/verbosity seam reaching the log
-    // regex-parse path yet (only per-subcommand verbose flags in worktree/etc.).
-    // TODO(verbose): surface detailed regex diagnostics ("brackets ([ ]) not
-    // balanced") under -v once a global verbosity level is plumbed into log.
-    let message = "Invalid regular expression";
-    eprintln!("fatal: {error_context}, '{pattern}': {message}");
-    Err(GitError::Exit(128))
+    Err(grep_source::report_regex_compile_error(
+        error_context,
+        pattern,
+        grep_source::RegexDiagnosticVerbosity::from_env(),
+        grep_source::RegexDiagnosticDetail::UnbalancedBrackets,
+    ))
 }
 
 fn log_author_filters_match(
