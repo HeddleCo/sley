@@ -4118,6 +4118,28 @@ impl IgnorePattern {
             if is_dir && self.match_path(path) {
                 return true;
             }
+            // For a *file* path, a directory-only pattern can only apply
+            // through an *ancestor* directory of the file: the leaf is matched
+            // only because it lives inside a directory the pattern excludes
+            // (e.g. `/tmp-*/` excludes `tmp-info-only`, so `tmp-info-only/x`
+            // is excluded too). Upstream git models this through directory
+            // traversal — `last_matching_pattern` skips a MUSTBEDIR pattern for
+            // a non-directory leaf (`dtype != DT_DIR`), and a file is excluded
+            // only when one of its parent directories is excluded.
+            //
+            // A *negated* directory-only pattern (`!data/**/`) re-includes a
+            // directory but, per git, does NOT re-include the files inside it
+            // (git's docs: "it is not possible to re-include a file if a parent
+            // directory of that file is excluded" — re-including the dir with
+            // `!dir/` still requires an explicit `!dir/*` to reach its files).
+            // So a negated directory-only pattern must never match a file via
+            // its ancestor, otherwise it wrongly wins the leaf scan and
+            // un-ignores a file that an earlier positive pattern ignored
+            // (t0008-ignores "directories and ** matches": `data/**` +
+            // `!data/**/` must leave `data/data1/file1` ignored).
+            if self.negated {
+                return false;
+            }
             return path
                 .iter()
                 .enumerate()
@@ -9482,6 +9504,30 @@ mod tests {
         assert!(matcher.is_ignored(b"tmp-info-only/file.txt", false));
         assert!(!matcher.is_ignored(b"nested/tmp-info-only", true));
         assert!(!matcher.is_ignored(b"tmp-info-only", false));
+    }
+
+    #[test]
+    fn ignore_negated_directory_glob_does_not_reinclude_files() {
+        // t0008-ignores "directories and ** matches": a negated directory-only
+        // pattern re-includes *directories* but never the *files* inside them
+        // (git: re-including a dir with `!dir/` still needs an explicit
+        // `!dir/*` to reach its files). Verified against git 2.54 check-ignore:
+        //   data/file              -> data/**           (ignored)
+        //   data/data1/file1       -> data/**           (ignored, NOT !data/**/)
+        //   data/data1/file1.txt   -> !data/**/*.txt    (re-included)
+        //   data/data1   (dir)     -> !data/**/         (re-included)
+        let matcher = ignore_matcher(&[b"data/**", b"!data/**/", b"!data/**/*.txt"]);
+        // Files stay ignored: `!data/**/` must not win the file leaf scan.
+        assert!(matcher.is_ignored(b"data/file", false));
+        assert!(matcher.is_ignored(b"data/data1/file1", false));
+        assert!(matcher.is_ignored(b"data/data2/file2", false));
+        // `.txt` files are re-included by the explicit non-dir negation.
+        assert!(!matcher.is_ignored(b"data/data1/file1.txt", false));
+        assert!(!matcher.is_ignored(b"data/data2/file2.txt", false));
+        // Directories ARE re-included by `!data/**/` (the directory-glob gain
+        // from `fix: match git status ignored directory globs`).
+        assert!(!matcher.is_ignored(b"data/data1", true));
+        assert!(!matcher.is_ignored(b"data/data2", true));
     }
 
     #[test]
