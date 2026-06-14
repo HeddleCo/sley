@@ -47,6 +47,157 @@ impl ConfigSnapshot {
     }
 }
 
+/// Worktree config inclusion policy for [`ConfigStackOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeConfig {
+    Never,
+    Always,
+    WhenEnabled,
+}
+
+/// Options for building an effective, source-attributed Git config stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigStackOptions {
+    follow_includes: bool,
+    worktree_config: WorktreeConfig,
+    track_origins: bool,
+}
+
+impl ConfigStackOptions {
+    /// Git's repository config behavior: follow includes and include worktree
+    /// config only when `extensions.worktreeConfig` enables it.
+    pub fn git_default() -> Self {
+        Self {
+            follow_includes: true,
+            worktree_config: WorktreeConfig::WhenEnabled,
+            track_origins: true,
+        }
+    }
+
+    pub fn follow_includes(mut self, follow_includes: bool) -> Self {
+        self.follow_includes = follow_includes;
+        self
+    }
+
+    pub fn worktree_config(mut self, worktree_config: WorktreeConfig) -> Self {
+        self.worktree_config = worktree_config;
+        self
+    }
+
+    pub fn track_origins(mut self, track_origins: bool) -> Self {
+        self.track_origins = track_origins;
+        self
+    }
+
+    pub fn includes_followed(self) -> bool {
+        self.follow_includes
+    }
+
+    pub fn worktree_config_policy(self) -> WorktreeConfig {
+        self.worktree_config
+    }
+
+    pub fn origins_tracked(self) -> bool {
+        self.track_origins
+    }
+}
+
+impl Default for ConfigStackOptions {
+    fn default() -> Self {
+        Self::git_default()
+    }
+}
+
+/// Stable id for a source-backed logical config section in a
+/// [`ConfigStackView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConfigSectionId(usize);
+
+/// A source-attributed effective config stack with helper lookups for remotes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigStackView {
+    pub values: ConfigSnapshot,
+    pub remotes: RemoteConfigSnapshot,
+    section_sources: Vec<RemoteConfigSource>,
+}
+
+impl ConfigStackView {
+    pub fn values(&self) -> &ConfigSnapshot {
+        &self.values
+    }
+
+    pub fn remotes(&self) -> &RemoteConfigSnapshot {
+        &self.remotes
+    }
+
+    /// Return a configured remote with the source section selected for editing.
+    pub fn remote(&self, name: &str) -> Result<ConfigRemote, ConfigEditError> {
+        let Some(remote) = self.remotes.get(name).cloned() else {
+            return Err(ConfigEditError::SectionNotFound {
+                section: "remote".to_string(),
+                subsection: Some(name.to_string()),
+            });
+        };
+        let Some(source) = remote.sources.last().cloned() else {
+            return Err(ConfigEditError::NoEditableSource);
+        };
+        let section_id = self
+            .section_sources
+            .iter()
+            .position(|candidate| candidate == &source)
+            .ok_or(ConfigEditError::NoEditableSource)?;
+        Ok(ConfigRemote {
+            remote,
+            section_id: ConfigSectionId(section_id),
+        })
+    }
+
+    /// Physical file that can safely edit the section identified by `section_id`.
+    pub fn editable_section_file(
+        &self,
+        section_id: ConfigSectionId,
+    ) -> Result<PathBuf, ConfigEditError> {
+        let source = self
+            .section_sources
+            .get(section_id.0)
+            .ok_or(ConfigEditError::NoEditableSource)?;
+        if source.editable
+            && let Some(path) = &source.target_path
+        {
+            return Ok(path.clone());
+        }
+        match &source.refusal {
+            Some(RemoteConfigRefusal::ExternalInclude { path }) => {
+                Err(ConfigEditError::RefusesExternalInclude { path: path.clone() })
+            }
+            Some(RemoteConfigRefusal::SyntheticSource) | None => {
+                Err(ConfigEditError::NoEditableSource)
+            }
+        }
+    }
+}
+
+/// A remote returned from [`ConfigStackView::remote`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRemote {
+    remote: RemoteConfig,
+    section_id: ConfigSectionId,
+}
+
+impl ConfigRemote {
+    pub fn section_id(&self) -> ConfigSectionId {
+        self.section_id
+    }
+
+    pub fn remote(&self) -> &RemoteConfig {
+        &self.remote
+    }
+
+    pub fn name(&self) -> &str {
+        &self.remote.name
+    }
+}
+
 /// Source-attributed remote configuration, lowest precedence first.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoteConfigSnapshot {
@@ -382,6 +533,33 @@ impl Repository {
     /// Return the effective config as a source-attributed flat stream.
     pub fn config_with_sources(&self) -> Result<ConfigSnapshot, ConfigEditError> {
         let stack = self.config_stack_with_sources()?;
+        Ok(self.config_snapshot_from_stack(stack))
+    }
+
+    /// Build an effective Git config stack with editable-origin metadata.
+    pub fn config_stack(
+        &self,
+        options: ConfigStackOptions,
+    ) -> Result<ConfigStackView, ConfigEditError> {
+        let stack = self.config_stack_with_options(options)?;
+        let values = self.config_snapshot_from_stack(stack.clone());
+        let remotes = self.remote_config_snapshot_from_stack(stack);
+        let mut section_sources = Vec::new();
+        for remote in &remotes.remotes {
+            for source in &remote.sources {
+                if !section_sources.contains(source) {
+                    section_sources.push(source.clone());
+                }
+            }
+        }
+        Ok(ConfigStackView {
+            values,
+            remotes,
+            section_sources,
+        })
+    }
+
+    fn config_snapshot_from_stack(&self, stack: ConfigStack) -> ConfigSnapshot {
         let bases = ConfigSourceBases::for_repository(self);
         let values = stack
             .entries
@@ -392,12 +570,16 @@ impl Repository {
                 source: bases.source_for(entry.scope, &entry.origin, entry.included_from.as_ref()),
             })
             .collect();
-        Ok(ConfigSnapshot { values })
+        ConfigSnapshot { values }
     }
 
     /// Return configured remotes with physical source and editability metadata.
     pub fn remote_config_with_sources(&self) -> Result<RemoteConfigSnapshot, ConfigEditError> {
         let stack = self.config_stack_with_sources()?;
+        Ok(self.remote_config_snapshot_from_stack(stack))
+    }
+
+    fn remote_config_snapshot_from_stack(&self, stack: ConfigStack) -> RemoteConfigSnapshot {
         let bases = ConfigSourceBases::for_repository(self);
         let mut remotes: Vec<RemoteConfig> = Vec::new();
         for entry in stack.entries {
@@ -430,7 +612,7 @@ impl Repository {
             }
             remote.values.push(value);
         }
-        Ok(RemoteConfigSnapshot { remotes })
+        RemoteConfigSnapshot { remotes }
     }
 
     /// Plan the physical config file that should be edited for `key` and `scope`.
@@ -558,6 +740,13 @@ impl Repository {
     }
 
     fn config_stack_with_sources(&self) -> Result<ConfigStack, ConfigEditError> {
+        self.config_stack_with_options(ConfigStackOptions::git_default())
+    }
+
+    fn config_stack_with_options(
+        &self,
+        options: ConfigStackOptions,
+    ) -> Result<ConfigStack, ConfigEditError> {
         let context = sley_config::ConfigIncludeContext::new(
             Some(self.config_include_git_dir()),
             self.config_include_branch(),
@@ -565,26 +754,44 @@ impl Repository {
         let mut stack = ConfigStack::new();
         for (path, scope) in sley_config::default_config_layer_paths() {
             stack
-                .push_file(&path, scope, true, &context)
+                .push_file(&path, scope, options.follow_includes, &context)
                 .map_err(ConfigEditError::from_git_error)?;
         }
         stack
             .push_file(
                 &self.common_dir().join("config"),
                 ConfigScope::Local,
-                true,
+                options.follow_includes,
                 &context,
             )
             .map_err(ConfigEditError::from_git_error)?;
-        stack
-            .push_file(
-                &self.git_dir().join("config.worktree"),
-                ConfigScope::Worktree,
-                true,
-                &context,
-            )
-            .map_err(ConfigEditError::from_git_error)?;
+        let include_worktree = match options.worktree_config {
+            WorktreeConfig::Never => false,
+            WorktreeConfig::Always => true,
+            WorktreeConfig::WhenEnabled => self.worktree_config_enabled()?,
+        };
+        if include_worktree {
+            stack
+                .push_file(
+                    &self.git_dir().join("config.worktree"),
+                    ConfigScope::Worktree,
+                    options.follow_includes,
+                    &context,
+                )
+                .map_err(ConfigEditError::from_git_error)?;
+        }
         Ok(stack)
+    }
+
+    fn worktree_config_enabled(&self) -> Result<bool, ConfigEditError> {
+        let path = self.common_dir().join("config");
+        match crate::GitConfig::read(&path) {
+            Ok(config) => Ok(config
+                .get_bool("extensions", None, "worktreeConfig")
+                .unwrap_or(false)),
+            Err(GitError::Io(_)) | Err(GitError::NotFound(_)) => Ok(false),
+            Err(err) => Err(ConfigEditError::from_git_error(err)),
+        }
     }
 
     fn config_edit_target_path(
@@ -598,7 +805,7 @@ impl Repository {
             ConfigEditScope::Global => sley_config::default_config_layer_paths()
                 .into_iter()
                 .filter_map(|(path, scope)| (scope == ConfigScope::Global).then_some(path))
-                .last()
+                .next_back()
                 .ok_or(ConfigEditError::NoEditableSource),
             ConfigEditScope::System => sley_config::default_config_layer_paths()
                 .into_iter()
@@ -933,12 +1140,9 @@ fn render_section(
     for entry in entries {
         out.push(b'\t');
         out.extend_from_slice(entry.name.as_bytes());
-        match &entry.value {
-            Some(value) => {
-                out.extend_from_slice(b" = ");
-                out.extend_from_slice(quote_config_value(value).as_bytes());
-            }
-            None => {}
+        if let Some(value) = &entry.value {
+            out.extend_from_slice(b" = ");
+            out.extend_from_slice(quote_config_value(value).as_bytes());
         }
         out.push(b'\n');
     }

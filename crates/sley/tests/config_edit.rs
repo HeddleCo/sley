@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sley::{
-    ConfigEditError, ConfigEditScope, ConfigSource, RemoteConfigRefusal, RemoteConfigRemove,
-    RemoteConfigSet, Repository,
+    ConfigEditError, ConfigEditScope, ConfigSource, ConfigStackOptions, RemoteConfigRefusal,
+    RemoteConfigRemove, RemoteConfigSet, Repository, WorktreeConfig,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -343,4 +343,61 @@ fn repository_plan_remote_set_refuses_external_include_by_default() {
         err,
         ConfigEditError::RefusesExternalInclude { path } if path == outside
     ));
+}
+
+#[test]
+fn repository_config_stack_reports_editable_remote_origin() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let repo = Repository::init(&repo_dir).expect("init");
+    fs::write(
+        repo.common_dir().join("config"),
+        b"[remote \"origin\"]\n\turl = https://example.invalid/repo.git\n",
+    )
+    .expect("write config");
+
+    let stack = repo
+        .config_stack(ConfigStackOptions::git_default().worktree_config(WorktreeConfig::Never))
+        .expect("config stack");
+    let origin = stack.remote("origin").expect("origin remote");
+    assert_eq!(origin.name(), "origin");
+    assert_eq!(
+        stack
+            .editable_section_file(origin.section_id())
+            .expect("editable file"),
+        repo.common_dir().join("config")
+    );
+}
+
+#[test]
+fn repository_config_stack_includes_worktree_config_only_when_enabled() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let repo = Repository::init(&repo_dir).expect("init");
+    fs::write(
+        repo.git_dir().join("config.worktree"),
+        b"[remote \"scratch\"]\n\turl = worktree-url\n",
+    )
+    .expect("write worktree config");
+
+    let disabled = repo
+        .config_stack(ConfigStackOptions::git_default())
+        .expect("disabled stack");
+    assert!(disabled.remote("scratch").is_err());
+
+    fs::write(
+        repo.common_dir().join("config"),
+        b"[extensions]\n\tworktreeConfig = true\n",
+    )
+    .expect("enable worktree config");
+    let enabled = repo
+        .config_stack(ConfigStackOptions::git_default())
+        .expect("enabled stack");
+    let scratch = enabled.remote("scratch").expect("scratch remote");
+    assert_eq!(
+        enabled
+            .editable_section_file(scratch.section_id())
+            .expect("editable worktree file"),
+        repo.git_dir().join("config.worktree")
+    );
 }
