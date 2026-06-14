@@ -3145,11 +3145,25 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
         false,
         false,
     )?;
-    let action_paths = actions
-        .iter()
-        .map(AddAction::path)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut seen_paths = BTreeSet::new();
+    let mut action_paths = Vec::new();
+    for path in actions.iter().map(AddAction::path) {
+        if seen_paths.insert(path.clone()) {
+            action_paths.push(path.clone());
+        }
+    }
+    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
+        for path in index
+            .entries
+            .iter()
+            .filter(|entry| index_entry_stage(entry) > 0)
+            .map(|entry| worktree_root.join(repo_path_to_path(entry.path.as_bytes())))
+        {
+            if seen_paths.insert(path.clone()) {
+                action_paths.push(path);
+            }
+        }
+    }
     if action_paths.is_empty() {
         return Ok(());
     }
