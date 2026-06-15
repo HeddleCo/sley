@@ -49,15 +49,18 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&git_dir, format);
     let mut entries = store.read_reflog(&options.reference)?;
     entries.reverse();
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let tip = resolve_revision(&git_dir, format, &options.reference)?;
-    let reachable = ancestor_depths(&db, format, &tip)?;
-    let mut seen = HashSet::new();
+    // `git reflog show` (== `git log -g`) walks the reflog newest-to-oldest and
+    // prints EVERY entry verbatim: HEAD@{N} is just the entry's position. There
+    // is no reachability filter and no dedup by OID — a no-op `rebase --no-ff`
+    // over an up-to-date branch records same-OID start/pick/finish entries and
+    // upstream shows them all (that growth is exactly what t3432 asserts:
+    // "--no-ff ... is work"). A prior implementation filtered by reachability
+    // and deduped consecutive OIDs; that matched upstream only for the
+    // pathological non-monotonic reflog (entries whose timestamps run backwards,
+    // which never occurs in real usage) and dropped the legitimate entries a
+    // real, monotonic reflog accumulates.
     let mut selected = Vec::new();
     for entry in &entries {
-        if !reachable.contains_key(&entry.new_oid) || !seen.insert(entry.new_oid) {
-            continue;
-        }
         if options
             .max_count
             .is_some_and(|max_count| selected.len() >= max_count)
