@@ -27,7 +27,9 @@
 //! markers, color spans) here — the part every diff-emitting command used to
 //! re-derive — while leaving the repository-coupled concerns in the consumer.
 
-use crate::{DiffLine, DiffOp, myers_diff_lines, split_lines};
+use crate::{
+    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws, split_lines,
+};
 
 /// git's default hunk context (`-U3`).
 pub const DEFAULT_CONTEXT: usize = 3;
@@ -130,6 +132,32 @@ pub struct HunkRenderOptions<'a, 'h> {
     /// renderer paints whitespace errors on the selected line kinds with
     /// `colors.whitespace` (git's `emit_line_ws_markup`). `None` disables it.
     pub ws_error: Option<WsErrorHighlight>,
+    /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
+    /// `--ignore-cr-at-eol`): applied to the line-level comparison so
+    /// whitespace-only changes do not appear as diffs (git's
+    /// `XDF_WHITESPACE_FLAGS`).
+    pub ws_ignore: WsIgnore,
+    /// The line-diff algorithm to use (Myers / patience / histogram).
+    pub algorithm: DiffAlgorithm,
+    /// Change-group suppression (`--ignore-blank-lines`, `-I<regex>`): when
+    /// set, change groups all of whose old and new lines are blank (and/or
+    /// match a `-I` regex) are dropped from hunk emission, mirroring git's
+    /// `xdl_mark_ignorable_lines` / `xdl_mark_ignorable_regex` + `xdl_get_hunk`.
+    pub change_ignore: Option<&'a ChangeIgnore<'a>>,
+}
+
+/// Configuration for change-group suppression (`--ignore-blank-lines` and
+/// `-I<regex>`). A change group is *ignorable* iff every old line and every new
+/// line it touches is blank (when `ignore_blank_lines`) or matches one of the
+/// `-I` regexes (`regex_match`). Ignorable groups are kept out of hunk emission
+/// per `xdl_get_hunk`'s leading/isolated-ignorable removal.
+pub struct ChangeIgnore<'a> {
+    /// `--ignore-blank-lines`: blank change groups are ignorable.
+    pub ignore_blank_lines: bool,
+    /// `-I<regex>`: a line is regex-ignorable when this returns `true`. The
+    /// closure receives the raw line bytes (including the trailing `\n`). When
+    /// `None`, no regex suppression applies.
+    pub regex_match: Option<&'a dyn Fn(&[u8]) -> bool>,
 }
 
 /// Which line kinds get whitespace-error highlighting, plus the rule to check
@@ -156,6 +184,9 @@ impl Default for HunkRenderOptions<'_, '_> {
             colors: None,
             word_diff: None,
             ws_error: None,
+            ws_ignore: WsIgnore::default(),
+            algorithm: DiffAlgorithm::Myers,
+            change_ignore: None,
         }
     }
 }
@@ -180,7 +211,7 @@ pub fn render_hunks(
 ) {
     let old = split_lines(old_content.unwrap_or_default());
     let new = split_lines(new_content.unwrap_or_default());
-    let ops = myers_diff_lines(&old, &new);
+    let ops = myers_diff_lines_ws(&old, &new, options.ws_ignore, options.algorithm);
 
     // Flatten the edit script into a tagged line stream carrying old/new
     // positions.
@@ -226,41 +257,209 @@ pub fn render_hunks(
         }
     }
 
-    // Indices of changed (non-context) lines.
-    let change_positions: Vec<usize> = tagged
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.kind != LineKind::Context)
-        .map(|(idx, _)| idx)
-        .collect();
-    if change_positions.is_empty() {
+    // Build the change list (git's xdchange script): each maximal run of
+    // consecutive `-`/`+` tagged lines is one change, carrying its old/new line
+    // ranges and the tagged-stream span it occupies.
+    let changes = build_changes(&tagged);
+    if changes.is_empty() {
         return;
     }
 
-    // Group changes whose context windows overlap into single hunks.
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    let mut group_start = change_positions[0];
-    let mut group_end = change_positions[0];
-    for &pos in &change_positions[1..] {
-        // Two change runs merge when at most 2*context (+ interhunk) equal
-        // lines separate them, mirroring xdl_get_hunk's `distance >
-        // max_common` break (the position gap counts the separating equal
-        // lines plus one, so adjacent delete/insert runs always merge).
-        if pos - group_end <= 2 * options.context + options.interhunk + 1 {
-            group_end = pos;
-        } else {
-            groups.push((group_start, group_end));
-            group_start = pos;
-            group_end = pos;
-        }
+    // Mark each change ignorable when `--ignore-blank-lines` / `-I<regex>`
+    // applies and every old and new line it touches is blank / regex-matched
+    // (git's xdl_mark_ignorable_lines + xdl_mark_ignorable_regex).
+    let mut changes = changes;
+    if let Some(ci) = options.change_ignore {
+        mark_ignorable_changes(&mut changes, &old, &new, options.ws_ignore, ci);
     }
-    groups.push((group_start, group_end));
+
+    // Group changes into hunks (xdl_get_hunk): the `distance > max_common`
+    // break plus leading/isolated-ignorable-change removal. Each hunk is a
+    // tagged-stream `(first_change_pos, last_change_pos)` span of *real*
+    // (emitted) changes.
+    let groups = group_changes_into_hunks(&changes, options.context, options.interhunk);
 
     for (first_change, last_change) in groups {
         let hunk_start = first_change.saturating_sub(options.context);
         let hunk_end = (last_change + options.context + 1).min(tagged.len());
         render_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
     }
+}
+
+/// One contiguous change in the edit script (git's `xdchange`): the old/new
+/// line ranges it covers, the tagged-stream positions of its first/last
+/// non-context line, and whether it is ignorable (`--ignore-blank-lines` /
+/// `-I<regex>`).
+#[derive(Clone, Copy)]
+struct Change {
+    /// 0-based first old line in this change (`i1`).
+    i1: usize,
+    /// Number of old lines deleted (`chg1`).
+    chg1: usize,
+    /// 0-based first new line in this change (`i2`).
+    i2: usize,
+    /// Number of new lines inserted (`chg2`).
+    chg2: usize,
+    /// Tagged-stream index of this change's first non-context line.
+    tag_first: usize,
+    /// Tagged-stream index of this change's last non-context line.
+    tag_last: usize,
+    /// Whether this change is ignorable (blank-only / regex-only).
+    ignore: bool,
+}
+
+/// Build the change list (xdchange script) from the flattened tagged stream.
+/// Each maximal run of consecutive `-`/`+` lines becomes one [`Change`].
+fn build_changes(tagged: &[TaggedLine<'_>]) -> Vec<Change> {
+    let mut changes: Vec<Change> = Vec::new();
+    let mut idx = 0usize;
+    while idx < tagged.len() {
+        if tagged[idx].kind == LineKind::Context {
+            idx += 1;
+            continue;
+        }
+        let tag_first = idx;
+        let i1 = tagged[idx].old_index;
+        let i2 = tagged[idx].new_index;
+        let mut chg1 = 0usize;
+        let mut chg2 = 0usize;
+        while idx < tagged.len() && tagged[idx].kind != LineKind::Context {
+            match tagged[idx].kind {
+                LineKind::Delete => chg1 += 1,
+                LineKind::Insert => chg2 += 1,
+                LineKind::Context => unreachable!(),
+            }
+            idx += 1;
+        }
+        changes.push(Change {
+            i1,
+            chg1,
+            i2,
+            chg2,
+            tag_first,
+            tag_last: idx - 1,
+            ignore: false,
+        });
+    }
+    changes
+}
+
+/// Mark each change ignorable when its old and new lines are all blank
+/// (`--ignore-blank-lines`) or all regex-matched (`-I<regex>`), mirroring
+/// git's `xdl_mark_ignorable_lines` then `xdl_mark_ignorable_regex` (the regex
+/// pass never overrides a blank-marked change).
+fn mark_ignorable_changes(
+    changes: &mut [Change],
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    ws_ignore: WsIgnore,
+    ci: &ChangeIgnore<'_>,
+) {
+    for change in changes.iter_mut() {
+        if ci.ignore_blank_lines {
+            let blank = (change.i1..change.i1 + change.chg1)
+                .all(|i| line_is_blank(old[i].content, ws_ignore))
+                && (change.i2..change.i2 + change.chg2)
+                    .all(|i| line_is_blank(new[i].content, ws_ignore));
+            change.ignore = blank;
+        }
+        if !change.ignore {
+            if let Some(regex_match) = ci.regex_match {
+                let matched = (change.i1..change.i1 + change.chg1)
+                    .all(|i| regex_match(old[i].content))
+                    && (change.i2..change.i2 + change.chg2).all(|i| regex_match(new[i].content));
+                change.ignore = matched;
+            }
+        }
+    }
+}
+
+/// Group the change list into hunks, returning each hunk's
+/// `(first_real_change_tag, last_real_change_tag)` tagged-stream span. This is
+/// a behavioural port of git's `xemit.c:xdl_get_hunk` driving
+/// `xdl_call_hunk_func`'s loop: it applies the `distance > max_common` hunk
+/// break, drops leading ignorable changes, and excludes trailing/isolated
+/// ignorable changes from the emitted span.
+fn group_changes_into_hunks(
+    changes: &[Change],
+    context: usize,
+    interhunk: usize,
+) -> Vec<(usize, usize)> {
+    let max_common = context.saturating_add(context).saturating_add(interhunk);
+    let max_ignorable = context;
+
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    // `start` is the index into `changes` of the first change still to emit
+    // (xdl_call_hunk_func's `xch` cursor).
+    let mut start = 0usize;
+    while start < changes.len() {
+        // Remove ignorable changes that are too far before other changes
+        // (xdl_get_hunk's leading-ignorable loop). Faithful port: `xchp`
+        // iterates over EVERY leading ignorable change; whenever the gap to the
+        // next change is ≥ max_ignorable (or there is no next change), the hunk
+        // start advances to that next change (`None` ⇒ the whole tail is
+        // ignorable ⇒ no hunk). Unlike a break-on-first-keep loop, this still
+        // advances past a run of ignorables when the FINAL one has no successor.
+        {
+            let mut xchp = start;
+            while xchp < changes.len() && changes[xchp].ignore {
+                let cur = &changes[xchp];
+                match changes.get(xchp + 1) {
+                    None => {
+                        start = changes.len();
+                    }
+                    Some(next) => {
+                        if next.i1 - (cur.i1 + cur.chg1) >= max_ignorable {
+                            start = xchp + 1;
+                        }
+                    }
+                }
+                xchp += 1;
+            }
+        }
+        if start >= changes.len() {
+            break;
+        }
+
+        // Walk forward extending the hunk; `last` tracks the last *real*
+        // (non-ignorable, or the very first) change that defines the hunk end.
+        let mut last = start;
+        let mut ignored = 0usize; // ignored new-line count accumulated
+        let mut prev = start;
+        let mut idx = start + 1;
+        while idx < changes.len() {
+            let xch = &changes[idx];
+            let xchp = &changes[prev];
+            let distance = xch.i1 - (xchp.i1 + xchp.chg1);
+            if distance > max_common {
+                break;
+            }
+            if distance < max_ignorable && (!xch.ignore || last == prev) {
+                last = idx;
+                ignored = 0;
+            } else if distance < max_ignorable && xch.ignore {
+                ignored += xch.chg2;
+            } else if last != prev
+                && xch.i1 + ignored - (changes[last].i1 + changes[last].chg1) > max_common
+            {
+                break;
+            } else if !xch.ignore {
+                last = idx;
+                ignored = 0;
+            } else {
+                ignored += xch.chg2;
+            }
+            prev = idx;
+            idx += 1;
+        }
+
+        let first_change = &changes[start];
+        let last_change = &changes[last];
+        hunks.push((first_change.tag_first, last_change.tag_last));
+        start = last + 1;
+    }
+
+    hunks
 }
 
 /// Emit a single hunk covering `tagged[start..end]`: the `@@ -os,oc +ns,nc @@

@@ -99,6 +99,15 @@ struct ShowOptions {
     /// pretty format or `--no-notes` suppresses them, `--notes`/`--show-notes`
     /// forces them on.
     show_notes: bool,
+    /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
+    /// `--ignore-cr-at-eol`).
+    ws_ignore: sley_diff_merge::WsIgnore,
+    /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--ignore-blank-lines`.
+    ignore_blank_lines: bool,
+    /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
+    ignore_regexes: Vec<crate::grep_source::Regex>,
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
 }
@@ -147,6 +156,10 @@ impl Default for ShowOptions {
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
+            ws_ignore: sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ignore_blank_lines: false,
+            ignore_regexes: Vec::new(),
             setup_args: Vec::new(),
         }
     }
@@ -792,6 +805,11 @@ fn write_commit_diff_patch(
                 no_index_contents: None,
                 dirty_submodules: None,
                 ws_error_rule: None,
+                interhunk: 0,
+                ws_ignore: options.ws_ignore,
+                diff_algorithm: options.diff_algorithm,
+                ignore_blank_lines: options.ignore_blank_lines,
+                ignore_regexes: &options.ignore_regexes,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }
@@ -872,6 +890,7 @@ fn diff_color_enabled(config: &GitConfig) -> bool {
 fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
     let mut options = ShowOptions::default();
     let mut positional_only = false;
+    let mut ignore_regex_patterns: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if positional_only {
@@ -1035,19 +1054,30 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             // --- accepted-but-inert diff knobs ----------------------------------
             // These influence rendering details sley does not yet model; accept
             // them so common invocations parse, matching how cmd_log treats them.
+            "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--ignore-all-space" | "-w" => options.ws_ignore.all_space = true,
+            "--ignore-space-change" | "-b" => options.ws_ignore.space_change = true,
+            "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,
+            "--ignore-cr-at-eol" => options.ws_ignore.cr_at_eol = true,
+            "--ignore-blank-lines" => options.ignore_blank_lines = true,
+            "-I" | "--ignore-matching-lines" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--ignore-matching-lines requires a value".into())
+                })?;
+                ignore_regex_patterns.push(value.clone());
+            }
+            value if let Some(rest) = value.strip_prefix("--ignore-matching-lines=") => {
+                ignore_regex_patterns.push(rest.to_string());
+            }
+            value if value.starts_with("-I") && value.len() > 2 => {
+                ignore_regex_patterns.push(value[2..].to_string());
+            }
             "--no-color"
             | "--color"
-            | "--minimal"
-            | "--patience"
-            | "--histogram"
             | "--indent-heuristic"
             | "--no-indent-heuristic"
-            | "--ignore-space-at-eol"
-            | "--ignore-space-change"
-            | "-b"
-            | "--ignore-all-space"
-            | "-w"
-            | "--ignore-blank-lines"
             | "--no-prefix"
             | "--text"
             | "-a"
@@ -1066,6 +1096,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             value => options.setup_args.push(value.to_string()),
         }
     }
+    options.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
     Ok(options)
 }
 

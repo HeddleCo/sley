@@ -341,6 +341,165 @@ fn coalesce_ops(ops: Vec<DiffOp>) -> Vec<DiffOp> {
 }
 
 // ===========================================================================
+// Whitespace-ignoring line comparison (git xdiff's XDF_WHITESPACE_FLAGS).
+//
+// git's xdiff compares two records (lines, including the trailing `\n`) for
+// equality under whitespace-ignore flags via `xdl_recmatch`. Rather than
+// re-implement the Myers core to take a custom equality predicate, we map each
+// flavour to a *canonicalization* of the line bytes that produces identical
+// output iff `xdl_recmatch` would return 1, then diff on the canonicalized
+// lines while emitting the original bytes. This is exact: it is a behavioural
+// port of `xdiff/xutils.c:xdl_recmatch` and `xdl_blankline`.
+// ===========================================================================
+
+/// Whitespace-ignore flags for line comparison, mirroring git's
+/// `XDF_WHITESPACE_FLAGS` (`-w`, `-b`, `--ignore-space-at-eol`,
+/// `--ignore-cr-at-eol`). Only one of the whitespace flavours is honoured per
+/// git's precedence (`-w` ⊃ `-b` ⊃ `--ignore-space-at-eol` ⊃
+/// `--ignore-cr-at-eol`); when several are set, the strongest wins, matching
+/// the cascade in `xdl_recmatch`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WsIgnore {
+    /// `-w` / `--ignore-all-space`: ignore all whitespace when comparing lines.
+    pub all_space: bool,
+    /// `-b` / `--ignore-space-change`: ignore changes in amount of whitespace.
+    pub space_change: bool,
+    /// `--ignore-space-at-eol`: ignore whitespace at end of line.
+    pub space_at_eol: bool,
+    /// `--ignore-cr-at-eol`: ignore a carriage-return at end of line.
+    pub cr_at_eol: bool,
+}
+
+impl WsIgnore {
+    /// True when no whitespace-ignore flavour is active.
+    pub fn is_empty(&self) -> bool {
+        !(self.all_space || self.space_change || self.space_at_eol || self.cr_at_eol)
+    }
+}
+
+/// `XDL_ISSPACE` — git uses C `isspace` over the unsigned byte (space, `\t`,
+/// `\n`, `\r`, `\x0b` vertical tab, `\x0c` form feed).
+#[inline]
+fn xdl_isspace(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// Canonicalize a line's bytes (including any trailing `\n`) for whitespace-
+/// insensitive comparison, exactly mirroring `xdl_recmatch`'s acceptance set:
+/// two original lines are equal under `ignore` iff their canonical forms are
+/// byte-identical.
+///
+/// * `all_space` (`-w`): drop every whitespace byte.
+/// * `space_change` (`-b`): collapse each run of whitespace to a single `' '`
+///   and strip trailing whitespace (a run on one side matches a run on the
+///   other regardless of length; leading/internal whitespace must still align,
+///   trailing whitespace is dropped entirely).
+/// * `space_at_eol`: strip trailing whitespace only.
+/// * `cr_at_eol`: drop a single `\r` immediately before a terminating `\n`.
+fn canonicalize_line(line: &[u8], ignore: WsIgnore) -> Vec<u8> {
+    if ignore.all_space {
+        return line.iter().copied().filter(|&c| !xdl_isspace(c)).collect();
+    }
+    if ignore.space_change {
+        let mut out = Vec::with_capacity(line.len());
+        let mut i = 0usize;
+        while i < line.len() {
+            if xdl_isspace(line[i]) {
+                // Collapse the whole whitespace run to a single space.
+                while i < line.len() && xdl_isspace(line[i]) {
+                    i += 1;
+                }
+                out.push(b' ');
+            } else {
+                out.push(line[i]);
+                i += 1;
+            }
+        }
+        // Strip a trailing collapsed-space (trailing whitespace is ignored).
+        if out.last() == Some(&b' ') {
+            out.pop();
+        }
+        return out;
+    }
+    if ignore.space_at_eol {
+        let mut end = line.len();
+        while end > 0 && xdl_isspace(line[end - 1]) {
+            end -= 1;
+        }
+        return line[..end].to_vec();
+    }
+    if ignore.cr_at_eol {
+        // Drop a `\r` directly before a terminating `\n`.
+        if let Some(stripped) = line.strip_suffix(b"\n") {
+            if let Some(without_cr) = stripped.strip_suffix(b"\r") {
+                let mut out = without_cr.to_vec();
+                out.push(b'\n');
+                return out;
+            }
+        } else if let Some(without_cr) = line.strip_suffix(b"\r") {
+            // Incomplete final line: a bare trailing `\r` is also ignored.
+            return without_cr.to_vec();
+        }
+        return line.to_vec();
+    }
+    line.to_vec()
+}
+
+/// `xdl_blankline`: a line is "blank" when, after applying the active
+/// whitespace flags, it has no content. With no whitespace flags, git treats a
+/// record of size ≤ 1 (empty, or a lone `\n`) as blank; with flags, a line all
+/// of whose bytes are whitespace is blank.
+fn line_is_blank(line: &[u8], ignore: WsIgnore) -> bool {
+    if ignore.is_empty() {
+        line.len() <= 1
+    } else {
+        line.iter().all(|&c| xdl_isspace(c))
+    }
+}
+
+/// Compute a line-level edit script transforming `old` into `new`, comparing
+/// lines under the whitespace-ignore flags `ignore` while the returned ops
+/// still index the *original* lines position-for-position.
+///
+/// When `ignore.is_empty()`, this is identical to [`myers_diff_lines`]. With
+/// flags, lines are canonicalized (see [`canonicalize_line`]) for the equality
+/// test only; the ops consume the same number of old/new lines as the originals
+/// so the caller can render the original bytes.
+pub fn myers_diff_lines_ws(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    ignore: WsIgnore,
+    algorithm: DiffAlgorithm,
+) -> Vec<DiffOp> {
+    if ignore.is_empty() {
+        return diff_lines_with_algorithm(old, new, algorithm);
+    }
+    let old_canon: Vec<Vec<u8>> = old
+        .iter()
+        .map(|l| canonicalize_line(l.content, ignore))
+        .collect();
+    let new_canon: Vec<Vec<u8>> = new
+        .iter()
+        .map(|l| canonicalize_line(l.content, ignore))
+        .collect();
+    let old_lines: Vec<DiffLine<'_>> = old_canon
+        .iter()
+        .map(|c| DiffLine {
+            content: c.as_slice(),
+            has_newline: true,
+        })
+        .collect();
+    let new_lines: Vec<DiffLine<'_>> = new_canon
+        .iter()
+        .map(|c| DiffLine {
+            content: c.as_slice(),
+            has_newline: true,
+        })
+        .collect();
+    diff_lines_with_algorithm(&old_lines, &new_lines, algorithm)
+}
+
+// ===========================================================================
 // Alternative diff algorithms: patience and histogram.
 //
 // Both share the recursive "anchor and recurse" shape used by git's xdiff

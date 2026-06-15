@@ -76,9 +76,14 @@ pub(crate) struct DiffOptions {
     pub(crate) patch_full_index: bool,
     pub(crate) color_always: bool,
     pub(crate) diff_algorithm_control: bool,
+    pub(crate) diff_algorithm: sley_diff_merge::DiffAlgorithm,
     pub(crate) diff_driver_control: bool,
     pub(crate) diff_hunk_control: bool,
+    pub(crate) interhunk: Option<usize>,
     pub(crate) diff_whitespace_control: bool,
+    pub(crate) ws_ignore: sley_diff_merge::WsIgnore,
+    pub(crate) ignore_blank_lines: bool,
+    pub(crate) ignore_regexes: Vec<String>,
     pub(crate) diff_output_indicator_control: bool,
     pub(crate) diff_patch_context_control: bool,
     pub(crate) diff_patch_output_control: bool,
@@ -91,6 +96,15 @@ pub(crate) struct DiffOptions {
     pub(crate) diff_relative_explicit: bool,
     pub(crate) src_prefix: String,
     pub(crate) dst_prefix: String,
+    /// CLI `--no-prefix` was given (overrides `diff.*Prefix` config).
+    pub(crate) cli_no_prefix: bool,
+    /// CLI `--default-prefix` was given (resets both prefixes to `a/`/`b/`,
+    /// overriding config).
+    pub(crate) cli_default_prefix: bool,
+    /// CLI `--src-prefix=<p>` override (overrides `diff.srcPrefix` config).
+    pub(crate) cli_src_prefix: Option<String>,
+    /// CLI `--dst-prefix=<p>` override (overrides `diff.dstPrefix` config).
+    pub(crate) cli_dst_prefix: Option<String>,
     pub(crate) head: bool,
     pub(crate) z: bool,
     pub(crate) detect_renames: bool,
@@ -130,9 +144,14 @@ impl Default for DiffOptions {
             patch_full_index: false,
             color_always: false,
             diff_algorithm_control: false,
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             diff_driver_control: false,
             diff_hunk_control: false,
+            interhunk: None,
             diff_whitespace_control: false,
+            ws_ignore: sley_diff_merge::WsIgnore::default(),
+            ignore_blank_lines: false,
+            ignore_regexes: Vec::new(),
             diff_output_indicator_control: false,
             diff_patch_context_control: false,
             diff_patch_output_control: false,
@@ -145,6 +164,10 @@ impl Default for DiffOptions {
             diff_relative_explicit: false,
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
+            cli_no_prefix: false,
+            cli_default_prefix: false,
+            cli_src_prefix: None,
+            cli_dst_prefix: None,
             head: false,
             z: false,
             detect_renames: true,
@@ -489,6 +512,13 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
             Some("ignore-blank-lines"),
             OptFlags::NONEG,
             "ignore changes whose lines are all blank",
+        ),
+        opt_str(
+            Some('I'),
+            Some("ignore-matching-lines"),
+            "<regex>",
+            OptFlags::NONEG,
+            "ignore changes whose all lines match <regex>",
         ),
         opt_optarg(
             None,
@@ -929,13 +959,25 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("find-object")) => options
             .find_object_values
             .push(str_value(option).to_string()),
-        (_, Some("minimal" | "patience" | "histogram")) => options.diff_algorithm_control = true,
+        (_, Some("minimal")) => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
+        (_, Some("patience")) => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+        (_, Some("histogram")) => {
+            options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram
+        }
         (_, Some("anchored")) => {
+            // The anchored algorithm is not implemented; keep bailing.
             options.diff_algorithm_control = true;
         }
         (_, Some("diff-algorithm")) => {
-            log_validate_diff_algorithm(str_value(option))?;
-            options.diff_algorithm_control = true;
+            let value = str_value(option);
+            log_validate_diff_algorithm(value)?;
+            options.diff_algorithm = match value {
+                "myers" | "default" => sley_diff_merge::DiffAlgorithm::Myers,
+                "minimal" => sley_diff_merge::DiffAlgorithm::Minimal,
+                "patience" => sley_diff_merge::DiffAlgorithm::Patience,
+                "histogram" => sley_diff_merge::DiffAlgorithm::Histogram,
+                _ => sley_diff_merge::DiffAlgorithm::Myers,
+            };
         }
         (_, Some("inter-hunk-context")) => {
             let value = str_value(option);
@@ -943,22 +985,20 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
                 return log_inter_hunk_context_requires_number_error();
             }
             log_validate_inter_hunk_context(value)?;
-            options.diff_hunk_control = true;
+            options.interhunk = Some(parse_unified_count(value));
         }
         (_, Some("ws-error-highlight")) => {
             log_validate_ws_error_highlight(str_value(option))?;
             options.diff_whitespace_control = true;
         }
-        (
-            _,
-            Some(
-                "ignore-space-at-eol"
-                | "ignore-cr-at-eol"
-                | "ignore-space-change"
-                | "ignore-all-space"
-                | "ignore-blank-lines",
-            ),
-        ) => options.diff_whitespace_control = true,
+        (_, Some("ignore-all-space")) => options.ws_ignore.all_space = true,
+        (_, Some("ignore-space-change")) => options.ws_ignore.space_change = true,
+        (_, Some("ignore-space-at-eol")) => options.ws_ignore.space_at_eol = true,
+        (_, Some("ignore-cr-at-eol")) => options.ws_ignore.cr_at_eol = true,
+        (_, Some("ignore-blank-lines")) => options.ignore_blank_lines = true,
+        (_, Some("ignore-matching-lines")) => {
+            options.ignore_regexes.push(str_value(option).to_string());
+        }
         (_, Some("submodule")) => {
             if let Some(value) = optional_arg(option) {
                 log_validate_submodule_format(value)?;
@@ -1068,13 +1108,27 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("no-prefix")) => {
             options.src_prefix.clear();
             options.dst_prefix.clear();
+            options.cli_no_prefix = true;
+            options.cli_default_prefix = false;
         }
         (_, Some("default-prefix")) => {
             options.src_prefix = "a/".to_string();
             options.dst_prefix = "b/".to_string();
+            options.cli_default_prefix = true;
+            options.cli_no_prefix = false;
+            options.cli_src_prefix = None;
+            options.cli_dst_prefix = None;
         }
-        (_, Some("src-prefix")) => options.src_prefix = str_value(option).to_string(),
-        (_, Some("dst-prefix")) => options.dst_prefix = str_value(option).to_string(),
+        (_, Some("src-prefix")) => {
+            let value = str_value(option).to_string();
+            options.src_prefix = value.clone();
+            options.cli_src_prefix = Some(value);
+        }
+        (_, Some("dst-prefix")) => {
+            let value = str_value(option).to_string();
+            options.dst_prefix = value.clone();
+            options.cli_dst_prefix = Some(value);
+        }
         (Some('z'), None) => options.z = true,
         (Some('M'), Some("find-renames")) => {
             options.detect_renames = true;

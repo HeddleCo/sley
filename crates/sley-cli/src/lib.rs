@@ -2067,6 +2067,18 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// (`--ws-error-highlight`, default new-only) when color is enabled.
     /// `None` disables whitespace-error highlighting.
     ws_error_rule: Option<sley_diff_merge::ws::WsRule>,
+    /// Extra inter-hunk merge distance (`--inter-hunk-context`).
+    interhunk: usize,
+    /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
+    /// `--ignore-cr-at-eol`) applied to the line comparison.
+    ws_ignore: sley_diff_merge::WsIgnore,
+    /// The line-diff algorithm (`--patience` / `--histogram` / default Myers).
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--ignore-blank-lines`: drop change groups whose lines are all blank.
+    ignore_blank_lines: bool,
+    /// `-I<regex>` / `--ignore-matching-lines`: drop change groups all of whose
+    /// lines match one of these (compiled ERE) regexes.
+    ignore_regexes: &'a [grep_source::Regex],
 }
 
 /// A `--word-diff` request before per-file word-regex resolution.
@@ -2317,10 +2329,34 @@ pub(crate) fn render_tree_to_tree_patch(
                 no_index_contents: None,
                 dirty_submodules: None,
                 ws_error_rule: None,
+                interhunk: 0,
+                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ignore_blank_lines: false,
+                ignore_regexes: &[],
             },
         )?;
     }
     Ok(out)
+}
+
+/// Compile the `-I<regex>` (`--ignore-matching-lines`) patterns into ERE
+/// matchers. A malformed pattern fails like git's `diff_opt_ignore_regex`:
+/// `error: invalid regex given to -I: '<pat>'` and exit code 129.
+pub(crate) fn compile_ignore_matching_regexes(
+    patterns: &[String],
+) -> Result<Vec<grep_source::Regex>> {
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        match grep_source::Regex::compile(pattern, grep_source::RegexMode::Ere, false, false) {
+            Ok(regex) => compiled.push(regex),
+            Err(_) => {
+                eprintln!("error: invalid regex given to -I: '{pattern}'");
+                return Err(GitError::Exit(129));
+            }
+        }
+    }
+    Ok(compiled)
 }
 
 fn write_diff_patch_entry(
@@ -2400,6 +2436,53 @@ fn write_diff_patch_entry(
         && mode_unchanged
     {
         return Ok(());
+    }
+    // `--ignore-blank-lines` / `-w` / `-I<regex>` can erase every hunk of a
+    // plain content modification. git then drops the whole file pair (the
+    // header is emitted lazily on the first hunk via fn_out_consume), so a
+    // file with no surviving hunks produces no `diff --git` block at all. A
+    // mode change / rename / copy / add / delete still shows its header, so
+    // restrict the suppression to a same-mode `Modified` pair with both sides
+    // present. We pre-render the body (cheaply, no funcname/color/word-diff
+    // since emptiness depends only on contents + ignore flags) to decide.
+    let ignore_active = !options.ws_ignore.is_empty()
+        || options.ignore_blank_lines
+        || !options.ignore_regexes.is_empty();
+    if ignore_active
+        && content_changed
+        && mode_unchanged
+        && matches!(entry.status, sley_diff_merge::NameStatus::Modified)
+        && old_content.is_some()
+        && new_content.is_some()
+    {
+        let ignore_regexes = options.ignore_regexes;
+        let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
+            ignore_regexes.iter().any(|re| re.is_match_with_case(line, false))
+        });
+        let change_ignore = (options.ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
+            sley_diff_merge::render::ChangeIgnore {
+                ignore_blank_lines: options.ignore_blank_lines,
+                regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
+            }
+        });
+        let mut probe_options = sley_diff_merge::render::HunkRenderOptions {
+            context: options.context,
+            interhunk: options.interhunk,
+            ws_ignore: options.ws_ignore,
+            algorithm: options.diff_algorithm,
+            change_ignore: change_ignore.as_ref(),
+            ..Default::default()
+        };
+        let mut probe = Vec::new();
+        sley_diff_merge::render::render_hunks(
+            &mut probe,
+            old_content.as_deref(),
+            new_content.as_deref(),
+            &mut probe_options,
+        );
+        if probe.is_empty() {
+            return Ok(());
+        }
     }
     write_diff_meta_line(
         stdout,
@@ -2552,14 +2635,32 @@ fn write_diff_patch_entry(
         }),
         _ => None,
     };
+    // `--ignore-blank-lines` / `-I<regex>` change-group suppression: build the
+    // regex predicate over the compiled `-I` patterns (ERE substring match,
+    // like git's regexec_buf over the line including its trailing newline).
+    let ignore_regexes = options.ignore_regexes;
+    let regex_match = (!ignore_regexes.is_empty())
+        .then_some(move |line: &[u8]| ignore_regexes.iter().any(|re| re.is_match_with_case(line, false)));
+    let change_ignore = (options.ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
+        sley_diff_merge::render::ChangeIgnore {
+            ignore_blank_lines: options.ignore_blank_lines,
+            regex_match: regex_match
+                .as_ref()
+                .map(|f| f as &dyn Fn(&[u8]) -> bool),
+        }
+    });
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
+        interhunk: options.interhunk,
         heading: Some(&mut heading),
         colors: colors.map(commands::format_patch::render_colors),
         word_diff: word_diff_adapter
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         ws_error,
+        ws_ignore: options.ws_ignore,
+        algorithm: options.diff_algorithm,
+        change_ignore: change_ignore.as_ref(),
         ..Default::default()
     };
     let mut hunks = Vec::new();
@@ -3649,6 +3750,70 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 fn gitlink_diff_content(oid: &ObjectId, dirty: bool) -> Vec<u8> {
     let suffix = if dirty { "-dirty" } else { "" };
     format!("Subproject commit {oid}{suffix}\n").into_bytes()
+}
+
+/// Whether a name-status entry produces any visible diff output once the
+/// whitespace-ignore (`-w`/`-b`/eol) and change-group-ignore
+/// (`--ignore-blank-lines` / `-I<regex>`) flags are applied — git's
+/// `DIFF_OPT_HAS_CHANGES`, which `--exit-code`/`--quiet` reflect. A
+/// non-content change (add/delete/rename/copy/mode change) always counts; a
+/// same-mode pure content modification counts only if a hunk survives the
+/// ignore filters.
+pub(crate) fn diff_entry_produces_output(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    interhunk: usize,
+    context: usize,
+    ws_ignore: sley_diff_merge::WsIgnore,
+    ignore_blank_lines: bool,
+    ignore_regexes: &[grep_source::Regex],
+) -> Result<bool> {
+    // Non-modification statuses, mode changes, and renames/copies always show.
+    let mode_unchanged = match (entry.old_mode, entry.new_mode) {
+        (Some(old_mode), Some(new_mode)) => old_mode == new_mode,
+        _ => true,
+    };
+    if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) || !mode_unchanged {
+        return Ok(true);
+    }
+    let old_content = diff_entry_old_content(entry, db)?;
+    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+    if old_content.as_deref() == new_content.as_deref() {
+        return Ok(false);
+    }
+    // Binary content always shows a (binary) change.
+    if old_content.as_deref().is_some_and(is_binary_content)
+        || new_content.as_deref().is_some_and(is_binary_content)
+    {
+        return Ok(true);
+    }
+    let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
+        ignore_regexes.iter().any(|re| re.is_match_with_case(line, false))
+    });
+    let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
+        sley_diff_merge::render::ChangeIgnore {
+            ignore_blank_lines,
+            regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
+        }
+    });
+    let mut probe_options = sley_diff_merge::render::HunkRenderOptions {
+        context,
+        interhunk,
+        ws_ignore,
+        algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+        change_ignore: change_ignore.as_ref(),
+        ..Default::default()
+    };
+    let mut probe = Vec::new();
+    sley_diff_merge::render::render_hunks(
+        &mut probe,
+        old_content.as_deref(),
+        new_content.as_deref(),
+        &mut probe_options,
+    );
+    Ok(!probe.is_empty())
 }
 
 fn diff_entry_old_content(
@@ -6543,7 +6708,7 @@ fn log_unknown_date_format(value: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-fn log_validate_diff_algorithm(value: &str) -> Result<()> {
+pub(crate) fn log_validate_diff_algorithm(value: &str) -> Result<()> {
     match value {
         "myers" | "minimal" | "patience" | "histogram" | "default" => Ok(()),
         _ => {
@@ -6552,6 +6717,16 @@ fn log_validate_diff_algorithm(value: &str) -> Result<()> {
             );
             Err(GitError::Exit(129))
         }
+    }
+}
+
+/// Map a validated `--diff-algorithm=<name>` value to a [`DiffAlgorithm`].
+pub(crate) fn log_parse_diff_algorithm(value: &str) -> sley_diff_merge::DiffAlgorithm {
+    match value {
+        "minimal" => sley_diff_merge::DiffAlgorithm::Minimal,
+        "patience" => sley_diff_merge::DiffAlgorithm::Patience,
+        "histogram" => sley_diff_merge::DiffAlgorithm::Histogram,
+        _ => sley_diff_merge::DiffAlgorithm::Myers,
     }
 }
 

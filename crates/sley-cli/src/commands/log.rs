@@ -357,6 +357,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Diff-output options (`-p`, `--stat`, ...): rendered per commit against
     // its first parent, mirroring git's log diff machinery.
     let mut diff_opts = LogDiffOptions::default();
+    // Raw `-I<regex>` (`--ignore-matching-lines`) patterns, compiled after the
+    // option scan so a malformed regex fails like git's diff_opt_ignore_regex.
+    let mut ignore_regex_patterns: Vec<String> = Vec::new();
     // `--root` flag; falls back to the log.showRoot config (default true).
     let mut show_root_flag: Option<bool> = None;
     let mut line_prefix: Option<String> = None;
@@ -509,16 +512,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--find-copies"
             | "--find-copies-harder"
             | "--no-find-copies-harder"
-            | "--minimal"
-            | "--patience"
-            | "--histogram"
             | "--indent-heuristic"
             | "--no-indent-heuristic"
-            | "--ignore-space-at-eol"
-            | "--ignore-cr-at-eol"
-            | "--ignore-space-change"
-            | "--ignore-all-space"
-            | "--ignore-blank-lines"
             | "--function-context"
             | "--no-prefix"
             | "--default-prefix"
@@ -539,11 +534,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "-C"
             | "-B"
             | "-D"
-            | "-b"
-            | "-w"
-            | "-bw"
-            | "-wb"
             | "-W" => {}
+            "--minimal" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--ignore-all-space" | "-w" => diff_opts.ws_ignore.all_space = true,
+            "--ignore-space-change" | "-b" => diff_opts.ws_ignore.space_change = true,
+            "-bw" | "-wb" => diff_opts.ws_ignore.all_space = true,
+            "--ignore-space-at-eol" => diff_opts.ws_ignore.space_at_eol = true,
+            "--ignore-cr-at-eol" => diff_opts.ws_ignore.cr_at_eol = true,
+            "--ignore-blank-lines" => diff_opts.ignore_blank_lines = true,
             "--decorate" | "--decorate=short" | "--decorate=true" | "--decorate=1"
             | "--decorate=on" | "--decorate=yes" => decoration = LogDecorationMode::Short,
             "--decorate=full" => decoration = LogDecorationMode::Full,
@@ -683,15 +683,31 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("diff-algorithm"))?;
                 log_validate_diff_algorithm(value)?;
+                diff_opts.diff_algorithm = log_parse_diff_algorithm(value);
             }
             value if value.starts_with("--diff-algorithm=") => {
-                log_validate_diff_algorithm(&value["--diff-algorithm=".len()..])?;
+                let algo = &value["--diff-algorithm=".len()..];
+                log_validate_diff_algorithm(algo)?;
+                diff_opts.diff_algorithm = log_parse_diff_algorithm(algo);
             }
             "--anchored" => {
                 iter.next()
                     .ok_or_else(|| log_option_requires_value_error("anchored"))?;
             }
             value if value.starts_with("--anchored=") => {}
+            "--ignore-matching-lines" | "-I" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("ignore-matching-lines"))?;
+                ignore_regex_patterns.push(value.to_string());
+            }
+            value if value.starts_with("--ignore-matching-lines=") => {
+                ignore_regex_patterns
+                    .push(value["--ignore-matching-lines=".len()..].to_string());
+            }
+            value if value.starts_with("-I") && value.len() > 2 => {
+                ignore_regex_patterns.push(value[2..].to_string());
+            }
             "--inter-hunk-context" => {
                 let value = iter
                     .next()
@@ -1114,6 +1130,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         eprintln!("fatal: cannot combine --no-walk with --graph");
         return Err(GitError::Exit(128));
     }
+    // Compile any `-I<regex>` patterns now (a malformed regex fails like git's
+    // diff_opt_ignore_regex, exit 129).
+    diff_opts.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
     let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
@@ -2249,6 +2268,15 @@ struct LogDiffOptions {
     /// Whether an explicit `--diff-merges=<mode>` was given: unlike `-m`, the
     /// explicit form enables patch output for merge commits on its own.
     merges_imply_patch: bool,
+    /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
+    /// `--ignore-cr-at-eol`).
+    ws_ignore: sley_diff_merge::WsIgnore,
+    /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--ignore-blank-lines`.
+    ignore_blank_lines: bool,
+    /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
+    ignore_regexes: Vec<crate::grep_source::Regex>,
 }
 
 impl Default for LogDiffOptions {
@@ -2265,6 +2293,10 @@ impl Default for LogDiffOptions {
             stat_count: None,
             merges: None,
             merges_imply_patch: false,
+            ws_ignore: sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ignore_blank_lines: false,
+            ignore_regexes: Vec::new(),
         }
     }
 }
@@ -2445,6 +2477,11 @@ impl LogDiffContext<'_> {
                         no_index_contents: None,
                         dirty_submodules: None,
                         ws_error_rule: None,
+                        interhunk: 0,
+                        ws_ignore: self.opts.ws_ignore,
+                        diff_algorithm: self.opts.diff_algorithm,
+                        ignore_blank_lines: self.opts.ignore_blank_lines,
+                        ignore_regexes: &self.opts.ignore_regexes,
                     },
                 )?;
             }

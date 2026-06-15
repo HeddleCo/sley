@@ -457,7 +457,7 @@ enum PosixClass {
     Graph,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Regex {
     root: Node,
     ignore_case: bool,

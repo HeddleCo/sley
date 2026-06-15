@@ -113,6 +113,15 @@ struct DiffTreeOptions {
     dst_prefix: String,
     /// `--check`: emit a whitespace-error report instead of the diff body.
     check: bool,
+    /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
+    /// `--ignore-cr-at-eol`).
+    ws_ignore: sley_diff_merge::WsIgnore,
+    /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--ignore-blank-lines`.
+    ignore_blank_lines: bool,
+    /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
+    ignore_regexes: Vec<crate::grep_source::Regex>,
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
 }
@@ -141,6 +150,10 @@ impl Default for DiffTreeOptions {
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             check: false,
+            ws_ignore: sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ignore_blank_lines: false,
+            ignore_regexes: Vec::new(),
             setup_args: Vec::new(),
         }
     }
@@ -199,6 +212,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     }
     let mut options = DiffTreeOptions::default();
     let mut positional_only = false;
+    let mut ignore_regex_patterns: Vec<String> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
@@ -331,6 +345,42 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 ));
             }
             "-m" => options.merges_separate = true,
+            // Whitespace-ignore / algorithm / ignore-matching-lines: applied to
+            // the patch hunk comparison (see the shared diff renderer).
+            "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--indent-heuristic" | "--no-indent-heuristic" => {}
+            "--diff-algorithm" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("--diff-algorithm requires a value".into()))?;
+                log_validate_diff_algorithm(value)?;
+                options.diff_algorithm = crate::log_parse_diff_algorithm(value);
+            }
+            value if let Some(rest) = value.strip_prefix("--diff-algorithm=") => {
+                log_validate_diff_algorithm(rest)?;
+                options.diff_algorithm = crate::log_parse_diff_algorithm(rest);
+            }
+            "-w" | "--ignore-all-space" => options.ws_ignore.all_space = true,
+            "-b" | "--ignore-space-change" => options.ws_ignore.space_change = true,
+            "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,
+            "--ignore-cr-at-eol" => options.ws_ignore.cr_at_eol = true,
+            "--ignore-blank-lines" => options.ignore_blank_lines = true,
+            "-I" | "--ignore-matching-lines" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GitError::Command("--ignore-matching-lines requires a value".into())
+                })?;
+                ignore_regex_patterns.push(value.clone());
+            }
+            value if let Some(rest) = value.strip_prefix("--ignore-matching-lines=") => {
+                ignore_regex_patterns.push(rest.to_string());
+            }
+            value if value.starts_with("-I") && value.len() > 2 => {
+                ignore_regex_patterns.push(value[2..].to_string());
+            }
             "--pretty" | "-v" | "--pretty=medium" => {
                 options.pretty = Some(DiffTreePretty::Medium);
             }
@@ -363,6 +413,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     if !options.output.any() {
         options.output.raw = true;
     }
+    options.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
     let repo = RepositoryContext::discover_current()?;
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -908,6 +959,11 @@ fn run_diff_request(
                 no_index_contents: None,
                 dirty_submodules: None,
                 ws_error_rule: None,
+                interhunk: 0,
+                ws_ignore: context.options.ws_ignore,
+                diff_algorithm: context.options.diff_algorithm,
+                ignore_blank_lines: context.options.ignore_blank_lines,
+                ignore_regexes: &context.options.ignore_regexes,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

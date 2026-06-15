@@ -2637,6 +2637,11 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         no_index_contents: None,
                         dirty_submodules: None,
                         ws_error_rule: None,
+                        interhunk: 0,
+                        ws_ignore: sley_diff_merge::WsIgnore::default(),
+                        diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                        ignore_blank_lines: false,
+                        ignore_regexes: &[],
                     };
                     write_diff_patch_entry(&mut stdout, entry, options)?;
                 }

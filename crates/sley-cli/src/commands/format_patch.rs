@@ -2954,6 +2954,7 @@ pub(crate) fn write_patch_hunks_with(
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         ws_error: None,
+        ..Default::default()
     };
     sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);
 }

@@ -287,9 +287,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         patch_full_index,
         color_always,
         diff_algorithm_control,
+        diff_algorithm,
         diff_driver_control,
         diff_hunk_control,
+        interhunk,
         diff_whitespace_control,
+        ws_ignore,
+        ignore_blank_lines,
+        ignore_regexes,
         diff_output_indicator_control,
         diff_patch_context_control,
         diff_patch_output_control,
@@ -300,8 +305,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         no_index,
         mut diff_relative,
         diff_relative_explicit,
-        src_prefix,
-        dst_prefix,
+        mut src_prefix,
+        mut dst_prefix,
+        cli_no_prefix,
+        cli_default_prefix,
+        cli_src_prefix,
+        cli_dst_prefix,
         mut head,
         z,
         mut detect_renames,
@@ -343,11 +352,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff hunk context controls are not supported for this output mode".into(),
         ));
     }
-    if diff_whitespace_control && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff whitespace controls are not supported for this output mode".into(),
-        ));
-    }
+    let _ = diff_whitespace_control;
     if diff_output_indicator_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff output indicator controls are not supported for this output mode".into(),
@@ -390,6 +395,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     // `--check` is handled below (after the entries are computed) rather than
     // here, where the diff content isn't available yet.
+    // Compile the `-I<regex>` (`--ignore-matching-lines`) patterns up front so
+    // a malformed regex fails like git's `diff_opt_ignore_regex` (exit 129).
+    let ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regexes)?;
     if pickaxe_all && !find_object_values.is_empty() {
         return diff_find_object_pickaxe_all_conflict_error();
     }
@@ -416,12 +424,63 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 src_prefix: &src_prefix,
                 dst_prefix: &dst_prefix,
                 quiet,
+                interhunk: interhunk.unwrap_or(0),
+                ws_ignore,
+                diff_algorithm,
+                ignore_blank_lines,
+                ignore_regexes: &ignore_regexes,
             },
         );
     }
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // Resolve the diff path prefixes from `diff.*Prefix` config, then layer the
+    // CLI overrides on top (git's diff_setup_done → diff_opt_* precedence):
+    //  * `diff.noPrefix` ⇒ both prefixes empty.
+    //  * `diff.mnemonicPrefix` ⇒ the comparison's mnemonic letters. For the
+    //    worktree-vs-index `git diff` here that is `i/` (index) and `w/`
+    //    (worktree); `diff.{src,dst}Prefix` are ignored under mnemonicPrefix.
+    //  * else `diff.srcPrefix`/`diff.dstPrefix` (defaulting to `a/`/`b/`).
+    // CLI `--no-prefix`/`--default-prefix`/`--src-prefix`/`--dst-prefix` always
+    // win over config.
+    if let Ok(config) = read_repo_config(&git_dir) {
+        let cfg_no_prefix = config.get_bool("diff", None, "noprefix").unwrap_or(false);
+        let cfg_mnemonic = config.get_bool("diff", None, "mnemonicprefix").unwrap_or(false);
+        let (mut cfg_src, mut cfg_dst) = if cfg_no_prefix {
+            (String::new(), String::new())
+        } else if cfg_mnemonic {
+            ("i/".to_string(), "w/".to_string())
+        } else {
+            (
+                config
+                    .get("diff", None, "srcprefix")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "a/".to_string()),
+                config
+                    .get("diff", None, "dstprefix")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "b/".to_string()),
+            )
+        };
+        // CLI overrides (highest precedence).
+        if cli_default_prefix {
+            cfg_src = "a/".to_string();
+            cfg_dst = "b/".to_string();
+        }
+        if cli_no_prefix {
+            cfg_src.clear();
+            cfg_dst.clear();
+        }
+        if let Some(p) = &cli_src_prefix {
+            cfg_src = p.clone();
+        }
+        if let Some(p) = &cli_dst_prefix {
+            cfg_dst = p.clone();
+        }
+        src_prefix = cfg_src;
+        dst_prefix = cfg_dst;
+    }
     if !diff_relative_explicit
         && let Ok(config) = read_repo_config(&git_dir)
         && config.get_bool("diff", None, "relative").unwrap_or(false)
@@ -764,7 +823,33 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .filter(|entry| diff_filter.matches_status(entry.status.code()))
             .collect()
     };
-    let has_differences = !entries.is_empty();
+    // `--exit-code`/`--quiet` reflect whether any *visible* diff remains. With
+    // `-w`/`-b`/eol or `--ignore-blank-lines`/`-I<regex>`, a content change can
+    // reduce to nothing; git then reports "no changes" (exit 0). Probe each
+    // entry under the ignore flags (git's DIFF_OPT_HAS_CHANGES).
+    let ignore_active = !ws_ignore.is_empty() || ignore_blank_lines || !ignore_regexes.is_empty();
+    let has_differences = if ignore_active && (quiet || exit_code) {
+        let mut any = false;
+        for entry in &entries {
+            if crate::diff_entry_produces_output(
+                entry,
+                &db,
+                worktree_root.as_deref(),
+                use_worktree_new,
+                interhunk.unwrap_or(0),
+                context.unwrap_or(3),
+                ws_ignore,
+                ignore_blank_lines,
+                &ignore_regexes,
+            )? {
+                any = true;
+                break;
+            }
+        }
+        any
+    } else {
+        !entries.is_empty()
+    };
     // `--check`: report whitespace errors introduced by the new side, in place
     // of the normal patch body (git's DIFF_FORMAT_CHECKDIFF). It exits 2 on a
     // whitespace error; combined with `--exit-code`/`--quiet` (not exclusive)
@@ -948,6 +1033,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     no_index_contents: None,
                     dirty_submodules: Some(&dirty_submodules),
                     ws_error_rule,
+                    interhunk: interhunk.unwrap_or(0),
+                    ws_ignore,
+                    diff_algorithm,
+                    ignore_blank_lines,
+                    ignore_regexes: &ignore_regexes,
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1244,6 +1334,11 @@ struct DiffNoIndexParams<'a> {
     src_prefix: &'a str,
     dst_prefix: &'a str,
     quiet: bool,
+    interhunk: usize,
+    ws_ignore: sley_diff_merge::WsIgnore,
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    ignore_blank_lines: bool,
+    ignore_regexes: &'a [crate::grep_source::Regex],
 }
 
 /// `git diff --no-index <path> <path>`: compare two files outside (or beside)
@@ -1344,6 +1439,11 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                     .and_then(sley_diff_merge::ws::parse_whitespace_rule)
                     .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE)
             }),
+            interhunk: params.interhunk,
+            ws_ignore: params.ws_ignore,
+            diff_algorithm: params.diff_algorithm,
+            ignore_blank_lines: params.ignore_blank_lines,
+            ignore_regexes: params.ignore_regexes,
         };
         write_diff_patch_entry(&mut stdout, &entry, options)?;
     }
