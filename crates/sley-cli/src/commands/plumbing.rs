@@ -1780,15 +1780,34 @@ enum ApplyAction {
     },
 }
 
+/// `git apply --whitespace=<action>` modes (apply.c's `ws_error_action`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WsAction {
+    /// `nowarn`: ignore whitespace errors entirely.
+    Nowarn,
+    /// `warn` (default with `--apply`): warn but still apply.
+    Warn,
+    /// `error`: warn and refuse to apply.
+    Error,
+    /// `error-all`: like `error` but do not squelch repeated warnings.
+    ErrorAll,
+    /// `fix`/`strip`: correct whitespace errors as the patch is applied.
+    Fix,
+}
+
 pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut check = false;
     let mut files = Vec::new();
+    // git's default when applying is `warn`; the value is overridden by the
+    // last `--whitespace=` seen.
+    let mut ws_action = WsAction::Warn;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--check" => check = true,
             "--apply" | "--stat" | "--numstat" | "--summary" | "-q" | "--quiet" | "--recount"
-            | "--allow-empty" | "--unsafe-paths" => {}
+            | "--allow-empty" | "--unsafe-paths" | "-l" | "--ignore-whitespace"
+            | "--ignore-space-change" => {}
             "-R" | "--reverse" => {
                 return Err(GitError::Unsupported(
                     "apply --reverse is not supported yet".into(),
@@ -1799,16 +1818,23 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     "apply {arg} is not supported yet"
                 )));
             }
-            "-p" | "-C" | "--whitespace" | "--directory" | "--exclude" | "--include" => {
+            "--whitespace" => {
+                if let Some(value) = iter.next() {
+                    ws_action = parse_ws_action(value)?;
+                }
+            }
+            "-p" | "-C" | "--directory" | "--exclude" | "--include" => {
                 iter.next();
             }
             "--" => {
                 files.extend(iter.by_ref().map(|value| value.to_string()));
                 break;
             }
+            value if let Some(rest) = value.strip_prefix("--whitespace=") => {
+                ws_action = parse_ws_action(rest)?;
+            }
             value
                 if value.starts_with("-p")
-                    || value.starts_with("--whitespace=")
                     || value.starts_with("--directory=")
                     || value.starts_with("--exclude=")
                     || value.starts_with("--include=") => {}
@@ -1822,6 +1848,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     let mut input = Vec::new();
     if files.is_empty() {
         io::stdin().read_to_end(&mut input)?;
@@ -1830,20 +1857,79 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             input.extend_from_slice(&fs::read(file)?);
         }
     }
-    let patches = sley_diff_merge::parse_unified_patch(&input)?;
+    let mut patches = sley_diff_merge::parse_unified_patch(&input)?;
+    let patch_input_file = files.first().map(String::as_str).unwrap_or("<stdin>");
+
+    // Phase 0: whitespace handling. Resolve the per-path rule, then warn/error
+    // or fix the introduced (`+`) lines per `--whitespace=<action>`. In `fix`
+    // mode this rewrites the patch's Insert lines (and trims new blank lines at
+    // EOF) before it is applied. In `error`/`error-all` mode a whitespace error
+    // aborts the whole apply.
+    let mut ws_error_count = 0usize;
+    let mut ws_squelched = 0usize;
+    let squelch_limit = if matches!(ws_action, WsAction::ErrorAll) {
+        usize::MAX
+    } else {
+        5
+    };
+    if !matches!(ws_action, WsAction::Nowarn) {
+        for patch in &mut patches {
+            let target = patch
+                .new_path
+                .as_deref()
+                .or(patch.old_path.as_deref())
+                .unwrap_or(b"");
+            let mut rule = ws_resolver.rule_for_path(target)?;
+            // A symlink's incomplete line is not news (apply.c clears it).
+            if patch.new_mode == Some(0o120000) {
+                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+            }
+            let base = read_patch_base(&worktree_root, patch)?;
+            apply_patch_whitespace(
+                patch,
+                &base,
+                rule,
+                ws_action,
+                patch_input_file,
+                squelch_limit,
+                &mut ws_error_count,
+                &mut ws_squelched,
+            );
+        }
+    }
+    if ws_squelched > 0 {
+        eprintln!(
+            "warning: squelched {ws_squelched} whitespace error{}",
+            if ws_squelched == 1 { "" } else { "s" }
+        );
+    }
+    if ws_error_count > 0 {
+        let n = ws_error_count;
+        match ws_action {
+            WsAction::Fix => {
+                eprintln!(
+                    "warning: {n} line{} applied after fixing whitespace errors.",
+                    if n == 1 { " adds" } else { "s add" }
+                );
+            }
+            _ => {
+                eprintln!(
+                    "warning: {n} line{} whitespace error{}.",
+                    if n == 1 { " adds" } else { "s add" },
+                    if n == 1 { "" } else { "s" }
+                );
+            }
+        }
+    }
+    if ws_error_count > 0 && matches!(ws_action, WsAction::Error | WsAction::ErrorAll) {
+        return Err(GitError::Exit(1));
+    }
+    let patches = patches;
 
     // Phase 1: compute every result first (git applies a patch atomically).
     let mut actions = Vec::new();
     for patch in &patches {
-        let base = if patch.is_new {
-            Vec::new()
-        } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
-            let rel = std::str::from_utf8(old)
-                .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
-            fs::read(worktree_root.join(rel)).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let base = read_patch_base(&worktree_root, patch)?;
         let content = match sley_diff_merge::apply_file_patch(&base, patch) {
             sley_diff_merge::ApplyOutcome::Applied(content) => content,
             sley_diff_merge::ApplyOutcome::Rejected => {
@@ -1893,6 +1979,159 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read the worktree base content a patch applies against (empty for a new
+/// file). Shared by the whitespace pass and the apply pass.
+fn read_patch_base(
+    worktree_root: &Path,
+    patch: &sley_diff_merge::FilePatch,
+) -> Result<Vec<u8>> {
+    if patch.is_new {
+        return Ok(Vec::new());
+    }
+    let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) else {
+        return Ok(Vec::new());
+    };
+    let rel = std::str::from_utf8(old)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
+    Ok(fs::read(worktree_root.join(rel)).unwrap_or_default())
+}
+
+/// Parse the `--whitespace=<action>` value into a [`WsAction`].
+fn parse_ws_action(value: &str) -> Result<WsAction> {
+    match value {
+        "nowarn" => Ok(WsAction::Nowarn),
+        "warn" => Ok(WsAction::Warn),
+        "error" => Ok(WsAction::Error),
+        "error-all" => Ok(WsAction::ErrorAll),
+        "fix" | "strip" => Ok(WsAction::Fix),
+        other => Err(GitError::Command(format!(
+            "unrecognized whitespace option '{other}'"
+        ))),
+    }
+}
+
+/// Whitespace handling for one file patch: warn/error on, or fix, the
+/// introduced (`+`) lines. Port of apply.c's `apply_one_fragment` ws path plus
+/// its `check_whitespace`. Mutates the patch's Insert lines in `fix` mode.
+#[allow(clippy::too_many_arguments)]
+fn apply_patch_whitespace(
+    patch: &mut sley_diff_merge::FilePatch,
+    base: &[u8],
+    rule: sley_diff_merge::ws::WsRule,
+    action: WsAction,
+    patch_input_file: &str,
+    squelch_limit: usize,
+    error_count: &mut usize,
+    squelched: &mut usize,
+) {
+    use sley_diff_merge::HunkLine;
+    use sley_diff_merge::ws;
+
+    let fixing = matches!(action, WsAction::Fix);
+
+    // git first scans the whole patch for whitespace errors (`check_whitespace`
+    // sets a single `state->whitespace_error` flag). In `fix` mode the actual
+    // `ws_fix_copy` is then applied to *every* introduced line, but only when
+    // that flag is set — so a clean-on-its-own line (e.g. `8 spaces + tab`,
+    // which the indent-with-non-tab check passes) is still re-indented when a
+    // sibling line in the same patch is dirty. We mirror that by pre-scanning.
+    let patch_has_ws_error = patch.hunks.iter().any(|hunk| {
+        hunk.lines.iter().any(|hl| match hl {
+            HunkLine::Insert(bytes) => ws::ws_check(bytes, rule) != 0,
+            _ => false,
+        })
+    });
+
+    for hunk in &mut patch.hunks {
+        let mut lineno = hunk.new_start; // 1-based new-file line of next +/space
+        for hl in &mut hunk.lines {
+            match hl {
+                HunkLine::Context(_) => {
+                    lineno += 1;
+                }
+                HunkLine::Delete(_) => {}
+                HunkLine::Insert(bytes) => {
+                    let bad = ws::ws_check(bytes, rule);
+                    if fixing {
+                        // Re-indent/strip every introduced line once any line
+                        // in the patch is dirty (git's global-flag semantics).
+                        if patch_has_ws_error {
+                            let fixed = ws::ws_fix_line_content(bytes, rule);
+                            if fixed != *bytes {
+                                *bytes = fixed;
+                                *error_count += 1;
+                            }
+                        }
+                    } else if bad != 0 {
+                        *error_count += 1;
+                        if *error_count <= squelch_limit {
+                            let err = ws::whitespace_error_string(bad);
+                            eprintln!("{patch_input_file}:{lineno}: {err}.");
+                            eprintln!("+{}", String::from_utf8_lossy(bytes));
+                        } else {
+                            *squelched += 1;
+                        }
+                    }
+                    lineno += 1;
+                }
+            }
+        }
+    }
+
+    // Blank-at-EOF: compare the trailing-blank run of the pre- and post-images.
+    if rule & ws::WS_BLANK_AT_EOF != 0 {
+        let postimage = match sley_diff_merge::apply_file_patch(base, patch) {
+            sley_diff_merge::ApplyOutcome::Applied(content) => content,
+            sley_diff_merge::ApplyOutcome::Rejected => return,
+        };
+        let l1 = ws::count_trailing_blank(base);
+        let l2 = ws::count_trailing_blank(&postimage);
+        if l2 > l1 {
+            let at = ws::count_lines(&postimage);
+            let blank_at_eof = at - l2 + 1;
+            if fixing {
+                // Trim the extra blank lines off the last hunk's trailing
+                // inserts.
+                let extra = l2 - l1;
+                trim_trailing_blank_inserts(patch, extra);
+                *error_count += 1;
+            } else {
+                *error_count += 1;
+                if *error_count <= squelch_limit {
+                    let err = ws::whitespace_error_string(ws::WS_BLANK_AT_EOF);
+                    eprintln!("{patch_input_file}:{blank_at_eof}: {err}.");
+                } else {
+                    *squelched += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Drop up to `count` trailing blank `Insert` lines from the patch's last hunk
+/// (the `--whitespace=fix` blank-at-EOF correction).
+fn trim_trailing_blank_inserts(patch: &mut sley_diff_merge::FilePatch, mut count: usize) {
+    use sley_diff_merge::HunkLine;
+    use sley_diff_merge::ws;
+    let Some(hunk) = patch.hunks.last_mut() else {
+        return;
+    };
+    while count > 0 {
+        match hunk.lines.last() {
+            Some(HunkLine::Insert(bytes)) if ws::ws_blank_line(bytes) => {
+                hunk.lines.pop();
+                if hunk.new_len > 0 {
+                    hunk.new_len -= 1;
+                }
+                count -= 1;
+            }
+            _ => break,
+        }
+    }
+    // The last surviving inserted line keeps the file's terminal newline state.
+    hunk.new_no_newline = false;
 }
 
 pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {

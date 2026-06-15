@@ -2060,6 +2060,10 @@ struct DiffPatchOptions<'a> {
     /// `-dirty` suffix (the submodule's own tree has modified/untracked
     /// content the effective ignore mode does not suppress).
     dirty_submodules: Option<&'a HashSet<Vec<u8>>>,
+    /// The whitespace rule used to highlight whitespace errors on new lines
+    /// (`--ws-error-highlight`, default new-only) when color is enabled.
+    /// `None` disables whitespace-error highlighting.
+    ws_error_rule: Option<sley_diff_merge::ws::WsRule>,
 }
 
 /// A `--word-diff` request before per-file word-regex resolution.
@@ -2463,6 +2467,17 @@ fn write_diff_patch_entry(
     let mut word_diff_adapter = word_diff
         .as_ref()
         .map(commands::format_patch::WordDiffAdapter::new);
+    // Whitespace-error highlighting (`--ws-error-highlight`, default new-only)
+    // is active only when both color and a resolved rule are present.
+    let ws_error = match (colors, options.ws_error_rule) {
+        (Some(_), Some(rule)) => Some(sley_diff_merge::render::WsErrorHighlight {
+            rule,
+            old: false,
+            new: true,
+            context: false,
+        }),
+        _ => None,
+    };
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         heading: Some(&mut heading),
@@ -2470,6 +2485,7 @@ fn write_diff_patch_entry(
         word_diff: word_diff_adapter
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
+        ws_error,
         ..Default::default()
     };
     let mut hunks = Vec::new();

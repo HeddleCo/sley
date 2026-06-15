@@ -111,6 +111,8 @@ struct DiffTreeOptions {
     patch_full_index: bool,
     src_prefix: String,
     dst_prefix: String,
+    /// `--check`: emit a whitespace-error report instead of the diff body.
+    check: bool,
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
 }
@@ -138,6 +140,7 @@ impl Default for DiffTreeOptions {
             patch_full_index: false,
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
+            check: false,
             setup_args: Vec::new(),
         }
     }
@@ -215,6 +218,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 options.show_trees = true;
             }
             "--root" => options.root = true,
+            "--check" => options.check = true,
             "--no-commit-id" => options.no_commit_id = true,
             "--stdin" => options.stdin = true,
             "-z" => options.z = true,
@@ -406,12 +410,19 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             .unwrap_or(7)
             .min(format.hex_len())
     };
+    let ws_resolver = if options.check {
+        Some(commands::diff::WhitespaceRuleResolver::from_git_dir(git_dir)?)
+    } else {
+        None
+    };
     let request_context = DiffRequestContext {
         format,
         db,
         options: &options,
         raw_abbrev,
         patch_abbrev,
+        ws_resolver,
+        check_failed: std::cell::Cell::new(false),
     };
 
     let mut has_differences = false;
@@ -444,6 +455,9 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     }
 
     let _ = has_differences;
+    if options.check && request_context.check_failed.get() {
+        return Err(GitError::Exit(2));
+    }
     Ok(())
 }
 
@@ -739,6 +753,10 @@ struct DiffRequestContext<'a> {
     options: &'a DiffTreeOptions,
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
+    /// `--check` whitespace-rule resolver (only built in check mode).
+    ws_resolver: Option<commands::diff::WhitespaceRuleResolver>,
+    /// Accumulated `--check` failure status across all requests.
+    check_failed: std::cell::Cell<bool>,
 }
 
 fn run_diff_request(
@@ -775,6 +793,17 @@ fn run_diff_request(
         recursive,
     )?;
     let has_differences = !entries.is_empty();
+
+    // `--check`: report whitespace errors in place of the normal diff body.
+    if context.options.check {
+        if let Some(resolver) = &context.ws_resolver {
+            let failed = commands::diff::run_diff_check(&entries, context.db, None, false, resolver)?;
+            if failed {
+                context.check_failed.set(true);
+            }
+        }
+        return Ok(has_differences);
+    }
 
     let output = context.options.output;
     let mut wrote_block = false;
@@ -878,6 +907,7 @@ fn run_diff_request(
                 word_diff: None,
                 no_index_contents: None,
                 dirty_submodules: None,
+                ws_error_rule: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

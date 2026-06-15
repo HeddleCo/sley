@@ -77,6 +77,9 @@ pub struct RenderColors<'a> {
     pub context: &'a str,
     /// The reset sequence terminating each colored span.
     pub reset: &'a str,
+    /// `color.diff.whitespace` — the highlight for whitespace errors
+    /// (`--ws-error-highlight`).
+    pub whitespace: &'a str,
 }
 
 /// Resolve the section heading for one candidate line.
@@ -123,6 +126,25 @@ pub struct HunkRenderOptions<'a, 'h> {
     pub colors: Option<RenderColors<'a>>,
     /// Word-diff body hook (replaces the `+`/`-` line bodies of each hunk).
     pub word_diff: Option<&'a mut dyn HunkWordDiff>,
+    /// `--ws-error-highlight` configuration: when set and colors are on, the
+    /// renderer paints whitespace errors on the selected line kinds with
+    /// `colors.whitespace` (git's `emit_line_ws_markup`). `None` disables it.
+    pub ws_error: Option<WsErrorHighlight>,
+}
+
+/// Which line kinds get whitespace-error highlighting, plus the rule to check
+/// against. git's `--ws-error-highlight` defaults to highlighting only new
+/// (`+`) lines.
+#[derive(Clone, Copy)]
+pub struct WsErrorHighlight {
+    /// The resolved whitespace rule to check each line against.
+    pub rule: crate::ws::WsRule,
+    /// Highlight errors on removed (`-`) lines.
+    pub old: bool,
+    /// Highlight errors on added (`+`) lines.
+    pub new: bool,
+    /// Highlight errors on context (` `) lines.
+    pub context: bool,
 }
 
 impl Default for HunkRenderOptions<'_, '_> {
@@ -133,6 +155,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             heading: None,
             colors: None,
             word_diff: None,
+            ws_error: None,
         }
     }
 }
@@ -347,7 +370,19 @@ fn render_one_hunk(
             LineKind::Insert => b'+',
         };
         match options.colors {
-            Some(colors) => write_patch_line_colored(out, prefix, line.content, colors),
+            Some(colors) => {
+                // Whitespace-error highlighting applies to the selected line
+                // kinds (default: new lines only).
+                let ws_rule = options.ws_error.and_then(|ws| {
+                    let enabled = match line.kind {
+                        LineKind::Context => ws.context,
+                        LineKind::Delete => ws.old,
+                        LineKind::Insert => ws.new,
+                    };
+                    enabled.then_some(ws.rule)
+                });
+                write_patch_line_colored(out, prefix, line.content, colors, ws_rule);
+            }
             None => write_patch_line(out, prefix, line.content),
         }
     }
@@ -395,11 +430,25 @@ fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
     }
 }
 
-/// [`write_patch_line`] in color. Context/old lines paint the sign and body
-/// in one span; new lines paint the sign and body as separate spans, matching
-/// the default `ws-error-highlight=new` path through `emit_line_ws_markup`
-/// (whitespace-error painting itself is not implemented).
-fn write_patch_line_colored(out: &mut Vec<u8>, prefix: u8, line: &[u8], colors: RenderColors<'_>) {
+/// [`write_patch_line`] in color, optionally painting whitespace errors.
+///
+/// When `ws_rule` is `Some`, the line body is emitted through
+/// [`crate::ws::ws_check_emit`] (git's `emit_line_ws_markup` highlighted
+/// branch): the sign is painted in the line color, then the body's non-error
+/// segments in the line color and its whitespace-error segments in
+/// `colors.whitespace`. A clean line produces no whitespace spans, so it stays
+/// visually plain.
+///
+/// When `ws_rule` is `None`, context/old lines paint the sign and body in one
+/// span; new lines paint the sign and body as separate spans (the default
+/// `ws-error-highlight` path with no rule).
+fn write_patch_line_colored(
+    out: &mut Vec<u8>,
+    prefix: u8,
+    line: &[u8],
+    colors: RenderColors<'_>,
+    ws_rule: Option<crate::ws::WsRule>,
+) {
     let (body, terminated) = match line.split_last() {
         Some((b'\n', body)) => (body, true),
         _ => (line, false),
@@ -409,6 +458,29 @@ fn write_patch_line_colored(out: &mut Vec<u8>, prefix: u8, line: &[u8], colors: 
         b'+' => colors.new,
         _ => colors.context,
     };
+
+    if let Some(rule) = ws_rule {
+        // Sign in the line color, then the body through ws_check_emit (no
+        // trailing newline in `body`, so the emit's own LF handling is inert).
+        out.extend_from_slice(color.as_bytes());
+        out.push(prefix);
+        out.extend_from_slice(colors.reset.as_bytes());
+        let emit_colors = crate::ws::WsEmitColors {
+            set: color,
+            reset: colors.reset,
+            ws: colors.whitespace,
+        };
+        crate::ws::ws_check_emit(body, rule, out, &emit_colors);
+        out.push(b'\n');
+        if !terminated {
+            out.extend_from_slice(colors.context.as_bytes());
+            out.extend_from_slice(b"\\ No newline at end of file");
+            out.extend_from_slice(colors.reset.as_bytes());
+            out.push(b'\n');
+        }
+        return;
+    }
+
     if prefix == b'+' {
         out.extend_from_slice(color.as_bytes());
         out.push(prefix);

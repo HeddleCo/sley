@@ -1,6 +1,7 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 
 pub mod render;
+pub mod ws;
 
 pub use sley_core::BString;
 use sley_index::{BorrowedIndex, Index, IndexStatCache};
