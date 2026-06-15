@@ -1462,6 +1462,12 @@ fn stage_and_commit(
     index
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
+    // We mutated entry OIDs above; the cache-tree extension carried over from
+    // the parsed index is now stale. `write_tree_from_index` trusts a present
+    // cache-tree by entry-count, so leaving a stale `TREE` here makes the
+    // commit reuse the OLD root tree (wrong OID; modified-file content lost).
+    // Invalidate it, matching every entry-mutating writer in sley-worktree.
+    index.set_cache_tree(None)?;
     fs::write(
         sley_worktree::repository_index_path(git_dir),
         index.write(format)?,
