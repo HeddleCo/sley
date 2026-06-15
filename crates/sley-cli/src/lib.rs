@@ -8341,6 +8341,13 @@ fn emit_compiled_log_format_limited_commit(
 }
 
 fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'_, str>) {
+    let (message, encoding) = commit_object_message_and_optional_encoding(body);
+    (message, encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
+}
+
+fn commit_object_message_and_optional_encoding(
+    body: &[u8],
+) -> (&[u8], Option<std::borrow::Cow<'_, str>>) {
     let mut encoding = None;
     let mut offset = 0usize;
     while offset < body.len() {
@@ -8352,10 +8359,7 @@ fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'
         let line = &body[offset..line_end];
         if line.is_empty() {
             let message_start = line_end.saturating_add(1).min(body.len());
-            return (
-                &body[message_start..],
-                encoding.unwrap_or(std::borrow::Cow::Borrowed("")),
-            );
+            return (&body[message_start..], encoding);
         }
         if let Some(value) = line.strip_prefix(b"encoding ") {
             encoding = Some(
@@ -8369,7 +8373,7 @@ fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'
         }
         offset = line_end + 1;
     }
-    (&[], encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
+    (&[], encoding)
 }
 
 fn emit_compiled_log_format_metadata_inner(
@@ -9407,6 +9411,20 @@ fn repository_abbrev(git_dir: &Path, format: ObjectFormat) -> Result<Option<usiz
     let Ok(config) = GitConfig::read(config_path) else {
         return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };
+    let Some(value) = config.get("core", None, "abbrev") else {
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
+    };
+    parse_repository_abbrev_value(git_dir, format, value)
+}
+
+fn repository_abbrev_from_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Option<usize>> {
+    if let Some(value) = global_config_value("core.abbrev")? {
+        return parse_repository_abbrev_value(git_dir, format, &value);
+    }
     let Some(value) = config.get("core", None, "abbrev") else {
         return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };

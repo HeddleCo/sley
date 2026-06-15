@@ -4558,14 +4558,11 @@ fn status_untracked_paths_from_borrowed_index(
         return Ok(Vec::new());
     }
     let mut paths = BTreeSet::new();
-    let tracked_dirs = stage0_tracked_directories_borrowed(index);
-    let tracked = BorrowedIndexLookup {
-        entries: &index.entries,
-    };
+    let tracked = BorrowedIndexLookup::new(&index.entries);
     let mut context = StatusUntrackedWalk {
         git_dir,
         tracked: &tracked,
-        tracked_dirs: &tracked_dirs,
+        tracked_dirs: &tracked.tracked_dirs,
         ignores,
         untracked_mode,
     };
@@ -4589,23 +4586,53 @@ impl StatusTrackedLookup for IndexStatCache {
 }
 
 struct BorrowedIndexLookup<'a> {
-    entries: &'a [IndexEntryRef<'a>],
+    tracked: HashSet<&'a [u8]>,
+    gitlinks: HashSet<&'a [u8]>,
+    tracked_dirs: HashSet<&'a [u8]>,
+}
+
+impl<'a> BorrowedIndexLookup<'a> {
+    fn new(entries: &'a [IndexEntryRef<'a>]) -> Self {
+        let mut tracked = HashSet::with_capacity(entries.len());
+        let mut gitlinks = HashSet::new();
+        let mut tracked_dirs = HashSet::new();
+        for entry in entries {
+            if entry.stage() != Stage::Normal {
+                continue;
+            }
+            let path = entry.path;
+            tracked.insert(path);
+            if entry.mode == 0o160000 {
+                gitlinks.insert(path);
+            }
+            for (idx, byte) in path.iter().enumerate() {
+                if *byte == b'/' && idx > 0 {
+                    tracked_dirs.insert(&path[..idx]);
+                }
+            }
+        }
+        Self {
+            tracked,
+            gitlinks,
+            tracked_dirs,
+        }
+    }
 }
 
 impl StatusTrackedLookup for BorrowedIndexLookup<'_> {
     fn contains_tracked(&self, git_path: &[u8]) -> bool {
-        borrowed_stage0_entry(self.entries, git_path).is_some()
+        self.tracked.contains(git_path)
     }
 
     fn is_tracked_gitlink(&self, git_path: &[u8]) -> bool {
-        borrowed_stage0_entry(self.entries, git_path).is_some_and(|entry| entry.mode == 0o160000)
+        self.gitlinks.contains(git_path)
     }
 }
 
 struct StatusUntrackedWalk<'a, T: StatusTrackedLookup + ?Sized> {
     git_dir: &'a Path,
     tracked: &'a T,
-    tracked_dirs: &'a HashSet<Vec<u8>>,
+    tracked_dirs: &'a HashSet<&'a [u8]>,
     ignores: &'a mut IgnoreMatcher,
     untracked_mode: StatusUntrackedMode,
 }
@@ -4620,11 +4647,10 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         return Ok(());
     }
     let ignore_len = context.ignores.patterns.len();
-    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    let entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, context.ignores)?;
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in entries {
             let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
@@ -4686,7 +4712,7 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
     result
 }
 
-fn stage0_tracked_directories(index: &Index) -> HashSet<Vec<u8>> {
+fn stage0_tracked_directories(index: &Index) -> HashSet<&[u8]> {
     let mut directories = HashSet::new();
     for entry in index
         .entries
@@ -4696,24 +4722,7 @@ fn stage0_tracked_directories(index: &Index) -> HashSet<Vec<u8>> {
         let path = entry.path.as_bytes();
         for (idx, byte) in path.iter().enumerate() {
             if *byte == b'/' && idx > 0 {
-                directories.insert(path[..idx].to_vec());
-            }
-        }
-    }
-    directories
-}
-
-fn stage0_tracked_directories_borrowed(index: &BorrowedIndex<'_>) -> HashSet<Vec<u8>> {
-    let mut directories = HashSet::new();
-    for entry in index
-        .entries
-        .iter()
-        .filter(|entry| entry.stage() == Stage::Normal)
-    {
-        let path = entry.path;
-        for (idx, byte) in path.iter().enumerate() {
-            if *byte == b'/' && idx > 0 {
-                directories.insert(path[..idx].to_vec());
+                directories.insert(&path[..idx]);
             }
         }
     }
@@ -4729,11 +4738,10 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
         return Ok(false);
     }
     let ignore_len = context.ignores.patterns.len();
-    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    let entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, context.ignores)?;
     let result = (|| -> Result<bool> {
         let mut git_path = dir_git_path.to_vec();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in entries {
             let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
@@ -4771,6 +4779,31 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
     })();
     context.ignores.patterns.truncate(ignore_len);
     result
+}
+
+fn read_dir_entries_with_ignore_patterns(
+    dir: &Path,
+    base: &[u8],
+    matcher: &mut IgnoreMatcher,
+) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = Vec::new();
+    let mut ignore_path = None;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(".gitignore") {
+            ignore_path = Some(entry.path());
+        }
+        entries.push(entry);
+    }
+    if let Some(path) = ignore_path {
+        let mut source = base.to_vec();
+        if !source.is_empty() {
+            source.push(b'/');
+        }
+        source.extend_from_slice(b".gitignore");
+        read_ignore_patterns(path, &mut matcher.patterns, base, &source);
+    }
+    Ok(entries)
 }
 
 fn untracked_normal_rollup_path(
@@ -9796,21 +9829,6 @@ fn head_matches_borrowed_index_from_cache_tree(
         return Ok(false);
     }
     Ok(cache_tree.entry_count as usize == stage0_entry_count)
-}
-
-fn borrowed_stage0_entry<'a>(
-    entries: &'a [IndexEntryRef<'a>],
-    git_path: &[u8],
-) -> Option<&'a IndexEntryRef<'a>> {
-    let start = entries.partition_point(|entry| entry.path < git_path);
-    let mut idx = start;
-    while idx < entries.len() && entries[idx].path == git_path {
-        if entries[idx].stage() == Stage::Normal {
-            return Some(&entries[idx]);
-        }
-        idx += 1;
-    }
-    None
 }
 
 /// Parses the index a single time and returns both the path -> [`TrackedEntry`]
