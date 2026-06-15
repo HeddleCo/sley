@@ -53,6 +53,11 @@ struct ReadTreeArgs {
     mode: ReadTreeMode,
     update_worktree: bool,
     empty: bool,
+    /// git's `-n` / `--dry-run`: compute (and validate) the merge without
+    /// writing the index or touching the worktree. Used by the upstream test
+    /// harness's `read_tree_*_must_succeed` to prove the dry run leaves index
+    /// and worktree untouched before the real run.
+    dry_run: bool,
     trees: Vec<String>,
 }
 
@@ -90,17 +95,26 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
         tree_oids.push(resolve_tree_ish(&repo, tree)?);
     }
 
+    // git's `-n` / `--dry-run`: run the merge to validate it (and surface the
+    // same errors / exit code), but leave the index and worktree untouched. The
+    // upstream `read_tree_*_must_succeed` helper relies on this to prove the dry
+    // run is a no-op before the real run. `update` is forced off so no file is
+    // written, and the resulting index is discarded rather than persisted.
+    let apply_worktree = parsed.update_worktree && !parsed.dry_run;
+
     match &parsed.mode {
         ReadTreeMode::Read => {
             let entries = read_tree_overlay(db, format, &tree_oids)?;
-            write_paired_entries(git_dir, format, entries)?;
+            if !parsed.dry_run {
+                write_paired_entries(git_dir, format, entries)?;
+            }
         }
         ReadTreeMode::Reset => {
             // `--reset` accepts up to three trees but only the resulting union
             // matters; higher-stage entries are simply dropped (we never create
             // them here). With `-u` the worktree is updated to match.
             let mut entries = read_tree_overlay(db, format, &tree_oids)?;
-            if parsed.update_worktree {
+            if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 reset_worktree_to_entries(
                     &worktree_root,
@@ -111,11 +125,13 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     &mut entries,
                 )?;
             }
-            write_paired_entries(git_dir, format, entries)?;
+            if !parsed.dry_run {
+                write_paired_entries(git_dir, format, entries)?;
+            }
         }
         ReadTreeMode::Prefix(prefix) => {
             let mut entries = read_tree_prefix(git_dir, format, db, &tree_oids, prefix)?;
-            if parsed.update_worktree {
+            if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 update_worktree_for_entries(
                     &worktree_root,
@@ -126,15 +142,19 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     &mut entries,
                 )?;
             }
-            write_paired_entries(git_dir, format, entries)?;
+            if !parsed.dry_run {
+                write_paired_entries(git_dir, format, entries)?;
+            }
         }
         ReadTreeMode::Merge => {
             // The trivial fast-forward / two-way / three-way merge now runs
             // through the shared `sley-unpack-trees` engine (git's
             // oneway/twoway/threeway_merge). The engine computes the result
             // index and the worktree update plan; we apply the plan with `-u`.
-            let entries = merge_trees(git_dir, format, db, &tree_oids, parsed.update_worktree)?;
-            write_paired_entries(git_dir, format, entries)?;
+            let entries = merge_trees(git_dir, format, db, &tree_oids, apply_worktree)?;
+            if !parsed.dry_run {
+                write_paired_entries(git_dir, format, entries)?;
+            }
         }
     }
 
@@ -147,6 +167,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     let mut mode: Option<ReadTreeMode> = None;
     let mut update_worktree = false;
     let mut empty = false;
+    let mut dry_run = false;
     let mut trees = Vec::new();
     let mut no_more_options = false;
 
@@ -185,10 +206,9 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             | "--no-sparse-checkout"
             | "--sparse-checkout"
             | "--debug-unpack"
-            | "--no-debug-unpack"
-            | "-n"
-            | "--dry-run"
-            | "--no-dry-run" => {}
+            | "--no-debug-unpack" => {}
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
             value => {
                 if let Some(prefix) = value.strip_prefix("--prefix=") {
                     set_mode(ReadTreeMode::Prefix(normalize_prefix(prefix)), &mut mode)?;
@@ -215,6 +235,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             mode,
             update_worktree,
             empty,
+            dry_run,
             trees,
         });
     }
@@ -225,6 +246,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
         mode,
         update_worktree,
         empty,
+        dry_run,
         trees,
     })
 }

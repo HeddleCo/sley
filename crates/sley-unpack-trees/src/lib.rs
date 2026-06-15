@@ -110,6 +110,15 @@ pub struct CacheEntry {
     /// git's `ce_stat_data`, carried forward from the source index on a kept
     /// entry. `None` when sourced from a tree or pending a worktree write.
     pub stat: Option<StatInfo>,
+    /// git's `o->df_conflict_entry` sentinel marker. When `true`, this slot is
+    /// not a real entry: it is the directory/file (D/F) conflict placeholder
+    /// that `unpack_trees` synthesizes for a tree slot whose path is a
+    /// *directory* (or lives under a *file* in that tree) where another source
+    /// has the colliding *file* (resp. *directory*). The merge functions test
+    /// it exactly as upstream tests `src[i] == o->df_conflict_entry`: it forces
+    /// a file-vs-directory collision to resolve to conflict *stages* instead of
+    /// a bogus stage-0 entry. The `mode`/`oid`/`stage` of a marker are inert.
+    df_conflict: bool,
 }
 
 impl CacheEntry {
@@ -120,6 +129,7 @@ impl CacheEntry {
             oid,
             stage: 0,
             stat: None,
+            df_conflict: false,
         }
     }
 
@@ -130,6 +140,7 @@ impl CacheEntry {
             oid,
             stage: 0,
             stat,
+            df_conflict: false,
         }
     }
 
@@ -140,7 +151,26 @@ impl CacheEntry {
             oid,
             stage,
             stat: None,
+            df_conflict: false,
         }
+    }
+
+    /// git's `o->df_conflict_entry`: the D/F-conflict sentinel placed into a
+    /// tree slot by [`unpack_trees`]. See [`CacheEntry::df_conflict`].
+    pub fn df_conflict_marker() -> Self {
+        Self {
+            mode: 0,
+            oid: ObjectId::null(ObjectFormat::Sha1),
+            stage: 0,
+            stat: None,
+            df_conflict: true,
+        }
+    }
+
+    /// Whether this slot is the D/F-conflict sentinel marker (git's
+    /// `ce == o->df_conflict_entry`).
+    pub fn is_df_conflict(&self) -> bool {
+        self.df_conflict
     }
 }
 
@@ -160,6 +190,12 @@ fn is_gitlink(mode: u32) -> bool {
 fn same(a: Option<&CacheEntry>, b: Option<&CacheEntry>) -> bool {
     match (a, b) {
         (None, None) => true,
+        // A D/F-conflict marker is never "same" as anything. Upstream nulls the
+        // marker out before calling `same()`, so it never reaches here in the
+        // normal path; this guard keeps `same()` honest if a caller hasn't
+        // unwrapped the sentinel yet (e.g. `oneway_merge`'s identical check).
+        (Some(x), _) if x.df_conflict => false,
+        (_, Some(y)) if y.df_conflict => false,
         (Some(x), Some(y)) => x.mode == y.mode && x.oid == y.oid,
         _ => false,
     }
@@ -435,9 +471,11 @@ pub fn oneway_merge<P: WorktreeProbe + ?Sized>(
     probe: &P,
 ) -> Result<()> {
     let old = src[0].as_ref();
-    let a = src[1].as_ref();
+    // git: `if (!a || a == o->df_conflict_entry) return deleted_entry(old,…)` —
+    // the tree has nothing real here (absent, or a directory shadowing this
+    // file via the D/F marker), so the index entry is dropped.
+    let a = src[1].as_ref().filter(|e| !e.is_df_conflict());
 
-    // `!a || a == df_conflict_entry` — the tree has nothing here, so delete.
     let Some(a) = a else {
         return deleted_entry(old, path, state, opts, probe);
     };
@@ -466,8 +504,11 @@ pub fn twoway_merge<P: WorktreeProbe + ?Sized>(
     probe: &P,
 ) -> Result<()> {
     let current = src[0].as_ref();
-    let oldtree = src[1].as_ref();
-    let newtree = src[2].as_ref();
+    // git: `if (oldtree == o->df_conflict_entry) oldtree = NULL;` — a D/F marker
+    // means the tree has a *directory* where the index/other-tree has a file, so
+    // there is no real file to merge from that side; treat it as absent.
+    let oldtree = src[1].as_ref().filter(|e| !e.is_df_conflict());
+    let newtree = src[2].as_ref().filter(|e| !e.is_df_conflict());
 
     if let Some(current) = current {
         // (sley does not carry CE_CONFLICTED into a stage-0 `current`, so the
@@ -556,12 +597,26 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
     probe: &P,
 ) -> Result<()> {
     let index = stages[0].as_ref();
-    let head = stages[opts.head_idx].as_ref();
-    let remote = stages[opts.head_idx + 1].as_ref();
+    let mut head = stages[opts.head_idx].as_ref();
+    let mut remote = stages[opts.head_idx + 1].as_ref();
 
-    // (sley does not synthesize a df_conflict_entry; the D/F-conflict marker is
-    // a TODO for the checkout/merge pilots, so `df_conflict_head/remote` are
-    // always 0 here and `head`/`remote` are taken as-is.)
+    // git's `if (head == o->df_conflict_entry) { df_conflict_head = 1; head =
+    // NULL; }` (and the same for remote): a D/F marker on the head/remote side
+    // means that side has a *directory* (or sits under a *file*) where the other
+    // side has the colliding file — there is no real entry to merge, but the
+    // marker is *not* the same as a plain deletion, so the `df_conflict_*` flags
+    // suppress the trivial-resolution arms (#13/#14) that would otherwise pick a
+    // bogus stage-0 result.
+    let mut df_conflict_head = false;
+    let mut df_conflict_remote = false;
+    if head.is_some_and(CacheEntry::is_df_conflict) {
+        df_conflict_head = true;
+        head = None;
+    }
+    if remote.is_some_and(CacheEntry::is_df_conflict) {
+        df_conflict_remote = true;
+        remote = None;
+    }
 
     let mut head_match = 0usize;
     let mut remote_match = 0usize;
@@ -569,7 +624,9 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
     let mut any_anc_missing = false;
     let mut no_anc_exists = true;
     for anc in &stages[1..opts.head_idx] {
-        if anc.is_none() {
+        // git: `if (!stages[i] || stages[i] == o->df_conflict_entry)` — a marker
+        // ancestor counts as missing for the any/no-anc bookkeeping.
+        if anc.as_ref().is_none_or(CacheEntry::is_df_conflict) {
             any_anc_missing = true;
         } else {
             no_anc_exists = false;
@@ -591,7 +648,10 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
     }
 
     // #14, #14ALT, #2ALT — the index may match the result rather than head.
+    // git: `if (remote && !df_conflict_head && head_match && !remote_match)` —
+    // a D/F head suppresses this trivial "take remote" resolution.
     if let Some(remote) = remote
+        && !df_conflict_head
         && head_match != 0
         && remote_match == 0
     {
@@ -618,8 +678,10 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
         if same(Some(head), remote) {
             return merged_entry(head, index, path, state, opts, probe);
         }
-        // #13, #3ALT
-        if remote_match != 0 && head_match == 0 {
+        // #13, #3ALT — git: `if (!df_conflict_remote && remote_match &&
+        // !head_match)`. A D/F remote suppresses this trivial "take head"
+        // resolution.
+        if !df_conflict_remote && remote_match != 0 && head_match == 0 {
             return merged_entry(head, index, path, state, opts, probe);
         }
     }
@@ -641,8 +703,9 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
         } else if remote.is_some() {
             ce = remote;
         } else {
+            // git: `if (stages[i] && stages[i] != o->df_conflict_entry)`.
             for stage in stages.iter().take(opts.head_idx).skip(1) {
-                if let Some(s) = stage.as_ref() {
+                if let Some(s) = stage.as_ref().filter(|e| !e.is_df_conflict()) {
                     ce = Some(s);
                     break;
                 }
@@ -685,9 +748,11 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
     state.nontrivial_merge = true;
 
     // #2, #3, #4, #6, #7, #9, #10, #11 — emit surviving stages.
+    // git: `if (stages[i] && stages[i] != o->df_conflict_entry)` — never keep a
+    // D/F marker as a stage entry.
     if head_match == 0 || remote_match == 0 {
         for stage in stages.iter().take(opts.head_idx).skip(1) {
-            if let Some(s) = stage.as_ref() {
+            if let Some(s) = stage.as_ref().filter(|e| !e.is_df_conflict()) {
                 keep_entry(s, path, state)?;
                 break;
             }
@@ -862,6 +927,48 @@ pub type IndexInputEntry = (u32, ObjectId, Option<StatInfo>);
 /// each entry's cached `lstat` data so the merge preserves it.
 pub type FlatIndex = BTreeMap<Vec<u8>, IndexInputEntry>;
 
+/// Whether a tree slot for `path` should be git's `o->df_conflict_entry` marker.
+///
+/// `tree` is a flat path→entry map for one source (the index is never a marker,
+/// so it isn't passed here). `path` is a leaf in *some* source (it is a member
+/// of the traversal's path union) but is *not* a leaf in this `tree`. The slot
+/// is a D/F-conflict marker iff this `tree` puts a *directory* or a *file* in
+/// the way of that leaf:
+///
+/// * **directory side** (git's `dirmask`): `tree` has a path under `path/` — so
+///   `path` names a directory here, colliding with the file another source
+///   carries at `path`.
+/// * **file-ancestor side** (git's propagated `df_conflicts`): a strict
+///   *ancestor directory* of `path` is a *file* leaf in `tree` — so `path`
+///   lives under a file here, colliding with the directory another source has.
+///   This walks every ancestor, so the recursive case (`a/b` file vs
+///   `a/b/c/d`, vs `a/b/c/d/e/…`) is covered at any depth.
+fn df_conflict_slot(tree: &FlatTree, path: &[u8]) -> bool {
+    // Directory side: is there any key strictly under `path/`?
+    let mut dir_prefix = path.to_vec();
+    dir_prefix.push(b'/');
+    if tree
+        .range(dir_prefix.clone()..)
+        .next()
+        .is_some_and(|(k, _)| k.starts_with(&dir_prefix))
+    {
+        return true;
+    }
+
+    // File-ancestor side: is any strict ancestor directory of `path` a file
+    // leaf in this tree? Walk the '/'-separated prefixes shortest→longest;
+    // any one of them being a leaf poisons every descendant slot.
+    let mut idx = 0;
+    while let Some(off) = path[idx..].iter().position(|&b| b == b'/') {
+        let cut = idx + off;
+        if tree.contains_key(&path[..cut]) {
+            return true;
+        }
+        idx = cut + 1;
+    }
+    false
+}
+
 /// Run git's `unpack_trees`: walk the union of paths across `index` and the
 /// supplied `trees`, dispatch each path's source slice to `merge_fn`, and
 /// accumulate the resulting index plus worktree removals.
@@ -915,14 +1022,29 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         // (the index is slot 0/stage 0, tree 1 is stage 1, …). `keep_entry`
         // then carries those stages into the conflict result, while
         // `merged_entry` clears the stage to 0 (git's `CE_STAGEMASK`).
+        //
+        // git never places a D/F marker in the index slot (`src[0]`): a
+        // directory in the index is handled by descending into it, and
+        // `find_cache_entry` returns nothing for a directory prefix, so the
+        // index slot is simply absent when this path is not a real index leaf.
         src[0] = index
             .get(path)
             .map(|(mode, oid, stat)| CacheEntry::stage0_with_stat(*mode, *oid, *stat));
         for (i, tree) in trees.iter().enumerate() {
             let stage = (i + 1) as u8;
-            src[i + 1] = tree
-                .get(path)
-                .map(|(mode, oid)| CacheEntry::staged(*mode, *oid, stage));
+            src[i + 1] = match tree.get(path) {
+                // A real leaf in this tree: take it at its slot's stage.
+                Some((mode, oid)) => Some(CacheEntry::staged(*mode, *oid, stage)),
+                // Not a leaf here. If this path is a *directory* in this tree
+                // (some `path/…` exists) — git's `dirmask` bit — or an *ancestor
+                // directory* of this path is a *file* leaf in this tree — git's
+                // propagated `df_conflicts` — then this slot collides with the
+                // colliding file/directory in another source. Synthesize git's
+                // `o->df_conflict_entry` marker so the merge function resolves
+                // the collision to conflict stages instead of a stage-0 entry.
+                None if df_conflict_slot(tree, path) => Some(CacheEntry::df_conflict_marker()),
+                None => None,
+            };
         }
 
         match merge_fn {
@@ -1239,6 +1361,106 @@ mod tests {
         .expect("threeway conflict");
         let stages: Vec<u8> = res.entries.iter().map(|e| e.entry.stage).collect();
         assert_eq!(stages, vec![1, 2, 3]);
+    }
+
+    /// `(stage, path)` pairs for the result, sorted as `git ls-files -s` emits.
+    fn staged_paths(res: &UnpackTreesResult) -> Vec<(u8, Vec<u8>)> {
+        res.entries
+            .iter()
+            .map(|e| (e.entry.stage, e.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn df_conflict_slot_detects_directory_and_file_ancestor() {
+        // `a/b` is a directory (has `a/b/c/d`) → marker for a file at `a/b`.
+        let tree = flat(&[(b"a/b/c/d", 1)]);
+        assert!(df_conflict_slot(&tree, b"a/b"));
+        // `a/b` is a file → `a/b/c/d` lives under it → marker for that slot.
+        let tree2 = flat(&[(b"a/b", 1)]);
+        assert!(df_conflict_slot(&tree2, b"a/b/c/d"));
+        // Recursive: a deep ancestor file poisons a deeper descendant.
+        assert!(df_conflict_slot(&tree2, b"a/b/c/d/e/f"));
+        // No collision: `a/b-2/...` is a sibling, not under `a/b/`.
+        let tree3 = flat(&[(b"a/b-2/c/d", 1)]);
+        assert!(!df_conflict_slot(&tree3, b"a/b"));
+        // A `.c` suffix is not a directory prefix of `ioat/`.
+        let tree4 = flat(&[(b"ds/dma/ioat/Makefile", 1)]);
+        assert!(!df_conflict_slot(&tree4, b"ds/dma/ioat.c"));
+    }
+
+    #[test]
+    fn threeway_df_conflict_synthesizes_stages() {
+        // git t1012 "3-way (1)": O,A have `a/b/c/d` (a/b is a directory); B has
+        // `a/b` (a file). Expected: `3 a/b`, `1 a/b/c/d`, `2 a/b/c/d`.
+        let index = idx(&[(b"a/b/c/d", 2), (b"a/b-2/c/d", 2), (b"a/x", 2)]);
+        let base = flat(&[(b"a/b/c/d", 1), (b"a/b-2/c/d", 1), (b"a/x", 1)]);
+        let ours = flat(&[(b"a/b/c/d", 2), (b"a/b-2/c/d", 2), (b"a/x", 2)]);
+        let theirs = flat(&[(b"a/b", 3), (b"a/b-2/c/d", 2), (b"a/x", 2)]);
+        let res = unpack_trees(
+            &index,
+            &[base, ours, theirs],
+            MergeFn::ThreeWay,
+            &opts(),
+            &NullWorktree,
+        )
+        .expect("threeway D/F");
+        assert_eq!(
+            staged_paths(&res),
+            vec![
+                (3, b"a/b".to_vec()),
+                (0, b"a/b-2/c/d".to_vec()),
+                (1, b"a/b/c/d".to_vec()),
+                (2, b"a/b/c/d".to_vec()),
+                (0, b"a/x".to_vec()),
+            ],
+            "the file `a/b` lands at stage 3, the dir-side `a/b/c/d` at stages 1+2"
+        );
+    }
+
+    #[test]
+    fn threeway_df_conflict_recursive_three_levels() {
+        // git t1004 "D/F": branch-point + ours keep `subdir/file2` as a FILE;
+        // theirs turns it into a directory `subdir/file2/another`. Expected
+        // unmerged stages: `1 subdir/file2`, `2 subdir/file2`,
+        // `3 subdir/file2/another` — a 3-level recursive D/F. The index is set
+        // to ours (a `settree side-b` precedes the read-tree), so the index
+        // matches head.
+        let index = idx(&[(b"subdir/file2", 1)]);
+        let base = flat(&[(b"subdir/file2", 1)]);
+        let ours = flat(&[(b"subdir/file2", 1)]); // same as base → file kept
+        let theirs = flat(&[(b"subdir/file2/another", 3)]);
+        let res = unpack_trees(
+            &index,
+            &[base, ours, theirs],
+            MergeFn::ThreeWay,
+            &opts(),
+            &NullWorktree,
+        )
+        .expect("threeway recursive D/F");
+        assert_eq!(
+            staged_paths(&res),
+            vec![
+                (1, b"subdir/file2".to_vec()),
+                (2, b"subdir/file2".to_vec()),
+                (3, b"subdir/file2/another".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn twoway_df_marker_treated_as_absent() {
+        // twoway: index+oldtree have `a/b` (a file); newtree turns it into a
+        // directory `a/b/c`. The marker on the newtree slot for `a/b` is
+        // treated as absent (no real file) → the file is deleted and `a/b/c`
+        // is added. No stale `a/b` survives.
+        let index = idx(&[(b"a/b", 1)]);
+        let old = flat(&[(b"a/b", 1)]);
+        let new = flat(&[(b"a/b/c", 9)]);
+        let res = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("twoway D/F");
+        assert_eq!(staged_paths(&res), vec![(0, b"a/b/c".to_vec())]);
+        assert_eq!(res.removed_paths, vec![b"a/b".to_vec()]);
     }
 
     /// Whether any path produced conflict stages (a stage > 0 entry).
