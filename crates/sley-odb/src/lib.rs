@@ -2860,6 +2860,141 @@ pub struct FileObjectDatabase {
     shallow_grafts: Arc<std::sync::OnceLock<HashSet<ObjectId>>>,
 }
 
+#[derive(Debug)]
+pub struct ObjectPresenceChecker {
+    db: FileObjectDatabase,
+    pack_dir: PathBuf,
+    midx: Option<Arc<MultiPackIndex>>,
+    registry: Option<Arc<PackRegistrySnapshot>>,
+    registry_indexes: Vec<Option<Arc<PackIndexViewData>>>,
+    recent_pack: Option<usize>,
+    prepared_packs: bool,
+}
+
+impl ObjectPresenceChecker {
+    fn new(db: FileObjectDatabase) -> Self {
+        let pack_dir = db.objects_dir.join("pack");
+        Self {
+            db,
+            pack_dir,
+            midx: None,
+            registry: None,
+            registry_indexes: Vec::new(),
+            recent_pack: None,
+            prepared_packs: false,
+        }
+    }
+
+    pub fn contains(&mut self, oid: &ObjectId) -> Result<bool> {
+        if oid.format() != self.db.format {
+            return Err(GitError::InvalidObjectId(format!(
+                "object {oid} uses {}, store uses {}",
+                oid.format().name(),
+                self.db.format.name()
+            )));
+        }
+        if self.db.loose.exists(oid)? {
+            return Ok(true);
+        }
+        if self.find_packed(oid, false)? {
+            return Ok(true);
+        }
+        if self.find_packed(oid, true)? {
+            return Ok(true);
+        }
+        for alternate in &self.db.alternates {
+            if FileObjectDatabase::without_alternates(alternate, self.db.format).contains(oid)? {
+                return Ok(true);
+            }
+        }
+        // Preserve the regular contains() reprepare-on-miss behavior for loose
+        // objects that appeared after the fanout cache was populated.
+        self.db.loose.invalidate_cache();
+        self.db.loose.exists(oid)
+    }
+
+    fn find_packed(&mut self, oid: &ObjectId, force_rescan: bool) -> Result<bool> {
+        self.prepare_packs(force_rescan)?;
+        if let Some(midx) = &self.midx
+            && midx.find(oid).is_some()
+        {
+            return Ok(true);
+        }
+        self.find_in_registry(oid)
+    }
+
+    fn prepare_packs(&mut self, force_rescan: bool) -> Result<()> {
+        if self.prepared_packs && !force_rescan {
+            return Ok(());
+        }
+        let midx_path = self.pack_dir.join("multi-pack-index");
+        self.midx = self.db.cached_multi_pack_index(&midx_path)?;
+        let registry = self
+            .db
+            .cached_pack_registry(&self.pack_dir, force_rescan)?;
+        let registry_changed = match self.registry.as_ref() {
+            Some(cached) => !Arc::ptr_eq(cached, &registry),
+            None => true,
+        };
+        if registry_changed {
+            self.registry_indexes = vec![None; registry.packs.len()];
+            self.recent_pack = None;
+            self.registry = Some(registry);
+        }
+        self.prepared_packs = true;
+        Ok(())
+    }
+
+    fn find_in_registry(&mut self, oid: &ObjectId) -> Result<bool> {
+        let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
+            return Ok(false);
+        };
+        if let Some(pack_index) = self
+            .recent_pack
+            .filter(|pack_index| *pack_index < registry.packs.len())
+        {
+            let index = self.registry_index(&registry, pack_index)?;
+            if index.find(oid).is_some() {
+                return Ok(true);
+            }
+        }
+        for pack_index in 0..registry.packs.len() {
+            if Some(pack_index) == self.recent_pack {
+                continue;
+            }
+            let index = self.registry_index(&registry, pack_index)?;
+            if index.find(oid).is_some() {
+                self.recent_pack = Some(pack_index);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn registry_index(
+        &mut self,
+        registry: &PackRegistrySnapshot,
+        pack_index: usize,
+    ) -> Result<Arc<PackIndexViewData>> {
+        if self.registry_indexes.len() != registry.packs.len() {
+            self.registry_indexes = vec![None; registry.packs.len()];
+            self.recent_pack = None;
+        }
+        if let Some(index) = self
+            .registry_indexes
+            .get(pack_index)
+            .and_then(|index| index.as_ref())
+        {
+            return Ok(Arc::clone(index));
+        }
+        let index = registry.packs[pack_index].index(self.db.format)?;
+        if let Some(slot) = self.registry_indexes.get_mut(pack_index) {
+            *slot = Some(Arc::clone(&index));
+        }
+        Ok(index)
+    }
+}
+
 /// Parse `$GIT_DIR/shallow`: one hex object id per line. A missing file is an
 /// empty set (the repository is not shallow); unparsable lines are ignored so
 /// a torn write never poisons walks.
@@ -3112,6 +3247,10 @@ impl FileObjectDatabase {
 
     pub fn loose(&self) -> &LooseObjectStore {
         &self.loose
+    }
+
+    pub fn presence_checker(&self) -> ObjectPresenceChecker {
+        ObjectPresenceChecker::new(self.clone())
     }
 
     pub fn install_pack(&self, pack: &PackWrite) -> Result<PackInstallResult> {
@@ -4690,6 +4829,36 @@ mod tests {
     }
 
     #[test]
+    fn object_presence_checker_observes_same_process_loose_write_after_miss() {
+        let root = temp_root("sley-presence-checker-loose-cache-write");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let mut checker = db.presence_checker();
+
+        let object = EncodedObject::new(ObjectType::Blob, b"checker loose after miss\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        assert!(
+            !checker
+                .contains(&oid)
+                .expect("test operation should succeed")
+        );
+        db.loose()
+            .write_object(object)
+            .expect("test operation should succeed");
+
+        assert!(
+            checker
+                .contains(&oid)
+                .expect("test operation should succeed")
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn read_object_header_matches_full_read_for_loose_and_packed_and_delta() {
         let root = temp_root("sley-read-object-header");
         let git_dir = root.join(".git");
@@ -5556,6 +5725,51 @@ mod tests {
         // The original object still resolves too.
         assert_eq!(read_object_for_assert(&db, &first_oid), first);
 
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn object_presence_checker_finds_pack_added_after_registry_was_cached() {
+        let root = temp_root("sley-presence-checker-pack-added-late");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let first = EncodedObject::new(ObjectType::Blob, b"checker first late\n".to_vec());
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first))
+            .expect("test operation should succeed");
+        db.install_pack(&first_pack)
+            .expect("test operation should succeed");
+
+        let second = EncodedObject::new(ObjectType::Blob, b"checker second late\n".to_vec());
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let mut checker = db.presence_checker();
+        assert!(
+            checker
+                .contains(&first_oid)
+                .expect("test operation should succeed")
+        );
+        assert!(
+            !checker
+                .contains(&second_oid)
+                .expect("test operation should succeed")
+        );
+
+        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second))
+            .expect("test operation should succeed");
+        db.install_pack(&second_pack)
+            .expect("test operation should succeed");
+
+        assert!(
+            checker
+                .contains(&second_oid)
+                .expect("test operation should succeed")
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

@@ -256,6 +256,30 @@ impl<'a> BorrowedIndex<'a> {
             checksum,
         })
     }
+
+    /// Iterate the optional/required extension chunks stored in
+    /// `self.extensions`.
+    pub fn extension_chunks(&self) -> Result<Vec<([u8; 4], &[u8])>> {
+        parse_index_extension_chunks(self.extensions)
+    }
+
+    /// Return the raw body of the first extension chunk with `signature`, if
+    /// any.
+    pub fn extension(&self, signature: &[u8; 4]) -> Result<Option<&[u8]>> {
+        Ok(self
+            .extension_chunks()?
+            .into_iter()
+            .find(|(id, _)| id == signature)
+            .map(|(_, body)| body))
+    }
+
+    /// Parse the `TREE` (cache-tree) extension, if present.
+    pub fn cache_tree(&self, format: ObjectFormat) -> Result<Option<CacheTree>> {
+        match self.extension(b"TREE")? {
+            Some(body) => Ok(Some(CacheTree::parse(format, body)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 impl Index {
