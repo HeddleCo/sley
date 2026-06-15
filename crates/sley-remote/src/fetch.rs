@@ -792,6 +792,26 @@ fn finalize_fetch(
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());
     }
+    // git refuses to clobber an existing local tag whose value changed unless the
+    // refspec is forced (`+`/`--force`): the offending update is dropped (the tag
+    // keeps its old value), a `! [rejected] … (would clobber existing tag)` line
+    // is emitted, and the fetch exits non-zero. Other updates and FETCH_HEAD still
+    // proceed.
+    let mut rejected_clobber = false;
+    let mut retained = Vec::with_capacity(updates.len());
+    for update in updates.drain(..) {
+        if let Some(reject) = fetch_tag_clobber_rejection(store, &update)? {
+            eprintln!(
+                " ! [rejected]        {} -> {}  (would clobber existing tag)",
+                reject.0, reject.1
+            );
+            rejected_clobber = true;
+            continue;
+        }
+        retained.push(update);
+    }
+    *updates = retained;
+
     if options.write_fetch_head {
         if default_head_fetch
             && updates.len() == 1
@@ -815,7 +835,37 @@ fn finalize_fetch(
         .collect::<Vec<_>>();
     store.apply_bundle_ref_updates(&ref_updates, None)?;
     outcome.ref_updates = std::mem::take(updates);
+    if rejected_clobber {
+        return Err(GitError::Exit(1));
+    }
     Ok(())
+}
+
+/// If `update` would clobber an existing local tag (`refs/tags/*`) with a
+/// *different* object id and the refspec is not forced, return the abbreviated
+/// `(src, dst)` ref names for the rejection line; otherwise `None`. Mirrors git's
+/// fetch refusal to overwrite a tag without `+`/`--force`.
+fn fetch_tag_clobber_rejection(
+    store: &FileRefStore,
+    update: &FetchRefUpdate,
+) -> Result<Option<(String, String)>> {
+    if update.force {
+        return Ok(None);
+    }
+    let Some(dst) = update.dst.as_deref() else {
+        return Ok(None);
+    };
+    if !dst.starts_with("refs/tags/") {
+        return Ok(None);
+    }
+    match store.read_ref(dst)? {
+        Some(RefTarget::Direct(existing)) if existing != update.oid => {
+            let src_short = update.src.trim_start_matches("refs/tags/");
+            let dst_short = dst.trim_start_matches("refs/tags/");
+            Ok(Some((src_short.to_string(), dst_short.to_string())))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The remote's advertised `HEAD` symref target (`HEAD:<target>` capability).
@@ -1000,6 +1050,8 @@ pub fn append_reachable_auto_follow_tags(
             dst: Some(reference.name.clone()),
             oid: reference.oid,
             not_for_merge: true,
+            // Reachable auto-followed tags are never forced (see plan path).
+            force: false,
         });
     }
     followed.sort_by(|a, b| a.src.cmp(&b.src));

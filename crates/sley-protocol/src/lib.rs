@@ -82,6 +82,11 @@ pub struct FetchRefUpdate {
     pub dst: Option<String>,
     pub oid: ObjectId,
     pub not_for_merge: bool,
+    /// Whether the refspec that produced this update was force (`+`-prefixed or
+    /// `git fetch --force`). A non-forced update that would clobber an existing
+    /// local tag, or non-fast-forward an existing branch, is rejected at apply
+    /// time (git's `fetch` ref-store update rules).
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,6 +674,7 @@ pub fn plan_fetch_ref_updates(
                         dst: Some(dst),
                         oid: reference.oid,
                         not_for_merge: false,
+                        force: refspec.force,
                     });
                 }
             }
@@ -685,6 +691,7 @@ pub fn plan_fetch_ref_updates(
             dst: refspec.dst.as_deref().map(fetch_local_ref_name),
             oid: reference.oid,
             not_for_merge: false,
+            force: refspec.force,
         });
     }
     if auto_follow_tags && updates.iter().any(|update| update.dst.is_some()) {
@@ -704,6 +711,10 @@ pub fn plan_fetch_ref_updates(
                     dst: Some(reference.name.clone()),
                     oid: reference.oid,
                     not_for_merge: true,
+                    // Auto-followed tags are never forced: git skips an
+                    // auto-follow tag that already exists locally
+                    // (`retain_missing_auto_follow_tags`) rather than clobbering.
+                    force: false,
                 });
             }
         }
@@ -7644,6 +7655,7 @@ mod tests {
                 dst: Some("refs/remotes/origin/main".into()),
                 oid: main,
                 not_for_merge: false,
+                force: false,
             }]
         );
     }
@@ -7681,12 +7693,14 @@ mod tests {
                     dst: Some("refs/heads/main".into()),
                     oid: commit.clone(),
                     not_for_merge: false,
+                    force: false,
                 },
                 FetchRefUpdate {
                     src: "refs/tags/v1".into(),
                     dst: Some("refs/tags/v1".into()),
                     oid: commit.clone(),
                     not_for_merge: true,
+                    force: false,
                 },
             ]
         );
