@@ -233,6 +233,15 @@
 # t1401-symbolic-ref=25, t7004-tag=159, t3200-branch=117, t3301-notes=144,
 # t1300-config=497, t2400-worktree-add=165. No workspace test regressed (2203/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
+#
+# 2026-06-15 (wave/rebase-noff-reflog): `reflog show` now walks every reflog
+# entry in order (no reachability filter, no OID dedup) — matching upstream's
+# real, monotonic-reflog behavior — fixing the `rebase --no-ff`/`--force-rebase`
+# "do-the-work-vs-noop" reflog-growth assertions. t3432-rebase-fast-forward
+# 144->219 (full PASS bar the 6 known-breakage fork-point cells); side gain
+# t3404-rebase-interactive 36->39. Neighbors held (measured==floor): t3403=16,
+# t3418=11, t3420=30, t3406=9, t1400=175, t1500=81, t2020=16, t7102=37. No
+# workspace test regressed (2206/0).
 
 set -euo pipefail
 
@@ -285,13 +294,13 @@ declare -A FLOOR=(
     [t4205-log-pretty-formats.sh]=108
     [t4216-log-bloom.sh]=112
     [t5318-commit-graph.sh]=38
-    [t3432-rebase-fast-forward.sh]=144
+    [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=50
     [t4202-log.sh]=57
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
-    [t3404-rebase-interactive.sh]=36
+    [t3404-rebase-interactive.sh]=39
     [t3406-rebase-message.sh]=9
     [t3418-rebase-continue.sh]=11
     [t3420-rebase-autostash.sh]=30

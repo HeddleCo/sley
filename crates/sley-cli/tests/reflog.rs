@@ -67,10 +67,6 @@ fn run_success_with_identity_at(cwd: &Path, args: &[&str], date: &str) -> Vec<u8
     output.stdout
 }
 
-fn run_success_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run_success_with_identity_at(cwd, args, "1970-01-01T00:00:00 +0000")
-}
-
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     assert_eq!(
         actual.status.code(),
@@ -94,24 +90,20 @@ fn prepare_reflog_repo(root: &Path) {
         root,
         &["init", "-q", "-b", "main"],
     );
-    run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "one"]);
-    run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "two"]);
-    run_success(
-        sley_testkit::oracle_git(),
-        root,
-        &["branch", "topic", "HEAD~1"],
-    );
-    run_success(
-        sley_testkit::oracle_git(),
-        root,
-        &["checkout", "-q", "topic"],
-    );
-    run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "topic"]);
-    run_success(
-        sley_testkit::oracle_git(),
-        root,
-        &["checkout", "-q", "main"],
-    );
+    // Drive every reflog-writing operation (commits AND branch/checkout) with a
+    // strictly-increasing committer date. Real reflogs are monotonic — entries
+    // are appended over time — and `git reflog show` shows every entry in that
+    // order. The earlier helper mixed fixed-1970 commits with current-time
+    // checkouts, producing a *non-monotonic* reflog whose timestamps run
+    // backwards; upstream git only collapses entries in that pathological case,
+    // so testing against it asserted a degenerate behavior rather than the real
+    // "show all entries" contract.
+    run_success_with_identity_at(root, &["commit", "--allow-empty", "-qm", "one"], "@1700000000 +0000");
+    run_success_with_identity_at(root, &["commit", "--allow-empty", "-qm", "two"], "@1700000010 +0000");
+    run_success_with_identity_at(root, &["branch", "topic", "HEAD~1"], "@1700000020 +0000");
+    run_success_with_identity_at(root, &["checkout", "-q", "topic"], "@1700000030 +0000");
+    run_success_with_identity_at(root, &["commit", "--allow-empty", "-qm", "topic"], "@1700000040 +0000");
+    run_success_with_identity_at(root, &["checkout", "-q", "main"], "@1700000050 +0000");
 }
 
 fn prepare_drop_reflog_repo(root: &Path) {
