@@ -1151,22 +1151,59 @@ pub fn reject_non_fast_forward_pushes(
     command_forces: &[(ReceivePackCommand, bool)],
 ) -> Result<()> {
     for (command, force) in command_forces {
-        if *force
-            || !command.name.starts_with("refs/heads/")
-            || command.old_id.is_null()
-            || command.new_id.is_null()
-        {
+        // Forced updates, deletions, and creations (null old) are always allowed.
+        if *force || command.old_id.is_null() || command.new_id.is_null() {
             continue;
+        }
+        // Mirror git's set_ref_status_for_push (remote.c) reject ladder for an
+        // existing, non-forced, non-deleting update:
+        //   1. refs/tags/* — a tag is never fast-forwardable; any change to an
+        //      existing tag is REJECT_ALREADY_EXISTS.
+        //   2. old or new is not a commit (annotated tag, tree, blob) — we cannot
+        //      reason about fast-forwardness, so REJECT_NEEDS_FORCE.
+        //   3. otherwise the new commit must be a descendant of the old, else
+        //      REJECT_NONFASTFORWARD.
+        if command.name.starts_with("refs/tags/") {
+            let short = command.name.trim_start_matches("refs/tags/");
+            return Err(GitError::Command(format!(
+                "failed to push some refs: tag {short} already exists"
+            )));
+        }
+        if !object_is_commit(local_db, &command.old_id)?
+            || !object_is_commit(local_db, &command.new_id)?
+        {
+            let short = push_ref_short_name(&command.name);
+            return Err(GitError::Command(format!(
+                "failed to push some refs: update to {short} needs --force"
+            )));
         }
         let ancestors = ancestor_depths(local_db, format, &command.new_id)?;
         if !ancestors.contains_key(&command.old_id) {
-            let short = command.name.trim_start_matches("refs/heads/");
+            let short = push_ref_short_name(&command.name);
             return Err(GitError::Command(format!(
                 "failed to push some refs: non-fast-forward update to {short}"
             )));
         }
     }
     Ok(())
+}
+
+/// Whether `oid` names a commit object in `db` (git's
+/// `lookup_commit_reference_gently` with no tag-peeling — an annotated tag is
+/// *not* a commit here, which is exactly what makes a tag update need force).
+fn object_is_commit(db: &FileObjectDatabase, oid: &ObjectId) -> Result<bool> {
+    match db.read_object(oid) {
+        Ok(object) => Ok(object.object_type == ObjectType::Commit),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Short display name for a pushed ref (strip the most specific known prefix).
+fn push_ref_short_name(name: &str) -> &str {
+    name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .or_else(|| name.strip_prefix("refs/remotes/"))
+        .unwrap_or(name)
 }
 
 /// The depth of every commit reachable from `start` (a breadth-first ancestry

@@ -2694,8 +2694,29 @@ fn push_remote_and_refspecs(
             })?;
             Ok((remote.clone(), vec![branch]))
         }
-        [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
+        [remote, refspecs @ ..] => Ok((remote.clone(), expand_push_tag_refspecs(refspecs)?)),
     }
+}
+
+/// Expand git's `git push <remote> tag <name>` shorthand into the explicit
+/// `refs/tags/<name>:refs/tags/<name>` refspec, leaving every other refspec
+/// untouched. Mirrors `git fetch <remote> tag <name>` (already supported) and
+/// builtin/push.c's `tag` keyword handling. A bare `tag` with no following name
+/// is a usage error.
+fn expand_push_tag_refspecs(refspecs: &[String]) -> Result<Vec<String>> {
+    let mut expanded = Vec::with_capacity(refspecs.len());
+    let mut iter = refspecs.iter();
+    while let Some(spec) = iter.next() {
+        if spec == "tag" {
+            let name = iter.next().ok_or_else(|| {
+                GitError::Command("push: 'tag' shorthand requires a tag name".into())
+            })?;
+            expanded.push(format!("refs/tags/{name}:refs/tags/{name}"));
+        } else {
+            expanded.push(spec.clone());
+        }
+    }
+    Ok(expanded)
 }
 
 fn push_upstream_for_branch(config: &GitConfig, branch: &str) -> Option<(String, String)> {
