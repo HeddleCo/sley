@@ -312,6 +312,20 @@
 # t3404-rebase-interactive 36->39. Neighbors held (measured==floor): t3403=16,
 # t3418=11, t3420=30, t3406=9, t1400=175, t1500=81, t2020=16, t7102=37. No
 # workspace test regressed (2206/0).
+#
+# stash-on-merge wave (2026-06-15, wave/stash-on-merge): stash apply/pop rebuilt
+# on the 3-way merge engine (three_way_merge_trees over the stash base / current
+# index / stash working tree, mirroring git's merge_ort_nonrecursive in
+# builtin/stash.c) — apply no longer refuses dirty trees, content-conflicts
+# render real stage 1/2/3 + markers, and unstage_changes_unless_new / the
+# --index has_index path match git. Plus the bare-`n` stash selector and the
+# assumed-`push` dispatch guard. t3903-stash NEW floor @52 (was unfloored at 22,
+# enrolled in upstream-parity.yml). Side gain via autostash-on-merge:
+# t3420-rebase-autostash 30->33. Neighbors held (measured==floor): t7102-reset=37,
+# t7508-status=113, t3600-rm=50, t3418-rebase-continue=11. Perf (clean-tree
+# apply+pop, both binaries do real work): 0.073s branch vs 0.120s REF (faster —
+# the merge engine touches only changed paths vs the old full reset-to-commit).
+# No workspace test regressed (2241/0).
 
 set -euo pipefail
 
@@ -375,7 +389,7 @@ declare -A FLOOR=(
     [t3404-rebase-interactive.sh]=39
     [t3406-rebase-message.sh]=9
     [t3418-rebase-continue.sh]=11
-    [t3420-rebase-autostash.sh]=30
+    [t3420-rebase-autostash.sh]=33
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=133
@@ -406,6 +420,7 @@ declare -A FLOOR=(
     [t8002-blame.sh]=117
     [t8001-annotate.sh]=99
     [t8012-blame-colors.sh]=98
+    [t3903-stash.sh]=52
 )
 
 fail=0
