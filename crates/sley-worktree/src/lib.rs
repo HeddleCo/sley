@@ -7897,6 +7897,12 @@ pub fn remove_index_and_worktree_paths(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
+    // Stat cache for the local-modification check (git's `ie_match_stat`):
+    // proves a path unchanged from the cached stat without reading its blob, so
+    // a `git rm --cached` of an untouched path whose blob was removed still
+    // succeeds (cf. t1450-fsck cell 90). (`sley_index::IndexStatCache` is a
+    // distinct type from this crate's same-named probe helper above.)
+    let rm_stat_cache = sley_index::IndexStatCache::from_index(&index, &index_path);
     let Index {
         version: index_version,
         entries: index_entry_list,
@@ -8033,17 +8039,34 @@ pub fn remove_index_and_worktree_paths(
                 }
                 Err(err) => return Err(err.into()),
                 Ok(meta) if meta.is_dir() => continue,
-                Ok(_) => {
-                    let object =
-                        read_expected_object(&db, &index_entry.oid, ObjectType::Blob)?;
-                    let worktree_bytes = apply_clean_filter(
-                        worktree_root,
-                        git_dir,
-                        &config,
-                        path,
-                        &fs::read(&worktree_file)?,
-                    )?;
-                    worktree_bytes != object.body
+                Ok(meta) => {
+                    // git refreshes the index before `check_local_mod`, so a path
+                    // whose stat changed but whose content is unchanged is up to
+                    // date. We mirror that: a clean cached stat short-circuits to
+                    // "unchanged"; otherwise re-hash the (clean-filtered) worktree
+                    // content and compare to the index entry's *cached oid* (git's
+                    // refresh `hash_object`), NOT the stored blob. Comparing to the
+                    // oid — not the blob bytes — means a removed object does not
+                    // abort the check (the worktree may still hash to the cached
+                    // oid), so `git rm --cached` of a path whose blob was deleted
+                    // still succeeds.
+                    match rm_stat_cache.index_entry_worktree_stat_verdict(index_entry, &meta) {
+                        sley_index::StatVerdict::Clean => false,
+                        sley_index::StatVerdict::Dirty
+                        | sley_index::StatVerdict::RacyNeedsContentCheck => {
+                            let worktree_bytes = apply_clean_filter(
+                                worktree_root,
+                                git_dir,
+                                &config,
+                                path,
+                                &fs::read(&worktree_file)?,
+                            )?;
+                            let worktree_oid =
+                                EncodedObject::new(ObjectType::Blob, worktree_bytes)
+                                    .object_id(format)?;
+                            worktree_oid != index_entry.oid
+                        }
+                    }
                 }
             };
             // Is the index different from the HEAD commit? (Before the first

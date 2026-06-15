@@ -1025,15 +1025,24 @@ fn current_unix_seconds() -> i64 {
 }
 
 fn parse_reflog_expire_time(value: &str, option: &str) -> Result<i64> {
+    // git's `parse_expiry_date`: "never"/"false" never expire; "all"/"now" expire
+    // everything (TIME_MAX — by definition a reflog records only the past, so
+    // "now" means "drop it all").
     match value {
-        "all" => return Ok(i64::MAX),
-        "never" => return Ok(i64::MIN),
+        "all" | "now" => return Ok(i64::MAX),
+        "never" | "false" => return Ok(i64::MIN),
         _ => {}
     }
-    parse_reflog_expire_date(value).ok_or_else(|| {
-        eprintln!("fatal: invalid timestamp '{value}' given to '{option}'");
-        GitError::Exit(128)
-    })
+    // Try the strict explicit-timestamp parser first; fall back to git's fuzzy
+    // approxidate so relative forms ("2.weeks.ago", "yesterday", ...) work.
+    if let Some(ts) = parse_reflog_expire_date(value) {
+        return Ok(ts);
+    }
+    if let Some(ts) = crate::commands::approxidate::parse_approxidate(value) {
+        return Ok(ts);
+    }
+    eprintln!("fatal: invalid timestamp '{value}' given to '{option}'");
+    Err(GitError::Exit(128))
 }
 
 fn parse_reflog_expire_date(value: &str) -> Option<i64> {

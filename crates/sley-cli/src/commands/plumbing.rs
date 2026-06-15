@@ -1903,6 +1903,9 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // `--tags` restricts the root set to tags; `--root` additionally pins the
     // root tree(s). Both default off (a bare `git fsck` walks all refs).
     let mut only_tags = false;
+    // `--name-objects` annotates broken/missing-object reports with a path
+    // describing how the object is reached (e.g. an index entry `:file`).
+    let mut name_objects = false;
     let mut explicit_oids: Vec<String> = Vec::new();
     for arg in args {
         match arg.as_str() {
@@ -1915,11 +1918,12 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             "--strict" => strict = true,
             "--no-strict" => strict = false,
             "--tags" => only_tags = true,
+            "--name-objects" => name_objects = true,
+            "--no-name-objects" => name_objects = false,
             // These affect output/perf only; object-content checks are
             // unconditional in this implementation, so accept and ignore them.
-            "--full" | "--no-full" | "--connectivity-only" | "--name-objects"
-            | "--no-name-objects" | "--root" | "--cache" | "--no-cache" | "--lost-found"
-            | "--references" | "--no-references" => {}
+            "--full" | "--no-full" | "--connectivity-only" | "--root" | "--cache"
+            | "--no-cache" | "--lost-found" | "--references" | "--no-references" => {}
             value if value.starts_with("--") => {
                 return Err(GitError::Command(format!(
                     "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
@@ -1947,17 +1951,21 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // resolves each to an object; an explicit but unknown head reports
     // `invalid sha1 pointer` and does NOT fall back to all heads (t1450 "bogus
     // head" case), so the rest of the walk sees no roots.
-    let mut explicit_root_error = false;
-    let roots = if !explicit_oids.is_empty() {
+    //
+    // git's `snapshot_ref` validates every root ref before the walk:
+    //   - if the ref's object is not parseable: `error: <name>: invalid sha1
+    //     pointer <oid>` on stderr, sets ERROR_REACHABLE, and the ref is NOT
+    //     walked (so its referents never surface as dangling/missing);
+    //   - if the ref is a branch but its object is not a commit:
+    //     `error: <name>: not a commit`, sets ERROR_REFS.
+    // We collect named roots, run those checks, and pass only the valid tip
+    // oids to the connectivity walk.
+    let mut ref_error_bits = 0i32;
+    let named_roots: Vec<(String, ObjectId)> = if !explicit_oids.is_empty() {
         let mut resolved = Vec::new();
         for spec in &explicit_oids {
             match ObjectId::from_hex(format, spec) {
-                Ok(oid) if db.contains(&oid).unwrap_or(false) => resolved.push(oid),
-                Ok(oid) => {
-                    // An explicit head that does not name a stored object.
-                    eprintln!("error: {oid}: invalid sha1 pointer {oid}");
-                    explicit_root_error = true;
-                }
+                Ok(oid) => resolved.push((oid.to_hex(), oid)),
                 Err(_) => {
                     return Err(GitError::Command(format!("Invalid object name '{spec}'.")));
                 }
@@ -1969,6 +1977,24 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     } else {
         fsck_root_oids(&git_dir, format)?
     };
+
+    let mut roots = Vec::new();
+    for (name, oid) in &named_roots {
+        match db.read_object(oid) {
+            Ok(object) => {
+                // A branch ref must point at a commit.
+                if object.object_type != sley_object::ObjectType::Commit && is_branch_ref(name) {
+                    eprintln!("error: {name}: not a commit");
+                    ref_error_bits |= sley_fsck::ERROR_REFS;
+                }
+                roots.push(*oid);
+            }
+            Err(_) => {
+                eprintln!("error: {name}: invalid sha1 pointer {oid}");
+                ref_error_bits |= sley_fsck::ERROR_REACHABLE;
+            }
+        }
+    }
 
     // With explicit object-id roots, git checks only what is reachable from
     // them — it does not enumerate every loose object (so a removed-but-
@@ -2009,6 +2035,26 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     }
     let loose_errors = !bad_loose.is_empty();
     object_ids.retain(|oid| !bad_loose.contains(oid));
+
+    // git's `fsck_index`: with no explicit object args, the current worktree's
+    // index (and other worktrees') becomes a reachability root set. Each
+    // non-gitlink entry's blob is marked reachable; a missing one is reported as
+    // `missing blob <oid>` (annotated `(<index>:<name>)` under --name-objects),
+    // setting ERROR_REACHABLE. The cache-tree's recorded tree oids must each be
+    // valid trees, else `<oid>: invalid sha1 pointer in cache-tree of <index>`
+    // sets ERROR_REFS.
+    let mut index_error_bits = 0i32;
+    if explicit_oids.is_empty() {
+        index_error_bits |= fsck_index_roots(
+            &db,
+            format,
+            &git_dir,
+            name_objects,
+            &mut roots,
+            &bad_loose,
+        )?;
+    }
+
     if roots.is_empty() && progress {
         eprintln!("notice: No default references");
     }
@@ -2039,9 +2085,13 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // report contributes ERROR_OBJECT/REACHABLE/REFS; a bad loose object or a
     // bogus explicit head sets ERROR_OBJECT.
     let mut exit_bits = report.exit_code();
-    if loose_errors || explicit_root_error {
+    if loose_errors {
         exit_bits |= sley_fsck::ERROR_OBJECT;
     }
+    // git's `snapshot_ref` errors (invalid sha1 pointer / not a commit) set
+    // ERROR_REACHABLE / ERROR_REFS — not ERROR_OBJECT.
+    exit_bits |= ref_error_bits;
+    exit_bits |= index_error_bits;
     if exit_bits != 0 {
         Err(GitError::Exit(exit_bits))
     } else {
@@ -2049,8 +2099,8 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     }
 }
 
-/// Root oids restricted to `refs/tags/*` (for `git fsck --tags`).
-fn fsck_tag_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+/// Named root refs restricted to `refs/tags/*` (for `git fsck --tags`).
+fn fsck_tag_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<(String, ObjectId)>> {
     let store = FileRefStore::new(git_dir, format);
     let mut seen = HashSet::new();
     let mut roots = Vec::new();
@@ -2061,7 +2111,7 @@ fn fsck_tag_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Object
         if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
             && seen.insert(oid)
         {
-            roots.push(oid);
+            roots.push((reference.name.clone(), oid));
         }
     }
     Ok(roots)
@@ -2078,10 +2128,181 @@ fn fsck_objects_dir_display(git_dir: &Path, cwd: &Path) -> String {
     format!("{}/objects", git_dir.display())
 }
 
-fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+/// git's `is_branch`: a ref whose tip must be a commit (`HEAD` or `refs/heads/*`).
+fn is_branch_ref(name: &str) -> bool {
+    name == "HEAD" || name.starts_with("refs/heads/")
+}
+
+/// git's `fsck_index` for every worktree index: mark each entry's blob
+/// reachable (appending existing ones to `roots`), report a missing blob with
+/// git's `missing blob <oid>` line (annotated `(<index>:<name>)` under
+/// `--name-objects`), and validate the cache-tree's recorded tree oids. Returns
+/// the accumulated `ERROR_*` bits (REACHABLE for a missing index blob, REFS for
+/// an invalid cache-tree pointer).
+fn fsck_index_roots(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    git_dir: &Path,
+    name_objects: bool,
+    roots: &mut Vec<ObjectId>,
+    bad_loose: &HashSet<ObjectId>,
+) -> Result<i32> {
+    let mut bits = 0i32;
+    // The current worktree's index (annotation prefix ""), then each linked
+    // worktree's index (annotation prefix `<index-path>`), mirroring git's
+    // get_worktrees() order with the current worktree's blank filename.
+    let mut indexes: Vec<(PathBuf, bool, String)> = Vec::new();
+    let current_index = sley_worktree::repository_index_path(git_dir);
+    indexes.push((current_index, true, String::new()));
+    // Linked worktrees: <common_git_dir>/worktrees/<name>/index. Their reports
+    // carry the index path (relative to the cwd-rooted .git when possible).
+    if let Ok(common) = common_git_dir_for_git_dir(git_dir) {
+        let worktrees_dir = common.join("worktrees");
+        if let Ok(entries) = fs::read_dir(&worktrees_dir) {
+            let mut linked: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            linked.sort();
+            for wt in linked {
+                let index_path = wt.join("index");
+                if index_path.exists() {
+                    let display = fsck_index_display_path(git_dir, &index_path);
+                    indexes.push((index_path, false, display));
+                }
+            }
+        }
+    }
+
+    for (index_path, _is_current, annotation_prefix) in indexes {
+        if !index_path.exists() {
+            continue;
+        }
+        let index_bytes = fs::read(&index_path)?;
+        // git's `verify_hdr` (with verify_index_checksum set for a full/`--cache`
+        // fsck) rejects a bad trailing SHA: `error: bad index file sha1
+        // signature` + `fatal: index file corrupt`, setting ERROR_OBJECT.
+        if !index_checksum_ok(&index_bytes, format) {
+            eprintln!("error: bad index file sha1 signature");
+            eprintln!("fatal: index file corrupt");
+            bits |= sley_fsck::ERROR_OBJECT;
+            continue;
+        }
+        let index = match Index::parse(&index_bytes, format) {
+            Ok(index) => index,
+            Err(_) => continue,
+        };
+        for entry in &index.entries {
+            // git skips gitlinks (S_ISGITLINK) in the index walk.
+            if entry.mode == 0o160000 {
+                continue;
+            }
+            let oid = entry.oid.clone();
+            if db.contains(&oid).unwrap_or(false) && !bad_loose.contains(&oid) {
+                // Present: mark reachable so it is not reported as dangling.
+                roots.push(oid);
+                continue;
+            }
+            // Missing index blob. git: `missing blob <oid>` (stdout),
+            // ERROR_REACHABLE; `--name-objects` appends `(<prefix>:<name>)`.
+            if name_objects {
+                let name = String::from_utf8_lossy(entry.path.as_ref());
+                println!("missing blob {oid} ({annotation_prefix}:{name})");
+            } else {
+                println!("missing blob {oid}");
+            }
+            bits |= sley_fsck::ERROR_REACHABLE;
+        }
+        // Cache-tree: each recorded (non-invalidated) subtree oid must be a
+        // valid tree. git: `<oid>: invalid sha1 pointer in cache-tree of
+        // <index>` + ERROR_REFS for an unparseable pointer.
+        if let Ok(Some(cache_tree)) = index.cache_tree(format) {
+            bits |= fsck_cache_tree(db, &cache_tree, &index_path, roots);
+        }
+    }
+    Ok(bits)
+}
+
+/// Recursively validate a cache-tree node: a node with a valid (>=0) entry
+/// count records a tree oid that must resolve to a tree object. Appends valid
+/// tree oids to `roots` so they are marked reachable.
+fn fsck_cache_tree(
+    db: &FileObjectDatabase,
+    node: &sley_index::CacheTree,
+    index_path: &Path,
+    roots: &mut Vec<ObjectId>,
+) -> i32 {
+    let mut bits = 0i32;
+    if node.entry_count >= 0
+        && let Some(oid) = &node.oid
+    {
+        match db.read_object(oid) {
+            Ok(object) if object.object_type == sley_object::ObjectType::Tree => {
+                roots.push(oid.clone());
+            }
+            Ok(_) => {
+                // Present but not a tree: git's `non-tree in cache-tree`.
+                eprintln!("error in cache-tree of {}: non-tree", index_path.display());
+                bits |= sley_fsck::ERROR_OBJECT;
+            }
+            Err(_) => {
+                eprintln!(
+                    "error: {oid}: invalid sha1 pointer in cache-tree of {}",
+                    index_path.display()
+                );
+                bits |= sley_fsck::ERROR_REFS;
+            }
+        }
+    }
+    for child in &node.subtrees {
+        bits |= fsck_cache_tree(db, &child.tree, index_path, roots);
+    }
+    bits
+}
+
+/// Whether an index file's trailing hash matches the digest of its body, git's
+/// `verify_hdr` checksum check. A too-short file (no room for the trailing hash)
+/// is treated as a checksum failure.
+fn index_checksum_ok(bytes: &[u8], format: ObjectFormat) -> bool {
+    let hash_len = format.raw_len();
+    if bytes.len() < 12 + hash_len {
+        return false;
+    }
+    let split = bytes.len() - hash_len;
+    match sley_core::digest_bytes(format, &bytes[..split]) {
+        Ok(actual) => actual.as_bytes() == &bytes[split..],
+        Err(_) => false,
+    }
+}
+
+/// The path string git prints for a linked worktree's index in fsck reports:
+/// relative to the cwd-rooted `.git` when the index lives under it, else the
+/// absolute path.
+fn fsck_index_display_path(git_dir: &Path, index_path: &Path) -> String {
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(rel) = git_dir.strip_prefix(&cwd)
+        && let Ok(suffix) = index_path.strip_prefix(git_dir)
+    {
+        return format!("{}/{}", rel.display(), suffix.display());
+    }
+    index_path.display().to_string()
+}
+
+/// Named root refs for a full fsck: every ref (and HEAD), each as
+/// `(refname, target_oid)`. The driver validates each against git's
+/// `snapshot_ref` rules (parseable object, branch→commit) before walking.
+fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<(String, ObjectId)>> {
     let store = FileRefStore::new(git_dir, format);
     let mut seen = HashSet::new();
     let mut roots = Vec::new();
+    for reference in store.list_refs()? {
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+            && seen.insert(oid)
+        {
+            roots.push((reference.name.clone(), oid));
+        }
+    }
+    // git resolves HEAD after the ref iteration (its worktree-HEAD pass).
     if let Some(target) = store.read_ref("HEAD")? {
         let reference = Ref {
             name: "HEAD".to_string(),
@@ -2090,14 +2311,7 @@ fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>>
         if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
             && seen.insert(oid)
         {
-            roots.push(oid);
-        }
-    }
-    for reference in store.list_refs()? {
-        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
-            && seen.insert(oid)
-        {
-            roots.push(oid);
+            roots.push(("HEAD".to_string(), oid));
         }
     }
     Ok(roots)
