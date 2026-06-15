@@ -2869,11 +2869,20 @@ fn commit_partial_paths(
     // Stage the matched paths with the regular add machinery (clean filters,
     // mode bits) — partial commits update those index entries too.
     let config = read_repo_config(git_dir)?;
+    // Partial-commit staging applies one uniform mode (`--add --remove`) to
+    // every matched path, so stamp that mode onto each `UpdateIndexPath`.
+    let commit_mode = sley_worktree::UpdateIndexPathMode {
+        add: true,
+        remove: true,
+        force_remove: false,
+        info_only: false,
+        chmod: None,
+    };
     let ordered: Vec<sley_worktree::UpdateIndexPath> = rel_paths
         .iter()
         .map(|rel| sley_worktree::UpdateIndexPath {
             path: worktree_root.join(String::from_utf8_lossy(rel).as_ref()),
-            chmod: None,
+            mode: commit_mode,
         })
         .collect();
     sley_worktree::update_index_ordered_paths_filtered(

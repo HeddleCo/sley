@@ -108,6 +108,14 @@ pub enum IndexInfoRecord {
     Remove { path: Vec<u8> },
 }
 
+/// Batch-wide options for the `git add`-style callers that apply one uniform
+/// mode to every path. The positional `add`/`remove`/`force_remove`/`info_only`/
+/// `chmod` fields describe that uniform mode; `ignore_skip_worktree_entries` is
+/// a genuine whole-invocation toggle (it is not positional in git either).
+///
+/// `git update-index <flag> <path>...` does NOT use this for its per-path mode —
+/// it builds [`UpdateIndexPath`] values directly, each carrying the sticky mode
+/// in effect when that path was parsed. See [`UpdateIndexPath`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateIndexOptions {
     pub add: bool,
@@ -118,18 +126,50 @@ pub struct UpdateIndexOptions {
     pub ignore_skip_worktree_entries: bool,
 }
 
+impl UpdateIndexOptions {
+    /// The uniform per-path mode this batch applies to every path.
+    fn path_mode(&self) -> UpdateIndexPathMode {
+        UpdateIndexPathMode {
+            add: self.add,
+            remove: self.remove,
+            force_remove: self.force_remove,
+            info_only: self.info_only,
+            chmod: self.chmod,
+        }
+    }
+}
+
 /// A single positional path passed to `update-index`, together with the
-/// `--chmod` state that was active at the point the path was seen on the
-/// command line. git applies `--chmod=(+|-)x` as a stateful flag that affects
-/// every *subsequent* path until overridden, so `--chmod=+x A --chmod=-x B`
-/// flips A executable and B non-executable. Each path also reports its action
+/// *mode* that was active at the point the path was seen on the command line.
+///
+/// git's `update-index` processes argv left-to-right with `parse_options_step`
+/// (`PARSE_OPT_STOP_AT_NON_OPTION`): the mode flags `--add`/`--remove`/
+/// `--force-remove`/`--info-only`/`--chmod` set sticky global state, and each
+/// non-option path is handed to `update_one()` under whatever state is in
+/// effect *at that point*. So `--add foo --force-remove bar` ADDs `foo` and
+/// FORCE-REMOVEs `bar` — the flags are positional, not global. We mirror that
+/// by snapshotting the mode onto each path as it is parsed, rather than
+/// applying one batch-wide `UpdateIndexOptions` to every path.
+///
+/// `--chmod=(+|-)x` is likewise sticky (`--chmod=+x A --chmod=-x B` flips A
+/// executable and B non-executable). Each path reports its action
 /// (`add '<p>'`, `remove '<p>'`, `chmod (+|-)x '<p>'`) inline under `--verbose`,
-/// interleaved in command-line order — which is why the chmod state must travel
-/// with the path rather than as a single batch-wide flag.
+/// interleaved in command-line order — which is why the mode must travel with
+/// the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpdateIndexPathMode {
+    pub add: bool,
+    pub remove: bool,
+    pub force_remove: bool,
+    pub info_only: bool,
+    /// `--chmod=+x` → `Some(true)`, `--chmod=-x` → `Some(false)`, else `None`.
+    pub chmod: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateIndexPath {
     pub path: PathBuf,
-    pub chmod: Option<bool>,
+    pub mode: UpdateIndexPathMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -717,7 +757,7 @@ pub fn update_index_paths_with_index(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
-    let ordered = ordered_paths_from_plain(paths, options.chmod);
+    let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
@@ -730,12 +770,17 @@ pub fn update_index_paths_with_index(
     )
 }
 
-fn ordered_paths_from_plain(paths: &[PathBuf], chmod: Option<bool>) -> Vec<UpdateIndexPath> {
+/// Stamp a single uniform mode (from a batch-wide [`UpdateIndexOptions`]) onto
+/// every path. Used by the `git add`-style callers that genuinely apply one
+/// mode to all paths; the positional `git update-index <flag> <path>...` path
+/// instead snapshots a distinct mode per path in the CLI parse walk.
+fn ordered_paths_from_plain(paths: &[PathBuf], options: UpdateIndexOptions) -> Vec<UpdateIndexPath> {
+    let mode = options.path_mode();
     paths
         .iter()
         .map(|path| UpdateIndexPath {
             path: path.clone(),
-            chmod,
+            mode,
         })
         .collect()
 }
@@ -852,7 +897,7 @@ pub fn update_index_paths_filtered_with_index(
     options: UpdateIndexOptions,
     config: &GitConfig,
 ) -> Result<UpdateIndexResult> {
-    let ordered = ordered_paths_from_plain(paths, options.chmod);
+    let ordered = ordered_paths_from_plain(paths, options);
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
@@ -1507,7 +1552,12 @@ fn update_index_paths_impl(
     let mut reports: Vec<String> = Vec::new();
     for update_path in paths {
         let path = &update_path.path;
-        let path_chmod = update_path.chmod;
+        // Each path carries the sticky mode that was in effect when it was
+        // parsed on the command line (git processes argv left-to-right). Read
+        // the action from the path's own mode, NOT a batch-wide flag, so
+        // `--add foo --force-remove bar` adds foo and force-removes bar.
+        let path_mode = update_path.mode;
+        let path_chmod = path_mode.chmod;
         let absolute = if path.is_absolute() {
             path.clone()
         } else {
@@ -1517,7 +1567,7 @@ fn update_index_paths_impl(
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
         let git_path = git_path_bytes(relative)?;
-        if options.force_remove {
+        if path_mode.force_remove {
             remove_index_entries_with_path(&mut index.entries, &git_path);
             // git's update_one() reports `remove` for a --force-remove path.
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
@@ -1528,7 +1578,7 @@ fn update_index_paths_impl(
             .iter()
             .any(index_entry_skip_worktree)
         {
-            if options.remove && !options.ignore_skip_worktree_entries {
+            if path_mode.remove && !options.ignore_skip_worktree_entries {
                 index.entries.drain(existing_range);
             }
             continue;
@@ -1546,7 +1596,7 @@ fn update_index_paths_impl(
             Err(err) => return Err(err.into()),
         };
         let Some(metadata) = symlink_metadata else {
-            if options.remove {
+            if path_mode.remove {
                 remove_index_entries_with_path(&mut index.entries, &git_path);
                 // git's update_one() unconditionally reports `add '<path>'`
                 // after process_path(), even when the missing file was removed
@@ -1557,7 +1607,7 @@ fn update_index_paths_impl(
             print_update_index_path_error(&git_path, "does not exist and --remove not passed");
             return Err(GitError::Exit(128));
         };
-        if !options.add && index_entries_path_range(&index.entries, &git_path).is_empty() {
+        if !path_mode.add && index_entries_path_range(&index.entries, &git_path).is_empty() {
             print_update_index_path_error(
                 &git_path,
                 "cannot add to the index - missing --add option?",
@@ -1637,7 +1687,7 @@ fn update_index_paths_impl(
             }
         };
         let object = EncodedObject::new(ObjectType::Blob, body);
-        let oid = if options.info_only {
+        let oid = if path_mode.info_only {
             object.object_id(format)?
         } else {
             odb.write_object(object)?

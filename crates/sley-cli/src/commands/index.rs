@@ -1236,8 +1236,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut allow_no_input = false;
     let mut show_index_version = false;
     let mut paths = Vec::new();
-    // chmod state captured per positional path, in lockstep with `paths`.
-    let mut path_chmods: Vec<Option<bool>> = Vec::new();
+    // The sticky mode (`--add`/`--remove`/`--force-remove`/`--info-only`/
+    // `--chmod`) in effect when each positional path was parsed, in lockstep
+    // with `paths`. git processes argv left-to-right and applies whatever mode
+    // is current to each path as it is seen, so `--add foo --force-remove bar`
+    // adds foo and force-removes bar — the flags are positional, not global.
+    let mut path_modes: Vec<sley_worktree::UpdateIndexPathMode> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
         if stdin || index_info {
@@ -1249,7 +1253,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         if positional_only {
             if !ignore_paths_after_unresolve {
                 paths.push(PathBuf::from(arg));
-                path_chmods.push(chmod);
+                path_modes.push(sley_worktree::UpdateIndexPathMode {
+                    add,
+                    remove,
+                    force_remove,
+                    info_only,
+                    chmod,
+                });
             }
             idx += 1;
             continue;
@@ -1453,7 +1463,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             value => {
                 if !ignore_paths_after_unresolve {
                     paths.push(PathBuf::from(value));
-                    path_chmods.push(chmod);
+                    path_modes.push(sley_worktree::UpdateIndexPathMode {
+                        add,
+                        remove,
+                        force_remove,
+                        info_only,
+                        chmod,
+                    });
                 }
             }
         }
@@ -1464,12 +1480,19 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         io::stdin().read_to_end(&mut input)?;
         if stdin {
             let stdin_paths = update_index_stdin_paths(&input, nul);
-            // Keep `path_chmods` in lockstep with `paths`: stdin paths inherit
-            // the chmod state in effect at the `--stdin` flag (git applies
-            // set_executable_bit to stdin paths too). Without this the later
-            // `paths`/`path_chmods` zip would truncate and silently drop the
-            // stdin paths.
-            path_chmods.extend(std::iter::repeat_n(chmod, stdin_paths.len()));
+            // Keep `path_modes` in lockstep with `paths`: stdin paths inherit
+            // the sticky mode in effect at the `--stdin` flag (git applies the
+            // current add/remove/force_remove/info_only + set_executable_bit to
+            // every stdin path too). Without this the later `paths`/`path_modes`
+            // zip would truncate and silently drop the stdin paths.
+            let stdin_mode = sley_worktree::UpdateIndexPathMode {
+                add,
+                remove,
+                force_remove,
+                info_only,
+                chmod,
+            };
+            path_modes.extend(std::iter::repeat_n(stdin_mode, stdin_paths.len()));
             paths.extend(stdin_paths);
         } else {
             let cwd = env::current_dir()?;
@@ -1536,13 +1559,15 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             }
         })
         .collect::<Vec<_>>();
-    // Pair each resolved path with the `--chmod` state active when it was
-    // parsed, preserving command-line order for the staging branch below.
+    // Pair each resolved path with the sticky mode active when it was parsed,
+    // preserving command-line order for the staging branch below. The mode
+    // (add/remove/force-remove/info-only/chmod) is positional in git, so it
+    // must travel with each path rather than be applied batch-wide.
     let ordered_paths = resolved_paths
         .iter()
         .cloned()
-        .zip(path_chmods.iter().copied())
-        .map(|(path, chmod)| sley_worktree::UpdateIndexPath { path, chmod })
+        .zip(path_modes.iter().copied())
+        .map(|(path, mode)| sley_worktree::UpdateIndexPath { path, mode })
         .collect::<Vec<_>>();
     if refresh {
         sley_worktree::refresh_index_paths(
@@ -1622,14 +1647,16 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             git_dir.clone(),
             format,
             &ordered_paths,
+            // The positional mode (add/remove/force_remove/info_only/chmod) is
+            // now carried per-path in `ordered_paths`; only the genuinely
+            // whole-invocation `ignore_skip_worktree_entries` is read off the
+            // batch options here.
             sley_worktree::UpdateIndexOptions {
-                add,
-                remove,
-                force_remove,
-                // chmod is now carried per-path in `ordered_paths`; the batch
-                // option is unused on this branch.
+                add: false,
+                remove: false,
+                force_remove: false,
                 chmod: None,
-                info_only,
+                info_only: false,
                 ignore_skip_worktree_entries,
             },
             &config,
