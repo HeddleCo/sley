@@ -68,6 +68,7 @@ fn run_capture(args: &[&str], stdin_bytes: Option<&[u8]>) -> io::Result<Vec<u8>>
 struct Hunk {
     old_offset: i64,
     old_count: i64,
+    new_offset: i64,
     new_count: i64,
     /// Text after the second `@@` on the header line (function context),
     /// including the trailing newline.
@@ -194,7 +195,7 @@ fn parse_git_header_path(line: &str) -> String {
 /// and the index of the line after it.
 fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
     let header = lines[start];
-    let (old_offset, old_count, new_count, heading) = parse_hunk_header(header);
+    let (old_offset, old_count, new_offset, new_count, heading) = parse_hunk_header(header);
     let mut body = Vec::new();
     let mut i = start + 1;
     while i < lines.len() {
@@ -219,6 +220,7 @@ fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
         Hunk {
             old_offset,
             old_count,
+            new_offset,
             new_count,
             heading,
             body,
@@ -230,7 +232,7 @@ fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
 }
 
 /// Parse `@@ -A,B +C,D @@ heading`. Counts default to 1 when omitted.
-fn parse_hunk_header(line: &str) -> (i64, i64, i64, String) {
+fn parse_hunk_header(line: &str) -> (i64, i64, i64, i64, String) {
     // After "@@ -" ... " @@" optional heading.
     let rest = line.strip_prefix("@@ -").unwrap_or(line);
     let end = rest.find(" @@").unwrap_or(rest.len());
@@ -243,8 +245,8 @@ fn parse_hunk_header(line: &str) -> (i64, i64, i64, String) {
     // ranges: "A,B +C,D"
     let mut parts = ranges.split(" +");
     let (old_off, old_cnt) = parse_range(parts.next().unwrap_or(""));
-    let (_new_off, new_cnt) = parse_range(parts.next().unwrap_or(""));
-    (old_off, old_cnt, new_cnt, heading)
+    let (new_off, new_cnt) = parse_range(parts.next().unwrap_or(""));
+    (old_off, old_cnt, new_off, new_cnt, heading)
 }
 
 fn parse_range(s: &str) -> (i64, i64) {
@@ -417,6 +419,9 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
     let mut rendered: Option<usize> = None;
     let mut pending_err: Option<String> = None;
 
+    // The file's diff header (`diff --git ...`) is printed exactly once on entry.
+    render_file_header(fd);
+
     loop {
         let nr = fd.hunks.len();
         // If a prior y/n advanced past the end with no undecided hunk left,
@@ -477,7 +482,12 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
 
         let line = match read_line(stdin) {
             Some(l) => l,
-            None => return Ok(()),
+            None => {
+                // On EOF at the prompt git terminates the line it was waiting on
+                // with a newline, so the captured output ends in `...]? \n`.
+                println!();
+                return Ok(());
+            }
         };
         if line.is_empty() {
             continue;
@@ -589,7 +599,9 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
                         }
                     }
                     'g' => {
-                        if let Some(target) = parse_goto(&answer, fd, stdin, &mut pending_err) {
+                        if let Some(target) =
+                            parse_goto(&answer, fd, hunk_index, stdin, &mut pending_err)
+                        {
                             hunk_index = target;
                             rendered = None;
                         }
@@ -679,25 +691,98 @@ fn dec_mod(i: usize, n: usize) -> usize {
     if i == 0 { n - 1 } else { i - 1 }
 }
 
+const SUMMARY_HEADER_WIDTH: usize = 20;
+const SUMMARY_LINE_WIDTH: usize = 80;
+const DISPLAY_HUNKS_LINES: usize = 20;
+
+/// `summarize_hunk`: ` -A,B +C,D ` padded to SUMMARY_HEADER_WIDTH, then the
+/// first non-context body line (truncated to SUMMARY_LINE_WIDTH), newline-
+/// terminated.
+fn summarize_hunk(h: &Hunk) -> String {
+    let mut s = format!(
+        " -{},{} +{},{} ",
+        h.old_offset, h.old_count, h.new_offset, h.new_count
+    );
+    if s.len() < SUMMARY_HEADER_WIDTH {
+        s.push_str(&" ".repeat(SUMMARY_HEADER_WIDTH - s.len()));
+    }
+    // First non-context line.
+    if let Some(line) = h.body.iter().find(|l| !l.starts_with(' ')) {
+        s.push_str(line);
+    }
+    if s.len() > SUMMARY_LINE_WIDTH {
+        s.truncate(SUMMARY_LINE_WIDTH);
+    }
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// `display_hunks`: print the use-marked numbered summaries for the window
+/// [start, start+DISPLAY_HUNKS_LINES). Returns the end index reached.
+fn display_hunks(fd: &FileDiff, start: usize) -> usize {
+    let end = (start + DISPLAY_HUNKS_LINES).min(fd.hunks.len());
+    for (idx, h) in fd.hunks.iter().enumerate().take(end).skip(start) {
+        let marker = match h.use_hunk {
+            HunkUse::Use => '+',
+            HunkUse::Skip => '-',
+            HunkUse::Undecided => ' ',
+        };
+        print!("{marker}{:2}: {}", idx + 1, summarize_hunk(h));
+    }
+    end
+}
+
 fn parse_goto(
     answer: &str,
     fd: &FileDiff,
+    cur: usize,
     stdin: &mut impl BufRead,
     err: &mut Option<String>,
 ) -> Option<usize> {
-    // "g" alone prompts; "g N" or "gN" gives the target.
-    let arg = answer[1..].trim();
-    let n: Option<usize> = if arg.is_empty() {
-        print!("go to which hunk? ");
-        let _ = io::stdout().flush();
-        read_line(stdin).and_then(|l| l.trim().parse().ok())
+    // "g N" / "gN" carry the target inline; bare "g" prints the hunk list and
+    // prompts "go to which hunk?".
+    let arg = answer[1..].trim().to_string();
+    let response = if arg.is_empty() {
+        // Display a window centered on the current hunk, then prompt.
+        let mut start = cur.saturating_sub(DISPLAY_HUNKS_LINES / 2);
+        let mut got = String::new();
+        loop {
+            let end = display_hunks(fd, start);
+            if end < fd.hunks.len() {
+                print!("go to which hunk (<ret> to see more)? ");
+            } else {
+                print!("go to which hunk? ");
+            }
+            let _ = io::stdout().flush();
+            match read_line(stdin) {
+                Some(l) => {
+                    let t = l.trim().to_string();
+                    if t.is_empty() {
+                        start = end;
+                        continue;
+                    }
+                    got = t;
+                    break;
+                }
+                None => return None,
+            }
+        }
+        got
     } else {
-        arg.parse().ok()
+        arg
     };
-    match n {
-        Some(num) if num >= 1 && num <= fd.hunks.len() => Some(num - 1),
-        _ => {
-            *err = Some("Sorry, only 1 hunk available.\n".to_string());
+    match response.parse::<usize>() {
+        Ok(num) if num >= 1 && num <= fd.hunks.len() => Some(num - 1),
+        Ok(_) => {
+            let n = fd.hunks.len();
+            let word = if n == 1 { "hunk" } else { "hunks" };
+            *err = Some(format!("Sorry, only {n} {word} available.\n"));
+            None
+        }
+        Err(_) => {
+            *err = Some(format!("Invalid number: '{response}'\n"));
             None
         }
     }
@@ -744,11 +829,6 @@ fn regex_lite_compile(pat: &str) -> Option<LiteRe> {
 fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
     // Print the file diff header before the FIRST hunk's render only once per
     // session; git prints the header before the first hunk of each file.
-    if hunk_index == 0 {
-        for h in &fd.header {
-            println!("{h}");
-        }
-    }
     let h = &fd.hunks[hunk_index];
     println!("{}", format_hunk_header(h, 0));
     for line in &h.body {
@@ -756,10 +836,18 @@ fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
     }
 }
 
+/// Print the file's diff header (the `diff --git ...` block up to the first
+/// `@@`). git emits this exactly once, when the file is first entered.
+fn render_file_header(fd: &FileDiff) {
+    for h in &fd.header {
+        println!("{h}");
+    }
+}
+
 /// Format a `@@ -A,B +C,D @@<heading>` header, applying `delta` to the new
 /// offset (used when reassembling a partial patch).
 fn format_hunk_header(h: &Hunk, delta: i64) -> String {
-    let new_offset = h.old_offset + delta;
+    let new_offset = h.new_offset + delta;
     let old = format_range(h.old_offset, h.old_count);
     let new = format_range(new_offset, h.new_count);
     if h.heading.is_empty() {
@@ -777,12 +865,134 @@ fn format_range(offset: i64, count: i64) -> String {
     }
 }
 
-/// Split a hunk into its sub-hunks. Returns the number of resulting hunks.
-fn split_hunk(fd: &FileDiff, _hunk_index: usize) -> usize {
-    // For now a faithful body-split is deferred; report the splittable count so
-    // the prompt count is consistent. The full split implementation is large;
-    // this keeps the REPL responsive without corrupting the patch.
-    fd.hunks[_hunk_index].splittable_into
+/// Number of leading context lines in a sub-hunk body (counts only ` `-marked
+/// lines before the first change line).
+fn leading_context_len(piece: &[String]) -> i64 {
+    let mut n = 0i64;
+    for l in piece {
+        match l.as_bytes().first().copied().unwrap_or(b' ') {
+            b' ' => n += 1,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// Split the hunk at `hunk_index` into its constituent sub-hunks in place,
+/// recomputing each sub-hunk's `@@` offsets/counts. Returns the number of
+/// resulting hunks. Mirrors add-patch.c's `split_hunk`: a new sub-hunk begins
+/// at the first context line following a run of `+`/`-` lines, and the trailing
+/// context of one sub-hunk is shared (overlapped) as the leading context of the
+/// next so each piece applies independently.
+fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
+    let h = &fd.hunks[hunk_index];
+    if h.splittable_into < 2 {
+        return 1;
+    }
+    let body = h.body.clone();
+    let heading = h.heading.clone();
+    let old_start = h.old_offset;
+    let new_start = h.new_offset;
+
+    // Identify the split points: an index in `body` where a context line begins
+    // a new piece (i.e. it follows a change line). The new piece's leading
+    // context overlaps with the previous piece's trailing context.
+    //
+    // We accumulate lines into the current piece; when we are *in* a change run
+    // and hit a context line, we close the current piece at the END of its
+    // trailing context and the next piece starts at the FIRST trailing-context
+    // line.
+    // git shares the context block between adjacent sub-hunks: the trailing
+    // context of piece N is also the leading context of piece N+1. We detect the
+    // boundary as the first change line that arrives *after* a context run which
+    // itself followed a change run. At that point the previous piece is closed
+    // (including the shared context), and the new piece is seeded with that same
+    // context block.
+    let mut pieces: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut marker = b'@';
+    // Index in `current` where the current trailing-context block began.
+    let mut ctx_start_in_current: Option<usize> = None;
+    let mut seen_change_in_current = false;
+
+    for line in &body {
+        let ch = line.as_bytes().first().copied().unwrap_or(b' ');
+        let norm = if ch == b'\\' { marker } else { ch };
+
+        // Entering a context run right after a change run: record where it began.
+        if (marker == b'-' || marker == b'+') && norm == b' ' {
+            ctx_start_in_current = Some(current.len());
+        }
+        // A new change line after a recorded trailing-context block: close the
+        // current piece (it already contains the full shared context), and start
+        // the next piece seeded with that shared context block.
+        if (norm == b'-' || norm == b'+') && seen_change_in_current {
+            if let Some(cut) = ctx_start_in_current.take() {
+                let shared: Vec<String> = current[cut..].to_vec();
+                pieces.push(std::mem::take(&mut current));
+                current = shared;
+                seen_change_in_current = false;
+            }
+        }
+        if norm == b'-' || norm == b'+' {
+            seen_change_in_current = true;
+            ctx_start_in_current = None;
+        }
+        current.push(line.clone());
+        if norm != b'\\' {
+            marker = norm;
+        }
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+
+    // Recompute each piece's header. Because adjacent pieces SHARE a context
+    // block (the trailing context of one is the leading context of the next),
+    // the next piece's offset must back up by the length of that shared leading
+    // context — otherwise the overlapped lines would be counted twice in the
+    // running offset.
+    let mut new_hunks = Vec::new();
+    let mut old_cursor = old_start;
+    let mut new_cursor = new_start;
+    for (pi, piece) in pieces.iter().enumerate() {
+        let mut old_count = 0i64;
+        let mut new_count = 0i64;
+        for l in piece {
+            match l.as_bytes().first().copied().unwrap_or(b' ') {
+                b' ' => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                b'-' => old_count += 1,
+                b'+' => new_count += 1,
+                _ => {}
+            }
+        }
+        // For pieces after the first, subtract the leading shared context length
+        // from the running cursors so the offset lands on the shared line.
+        if pi > 0 {
+            let lead_ctx = leading_context_len(piece);
+            old_cursor -= lead_ctx;
+            new_cursor -= lead_ctx;
+        }
+        new_hunks.push(Hunk {
+            old_offset: old_cursor,
+            old_count,
+            new_offset: new_cursor,
+            new_count,
+            heading: heading.clone(),
+            body: piece.clone(),
+            use_hunk: HunkUse::Undecided,
+            splittable_into: 1,
+        });
+        old_cursor += old_count;
+        new_cursor += new_count;
+    }
+    let n = new_hunks.len();
+    // Replace the single hunk with the pieces.
+    fd.hunks.splice(hunk_index..hunk_index + 1, new_hunks);
+    n
 }
 
 /// Apply the USE_HUNK hunks of one file to the index.
