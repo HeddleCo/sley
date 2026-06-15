@@ -1,6 +1,6 @@
 [package]
 name = "sley-remote"
-version = "0.0.1"
+version = "0.0.2"
 description = "Callable fetch, push, clone, and ls-remote orchestration over the sley transport and object stack."
 repository.workspace = true
 edition.workspace = true
@@ -17,18 +17,18 @@ tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 
 [dependencies]
-sley-config = { path = "../sley-config", version = "0.0.1" }
-sley-core = { path = "../sley-core", version = "0.0.1" }
-sley-fetch = { path = "../sley-fetch", version = "0.0.1" }
-sley-formats = { path = "../sley-formats", version = "0.0.1" }
-sley-object = { path = "../sley-object", version = "0.0.1" }
-sley-odb = { path = "../sley-odb", version = "0.0.1" }
-sley-pack = { path = "../sley-pack", version = "0.0.1" }
-sley-protocol = { path = "../sley-protocol", version = "0.0.1" }
-sley-refs = { path = "../sley-refs", version = "0.0.1" }
-sley-rev = { path = "../sley-rev", version = "0.0.1" }
-sley-transport = { path = "../sley-transport", version = "0.0.1", default-features = false }
-sley-worktree = { path = "../sley-worktree", version = "0.0.1" }
+sley-config = { path = "../sley-config", version = "0.0.2" }
+sley-core = { path = "../sley-core", version = "0.0.2" }
+sley-fetch = { path = "../sley-fetch", version = "0.0.2" }
+sley-formats = { path = "../sley-formats", version = "0.0.2" }
+sley-object = { path = "../sley-object", version = "0.0.2" }
+sley-odb = { path = "../sley-odb", version = "0.0.2" }
+sley-pack = { path = "../sley-pack", version = "0.0.2" }
+sley-protocol = { path = "../sley-protocol", version = "0.0.2" }
+sley-refs = { path = "../sley-refs", version = "0.0.2" }
+sley-rev = { path = "../sley-rev", version = "0.0.2" }
+sley-transport = { path = "../sley-transport", version = "0.0.2", default-features = false }
+sley-worktree = { path = "../sley-worktree", version = "0.0.2" }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "sley-pathspec"
-version = "0.0.1"
+version = "0.0.2"
 description = "Byte-faithful port of Git's wildmatch engine and pathspec magic parser for the sley engine."
 repository.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.0.1" }
+sley-core = { path = "../sley-core", version = "0.0.2" }
 
 [lints]
 workspace = true

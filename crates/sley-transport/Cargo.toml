@@ -1,6 +1,6 @@
 [package]
 name = "sley-transport"
-version = "0.0.1"
+version = "0.0.2"
 description = "Smart-HTTP and git-protocol transport request/response codecs for the sley engine."
 repository.workspace = true
 edition.workspace = true
@@ -15,8 +15,8 @@ tls-native-tls = ["http-client", "ureq/native-tls"]
 tls-platform-verifier = ["http-client", "ureq/rustls", "ureq/platform-verifier"]
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.0.1" }
-sley-protocol = { path = "../sley-protocol", version = "0.0.1" }
+sley-core = { path = "../sley-core", version = "0.0.2" }
+sley-protocol = { path = "../sley-protocol", version = "0.0.2" }
 # gzip is required for smart-HTTP; TLS features are forwarded separately above.
 ureq = { version = "3.3.0", optional = true, default-features = false, features = ["gzip"] }
 
