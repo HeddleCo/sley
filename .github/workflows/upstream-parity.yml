@@ -173,6 +173,9 @@ jobs:
             t7506-status-submodule.sh
             t7508-status.sh
             t7810-grep.sh
+            t8001-annotate.sh
+            t8002-blame.sh
+            t8012-blame-colors.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.

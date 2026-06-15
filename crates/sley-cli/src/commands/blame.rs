@@ -54,12 +54,19 @@ enum DateField {
     Raw,
 }
 
+/// Positional arguments to `git blame`, before rev-vs-path disambiguation
+/// (which needs the repository to test whether a token names a revision).
+struct BlamePositionals {
+    /// Positionals seen before any `--`.
+    bare: Vec<String>,
+    /// Paths seen after `--` (these are always paths, never revisions).
+    after_dd: Vec<String>,
+}
+
 /// Parsed `git blame` invocation.
 struct BlameOptions {
-    /// Optional starting revision; `None` means `HEAD`.
-    rev: Option<String>,
-    /// The (cwd-relative) path to blame.
-    path: String,
+    /// Raw positionals; resolved into (rev, path) in `run_blame`.
+    positionals: BlamePositionals,
     /// Show the full object name instead of an abbreviation (`-l`).
     long_sha: bool,
     /// Suppress the author and date columns (`-s`).
@@ -74,6 +81,18 @@ struct BlameOptions {
     abbrev_override: Option<usize>,
     /// Line ranges requested with `-L`; empty means the whole file.
     ranges: Vec<RawRange>,
+    /// Follow only the first parent of merges (`--first-parent`).
+    first_parent: bool,
+    /// Emit `git annotate`-compatible output (`-c`, or the `annotate` command):
+    /// `<hex>\t(<author>\t<date>\t<lineno>)<content>`, no boundary `^`.
+    compat: bool,
+    /// `-b`: blank out the object name of boundary commits (render the hex
+    /// column as spaces instead of `^`+hash).
+    blank_boundary: bool,
+    /// Whether the author column (`-e`/`--show-email`/`--no-show-email`) was set
+    /// on the command line; if not, `blame.showEmail` config supplies the
+    /// default.
+    author_field_explicit: bool,
 }
 
 /// A `-L` argument before it is resolved against the file's line count.
@@ -88,8 +107,16 @@ enum RangeBound {
     Omitted,
     /// An absolute 1-based line number.
     Absolute(usize),
-    /// A relative offset from the other bound (`+N`), only valid as the end.
+    /// A forward relative offset from the start (`+N`), only valid as the end:
+    /// end = start + N - 1.
     Relative(usize),
+    /// A backward relative offset from the start (`-N`), only valid as the end:
+    /// end = start - N (git's `-L X,-N`, which yields a reversed span).
+    RelativeNeg(usize),
+    /// A `/regex/` bound: the first line matching `pattern` at or after the
+    /// search anchor (the previous range's end + 1, or line 1 when
+    /// `absolute`). `^/regex/` forces the absolute anchor.
+    Regex { pattern: String, absolute: bool },
 }
 
 /// The blame result for a single final-image line.
@@ -103,8 +130,24 @@ struct LineBlame {
 }
 
 pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
-    let options = match parse_blame_args(args)? {
-        BlameArgs::Run(options) => options,
+    run_blame(args, false)
+}
+
+/// `git annotate` — `git blame` with the annotate-compatible output mode forced
+/// on (equivalent to `git blame -c`). Shares all of blame's parsing and the
+/// scoreboard; only the output format differs.
+pub(crate) fn cmd_annotate(args: &[String]) -> Result<()> {
+    run_blame(args, true)
+}
+
+fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
+    let mut options = match parse_blame_args(args)? {
+        BlameArgs::Run(mut options) => {
+            if force_compat {
+                options.compat = true;
+            }
+            options
+        }
         BlameArgs::Help => {
             print!("{BLAME_USAGE}");
             return Ok(());
@@ -117,9 +160,39 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
     let format = repo.format();
     let db = repo.objects();
 
+    // `blame.showEmail` config supplies the author-column default when no
+    // `-e`/`--show-email`/`--no-show-email` was given on the command line.
+    if !options.author_field_explicit
+        && let Some(true) = blame_config_bool(git_dir, "showemail")?
+    {
+        options.author_field = AuthorField::Email;
+    }
+
+    // Disambiguate rev vs path now that the repository is available: a token
+    // "is a rev" if it resolves to an object, matching git's `is_a_rev`. A
+    // leading `^` marks a boundary rev (`git blame ^<rev>`); strip it before
+    // testing/resolving.
+    let (rev, path) = resolve_positionals(&options.positionals, |tok| {
+        let core = tok.strip_prefix('^').unwrap_or(tok);
+        repo.resolve_revision(core).is_ok()
+    })?;
+
+    // A `^<rev>` rev makes `<rev>` (and its ancestors) an uninteresting
+    // *boundary*: the blame walk stops there and renders it with `^`. The final
+    // image then comes from HEAD (the default), not from the boundary rev.
+    let (rev_spec, boundary_tip): (String, Option<ObjectId>) = match &rev {
+        Some(r) if r.starts_with('^') => {
+            let core = &r[1..];
+            let oid = repo.resolve_revision(core)?;
+            let tip = sley_rev::peel_to_commit(db, format, &oid)?;
+            ("HEAD".to_string(), Some(tip))
+        }
+        Some(r) => (r.clone(), None),
+        None => ("HEAD".to_string(), None),
+    };
+
     // Resolve the requested revision (default HEAD) to a commit.
-    let rev_spec = options.rev.as_deref().unwrap_or("HEAD");
-    let start_oid = repo.resolve_revision(rev_spec)?;
+    let start_oid = repo.resolve_revision(&rev_spec)?;
     let start_commit = sley_rev::peel_to_commit(db, format, &start_oid)?;
 
     // Turn the cwd-relative path into a repository-root-relative path the way
@@ -136,7 +209,7 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
     // and applying smudge would diverge from git. When the working-tree overlay
     // lands, route that worktree-sourced content through
     // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
-    let repo_path = blame_repo_relative_path(cwd, git_dir, &options.path)?;
+    let repo_path = blame_repo_relative_path(cwd, git_dir, &path)?;
     let final_blob = match read_path_blob(db, format, &start_commit, &repo_path)? {
         Some(blob) => blob,
         None => {
@@ -148,7 +221,15 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
         }
     };
 
-    let lines = compute_blame(db, format, &start_commit, &repo_path, &final_blob)?;
+    let lines = compute_blame(
+        db,
+        format,
+        &start_commit,
+        &repo_path,
+        &final_blob,
+        options.first_parent,
+        boundary_tip,
+    )?;
 
     // Resolve the -L ranges against the real line count, then render. The
     // repo-relative path is used for any -L error message, matching git.
@@ -172,10 +253,14 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut long_sha = false;
     let mut suppress_author = false;
     let mut author_field = AuthorField::Name;
+    let mut author_field_explicit = false;
     let mut date_field = DateField::Iso;
     let mut show_root = false;
     let mut abbrev_override = None;
     let mut ranges = Vec::new();
+    let mut first_parent = false;
+    let mut compat = false;
+    let mut blank_boundary = false;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -192,12 +277,24 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--" => saw_dd = true,
             "-l" | "--long" => long_sha = true,
             "-s" => suppress_author = true,
-            "-e" | "--show-email" => author_field = AuthorField::Email,
-            "--no-show-email" => author_field = AuthorField::Name,
+            "-e" | "--show-email" => {
+                author_field = AuthorField::Email;
+                author_field_explicit = true;
+            }
+            "--no-show-email" => {
+                author_field = AuthorField::Name;
+                author_field_explicit = true;
+            }
             "-t" => date_field = DateField::Raw,
             "--root" => show_root = true,
             "--no-root" => show_root = false,
+            "--first-parent" => first_parent = true,
+            "-c" => compat = true,
+            "-b" => blank_boundary = true,
             "--abbrev" => abbrev_override = Some(0),
+            // `--no-abbrev` shows the full object name, like `-l` / `--abbrev`
+            // with the full hash length.
+            "--no-abbrev" => long_sha = true,
             "-L" => {
                 let Some(value) = iter.next() else {
                     return Err(blame_option_requires_value("L"));
@@ -239,14 +336,16 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         }
     }
 
-    // Resolve positionals into (optional rev, path). git accepts
-    // `blame <file>`, `blame <rev> <file>`, `blame <rev> -- <file>`, and
-    // `blame <file>` with `<rev>` omitted; paths after `--` take precedence.
-    let (rev, path) = resolve_positionals(positionals, paths_after_dd)?;
+    // Collect the positionals for rev/path disambiguation; the rev-vs-path
+    // decision for the ambiguous `blame X Y` form needs the repository (to test
+    // whether a token resolves as a revision), so it is deferred to `run_blame`.
+    let positionals = BlamePositionals {
+        bare: positionals,
+        after_dd: paths_after_dd,
+    };
 
     Ok(BlameArgs::Run(BlameOptions {
-        rev,
-        path,
+        positionals,
         long_sha,
         suppress_author,
         author_field,
@@ -254,29 +353,47 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         show_root,
         abbrev_override,
         ranges,
+        first_parent,
+        compat,
+        blank_boundary,
+        author_field_explicit,
     }))
 }
 
-/// Decide which positional is the revision and which is the path.
+/// Decide which positional is the revision and which is the path, using the
+/// repository to disambiguate the `blame X Y` form the way git's builtin does
+/// (blame.c cases 1a/1b/2a/2b): with no `--`, two positionals where the *last*
+/// names a revision are `blame <path> <rev>` (e.g. `git blame file main`);
+/// otherwise the last is the path and the first the rev.
 fn resolve_positionals(
-    positionals: Vec<String>,
-    paths_after_dd: Vec<String>,
+    positionals: &BlamePositionals,
+    is_rev: impl Fn(&str) -> bool,
 ) -> Result<(Option<String>, String)> {
-    if !paths_after_dd.is_empty() {
-        if paths_after_dd.len() > 1 {
+    let bare = &positionals.bare;
+    if !positionals.after_dd.is_empty() {
+        // `blame [<rev>] -- <path>` or `blame -- <path> <rev>`.
+        if positionals.after_dd.len() > 1 {
             return Err(blame_too_many_paths());
         }
-        let rev = match positionals.len() {
+        let rev = match bare.len() {
             0 => None,
-            1 => Some(positionals[0].clone()),
+            1 => Some(bare[0].clone()),
             _ => return Err(blame_usage_error()),
         };
-        return Ok((rev, paths_after_dd[0].clone()));
+        return Ok((rev, positionals.after_dd[0].clone()));
     }
-    match positionals.len() {
+    match bare.len() {
         0 => Err(blame_usage_error()),
-        1 => Ok((None, positionals[0].clone())),
-        2 => Ok((Some(positionals[0].clone()), positionals[1].clone())),
+        1 => Ok((None, bare[0].clone())),
+        2 => {
+            if is_rev(&bare[1]) {
+                // `blame <path> <rev>` — last token is the revision.
+                Ok((Some(bare[1].clone()), bare[0].clone()))
+            } else {
+                // `blame <rev> <path>` — last token is the path.
+                Ok((Some(bare[0].clone()), bare[1].clone()))
+            }
+        }
         _ => Err(blame_too_many_paths()),
     }
 }
@@ -289,8 +406,6 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
         "-p" | "--porcelain"
             | "--line-porcelain"
             | "--incremental"
-            | "-c"
-            | "-b"
             | "-f"
             | "--show-name"
             | "-n"
@@ -331,20 +446,37 @@ fn parse_line_range(value: &str) -> Result<RawRange> {
     if value.is_empty() {
         return Err(blame_usage_error());
     }
-    // The `:funcname` and `/regex/` range forms are recognized by git but not
-    // implemented here; report them as unsupported instead of misparsing.
-    if value.starts_with(':') || value.starts_with('/') {
+    // The `:funcname` / `:/regex/` function-name range forms are recognized by
+    // git but not implemented here; report them as unsupported.
+    if value.starts_with(':') || value.starts_with("^:") {
         return Err(GitError::Unsupported(format!(
-            "git blame -L {value} (function/regex range) is not supported by sley"
+            "git blame -L {value} (function-name range) is not supported by sley"
         )));
     }
-    let (start_raw, end_raw) = match value.split_once(',') {
-        Some((start, end)) => (start, end),
-        None => (value, ""),
-    };
+    // Split on the FIRST `,` that is not inside a `/regex/` (a regex may contain
+    // a comma), so `-L/a,b/,/c/` splits into `/a,b/` and `/c/`.
+    let (start_raw, end_raw) = split_range_at_comma(value);
     let start = parse_range_bound(start_raw, false)?;
     let end = parse_range_bound(end_raw, true)?;
     Ok(RawRange { start, end })
+}
+
+/// Split a `-L` argument at the first top-level `,` (one not inside a `/.../`
+/// regex). Returns `(start, end)`; `end` is empty when there is no comma.
+fn split_range_at_comma(value: &str) -> (&str, &str) {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    let mut in_regex = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_regex => i += 1, // skip the escaped char
+            b'/' => in_regex = !in_regex,
+            b',' if !in_regex => return (&value[..i], &value[i + 1..]),
+            _ => {}
+        }
+        i += 1;
+    }
+    (value, "")
 }
 
 /// Parse one `-L` bound. `is_end` allows the `+N` relative form. A token that
@@ -353,6 +485,24 @@ fn parse_range_bound(raw: &str, is_end: bool) -> Result<RangeBound> {
     if raw.is_empty() {
         return Ok(RangeBound::Omitted);
     }
+    // `/regex/` and `^/regex/` bounds: the first matching line at/after the
+    // search anchor; `^` forces the absolute (line-1) anchor.
+    let (regex_body, absolute) = match raw.strip_prefix('^') {
+        Some(rest) if rest.starts_with('/') => (Some(rest), true),
+        _ if raw.starts_with('/') => (Some(raw), false),
+        _ => (None, false),
+    };
+    if let Some(body) = regex_body {
+        // Strip the surrounding slashes; a trailing `/` is required.
+        let inner = body
+            .strip_prefix('/')
+            .and_then(|s| s.strip_suffix('/'))
+            .ok_or_else(blame_usage_error)?;
+        return Ok(RangeBound::Regex {
+            pattern: inner.to_string(),
+            absolute,
+        });
+    }
     if let Some(rest) = raw.strip_prefix('+') {
         if !is_end {
             return Err(blame_usage_error());
@@ -360,8 +510,17 @@ fn parse_range_bound(raw: &str, is_end: bool) -> Result<RangeBound> {
         let count = rest.parse::<usize>().map_err(|_| blame_usage_error())?;
         return Ok(RangeBound::Relative(count));
     }
-    // Only absolute numbers and the `+N` end form are accepted; anything else
-    // (e.g. `abc`, `1.5`, a leading `-`) is a usage error, matching git.
+    if let Some(rest) = raw.strip_prefix('-') {
+        // `-N` is a backward-relative *end* bound (`-L X,-N`); as a start it is
+        // a usage error (git's parser rejects a leading-dash start too).
+        if !is_end {
+            return Err(blame_usage_error());
+        }
+        let count = rest.parse::<usize>().map_err(|_| blame_usage_error())?;
+        return Ok(RangeBound::RelativeNeg(count));
+    }
+    // Only absolute numbers and the `±N` end forms are accepted; anything else
+    // (e.g. `abc`, `1.5`) is a usage error, matching git.
     let number = raw.parse::<usize>().map_err(|_| blame_usage_error())?;
     Ok(RangeBound::Absolute(number))
 }
@@ -466,107 +625,165 @@ fn lookup_tree_path(
     Ok(None)
 }
 
-/// Core blame: assign each final-image line to a commit.
+/// A contiguous run of final-image lines currently suspected to originate in
+/// one commit's version of the path. Mirrors git's `struct blame_entry`
+/// (blame.c): `lno` is the 0-based line in the *final image*, `s_lno` the
+/// 0-based line in the *suspect's* blob, and the entry covers `num_lines`
+/// consecutive lines in both. The invariant `final[lno + k] == suspect[s_lno +
+/// k]` for `k in 0..num_lines` is what lets us pass whole chunks to a parent.
+#[derive(Clone)]
+struct BlameEntry {
+    /// Commit currently suspected of introducing these lines.
+    suspect: ObjectId,
+    /// Whether the suspect is a rendered boundary (root, absent `--root`).
+    boundary: bool,
+    /// 0-based start line in the final image.
+    lno: usize,
+    /// 0-based start line in the suspect's blob.
+    s_lno: usize,
+    /// Number of lines this entry covers (in both the final image and the
+    /// suspect's blob).
+    num_lines: usize,
+}
+
+/// Core blame: assign each final-image line to a commit, mirroring git's
+/// diff-driven multi-pass scoreboard (blame.c `pass_blame` / `blame_chunk` /
+/// `split_overlap`).
 ///
-/// Maintains, per commit, the set of final lines still "owned" by that
-/// commit's version of the path together with each line's index inside that
-/// commit's blob. Commits are processed children-before-parents so that by the
-/// time a commit is examined, every line it might own has been propagated to
-/// it. A line is charged to a commit when it has no unchanged counterpart in
-/// any parent (or the commit is a root / the path is absent in every parent).
+/// Rather than routing each final line independently to the first parent that
+/// preserves it, we carry line *chunks* (`BlameEntry`) and, for each commit
+/// pulled off a commit-date priority queue, diff that commit's blob against
+/// each parent in turn. Lines a parent preserves migrate to the parent as
+/// (possibly split) chunks with their `s_lno` rebased onto the parent's blob;
+/// lines no parent preserves are charged to this commit. For a merge this
+/// gives the *correct* parent (parent 0 first, the residual to parent 1, …),
+/// which whole-line first-parent routing got wrong — and `-L` is simply a
+/// final-range filter applied at render time over correctly-attributed chunks.
 fn compute_blame(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     start_commit: &ObjectId,
     repo_path: &str,
     final_blob: &[u8],
+    first_parent: bool,
+    boundary_tip: Option<ObjectId>,
 ) -> Result<Vec<LineBlame>> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
 
-    // Result slot per final line; filled in as commits claim lines.
+    // Final attribution per line, filled in as commits are found guilty.
     let mut result: Vec<Option<LineBlame>> = (0..line_count).map(|_| None).collect();
+    if line_count == 0 {
+        return Ok(Vec::new());
+    }
 
-    // Per-commit pending work: for each owned final line, its index within
-    // that commit's blob. `pending[commit][final_line] = blob_index`.
-    let mut pending: HashMap<ObjectId, HashMap<usize, usize>> = HashMap::new();
-    // Each final line initially maps to the identically-indexed line of the
-    // start commit's blob (the final image is that blob).
-    let seed: HashMap<usize, usize> = (0..line_count).map(|line| (line, line)).collect();
-    pending.insert(start_commit.clone(), seed);
+    // `git blame ^<rev>`: `<rev>` and all its ancestors are uninteresting
+    // boundaries — when the walk reaches one, it charges the lines there as a
+    // boundary and does not recurse into parents. Precompute that closure.
+    let uninteresting = match boundary_tip {
+        Some(tip) => ancestors_closure(db, format, &tip)?,
+        None => HashSet::new(),
+    };
 
-    // Reverse-topological order: every commit precedes its parents, so each
-    // commit is finalized (all the lines it could own have propagated to it)
-    // by the time we reach it. Ties are broken newest-first by committer date.
-    let order = topo_order(db, format, start_commit)?;
+    // Per-commit suspect chunks ("origin->suspects" in git). A commit is in the
+    // queue iff it has at least one suspect chunk. The blob for each commit's
+    // path is cached on first use.
+    let mut suspects: HashMap<ObjectId, Vec<BlameEntry>> = HashMap::new();
+    let mut blob_cache: HashMap<ObjectId, Option<Vec<u8>>> = HashMap::new();
+    let mut date_cache: HashMap<ObjectId, i64> = HashMap::new();
 
-    for commit_oid in order {
-        let Some(owned) = pending.remove(&commit_oid) else {
+    // The start commit owns the entire final image as one chunk.
+    suspects.insert(
+        *start_commit,
+        vec![BlameEntry {
+            suspect: *start_commit,
+            boundary: false,
+            lno: 0,
+            s_lno: 0,
+            num_lines: line_count,
+        }],
+    );
+
+    // Commit-date priority queue, newest first (git's
+    // compare_commits_by_commit_date). We materialise the comparator lazily via
+    // `pop_newest_commit`, caching each commit's date.
+    let mut queue: Vec<ObjectId> = vec![*start_commit];
+
+    while let Some(commit_oid) = pop_newest_commit(&mut queue, db, format, &mut date_cache)? {
+        let Some(mut owned) = suspects.remove(&commit_oid) else {
             continue;
         };
         if owned.is_empty() {
             continue;
         }
 
+        // Uninteresting (`^<rev>`) commits are boundaries: charge their lines
+        // with the boundary marker and stop — do not pass blame to parents.
+        if uninteresting.contains(&commit_oid) {
+            charge_remaining(&mut result, &final_lines, &commit_oid, true, owned);
+            continue;
+        }
+
+        // Resolve this commit and its blob for the path.
         let commit_obj = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &commit_obj.body)?;
-        let Some(child_blob) = read_path_blob(db, format, &commit_oid, repo_path)? else {
-            // Defensive: a commit that does not contain the path cannot own
-            // any line; charge them here to avoid losing lines.
-            assign_lines(&mut result, &commit_oid, false, &final_lines, owned);
+        let child_blob = cached_blob(db, format, &commit_oid, repo_path, &mut blob_cache)?;
+        let Some(child_blob) = child_blob else {
+            // The path is absent at this commit (shouldn't normally happen for a
+            // suspect): charge everything here so no line is lost.
+            charge_remaining(&mut result, &final_lines, &commit_oid, false, owned);
             continue;
         };
         let child_lines = sley_diff_merge::split_lines(&child_blob);
 
-        // Find, for each owned line, whether some parent preserves it. We try
-        // parents in order and route a line to the first parent that has an
-        // unchanged counterpart. Lines preserved by no parent are charged to
-        // this commit. A commit with no parents (root) charges everything.
-        let parents = commit.parents.clone();
+        let mut parents = commit.parents.clone();
+        if first_parent {
+            parents.truncate(1);
+        }
         if parents.is_empty() {
-            assign_lines(&mut result, &commit_oid, true, &final_lines, owned);
+            // Root commit (or `--first-parent` past a root): every remaining
+            // line is its own. Render as a boundary unless `--root`.
+            charge_remaining(&mut result, &final_lines, &commit_oid, true, owned);
             continue;
         }
 
-        // For each parent compute the child->parent line mapping once.
-        let mut parent_maps: Vec<(ObjectId, Vec<Option<usize>>)> = Vec::new();
+        // Pass blame to each parent in order. `owned` shrinks as parents claim
+        // chunks; whatever remains after the last parent is charged here.
         for parent in &parents {
-            match read_path_blob(db, format, parent, repo_path)? {
-                Some(parent_blob) => {
-                    let parent_lines = sley_diff_merge::split_lines(&parent_blob);
-                    let map = child_to_parent_map(&parent_lines, &child_lines);
-                    parent_maps.push((*parent, map));
-                }
-                None => {
-                    // Path absent in this parent: it preserves nothing.
-                    parent_maps.push((*parent, vec![None; child_lines.len()]));
-                }
+            if owned.is_empty() {
+                break;
+            }
+            let parent_blob = cached_blob(db, format, parent, repo_path, &mut blob_cache)?;
+            let Some(parent_blob) = parent_blob else {
+                // Path absent in this parent: it preserves nothing, so all
+                // chunks stay with the current commit for the next parent.
+                continue;
+            };
+
+            // Whole-file shortcut: if the parent's blob is byte-identical, every
+            // remaining chunk passes through unchanged (git's
+            // pass_whole_blame / oideq(blob_oid) fast path).
+            if parent_blob == child_blob {
+                let passed = std::mem::take(&mut owned);
+                queue_entries(&mut suspects, &mut queue, *parent, passed);
+                break;
+            }
+
+            let parent_lines = sley_diff_merge::split_lines(&parent_blob);
+            let mut still_ours = Vec::new();
+            let passed = pass_blame_to_parent(&parent_lines, &child_lines, *parent, &mut owned);
+            still_ours.append(&mut owned);
+            owned = still_ours;
+            if !passed.is_empty() {
+                queue_entries(&mut suspects, &mut queue, *parent, passed);
             }
         }
 
-        let mut charged: HashMap<usize, usize> = HashMap::new();
-        for (final_line, child_index) in owned {
-            let mut routed = false;
-            for (parent_oid, map) in &parent_maps {
-                if let Some(Some(parent_index)) = map.get(child_index) {
-                    pending
-                        .entry(*parent_oid)
-                        .or_default()
-                        .insert(final_line, *parent_index);
-                    routed = true;
-                    break;
-                }
-            }
-            if !routed {
-                charged.insert(final_line, child_index);
-            }
+        // Anything still suspected of this commit after every parent had a turn
+        // is genuinely this commit's: charge it (non-boundary — it has parents).
+        if !owned.is_empty() {
+            charge_remaining(&mut result, &final_lines, &commit_oid, false, owned);
         }
-        if !charged.is_empty() {
-            assign_lines(&mut result, &commit_oid, false, &final_lines, charged);
-        }
-        // No rescheduling is needed: `topo_order` emits every commit after all
-        // of its children (Kahn's algorithm over the child→parent DAG), so any
-        // parent we just routed lines to still lies ahead in `order`.
     }
 
     // Any line not resolved (shouldn't happen) falls back to the start commit
@@ -576,7 +793,7 @@ fn compute_blame(
         match slot {
             Some(blame) => out.push(blame),
             None => out.push(LineBlame {
-                commit: start_commit.clone(),
+                commit: *start_commit,
                 boundary: false,
                 content: final_lines[line_index].content.to_vec(),
             }),
@@ -585,163 +802,358 @@ fn compute_blame(
     Ok(out)
 }
 
-/// Record `owned` final lines as attributed to `commit_oid`.
-fn assign_lines(
-    result: &mut [Option<LineBlame>],
-    commit_oid: &ObjectId,
-    boundary: bool,
-    final_lines: &[sley_diff_merge::DiffLine<'_>],
-    owned: HashMap<usize, usize>,
-) {
-    for final_line in owned.into_keys() {
-        if let Some(slot) = result.get_mut(final_line)
-            && slot.is_none()
-        {
-            *slot = Some(LineBlame {
-                commit: *commit_oid,
-                boundary,
-                content: final_lines[final_line].content.to_vec(),
-            });
-        }
-    }
-}
-
-/// Build `child_index -> Some(parent_index)` for lines unchanged from parent to
-/// child (the `Equal` runs of the Myers diff); changed/inserted child lines map
-/// to `None`.
-fn child_to_parent_map(
+/// Diff the suspect blob (`child_lines`) against `parent_lines` and split every
+/// chunk in `owned` along the diff boundaries: lines unchanged from the parent
+/// migrate to `parent` (returned, with `s_lno` rebased onto the parent's blob);
+/// lines that differ remain in `owned` for the next parent (or to be charged to
+/// the suspect). This is the port of git's `blame_chunk` driven by
+/// `blame_chunk_cb` over `diff_hunks` (blame.c).
+///
+/// The diff is computed *parent → child* so a hunk `(start_a, count_a) ->
+/// (start_b, count_b)` says child lines `[start_b, start_b+count_b)` differ from
+/// the parent, while the run before each hunk (and after the last) is common.
+/// `offset = start_a - start_b` is how far the parent's line numbers lead the
+/// child's across a common run.
+fn pass_blame_to_parent(
     parent_lines: &[sley_diff_merge::DiffLine<'_>],
     child_lines: &[sley_diff_merge::DiffLine<'_>],
-) -> Vec<Option<usize>> {
-    let mut map = vec![None; child_lines.len()];
+    _parent: ObjectId,
+    owned: &mut Vec<BlameEntry>,
+) -> Vec<BlameEntry> {
+    let hunks = diff_hunks(parent_lines, child_lines);
+
+    let mut passed: Vec<BlameEntry> = Vec::new();
+    let mut still_ours: Vec<BlameEntry> = Vec::new();
+
+    // Process chunks in `s_lno` (child line) order so the running `offset`
+    // — how far the parent's line numbers lead the child's across the current
+    // common run — stays valid. `deferred` holds split tails to re-merge in
+    // order; `entries` is the original sorted suspect list.
+    owned.sort_by_key(|e| e.s_lno);
+    let mut entries = std::mem::take(owned).into_iter().peekable();
+    let mut deferred: Vec<BlameEntry> = Vec::new();
+    let mut offset: isize = 0;
+
+    for hunk in &hunks {
+        let tlno = hunk.start_b; // first child line that differs
+        let same = hunk.start_b + hunk.count_b; // first child line common again
+
+        // Pre-chunk region [.., tlno): common with the parent → pass it through.
+        while let Some(mut e) = take_next_before(&mut deferred, &mut entries, tlno) {
+            if e.s_lno + e.num_lines > tlno {
+                // Straddles the boundary: pass the common head, defer the tail.
+                let head_len = tlno - e.s_lno;
+                let tail = split_entry_at(&mut e, head_len);
+                pass_entry(&mut e, offset, &mut passed);
+                put_back(&mut deferred, tail);
+            } else {
+                pass_entry(&mut e, offset, &mut passed);
+            }
+        }
+
+        // Differing region [tlno, same): stays with the suspect; split a chunk
+        // that reaches past `same` so its common tail is handled by a later hunk.
+        while let Some(mut e) = take_next_before(&mut deferred, &mut entries, same) {
+            if e.s_lno + e.num_lines > same {
+                let head_len = same - e.s_lno;
+                let tail = split_entry_at(&mut e, head_len);
+                still_ours.push(e);
+                put_back(&mut deferred, tail);
+            } else {
+                still_ours.push(e);
+            }
+        }
+
+        // Advance the offset across this hunk (parent count - child count delta).
+        offset = hunk.start_a as isize + hunk.count_a as isize
+            - (hunk.start_b as isize + hunk.count_b as isize);
+    }
+
+    // Everything after the last hunk is common with the parent.
+    while let Some(mut e) = take_next_before(&mut deferred, &mut entries, usize::MAX) {
+        pass_entry(&mut e, offset, &mut passed);
+    }
+
+    *owned = still_ours;
+    passed
+}
+
+/// A changed region of a parent→child line diff: parent lines
+/// `[start_a, start_a+count_a)` were replaced by child lines
+/// `[start_b, start_b+count_b)`. Equivalent to one `xdl` hunk / one
+/// `blame_chunk_cb` call in git.
+struct DiffHunk {
+    start_a: usize,
+    count_a: usize,
+    start_b: usize,
+    count_b: usize,
+}
+
+/// Convert the run-length `DiffOp` script (parent → child) into the changed
+/// hunks git's `diff_hunks` yields: maximal runs of non-`Equal` ops collapse
+/// into a single `(start_a, count_a, start_b, count_b)` hunk; `Equal` runs are
+/// the common stretches between hunks.
+fn diff_hunks(
+    parent_lines: &[sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley_diff_merge::DiffLine<'_>],
+) -> Vec<DiffHunk> {
     let ops = sley_diff_merge::myers_diff_lines(parent_lines, child_lines);
-    let mut parent_idx = 0usize;
-    let mut child_idx = 0usize;
+    let mut hunks = Vec::new();
+    let mut a = 0usize; // parent line cursor
+    let mut b = 0usize; // child line cursor
+    let mut pending: Option<DiffHunk> = None;
     for op in ops {
         match op {
             sley_diff_merge::DiffOp::Equal(n) => {
-                for _ in 0..n {
-                    if child_idx < map.len() {
-                        map[child_idx] = Some(parent_idx);
-                    }
-                    parent_idx += 1;
-                    child_idx += 1;
+                if let Some(h) = pending.take() {
+                    hunks.push(h);
                 }
+                a += n;
+                b += n;
             }
             sley_diff_merge::DiffOp::Delete(n) => {
-                parent_idx += n;
+                let h = pending.get_or_insert(DiffHunk {
+                    start_a: a,
+                    count_a: 0,
+                    start_b: b,
+                    count_b: 0,
+                });
+                h.count_a += n;
+                a += n;
             }
             sley_diff_merge::DiffOp::Insert(n) => {
-                child_idx += n;
+                let h = pending.get_or_insert(DiffHunk {
+                    start_a: a,
+                    count_a: 0,
+                    start_b: b,
+                    count_b: 0,
+                });
+                h.count_b += n;
+                b += n;
             }
         }
     }
-    map
+    if let Some(h) = pending.take() {
+        hunks.push(h);
+    }
+    hunks
 }
 
-/// Reachable commits from `start`, ordered so that every commit precedes its
-/// parents (a reverse-topological / children-first order). Uses Kahn's
-/// algorithm over the in-degree induced by child→parent edges, breaking ties
-/// by descending committer timestamp to match git's tendency to surface newer
-/// commits first.
-fn topo_order(
+/// Pass `entry` to a parent: rebase its `s_lno` by `offset` (the parent leads
+/// the child by `offset` across this common run). The suspect id is left as the
+/// child's; [`queue_entries`] re-stamps it with the parent before enqueuing.
+fn pass_entry(entry: &mut BlameEntry, offset: isize, passed: &mut Vec<BlameEntry>) {
+    let s_lno = (entry.s_lno as isize + offset) as usize;
+    passed.push(BlameEntry {
+        suspect: entry.suspect,
+        boundary: false,
+        lno: entry.lno,
+        s_lno,
+        num_lines: entry.num_lines,
+    });
+}
+
+/// Split `e` into a head of `head_len` lines (kept in `e`) and a returned tail
+/// covering the remainder, mirroring git's `split_blame_at`.
+fn split_entry_at(e: &mut BlameEntry, head_len: usize) -> BlameEntry {
+    let tail = BlameEntry {
+        suspect: e.suspect,
+        boundary: e.boundary,
+        lno: e.lno + head_len,
+        s_lno: e.s_lno + head_len,
+        num_lines: e.num_lines - head_len,
+    };
+    e.num_lines = head_len;
+    tail
+}
+
+/// Pop the next chunk whose `s_lno < limit`, in global `s_lno` order, drawing
+/// from `deferred` (split tails) and `entries` (the original sorted suspect
+/// chunks) — both individually sorted. Returns `None` when the next chunk in
+/// order starts at or past `limit` (or both streams are exhausted).
+fn take_next_before(
+    deferred: &mut Vec<BlameEntry>,
+    entries: &mut std::iter::Peekable<std::vec::IntoIter<BlameEntry>>,
+    limit: usize,
+) -> Option<BlameEntry> {
+    // Determine which stream has the smaller front (and that front's s_lno)
+    // without consuming it.
+    let (from_deferred, next_s_lno) = match (deferred.first(), entries.peek()) {
+        (Some(d), Some(e)) => {
+            if d.s_lno <= e.s_lno {
+                (true, d.s_lno)
+            } else {
+                (false, e.s_lno)
+            }
+        }
+        (Some(d), None) => (true, d.s_lno),
+        (None, Some(e)) => (false, e.s_lno),
+        (None, None) => return None,
+    };
+    if next_s_lno >= limit {
+        return None;
+    }
+    if from_deferred {
+        Some(deferred.remove(0))
+    } else {
+        entries.next()
+    }
+}
+
+/// Return an entry to the deferred stream, keeping it sorted by `s_lno`.
+fn put_back(deferred: &mut Vec<BlameEntry>, e: BlameEntry) {
+    let pos = deferred
+        .iter()
+        .position(|d| d.s_lno > e.s_lno)
+        .unwrap_or(deferred.len());
+    deferred.insert(pos, e);
+}
+
+/// Queue a batch of chunks onto `parent`'s suspect list, stamping them with the
+/// parent id and enqueuing the parent commit if it was not already pending.
+fn queue_entries(
+    suspects: &mut HashMap<ObjectId, Vec<BlameEntry>>,
+    queue: &mut Vec<ObjectId>,
+    parent: ObjectId,
+    mut entries: Vec<BlameEntry>,
+) {
+    for e in &mut entries {
+        e.suspect = parent;
+    }
+    let slot = suspects.entry(parent).or_default();
+    let was_empty = slot.is_empty();
+    slot.extend(entries);
+    if was_empty {
+        queue.push(parent);
+    }
+}
+
+/// Charge every remaining chunk to `commit_oid` as a final attribution.
+fn charge_remaining(
+    result: &mut [Option<LineBlame>],
+    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    commit_oid: &ObjectId,
+    boundary: bool,
+    owned: Vec<BlameEntry>,
+) {
+    for entry in owned {
+        for k in 0..entry.num_lines {
+            let final_line = entry.lno + k;
+            if let Some(slot) = result.get_mut(final_line)
+                && slot.is_none()
+            {
+                *slot = Some(LineBlame {
+                    commit: *commit_oid,
+                    boundary,
+                    content: final_lines[final_line].content.to_vec(),
+                });
+            }
+        }
+    }
+}
+
+/// The set of `tip` and all commits reachable from it (its ancestor closure),
+/// used to mark `git blame ^<rev>` boundaries as uninteresting.
+fn ancestors_closure(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    start: &ObjectId,
-) -> Result<Vec<ObjectId>> {
-    // Gather the reachable subgraph and each commit's parents + timestamp.
-    let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    let mut timestamp_of: HashMap<ObjectId, i64> = HashMap::new();
-    let mut stack = vec![start.clone()];
+    tip: &ObjectId,
+) -> Result<HashSet<ObjectId>> {
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut stack = vec![*tip];
     while let Some(oid) = stack.pop() {
-        if parents_of.contains_key(&oid) {
+        if !seen.insert(oid) {
             continue;
         }
         let object = db.read_object(&oid)?;
         if object.object_type != ObjectType::Commit {
-            return Err(GitError::InvalidObject(format!(
-                "expected commit {oid}, found {}",
-                object.object_type.as_str()
-            )));
+            continue;
         }
         let commit = Commit::parse(format, &object.body)?;
-        let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
-        timestamp_of.insert(oid, ts);
-        let parents = commit.parents.clone();
-        for parent in &parents {
+        for parent in &commit.parents {
             stack.push(*parent);
         }
-        parents_of.insert(oid, parents);
     }
-
-    // child_count[parent] = number of in-subgraph children pointing at it.
-    let mut child_count: HashMap<ObjectId, usize> = HashMap::new();
-    for oid in parents_of.keys() {
-        child_count.entry(*oid).or_insert(0);
-    }
-    for parents in parents_of.values() {
-        for parent in parents {
-            if parents_of.contains_key(parent) {
-                *child_count.entry(*parent).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Ready set: commits with no remaining children. `pop_newest` selects the
-    // newest deterministically each step, so the collection order here (a
-    // HashMap iteration) does not affect the result.
-    let mut ready: Vec<ObjectId> = child_count
-        .iter()
-        .filter(|(_, count)| **count == 0)
-        .map(|(oid, _)| *oid)
-        .collect();
-
-    let mut order = Vec::with_capacity(parents_of.len());
-    while let Some(next) = pop_newest(&mut ready, &timestamp_of) {
-        order.push(next.clone());
-        if let Some(parents) = parents_of.get(&next) {
-            for parent in parents.clone() {
-                if let Some(count) = child_count.get_mut(&parent) {
-                    *count -= 1;
-                    if *count == 0 {
-                        ready.push(parent);
-                    }
-                }
-            }
-        }
-    }
-
-    // If the graph had a cycle (corrupt history), append anything left so we
-    // never silently drop commits.
-    if order.len() < parents_of.len() {
-        for oid in parents_of.keys() {
-            if !order.contains(oid) {
-                order.push(*oid);
-            }
-        }
-    }
-    Ok(order)
+    Ok(seen)
 }
 
-/// Remove and return the newest commit from `ready` (treated as a priority
-/// queue keyed by descending timestamp, ties broken by ascending hex id for
-/// determinism).
-fn pop_newest(
-    ready: &mut Vec<ObjectId>,
-    timestamp_of: &HashMap<ObjectId, i64>,
-) -> Option<ObjectId> {
-    if ready.is_empty() {
-        return None;
+/// Read a `blame.<key>` boolean config value (e.g. `blame.showEmail`), checking
+/// the repository config then the global config, mirroring git's precedence.
+/// `key` is the lowercase, dotless tail (git config keys are case-insensitive).
+/// Returns `None` when unset.
+fn blame_config_bool(git_dir: &Path, key: &str) -> Result<Option<bool>> {
+    // Repository config takes precedence over global.
+    let config_path = git_dir.join("config");
+    if let Ok(config) = GitConfig::read(config_path)
+        && let Some(value) = config.get("blame", None, key)
+    {
+        return Ok(parse_config_bool(value));
+    }
+    if let Some(value) = global_config_value(&format!("blame.{key}"))? {
+        return Ok(parse_config_bool(&value));
+    }
+    Ok(None)
+}
+
+/// Read (and memoise) the blob for `repo_path` at `commit`. `None` means the
+/// path is absent (or names a non-blob) at that commit.
+fn cached_blob(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit: &ObjectId,
+    repo_path: &str,
+    cache: &mut HashMap<ObjectId, Option<Vec<u8>>>,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(hit) = cache.get(commit) {
+        return Ok(hit.clone());
+    }
+    let blob = read_path_blob(db, format, commit, repo_path)?;
+    cache.insert(*commit, blob.clone());
+    Ok(blob)
+}
+
+/// Pop the newest-by-committer-date commit from the working queue, mirroring
+/// git's commit-date priority queue (`compare_commits_by_commit_date`: larger
+/// date first, ties broken deterministically by ascending hex id). Commit dates
+/// are memoised in `date_cache`. Returns `None` when the queue is empty.
+///
+/// The queue may transiently hold the same commit twice (it is enqueued when
+/// its suspect list first becomes non-empty); a duplicate pops with an empty
+/// suspect list and the caller simply skips it, exactly as git's `assign_blame`
+/// does.
+fn pop_newest_commit(
+    queue: &mut Vec<ObjectId>,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    date_cache: &mut HashMap<ObjectId, i64>,
+) -> Result<Option<ObjectId>> {
+    if queue.is_empty() {
+        return Ok(None);
+    }
+    // Ensure every queued commit has a cached date.
+    for oid in queue.iter() {
+        if !date_cache.contains_key(oid) {
+            let object = db.read_object(oid)?;
+            if object.object_type != ObjectType::Commit {
+                return Err(GitError::InvalidObject(format!(
+                    "expected commit {oid}, found {}",
+                    object.object_type.as_str()
+                )));
+            }
+            let commit = Commit::parse(format, &object.body)?;
+            let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
+            date_cache.insert(*oid, ts);
+        }
     }
     let mut best = 0usize;
-    for i in 1..ready.len() {
-        let ti = timestamp_of.get(&ready[i]).copied().unwrap_or(0);
-        let tb = timestamp_of.get(&ready[best]).copied().unwrap_or(0);
-        if ti > tb || (ti == tb && ready[i].to_hex() < ready[best].to_hex()) {
+    for i in 1..queue.len() {
+        let ti = date_cache.get(&queue[i]).copied().unwrap_or(0);
+        let tb = date_cache.get(&queue[best]).copied().unwrap_or(0);
+        if ti > tb || (ti == tb && queue[i].to_hex() < queue[best].to_hex()) {
             best = i;
         }
     }
-    Some(ready.swap_remove(best))
+    Ok(Some(queue.swap_remove(best)))
 }
 
 /// Resolve the `-L` ranges to a sorted, de-duplicated set of 1-based line
@@ -751,14 +1163,49 @@ fn select_lines(lines: &[LineBlame], options: &BlameOptions, path: &str) -> Resu
     if options.ranges.is_empty() {
         return Ok((1..=total).collect());
     }
+    // The line *contents* (newline-stripped) feed the `/regex/` bound search.
+    let contents: Vec<&[u8]> = lines
+        .iter()
+        .map(|l| strip_trailing_newline(&l.content))
+        .collect();
     let mut selected: BTreeSet<usize> = BTreeSet::new();
+    // git threads an `anchor` between ranges: a relative `/regex/` starts its
+    // search at the previous range's end + 1.
+    let mut anchor = 1usize;
     for range in &options.ranges {
-        let (lo, hi) = resolve_range(range, total, path)?;
+        let (lo, hi) = resolve_range(range, total, &contents, anchor, path)?;
         for line in lo..=hi {
             selected.insert(line);
         }
+        anchor = hi + 1;
     }
     Ok(selected.into_iter().collect())
+}
+
+/// Resolve a `/regex/` `-L` bound: the 1-based number of the first line at or
+/// after `from` (1-based) whose content matches `pattern`. git compiles the
+/// pattern as a POSIX *basic* regex (`regcomp` without `REG_EXTENDED`) with
+/// `REG_NEWLINE`; we mirror that with sley's BRE engine. No match is the fatal
+/// "no match" error git reports.
+fn resolve_regex_bound(
+    pattern: &str,
+    contents: &[&[u8]],
+    from: usize,
+    _total: usize,
+) -> Result<usize> {
+    use crate::grep_source::{Regex, RegexMode};
+    let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
+        eprintln!("fatal: -L parameter '{pattern}': invalid regex");
+        GitError::Exit(128)
+    })?;
+    let start_idx = from.saturating_sub(1); // 0-based
+    for (idx, line) in contents.iter().enumerate().skip(start_idx) {
+        if re.find_from(line, 0).is_some() {
+            return Ok(idx + 1);
+        }
+    }
+    eprintln!("fatal: -L parameter '{pattern}' starting at line {from}: No match");
+    Err(GitError::Exit(128))
 }
 
 /// Resolve one `-L` range against the file's `total` line count, applying git's
@@ -771,13 +1218,25 @@ fn select_lines(lines: &[LineBlame], options: &BlameOptions, path: &str) -> Resu
 /// the *smaller* endpoint, not the literal start: `-L 100,2` lists lines 2..N
 /// (no error), while `-L 100,200` — whose smaller endpoint is also past the end
 /// — is the error. We mirror that exactly.
-fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, usize)> {
-    let start = match range.start {
+fn resolve_range(
+    range: &RawRange,
+    total: usize,
+    contents: &[&[u8]],
+    anchor: usize,
+    path: &str,
+) -> Result<(usize, usize)> {
+    let start = match &range.start {
         RangeBound::Omitted => 1,
-        RangeBound::Absolute(n) => n,
-        // `+N` is only meaningful as an end bound; the parser already rejects a
+        RangeBound::Absolute(n) => *n,
+        // The `/regex/` start searches from the running anchor (or line 1 for
+        // the `^/regex/` absolute form).
+        RangeBound::Regex { pattern, absolute } => {
+            let from = if *absolute { 1 } else { anchor };
+            resolve_regex_bound(pattern, contents, from, total)?
+        }
+        // `±N` is only meaningful as an end bound; the parser already rejects a
         // relative start, so this is defensive and reports a usage error.
-        RangeBound::Relative(_) => return Err(blame_usage_error()),
+        RangeBound::Relative(_) | RangeBound::RelativeNeg(_) => return Err(blame_usage_error()),
     };
     // git validates the start line number before anything else (so `-L 0,+5` and
     // `-L 0,3` both report the zero error rather than an empty-range/clamp).
@@ -785,34 +1244,64 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
         eprintln!("fatal: -L invalid line number: 0");
         return Err(GitError::Exit(128));
     }
-    let end = match range.end {
-        RangeBound::Omitted => total,
+
+    // `begin` mirrors git's `*begin` (the start endpoint); `end` is the explicit
+    // end (0 means "omitted", to be defaulted to end-of-file below — NOT to
+    // `total` here, so a start past the end is still detected as an error).
+    let mut begin = start;
+    let mut end = match &range.end {
+        RangeBound::Omitted => 0,
         RangeBound::Absolute(n) => {
-            if n == 0 {
+            if *n == 0 {
                 eprintln!("fatal: -L invalid line number: 0");
                 return Err(GitError::Exit(128));
             }
-            n
+            *n
         }
-        // `start,+0` is an empty range, which git rejects outright; otherwise the
-        // end is `start + count - 1` (a `+N` range can never be reversed).
+        // The `/regex/` end searches from `begin + 1` (git's `*begin + 1`). The
+        // absolute `^/regex/` anchor is only valid as a *start* bound — git
+        // rejects `-L X,^/RE/` as a usage error.
+        RangeBound::Regex { pattern, absolute } => {
+            if *absolute {
+                return Err(blame_usage_error());
+            }
+            resolve_regex_bound(pattern, contents, start + 1, total)?
+        }
+        // `start,+0` is an empty range git rejects; else end = start + count - 1.
         RangeBound::Relative(count) => {
-            if count == 0 {
+            if *count == 0 {
                 eprintln!("fatal: -L invalid empty range");
                 return Err(GitError::Exit(128));
             }
             start + count - 1
         }
+        // `start,-N` selects the N lines ending at `start`: span [start-N+1, start].
+        RangeBound::RelativeNeg(count) => {
+            if *count == 0 {
+                eprintln!("fatal: -L invalid empty range");
+                return Err(GitError::Exit(128));
+            }
+            begin = start.saturating_sub(count - 1).max(1);
+            start
+        }
     };
-    // Order the endpoints, then bound-check the lower one and clamp the upper one
-    // to the file, matching git's blame range handling.
-    let lo = start.min(end);
-    let hi = start.max(end);
-    if lo > total {
-        eprintln!("fatal: file {path} has only {total} lines");
+
+    // git swaps when both endpoints are present and reversed (line-range.c).
+    if begin != 0 && end != 0 && end < begin {
+        std::mem::swap(&mut begin, &mut end);
+    }
+    // The "file has only N lines" error keys off the (lower) start endpoint,
+    // BEFORE the end is defaulted to end-of-file — so `-L <past-end>` errors
+    // while `-L <past-end>,<in-range>` (reversed) does not (blame.c:1211).
+    if total < begin {
+        let lines_word = if total == 1 { "line" } else { "lines" };
+        eprintln!("fatal: file {path} has only {total} {lines_word}");
         return Err(GitError::Exit(128));
     }
-    Ok((lo, hi.min(total)))
+    // Default/clamp the upper endpoint to end-of-file (blame.c:1217).
+    let top = if end == 0 || total < end { total } else { end };
+    let bottom = begin.max(1);
+    Ok((bottom, top))
 }
 
 /// Print the selected lines in git blame's default format.
@@ -824,8 +1313,7 @@ fn render_blame(
     selected: &[usize],
     options: &BlameOptions,
 ) -> Result<()> {
-    let abbrev = blame_display_abbrev(git_dir, format, options)?;
-    let hex_width = abbrev + 1;
+    let (abbrev, hex_width) = blame_display_abbrev(git_dir, format, options)?;
 
     // Column widths are computed over the displayed lines only, matching git
     // (e.g. `-L 2,2` does not pad the line number to the whole file's width).
@@ -850,13 +1338,6 @@ fn render_blame(
     let mut handle = stdout.lock();
     for (display_idx, &line_no) in selected.iter().enumerate() {
         let blame = &lines[line_no - 1];
-        let sha = render_sha(
-            &blame.commit,
-            abbrev,
-            blame.boundary,
-            options.show_root,
-            hex_width,
-        );
 
         // Strip the trailing newline from the stored content; we always emit a
         // newline ourselves, matching git which prints one line per entry even
@@ -864,6 +1345,29 @@ fn render_blame(
         // written raw (not via a lossy String) so non-UTF-8 content round-trips
         // exactly.
         let content = strip_trailing_newline(&blame.content);
+
+        if options.compat {
+            // `git annotate` / `git blame -c` format:
+            // `<hex>\t(<author %10s>\t<date>\t<lineno>)<content>`. No boundary
+            // `^` marker (compat mode never prints it) and no space before the
+            // content.
+            let hex = render_compat_sha(&blame.commit, hex_width);
+            let author = &author_strings[display_idx];
+            let date = &date_strings[display_idx];
+            write!(handle, "{hex}\t({author:>10}\t{date}\t{line_no})")?;
+            handle.write_all(content)?;
+            handle.write_all(b"\n")?;
+            continue;
+        }
+
+        let sha = render_sha(
+            &blame.commit,
+            abbrev,
+            blame.boundary,
+            options.show_root,
+            hex_width,
+            options.blank_boundary,
+        );
 
         if options.suppress_author {
             // `<sha> <lineno>) <line>`
@@ -883,6 +1387,13 @@ fn render_blame(
     Ok(())
 }
 
+/// Render the object-name column for annotate-compat (`-c`) mode: exactly
+/// `hex_width` hex digits, with no boundary `^` (compat output suppresses it,
+/// blame.c `emit_other`).
+fn render_compat_sha(commit: &ObjectId, hex_width: usize) -> String {
+    commit.to_hex().chars().take(hex_width).collect()
+}
+
 /// Compute the abbreviation length for object names. git blame displays
 /// `core.abbrev` (default 7) hex digits for boundary commits and one more for
 /// non-boundary commits, so the column width is `abbrev + 1`.
@@ -890,19 +1401,37 @@ fn blame_display_abbrev(
     git_dir: &Path,
     format: ObjectFormat,
     options: &BlameOptions,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
+    let hexsz = format.hex_len();
     if options.long_sha {
-        // Full object name; the boundary marker replaces one leading digit so
-        // the displayed boundary form is `^` + (hex_len - 1) digits.
-        return Ok(format.hex_len() - 1);
+        // Full object name: non-boundary is the full hash (`hex_width = hexsz`);
+        // the boundary form is `^` + (hexsz - 1) digits.
+        return Ok((hexsz - 1, hexsz));
     }
-    let configured = match options.abbrev_override {
-        Some(0) | None => repository_abbrev(git_dir, format)?.unwrap_or(format.hex_len()),
-        Some(n) => n.clamp(1, format.hex_len()),
+    // Mirror git's abbrev resolution (builtin/blame.c):
+    //   0 < abbrev < hexsz  -> abbrev++  (boundary `^`+abbrev-1, non-bnd abbrev)
+    //   abbrev == 0         -> abbrev = hexsz
+    //   abbrev >= hexsz     -> left as is, then the hex column is capped to hexsz
+    // `abbrev_override` carries the user `--abbrev=<n>` (Some(0)/None => auto).
+    let raw = match options.abbrev_override {
+        Some(0) | None => repository_abbrev(git_dir, format)?.unwrap_or(hexsz),
+        Some(n) => n,
     };
-    // The displayed boundary form is `^` + `configured` digits; non-boundary
-    // is `configured + 1` digits. Cap so non-boundary never exceeds hex_len.
-    Ok(configured.min(format.hex_len() - 1))
+    let git_abbrev = if raw == 0 {
+        hexsz
+    } else if raw < hexsz {
+        raw + 1
+    } else {
+        raw
+    };
+    // git prints `length = abbrev` hex digits (then `length--` for the `^` on a
+    // boundary), each capped at hexsz by the final `printf`. So the non-boundary
+    // column is min(git_abbrev, hexsz) and the boundary hash min(git_abbrev-1,
+    // hexsz) — for a huge `--abbrev` the decrement still exceeds hexsz, leaving
+    // the full hash under the boundary marker.
+    let hex_width = git_abbrev.min(hexsz);
+    let boundary_abbrev = git_abbrev.saturating_sub(1).min(hexsz);
+    Ok((boundary_abbrev, hex_width))
 }
 
 /// Render the object-name column for one entry.
@@ -916,7 +1445,13 @@ fn render_sha(
     boundary: bool,
     show_root: bool,
     hex_width: usize,
+    blank_boundary: bool,
 ) -> String {
+    if boundary && !show_root && blank_boundary {
+        // `-b`: blank out the boundary object name with spaces (full column
+        // width), matching git's `memset(hex, ' ', ...)` in emit_other.
+        return " ".repeat(hex_width);
+    }
     let hex = commit.to_hex();
     if boundary && !show_root {
         let body: String = hex.chars().take(abbrev).collect();
@@ -993,4 +1528,176 @@ fn blame_option_requires_value(option: &str) -> GitError {
     eprintln!("error: switch `{option}' requires a value");
     eprint!("{BLAME_USAGE}");
     GitError::Exit(129)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(blob: &[u8]) -> Vec<sley_diff_merge::DiffLine<'_>> {
+        sley_diff_merge::split_lines(blob)
+    }
+
+    #[test]
+    fn diff_hunks_collapses_change_runs() {
+        // parent: a b c   child: a X c  -> one hunk replacing line 2 (0-based 1).
+        let p = lines(b"a\nb\nc\n");
+        let c = lines(b"a\nX\nc\n");
+        let h = diff_hunks(&p, &c);
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].start_a, h[0].count_a), (1, 1));
+        assert_eq!((h[0].start_b, h[0].count_b), (1, 1));
+    }
+
+    #[test]
+    fn diff_hunks_pure_insertion() {
+        // parent: a c   child: a b c -> insert one child line at index 1.
+        let p = lines(b"a\nc\n");
+        let c = lines(b"a\nb\nc\n");
+        let h = diff_hunks(&p, &c);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].count_a, 0);
+        assert_eq!((h[0].start_b, h[0].count_b), (1, 1));
+    }
+
+    #[test]
+    fn diff_hunks_identical_is_empty() {
+        let p = lines(b"a\nb\n");
+        let c = lines(b"a\nb\n");
+        assert!(diff_hunks(&p, &c).is_empty());
+    }
+
+    /// A chunk that is wholly preserved by the parent migrates entirely, with
+    /// its `s_lno` rebased by the offset of any inserted lines above it.
+    #[test]
+    fn pass_blame_routes_preserved_lines_to_parent() {
+        let child = ObjectId::null(ObjectFormat::Sha1);
+        // parent: a b   child: X a b  (one line inserted at the top). Child
+        // lines 1 and 2 (a, b) are preserved; they rebase to parent lines 0, 1.
+        let p = lines(b"a\nb\n");
+        let c = lines(b"X\na\nb\n");
+        let mut owned = vec![BlameEntry {
+            suspect: child,
+            boundary: false,
+            lno: 0,
+            s_lno: 0,
+            num_lines: 3,
+        }];
+        let parent = ObjectId::null(ObjectFormat::Sha1);
+        let passed = pass_blame_to_parent(&p, &c, parent, &mut owned);
+        // The inserted line (child s_lno 0) stays with the child; lines 1..3 go
+        // to the parent at parent-s_lno 0..2.
+        let ours_lines: usize = owned.iter().map(|e| e.num_lines).sum();
+        let passed_lines: usize = passed.iter().map(|e| e.num_lines).sum();
+        assert_eq!(ours_lines, 1, "the inserted line stays with the child");
+        assert_eq!(passed_lines, 2, "the two preserved lines go to the parent");
+        // Preserved chunk rebased: child s_lno 1 -> parent s_lno 0.
+        let first = passed.iter().min_by_key(|e| e.lno).unwrap();
+        assert_eq!(first.lno, 1);
+        assert_eq!(first.s_lno, 0);
+    }
+
+    #[test]
+    fn pass_blame_charges_changed_lines_to_child() {
+        let child = ObjectId::null(ObjectFormat::Sha1);
+        // parent: a b c   child: a Z c — only the middle line changed.
+        let p = lines(b"a\nb\nc\n");
+        let c = lines(b"a\nZ\nc\n");
+        let mut owned = vec![BlameEntry {
+            suspect: child,
+            boundary: false,
+            lno: 0,
+            s_lno: 0,
+            num_lines: 3,
+        }];
+        let parent = ObjectId::null(ObjectFormat::Sha1);
+        let passed = pass_blame_to_parent(&p, &c, parent, &mut owned);
+        let ours: usize = owned.iter().map(|e| e.num_lines).sum();
+        let to_parent: usize = passed.iter().map(|e| e.num_lines).sum();
+        assert_eq!(ours, 1, "the changed middle line is charged to the child");
+        assert_eq!(to_parent, 2, "the unchanged a/c lines pass to the parent");
+    }
+
+    #[test]
+    fn split_entry_at_partitions_lines() {
+        let oid = ObjectId::null(ObjectFormat::Sha1);
+        let mut e = BlameEntry {
+            suspect: oid,
+            boundary: false,
+            lno: 10,
+            s_lno: 4,
+            num_lines: 5,
+        };
+        let tail = split_entry_at(&mut e, 2);
+        assert_eq!((e.lno, e.s_lno, e.num_lines), (10, 4, 2));
+        assert_eq!((tail.lno, tail.s_lno, tail.num_lines), (12, 6, 3));
+    }
+
+    #[test]
+    fn split_range_at_comma_respects_regex() {
+        assert_eq!(split_range_at_comma("3,6"), ("3", "6"));
+        assert_eq!(split_range_at_comma("/a,b/,/c/"), ("/a,b/", "/c/"));
+        assert_eq!(split_range_at_comma("/only/"), ("/only/", ""));
+        assert_eq!(split_range_at_comma("5"), ("5", ""));
+    }
+
+    #[test]
+    fn resolve_range_errors_when_start_past_eof() {
+        // 3-line file; -L4 (start 4) must error, not clamp.
+        let contents: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let range = RawRange {
+            start: RangeBound::Absolute(4),
+            end: RangeBound::Omitted,
+        };
+        let r = resolve_range(&range, 3, &contents, 1, "f");
+        assert!(matches!(r, Err(GitError::Exit(128))));
+    }
+
+    #[test]
+    fn resolve_range_reversed_lists_inner_span() {
+        // -L100,2 on a 3-line file lists [2,3] (no error: smaller endpoint in range).
+        let contents: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let range = RawRange {
+            start: RangeBound::Absolute(100),
+            end: RangeBound::Absolute(2),
+        };
+        let (lo, hi) = resolve_range(&range, 3, &contents, 1, "f").unwrap();
+        assert_eq!((lo, hi), (2, 3));
+    }
+
+    #[test]
+    fn resolve_range_negative_relative_end() {
+        // -L3,-1 selects [3,3]; -L6,-4 selects [3,6].
+        let contents: Vec<&[u8]> = (1..=8).map(|_| b"x".as_slice()).collect();
+        let r1 = RawRange {
+            start: RangeBound::Absolute(3),
+            end: RangeBound::RelativeNeg(1),
+        };
+        assert_eq!(resolve_range(&r1, 8, &contents, 1, "f").unwrap(), (3, 3));
+        let r2 = RawRange {
+            start: RangeBound::Absolute(6),
+            end: RangeBound::RelativeNeg(4),
+        };
+        assert_eq!(resolve_range(&r2, 8, &contents, 1, "f").unwrap(), (3, 6));
+    }
+
+    #[test]
+    fn resolve_regex_bound_finds_first_match_from_anchor() {
+        let contents: Vec<&[u8]> = vec![b"apple", b"robot green", b"banana", b"green tea"];
+        // From line 1, /green/ matches line 2.
+        assert_eq!(
+            resolve_regex_bound("green", &contents, 1, 4).unwrap(),
+            2
+        );
+        // From line 3, /green/ matches line 4 (the search anchor advances).
+        assert_eq!(
+            resolve_regex_bound("green", &contents, 3, 4).unwrap(),
+            4
+        );
+        // No match is the fatal error.
+        assert!(matches!(
+            resolve_regex_bound("zzz", &contents, 1, 4),
+            Err(GitError::Exit(128))
+        ));
+    }
 }

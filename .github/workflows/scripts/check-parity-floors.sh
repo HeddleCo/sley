@@ -399,6 +399,13 @@ declare -A FLOOR=(
     [t7508-status.sh]=113
     [t4027-diff-submodule.sh]=18
     [t7102-reset.sh]=37
+    # blame scoreboard wave (blame.c pass_blame/blame_chunk port + annotate-compat
+    # output + -L /regex/ ranges + -b/--first-parent/^rev/abbrev parity): NEW floors.
+    # t8002 54->117, t8001 44->99, t8012 44->98. Residual: :funcname ranges,
+    # --contents working-tree overlay, --progress, --color-lines/--color-by-age.
+    [t8002-blame.sh]=117
+    [t8001-annotate.sh]=99
+    [t8012-blame-colors.sh]=98
 )
 
 fail=0
