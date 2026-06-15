@@ -646,7 +646,10 @@ fn diff_files_stat_entry_has_content_change(data: &DiffStatEntryData<'_>) -> boo
     if !mode_unchanged {
         return true;
     }
-    data.old_content.as_deref() != data.new_content.as_deref()
+    match data.stats {
+        DiffLineStats::Binary { unchanged, .. } => !unchanged,
+        DiffLineStats::Text { inserted, deleted } => inserted != 0 || deleted != 0,
+    }
 }
 
 /// Render a single entry for `--name-only` / `--name-status`, honouring `-z`

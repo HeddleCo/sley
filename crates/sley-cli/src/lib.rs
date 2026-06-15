@@ -2205,16 +2205,35 @@ fn collect_dirty_submodules(
     format: ObjectFormat,
     worktree_root: &Path,
     config: &SubmoduleDiffConfig,
+    precomputed_gitlinks: Option<&[sley_diff_merge::IndexGitlinkEntry]>,
+) -> Result<HashSet<Vec<u8>>> {
+    if let Some(gitlinks) = precomputed_gitlinks {
+        return collect_dirty_submodules_from_gitlinks(entries, worktree_root, config, gitlinks);
+    }
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(HashSet::new());
+    };
+    let gitlinks = index
+        .entries
+        .iter()
+        .filter(|entry| entry.mode == 0o160000)
+        .map(|entry| sley_diff_merge::IndexGitlinkEntry {
+            path: BString::from_bytes(entry.path.as_bytes()),
+            oid: entry.oid,
+        })
+        .collect::<Vec<_>>();
+    collect_dirty_submodules_from_gitlinks(entries, worktree_root, config, &gitlinks)
+}
+
+fn collect_dirty_submodules_from_gitlinks(
+    entries: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    worktree_root: &Path,
+    config: &SubmoduleDiffConfig,
+    gitlinks: &[sley_diff_merge::IndexGitlinkEntry],
 ) -> Result<HashSet<Vec<u8>>> {
     let mut dirty = HashSet::new();
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
-        return Ok(dirty);
-    };
     let mut injected = false;
-    for entry in &index.entries {
-        if entry.mode != 0o160000 {
-            continue;
-        }
+    for entry in gitlinks {
         let path = entry.path.as_bytes();
         let mode = config.effective(path);
         if matches!(mode, SubmoduleIgnoreMode::All | SubmoduleIgnoreMode::Dirty) {
@@ -2663,7 +2682,7 @@ fn write_diff_numstat_materialized_entry(
 
 fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Result<()> {
     match stats {
-        DiffLineStats::Binary => write!(stdout, "-\t-\t")?,
+        DiffLineStats::Binary { .. } => write!(stdout, "-\t-\t")?,
         DiffLineStats::Text { inserted, deleted } => write!(stdout, "{inserted}\t{deleted}\t")?,
     }
     Ok(())
@@ -3152,7 +3171,7 @@ fn write_diff_dirstat(
                     let new_content =
                         diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
                     match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
-                        DiffLineStats::Binary => {
+                        DiffLineStats::Binary { .. } => {
                             let bytes = old_content.as_ref().map_or(0, Vec::len)
                                 + new_content.as_ref().map_or(0, Vec::len);
                             (bytes as u64).div_ceil(64)
@@ -3287,8 +3306,6 @@ struct DiffStatOptions {
 
 struct DiffStatEntryData<'a> {
     entry: &'a sley_diff_merge::NameStatusEntry,
-    old_content: Option<Vec<u8>>,
-    new_content: Option<Vec<u8>>,
     stats: DiffLineStats,
 }
 
@@ -3301,14 +3318,13 @@ fn collect_diff_stat_entries<'a>(
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_content(entry, db)?;
-        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-        let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
-        stat_entries.push(DiffStatEntryData {
-            entry,
-            old_content,
-            new_content,
-            stats,
-        });
+        let stats = if entry.old_oid.is_some() && entry.old_oid == entry.new_oid {
+            diff_line_stats(old_content.as_deref(), old_content.as_deref())
+        } else {
+            let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+            diff_line_stats(old_content.as_deref(), new_content.as_deref())
+        };
+        stat_entries.push(DiffStatEntryData { entry, stats });
     }
     Ok(stat_entries)
 }
@@ -3336,10 +3352,14 @@ fn diff_stat_rows_from_materialized(
     let mut rows = Vec::with_capacity(entries.len());
     for data in entries {
         let stats = match data.stats {
-            DiffLineStats::Binary => DiffStatStats::Binary {
-                old_size: data.old_content.as_ref().map_or(0, Vec::len),
-                new_size: data.new_content.as_ref().map_or(0, Vec::len),
-                unchanged: data.old_content == data.new_content,
+            DiffLineStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
+            } => DiffStatStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
             },
             DiffLineStats::Text { inserted, deleted } => DiffStatStats::Text { inserted, deleted },
         };
@@ -3658,13 +3678,21 @@ fn repo_path_to_path(path: &[u8]) -> PathBuf {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffLineStats {
-    Binary,
+    Binary {
+        old_size: usize,
+        new_size: usize,
+        unchanged: bool,
+    },
     Text { inserted: usize, deleted: usize },
 }
 
 fn diff_line_stats(old: Option<&[u8]>, new: Option<&[u8]>) -> DiffLineStats {
     if old.is_some_and(is_binary_content) || new.is_some_and(is_binary_content) {
-        return DiffLineStats::Binary;
+        return DiffLineStats::Binary {
+            old_size: old.map_or(0, <[u8]>::len),
+            new_size: new.map_or(0, <[u8]>::len),
+            unchanged: old == new,
+        };
     }
     match (old, new) {
         (None, None) => DiffLineStats::Text {
@@ -3699,6 +3727,34 @@ fn is_binary_content(bytes: &[u8]) -> bool {
 fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     let old_lines = sley_diff_merge::split_lines(old);
     let new_lines = sley_diff_merge::split_lines(new);
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut old_end = old_lines.len();
+    let mut new_end = new_lines.len();
+    while old_end > prefix
+        && new_end > prefix
+        && old_lines[old_end - 1] == new_lines[new_end - 1]
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    let old_middle = &old_lines[prefix..old_end];
+    let new_middle = &new_lines[prefix..new_end];
+    if let Some(common) = trivial_lcs_len(old_middle, new_middle) {
+        return (new_middle.len() - common, old_middle.len() - common);
+    }
+    const NO_COMMON_SCAN_MIN_PRODUCT: usize = 1_000_000;
+    if old_middle.len().saturating_mul(new_middle.len()) >= NO_COMMON_SCAN_MIN_PRODUCT
+        && !diff_lines_have_any_common(old_middle, new_middle)
+    {
+        return (new_middle.len(), old_middle.len());
+    }
+
     let mut inserted = 0usize;
     let mut deleted = 0usize;
     for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
@@ -3709,6 +3765,40 @@ fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
         }
     }
     (inserted, deleted)
+}
+
+fn trivial_lcs_len(
+    old: &[sley_diff_merge::DiffLine<'_>],
+    new: &[sley_diff_merge::DiffLine<'_>],
+) -> Option<usize> {
+    if old.is_empty() || new.is_empty() {
+        return Some(0);
+    }
+    if old.len() == 1 {
+        return Some(usize::from(new.iter().any(|line| *line == old[0])));
+    }
+    if new.len() == 1 {
+        return Some(usize::from(old.iter().any(|line| *line == new[0])));
+    }
+    None
+}
+
+fn diff_lines_have_any_common(
+    old: &[sley_diff_merge::DiffLine<'_>],
+    new: &[sley_diff_merge::DiffLine<'_>],
+) -> bool {
+    let (small, large) = if old.len() <= new.len() {
+        (old, new)
+    } else {
+        (new, old)
+    };
+    let mut seen = HashSet::with_capacity(small.len());
+    for line in small {
+        seen.insert((line.content, line.has_newline));
+    }
+    large
+        .iter()
+        .any(|line| seen.contains(&(line.content, line.has_newline)))
 }
 
 fn count_diff_lines(bytes: &[u8]) -> usize {
@@ -9701,7 +9791,7 @@ fn default_committer() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::refname_pattern_matches;
+    use super::{count_line_diff, refname_pattern_matches};
 
     #[test]
     fn refname_patterns_match_git_style_wildcards() {
@@ -9721,5 +9811,24 @@ mod tests {
         assert!(refname_pattern_matches("release[", "release["));
         assert!(refname_pattern_matches(r"release\*", "release*"));
         assert!(!refname_pattern_matches(r"release\*", "release/1"));
+    }
+
+    #[test]
+    fn diff_stat_line_count_fast_paths_are_exact() {
+        let mut many_new = String::new();
+        for idx in 0..1024 {
+            many_new.push_str(&format!("new line {idx}\n"));
+        }
+        assert_eq!(count_line_diff(b"old line\n", many_new.as_bytes()), (1024, 1));
+
+        let mut old = String::from("shared prefix\n");
+        let mut new = String::from("shared prefix\n");
+        for idx in 0..1024 {
+            old.push_str(&format!("old middle {idx}\n"));
+            new.push_str(&format!("new middle {idx}\n"));
+        }
+        old.push_str("shared suffix\n");
+        new.push_str("shared suffix\n");
+        assert_eq!(count_line_diff(old.as_bytes(), new.as_bytes()), (1024, 1024));
     }
 }

@@ -383,6 +383,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         rename_threshold,
         copy_threshold,
     };
+    let mut precomputed_staged_gitlinks = None;
     let entries = if !diff_trees.is_empty() {
         match diff_trees.as_slice() {
             // `diff <rev>`: that tree vs the worktree (or the index with --cached).
@@ -487,34 +488,47 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     } else {
         let worktree_root = worktree_root.as_ref().expect("worktree root set for diff");
-        if inexact_renames {
-            sley_diff_merge::diff_name_status_index_worktree_with_rename_options(
+        let diff = if inexact_renames {
+            sley_diff_merge::diff_name_status_index_worktree_with_rename_options_and_gitlinks(
                 worktree_root,
                 &git_dir,
                 format,
                 rename_options,
             )?
         } else {
-            sley_diff_merge::diff_name_status_index_worktree_with_options(
+            sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks(
                 worktree_root,
                 &git_dir,
                 format,
                 name_status_options,
             )?
-        }
+        };
+        precomputed_staged_gitlinks = Some(diff.staged_gitlinks);
+        diff.entries
     };
     // Submodule-ignore handling: drop `all`-ignored gitlink entries, then for
     // worktree-involved diffs collect each staged submodule's dirt (for the
     // `-dirty` patch suffix) and append dirty-but-same-commit pairs the map
     // comparison alone cannot see.
-    let submodule_config =
-        submodule_diff_config(&git_dir, worktree_root.as_deref(), ignore_submodules_cli);
-    let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
-    let dirty_submodules = match (use_worktree_new, worktree_root.as_deref()) {
-        (true, Some(root)) => {
-            collect_dirty_submodules(&mut entries, &git_dir, format, root, &submodule_config)?
-        }
-        _ => HashSet::new(),
+    let skip_submodule_work = matches!(precomputed_staged_gitlinks.as_deref(), Some([]));
+    let (entries, dirty_submodules) = if skip_submodule_work {
+        (entries, HashSet::new())
+    } else {
+        let submodule_config =
+            submodule_diff_config(&git_dir, worktree_root.as_deref(), ignore_submodules_cli);
+        let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
+        let dirty_submodules = match (use_worktree_new, worktree_root.as_deref()) {
+            (true, Some(root)) => collect_dirty_submodules(
+                &mut entries,
+                &git_dir,
+                format,
+                root,
+                &submodule_config,
+                precomputed_staged_gitlinks.as_deref(),
+            )?,
+            _ => HashSet::new(),
+        };
+        (entries, dirty_submodules)
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if let Some(needle) = pickaxe.as_deref() {
