@@ -41,6 +41,16 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut test_bitmap = false;
     let mut unpacked = false;
     let mut setup_not = false;
+    // Bisection plumbing (`--bisect[-vars|-all]`): `bisect` selects the
+    // weighted-midpoint output mode, `bisect_vars` prints the `bisect_*=`
+    // block, `bisect_all` lists every candidate by distance. Only the literal
+    // `--bisect` form injects the default `refs/bisect/*` revisions (git wires
+    // it into `setup_revisions`); `--bisect-vars`/`--bisect-all` are consumed
+    // by `builtin/rev-list.c` after setup and do not.
+    let mut bisect = false;
+    let mut bisect_inject_refs = false;
+    let mut bisect_vars = false;
+    let mut bisect_all = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -117,6 +127,22 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             // No effect on the regular walk yet (pre-existing behaviour); the
             // bitmap path filters packed objects out of its result.
             "--unpacked" => unpacked = true,
+            // Bisection modes. `--bisect` additionally injects the default
+            // `refs/bisect/{bad,good-*}` refs as revisions when none are given,
+            // matching git's setup_revisions; `--bisect-all` turns on
+            // decorations for the `dist=N` annotation.
+            "--bisect" => {
+                bisect = true;
+                bisect_inject_refs = true;
+            }
+            "--bisect-vars" => {
+                bisect = true;
+                bisect_vars = true;
+            }
+            "--bisect-all" => {
+                bisect = true;
+                bisect_all = true;
+            }
             "--abbrev-commit" => abbrev_commit = true,
             "--no-abbrev-commit" => abbrev_commit = false,
             "--no-abbrev" => abbrev_len = None,
@@ -313,6 +339,20 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    if bisect_inject_refs {
+        // git's `setup_revisions` treats `--bisect` as "also add the current
+        // `refs/bisect/<bad>` as a positive and every `refs/bisect/<good>-*`
+        // as a negative". They stack on top of any explicit revisions; when
+        // the refs are absent nothing is added. This is what makes
+        // `git rev-list --bisect` (no args) default to the bisect state.
+        let default = rev_list_bisect_default_revs(&git_dir, format)?;
+        if let Some(bad) = default.bad {
+            setup_args.push(bad.to_hex());
+        }
+        for good in default.goods {
+            setup_args.push(format!("^{}", good.to_hex()));
+        }
+    }
     let setup = sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {
@@ -330,7 +370,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         )));
     }
     let revision_options = setup.options;
-    if !revision_options.has_revisions() && !revision_options.ignore_missing {
+    if !revision_options.has_revisions() && !revision_options.ignore_missing && !bisect {
         return Err(GitError::Command(
             "rev-list currently requires at least one revision".into(),
         ));
@@ -452,6 +492,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         // helpers returning -1.
         let bitmap_eligible = walk_mode == RevListWalkMode::Walk
             && ordering == RevListOrdering::Default
+            && !bisect
             && pathspecs.is_empty()
             && !full_history
             && !first_parent
@@ -555,6 +596,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     };
     if walk_mode == RevListWalkMode::Walk
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && !bisect
         && (matches!(pretty, RevListPretty::Default) || metadata_format.is_some())
         && matches!(object_filter, RevListObjectFilter::None)
         && pathspecs.is_empty()
@@ -738,6 +780,19 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         (_, RevListOrdering::Date) => rev_list_date_order(selected)?,
         (_, RevListOrdering::AuthorDate) => rev_list_author_date_order(selected)?,
     };
+    if bisect {
+        // git runs `find_bisection` on the limited commit list (date-ordered,
+        // newest-first) and replaces the output with the bisection result.
+        return rev_list_emit_bisection(
+            &git_dir,
+            &db,
+            format,
+            &selected,
+            bisect_vars,
+            bisect_all,
+            first_parent,
+        );
+    }
     // Pathspec-limited / --full-history simplification: TREESAME-prune the
     // ordered set and rewrite parents past the dropped commits. Held in an
     // owned binding so `selected` (a Vec of references) can borrow from it.
@@ -1030,6 +1085,100 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         write_rev_list_object_line(&object, object_names, nul_terminated)?;
     }
     io::stdout().flush()?;
+    Ok(())
+}
+
+/// The default bisect revisions injected by `--bisect`: the `refs/bisect/<bad>`
+/// commit (positive) plus every `refs/bisect/<good>-*` commit (negative). The
+/// bad/good terms come from `BISECT_TERMS` (defaulting to `bad`/`good`).
+struct BisectDefaultRevs {
+    bad: Option<ObjectId>,
+    goods: Vec<ObjectId>,
+}
+
+fn rev_list_bisect_default_revs(git_dir: &Path, format: ObjectFormat) -> Result<BisectDefaultRevs> {
+    // Same selection as `bisect next`: the single `refs/bisect/<bad>` and every
+    // `refs/bisect/<good>-<oid>` ref (`bad`/`good` from BISECT_TERMS).
+    let terms = sley_rev::read_bisect_terms(git_dir)?;
+    let good_prefix = format!("{}-", terms.good);
+    let store = FileRefStore::new(git_dir, format);
+    let mut bad = None;
+    let mut goods = Vec::new();
+    for reference in store.list_refs()? {
+        let RefTarget::Direct(oid) = reference.target else {
+            continue;
+        };
+        let Some(name) = reference.name.strip_prefix("refs/bisect/") else {
+            continue;
+        };
+        if name == terms.bad {
+            bad = Some(oid);
+        } else if name.starts_with(&good_prefix) {
+            goods.push(oid);
+        }
+    }
+    Ok(BisectDefaultRevs { bad, goods })
+}
+
+/// Run `find_bisection` over the (date-ordered, newest-first) interesting set
+/// and emit the plumbing output for `--bisect` / `--bisect-vars` /
+/// `--bisect-all` (upstream `builtin/rev-list.c`'s bisect path +
+/// `show_bisect_vars`).
+fn rev_list_emit_bisection(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    selected: &[&sley_rev::CommitRecord],
+    bisect_vars: bool,
+    bisect_all: bool,
+    first_parent: bool,
+) -> Result<()> {
+    let owned: Vec<sley_rev::CommitRecord> = selected.iter().map(|r| (*r).clone()).collect();
+    let result = sley_rev::bisect::find_bisection(&owned, bisect_all, first_parent);
+    let mut stdout = io::stdout();
+
+    if bisect_vars {
+        // `show_bisect_vars`: nothing when the set is empty.
+        let Some(&(rev, _)) = result.picks.first() else {
+            return Ok(());
+        };
+        let all = result.all;
+        let reaches = result.reaches;
+        // cnt = max(all - reaches, reaches); test count is cnt - 1.
+        let cnt = (all - reaches).max(reaches);
+        writeln!(stdout, "bisect_rev='{}'", rev.to_hex())?;
+        writeln!(stdout, "bisect_nr={}", cnt - 1)?;
+        writeln!(stdout, "bisect_good={}", all - reaches - 1)?;
+        writeln!(stdout, "bisect_bad={}", reaches - 1)?;
+        writeln!(stdout, "bisect_all={}", all)?;
+        writeln!(
+            stdout,
+            "bisect_steps={}",
+            sley_rev::bisect::estimate_bisect_steps(all)
+        )?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    if bisect_all {
+        // Every candidate, newest-first by distance, decorated with `dist=N`
+        // alongside its ref decorations (upstream `best_bisection_sorted` +
+        // `revs.show_decorations`).
+        let decorations = log_decoration_map(git_dir, db, format, LogDecorationMode::Short)?;
+        for (oid, distance) in &result.picks {
+            let mut labels: Vec<String> = decorations.get(oid).cloned().unwrap_or_default();
+            labels.push(format!("dist={distance}"));
+            writeln!(stdout, "{} ({})", oid.to_hex(), labels.join(", "))?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    // Plain `--bisect`: the single midpoint commit (or nothing).
+    if let Some(&(rev, _)) = result.picks.first() {
+        writeln!(stdout, "{}", rev.to_hex())?;
+    }
+    stdout.flush()?;
     Ok(())
 }
 

@@ -1,3 +1,4 @@
+pub mod bisect;
 pub mod graph;
 mod setup;
 
