@@ -172,14 +172,23 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                         return rev_parse_needed_single_revision(quiet);
                     }
                 }
+                // A leading `^` marks an excluded revision (rev-list's "not this
+                // one"). git resolves the remainder exactly like a positive arg
+                // and prefixes the rendered output with `^`; the same applies to
+                // --abbrev-ref / --symbolic-full-name / --short rendering.
+                let (rev, negate) = match rev.strip_prefix('^') {
+                    Some(rest) => (rest, true),
+                    None => (rev, false),
+                };
                 if abbrev_ref {
-                    println!("{}", rev_parse_abbrev_ref(&git_dir, format, rev)?);
+                    let rendered = rev_parse_abbrev_ref(&git_dir, format, rev)?;
+                    rev_parse_print_positional(&rendered, negate);
                     idx += 1;
                     continue;
                 }
                 if symbolic_full_name {
                     if let Some(name) = rev_parse_symbolic_full_name(&git_dir, format, rev)? {
-                        println!("{name}");
+                        rev_parse_print_positional(&name, negate);
                     }
                     idx += 1;
                     continue;
@@ -198,9 +207,9 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                         return Err(GitError::Command("needed a single revision".into()));
                     }
                     let oid = oid.to_hex();
-                    println!("{}", &oid[..len.min(oid.len())]);
+                    rev_parse_print_positional(&oid[..len.min(oid.len())], negate);
                 } else {
-                    println!("{oid}");
+                    rev_parse_print_positional(&oid.to_hex(), negate);
                 }
             }
         }
@@ -354,6 +363,17 @@ fn rev_parse_abbrev_ref(git_dir: &Path, format: ObjectFormat, rev: &str) -> Resu
     Err(GitError::not_found(format!("revision {rev}")))
 }
 
+/// Render a positional rev-parse line, prefixing `^` for an excluded (`^rev`)
+/// argument. Mirrors the `^{rendered}` form `rev_parse_bisect` emits for good
+/// refs.
+fn rev_parse_print_positional(rendered: &str, negate: bool) {
+    if negate {
+        println!("^{rendered}");
+    } else {
+        println!("{rendered}");
+    }
+}
+
 fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bool) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
     let refs = store.list_refs()?;
@@ -367,11 +387,7 @@ fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bo
                 None => return Ok(()),
             }
         };
-        if negate {
-            println!("^{rendered}");
-        } else {
-            println!("{rendered}");
-        }
+        rev_parse_print_positional(&rendered, negate);
         Ok(())
     };
     // `list_refs` already returns refs in name order, so a single forward pass

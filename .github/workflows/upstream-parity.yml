@@ -157,6 +157,7 @@ jobs:
             t5500-fetch-pack.sh
             t5571-pre-push-hook.sh
             t5537-fetch-shallow.sh
+            t6002-rev-list-bisect.sh
             t6003-rev-list-topo-order.sh
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh
