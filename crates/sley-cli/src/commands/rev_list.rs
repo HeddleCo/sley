@@ -370,7 +370,13 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         )));
     }
     let revision_options = setup.options;
-    if !revision_options.has_revisions() && !revision_options.ignore_missing && !bisect {
+    // `--stdin` makes the empty case legal: git reads revisions from stdin and
+    // produces empty output rather than the usage error a bare `rev-list` hits.
+    if !revision_options.has_revisions()
+        && !revision_options.ignore_missing
+        && !bisect
+        && !read_stdin
+    {
         return Err(GitError::Command(
             "rev-list currently requires at least one revision".into(),
         ));

@@ -1636,6 +1636,14 @@ fn print_tag_list(
         let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
         let deltabase = zero_oid(format)?;
         let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+        let ref_names: std::collections::HashSet<String> = store
+            .list_refs()?
+            .into_iter()
+            .map(|reference| reference.name)
+            .collect();
+        let warn_ambiguous_refs = read_repo_config(git_dir)?
+            .get_bool("core", None, "warnambiguousrefs")
+            .unwrap_or(true);
         let mut stdout = io::stdout();
         for entry in entries {
             let Some((oid, symref)) = resolve_for_each_ref_target(store, &entry.reference)? else {
@@ -1670,6 +1678,8 @@ fn print_tag_list(
                 contents,
                 peeled_object,
                 mailmap: &mailmap,
+                ref_names: &ref_names,
+                warn_ambiguous_refs,
             };
             let mut line = Vec::new();
             print_for_each_ref_format(&mut line, &format_spec, &format_context)?;

@@ -34,7 +34,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
         return Err(GitError::Command("rev-parse requires <rev>...".into()));
     }
     let format = repository_object_format(&git_dir)?;
-    let mut short = None;
+    let mut short: Option<usize> = None;
     let mut short_revs = 0usize;
     let mut verify = false;
     let mut verified_revs = 0usize;
@@ -42,9 +42,40 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     let mut abbrev_ref = false;
     let mut symbolic_full_name = false;
     let mut path_format = RevParsePathFormat::Default;
+    // Pseudo-ref options (`--all`, `--glob=`, `--branches[=]`, `--exclude=`, …)
+    // resolve refs and print their OIDs interleaved with positional args, the
+    // same way git's `handle_revision_pseudo_opt` feeds `add_pending_object`.
+    // Lazily built (and config loaded) only when the first such option appears.
+    let mut pseudo: Option<sley_rev::PseudoRefResolver> = None;
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
+        if !verify && sley_rev::PseudoRefResolver::is_pseudo_ref_arg(arg) {
+            let resolver = match pseudo.as_mut() {
+                Some(resolver) => resolver,
+                None => {
+                    let config = read_repo_config(&git_dir).ok();
+                    pseudo = Some(sley_rev::PseudoRefResolver::new(
+                        &git_dir,
+                        format,
+                        config.as_ref(),
+                    )?);
+                    pseudo.as_mut().expect("just inserted")
+                }
+            };
+            if let Some(matched) = resolver.feed(arg)? {
+                for matched_ref in matched {
+                    let oid = matched_ref.oid.to_hex();
+                    if let Some(len) = short {
+                        println!("{}", &oid[..len.min(oid.len())]);
+                    } else {
+                        println!("{oid}");
+                    }
+                }
+            }
+            idx += 1;
+            continue;
+        }
         match arg.as_str() {
             "--" if verify => break,
             "--end-of-options" if verify => {}

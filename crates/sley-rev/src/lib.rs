@@ -6,9 +6,9 @@ use sley_config::GitConfig;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
 pub use setup::{
-    NoWalkMode, RevisionOptions, RevisionOrder, RevisionSetupContext, RevisionSymmetricRange,
-    RevisionTip, SetupRevisions, ambiguous_argument_error, ambiguous_argument_message,
-    setup_revisions, setup_revisions_os,
+    MatchedRef, NoWalkMode, PseudoRefResolver, RevisionOptions, RevisionOrder,
+    RevisionSetupContext, RevisionSymmetricRange, RevisionTip, SetupRevisions,
+    ambiguous_argument_error, ambiguous_argument_message, setup_revisions, setup_revisions_os,
 };
 pub use sley_core::BString;
 use sley_formats::CommitGraph;
@@ -369,7 +369,48 @@ fn resolve_revision_name(
             ObjectPrefixResolution::Missing => {}
         }
     }
+    // git's get_describe_name: `<tag>-<count>-g<hex>` (describe output) resolves
+    // to the abbreviated commit named by the trailing `-g<hex>`.
+    if let Some(oid) = resolve_describe_name(git_dir, format, rev)? {
+        return Ok(oid);
+    }
     Err(GitError::not_found(format!("revision {rev}")))
+}
+
+/// Resolve a `git describe` name (`<ref>-<count>-g<hex>`) back to the commit it
+/// names, mirroring `get_describe_name` in git's object-name.c: scan from the
+/// end over hex digits; the first non-hex byte must be the `g` of a `-g` marker,
+/// and the bytes after it form an abbreviated commit oid.
+fn resolve_describe_name(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    rev: &str,
+) -> Result<Option<ObjectId>> {
+    let bytes = rev.as_bytes();
+    // Need at least `X-gY`: the scan starts at the last byte and stops once we
+    // are within two bytes of the start (matching git's `name + 2 <= cp`).
+    let mut idx = bytes.len();
+    while idx >= 2 {
+        idx -= 1;
+        let ch = bytes[idx];
+        if ch.is_ascii_hexdigit() {
+            continue;
+        }
+        if ch == b'g' && idx >= 1 && bytes[idx - 1] == b'-' {
+            let hex = &rev[idx + 1..];
+            if hex.len() >= 4
+                && hex.len() < format.hex_len()
+                && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                let db = FileObjectDatabase::from_git_dir(git_dir, format);
+                if let ObjectPrefixResolution::Unique(oid) = db.resolve_prefix(hex)? {
+                    return Ok(Some(oid));
+                }
+            }
+        }
+        break;
+    }
+    Ok(None)
 }
 
 fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectId>> {
@@ -787,6 +828,23 @@ fn parse_revision_count(rev: &str, text: &str) -> Result<usize> {
         .map_err(|_| GitError::InvalidFormat(format!("invalid revision suffix in {rev}")))
 }
 
+/// Peel `base` to a commit for `~N`/`^N` navigation, but only read the object
+/// when necessary: a base already present in the commit-graph is a commit, so it
+/// is returned without a read (preserving the graph-only navigation fast path).
+/// A base absent from the graph is read; commits pass through, annotated tags are
+/// followed to their commit.
+fn peel_base_to_commit_if_needed<R: ObjectReader>(
+    reader: &R,
+    format: sley_core::ObjectFormat,
+    graph: &mut CommitGraphContext<'_>,
+    base: &ObjectId,
+) -> Result<ObjectId> {
+    if graph.lookup(base).is_some() {
+        return Ok(*base);
+    }
+    peel_to_commit(reader, format, base)
+}
+
 fn apply_revision_suffix<R: ObjectReader>(
     git_dir: &Path,
     reader: &R,
@@ -805,16 +863,23 @@ fn apply_revision_suffix<R: ObjectReader>(
                 let _ = raw_rev;
                 return peel_revision(reader, format, base, PeelKind::Commit);
             }
+            // git peels the base to a commit before taking the Nth parent, so
+            // `<annotated-tag>^N` follows the tag to its commit first. Peeling
+            // reads the object, so skip it when the graph already covers the base
+            // (a commit) to preserve the graph-only navigation fast path.
             let mut graph = CommitGraphContext::load(git_dir, format);
+            let base = peel_base_to_commit_if_needed(reader, format, &mut graph, base)?;
             graph
-                .commit_parents(reader, base)?
+                .commit_parents(reader, &base)?
                 .get(parent - 1)
                 .cloned()
                 .ok_or_else(|| GitError::not_found(format!("parent {parent} of {base}")))
         }
         RevisionSuffix::FirstParent(count) => {
+            // Likewise `<annotated-tag>~N` peels to the commit before walking
+            // first parents (skipping the read when the graph covers the base).
             let mut graph = CommitGraphContext::load(git_dir, format);
-            let mut current = *base;
+            let mut current = peel_base_to_commit_if_needed(reader, format, &mut graph, base)?;
             for _ in 0..count {
                 current = graph
                     .commit_first_parent(reader, &current)?
@@ -4178,7 +4243,10 @@ mod tests {
     #[test]
     fn setup_revisions_expands_all_with_scoped_exclude() {
         let fixture = setup_revisions_fixture();
-        let setup = run_setup(&fixture, ["--exclude=skip", "--branches"])
+        // `--exclude` matches like git's `wildmatch(pattern, name, 0)`: a bare
+        // `skip` is an exact match (it would NOT drop `skip/topic`), so excluding
+        // the nested branch needs the `skip/*` glob — matching git's behavior.
+        let setup = run_setup(&fixture, ["--exclude=skip/*", "--branches"])
             .expect("setup should parse");
         assert_oid_set(
             setup.options.positives.iter().map(|tip| tip.oid),

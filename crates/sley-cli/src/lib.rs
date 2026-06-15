@@ -5025,6 +5025,20 @@ struct ForEachRefFormatContext<'a> {
     contents: Option<ForEachRefContents<'a>>,
     peeled_object: Option<ForEachRefPeeledObject<'a>>,
     mailmap: &'a commands::utility::Mailmap,
+    // All ref names in the store + `core.warnambiguousrefs`, for the
+    // `:short` atoms' shorten_unambiguous_ref resolution.
+    ref_names: &'a std::collections::HashSet<String>,
+    warn_ambiguous_refs: bool,
+}
+
+impl ForEachRefFormatContext<'_> {
+    /// Shorten a fully-qualified refname to its unambiguous abbreviation, the
+    /// way git's `%(refname:short)` / `%(symref:short)` / `%(upstream:short)` do.
+    fn shorten_ref(&self, refname: &str) -> String {
+        sley_ref_filter::shorten_unambiguous_ref(refname, self.warn_ambiguous_refs, |candidate| {
+            self.ref_names.contains(candidate)
+        })
+    }
 }
 
 struct ForEachRefPeeledObject<'a> {
@@ -5064,7 +5078,7 @@ fn print_for_each_ref_format(
                 "HEAD" => stdout.write_all(if context.is_head { b"*" } else { b" " })?,
                 "refname" => stdout.write_all(context.refname.as_bytes())?,
                 "refname:short" => {
-                    stdout.write_all(for_each_ref_short_name(context.refname).as_bytes())?
+                    stdout.write_all(context.shorten_ref(context.refname).as_bytes())?
                 }
                 "objectname" => write!(stdout, "{}", context.oid)?,
                 "objectname:short" => stdout.write_all(
@@ -5143,8 +5157,8 @@ fn print_for_each_ref_format(
                 "symref:short" => stdout.write_all(
                     context
                         .symref
-                        .map(for_each_ref_short_name)
-                        .unwrap_or("")
+                        .map(|symref| context.shorten_ref(symref))
+                        .unwrap_or_default()
                         .as_bytes(),
                 )?,
                 "upstream" => stdout.write_all(
@@ -5159,8 +5173,8 @@ fn print_for_each_ref_format(
                     context
                         .upstream
                         .as_ref()
-                        .map(|upstream| for_each_ref_short_name(&upstream.refname))
-                        .unwrap_or("")
+                        .map(|upstream| context.shorten_ref(&upstream.refname))
+                        .unwrap_or_default()
                         .as_bytes(),
                 )?,
                 "upstream:remotename" => stdout.write_all(
@@ -5207,8 +5221,8 @@ fn print_for_each_ref_format(
                         .push
                         .as_ref()
                         .and_then(|push| push.refname.as_deref())
-                        .map(for_each_ref_short_name)
-                        .unwrap_or("")
+                        .map(|refname| context.shorten_ref(refname))
+                        .unwrap_or_default()
                         .as_bytes(),
                 )?,
                 "push:remotename" => stdout.write_all(
@@ -5567,7 +5581,7 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "tree") {
-                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(tree) = context
                             .contents
                             .as_ref()
@@ -5579,7 +5593,7 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
-                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(tree) = context
                             .peeled_object
                             .as_ref()
@@ -5591,7 +5605,7 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
-                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(contents) = &context.contents {
                             for (idx, parent) in contents.parents.iter().enumerate() {
                                 if idx > 0 {
@@ -5608,7 +5622,7 @@ fn print_for_each_ref_format(
                             }
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*parent") {
-                        let width = for_each_ref_oid_atom_width(arg, other)?;
+                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(peeled) = &context.peeled_object {
                             for (idx, parent) in peeled.parents.iter().enumerate() {
                                 if idx > 0 {
@@ -5669,6 +5683,43 @@ fn print_for_each_ref_format(
                         // above recognized — git reports the bare contents arg.
                         eprintln!("fatal: unrecognized %(contents) argument: {arg}");
                         return Err(GitError::Exit(128));
+                    } else if let Some((peeled, opts)) = for_each_ref_describe_atom(other) {
+                        // %(describe[:opts]) / %(*describe[:opts]) reuse the same
+                        // describe engine as log's %(describe); git treats describe
+                        // failures as an empty placeholder.
+                        let spec = for_each_ref_parse_describe_opts(opts)?;
+                        let target = if peeled {
+                            context.peeled_object.as_ref().map(|object| object.oid)
+                        } else {
+                            Some(*context.oid)
+                        };
+                        if let Some(target) = target
+                            && let Some(text) = crate::commands::describe::describe_for_format(
+                                context.git_dir,
+                                context.format,
+                                context.db,
+                                &target,
+                                spec.tags,
+                                spec.abbrev,
+                                &spec.matches,
+                                &spec.excludes,
+                            )?
+                        {
+                            stdout.write_all(text.as_bytes())?;
+                        }
+                    } else if other.starts_with("HEAD:") {
+                        // git's head_atom_parser: %(HEAD) takes no arguments.
+                        eprintln!("fatal: %(HEAD) does not take arguments");
+                        return Err(GitError::Exit(128));
+                    } else if let Some(arg) = other
+                        .strip_prefix("subject:")
+                        .or_else(|| other.strip_prefix("*subject:"))
+                    {
+                        // The only valid %(subject) arg is `sanitize` (matched
+                        // above); anything else is rejected like git's
+                        // subject_atom_parser.
+                        eprintln!("fatal: unrecognized %(subject) argument: {arg}");
+                        return Err(GitError::Exit(128));
                     } else {
                         return Err(GitError::Command(format!(
                             "unsupported for-each-ref format placeholder %({other})"
@@ -5699,7 +5750,7 @@ fn write_for_each_ref_typed_atom(
             match format {
                 ForEachRefNameFormat::Full => stdout.write_all(refname.as_bytes())?,
                 ForEachRefNameFormat::Short => {
-                    stdout.write_all(for_each_ref_short_name(refname).as_bytes())?
+                    stdout.write_all(context.shorten_ref(refname).as_bytes())?
                 }
                 ForEachRefNameFormat::Strip(strip) => {
                     let refname = match strip.direction {
@@ -6061,6 +6112,57 @@ fn for_each_ref_try_date_atom(
     })())
 }
 
+/// Recognize the `%(describe)` family. Returns `(peeled, opts)` where `peeled`
+/// is set for the deref form `%(*describe…)` and `opts` is whatever follows the
+/// colon (empty when there is none). Returns `None` for non-describe atoms.
+fn for_each_ref_describe_atom(placeholder: &str) -> Option<(bool, &str)> {
+    let (peeled, rest) = match placeholder.strip_prefix('*') {
+        Some(rest) => (true, rest),
+        None => (false, placeholder),
+    };
+    if rest == "describe" {
+        Some((peeled, ""))
+    } else {
+        rest.strip_prefix("describe:").map(|opts| (peeled, opts))
+    }
+}
+
+/// Parse `%(describe:opts)` like git's `describe_atom_parser`: walk the
+/// comma-separated options, and on the first unrecognized token report
+/// `unrecognized %(describe) argument: <bad-token-through-end>` (git keeps the
+/// rest of the string, not just the offending token).
+fn for_each_ref_parse_describe_opts(opts: &str) -> Result<log_format::DescribeSpec> {
+    let mut spec = log_format::DescribeSpec::default();
+    let mut rest = opts;
+    while !rest.is_empty() {
+        let (part, next) = match rest.split_once(',') {
+            Some((part, next)) => (part, next),
+            None => (rest, ""),
+        };
+        if part == "tags" {
+            spec.tags = true;
+        } else if let Some(value) = part.strip_prefix("abbrev=") {
+            match value.parse::<usize>() {
+                Ok(width) => spec.abbrev = Some(width),
+                Err(_) => return Err(for_each_ref_bad_describe_arg(rest)),
+            }
+        } else if let Some(value) = part.strip_prefix("match=") {
+            spec.matches.push(value.to_string());
+        } else if let Some(value) = part.strip_prefix("exclude=") {
+            spec.excludes.push(value.to_string());
+        } else {
+            return Err(for_each_ref_bad_describe_arg(rest));
+        }
+        rest = next;
+    }
+    Ok(spec)
+}
+
+fn for_each_ref_bad_describe_arg(bad: &str) -> GitError {
+    eprintln!("fatal: unrecognized %(describe) argument: {bad}");
+    GitError::Exit(128)
+}
+
 /// For an oid atom like `tree:short` / `parent:short=7`, return the option
 /// argument (`short` or `short=7`) when `placeholder` is exactly `atom:<arg>`.
 fn for_each_ref_oid_atom_arg<'a>(placeholder: &'a str, atom: &str) -> Option<&'a str> {
@@ -6069,10 +6171,16 @@ fn for_each_ref_oid_atom_arg<'a>(placeholder: &'a str, atom: &str) -> Option<&'a
 }
 
 /// Parse the `short`/`short=N` argument of an oid atom into an abbreviation
-/// width, mirroring git's `oid_atom_parser` validation.
-fn for_each_ref_oid_atom_width(arg: &str, atom: &str) -> Result<Option<usize>> {
+/// width, mirroring git's `oid_atom_parser` validation. A bare `short` resolves
+/// to the repository's `DEFAULT_ABBREV` (git's `O_SHORT` case), supplied by the
+/// caller via `default_abbrev`; `short=N` overrides it.
+fn for_each_ref_oid_atom_width(
+    arg: &str,
+    atom: &str,
+    default_abbrev: Option<usize>,
+) -> Result<Option<usize>> {
     if arg == "short" {
-        Ok(None)
+        Ok(default_abbrev)
     } else if let Some(value) = arg.strip_prefix("short=") {
         Ok(Some(parse_for_each_ref_abbrev_width(value).map_err(
             |_| {

@@ -52,6 +52,17 @@ pub(crate) fn describe_for_format(
         return Ok(None);
     }
 
+    // git describe peels the requested object to a commit first (e.g. the
+    // %(describe) atom on an annotated tag is asked to describe the tag object).
+    // The by-commit map and the `-g<oid>` suffix are keyed on the commit, so
+    // resolve it once here.
+    let object = db.read_object(target)?;
+    let target = &match object.object_type {
+        ObjectType::Commit => *target,
+        ObjectType::Tag => sley_rev::peel_to_commit(db, format, target)?,
+        _ => return Ok(None),
+    };
+
     // Exact match.
     if let Some(best) = tags
         .by_commit
@@ -794,7 +805,14 @@ fn describe_no_candidate(
     dirty_suffix: Option<&str>,
 ) -> Result<()> {
     if options.always {
-        let short = describe_abbrev_oid(db, target, abbrev)?;
+        // git's `--always` uses strbuf_add_unique_abbrev, where abbrev==0 means
+        // the FULL oid (unlike the `tag-N-g<short>` path where abbrev==0 drops
+        // the suffix entirely).
+        let short = if abbrev == 0 {
+            target.to_hex()
+        } else {
+            describe_abbrev_oid(db, target, abbrev)?
+        };
         println!("{short}{}", dirty_suffix.unwrap_or(""));
         return Ok(());
     }

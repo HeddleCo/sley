@@ -359,7 +359,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     } else {
         HashMap::new()
     };
-    let config = if needs.config || for_each_ref_sorts_need_config(&sorts) {
+    let config = if needs.config || needs.short_ref || for_each_ref_sorts_need_config(&sorts) {
         GitConfig::read(git_dir.join("config")).unwrap_or_default()
     } else {
         GitConfig::default()
@@ -377,6 +377,17 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
     let mut emitted = 0usize;
     let mut refs = store.list_refs()?;
+    // The `:short` atoms (refname/symref/upstream/push) resolve via git's
+    // shorten_unambiguous_ref, which probes the ref store for ambiguity; collect
+    // the ref-name universe once, plus `core.warnambiguousrefs` (default true).
+    let ref_names: std::collections::HashSet<String> = if needs.short_ref {
+        refs.iter().map(|reference| reference.name.clone()).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let warn_ambiguous_refs = config
+        .get_bool("core", None, "warnambiguousrefs")
+        .unwrap_or(true);
     if include_root_refs && let Some(target) = store.read_ref("HEAD")? {
         refs.push(sley_refs::Ref {
             name: "HEAD".to_string(),
@@ -612,6 +623,8 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             contents,
             peeled_object,
             mailmap: &mailmap,
+            ref_names: &ref_names,
+            warn_ambiguous_refs,
         };
         let mut line = Vec::new();
         print_for_each_ref_format(&mut line, &format_spec, &format_context)?;
@@ -747,6 +760,9 @@ struct ForEachRefNeeds {
     mailmap: bool,
     /// `%(upstream*)` / `%(push*)` — needs branch config.
     config: bool,
+    /// `%(refname:short)` / `%(symref:short)` / `%(upstream:short)` /
+    /// `%(push:short)` — needs the ref-name universe for shorten_unambiguous_ref.
+    short_ref: bool,
 }
 
 impl ForEachRefNeeds {
@@ -764,17 +780,22 @@ impl ForEachRefNeeds {
                     needs.note_raw(placeholder);
                 }
                 ForEachRefAtom::Color(_) => {}
-                ForEachRefAtom::RefName { source, .. } => match source {
-                    ForEachRefNameSource::Ref => {}
-                    ForEachRefNameSource::Upstream => {
-                        needs.upstream = true;
-                        needs.config = true;
+                ForEachRefAtom::RefName { source, format } => {
+                    if matches!(format, ForEachRefNameFormat::Short) {
+                        needs.short_ref = true;
                     }
-                    ForEachRefNameSource::Push => {
-                        needs.push = true;
-                        needs.config = true;
+                    match source {
+                        ForEachRefNameSource::Ref => {}
+                        ForEachRefNameSource::Upstream => {
+                            needs.upstream = true;
+                            needs.config = true;
+                        }
+                        ForEachRefNameSource::Push => {
+                            needs.push = true;
+                            needs.config = true;
+                        }
                     }
-                },
+                }
                 ForEachRefAtom::ObjectName { peeled, abbrev } => {
                     if abbrev.is_some() {
                         needs.candidates = true;
@@ -808,6 +829,14 @@ impl ForEachRefNeeds {
     }
 
     fn note_raw(&mut self, placeholder: &str) {
+        // `%(symref:short)` / `%(upstream:short)` / `%(push:short)` (the Raw-atom
+        // forms) need the ref-name universe for shorten_unambiguous_ref.
+        if matches!(
+            placeholder,
+            "symref:short" | "upstream:short" | "push:short"
+        ) {
+            self.short_ref = true;
+        }
         // Strip a leading `*` (peeled) marker, classifying the peeled need first.
         let (base, peeled) = placeholder
             .strip_prefix('*')
@@ -852,6 +881,11 @@ impl ForEachRefNeeds {
                     // object (to read the oids) and the ambiguity candidate set.
                     self.candidates = true;
                     true
+                } else if other == "describe" || other.starts_with("describe:") {
+                    // %(describe) runs the describe engine directly off the OID
+                    // (no body read); the deref form needs the peeled tag target
+                    // resolved so `context.peeled_object` is populated.
+                    peeled
                 } else if other.starts_with("authordate:")
                     || other.starts_with("committerdate:")
                     || other.starts_with("taggerdate:")
@@ -2080,20 +2114,23 @@ fn for_each_ref_pattern_matches(name: &str, pattern: &str, ignore_case: bool) ->
     {
         return for_each_ref_pattern_glob_matches(name, pattern, ignore_case);
     }
-    if ignore_case {
-        name.eq_ignore_ascii_case(pattern)
-            || strip_prefix_ignore_ascii_case(name, pattern)
-                .is_some_and(|rest| rest.starts_with('/'))
+    // git's match_name_as_path: a literal pattern matches when `name` starts with
+    // it AND the boundary is a path component edge — `name[plen]` is end-of-string
+    // or '/', OR the pattern itself ends in '/' (a `refs/tags/` prefix pattern).
+    let pattern_is_prefix = pattern.ends_with('/');
+    let rest = if ignore_case {
+        strip_prefix_ignore_ascii_case(name, pattern)
     } else {
-        name == pattern
-            || name
-                .strip_prefix(pattern)
-                .is_some_and(|rest| rest.starts_with('/'))
-    }
+        name.strip_prefix(pattern)
+    };
+    rest.is_some_and(|rest| pattern_is_prefix || rest.is_empty() || rest.starts_with('/'))
 }
 
 fn for_each_ref_exclude_matches(name: &str, pattern: &str, ignore_case: bool) -> bool {
-    for_each_ref_pattern_glob_matches(name, pattern, ignore_case)
+    // git's filter_exclude_match uses the same match_name_as_path as the positive
+    // patterns, so an exclude like `refs/tags/foo` is a path-prefix match that
+    // drops `refs/tags/foo/one` &c, not just an exact wildmatch.
+    for_each_ref_pattern_matches(name, pattern, ignore_case)
 }
 
 fn for_each_ref_pattern_glob_matches(name: &str, pattern: &str, ignore_case: bool) -> bool {

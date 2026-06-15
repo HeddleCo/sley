@@ -89,6 +89,14 @@ pub enum ForEachRefAtomIdentityPart {
 
 impl ForEachRefAtom {
     fn parse(value: &str) -> Result<Self> {
+        // git's parse_ref_filter_atom: an empty sub-argument list is treated as
+        // NULL, i.e. `%(atom:)` is equivalent to `%(atom)`. The arg is whatever
+        // follows the FIRST colon, so only a trailing colon at that position is
+        // dropped (e.g. `refname:` -> `refname`).
+        let value = match value.split_once(':') {
+            Some((name, "")) => name,
+            _ => value,
+        };
         if let Some(color) = value.strip_prefix("color:") {
             return Ok(Self::Color(color.to_string()));
         }
@@ -160,6 +168,12 @@ fn parse_for_each_ref_refname_atom(value: &str) -> Result<Option<ForEachRefAtom>
                 direction: ForEachRefStripDirection::Right,
                 count: parse_for_each_ref_strip_count(count)?,
             })
+        } else if prefix == "refname" {
+            // git's refname_atom_parser rejects unknown args outright (the
+            // upstream/push variants accept extra modifiers handled later, so
+            // only `refname` is strict here).
+            eprintln!("fatal: unrecognized %({prefix}) argument: {modifier}");
+            return Err(GitError::Exit(128));
         } else {
             continue;
         };
@@ -703,6 +717,60 @@ pub fn for_each_ref_short_name(refname: &str) -> &str {
         .or_else(|| refname.strip_prefix("refs/tags/"))
         .or_else(|| refname.strip_prefix("refs/remotes/"))
         .unwrap_or(refname)
+}
+
+/// git's `ref_rev_parse_rules`: the format patterns tried (shortest-name first)
+/// when resolving an abbreviated ref, and in reverse when shortening one.
+const REF_REV_PARSE_RULES: [&str; 6] = [
+    "{}",
+    "refs/{}",
+    "refs/tags/{}",
+    "refs/heads/{}",
+    "refs/remotes/{}",
+    "refs/remotes/{}/HEAD",
+];
+
+fn expand_ref_rule(rule: &str, short: &str) -> String {
+    rule.replace("{}", short)
+}
+
+/// Strip the prefix/suffix of a rev-parse rule from `refname`, returning the
+/// `%.*s` portion if the rule matches (git's `match_parse_rule`).
+fn match_ref_parse_rule<'a>(refname: &'a str, rule: &str) -> Option<&'a str> {
+    let (prefix, suffix) = rule.split_once("{}").expect("rule contains {}");
+    refname
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+}
+
+/// git's `shorten_unambiguous_ref`: find the shortest abbreviation of `refname`
+/// that, under the rev-parse rules, resolves back to exactly this ref.
+/// `strict` (git's `core.warnambiguousrefs`, default true) requires *all* other
+/// rules to fail; otherwise only rules that sort before the matched one matter.
+/// `ref_exists` reports whether a fully-qualified refname is present.
+pub fn shorten_unambiguous_ref(
+    refname: &str,
+    strict: bool,
+    ref_exists: impl Fn(&str) -> bool,
+) -> String {
+    // Skip rule 0 ("{}"), which always matches.
+    for matched in (1..REF_REV_PARSE_RULES.len()).rev() {
+        let Some(short) = match_ref_parse_rule(refname, REF_REV_PARSE_RULES[matched]) else {
+            continue;
+        };
+        let rules_to_fail = if strict {
+            REF_REV_PARSE_RULES.len()
+        } else {
+            matched
+        };
+        let ambiguous = (0..rules_to_fail).any(|rule_idx| {
+            rule_idx != matched && ref_exists(&expand_ref_rule(REF_REV_PARSE_RULES[rule_idx], short))
+        });
+        if !ambiguous {
+            return short.to_string();
+        }
+    }
+    refname.to_string()
 }
 
 pub fn parse_for_each_ref_strip_count(value: &str) -> Result<isize> {

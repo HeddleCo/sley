@@ -8287,8 +8287,14 @@ fn print_branch_list_format_omit_empty(
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
     let deltabase = zero_oid(format)?;
     let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let all_refs = store.list_refs()?;
+    let ref_names: std::collections::HashSet<String> =
+        all_refs.iter().map(|reference| reference.name.clone()).collect();
+    let warn_ambiguous_refs = config
+        .get_bool("core", None, "warnambiguousrefs")
+        .unwrap_or(true);
     let mut stdout = io::stdout().lock();
-    for reference in store.list_refs()? {
+    for reference in all_refs.iter() {
         if !branch_ref_matches_mode(&reference.name, options.mode) {
             continue;
         }
@@ -8352,6 +8358,8 @@ fn print_branch_list_format_omit_empty(
             contents,
             peeled_object: None,
             mailmap: &mailmap,
+            ref_names: &ref_names,
+            warn_ambiguous_refs,
         };
         let mut line = Vec::new();
         print_for_each_ref_format(&mut line, &format_spec, &context)?;

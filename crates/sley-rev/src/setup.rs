@@ -116,11 +116,20 @@ impl HiddenRefs {
         let Some(config) = config else {
             return Self::default();
         };
+        // git's parse_hide_refs_config strips trailing '/' from each value, so
+        // `transfer.hideRefs=refs/heads/subspace/` hides `refs/heads/subspace/*`
+        // via the `*p == '/'` clause in ref_is_hidden.
+        let section = |sec| {
+            config_section_values(config, sec, None, "hideRefs")
+                .into_iter()
+                .map(|value| value.trim_end_matches('/').to_string())
+                .collect()
+        };
         Self {
-            transfer: config_section_values(config, "transfer", None, "hideRefs"),
-            fetch: config_section_values(config, "fetch", None, "hideRefs"),
-            receive: config_section_values(config, "receive", None, "hideRefs"),
-            uploadpack: config_section_values(config, "uploadpack", None, "hideRefs"),
+            transfer: section("transfer"),
+            fetch: section("fetch"),
+            receive: section("receive"),
+            uploadpack: section("uploadpack"),
         }
     }
 
@@ -363,14 +372,14 @@ where
                     let value = iter.next().ok_or_else(|| {
                         GitError::Command("--exclude-hidden requires a value".into())
                     })?;
-                    self.pending_hidden = Some(parse_exclude_hidden(value)?);
+                    self.set_pending_hidden(parse_exclude_hidden(value)?)?;
                 }
                 value if value.starts_with("--exclude-hidden=") => {
-                    self.pending_hidden = Some(parse_exclude_hidden(
+                    self.set_pending_hidden(parse_exclude_hidden(
                         value
                             .strip_prefix("--exclude-hidden=")
                             .expect("prefix matched"),
-                    )?);
+                    )?)?;
                 }
                 value if value.starts_with('-') => self.setup.leftovers.push(value.to_string()),
                 value => self.add_positional(value)?,
@@ -419,6 +428,16 @@ where
             excludes: std::mem::take(&mut self.pending_excludes),
             hidden: self.pending_hidden.take(),
         });
+        Ok(())
+    }
+
+    fn set_pending_hidden(&mut self, section: HiddenRefsSection) -> Result<()> {
+        // git dies on a second --exclude-hidden before a consuming pseudo-ref.
+        if self.pending_hidden.is_some() {
+            eprintln!("fatal: --exclude-hidden= passed more than once");
+            return Err(GitError::Exit(128));
+        }
+        self.pending_hidden = Some(section);
         Ok(())
     }
 
@@ -869,6 +888,140 @@ fn parse_exclude_hidden(value: &str) -> Result<HiddenRefsSection> {
     }
 }
 
+/// A single ref matched by a pseudo-ref option (`--glob`, `--branches=`, …).
+///
+/// `rev-parse` prints the OIDs of these in the order the selectors are seen on
+/// the command line (sorted by refname within each selector); this mirrors
+/// git's `add_pending_object` flow through `handle_revision_pseudo_opt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedRef {
+    pub name: String,
+    pub oid: ObjectId,
+}
+
+/// Stateful resolver for `rev-parse`'s pseudo-ref options.
+///
+/// git processes `--exclude`/`--exclude-hidden` as *pending* exclusion state
+/// that the next `--all`/`--branches`/`--tags`/`--remotes`/`--glob` consumes,
+/// then clears (`clear_ref_exclusions`). This struct replays that protocol so
+/// `rev-parse` and `rev-list` share one implementation of the matching rules.
+pub struct PseudoRefResolver {
+    hidden_refs: HiddenRefs,
+    refs: Vec<sley_refs::Ref>,
+    pending_excludes: Vec<String>,
+    pending_hidden: Option<HiddenRefsSection>,
+}
+
+impl PseudoRefResolver {
+    pub fn new(git_dir: &Path, format: ObjectFormat, config: Option<&GitConfig>) -> Result<Self> {
+        let store = FileRefStore::new(git_dir, format);
+        Ok(Self {
+            hidden_refs: HiddenRefs::from_config(config),
+            refs: store.list_refs()?,
+            pending_excludes: Vec::new(),
+            pending_hidden: None,
+        })
+    }
+
+    /// Whether `arg` is a pseudo-ref option this resolver understands. Used by
+    /// `rev-parse` to route the argument here instead of treating it as a rev.
+    pub fn is_pseudo_ref_arg(arg: &str) -> bool {
+        matches!(arg, "--all" | "--branches" | "--tags" | "--remotes")
+            || arg.starts_with("--glob=")
+            || arg.starts_with("--branches=")
+            || arg.starts_with("--tags=")
+            || arg.starts_with("--remotes=")
+            || arg.starts_with("--exclude=")
+            || arg.starts_with("--exclude-hidden=")
+    }
+
+    /// Feed one pseudo-ref argument. `--exclude`/`--exclude-hidden` only update
+    /// pending state and return `Ok(None)`; selector options return the matched
+    /// refs (sorted by name) and clear the pending exclusions.
+    pub fn feed(&mut self, arg: &str) -> Result<Option<Vec<MatchedRef>>> {
+        if let Some(pattern) = arg.strip_prefix("--exclude=") {
+            self.pending_excludes.push(pattern.to_string());
+            return Ok(None);
+        }
+        if let Some(section) = arg.strip_prefix("--exclude-hidden=") {
+            // git: exclude_hidden_refs() dies if called twice without an
+            // intervening pseudo-ref option consuming the pending state.
+            if self.pending_hidden.is_some() {
+                eprintln!("fatal: --exclude-hidden= passed more than once");
+                return Err(GitError::Exit(128));
+            }
+            self.pending_hidden = Some(parse_exclude_hidden(section)?);
+            return Ok(None);
+        }
+        let (kind, pattern, include_all) = if arg == "--all" {
+            (RefSelectorKind::All, None, true)
+        } else if arg == "--branches" {
+            (RefSelectorKind::Branches, None, true)
+        } else if arg == "--tags" {
+            (RefSelectorKind::Tags, None, true)
+        } else if arg == "--remotes" {
+            (RefSelectorKind::Remotes, None, true)
+        } else if let Some(pat) = arg.strip_prefix("--glob=") {
+            (RefSelectorKind::Glob, Some(pat.to_string()), false)
+        } else if let Some(pat) = arg.strip_prefix("--branches=") {
+            (RefSelectorKind::Branches, Some(pat.to_string()), false)
+        } else if let Some(pat) = arg.strip_prefix("--tags=") {
+            (RefSelectorKind::Tags, Some(pat.to_string()), false)
+        } else if let Some(pat) = arg.strip_prefix("--remotes=") {
+            (RefSelectorKind::Remotes, Some(pat.to_string()), false)
+        } else {
+            return Err(GitError::Command(format!(
+                "unsupported pseudo-ref option {arg}"
+            )));
+        };
+        // git rejects `--exclude-hidden` paired with --branches/--tags/--remotes
+        // (any namespaced selector); --all and --glob are allowed.
+        if self.pending_hidden.is_some()
+            && matches!(
+                kind,
+                RefSelectorKind::Branches | RefSelectorKind::Tags | RefSelectorKind::Remotes
+            )
+        {
+            eprintln!(
+                "error: options '--exclude-hidden' and '{}' cannot be used together",
+                selector_option_name(kind)
+            );
+            return Err(GitError::Exit(129));
+        }
+        let selector = RefSelector {
+            kind,
+            not: false,
+            pattern,
+            include_all,
+            excludes: std::mem::take(&mut self.pending_excludes),
+            hidden: self.pending_hidden.take(),
+        };
+        let selectors = [selector];
+        let mut matched = Vec::new();
+        for reference in &self.refs {
+            let (include_ref, _exclude_ref) =
+                ref_selection(&reference.name, &selectors, &self.hidden_refs);
+            if !include_ref {
+                continue;
+            }
+            if let RefTarget::Direct(oid) = reference.target {
+                matched.push(MatchedRef {
+                    name: reference.name.clone(),
+                    oid,
+                });
+            }
+        }
+        Ok(Some(matched))
+    }
+
+    /// `--exclude-hidden` requires a following pseudo-ref option per git
+    /// (`die("--exclude-hidden ... must be used with another ref option")`);
+    /// callers check this after the argument loop.
+    pub fn has_dangling_exclude_hidden(&self) -> bool {
+        self.pending_hidden.is_some()
+    }
+}
+
 fn selector_option_name(kind: RefSelectorKind) -> &'static str {
     match kind {
         RefSelectorKind::All => "--all",
@@ -962,52 +1115,68 @@ fn ref_selector_matches(
     include_all: bool,
     pattern: Option<&str>,
 ) -> bool {
-    let Some(short_name) = name.strip_prefix(namespace) else {
+    if name.strip_prefix(namespace).is_none() {
         return false;
-    };
-    include_all || pattern.is_some_and(|pattern| ref_selector_pattern_matches(pattern, short_name))
-}
-
-fn ref_selector_pattern_matches(pattern: &str, name: &str) -> bool {
-    if has_glob_magic(pattern) {
-        refname_pattern_matches(pattern, name)
-    } else {
-        name.starts_with(&format!("{pattern}/"))
+    }
+    match pattern {
+        None => include_all,
+        Some(pattern) => refname_pattern_matches(&namespaced_real_pattern(namespace, pattern), name),
     }
 }
 
+/// Build git's `real_pattern` for a namespaced selector (`--branches=<pat>` &c),
+/// mirroring `refs_for_each_ref_ext`: `prefix + pattern`, and when the user
+/// pattern has no glob specials, complete a trailing `/` (only if absent) and
+/// append `*`. The result is wildmatched against the *full* refname.
+fn namespaced_real_pattern(prefix: &str, pattern: &str) -> String {
+    let mut real = format!("{prefix}{pattern}");
+    if !has_glob_magic(pattern) {
+        if !real.ends_with('/') {
+            real.push('/');
+        }
+        real.push('*');
+    }
+    real
+}
+
 fn glob_ref_selector_matches(pattern: &str, refname: &str) -> bool {
-    let normalized = if pattern.starts_with("refs/") {
+    // `--glob=<pat>`: prefix is empty, so git prepends `refs/` unless the
+    // pattern already names it, then applies the same complete-`/`-and-`*`
+    // rule as namespaced selectors.
+    let mut real = if pattern.starts_with("refs/") {
         pattern.to_string()
     } else {
         format!("refs/{pattern}")
     };
-    if has_glob_magic(&normalized) {
-        refname_pattern_matches(&normalized, refname)
-    } else if normalized.ends_with('/') {
-        refname.starts_with(&normalized)
-    } else {
-        refname.starts_with(&format!("{normalized}/"))
+    if !has_glob_magic(pattern) {
+        if !real.ends_with('/') {
+            real.push('/');
+        }
+        real.push('*');
     }
+    refname_pattern_matches(&real, refname)
 }
 
 fn ref_excluded(refname: &str, patterns: &[String], namespace: Option<&str>) -> bool {
-    patterns.iter().any(|pattern| {
-        ref_exclude_pattern_matches(pattern, refname)
-            || namespace.is_some_and(|namespace| {
-                refname
-                    .strip_prefix(namespace)
-                    .is_some_and(|name| ref_exclude_pattern_matches(pattern, name))
-            })
-    })
+    // git matches `--exclude` against the name handed to `handle_one_ref`, which
+    // is the *trimmed* refname for namespaced selectors (`--branches`/`--tags`/
+    // `--remotes` set `trim_prefix`) and the *full* refname for `--all`/`--glob`.
+    let candidate = match namespace {
+        Some(namespace) => match refname.strip_prefix(namespace) {
+            Some(trimmed) => trimmed,
+            None => return false,
+        },
+        None => refname,
+    };
+    patterns
+        .iter()
+        .any(|pattern| ref_exclude_pattern_matches(pattern, candidate))
 }
 
 fn ref_exclude_pattern_matches(pattern: &str, name: &str) -> bool {
-    if has_glob_magic(pattern) {
-        refname_pattern_matches(pattern, name)
-    } else {
-        name == pattern || name.starts_with(&format!("{pattern}/"))
-    }
+    // git: `wildmatch(item->string, name, 0)` — a non-glob pattern is an exact
+    // match (no implicit prefix/`*` expansion, unlike the positive selectors).
+    refname_pattern_matches(pattern, name)
 }
 
 fn ref_hidden(refname: &str, section: Option<HiddenRefsSection>, hidden_refs: &HiddenRefs) -> bool {
