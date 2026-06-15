@@ -3551,6 +3551,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut dry_run = false;
     let mut ignore_unmatch = false;
+    let mut include_sparse = false;
     let mut parsing_options = true;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -3579,7 +3580,8 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             "--no-cached" => cached = false,
             "--ignore-unmatch" => ignore_unmatch = true,
             "--no-ignore-unmatch" => ignore_unmatch = false,
-            "--sparse" | "--no-sparse" => {}
+            "--sparse" => include_sparse = true,
+            "--no-sparse" => include_sparse = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -3671,8 +3673,8 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     let config_parameters_env = effective_config_parameters_env();
     let result = sley_worktree::remove_index_and_worktree_paths(
-        worktree_root,
-        git_dir,
+        &worktree_root,
+        &git_dir,
         format,
         &resolved_paths,
         sley_worktree::RemoveOptions {
@@ -3681,14 +3683,24 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             force,
             dry_run,
             ignore_unmatch,
+            include_sparse,
         },
         config_parameters_env.as_deref(),
     )?;
     if !quiet {
         let mut stdout = io::stdout().lock();
-        for path in result.removed {
-            writeln!(stdout, "rm '{}'", String::from_utf8_lossy(&path))?;
+        for path in &result.removed {
+            writeln!(stdout, "rm '{}'", String::from_utf8_lossy(path))?;
         }
+    }
+    // A pathspec that matched only out-of-cone / skip-worktree entries is
+    // reported via the `updateSparsePath` advice and makes `rm` exit 1, mirroring
+    // builtin/rm.c's `advise_on_updating_sparse_paths` + `ret = 1`.
+    if !result.sparse_skipped.is_empty() {
+        let show_hint = advice_enabled(&git_dir, "updateSparsePath");
+        let advice = sley_worktree::updating_sparse_paths_advice(&result.sparse_skipped, show_hint);
+        eprint!("{}", String::from_utf8_lossy(&advice));
+        return Err(GitError::Exit(1));
     }
     Ok(())
 }

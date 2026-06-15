@@ -515,6 +515,10 @@ pub struct RestoreResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveResult {
     pub removed: Vec<Vec<u8>>,
+    /// Original pathspecs that matched *only* out-of-cone / skip-worktree entries
+    /// and were therefore left untouched (sans `--sparse`). The caller emits the
+    /// `updateSparsePath` advice for these and exits 1.
+    pub sparse_skipped: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +644,11 @@ pub struct RemoveOptions {
     pub force: bool,
     pub dry_run: bool,
     pub ignore_unmatch: bool,
+    /// `git rm --sparse`: act on entries outside the sparse-checkout cone too.
+    /// When false (the default), out-of-cone / skip-worktree entries are left
+    /// untouched and a pathspec that matched *only* such entries is reported via
+    /// [`RemoveResult::sparse_skipped`] for the caller's `updateSparsePath` advice.
+    pub include_sparse: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8444,10 +8453,42 @@ pub fn remove_index_and_worktree_paths(
         .iter()
         .map(|entry| entry.path.as_bytes().to_vec())
         .collect();
+    // Sparse / skip-worktree gate (builtin/rm.c): an explicitly-named entry that
+    // lies outside the sparse-checkout cone (or carries the skip-worktree bit) is
+    // never removed unless `--sparse`; a pathspec matching *only* such entries is
+    // reported via the `updateSparsePath` advice instead of being removed.
+    let gate = if options.include_sparse {
+        None
+    } else {
+        let g = SparseGate::load(git_dir, format)?;
+        if g.is_inert() { None } else { Some(g) }
+    };
+    // `partition_sparse(matched)` splits a pathspec's matched index paths into the
+    // dense entries (returned, to be removed) and notes whether any sparse entry
+    // was filtered out, so the caller can decide between advice and "did not match".
+    let partition_sparse = |matched: Vec<Vec<u8>>| -> (Vec<Vec<u8>>, bool) {
+        match gate.as_ref() {
+            None => (matched, false),
+            Some(gate) => {
+                let mut dense = Vec::new();
+                let mut had_sparse = false;
+                for path in matched {
+                    if gate.path_in_sparse_checkout(&path) && !gate.is_skip_worktree(&path) {
+                        dense.push(path);
+                    } else {
+                        had_sparse = true;
+                    }
+                }
+                (dense, had_sparse)
+            }
+        }
+    };
+
     // Paths selected for removal. A single selected path removes ALL of its
     // stage entries (so resolving an unmerged path by removal drops stages
     // 1/2/3 together), matching git's name-keyed removal.
     let mut selected = BTreeSet::new();
+    let mut sparse_skipped: Vec<Vec<u8>> = Vec::new();
     for path in paths {
         let absolute = if path.is_absolute() {
             path.clone()
@@ -8462,8 +8503,16 @@ pub fn remove_index_and_worktree_paths(
         // component iterator drops the slash, so capture it before it is lost.
         let has_trailing_slash = path_has_trailing_separator(&absolute);
         let git_path = git_path_bytes(relative)?;
+        // The worktree-relative pathspec text git lists in the sparse advice
+        // (`rm b` → `b`). `git_path` is already repo-relative and forward-slashed.
+        let display = git_path.clone();
         if !has_trailing_slash && index_paths.contains(&git_path) {
-            selected.insert(git_path);
+            let (dense, had_sparse) = partition_sparse(vec![git_path.clone()]);
+            if dense.is_empty() && had_sparse {
+                sparse_skipped.push(display);
+                continue;
+            }
+            selected.extend(dense);
             continue;
         }
         // A wildcard pathspec (e.g. `git rm "*"` or `git rm "dir/*.c"`) matches
@@ -8480,7 +8529,12 @@ pub fn remove_index_and_worktree_paths(
                 .cloned()
                 .collect::<Vec<_>>();
             if !glob_matched.is_empty() {
-                selected.extend(glob_matched);
+                let (dense, had_sparse) = partition_sparse(glob_matched);
+                if dense.is_empty() && had_sparse {
+                    sparse_skipped.push(display);
+                    continue;
+                }
+                selected.extend(dense);
                 continue;
             }
             if options.ignore_unmatch {
@@ -8507,6 +8561,11 @@ pub fn remove_index_and_worktree_paths(
             );
             return Err(GitError::Exit(128));
         }
+        let (dense, had_sparse) = partition_sparse(matched);
+        if dense.is_empty() && had_sparse {
+            sparse_skipped.push(display);
+            continue;
+        }
         if !options.recursive {
             eprintln!(
                 "fatal: not removing '{}' recursively without -r",
@@ -8514,7 +8573,7 @@ pub fn remove_index_and_worktree_paths(
             );
             return Err(GitError::Exit(128));
         }
-        selected.extend(matched);
+        selected.extend(dense);
     }
 
     // `git rm` runs the local-modification safety check unless `-f` is given —
@@ -8654,6 +8713,16 @@ pub fn remove_index_and_worktree_paths(
     if options.dry_run {
         return Ok(RemoveResult {
             removed: selected.into_iter().collect(),
+            sparse_skipped,
+        });
+    }
+    // Nothing to remove (every match was filtered as sparse): leave the index
+    // untouched and hand the caller the skipped pathspecs for the advice + exit 1,
+    // exactly like git's early `exit(ret)` when `seen_any` is 0.
+    if selected.is_empty() {
+        return Ok(RemoveResult {
+            removed: Vec::new(),
+            sparse_skipped,
         });
     }
     // Mirror builtin/rm.c's ordering: remove the worktree files BEFORE writing
@@ -8703,6 +8772,7 @@ pub fn remove_index_and_worktree_paths(
     )?;
     Ok(RemoveResult {
         removed: selected.into_iter().collect(),
+        sparse_skipped,
     })
 }
 
