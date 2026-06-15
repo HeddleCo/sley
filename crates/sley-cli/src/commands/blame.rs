@@ -976,17 +976,19 @@ fn take_next_before(
     entries: &mut std::iter::Peekable<std::vec::IntoIter<BlameEntry>>,
     limit: usize,
 ) -> Option<BlameEntry> {
-    // Determine which stream has the smaller front without consuming it.
-    let from_deferred = match (deferred.first(), entries.peek()) {
-        (Some(d), Some(e)) => d.s_lno <= e.s_lno,
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
+    // Determine which stream has the smaller front (and that front's s_lno)
+    // without consuming it.
+    let (from_deferred, next_s_lno) = match (deferred.first(), entries.peek()) {
+        (Some(d), Some(e)) => {
+            if d.s_lno <= e.s_lno {
+                (true, d.s_lno)
+            } else {
+                (false, e.s_lno)
+            }
+        }
+        (Some(d), None) => (true, d.s_lno),
+        (None, Some(e)) => (false, e.s_lno),
         (None, None) => return None,
-    };
-    let next_s_lno = if from_deferred {
-        deferred[0].s_lno
-    } else {
-        entries.peek().unwrap().s_lno
     };
     if next_s_lno >= limit {
         return None;
@@ -1526,4 +1528,176 @@ fn blame_option_requires_value(option: &str) -> GitError {
     eprintln!("error: switch `{option}' requires a value");
     eprint!("{BLAME_USAGE}");
     GitError::Exit(129)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(blob: &[u8]) -> Vec<sley_diff_merge::DiffLine<'_>> {
+        sley_diff_merge::split_lines(blob)
+    }
+
+    #[test]
+    fn diff_hunks_collapses_change_runs() {
+        // parent: a b c   child: a X c  -> one hunk replacing line 2 (0-based 1).
+        let p = lines(b"a\nb\nc\n");
+        let c = lines(b"a\nX\nc\n");
+        let h = diff_hunks(&p, &c);
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].start_a, h[0].count_a), (1, 1));
+        assert_eq!((h[0].start_b, h[0].count_b), (1, 1));
+    }
+
+    #[test]
+    fn diff_hunks_pure_insertion() {
+        // parent: a c   child: a b c -> insert one child line at index 1.
+        let p = lines(b"a\nc\n");
+        let c = lines(b"a\nb\nc\n");
+        let h = diff_hunks(&p, &c);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].count_a, 0);
+        assert_eq!((h[0].start_b, h[0].count_b), (1, 1));
+    }
+
+    #[test]
+    fn diff_hunks_identical_is_empty() {
+        let p = lines(b"a\nb\n");
+        let c = lines(b"a\nb\n");
+        assert!(diff_hunks(&p, &c).is_empty());
+    }
+
+    /// A chunk that is wholly preserved by the parent migrates entirely, with
+    /// its `s_lno` rebased by the offset of any inserted lines above it.
+    #[test]
+    fn pass_blame_routes_preserved_lines_to_parent() {
+        let child = ObjectId::null(ObjectFormat::Sha1);
+        // parent: a b   child: X a b  (one line inserted at the top). Child
+        // lines 1 and 2 (a, b) are preserved; they rebase to parent lines 0, 1.
+        let p = lines(b"a\nb\n");
+        let c = lines(b"X\na\nb\n");
+        let mut owned = vec![BlameEntry {
+            suspect: child,
+            boundary: false,
+            lno: 0,
+            s_lno: 0,
+            num_lines: 3,
+        }];
+        let parent = ObjectId::null(ObjectFormat::Sha1);
+        let passed = pass_blame_to_parent(&p, &c, parent, &mut owned);
+        // The inserted line (child s_lno 0) stays with the child; lines 1..3 go
+        // to the parent at parent-s_lno 0..2.
+        let ours_lines: usize = owned.iter().map(|e| e.num_lines).sum();
+        let passed_lines: usize = passed.iter().map(|e| e.num_lines).sum();
+        assert_eq!(ours_lines, 1, "the inserted line stays with the child");
+        assert_eq!(passed_lines, 2, "the two preserved lines go to the parent");
+        // Preserved chunk rebased: child s_lno 1 -> parent s_lno 0.
+        let first = passed.iter().min_by_key(|e| e.lno).unwrap();
+        assert_eq!(first.lno, 1);
+        assert_eq!(first.s_lno, 0);
+    }
+
+    #[test]
+    fn pass_blame_charges_changed_lines_to_child() {
+        let child = ObjectId::null(ObjectFormat::Sha1);
+        // parent: a b c   child: a Z c — only the middle line changed.
+        let p = lines(b"a\nb\nc\n");
+        let c = lines(b"a\nZ\nc\n");
+        let mut owned = vec![BlameEntry {
+            suspect: child,
+            boundary: false,
+            lno: 0,
+            s_lno: 0,
+            num_lines: 3,
+        }];
+        let parent = ObjectId::null(ObjectFormat::Sha1);
+        let passed = pass_blame_to_parent(&p, &c, parent, &mut owned);
+        let ours: usize = owned.iter().map(|e| e.num_lines).sum();
+        let to_parent: usize = passed.iter().map(|e| e.num_lines).sum();
+        assert_eq!(ours, 1, "the changed middle line is charged to the child");
+        assert_eq!(to_parent, 2, "the unchanged a/c lines pass to the parent");
+    }
+
+    #[test]
+    fn split_entry_at_partitions_lines() {
+        let oid = ObjectId::null(ObjectFormat::Sha1);
+        let mut e = BlameEntry {
+            suspect: oid,
+            boundary: false,
+            lno: 10,
+            s_lno: 4,
+            num_lines: 5,
+        };
+        let tail = split_entry_at(&mut e, 2);
+        assert_eq!((e.lno, e.s_lno, e.num_lines), (10, 4, 2));
+        assert_eq!((tail.lno, tail.s_lno, tail.num_lines), (12, 6, 3));
+    }
+
+    #[test]
+    fn split_range_at_comma_respects_regex() {
+        assert_eq!(split_range_at_comma("3,6"), ("3", "6"));
+        assert_eq!(split_range_at_comma("/a,b/,/c/"), ("/a,b/", "/c/"));
+        assert_eq!(split_range_at_comma("/only/"), ("/only/", ""));
+        assert_eq!(split_range_at_comma("5"), ("5", ""));
+    }
+
+    #[test]
+    fn resolve_range_errors_when_start_past_eof() {
+        // 3-line file; -L4 (start 4) must error, not clamp.
+        let contents: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let range = RawRange {
+            start: RangeBound::Absolute(4),
+            end: RangeBound::Omitted,
+        };
+        let r = resolve_range(&range, 3, &contents, 1, "f");
+        assert!(matches!(r, Err(GitError::Exit(128))));
+    }
+
+    #[test]
+    fn resolve_range_reversed_lists_inner_span() {
+        // -L100,2 on a 3-line file lists [2,3] (no error: smaller endpoint in range).
+        let contents: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let range = RawRange {
+            start: RangeBound::Absolute(100),
+            end: RangeBound::Absolute(2),
+        };
+        let (lo, hi) = resolve_range(&range, 3, &contents, 1, "f").unwrap();
+        assert_eq!((lo, hi), (2, 3));
+    }
+
+    #[test]
+    fn resolve_range_negative_relative_end() {
+        // -L3,-1 selects [3,3]; -L6,-4 selects [3,6].
+        let contents: Vec<&[u8]> = (1..=8).map(|_| b"x".as_slice()).collect();
+        let r1 = RawRange {
+            start: RangeBound::Absolute(3),
+            end: RangeBound::RelativeNeg(1),
+        };
+        assert_eq!(resolve_range(&r1, 8, &contents, 1, "f").unwrap(), (3, 3));
+        let r2 = RawRange {
+            start: RangeBound::Absolute(6),
+            end: RangeBound::RelativeNeg(4),
+        };
+        assert_eq!(resolve_range(&r2, 8, &contents, 1, "f").unwrap(), (3, 6));
+    }
+
+    #[test]
+    fn resolve_regex_bound_finds_first_match_from_anchor() {
+        let contents: Vec<&[u8]> = vec![b"apple", b"robot green", b"banana", b"green tea"];
+        // From line 1, /green/ matches line 2.
+        assert_eq!(
+            resolve_regex_bound("green", &contents, 1, 4).unwrap(),
+            2
+        );
+        // From line 3, /green/ matches line 4 (the search anchor advances).
+        assert_eq!(
+            resolve_regex_bound("green", &contents, 3, 4).unwrap(),
+            4
+        );
+        // No match is the fatal error.
+        assert!(matches!(
+            resolve_regex_bound("zzz", &contents, 1, 4),
+            Err(GitError::Exit(128))
+        ));
+    }
 }
