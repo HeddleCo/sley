@@ -280,11 +280,17 @@ impl HashObjectInvocation {
         {
             self.format = repository_object_format(git_dir)?;
         }
+        // Caching the worktree `.gitattributes` chain pays for itself whenever
+        // more than one path is hashed in this process — `--stdin-paths` (many,
+        // count unknown up front) OR multiple positional paths. Gating only on
+        // `--stdin-paths` regressed `hash-object -w file1 file2 …` back to the
+        // per-path attribute re-walk this cache was added to avoid (sley#25).
+        let cache_attributes = self.read_stdin_paths || self.paths.len() > 1;
         let filter_context = HashObjectFilterContext::new(
             self.object_type,
             &self.filters,
             repo_git_dir.as_deref(),
-            self.read_stdin_paths,
+            cache_attributes,
         )?;
         let mut stdout = io::stdout().lock();
 
