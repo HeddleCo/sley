@@ -86,6 +86,9 @@ struct BlameOptions {
     /// Emit `git annotate`-compatible output (`-c`, or the `annotate` command):
     /// `<hex>\t(<author>\t<date>\t<lineno>)<content>`, no boundary `^`.
     compat: bool,
+    /// `-b`: blank out the object name of boundary commits (render the hex
+    /// column as spaces instead of `^`+hash).
+    blank_boundary: bool,
 }
 
 /// A `-L` argument before it is resolved against the file's line count.
@@ -240,6 +243,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut ranges = Vec::new();
     let mut first_parent = false;
     let mut compat = false;
+    let mut blank_boundary = false;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -263,6 +267,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--no-root" => show_root = false,
             "--first-parent" => first_parent = true,
             "-c" => compat = true,
+            "-b" => blank_boundary = true,
             "--abbrev" => abbrev_override = Some(0),
             // `--no-abbrev` shows the full object name, like `-l` / `--abbrev`
             // with the full hash length.
@@ -327,6 +332,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         ranges,
         first_parent,
         compat,
+        blank_boundary,
     }))
 }
 
@@ -376,7 +382,6 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
         "-p" | "--porcelain"
             | "--line-porcelain"
             | "--incremental"
-            | "-b"
             | "-f"
             | "--show-name"
             | "-n"
@@ -1113,8 +1118,13 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
         eprintln!("fatal: -L invalid line number: 0");
         return Err(GitError::Exit(128));
     }
-    let end = match range.end {
-        RangeBound::Omitted => total,
+
+    // `begin` mirrors git's `*begin` (the start endpoint); `end` is the explicit
+    // end (0 means "omitted", to be defaulted to end-of-file below — NOT to
+    // `total` here, so a start past the end is still detected as an error).
+    let mut begin = start;
+    let mut end = match range.end {
+        RangeBound::Omitted => 0,
         RangeBound::Absolute(n) => {
             if n == 0 {
                 eprintln!("fatal: -L invalid line number: 0");
@@ -1122,8 +1132,7 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
             }
             n
         }
-        // `start,+0` is an empty range, which git rejects outright; otherwise the
-        // end is `start + count - 1` (a `+N` range can never be reversed).
+        // `start,+0` is an empty range git rejects; else end = start + count - 1.
         RangeBound::Relative(count) => {
             if count == 0 {
                 eprintln!("fatal: -L invalid empty range");
@@ -1131,34 +1140,33 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
             }
             start + count - 1
         }
-        // `start,-N` selects the N lines *ending* at `start`: the span is
-        // [start - N + 1, start]. So the resolved end is `start` and the start
-        // is pulled back by N-1 (handled below). `-0` is an empty range.
+        // `start,-N` selects the N lines ending at `start`: span [start-N+1, start].
         RangeBound::RelativeNeg(count) => {
             if count == 0 {
                 eprintln!("fatal: -L invalid empty range");
                 return Err(GitError::Exit(128));
             }
-            // The lower endpoint, clamped at line 1 the way git's parse_loc does.
-            let lo = start.saturating_sub(count - 1).max(1);
-            return finish_range(lo, start, total, path);
+            begin = start.saturating_sub(count - 1).max(1);
+            start
         }
     };
-    finish_range(start, end, total, path)
-}
 
-/// Order the two resolved endpoints, bound-check the lower one, and clamp the
-/// upper one to the file — git's blame range handling. A reversed range
-/// (`-L 5,2`) displays the inclusive span `[min, max]`; the "file has only N
-/// lines" error keys off the *smaller* endpoint.
-fn finish_range(a: usize, b: usize, total: usize, path: &str) -> Result<(usize, usize)> {
-    let lo = a.min(b);
-    let hi = a.max(b);
-    if lo > total {
-        eprintln!("fatal: file {path} has only {total} lines");
+    // git swaps when both endpoints are present and reversed (line-range.c).
+    if begin != 0 && end != 0 && end < begin {
+        std::mem::swap(&mut begin, &mut end);
+    }
+    // The "file has only N lines" error keys off the (lower) start endpoint,
+    // BEFORE the end is defaulted to end-of-file — so `-L <past-end>` errors
+    // while `-L <past-end>,<in-range>` (reversed) does not (blame.c:1211).
+    if total < begin {
+        let lines_word = if total == 1 { "line" } else { "lines" };
+        eprintln!("fatal: file {path} has only {total} {lines_word}");
         return Err(GitError::Exit(128));
     }
-    Ok((lo, hi.min(total)))
+    // Default/clamp the upper endpoint to end-of-file (blame.c:1217).
+    let top = if end == 0 || total < end { total } else { end };
+    let bottom = begin.max(1);
+    Ok((bottom, top))
 }
 
 /// Print the selected lines in git blame's default format.
@@ -1170,8 +1178,7 @@ fn render_blame(
     selected: &[usize],
     options: &BlameOptions,
 ) -> Result<()> {
-    let abbrev = blame_display_abbrev(git_dir, format, options)?;
-    let hex_width = abbrev + 1;
+    let (abbrev, hex_width) = blame_display_abbrev(git_dir, format, options)?;
 
     // Column widths are computed over the displayed lines only, matching git
     // (e.g. `-L 2,2` does not pad the line number to the whole file's width).
@@ -1224,6 +1231,7 @@ fn render_blame(
             blame.boundary,
             options.show_root,
             hex_width,
+            options.blank_boundary,
         );
 
         if options.suppress_author {
@@ -1258,19 +1266,37 @@ fn blame_display_abbrev(
     git_dir: &Path,
     format: ObjectFormat,
     options: &BlameOptions,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
+    let hexsz = format.hex_len();
     if options.long_sha {
-        // Full object name; the boundary marker replaces one leading digit so
-        // the displayed boundary form is `^` + (hex_len - 1) digits.
-        return Ok(format.hex_len() - 1);
+        // Full object name: non-boundary is the full hash (`hex_width = hexsz`);
+        // the boundary form is `^` + (hexsz - 1) digits.
+        return Ok((hexsz - 1, hexsz));
     }
-    let configured = match options.abbrev_override {
-        Some(0) | None => repository_abbrev(git_dir, format)?.unwrap_or(format.hex_len()),
-        Some(n) => n.clamp(1, format.hex_len()),
+    // Mirror git's abbrev resolution (builtin/blame.c):
+    //   0 < abbrev < hexsz  -> abbrev++  (boundary `^`+abbrev-1, non-bnd abbrev)
+    //   abbrev == 0         -> abbrev = hexsz
+    //   abbrev >= hexsz     -> left as is, then the hex column is capped to hexsz
+    // `abbrev_override` carries the user `--abbrev=<n>` (Some(0)/None => auto).
+    let raw = match options.abbrev_override {
+        Some(0) | None => repository_abbrev(git_dir, format)?.unwrap_or(hexsz),
+        Some(n) => n,
     };
-    // The displayed boundary form is `^` + `configured` digits; non-boundary
-    // is `configured + 1` digits. Cap so non-boundary never exceeds hex_len.
-    Ok(configured.min(format.hex_len() - 1))
+    let git_abbrev = if raw == 0 {
+        hexsz
+    } else if raw < hexsz {
+        raw + 1
+    } else {
+        raw
+    };
+    // git prints `length = abbrev` hex digits (then `length--` for the `^` on a
+    // boundary), each capped at hexsz by the final `printf`. So the non-boundary
+    // column is min(git_abbrev, hexsz) and the boundary hash min(git_abbrev-1,
+    // hexsz) — for a huge `--abbrev` the decrement still exceeds hexsz, leaving
+    // the full hash under the boundary marker.
+    let hex_width = git_abbrev.min(hexsz);
+    let boundary_abbrev = git_abbrev.saturating_sub(1).min(hexsz);
+    Ok((boundary_abbrev, hex_width))
 }
 
 /// Render the object-name column for one entry.
@@ -1284,7 +1310,13 @@ fn render_sha(
     boundary: bool,
     show_root: bool,
     hex_width: usize,
+    blank_boundary: bool,
 ) -> String {
+    if boundary && !show_root && blank_boundary {
+        // `-b`: blank out the boundary object name with spaces (full column
+        // width), matching git's `memset(hex, ' ', ...)` in emit_other.
+        return " ".repeat(hex_width);
+    }
     let hex = commit.to_hex();
     if boundary && !show_root {
         let body: String = hex.chars().take(abbrev).collect();
