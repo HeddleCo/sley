@@ -213,6 +213,16 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
+    // git resolves a relative submodule URL (`./` / `../`) against THIS repo's
+    // `remote.origin.url` before cloning, so `git -C sub submodule add ../other`
+    // (a submodule added inside a submodule) clones from the right place. The
+    // relative form is preserved in `.gitmodules` (keeping the repo
+    // relocatable); only the clone source and `.git/config` get the resolved
+    // path. Mirrors `submodule.c::resolve_relative_url`.
+    let repo_config_for_url = read_repo_config(&git_dir).unwrap_or_default();
+    let clone_source =
+        resolve_submodule_init_url(&worktree_root, &repo_config_for_url, &options.repository);
+
     if existing_repo {
         println!("Adding existing repo at '{normalized_path}' to the index");
     } else {
@@ -227,7 +237,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         }
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
-        clone_args.push(options.repository.clone());
+        clone_args.push(clone_source.clone());
         clone_args.push(destination.display().to_string());
         super::remote_cmds::cmd_clone(&clone_args)?;
 
@@ -247,6 +257,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         &worktree_root,
         &normalized_path,
         &options.repository,
+        &clone_source,
         options.branch.as_deref(),
         options.name.as_deref(),
     )?;
@@ -559,6 +570,7 @@ fn write_submodule_mapping(
     worktree_root: &Path,
     path: &str,
     url: &str,
+    resolved_url: &str,
     branch: Option<&str>,
     name_override: Option<&str>,
 ) -> Result<()> {
@@ -568,6 +580,8 @@ fn write_submodule_mapping(
         submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string())
     });
     set_submodule_config_value(&mut gitmodules, &name, "path", path);
+    // `.gitmodules` keeps the URL as the user gave it (a relative form stays
+    // relative so the repo is relocatable), matching `git submodule add`.
     set_submodule_config_value(&mut gitmodules, &name, "url", url);
     if let Some(branch) = branch {
         set_submodule_config_value(&mut gitmodules, &name, "branch", branch);
@@ -575,7 +589,8 @@ fn write_submodule_mapping(
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
 
     let mut config = read_repo_config(git_dir)?;
-    set_submodule_config_value(&mut config, &name, "url", url);
+    // `.git/config` records the resolved (absolute) URL git would fetch from.
+    set_submodule_config_value(&mut config, &name, "url", resolved_url);
     set_submodule_config_value(&mut config, &name, "active", "true");
     write_repo_config(git_dir, &config)?;
     Ok(())
@@ -1184,31 +1199,53 @@ fn resolve_submodule_init_url(worktree_root: &Path, config: &GitConfig, url: &st
     if !(url.starts_with("../") || url.starts_with("./")) {
         return url.to_string();
     }
-    let base = config
+    match config
         .get("remote", Some("origin"), "url")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .and_then(|path| path.parent().map(|parent| parent.join(url)))
-        .unwrap_or_else(|| {
+    {
+        Some(base) => resolve_relative_submodule_url(&base, url),
+        None => {
             eprintln!(
                 "warning: could not look up configuration 'remote.origin.url'. Assuming this repository is its own authoritative upstream."
             );
-            worktree_root.join(url)
-        });
-    normalize_lexical_path(&base).display().to_string()
+            normalize_lexical_path(&worktree_root.join(url))
+                .display()
+                .to_string()
+        }
+    }
 }
 
 fn resolve_submodule_sync_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
     if !(url.starts_with("../") || url.starts_with("./")) {
         return url.to_string();
     }
-    let base = config
+    match config
         .get("remote", Some("origin"), "url")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .and_then(|path| path.parent().map(|parent| parent.join(url)))
-        .unwrap_or_else(|| worktree_root.join(url));
-    normalize_lexical_path(&base).display().to_string()
+    {
+        Some(base) => resolve_relative_submodule_url(&base, url),
+        None => normalize_lexical_path(&worktree_root.join(url))
+            .display()
+            .to_string(),
+    }
+}
+
+/// Resolve a relative submodule URL (`./x` / `../x`) against the superproject's
+/// `remote.origin.url`, matching git's `submodule.c::relative_url`.
+///
+/// git treats the relative path as joined directly onto the full base URL: the
+/// FIRST `../` is what pops the base's repo-name component (so `../A` against
+/// `.../x/super` → `.../x/A`), and `./A` resolves to a sibling
+/// (`.../x/super` `./A` → `.../x/super/A`). We therefore join the relative onto
+/// the *full* base URL — NOT its parent — and lexically normalize. (The earlier
+/// `parent().join(url)` double-popped, sending `../A` one level too high and
+/// breaking nested `submodule add ../sub` inside a submodule.)
+fn resolve_relative_submodule_url(base_url: &Path, rel: &str) -> String {
+    normalize_lexical_path(&base_url.join(rel))
+        .display()
+        .to_string()
 }
 
 fn set_submodule_config_value(config: &mut GitConfig, name: &str, key: &str, value: &str) {
