@@ -9225,6 +9225,7 @@ fn materialize_index_entry_file(
         fs::create_dir_all(parent)?;
     }
     fs::write(file_path, &object.body)?;
+    set_worktree_file_mode(file_path, entry.mode)?;
     Ok(())
 }
 
@@ -10019,7 +10020,8 @@ fn restore_index_entry(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, &body)?;
+    fs::write(&file_path, &body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
     Ok(())
 }
 
