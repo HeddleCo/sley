@@ -1510,8 +1510,85 @@ fn remove_index_entries_with_path(entries: &mut Vec<IndexEntry>, path: &[u8]) ->
     true
 }
 
+/// Remove every index entry whose path lives *under* `name/` (a strict
+/// directory-prefix collision). Mirrors git's `has_file_name`
+/// (read-cache.c): when a *file* entry `a/b` is being added, any entry
+/// `a/b/...` already in the index would produce a tree that records `a/b`
+/// both as a blob and as a tree — `write-tree` would emit a malformed tree.
+/// Entries are sorted by path, so the conflicting children form a contiguous
+/// run immediately after `name`'s insertion point.
+fn remove_index_entries_under_dir(entries: &mut Vec<IndexEntry>, name: &[u8]) {
+    let start = match entries.binary_search_by(|entry| entry.path.as_bytes().cmp(name)) {
+        Ok(found) => found + 1,
+        Err(insert) => insert,
+    };
+    let mut end = start;
+    while end < entries.len() {
+        let candidate = entries[end].path.as_bytes();
+        // `candidate` is under `name/` iff it is strictly longer, shares the
+        // `name` prefix, and the next byte is the path separator.
+        if candidate.len() > name.len()
+            && candidate[name.len()] == b'/'
+            && candidate[..name.len()] == *name
+        {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if end > start {
+        entries.drain(start..end);
+    }
+}
+
+/// Remove any *file* entry that is a strict directory-prefix of `name` (e.g.
+/// when adding `a/b/c`, drop a file entry `a/b` or `a`). Mirrors git's
+/// `has_dir_name` (read-cache.c): such an entry would make the resulting tree
+/// record the prefix both as a blob and as the directory containing `name`.
+/// We walk every parent directory of `name`, longest first; the moment a
+/// real subdirectory already exists at a prefix, no shorter prefix can
+/// conflict, so we stop early (git's "already matches the sub-directory"
+/// trivial optimization).
+fn remove_index_dir_name_conflicts(entries: &mut Vec<IndexEntry>, name: &[u8]) {
+    let mut slash = name.len();
+    // Walk back over each '/' (longest parent dir first) until the path has no
+    // more components.
+    while let Some(pos) = name[..slash].iter().rposition(|&byte| byte == b'/') {
+        slash = pos;
+        let prefix = &name[..slash];
+        match entries.binary_search_by(|entry| entry.path.as_bytes().cmp(prefix)) {
+            Ok(found) => {
+                // A file entry sits exactly at this directory prefix — drop it.
+                entries.remove(found);
+            }
+            Err(insert) => {
+                // No file at `prefix`. If a child `prefix/...` already exists,
+                // the directory is established and nothing at this prefix (or
+                // any shorter one) can conflict; stop.
+                if insert < entries.len() {
+                    let candidate = entries[insert].path.as_bytes();
+                    if candidate.len() > prefix.len()
+                        && candidate[prefix.len()] == b'/'
+                        && candidate[..prefix.len()] == *prefix
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn replace_index_entries_with_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry) {
     let path = entry.path.as_bytes().to_vec();
+    // Enforce directory/file replacement *before* computing the insert
+    // position: git's `add_index_entry_with_check` removes the conflicting
+    // entries, then recomputes where the new entry lands. Adding the entry
+    // as a file drops any `path/...` children; adding it drops any file that
+    // is a directory-prefix of `path`. Skipping this leaves a D/F-corrupt
+    // index that `write-tree` turns into a malformed tree.
+    remove_index_entries_under_dir(entries, &path);
+    remove_index_dir_name_conflicts(entries, &path);
     let range = index_entries_path_range(entries, &path);
     if range.is_empty() {
         entries.insert(range.start, entry);
@@ -1592,7 +1669,20 @@ fn update_index_paths_impl(
         // of what (if anything) the target resolves to.
         let symlink_metadata = match fs::symlink_metadata(&absolute) {
             Ok(metadata) => Some(metadata),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            // ENOTDIR (a leading path component is now a file, e.g. staging the
+            // stale `a/b/c` entry after `a/b` became a regular file in a D/F
+            // flip) means the path no longer exists as a file — git's lstat
+            // returns ENOTDIR here and treats it exactly like ENOENT. Fold both
+            // into the "missing" arm so the `--remove` path drops the stale
+            // entry instead of aborting the whole add with an I/O error.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                None
+            }
             Err(err) => return Err(err.into()),
         };
         let Some(metadata) = symlink_metadata else {
