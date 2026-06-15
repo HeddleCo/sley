@@ -434,11 +434,13 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
         // index run one past the end and relies on the undecided scan; we guard
         // the out-of-range index explicitly.)
         if hunk_index >= nr {
-            if first_undecided(fd).is_none() {
-                break;
+            match first_undecided(fd) {
+                Some(i) => {
+                    hunk_index = i;
+                    rendered = None;
+                }
+                None => break,
             }
-            hunk_index = first_undecided(fd).unwrap();
-            rendered = None;
         }
         // Find undecided next/prev.
         let undecided_next = next_undecided(fd, hunk_index);
@@ -498,7 +500,9 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
             continue;
         }
         let answer = line.clone();
-        let ch = answer.chars().next().unwrap();
+        let Some(ch) = answer.chars().next() else {
+            continue;
+        };
         let lower = ch.to_ascii_lowercase();
 
         // g and / take arguments; everything else must be a single letter.
