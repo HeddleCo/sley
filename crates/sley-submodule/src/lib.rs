@@ -18,10 +18,22 @@
 //! The two halves are paired on purpose: a tree-switch needs the typed config
 //! (to know *which* paths are submodules and their bindings) AND the move-head
 //! check (to know whether moving each one is safe).
+//!
+//! - [`apply`] — the gitlink *worktree-apply* primitive (`entry.c`'s
+//!   `S_IFGITLINK` create + `remove_or_warn`/`rmdir_or_warn` drop branches):
+//!   one decision table over appearing / disappearing gitlinks that every
+//!   tree-applying command (checkout / reset / read-tree / merge) routes
+//!   through, so an appearing submodule always leaves an empty placeholder
+//!   directory and a disappearing one is always left in place.
 
+pub mod apply;
 pub mod config;
 pub mod move_head;
 
+pub use apply::{
+    Directive, GITLINK_MODE, OnDisk, apply_appearing_gitlink, apply_disappearing_gitlink,
+    gitlink_apply_appearing, gitlink_apply_disappearing, is_gitlink, probe_on_disk, worktree_join,
+};
 pub use config::{
     ParseWarning, RecurseMode, Submodule, SubmoduleConfigSet, UpdateStrategy, UpdateType,
     check_submodule_name, check_submodule_url, looks_like_command_line_option, parse_fetch_recurse,

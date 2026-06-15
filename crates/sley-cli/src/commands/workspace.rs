@@ -1470,18 +1470,16 @@ fn checkout_remove_gitlink_worktree_dir(worktree_root: &Path, path: &[u8]) -> Re
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
     let full = worktree_root.join(rel);
-    if !full.exists() {
-        return Ok(());
+    match fs::symlink_metadata(&full) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+        // Disappearing gitlink: rmdir an empty placeholder, leave a populated
+        // submodule (+ its history) in place. The shared primitive owns the
+        // leave-in-place rule git's `rmdir_or_warn` encodes.
+        Ok(meta) if meta.is_dir() => sley_submodule::apply_disappearing_gitlink(&full),
+        // A plain file where a gitlink was tracked: ordinary unlink.
+        Ok(_) => commands::merge_rebase::merge_remove_worktree_file(worktree_root, path),
     }
-    if full.is_dir() {
-        match fs::remove_dir(&full) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(err) => return Err(err.into()),
-        }
-        return Ok(());
-    }
-    commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)
 }
 
 fn checkout_is_dirty_tree_error(err: &GitError) -> bool {

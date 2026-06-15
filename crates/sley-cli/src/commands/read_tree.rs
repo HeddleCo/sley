@@ -554,7 +554,21 @@ fn move_head_verdict_to_result(
 }
 
 impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
-    fn write_blob(&mut self, path: &[u8], _mode: u32, oid: &ObjectId) -> Result<()> {
+    fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId) -> Result<()> {
+        // A gitlink (submodule) is not a blob: it materializes as an empty
+        // placeholder directory via the shared gitlink-apply primitive. A
+        // non-recursing read-tree -u never checks out the submodule.
+        if sley_submodule::is_gitlink(mode) {
+            let full = sley_submodule::worktree_join(&self.worktree_root, path)?;
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // read-tree -u is unforced (--reset maps to the engine's reset, but
+            // a gitlink placeholder is never blocked by a clean file); a refusal
+            // leaves an in-the-way file in place, matching git's D/F refusal.
+            sley_submodule::apply_appearing_gitlink(&full, false)?;
+            return Ok(());
+        }
         write_blob_to_worktree(&self.worktree_root, self.db, path, oid)
     }
 
@@ -885,7 +899,7 @@ fn update_worktree_for_entries(
         if original.get(path) == Some(&(entry.mode, entry.oid)) {
             continue;
         }
-        write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
+        write_staged_entry_to_worktree(worktree_root, db, path, entry)?;
     }
     Ok(())
 }
@@ -908,9 +922,30 @@ fn reset_worktree_to_entries(
         }
     }
     for (path, entry) in entries {
-        write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
+        write_staged_entry_to_worktree(worktree_root, db, path, entry)?;
     }
     Ok(())
+}
+
+/// Write one stage-0 entry into the worktree, routing a gitlink (submodule)
+/// through the shared empty-dir primitive and everything else through the blob
+/// writer. The `--prefix -u` and `--reset -u` paths share this so a gitlink
+/// never gets its commit oid written as file bytes.
+fn write_staged_entry_to_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    path: &[u8],
+    entry: &StagedEntry,
+) -> Result<()> {
+    if sley_submodule::is_gitlink(entry.mode) {
+        let full = sley_submodule::worktree_join(worktree_root, path)?;
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        sley_submodule::apply_appearing_gitlink(&full, false)?;
+        return Ok(());
+    }
+    write_blob_to_worktree(worktree_root, db, path, &entry.oid)
 }
 
 /// Write a single blob from the object database to `path` under `worktree_root`,
@@ -947,6 +982,19 @@ fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
     let Some(file_path) = safe_worktree_path(worktree_root, path) else {
         return Ok(());
     };
+    match fs::symlink_metadata(&file_path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+        // A directory at a removed tracked path is a gitlink (submodule): the
+        // shared primitive rmdirs an empty placeholder and leaves a populated
+        // submodule in place. Never `remove_file` a dir (errors "Is a directory").
+        Ok(meta) if meta.is_dir() => {
+            sley_submodule::apply_disappearing_gitlink(&file_path)?;
+            prune_empty_dirs(worktree_root, file_path.parent());
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
     match fs::remove_file(&file_path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),

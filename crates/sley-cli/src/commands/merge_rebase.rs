@@ -50,6 +50,20 @@ pub(crate) fn merge_write_worktree_file(
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
     let full = worktree_root.join(rel);
+    // A gitlink (submodule) materializes as an empty placeholder directory, not
+    // as file bytes — its oid names a commit in the submodule's repo. Route
+    // through the shared gitlink-apply primitive so every tree-apply consumer
+    // gets the identical empty-dir / leave-populated-in-place contract.
+    if sley_submodule::is_gitlink(mode) {
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Merge worktree-apply is unforced (a conflicting file would have been
+        // caught by the merge's own clobber check); a refusal here leaves the
+        // file in place, matching git's D/F refusal.
+        sley_submodule::apply_appearing_gitlink(&full, false)?;
+        return Ok(());
+    }
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -60,7 +74,6 @@ pub(crate) fn merge_write_worktree_file(
         let perms = fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
         fs::set_permissions(&full, perms)?;
     }
-    let _ = mode;
     Ok(())
 }
 
@@ -96,10 +109,19 @@ pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> R
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
     let full = worktree_root.join(rel);
-    if full.exists() {
-        fs::remove_file(&full)?;
+    match fs::symlink_metadata(&full) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+        // A directory at a removed tracked path is a gitlink (submodule)
+        // worktree: git never recurses to delete it — it rmdirs an empty
+        // placeholder and leaves a populated submodule in place. Route through
+        // the shared primitive instead of `remove_file`, which errors on a dir.
+        Ok(meta) if meta.is_dir() => sley_submodule::apply_disappearing_gitlink(&full),
+        Ok(_) => {
+            fs::remove_file(&full)?;
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Per-path outcome of a 3-way tree merge.
