@@ -232,6 +232,21 @@
 # t7102-reset=37, t1007-hash-object=40, t1500-rev-parse=81, t1462-refs-exists=12,
 # t1401-symbolic-ref=25, t7004-tag=159, t3200-branch=117, t3301-notes=144,
 # t1300-config=497, t2400-worktree-add=165. No workspace test regressed (2203/0).
+# core.safecrlf emitter wave (2026-06-15, wave/safecrlf-emitter): t0027-auto-crlf
+# 2281->2354 (+73). sley's clean pipeline converted CRLF<->LF silently; it now
+# emits git convert.c's round-trip warnings ("CRLF will be replaced by LF" /
+# "LF will be replaced by CRLF") and dies under core.safecrlf=true. New
+# ConvFlags::from_config (default WARN, matching git's global_conv_flags_eol),
+# ContentFilterPlan::check_safe_crlf_stats (git's crlf_to_git round-trip
+# simulation: simulate clean CRLF->LF then checkout LF->CRLF, warn if a line
+# ending would not survive), and has_crlf_in_index for the auto-crlf decision,
+# threaded through both index-update clean sites (update_index_paths_impl +
+# add_update_tracked_path) in crates/sley-worktree/src/lib.rs. PURE additive
+# stderr emitter: byte output to the object store is unchanged. t3920-crlf-
+# messages newly floored at 9 (unaffected by this change — it exercises ref-
+# filter/pretty CRLF message rendering, a different subsystem — floored+enrolled
+# per the wave brief). Neighbors held (measured==floor): t0008-ignores=306,
+# t0001-init=102. No workspace test regressed (2213/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -259,7 +274,8 @@ declare -A FLOOR=(
     [t6300-for-each-ref.sh]=358
     [t7004-tag.sh]=159
     [t3200-branch.sh]=117
-    [t0027-auto-crlf.sh]=2281
+    [t0027-auto-crlf.sh]=2354
+    [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10
     [t7810-grep.sh]=228
     [t3301-notes.sh]=144
