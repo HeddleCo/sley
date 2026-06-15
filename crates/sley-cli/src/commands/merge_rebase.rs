@@ -418,7 +418,11 @@ fn merge_commit_and_advance(
             old_oid: *head_oid,
             new_oid: oid,
             committer,
-            message: format!("merge {other_oid}: Merge made by the 'ort' strategy.").into_bytes(),
+            message: format!(
+                "{}: Merge made by the 'ort' strategy.",
+                merge_reflog_action(&other_oid.to_string())
+            )
+            .into_bytes(),
         }),
     });
     tx.commit()?;
@@ -583,7 +587,8 @@ fn merge_octopus(
                 old_oid: head_oid,
                 new_oid,
                 committer: commit_identity_from_env("COMMITTER")?,
-                message: format!("merge {}: Fast-forward", reduced[0].0).into_bytes(),
+                message: format!("{}: Fast-forward", merge_reflog_action(&reduced[0].0))
+                    .into_bytes(),
             }),
         });
         tx.commit()?;
@@ -972,6 +977,41 @@ fn split_cmdline(cmdline: &str) -> std::result::Result<Vec<String>, SplitCmdline
     Ok(argv)
 }
 
+/// In-process `GIT_REFLOG_ACTION` override set by `git pull` before it drives
+/// merge/rebase. The workspace forbids `unsafe`, so we cannot mutate the real
+/// env var the way git's `setenv` does; this process-global stands in and is
+/// consulted by [`merge_reflog_action`].
+static REFLOG_ACTION_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record the reflog action a pull wants its driven merge to log under.
+fn set_reflog_action_override(action: String) {
+    if let Ok(mut slot) = REFLOG_ACTION_OVERRIDE.lock() {
+        *slot = Some(action);
+    }
+}
+
+/// The reflog action prefix for a merge ref update — git's `GIT_REFLOG_ACTION`.
+///
+/// git's merge sets `GIT_REFLOG_ACTION` to `merge <remoteheads>` and writes
+/// `<action>: <detail>` (e.g. `merge topic: Fast-forward`). But `git pull`
+/// exports `GIT_REFLOG_ACTION=pull <argv>` *before* invoking merge, so the
+/// reflog reads `pull: Fast-forward` / `pull --no-rebase . second: Fast-forward`
+/// instead. Precedence mirrors git: an inherited `GIT_REFLOG_ACTION` env var
+/// wins, then the in-process pull override, then the `merge <target>` default.
+fn merge_reflog_action(target: &str) -> String {
+    if let Ok(action) = env::var("GIT_REFLOG_ACTION") {
+        if !action.is_empty() {
+            return action;
+        }
+    }
+    if let Ok(slot) = REFLOG_ACTION_OVERRIDE.lock() {
+        if let Some(action) = slot.as_ref() {
+            return action.clone();
+        }
+    }
+    format!("merge {target}")
+}
+
 pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut options = MergeOptions::default();
     let cwd = env::current_dir()?;
@@ -1067,7 +1107,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 old_oid: zero_oid(format)?,
                 new_oid: other_oid,
                 committer: commit_identity_from_env("COMMITTER")?,
-                message: format!("merge {target}: Fast-forward").into_bytes(),
+                message: format!("{}: Fast-forward", merge_reflog_action(&target)).into_bytes(),
             }),
         });
         tx.commit()?;
@@ -1111,7 +1151,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 old_oid: head_oid,
                 new_oid: other_oid,
                 committer: commit_identity_from_env("COMMITTER")?,
-                message: format!("merge {target}: Fast-forward").into_bytes(),
+                message: format!("{}: Fast-forward", merge_reflog_action(&target)).into_bytes(),
             }),
         });
         tx.commit()?;
@@ -2446,6 +2486,21 @@ fn run_fetch_with_outcome(
 }
 
 pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
+    // git's pull exports GIT_REFLOG_ACTION to the joined argv (`pull <args>`)
+    // before invoking fetch+merge/rebase, so the resulting reflog entry reads
+    // e.g. `pull: Fast-forward` or `pull --no-rebase . second: Fast-forward`
+    // rather than the merge's default `merge FETCH_HEAD: ...`. The workspace
+    // forbids `unsafe` (so no `env::set_var`); the action is stashed in a
+    // process-global instead — `merge_reflog_action` folds it in. `setenv(0)`
+    // semantics: do not overwrite an action a caller already set.
+    if env::var_os("GIT_REFLOG_ACTION").is_none() {
+        let mut action = String::from("pull");
+        for arg in args {
+            action.push(' ');
+            action.push_str(arg);
+        }
+        set_reflog_action_override(action);
+    }
     let mut no_ff = false;
     let mut ff_only = false;
     let mut quiet = false;
@@ -2544,12 +2599,49 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // refspec that created the branch still triggers the void checkout.
     if orig_head_unborn {
         let merge_oid = resolve_fetch_head_revision(&git_dir, format)?;
+        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        // git's pull_into_void does a two-way merge from the empty tree to the
+        // merge head FIRST (checkout_fast_forward); it only updates HEAD if that
+        // checkout succeeds. A staged or untracked file colliding with the
+        // incoming tree aborts the pull and preserves the user's unborn-branch
+        // work, so this must run before we touch any ref.
+        match sley_worktree::pull_into_void_two_way(
+            &worktree_root,
+            &git_dir,
+            format,
+            &merge_oid,
+        )? {
+            sley_worktree::PullIntoVoidOutcome::Merged { .. } => {}
+            sley_worktree::PullIntoVoidOutcome::UntrackedConflict { paths } => {
+                eprintln!(
+                    "error: The following untracked working tree files would be overwritten by merge:"
+                );
+                for path in &paths {
+                    eprintln!("\t{}", String::from_utf8_lossy(path));
+                }
+                eprintln!("Please move or remove them before you merge.");
+                eprintln!("Aborting");
+                return Err(GitError::Exit(1));
+            }
+            sley_worktree::PullIntoVoidOutcome::StagedConflict { paths } => {
+                eprintln!(
+                    "error: Your local changes to the following files would be overwritten by merge:"
+                );
+                for path in &paths {
+                    eprintln!("\t{}", String::from_utf8_lossy(path));
+                }
+                eprintln!("Please commit your changes or stash them before you merge.");
+                eprintln!("Aborting");
+                return Err(GitError::Exit(1));
+            }
+        }
+        // Checkout succeeded: now point the current branch (or HEAD if detached)
+        // at the merge head. A refspec like `main:main` may have already moved
+        // it during the fetch — only update when it doesn't already match.
         let target_ref = match store.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),
         };
-        // The branch may already point at `merge_oid` if a refspec like
-        // `main:main` updated it during the fetch; only move it when it doesn't.
         if store.read_ref(&target_ref)? != Some(RefTarget::Direct(merge_oid)) {
             let mut tx = store.transaction();
             tx.update(RefUpdate {
@@ -2565,13 +2657,6 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             });
             tx.commit()?;
         }
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &worktree_root,
-            &git_dir,
-            format,
-            &merge_oid,
-        )?;
         return Ok(());
     }
     let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;

@@ -558,6 +558,26 @@ pub struct RestoreResult {
     pub restored: usize,
 }
 
+/// Outcome of a `pull_into_void` two-way merge (git's `checkout_fast_forward`
+/// from the empty tree to the merge head). On a clean merge the incoming tree
+/// is materialized; on a collision the operation aborts and reports which
+/// worktree paths would have been lost so the caller can print git's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullIntoVoidOutcome {
+    /// The merge succeeded; the worktree + index now contain the merge head's
+    /// tree (plus any pre-existing staged/untracked paths the tree did not
+    /// touch). `restored` counts the materialized entries.
+    Merged { restored: usize },
+    /// An untracked worktree file would be overwritten by the merge. These are
+    /// the offending paths (git: "untracked working tree files would be
+    /// overwritten by merge").
+    UntrackedConflict { paths: Vec<Vec<u8>> },
+    /// A staged index entry differs from the incoming tree, so the merge would
+    /// overwrite local changes (git: "Your local changes ... would be
+    /// overwritten by merge").
+    StagedConflict { paths: Vec<Vec<u8>> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveResult {
     pub removed: Vec<Vec<u8>>,
@@ -8736,6 +8756,112 @@ pub fn reset_index_and_worktree_to_commit(
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
+}
+
+/// Pull into an unborn branch via git's `pull_into_void` two-way merge.
+///
+/// git treats the index as based on the *empty tree* and fast-forwards it to
+/// `commit_oid`'s tree (`checkout_fast_forward(empty_tree, merge_head)`). Unlike
+/// [`reset_index_and_worktree_to_commit`], this does **not** clobber the user's
+/// pre-existing index/worktree state: an untracked file or a staged blob that
+/// collides with an incoming path aborts the merge (so the unborn-branch work is
+/// never silently lost), while paths the incoming tree does not touch are kept.
+///
+/// Collision rules mirror `twoway_merge` + `verify_absent`/`verify_uptodate` with
+/// an always-empty oldtree:
+///   * incoming path already staged with the *same* oid -> keep (no-op).
+///   * incoming path staged with a *different* oid -> StagedConflict (abort).
+///   * incoming path not staged but an untracked worktree file exists there ->
+///     UntrackedConflict (abort) — git rejects regardless of content.
+///   * otherwise -> materialize the blob into the worktree + stage it.
+///
+/// On any conflict the worktree and index are left untouched.
+pub fn pull_into_void_two_way(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<PullIntoVoidOutcome> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let commit = read_commit(&db, format, commit_oid)?;
+    let mut target_entries = BTreeMap::new();
+    collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+
+    // Existing stage-0 index entries, keyed by path. A pull into void normally
+    // runs on a fresh `git init`, so this is usually empty — but #5/#6 stage
+    // files first, and those must survive.
+    let existing_index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let mut staged: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
+    for entry in &existing_index.entries {
+        if entry.stage() == Stage::Normal {
+            staged.insert(entry.path.to_vec(), entry.clone());
+        }
+    }
+
+    // First pass: classify every incoming path WITHOUT mutating the worktree, so
+    // a conflict aborts cleanly (git verifies the whole merge before applying).
+    let mut untracked_conflicts = Vec::new();
+    let mut staged_conflicts = Vec::new();
+    for (path, entry) in &target_entries {
+        match staged.get(path) {
+            Some(existing) if existing.oid == entry.oid => {
+                // same(current, newtree): keep the staged entry as-is.
+            }
+            Some(_) => {
+                // Staged blob differs from the incoming tree: local change.
+                staged_conflicts.push(path.clone());
+            }
+            None => {
+                // Not staged: an untracked worktree file at this path would be
+                // overwritten. git rejects it regardless of content match.
+                let file_path = worktree_path(worktree_root, path)?;
+                if fs::symlink_metadata(&file_path).is_ok() {
+                    untracked_conflicts.push(path.clone());
+                }
+            }
+        }
+    }
+    if !untracked_conflicts.is_empty() {
+        untracked_conflicts.sort();
+        return Ok(PullIntoVoidOutcome::UntrackedConflict {
+            paths: untracked_conflicts,
+        });
+    }
+    if !staged_conflicts.is_empty() {
+        staged_conflicts.sort();
+        return Ok(PullIntoVoidOutcome::StagedConflict {
+            paths: staged_conflicts,
+        });
+    }
+
+    // Second pass: apply. Materialize incoming paths that aren't already staged
+    // at the same oid; keep everything else (the staged-same paths and any
+    // staged path the tree never mentions, e.g. a freshly `git add`ed newfile).
+    let mut restored = 0usize;
+    for (path, entry) in &target_entries {
+        if staged.contains_key(path) {
+            continue; // already staged at the same oid (verified above)
+        }
+        let index_entry = materialize_tree_entry(&db, worktree_root, path, entry)?;
+        staged.insert(path.clone(), index_entry);
+        restored += 1;
+    }
+
+    let mut index_entries: Vec<IndexEntry> = staged.into_values().collect();
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: existing_index.version.max(2),
+            entries: index_entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
+    Ok(PullIntoVoidOutcome::Merged { restored })
 }
 
 /// Write one target tree entry into the worktree and return its index entry —

@@ -193,11 +193,25 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .config
         .get_bool("remote", Some(request.remote_name), "promisor")
         .unwrap_or(false);
-    let configured_refspecs = if request.refspecs.is_empty() {
+    let mut configured_refspecs = if request.refspecs.is_empty() {
         remote_config_values(request.config, request.remote_name, "fetch")
     } else {
         Vec::new()
     };
+    // `git pull` with `branch.<name>.merge` against a remote that has no
+    // `remote.<name>.fetch` config (the classic `branch.copy.remote=.` case, or
+    // a URL remote) still has something to fetch: the configured merge ref.
+    // git fetches that ref into FETCH_HEAD (source-only, no remote-tracking dst)
+    // and marks it for-merge. Without this, an empty refspec set falls back to
+    // fetching `HEAD`, which leaves the merge candidate pointing at the wrong
+    // ref. Promote the merge srcs into the configured-refspec slot so the
+    // existing for-merge marking (`configured_remote_fetch`) handles them.
+    let merge_srcs_drive_fetch = request.refspecs.is_empty()
+        && configured_refspecs.is_empty()
+        && !options.merge_srcs.is_empty();
+    if merge_srcs_drive_fetch {
+        configured_refspecs = options.merge_srcs.clone();
+    }
     let default_head_fetch = request.refspecs.is_empty() && configured_refspecs.is_empty();
     let configured_remote_fetch = request.refspecs.is_empty() && !configured_refspecs.is_empty();
     let fetch_head_source = fetch_head_source_description(request.config, request.remote_name);

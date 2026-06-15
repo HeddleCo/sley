@@ -1481,6 +1481,36 @@ impl FileRefStore {
         Ok(())
     }
 
+    /// Append a reflog entry for `name`, mirroring it to `HEAD` when `name` is the
+    /// branch HEAD currently points at — exactly git's files-backend behavior
+    /// (`split_symref_update`): a commit/merge/reset/pull on the checked-out
+    /// branch records the *same* entry in both `logs/<branch>` and `logs/HEAD`,
+    /// while an update to a non-checked-out branch (or to HEAD itself) touches a
+    /// single log. `head_symref` is the resolved `HEAD` symbolic target captured
+    /// once per transaction so we do not re-stat HEAD for every ref.
+    fn append_reflog_with_head_mirror(
+        &self,
+        name: &str,
+        entry: &ReflogEntry,
+        head_symref: Option<&str>,
+    ) -> Result<()> {
+        self.append_reflog(name, entry)?;
+        if name != "HEAD" && head_symref == Some(name) {
+            self.append_reflog("HEAD", entry)?;
+        }
+        Ok(())
+    }
+
+    /// The branch `HEAD` symbolically points at, if any (`None` when HEAD is
+    /// detached, unborn-but-direct, or absent). Read once before a transaction's
+    /// reflog writes so branch updates can mirror to `logs/HEAD`.
+    fn head_symref_target(&self) -> Option<String> {
+        match self.read_ref("HEAD") {
+            Ok(Some(RefTarget::Symbolic(branch))) => Some(branch),
+            _ => None,
+        }
+    }
+
     fn ref_path(&self, name: &str) -> PathBuf {
         self.ref_base_dir(name).join(name)
     }
@@ -1739,8 +1769,9 @@ impl FileRefStore {
         for name in &delete_names {
             self.remove_reflog_file(name);
         }
+        let head_symref = self.head_symref_target();
         for (name, entry) in reflogs {
-            self.append_reflog(&name, &entry)?;
+            self.append_reflog_with_head_mirror(&name, &entry, head_symref.as_deref())?;
         }
         Ok(())
     }
@@ -1988,8 +2019,13 @@ impl FileRefStore {
             self.remove_reflog_file(name);
         }
         // All refs are durable; append reflogs last, matching git's ordering.
+        // An update to the checked-out branch mirrors its entry to logs/HEAD
+        // (git's split_symref_update). HEAD's symref is resolved post-apply so a
+        // tx that itself moved HEAD (detach/switch wrote its own HEAD entry)
+        // does not double-log.
+        let head_symref = self.head_symref_target();
         for (name, entry) in reflogs {
-            self.append_reflog(&name, &entry)?;
+            self.append_reflog_with_head_mirror(&name, &entry, head_symref.as_deref())?;
         }
         Ok(())
     }
