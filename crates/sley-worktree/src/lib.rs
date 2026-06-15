@@ -8155,6 +8155,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
             fs::create_dir_all(parent)?;
         }
         fs::write(&file_path, &body)?;
+        set_worktree_file_mode(&file_path, entry.mode)?;
         let metadata = fs::metadata(&file_path)?;
         let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
         index_entry.mode = entry.mode;
@@ -8779,10 +8780,47 @@ fn materialize_tree_entry(
         fs::create_dir_all(parent)?;
     }
     fs::write(&file_path, &object.body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
     let metadata = fs::metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
     Ok(index_entry)
+}
+
+/// chmod a freshly-materialized worktree blob to match its tree/index entry mode.
+///
+/// `fs::write` truncates an existing file *in place*, preserving its prior
+/// permission bits. For a mode-only diff (identical oid, 100644 vs 100755) that
+/// leaves the wrong exec bit on disk — which is exactly the `reset --hard` /
+/// checkout bug this guards against. git's checkout path unlinks+recreates the
+/// file precisely to "get the new one with the right permissions" (entry.c
+/// `write_entry`); we instead chmod the just-written file.
+///
+/// Mirrors the observable result of git's `create_file` (entry.c):
+/// `(mode & 0100) ? 0777 : 0666` masked by the standard umask (0022), i.e. 0755
+/// for an executable entry and 0644 otherwise. Only regular-file entries (100644
+/// / 100755) are chmod'd; gitlinks and symlinks have no meaningful exec bit.
+///
+/// We set the perms directly (rather than relying on a fresh `open(2)` to apply
+/// the umask) because `fs::write` truncates an existing file in place, leaving its
+/// old permission bits — the very thing that breaks a mode-only checkout/reset.
+/// Matching git's default-umask output keeps the worktree byte-for-byte aligned
+/// with the oracle, which is what the parity suite asserts.
+#[cfg(unix)]
+fn set_worktree_file_mode(file_path: &Path, entry_mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = match entry_mode {
+        0o100755 => 0o755,
+        0o100644 => 0o644,
+        _ => return Ok(()),
+    };
+    fs::set_permissions(file_path, fs::Permissions::from_mode(perms))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_worktree_file_mode(_file_path: &Path, _entry_mode: u32) -> Result<()> {
+    Ok(())
 }
 
 /// Materialize a tree object into the index and worktree.
@@ -10042,7 +10080,8 @@ fn restore_head_entry_to_worktree(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, &object.body)?;
+    fs::write(&file_path, &object.body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
     Ok(())
 }
 
@@ -10058,6 +10097,7 @@ fn restore_head_entry_to_worktree_and_index(
         fs::create_dir_all(parent)?;
     }
     fs::write(&file_path, &object.body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
     let metadata = fs::metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
