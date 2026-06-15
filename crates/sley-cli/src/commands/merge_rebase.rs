@@ -1735,6 +1735,9 @@ fn finish_rebase_update_branch(
         committer,
         message: format!("{reflog_prefix}: {head_name}").into_bytes(),
     };
+    // Both the branch and HEAD are updated explicitly here; the ref store's
+    // HEAD-reflog mirror is suppressed when a transaction already carries an
+    // explicit HEAD update, so logs/HEAD gets exactly one entry.
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name: head_name.into(),

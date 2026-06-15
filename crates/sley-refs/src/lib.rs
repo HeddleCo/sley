@@ -1769,7 +1769,13 @@ impl FileRefStore {
         for name in &delete_names {
             self.remove_reflog_file(name);
         }
-        let head_symref = self.head_symref_target();
+        // Mirror a checked-out branch's reflog to logs/HEAD, unless the tx
+        // already wrote HEAD explicitly (see commit_loose for the rationale).
+        let head_symref = if reflogs.iter().any(|(name, _)| name == "HEAD") {
+            None
+        } else {
+            self.head_symref_target()
+        };
         for (name, entry) in reflogs {
             self.append_reflog_with_head_mirror(&name, &entry, head_symref.as_deref())?;
         }
@@ -2020,10 +2026,14 @@ impl FileRefStore {
         }
         // All refs are durable; append reflogs last, matching git's ordering.
         // An update to the checked-out branch mirrors its entry to logs/HEAD
-        // (git's split_symref_update). HEAD's symref is resolved post-apply so a
-        // tx that itself moved HEAD (detach/switch wrote its own HEAD entry)
-        // does not double-log.
-        let head_symref = self.head_symref_target();
+        // (git's split_symref_update). Suppress the mirror when this same
+        // transaction already carries an explicit HEAD update (rebase/reset and
+        // friends write HEAD themselves) so logs/HEAD gets exactly one entry.
+        let head_symref = if reflogs.iter().any(|(name, _)| name == "HEAD") {
+            None
+        } else {
+            self.head_symref_target()
+        };
         for (name, entry) in reflogs {
             self.append_reflog_with_head_mirror(&name, &entry, head_symref.as_deref())?;
         }
