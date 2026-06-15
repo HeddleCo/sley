@@ -1592,6 +1592,70 @@ impl PackIndex {
         index.extend_from_slice(index_checksum.as_bytes());
         Ok(index)
     }
+
+    /// Serialise a version-1 pack `.idx`: a 256-entry fanout, then for each
+    /// object an inline 4-byte big-endian pack offset immediately followed by
+    /// its object id (sorted by oid), then the pack checksum and a trailing
+    /// index checksum. v1 has no CRC table and cannot represent offsets that
+    /// do not fit in 32 bits.
+    pub fn write_v1(
+        format: ObjectFormat,
+        entries: &[PackIndexEntry],
+        pack_checksum: &ObjectId,
+    ) -> Result<Vec<u8>> {
+        if pack_checksum.format() != format {
+            return Err(GitError::InvalidObjectId(
+                "pack checksum format does not match index format".into(),
+            ));
+        }
+        let mut entries = entries.iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+        for pair in entries.windows(2) {
+            if pair[0].oid.as_bytes() == pair[1].oid.as_bytes() {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index contains duplicate object id {}",
+                    pair[0].oid
+                )));
+            }
+        }
+        let mut fanout = [0u32; 256];
+        for entry in &entries {
+            if entry.oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "pack index entry format does not match index format".into(),
+                ));
+            }
+            if entry.offset > 0xffff_ffff {
+                return Err(GitError::InvalidFormat(
+                    "pack offset too large for a version-1 index".into(),
+                ));
+            }
+            let first = entry.oid.as_bytes()[0] as usize;
+            fanout[first] = fanout[first]
+                .checked_add(1)
+                .ok_or_else(|| GitError::InvalidFormat("pack index fanout overflow".into()))?;
+        }
+        let mut running = 0u32;
+        for slot in &mut fanout {
+            running = running
+                .checked_add(*slot)
+                .ok_or_else(|| GitError::InvalidFormat("pack index fanout overflow".into()))?;
+            *slot = running;
+        }
+
+        let mut index = Vec::new();
+        for count in fanout {
+            index.extend_from_slice(&count.to_be_bytes());
+        }
+        for entry in &entries {
+            index.extend_from_slice(&(entry.offset as u32).to_be_bytes());
+            index.extend_from_slice(entry.oid.as_bytes());
+        }
+        index.extend_from_slice(pack_checksum.as_bytes());
+        let index_checksum = sley_core::digest_bytes(format, &index)?;
+        index.extend_from_slice(index_checksum.as_bytes());
+        Ok(index)
+    }
 }
 
 /// The `.rev` table for a pack: index positions (the rank of each object in

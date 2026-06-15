@@ -37,6 +37,11 @@ struct PackObjectsOptions {
     unpacked: bool,
     use_bitmap_index: Option<bool>,
     progress: Option<bool>,
+    /// `.idx` format version to emit (1 or 2). `None` keeps the v2 default.
+    /// `--index-version=2,<n>` carries a large-offset threshold which only
+    /// affects v2 and which sley derives from the offsets themselves, so the
+    /// threshold suffix is accepted and ignored.
+    index_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +81,18 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             }
             "--no-progress" if !saw_dashdash => options.progress = Some(false),
             "--no-all-progress" | "--no-all-progress-implied" if !saw_dashdash => {}
+            value if !saw_dashdash && value.starts_with("--index-version=") => {
+                let spec = &value["--index-version=".len()..];
+                // Format is "<version>" or "<version>,<offset-threshold>".
+                let version_part = spec.split(',').next().unwrap_or(spec);
+                let version: u32 = version_part.parse().map_err(|_| {
+                    GitError::Command(format!("bad index version '{spec}'"))
+                })?;
+                if version != 1 && version != 2 {
+                    return Err(GitError::Command(format!("bad index version '{spec}'")));
+                }
+                options.index_version = Some(version);
+            }
             value if !saw_dashdash && value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
                     "unsupported pack-objects option {value}"
@@ -205,12 +222,20 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let positions = pack_order_index_positions(&result.entries);
     let reverse_index = PackReverseIndex::write(format, &positions, &result.checksum)?;
 
+    // The writer always produces a v2 `.idx`; honour an explicit
+    // `--index-version=1` by re-serialising the same entries in the v1 layout.
+    let index_bytes = if options.index_version == Some(1) {
+        PackIndex::write_v1(format, &result.entries, &result.checksum)?
+    } else {
+        result.index
+    };
+
     // Write the pack before its lookup companions so no reader ever sees an
     // index that points at a missing or incomplete pack.
     let checksum = result.checksum.to_hex();
     fs::write(format!("{base_name}-{checksum}.pack"), &result.pack)?;
     fs::write(format!("{base_name}-{checksum}.rev"), &reverse_index)?;
-    fs::write(format!("{base_name}-{checksum}.idx"), &result.index)?;
+    fs::write(format!("{base_name}-{checksum}.idx"), &index_bytes)?;
     println!("{checksum}");
     emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
     Ok(())

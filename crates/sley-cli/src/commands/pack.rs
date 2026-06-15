@@ -3,7 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_pack::PackReverseIndex;
+use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
 
 #[derive(Debug)]
 struct IndexPackOptions {
@@ -1596,6 +1596,7 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
     let combined: Vec<String> = global.into_iter().chain(rest).collect();
     match subcommand.as_str() {
         "expire" => cmd_multi_pack_index_expire(&combined),
+        "repack" => cmd_multi_pack_index_repack(&combined),
         "write" => cmd_multi_pack_index_write(&combined),
         "verify" => cmd_multi_pack_index_verify(&combined),
         other => {
@@ -1615,6 +1616,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let mut write_bitmap = false;
     let mut preferred_pack_name: Option<String> = None;
     let mut refs_snapshot: Option<PathBuf> = None;
+    let mut progress = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1624,7 +1626,8 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
                 object_dir = Some(resolve_cli_path(&cwd, value));
             }
-            "--progress" | "--no-progress" => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
             value if value.starts_with("--object-dir=") => {
                 let value = value
                     .strip_prefix("--object-dir=")
@@ -1663,6 +1666,29 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
     let pack_dir = object_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
+    if progress {
+        // Upstream shows a delayed progress meter labelled this way; with
+        // GIT_PROGRESS_DELAY=0 it appears immediately. We emit a single line so
+        // `--progress` produces non-empty stderr and the default stays silent.
+        eprintln!("Adding packfiles to multi-pack-index");
+    }
+
+    // If a midx already exists on disk but its trailing checksum does not match
+    // its contents, upstream refuses to reuse it and warns before rebuilding
+    // from scratch (midx-write.c: "ignoring existing multi-pack-index; checksum
+    // mismatch").
+    let existing_midx = pack_dir.join("multi-pack-index");
+    if let Ok(bytes) = fs::read(&existing_midx)
+        && bytes.len() > format.raw_len()
+    {
+        let checksum_offset = bytes.len() - format.raw_len();
+        if let Ok(actual) = sley_core::digest_bytes(format, &bytes[..checksum_offset])
+            && actual.as_bytes() != &bytes[checksum_offset..]
+        {
+            eprintln!("warning: ignoring existing multi-pack-index; checksum mismatch");
+        }
+    }
+
     let mut pack_names = if stdin_packs {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
@@ -1705,6 +1731,18 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             .copied()
             .unwrap_or(std::time::UNIX_EPOCH)
     };
+
+    if pack_names.is_empty() {
+        // Upstream resolves the preferred-pack name against the (here empty)
+        // pack set first, warning when it is unknown, and only then refuses to
+        // write a midx that would index zero packs (midx-write.c: "no pack
+        // files to index."), exiting non-zero.
+        if let Some(name) = &preferred_pack_name {
+            eprintln!("warning: unknown preferred pack: '{name}'");
+        }
+        eprintln!("error: no pack files to index.");
+        return Err(GitError::Exit(1));
+    }
 
     let mut objects = Vec::new();
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
@@ -1870,11 +1908,303 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Scan `<object_dir>/pack` for `.idx` files and write a fresh, non-bitmap
+/// multi-pack-index over them, applying upstream's cross-pack duplicate
+/// resolution (keep the copy from the newest pack, ties broken by lowest pack
+/// id). This is the default `multi-pack-index write` behaviour, factored out so
+/// `repack` and `expire` can rewrite the midx after changing the pack set.
+fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let pack_dir = object_dir.join("pack");
+    let mut pack_names = Vec::new();
+    for entry in fs::read_dir(&pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            pack_names.push(name.to_string());
+        }
+    }
+    pack_names.sort();
+    if pack_names.is_empty() {
+        // Nothing to index; remove any stale midx so callers observe the empty
+        // state the way upstream leaves it after dropping the last pack.
+        let _ = fs::remove_file(pack_dir.join("multi-pack-index"));
+        return Ok(());
+    }
+
+    let pack_mtimes: Vec<std::time::SystemTime> = pack_names
+        .iter()
+        .map(|name| {
+            fs::metadata(pack_dir.join(name).with_extension("pack"))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        })
+        .collect();
+    let pack_mtime = |pack_int_id: u32| -> std::time::SystemTime {
+        pack_mtimes
+            .get(pack_int_id as usize)
+            .copied()
+            .unwrap_or(std::time::UNIX_EPOCH)
+    };
+
+    let mut objects = Vec::new();
+    for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
+        let index = PackIndex::parse(&fs::read(pack_dir.join(pack_name))?, format)?;
+        for entry in index.entries {
+            objects.push(MultiPackIndexEntry {
+                oid: entry.oid,
+                pack_int_id: pack_int_id as u32,
+                offset: entry.offset,
+            });
+        }
+    }
+
+    objects.sort_by(|left, right| {
+        left.oid
+            .as_bytes()
+            .cmp(right.oid.as_bytes())
+            .then_with(|| pack_mtime(right.pack_int_id).cmp(&pack_mtime(left.pack_int_id)))
+            .then_with(|| left.pack_int_id.cmp(&right.pack_int_id))
+    });
+    objects.dedup_by(|next, kept| next.oid == kept.oid);
+
+    let midx = MultiPackIndex::write(format, 1, &pack_names, &objects)?;
+    let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
+
+    // Clear stale bitmap/rev sidecars not produced by this (non-bitmap) write.
+    for entry in fs::read_dir(&pack_dir)? {
+        let path = entry?.path();
+        if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && name.starts_with("multi-pack-index-")
+            && (name.ends_with(".bitmap") || name.ends_with(".rev"))
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    let _ = midx_checksum;
+
+    fs::write(pack_dir.join("multi-pack-index"), &midx)?;
+    Ok(())
+}
+
+/// Parse the `--object-dir`/`--progress` options shared by `repack` and
+/// `expire`, returning the resolved object dir and whether progress is forced.
+fn parse_midx_object_dir_and_progress(
+    args: &[String],
+    cwd: &Path,
+    git_dir: &Path,
+    subcommand: &str,
+) -> Result<(PathBuf, bool, Option<u64>)> {
+    let mut object_dir: Option<PathBuf> = None;
+    let mut progress = false;
+    let mut batch_size: Option<u64> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--object-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
+                object_dir = Some(resolve_cli_path(cwd, value));
+            }
+            value if value.starts_with("--object-dir=") => {
+                let value = &value["--object-dir=".len()..];
+                object_dir = Some(resolve_cli_path(cwd, value));
+            }
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
+            "--batch-size" if subcommand == "repack" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--batch-size requires a value".into()))?;
+                batch_size = Some(value.parse().map_err(|_| {
+                    GitError::Command("option `batch-size' expects a numerical value".into())
+                })?);
+            }
+            value if subcommand == "repack" && value.starts_with("--batch-size=") => {
+                let value = &value["--batch-size=".len()..];
+                batch_size = Some(value.parse().map_err(|_| {
+                    GitError::Command("option `batch-size' expects a numerical value".into())
+                })?);
+            }
+            other => {
+                return Err(GitError::Unsupported(format!(
+                    "multi-pack-index {subcommand} option {other}"
+                )));
+            }
+        }
+    }
+    let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(git_dir));
+    Ok((object_dir, progress, batch_size))
+}
+
+/// Whether a pack (named by its `.idx` basename) carries a `.keep` companion.
+fn pack_has_keep(pack_dir: &Path, idx_name: &str) -> bool {
+    let keep = pack_dir.join(idx_name).with_extension("keep");
+    keep.exists()
+}
+
+/// Whether a pack (named by its `.idx` basename) is a cruft pack, i.e. has a
+/// `.mtimes` companion (upstream marks cruft packs this way).
+fn pack_is_cruft(pack_dir: &Path, idx_name: &str) -> bool {
+    pack_dir.join(idx_name).with_extension("mtimes").exists()
+}
+
+fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let (object_dir, progress, batch_size) =
+        parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "repack")?;
+    let pack_dir = object_dir.join("pack");
+    let midx_path = pack_dir.join("multi-pack-index");
+    if !midx_path.exists() {
+        return Ok(());
+    }
+    let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
+    let num_packs = midx.pack_names.len();
+
+    // referenced[i] = number of midx objects whose copy lives in pack i, and
+    // per-pack file metadata used for batch selection.
+    let mut referenced = vec![0u64; num_packs];
+    for entry in &midx.objects {
+        if (entry.pack_int_id as usize) < num_packs {
+            referenced[entry.pack_int_id as usize] += 1;
+        }
+    }
+    let mut pack_objects_total = vec![0u64; num_packs];
+    let mut pack_size = vec![0u64; num_packs];
+    let mut pack_mtime = vec![std::time::UNIX_EPOCH; num_packs];
+    for (i, name) in midx.pack_names.iter().enumerate() {
+        if let Ok(index) = PackIndex::parse(&fs::read(pack_dir.join(name))?, format) {
+            pack_objects_total[i] = index.entries.len() as u64;
+        }
+        let pack_path = pack_dir.join(name).with_extension("pack");
+        if let Ok(meta) = fs::metadata(&pack_path) {
+            pack_size[i] = meta.len();
+            if let Ok(mtime) = meta.modified() {
+                pack_mtime[i] = mtime;
+            }
+        }
+    }
+
+    let config = read_repo_config(&git_dir)?;
+    let pack_kept_objects = config
+        .get_bool("repack", None, "packKeptObjects")
+        .unwrap_or(false);
+
+    let want = |i: usize| -> bool {
+        if !pack_kept_objects && pack_has_keep(&pack_dir, &midx.pack_names[i]) {
+            return false;
+        }
+        if pack_is_cruft(&pack_dir, &midx.pack_names[i]) {
+            return false;
+        }
+        pack_objects_total[i] > 0
+    };
+
+    let mut include = vec![false; num_packs];
+    match batch_size {
+        None | Some(0) => {
+            for (i, slot) in include.iter_mut().enumerate() {
+                if want(i) {
+                    *slot = true;
+                }
+            }
+        }
+        Some(batch_size) => {
+            // Visit packs smallest-mtime first; include the smaller packs whose
+            // expected (reference-proportional) size keeps the running total
+            // under the batch, skipping any single pack already >= batch.
+            let mut order: Vec<usize> = (0..num_packs).collect();
+            order.sort_by(|&a, &b| pack_mtime[a].cmp(&pack_mtime[b]));
+            let mut total: u64 = 0;
+            for i in order {
+                if total >= batch_size {
+                    break;
+                }
+                if !want(i) {
+                    continue;
+                }
+                // expected_size ~= referenced/num_objects * pack_size, in the
+                // same shifted-integer form upstream uses.
+                let objects = pack_objects_total[i].max(1);
+                let mut expected = (referenced[i] << 14) / objects;
+                expected = expected.saturating_mul(pack_size[i]);
+                expected = (expected + (1 << 13)) >> 14;
+                if expected >= batch_size {
+                    continue;
+                }
+                total = total.saturating_add(expected);
+                include[i] = true;
+            }
+        }
+    }
+
+    let packs_to_repack = include.iter().filter(|&&v| v).count();
+    if packs_to_repack <= 1 {
+        return Ok(());
+    }
+    if progress {
+        // Upstream forwards `--progress` to the spawned pack-objects, which
+        // prints its own meters once it actually has packs to combine. A single
+        // line keeps `--progress` non-empty while the default stays silent.
+        eprintln!("Repacking multi-pack-index");
+    }
+
+    // Collect the oids whose copy lives in an included pack, then build one new
+    // pack from them and rewrite the midx.
+    let db = FileObjectDatabase::new(object_dir.clone(), format);
+    let mut inputs_oids = Vec::new();
+    for entry in &midx.objects {
+        if include
+            .get(entry.pack_int_id as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            inputs_oids.push(entry.oid);
+        }
+    }
+
+    let mut encoded = Vec::with_capacity(inputs_oids.len());
+    for oid in &inputs_oids {
+        encoded.push(db.read_object(oid)?);
+    }
+    let inputs: Vec<PackInput<'_>> = inputs_oids
+        .iter()
+        .zip(&encoded)
+        .map(|(oid, object)| PackInput {
+            oid,
+            object: object.as_ref(),
+        })
+        .collect();
+
+    let written = PackFile::write_packed_with_known_ids_and_options(
+        &inputs,
+        format,
+        &PackWriteOptions::new(),
+    )?;
+    let checksum = written.checksum.to_hex();
+    let base = pack_dir.join(format!("pack-{checksum}"));
+    let positions = pack_order_index_positions(&written.entries);
+    let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
+    fs::write(base.with_extension("pack"), &written.pack)?;
+    fs::write(base.with_extension("rev"), &reverse_index)?;
+    fs::write(base.with_extension("idx"), &written.index)?;
+
+    write_default_midx(&object_dir, format)
+}
+
 fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
+    // Upstream defaults progress to a tty heuristic; when stderr is not a tty
+    // it stays off. `--progress` forces it on, `--no-progress` forces it off.
+    // Our test oracle never has a tty, so default off and honour the flags.
+    let mut progress = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1884,7 +2214,8 @@ fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
                 object_dir = Some(resolve_cli_path(&cwd, value));
             }
-            "--progress" | "--no-progress" => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
             value if value.starts_with("--object-dir=") => {
                 let value = value
                     .strip_prefix("--object-dir=")
@@ -1899,43 +2230,377 @@ fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
         }
     }
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
-    let midx_path = object_dir.join("pack").join("multi-pack-index");
-    MultiPackIndex::parse(&fs::read(midx_path)?, format)?;
-    Ok(())
+    verify_midx_at(&object_dir, format, progress)
+}
+
+/// Run the full upstream `verify_midx_file` pass over the multi-pack-index in
+/// `<object_dir>/pack/multi-pack-index`, emitting git-exact error substrings to
+/// stderr and returning `GitError::Exit(1)` on any detected corruption.
+///
+/// Parse-time corruptions (signature, version, hash version, chunk table,
+/// fanout order, pack names order, pack-int-id) abort with git's load-time
+/// `die()`/`error()` strings; verify-time corruptions (incorrect checksum,
+/// failed pack load, no oid, oid lookup order, incorrect object offset) are
+/// reported the way upstream's verify pass reports them.
+fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Result<()> {
+    let pack_dir = object_dir.join("pack");
+    let midx_path = pack_dir.join("multi-pack-index");
+    let bytes = match fs::read(&midx_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // No midx ⇒ upstream verify is a no-op success.
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let parsed = match parse_midx_for_verify(&bytes, format) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return Err(GitError::Exit(1));
+        }
+    };
+
+    let mut reported = false;
+    let mut report = |message: String| {
+        eprintln!("error: {message}");
+        reported = true;
+    };
+
+    // Verify-time checksum check: recompute over everything but the trailing
+    // hash and compare.
+    let checksum_offset = bytes.len() - format.raw_len();
+    let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    if actual_checksum.as_bytes() != &bytes[checksum_offset..] {
+        report("incorrect checksum".to_string());
+    }
+
+    if progress {
+        eprintln!("Looking for referenced packfiles");
+    }
+
+    // Load each referenced pack-index; a missing/corrupt one is reported but
+    // not fatal to the rest of the pass.
+    let mut pack_indexes: Vec<Option<PackIndex>> = Vec::with_capacity(parsed.pack_names.len());
+    for (position, name) in parsed.pack_names.iter().enumerate() {
+        match fs::read(pack_dir.join(name)).ok().and_then(|raw| PackIndex::parse(&raw, format).ok()) {
+            Some(index) => pack_indexes.push(Some(index)),
+            None => {
+                report(format!("failed to load pack in position {position}"));
+                pack_indexes.push(None);
+            }
+        }
+    }
+
+    if parsed.object_count == 0 {
+        report("the midx contains no oid".to_string());
+        return if reported { Err(GitError::Exit(1)) } else { Ok(()) };
+    }
+
+    if progress {
+        eprintln!("Verifying OID order in multi-pack-index");
+    }
+    for window in parsed.entries.windows(2) {
+        if window[0].oid.as_bytes() >= window[1].oid.as_bytes() {
+            report(format!(
+                "oid lookup out of order: oid[?] = {} >= {} = oid[?]",
+                window[0].oid.to_hex(),
+                window[1].oid.to_hex()
+            ));
+        }
+    }
+
+    if progress {
+        eprintln!("Verifying object offsets");
+    }
+    // Build per-pack offset lookups once, then check each midx entry's offset
+    // against the pack's own .idx.
+    for (idx, entry) in parsed.entries.iter().enumerate() {
+        let Some(Some(index)) = pack_indexes.get(entry.pack_int_id as usize) else {
+            // A pack that failed to load was already reported above.
+            continue;
+        };
+        let pack_offset = index
+            .entries
+            .iter()
+            .find(|e| e.oid == entry.oid)
+            .map(|e| e.offset);
+        match pack_offset {
+            Some(offset) if offset == entry.offset => {}
+            Some(offset) => report(format!(
+                "incorrect object offset for oid[{idx}] = {}: {:x} != {:x}",
+                entry.oid.to_hex(),
+                entry.offset,
+                offset
+            )),
+            None => report(format!(
+                "failed to load pack entry for oid[{idx}] = {}",
+                entry.oid.to_hex()
+            )),
+        }
+    }
+
+    if reported {
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
+    }
+}
+
+/// A minimal parse of the multi-pack-index used purely by verify, reproducing
+/// upstream `load_multi_pack_index`'s die/error wording so corruption tests
+/// match byte-for-byte. Returns the human-facing message string on failure.
+struct VerifyMidx {
+    pack_names: Vec<String>,
+    object_count: usize,
+    entries: Vec<MultiPackIndexEntry>,
+}
+
+fn parse_midx_for_verify(bytes: &[u8], format: ObjectFormat) -> std::result::Result<VerifyMidx, String> {
+    let hash_len = format.raw_len();
+    const MIDX_HEADER_SIZE: usize = 12;
+    if bytes.len() < MIDX_HEADER_SIZE + 12 + hash_len {
+        return Err("multi-pack-index file is too small".to_string());
+    }
+    if &bytes[..4] != b"MIDX" {
+        return Err(format!(
+            "multi-pack-index signature 0x{:08x} does not match signature 0x{:08x}",
+            u32_be4(&bytes[..4]),
+            u32::from_be_bytes(*b"MIDX")
+        ));
+    }
+    let version = bytes[4];
+    if version != 1 && version != 2 {
+        return Err(format!("multi-pack-index version {version} not recognized"));
+    }
+    let hash_version = bytes[5];
+    let expected_hash_version = match format {
+        ObjectFormat::Sha1 => 1u8,
+        ObjectFormat::Sha256 => 2u8,
+    };
+    if hash_version != expected_hash_version {
+        return Err(format!(
+            "multi-pack-index hash version {hash_version} does not match version {expected_hash_version}"
+        ));
+    }
+    let num_chunks = bytes[6] as usize;
+    let num_packs = u32_be4(&bytes[8..12]) as usize;
+
+    // Table of contents: num_chunks entries of (id:4, offset:8) plus a
+    // terminating entry. Reproduce read_table_of_contents's check order so the
+    // truncated/extended/improper-offset corruptions report git's exact text.
+    let checksum_offset = bytes.len() - hash_len;
+    let mut chunks: Vec<([u8; 4], u64)> = Vec::with_capacity(num_chunks);
+    let mut toc = MIDX_HEADER_SIZE;
+    for _ in 0..num_chunks {
+        if toc + 12 + 12 > bytes.len() {
+            return Err("multi-pack-index file is too small".to_string());
+        }
+        let chunk_id = [bytes[toc], bytes[toc + 1], bytes[toc + 2], bytes[toc + 3]];
+        let chunk_offset = u64_be8(&bytes[toc + 4..toc + 12]);
+        if chunk_id == [0, 0, 0, 0] {
+            return Err("terminating chunk id appears earlier than expected".to_string());
+        }
+        // CHUNK alignment for midx is 1 byte, so alignment never trips.
+        let next_offset = u64_be8(&bytes[toc + 12 + 4..toc + 12 + 12]);
+        if next_offset < chunk_offset || next_offset > checksum_offset as u64 {
+            return Err(format!(
+                "improper chunk offset(s) {chunk_offset:x} and {next_offset:x}"
+            ));
+        }
+        chunks.push((chunk_id, chunk_offset));
+        toc += 12;
+    }
+    // The final (terminating) entry must have a zero id.
+    let final_id = [bytes[toc], bytes[toc + 1], bytes[toc + 2], bytes[toc + 3]];
+    if final_id != [0, 0, 0, 0] {
+        return Err(format!(
+            "final chunk has non-zero id {:x}",
+            u32_be4(&final_id)
+        ));
+    }
+    let final_offset = u64_be8(&bytes[toc + 4..toc + 12]);
+
+    // Resolve a chunk's data slice using the next chunk's start (or the
+    // terminator) as the end.
+    let chunk_slice = |want: &[u8; 4]| -> Option<(usize, usize)> {
+        for i in 0..chunks.len() {
+            if &chunks[i].0 == want {
+                let start = chunks[i].1 as usize;
+                let end = if i + 1 < chunks.len() {
+                    chunks[i + 1].1 as usize
+                } else {
+                    final_offset as usize
+                };
+                return Some((start, end));
+            }
+        }
+        None
+    };
+
+    // PNAM (required).
+    let Some((pnam_start, pnam_end)) = chunk_slice(b"PNAM") else {
+        return Err("multi-pack-index required pack-name chunk missing or corrupted".to_string());
+    };
+    let pnam = &bytes[pnam_start..pnam_end.min(bytes.len())];
+    let mut pack_names = Vec::with_capacity(num_packs);
+    let mut cursor = 0usize;
+    for _ in 0..num_packs {
+        let Some(nul) = pnam[cursor..].iter().position(|b| *b == 0) else {
+            return Err("multi-pack-index pack-name chunk is too short".to_string());
+        };
+        let name = String::from_utf8_lossy(&pnam[cursor..cursor + nul]).into_owned();
+        if version == 1
+            && let Some(prev) = pack_names.last()
+            && &name <= prev
+        {
+            return Err(format!(
+                "multi-pack-index pack names out of order: '{prev}' before '{name}'"
+            ));
+        }
+        pack_names.push(name);
+        cursor += nul + 1;
+    }
+
+    // OIDF (required) — fanout monotonicity is checked at load time.
+    let Some((oidf_start, oidf_end)) = chunk_slice(b"OIDF") else {
+        return Err("multi-pack-index required OID fanout chunk missing or corrupted".to_string());
+    };
+    let oidf = &bytes[oidf_start..oidf_end.min(bytes.len())];
+    if oidf.len() != 256 * 4 {
+        return Err("multi-pack-index OID fanout is of the wrong size".to_string());
+    }
+    let fanout: Vec<u32> = (0..256).map(|i| u32_be4(&oidf[i * 4..i * 4 + 4])).collect();
+    for i in 0..255 {
+        if fanout[i] > fanout[i + 1] {
+            return Err(format!(
+                "oid fanout out of order: fanout[{i}] = {:x} > {:x} = fanout[{}]",
+                fanout[i],
+                fanout[i + 1],
+                i + 1
+            ));
+        }
+    }
+    let object_count = fanout[255] as usize;
+
+    // OIDL (required).
+    let Some((oidl_start, oidl_end)) = chunk_slice(b"OIDL") else {
+        return Err("multi-pack-index required OID lookup chunk missing or corrupted".to_string());
+    };
+    let oidl = &bytes[oidl_start..oidl_end.min(bytes.len())];
+    if oidl.len() != object_count * hash_len {
+        return Err("multi-pack-index OID lookup chunk is the wrong size".to_string());
+    }
+
+    // OOFF (required).
+    let Some((ooff_start, ooff_end)) = chunk_slice(b"OOFF") else {
+        return Err(
+            "multi-pack-index required object offsets chunk missing or corrupted".to_string(),
+        );
+    };
+    let ooff = &bytes[ooff_start..ooff_end.min(bytes.len())];
+    if ooff.len() != object_count * 8 {
+        return Err("multi-pack-index object offset chunk is the wrong size".to_string());
+    }
+
+    // LOFF (optional).
+    let loff = chunk_slice(b"LOFF").map(|(s, e)| &bytes[s..e.min(bytes.len())]);
+
+    let mut entries = Vec::with_capacity(object_count);
+    for i in 0..object_count {
+        let oid = ObjectId::from_raw(format, &oidl[i * hash_len..i * hash_len + hash_len])
+            .map_err(|err| err.to_string())?;
+        let pack_int_id = u32_be4(&ooff[i * 8..i * 8 + 4]);
+        if pack_int_id as usize >= num_packs {
+            return Err(format!(
+                "bad pack-int-id: {pack_int_id} ({num_packs} total packs)"
+            ));
+        }
+        let raw_offset = u32_be4(&ooff[i * 8 + 4..i * 8 + 8]);
+        let offset = if raw_offset & 0x8000_0000 == 0 {
+            u64::from(raw_offset)
+        } else {
+            let large_idx = (raw_offset & 0x7fff_ffff) as usize;
+            let loff = loff.ok_or_else(|| "multi-pack-index missing LOFF chunk".to_string())?;
+            if large_idx * 8 + 8 > loff.len() {
+                return Err("multi-pack-index large offset out of bounds".to_string());
+            }
+            u64_be8(&loff[large_idx * 8..large_idx * 8 + 8])
+        };
+        entries.push(MultiPackIndexEntry {
+            oid,
+            pack_int_id,
+            offset,
+        });
+    }
+
+    Ok(VerifyMidx {
+        pack_names,
+        object_count,
+        entries,
+    })
+}
+
+fn u32_be4(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn u64_be8(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_be_bytes(buf)
 }
 
 fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    let mut object_dir: Option<PathBuf> = None;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--object-dir" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
-                object_dir = Some(resolve_cli_path(&cwd, value));
-            }
-            "--progress" | "--no-progress" => {}
-            value if value.starts_with("--object-dir=") => {
-                let value = value
-                    .strip_prefix("--object-dir=")
-                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
-                object_dir = Some(resolve_cli_path(&cwd, value));
-            }
-            other => {
-                return Err(GitError::Unsupported(format!(
-                    "multi-pack-index expire option {other}"
-                )));
-            }
+    let (object_dir, progress, _) =
+        parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "expire")?;
+    let pack_dir = object_dir.join("pack");
+    let midx_path = pack_dir.join("multi-pack-index");
+    if !midx_path.exists() {
+        return Ok(());
+    }
+    let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
+    if progress {
+        // Upstream shows two delayed progress meters during expiration; with
+        // GIT_PROGRESS_DELAY=0 they appear immediately, even when nothing is
+        // dropped. Emit a line so `--progress` is non-empty and default silent.
+        eprintln!("Counting referenced objects");
+    }
+    let num_packs = midx.pack_names.len();
+
+    // Count how many of the midx's surviving objects each pack actually
+    // provides. A pack whose objects are all dedup-covered by newer packs ends
+    // up with zero references and is a deletion candidate.
+    let mut count = vec![0u64; num_packs];
+    for entry in &midx.objects {
+        if (entry.pack_int_id as usize) < num_packs {
+            count[entry.pack_int_id as usize] += 1;
         }
     }
-    let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
-    let midx_path = object_dir.join("pack").join("multi-pack-index");
-    if midx_path.exists() {
-        MultiPackIndex::parse(&fs::read(midx_path)?, format)?;
+
+    let mut dropped_any = false;
+    for (i, name) in midx.pack_names.iter().enumerate() {
+        if count[i] != 0 {
+            continue;
+        }
+        // Never expire a kept or cruft pack.
+        if pack_has_keep(&pack_dir, name) || pack_is_cruft(&pack_dir, name) {
+            continue;
+        }
+        // Drop the pack and all its companions.
+        let stem = pack_dir.join(name);
+        for ext in ["pack", "idx", "rev", "bitmap", "mtimes", "keep"] {
+            let _ = fs::remove_file(stem.with_extension(ext));
+        }
+        dropped_any = true;
+    }
+
+    if dropped_any {
+        write_default_midx(&object_dir, format)?;
     }
     Ok(())
 }
