@@ -89,6 +89,10 @@ struct BlameOptions {
     /// `-b`: blank out the object name of boundary commits (render the hex
     /// column as spaces instead of `^`+hash).
     blank_boundary: bool,
+    /// Whether the author column (`-e`/`--show-email`/`--no-show-email`) was set
+    /// on the command line; if not, `blame.showEmail` config supplies the
+    /// default.
+    author_field_explicit: bool,
 }
 
 /// A `-L` argument before it is resolved against the file's line count.
@@ -137,7 +141,7 @@ pub(crate) fn cmd_annotate(args: &[String]) -> Result<()> {
 }
 
 fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
-    let options = match parse_blame_args(args)? {
+    let mut options = match parse_blame_args(args)? {
         BlameArgs::Run(mut options) => {
             if force_compat {
                 options.compat = true;
@@ -155,6 +159,14 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
+
+    // `blame.showEmail` config supplies the author-column default when no
+    // `-e`/`--show-email`/`--no-show-email` was given on the command line.
+    if !options.author_field_explicit
+        && let Some(true) = blame_config_bool(git_dir, "showemail")?
+    {
+        options.author_field = AuthorField::Email;
+    }
 
     // Disambiguate rev vs path now that the repository is available: a token
     // "is a rev" if it resolves to an object, matching git's `is_a_rev`. A
@@ -241,6 +253,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut long_sha = false;
     let mut suppress_author = false;
     let mut author_field = AuthorField::Name;
+    let mut author_field_explicit = false;
     let mut date_field = DateField::Iso;
     let mut show_root = false;
     let mut abbrev_override = None;
@@ -264,8 +277,14 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--" => saw_dd = true,
             "-l" | "--long" => long_sha = true,
             "-s" => suppress_author = true,
-            "-e" | "--show-email" => author_field = AuthorField::Email,
-            "--no-show-email" => author_field = AuthorField::Name,
+            "-e" | "--show-email" => {
+                author_field = AuthorField::Email;
+                author_field_explicit = true;
+            }
+            "--no-show-email" => {
+                author_field = AuthorField::Name;
+                author_field_explicit = true;
+            }
             "-t" => date_field = DateField::Raw,
             "--root" => show_root = true,
             "--no-root" => show_root = false,
@@ -337,6 +356,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         first_parent,
         compat,
         blank_boundary,
+        author_field_explicit,
     }))
 }
 
@@ -1055,6 +1075,24 @@ fn ancestors_closure(
     Ok(seen)
 }
 
+/// Read a `blame.<key>` boolean config value (e.g. `blame.showEmail`), checking
+/// the repository config then the global config, mirroring git's precedence.
+/// `key` is the lowercase, dotless tail (git config keys are case-insensitive).
+/// Returns `None` when unset.
+fn blame_config_bool(git_dir: &Path, key: &str) -> Result<Option<bool>> {
+    // Repository config takes precedence over global.
+    let config_path = git_dir.join("config");
+    if let Ok(config) = GitConfig::read(config_path)
+        && let Some(value) = config.get("blame", None, key)
+    {
+        return Ok(parse_config_bool(value));
+    }
+    if let Some(value) = global_config_value(&format!("blame.{key}"))? {
+        return Ok(parse_config_bool(&value));
+    }
+    Ok(None)
+}
+
 /// Read (and memoise) the blob for `repo_path` at `commit`. `None` means the
 /// path is absent (or names a non-blob) at that commit.
 fn cached_blob(
@@ -1218,10 +1256,14 @@ fn resolve_range(
             }
             *n
         }
-        // The `/regex/` end searches from `begin + 1` (git's `*begin + 1`).
+        // The `/regex/` end searches from `begin + 1` (git's `*begin + 1`). The
+        // absolute `^/regex/` anchor is only valid as a *start* bound — git
+        // rejects `-L X,^/RE/` as a usage error.
         RangeBound::Regex { pattern, absolute } => {
-            let from = if *absolute { 1 } else { start + 1 };
-            resolve_regex_bound(pattern, contents, from, total)?
+            if *absolute {
+                return Err(blame_usage_error());
+            }
+            resolve_regex_bound(pattern, contents, start + 1, total)?
         }
         // `start,+0` is an empty range git rejects; else end = start + count - 1.
         RangeBound::Relative(count) => {
