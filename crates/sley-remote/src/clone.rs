@@ -115,8 +115,14 @@ pub struct CloneOutcome {
     /// The destination repository's `$GIT_DIR` (the `.git` directory created by
     /// the init step). The caller uses it for its post-checkout steps.
     pub git_dir: PathBuf,
-    /// The object id the local branch was created at (the fetched remote tip).
-    pub branch_oid: ObjectId,
+    /// The object id the local branch was created at (the fetched remote tip), or
+    /// `None` when the remote was empty (an empty clone leaves HEAD unborn at the
+    /// remote's default branch with no local branch or checkout).
+    pub branch_oid: Option<ObjectId>,
+    /// Set when the remote advertised no refs: git prints "warning: You appear to
+    /// have cloned an empty repository." and skips the worktree checkout. The CLI
+    /// owns the user-facing warning.
+    pub empty: bool,
 }
 
 /// Fully resolved inputs for a [`clone`] run.
@@ -204,7 +210,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         request.options.deepen_not.clone(),
         request.options.filter,
     );
-    fetch(
+    let fetch_outcome = fetch(
         crate::fetch::FetchRequest {
             git_dir: &git_dir,
             format: request.format,
@@ -233,7 +239,8 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         )?;
         return Ok(CloneOutcome {
             git_dir,
-            branch_oid: *detached,
+            branch_oid: Some(*detached),
+            empty: false,
         });
     }
     let remote_branch_ref = format!(
@@ -248,6 +255,35 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             ));
         }
         None => {
+            // An empty remote advertised no refs: nothing was fetched, so the
+            // checkout branch's remote-tracking ref never appeared. git treats
+            // this as a successful "empty clone" — HEAD stays unborn at the
+            // remote's default branch (set up by init to CLONE_UNBORN_BRANCH and
+            // re-pointed below), the branch upstream config is still written, and
+            // no worktree checkout happens. A missing branch with a *non*-empty
+            // remote is still a real error (`-b <missing>`).
+            if fetch_outcome.ref_updates.is_empty() {
+                // Point HEAD at the remote's default branch so an empty clone of a
+                // repo whose HEAD is `refs/heads/<x>` lands on `<x>` unborn.
+                let head_branch_ref =
+                    format!("refs/heads/{}", request.options.remote_head_branch);
+                let mut tx = store.transaction();
+                tx.update(RefUpdate {
+                    name: "HEAD".into(),
+                    expected: None,
+                    new: RefTarget::Symbolic(head_branch_ref),
+                    reflog: None,
+                });
+                tx.commit()?;
+                // Still write the branch upstream config (git's empty clone keeps
+                // `[branch "<head>"]`), but there is no worktree to check out.
+                (services.configure_branch)(&git_dir, request.options.remote_head_branch)?;
+                return Ok(CloneOutcome {
+                    git_dir,
+                    branch_oid: None,
+                    empty: true,
+                });
+            }
             return Err(GitError::reference_not_found(format!(
                 "remote ref {remote_branch_ref}"
             )));
@@ -296,7 +332,8 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 
     Ok(CloneOutcome {
         git_dir,
-        branch_oid,
+        branch_oid: Some(branch_oid),
+        empty: false,
     })
 }
 

@@ -843,7 +843,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         },
     )?;
     let git_dir = outcome.git_dir;
-    if !checkout {
+    if outcome.empty {
+        // git prints this after the (no-op) fetch and before "done.", and skips
+        // the worktree checkout for an empty clone.
+        eprintln!("warning: You appear to have cloned an empty repository.");
+    } else if !checkout {
         remove_clone_worktree_files(&destination, &git_dir, format)?;
     } else if sparse {
         apply_clone_sparse_checkout(&destination, &git_dir, format)?;
@@ -1037,7 +1041,9 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
     let git_dir = outcome.git_dir;
 
-    if !options.checkout {
+    if outcome.empty {
+        eprintln!("warning: You appear to have cloned an empty repository.");
+    } else if !options.checkout {
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse {
         apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
@@ -1203,7 +1209,9 @@ fn clone_network_repository(
     let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
     let git_dir = outcome.git_dir;
 
-    if !options.checkout {
+    if outcome.empty {
+        eprintln!("warning: You appear to have cloned an empty repository.");
+    } else if !options.checkout {
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse {
         apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
