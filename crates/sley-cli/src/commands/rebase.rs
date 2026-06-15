@@ -1062,7 +1062,9 @@ fn is_linear_history(
         }
         let record = read_rev_list_commit_record(db, format, current)?;
         if record.parents.len() != 1 {
-            return Ok(record.parents.is_empty() && false);
+            // Reached a root (0 parents) without finding `from`, or a merge
+            // (>1 parents) — either way the history to `from` is not linear.
+            return Ok(false);
         }
         current = record.parents[0];
     }
