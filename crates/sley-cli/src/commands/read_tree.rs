@@ -62,6 +62,11 @@ struct StagedEntry {
     mode: u32,
     oid: ObjectId,
     stage: u8,
+    /// git's `ce_stat_data` for this entry: carried forward from the source
+    /// index on a kept entry, or filled from the post-write `lstat` after a
+    /// `-u` worktree apply. `None` serializes as an all-zero stat (a fresh /
+    /// not-yet-refreshed entry, which `diff-files` treats as racily clean).
+    stat: Option<sley_unpack_trees::StatInfo>,
 }
 
 pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
@@ -94,7 +99,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             // `--reset` accepts up to three trees but only the resulting union
             // matters; higher-stage entries are simply dropped (we never create
             // them here). With `-u` the worktree is updated to match.
-            let entries = read_tree_overlay(db, format, &tree_oids)?;
+            let mut entries = read_tree_overlay(db, format, &tree_oids)?;
             if parsed.update_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 reset_worktree_to_entries(
@@ -103,13 +108,13 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     format,
                     db,
                     repo.config(),
-                    &entries,
+                    &mut entries,
                 )?;
             }
             write_paired_entries(git_dir, format, entries)?;
         }
         ReadTreeMode::Prefix(prefix) => {
-            let entries = read_tree_prefix(git_dir, format, db, &tree_oids, prefix)?;
+            let mut entries = read_tree_prefix(git_dir, format, db, &tree_oids, prefix)?;
             if parsed.update_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 update_worktree_for_entries(
@@ -118,7 +123,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     format,
                     db,
                     repo.config(),
-                    &entries,
+                    &mut entries,
                 )?;
             }
             write_paired_entries(git_dir, format, entries)?;
@@ -400,6 +405,44 @@ fn current_index_stage0(git_dir: &Path, format: ObjectFormat) -> Result<LeafMap>
     Ok(out)
 }
 
+/// git's `ce_stat_data` for a parsed on-disk index entry: the cached `lstat`
+/// fields the merge must carry forward so a kept entry stays `diff-files`-clean.
+fn stat_info_from_index_entry(entry: &IndexEntry) -> sley_unpack_trees::StatInfo {
+    sley_unpack_trees::StatInfo {
+        ctime_seconds: entry.ctime_seconds,
+        ctime_nanoseconds: entry.ctime_nanoseconds,
+        mtime_seconds: entry.mtime_seconds,
+        mtime_nanoseconds: entry.mtime_nanoseconds,
+        dev: entry.dev,
+        ino: entry.ino,
+        uid: entry.uid,
+        gid: entry.gid,
+        size: entry.size,
+    }
+}
+
+/// Read the current on-disk index's stage-0 entries into the engine's
+/// [`sley_unpack_trees::FlatIndex`] — path → `(mode, oid, cached stat)` — so a
+/// `read-tree -m` carries each kept entry's `lstat` info forward. A missing
+/// index yields an empty map.
+fn current_index_flat(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<sley_unpack_trees::FlatIndex> {
+    let mut out = sley_unpack_trees::FlatIndex::new();
+    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
+        for entry in &index.entries {
+            if entry_stage(entry) == 0 {
+                out.insert(
+                    entry.path.as_bytes().to_vec(),
+                    (entry.mode, entry.oid, Some(stat_info_from_index_entry(entry))),
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Extract the merge stage (0-3) encoded in bits 12-13 of an index entry's
 /// `flags` field.
 fn entry_stage(entry: &IndexEntry) -> u8 {
@@ -460,7 +503,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         &self,
         path: &[u8],
         _merge: &sley_unpack_trees::CacheEntry,
-        _reset: sley_unpack_trees::ResetType,
+        reset: sley_unpack_trees::ResetType,
     ) -> Result<()> {
         // git's `verify_absent(ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN)`: a brand
         // new path must not write over an untracked file. A path already in the
@@ -468,19 +511,28 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         if self.original_paths.contains(path) {
             return Ok(());
         }
+        // `--reset` (OverwriteUntracked) authorizes clobbering anything in the
+        // way (git's `o->reset == UNPACK_RESET_OVERWRITE_UNTRACKED` early return).
+        if matches!(reset, sley_unpack_trees::ResetType::OverwriteUntracked) {
+            return Ok(());
+        }
         let Some(file_path) = safe_worktree_path(&self.worktree_root, path) else {
             return Ok(());
         };
-        if let Ok(metadata) = fs::symlink_metadata(&file_path)
-            && metadata.is_file()
-        {
-            let display = String::from_utf8_lossy(path);
-            eprintln!(
-                "error: Untracked working tree file '{display}' would be overwritten by merge."
-            );
-            return Err(GitError::Exit(128));
+        let Ok(metadata) = fs::symlink_metadata(&file_path) else {
+            return Ok(());
+        };
+        // git's `check_ok_to_remove`: a directory in the way (the D/F dir→file
+        // transition) is checked by `verify_clean_subdirectory` — it is only OK
+        // to replace when nothing untracked-and-not-ignored lives under it, and
+        // every tracked file under it is itself up to date. The writer then
+        // removes the subtree.
+        if metadata.is_dir() {
+            return self.verify_clean_subdirectory(path, &file_path);
         }
-        Ok(())
+        let display = String::from_utf8_lossy(path);
+        eprintln!("error: Untracked working tree file '{display}' would be overwritten by merge.");
+        Err(GitError::Exit(128))
     }
 
     fn verify_absent_remove(
@@ -552,6 +604,52 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
     }
 }
 
+impl ReadTreeWorktree<'_> {
+    /// git's `verify_clean_subdirectory`: a directory occupies `path` where the
+    /// merge wants to write a file (the D/F dir→file transition). It is safe to
+    /// replace only when the directory holds nothing we would lose — concretely,
+    /// no **untracked** file (one absent from the pre-merge index). Every file
+    /// under it that *is* tracked is already accounted for by the merge result
+    /// (it will be removed or rewritten), so it does not block the replacement.
+    ///
+    /// On a clean subdirectory the writer's `remove_subtree` clears it before the
+    /// file is written; on an unclean one this rejects with git's
+    /// `ERROR_NOT_UPTODATE_DIR` exit so no untracked work is silently destroyed.
+    fn verify_clean_subdirectory(&self, dir_git_path: &[u8], dir_fs_path: &Path) -> Result<()> {
+        let mut stack = vec![(dir_fs_path.to_path_buf(), dir_git_path.to_vec())];
+        while let Some((fs_dir, git_dir)) = stack.pop() {
+            let read = match fs::read_dir(&fs_dir) {
+                Ok(read) => read,
+                // A vanished directory is, trivially, clean.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            for entry in read {
+                let entry = entry?;
+                let name = entry.file_name();
+                let mut child_git = git_dir.clone();
+                child_git.push(b'/');
+                child_git.extend_from_slice(name.as_encoded_bytes());
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    stack.push((entry.path(), child_git));
+                    continue;
+                }
+                // A tracked path (present in the pre-merge index at any stage) is
+                // owned by the merge; an untracked one would be lost → reject.
+                if !self.original_paths.contains(&child_git) {
+                    let display = String::from_utf8_lossy(dir_git_path);
+                    eprintln!(
+                        "error: Updating '{display}' would lose untracked files in it"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Map a [`sley_submodule::MoveHeadVerdict`] to read-tree's exit semantics:
 /// `Ok` → proceed, `WouldLose` → git's `ERROR_WOULD_LOSE_SUBMODULE`
 /// (`Cannot update submodule:\n%s`, naming the path) with exit 128.
@@ -569,7 +667,12 @@ fn move_head_verdict_to_result(
 }
 
 impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
-    fn write_blob(&mut self, path: &[u8], _mode: u32, oid: &ObjectId) -> Result<()> {
+    fn write_blob(
+        &mut self,
+        path: &[u8],
+        mode: u32,
+        oid: &ObjectId,
+    ) -> Result<Option<sley_unpack_trees::StatInfo>> {
         write_blob_to_worktree(
             &self.worktree_root,
             &self.git_dir,
@@ -577,6 +680,7 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
             self.db,
             &self.repo_config,
             path,
+            mode,
             oid,
         )
     }
@@ -616,7 +720,7 @@ fn merge_trees(
         }
     };
 
-    let index = current_index_stage0(git_dir, format)?;
+    let index = current_index_flat(git_dir, format)?;
     let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
         .iter()
         .map(|oid| tree_leaf_map(db, format, oid))
@@ -625,6 +729,13 @@ fn merge_trees(
     let mut opts = UnpackTreesOptions::new(format);
     opts.merge = true;
     opts.update = update_worktree;
+    // git's read-tree: `o.initial_checkout = is_index_unborn(o->src_index)` — an
+    // empty (unborn) index means there is no staged deletion to honour, so
+    // twoway_merge must take a path from the new tree (`merged_entry`) rather
+    // than its "deletion of the path was staged" arm dropping it. Almost every
+    // t1001/t1002 test does `rm .git/index && read-tree -m`, so this gate is what
+    // makes the post-reset merge populate the index at all.
+    opts.initial_checkout = index.is_empty();
     // `read-tree -m` is index-only unless `-u` is given; the engine's worktree
     // safety checks (verify_uptodate / verify_absent) only run when not
     // index-only, matching upstream where `-m` without `-u` still runs the
@@ -644,10 +755,13 @@ fn merge_trees(
         original_paths: original_index_paths(git_dir, format)?,
     };
 
-    let result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
+    let mut result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
 
     if update_worktree {
-        check_updates(&result, &opts, &mut wt)?;
+        // check_updates folds the post-write `lstat` back into `result.entries`
+        // (git's refresh_cache), so the serialized index records real stat-info
+        // for every freshly-written path.
+        check_updates(&mut result, &opts, &mut wt)?;
     }
 
     Ok(result
@@ -660,6 +774,7 @@ fn merge_trees(
                     mode: e.entry.mode,
                     oid: e.entry.oid,
                     stage: e.entry.stage,
+                    stat: e.entry.stat,
                 },
             )
         })
@@ -770,12 +885,15 @@ fn submodule_has_dirty_index(sub_root: &Path) -> bool {
     }
 }
 
-/// Construct a stage-0 [`StagedEntry`].
+/// Construct a stage-0 [`StagedEntry`] with no cached stat (the overlay /
+/// `--prefix` paths build the index purely from tree contents, so no worktree
+/// stat is available; git's `read-tree` without `-m` writes a zeroed stat too).
 fn stage0(mode: u32, oid: ObjectId) -> StagedEntry {
     StagedEntry {
         mode,
         oid,
         stage: 0,
+        stat: None,
     }
 }
 
@@ -854,20 +972,26 @@ fn write_paired_entries(
 
 /// Convert a `(path, StagedEntry)` into a writable [`IndexEntry`], encoding the
 /// stage into bits 12-13 of `flags` and the path length into the low 12 bits.
+///
+/// When the entry carries cached stat info (a kept entry, or one refreshed by
+/// the `-u` apply), it is written into the entry's `ce_stat_data` fields so a
+/// follow-up `diff-files` reports the correct clean/dirty verdict; otherwise
+/// the stat fields stay zeroed (git's all-zero "needs refresh" state).
 fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
     let name_len = path.len().min(0x0fff) as u16;
     let stage_bits = ((entry.stage as u16) & 0x3) << 12;
+    let stat = entry.stat.unwrap_or_default();
     Ok(IndexEntry {
-        ctime_seconds: 0,
-        ctime_nanoseconds: 0,
-        mtime_seconds: 0,
-        mtime_nanoseconds: 0,
-        dev: 0,
-        ino: 0,
+        ctime_seconds: stat.ctime_seconds,
+        ctime_nanoseconds: stat.ctime_nanoseconds,
+        mtime_seconds: stat.mtime_seconds,
+        mtime_nanoseconds: stat.mtime_nanoseconds,
+        dev: stat.dev,
+        ino: stat.ino,
         mode: entry.mode,
-        uid: 0,
-        gid: 0,
-        size: 0,
+        uid: stat.uid,
+        gid: stat.gid,
+        size: stat.size,
         oid: entry.oid,
         flags: name_len | stage_bits,
         flags_extended: 0,
@@ -893,37 +1017,50 @@ fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>)
 /// Materialize newly-introduced blobs into the working tree (used by
 /// `--prefix -u`): only stage-0 paths whose `(mode, oid)` differ from the prior
 /// index entry are written, so unrelated locally-modified files the prefix read
-/// merely carried over are left untouched. Nothing is removed.
+/// merely carried over are left untouched. Nothing is removed. The post-write
+/// `lstat` is folded back into each written entry's `stat` so the serialized
+/// index records real stat-info (git's `refresh_cache`).
 fn update_worktree_for_entries(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     config: &GitConfig,
-    entries: &[(Vec<u8>, StagedEntry)],
+    entries: &mut [(Vec<u8>, StagedEntry)],
 ) -> Result<()> {
     let original = current_index_stage0(git_dir, format)?;
-    for (path, entry) in worktree_write_order(entries) {
-        if entry.stage != 0 {
-            continue;
+    let mut written: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>> = BTreeMap::new();
+    // Borrow-split: pick write order from a read-only view, then mutate by path.
+    let plan: Vec<(Vec<u8>, u32, ObjectId)> = worktree_write_order(entries)
+        .into_iter()
+        .filter(|(_, entry)| entry.stage == 0)
+        .filter(|(path, entry)| original.get(*path) != Some(&(entry.mode, entry.oid)))
+        .map(|(path, entry)| (path.clone(), entry.mode, entry.oid))
+        .collect();
+    for (path, mode, oid) in plan {
+        let stat = write_blob_to_worktree(worktree_root, git_dir, format, db, config, &path, mode, &oid)?;
+        written.insert(path, stat);
+    }
+    for (path, entry) in entries.iter_mut() {
+        if let Some(stat) = written.get(path) {
+            entry.stat = *stat;
         }
-        if original.get(path) == Some(&(entry.mode, entry.oid)) {
-            continue;
-        }
-        write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, &entry.oid)?;
     }
     Ok(())
 }
 
 /// Reset the working tree to exactly the given stage-0 entries (`--reset -u`):
-/// remove tracked files no longer present, then write each entry's blob.
+/// remove tracked files no longer present, then write each entry's blob,
+/// folding the post-write `lstat` back into the entry's `stat` so the serialized
+/// index is stat-accurate (git's `refresh_cache`, satisfying a follow-up
+/// `diff-files`/`check_cache_at` "is it dirty?" query).
 fn reset_worktree_to_entries(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     config: &GitConfig,
-    entries: &[(Vec<u8>, StagedEntry)],
+    entries: &mut [(Vec<u8>, StagedEntry)],
 ) -> Result<()> {
     let target: BTreeSet<&Vec<u8>> = entries.iter().map(|(path, _)| path).collect();
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
@@ -933,8 +1070,19 @@ fn reset_worktree_to_entries(
             }
         }
     }
-    for (path, entry) in worktree_write_order(entries) {
-        write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, &entry.oid)?;
+    let plan: Vec<(Vec<u8>, u32, ObjectId)> = worktree_write_order(entries)
+        .into_iter()
+        .map(|(path, entry)| (path.clone(), entry.mode, entry.oid))
+        .collect();
+    let mut written: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>> = BTreeMap::new();
+    for (path, mode, oid) in plan {
+        let stat = write_blob_to_worktree(worktree_root, git_dir, format, db, config, &path, mode, &oid)?;
+        written.insert(path, stat);
+    }
+    for (path, entry) in entries.iter_mut() {
+        if let Some(stat) = written.get(path) {
+            entry.stat = *stat;
+        }
     }
     Ok(())
 }
@@ -970,9 +1118,28 @@ fn attribute_priority_key(path: &[u8]) -> (Vec<u8>, u8, Vec<u8>) {
     (dir, is_not_attributes, base.to_vec())
 }
 
-/// Write a single blob from the object database to `path` under `worktree_root`,
-/// applying the smudge filter (EOL conversion + `filter.<name>.smudge`) so the
-/// materialized bytes match `git checkout`. Non-blob targets are rejected.
+/// Write a single tree entry from the object database to `path` under
+/// `worktree_root`, returning the post-write `lstat` info git records back into
+/// the index entry (its `ce_stat_data`).
+///
+/// This is git's `checkout_entry` with `state.force = 1, refresh_cache = 1`:
+///
+/// * **D/F replacement.** Whatever is already at `path` — a regular file, a
+///   symlink, or a whole **directory subtree** (the dir→file transition) — is
+///   removed first. A gitlink (mode 160000) leaves an existing directory alone.
+/// * **Leading directories.** Each missing parent component is created; a
+///   non-directory in the way of a needed component is unlinked first (git's
+///   `create_directories`, the file→dir transition).
+/// * **Type by mode.** `0o120000` is written as a **symlink** whose target is
+///   the (raw, unfiltered) blob bytes; `0o160000` (gitlink) is a directory that
+///   the submodule machinery populates; everything else is a regular file with
+///   the executable bit set iff the mode is `0o100755`. Regular-file content
+///   goes through the smudge filter (EOL + `filter.<name>.smudge`) so the
+///   materialized bytes match `git checkout`; symlink targets are opaque.
+/// * **Stat-back.** The written path is `lstat`'d and its [`StatInfo`] returned
+///   so [`check_updates`] folds it into the index entry — the size + mtime the
+///   racy-clean machinery (`worktree_entry_is_uptodate`) keys on to keep a
+///   freshly-checked-out file reported clean.
 fn write_blob_to_worktree(
     worktree_root: &Path,
     git_dir: &Path,
@@ -980,14 +1147,26 @@ fn write_blob_to_worktree(
     db: &FileObjectDatabase,
     config: &GitConfig,
     path: &[u8],
+    mode: u32,
     oid: &ObjectId,
-) -> Result<()> {
+) -> Result<Option<sley_unpack_trees::StatInfo>> {
     let Some(file_path) = safe_worktree_path(worktree_root, path) else {
         return Err(GitError::InvalidPath(format!(
             "invalid worktree path {}",
             String::from_utf8_lossy(path)
         )));
     };
+
+    // A gitlink is a directory git leaves to the submodule move-head machinery;
+    // it never reads an object here. Ensure the directory exists (an
+    // already-populated submodule is left untouched) and record a zeroed stat,
+    // exactly as git's `write_entry` S_IFGITLINK arm and `materialize_tree_entry`.
+    if (mode & 0o170000) == 0o160000 {
+        create_leading_directories(worktree_root, &file_path)?;
+        fs::create_dir_all(&file_path)?;
+        return Ok(None);
+    }
+
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
@@ -995,23 +1174,138 @@ fn write_blob_to_worktree(
             object.object_type.as_str()
         )));
     }
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
+
+    // git's `write_entry` first removes whatever is in the way: a directory
+    // subtree (D/F dir→file), or any file/symlink. `force` is always set here.
+    remove_path_in_the_way(&file_path)?;
+    // Create leading directories, unlinking a non-dir in the way of a needed
+    // component (git's `create_directories`, the file→dir transition).
+    create_leading_directories(worktree_root, &file_path)?;
+
+    if (mode & 0o170000) == 0o120000 {
+        // Symlink: the blob bytes are the link target, opaque to clean/smudge.
+        use std::os::unix::ffi::OsStringExt;
+        let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(object.body.clone()));
+        std::os::unix::fs::symlink(&target, &file_path)?;
+    } else {
+        let body = sley_worktree::apply_smudge_filter(
+            worktree_root,
+            git_dir,
+            format,
+            config,
+            path,
+            &object.body,
+        )?;
+        fs::write(&file_path, &body)?;
+        // Executable bit: 0o100755 → +x, 0o100644 → plain. git only honours the
+        // user-execute bit when deciding the index mode, so set/clear it here.
+        if (mode & 0o170000) == 0o100000 {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::symlink_metadata(&file_path)?.permissions();
+            let mut bits = perms.mode();
+            if mode & 0o111 != 0 {
+                bits |= 0o111;
+            } else {
+                bits &= !0o111;
+            }
+            fs::set_permissions(&file_path, fs::Permissions::from_mode(bits))?;
+        }
     }
-    let body =
-        sley_worktree::apply_smudge_filter(worktree_root, git_dir, format, config, path, &object.body)?;
-    fs::write(&file_path, &body)?;
+
+    Ok(Some(stat_info_from_lstat(&file_path)?))
+}
+
+/// git's `fill_stat_cache_info`/`fill_stat_data`: `lstat` the just-written path
+/// and project its fields into the engine's [`sley_unpack_trees::StatInfo`].
+/// `size` is the **on-disk** byte length (so it equals `metadata.len()`, which
+/// sley's `worktree_entry_is_uptodate` compares directly), and mtime is the
+/// file's real mtime so the racy-clean shortcut can prove the path unchanged.
+fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::symlink_metadata(file_path)?;
+    Ok(sley_unpack_trees::StatInfo {
+        ctime_seconds: md.ctime().clamp(0, u32::MAX as i64) as u32,
+        ctime_nanoseconds: (md.ctime_nsec().max(0)) as u32,
+        mtime_seconds: md.mtime().clamp(0, u32::MAX as i64) as u32,
+        mtime_nanoseconds: (md.mtime_nsec().max(0)) as u32,
+        dev: md.dev() as u32,
+        ino: md.ino() as u32,
+        uid: md.uid(),
+        gid: md.gid(),
+        size: md.len().min(u32::MAX as u64) as u32,
+    })
+}
+
+/// git's `write_entry` D/F-removal preamble: remove whatever currently occupies
+/// `file_path` so a write can proceed. A directory is removed recursively (the
+/// dir→file transition, git's `remove_subtree`); a file or symlink is unlinked.
+/// An absent path is a no-op.
+fn remove_path_in_the_way(file_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(file_path) {
+        Ok(md) if md.is_dir() => {
+            fs::remove_dir_all(file_path)?;
+        }
+        Ok(_) => {
+            fs::remove_file(file_path)?;
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
     Ok(())
 }
 
-/// Remove a working-tree file and prune any directories left empty, ignoring an
-/// already-absent target.
+/// git's `create_directories`: create every leading directory of `file_path`
+/// up from (and excluding) `worktree_root`, unlinking a non-directory in the way
+/// of a needed component (the file→dir transition). `fs::create_dir_all` handles
+/// the common all-missing case; the per-component fallback handles a regular
+/// file or symlink sitting where a directory must be.
+fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<()> {
+    let Some(parent) = file_path.parent() else {
+        return Ok(());
+    };
+    match fs::create_dir_all(parent) {
+        Ok(()) => return Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        // A non-directory in the way yields NotADirectory / other errors; fall
+        // through to the component-by-component repair below.
+        Err(_) => {}
+    }
+    // Walk each leading component; where a non-dir blocks a needed directory,
+    // unlink it and retry (git's `mkdir → EEXIST && force → unlink → mkdir`).
+    let mut cur = worktree_root.to_path_buf();
+    let rel = parent.strip_prefix(worktree_root).unwrap_or(parent);
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        cur.push(name);
+        match fs::symlink_metadata(&cur) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                fs::remove_file(&cur)?;
+                fs::create_dir(&cur)?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&cur)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+/// git's `unlink_entry`: remove a working-tree path and prune now-empty leading
+/// directories, ignoring an already-absent target. A directory occupying the
+/// path (a leftover from a prior file→dir transition, or a populated gitlink
+/// being removed) is removed recursively — git's `remove_or_warn` honours the
+/// directory mode.
 fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
     let Some(file_path) = safe_worktree_path(worktree_root, path) else {
         return Ok(());
     };
-    match fs::remove_file(&file_path) {
-        Ok(()) => {}
+    match fs::symlink_metadata(&file_path) {
+        Ok(md) if md.is_dir() => fs::remove_dir_all(&file_path)?,
+        Ok(_) => fs::remove_file(&file_path)?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     }

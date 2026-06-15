@@ -45,6 +45,47 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::BTreeMap;
 
+/// git's `struct stat_data`: the `lstat`-derived fields the index caches so the
+/// "is this path dirty / up-to-date / racy-clean" machinery (`ce_match_stat`,
+/// `diff-files`, refresh) can answer without re-hashing the worktree blob.
+///
+/// These are exactly the keys git stores per cache entry (`fill_stat_data`):
+/// ctime/mtime split into seconds + nanoseconds, the device + inode, owner
+/// uid/gid, and the file size. The engine never produces these itself (it does
+/// no I/O); the consumer's [`WorktreeWriter`] fills them from a real `lstat`
+/// after writing a file, and the input index carries the previously-recorded
+/// values forward on a kept entry. `size` is git's *munged* size
+/// (`munge_st_size`): a non-zero file whose low 32 bits are zero is stored as
+/// `0x8000_0000` so it isn't mistaken for the racy-smudged "size 0" sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatInfo {
+    pub ctime_seconds: u32,
+    pub ctime_nanoseconds: u32,
+    pub mtime_seconds: u32,
+    pub mtime_nanoseconds: u32,
+    pub dev: u32,
+    pub ino: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// git's munged size (see [`StatInfo::munge_size`]).
+    pub size: u32,
+}
+
+impl StatInfo {
+    /// git's `munge_st_size`: a file whose size is a non-zero exact multiple of
+    /// 4 GiB (so its low 32 bits are zero) is stored as `0x8000_0000` rather
+    /// than `0`, so it is not mistaken for the racy-smudged "size 0" marker
+    /// that forces a content re-check. Truncates to 32 bits otherwise.
+    pub fn munge_size(size: u64) -> u32 {
+        let truncated = size as u32;
+        if truncated == 0 && size != 0 {
+            0x8000_0000
+        } else {
+            truncated
+        }
+    }
+}
+
 /// The merge-relevant slice of git's `struct cache_entry`.
 ///
 /// `mode` is the raw git file mode (`0o100644`, `0o100755`, `0o120000`,
@@ -52,27 +93,54 @@ use std::collections::BTreeMap;
 /// for base/ours/theirs conflict stages). An *absent* path is represented by
 /// `None` rather than a sentinel entry, matching how the merge functions take
 /// `const struct cache_entry *` arguments that may be `NULL`.
+///
+/// `stat` carries git's `ce_stat_data` for an entry kept from the source index
+/// (so a carry-forward entry round-trips its cached `lstat` info and
+/// `diff-files` keeps reporting the right clean/dirty verdict). It is `None`
+/// for entries sourced from a tree (a tree has no worktree stat) and for any
+/// entry the apply phase is about to (re)write — [`check_updates`] re-fills it
+/// from the post-write `lstat`, exactly as git's `check_updates` sets
+/// `refresh_cache` so `checkout_entry` calls `fill_stat_cache_info`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheEntry {
     pub mode: u32,
     pub oid: ObjectId,
     /// Merge stage 0-3.
     pub stage: u8,
+    /// git's `ce_stat_data`, carried forward from the source index on a kept
+    /// entry. `None` when sourced from a tree or pending a worktree write.
+    pub stat: Option<StatInfo>,
 }
 
 impl CacheEntry {
-    /// A stage-0 (resolved) entry.
+    /// A stage-0 (resolved) entry with no cached stat info.
     pub fn stage0(mode: u32, oid: ObjectId) -> Self {
         Self {
             mode,
             oid,
             stage: 0,
+            stat: None,
+        }
+    }
+
+    /// A stage-0 (resolved) entry carrying the source index's cached stat info.
+    pub fn stage0_with_stat(mode: u32, oid: ObjectId, stat: Option<StatInfo>) -> Self {
+        Self {
+            mode,
+            oid,
+            stage: 0,
+            stat,
         }
     }
 
     /// An entry at an explicit conflict stage (1=base, 2=ours, 3=theirs).
     pub fn staged(mode: u32, oid: ObjectId, stage: u8) -> Self {
-        Self { mode, oid, stage }
+        Self {
+            mode,
+            oid,
+            stage,
+            stat: None,
+        }
     }
 }
 
@@ -247,9 +315,30 @@ pub enum WorktreeAction {
 /// write a blob and how to remove a path; [`check_updates`] sequences the calls
 /// the way git's `check_updates` does (removals first, then writes).
 pub trait WorktreeWriter {
-    /// Materialize `oid` (a blob) at `path` with `mode`.
-    fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId) -> Result<()>;
+    /// Materialize `oid` at `path` with `mode`, returning the post-write
+    /// `lstat` data git records back into the index entry.
+    ///
+    /// This is git's `checkout_entry` with `state.force = 1` and
+    /// `state.refresh_cache = 1`: the implementation must
+    ///
+    /// * remove anything already at `path` that is in the way — a regular file,
+    ///   a symlink, **or a whole directory subtree** (the D/F case where a path
+    ///   that was a directory is being replaced by a file);
+    /// * create any leading directories, removing a file in the way of a needed
+    ///   directory component (git's `create_directories`);
+    /// * write the content as the right *type* for `mode` — a regular file for
+    ///   `0o100644`/`0o100755`, a **symlink** whose target is the blob bytes for
+    ///   `0o120000`;
+    /// * `lstat` the result and return its [`StatInfo`] so [`check_updates`] can
+    ///   store it back into the entry (git's `fill_stat_cache_info`).
+    ///
+    /// Returning `Ok(None)` means "no stat available" (e.g. the platform could
+    /// not `lstat` the written path); the entry then keeps an all-zero stat,
+    /// which git treats as "needs a refresh / racily clean".
+    fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId)
+    -> Result<Option<StatInfo>>;
     /// Remove `path` from the working tree (idempotent on an absent target).
+    /// This is git's `unlink_entry`.
     fn remove_path(&mut self, path: &[u8]) -> Result<()>;
 }
 
@@ -632,8 +721,11 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
     let mut update = true; // CE_UPDATE
     // git's `do_add_entry(o, merge, update, CE_STAGEMASK)` clears the stage:
     // a merged entry always lands at stage 0, regardless of which slot it came
-    // from.
-    let merge = CacheEntry::stage0(ce.mode, ce.oid);
+    // from. A freshly-merged entry starts with no cached stat (it will be
+    // filled by the apply phase's post-write `lstat`); the `same(old)` branch
+    // below copies the old entry's stat over, mirroring git's
+    // `copy_cache_entry(merge, old)`.
+    let mut merge = CacheEntry::stage0(ce.mode, ce.oid);
 
     match old {
         None => {
@@ -653,9 +745,12 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
         }
         Some(old) => {
             // Re-use the old entry directly when identical (keeps stat info and
-            // drops CE_UPDATE so we don't overwrite local changes).
+            // drops CE_UPDATE so we don't overwrite local changes). git's
+            // `copy_cache_entry(merge, old)`: carry the old cached `lstat` over
+            // so a no-op merge leaves `diff-files` reporting the path clean.
             if same(Some(old), Some(&merge)) {
                 update = false;
+                merge.stat = old.stat;
             } else if opts.merge && !opts.index_only {
                 probe.verify_uptodate(path, old)?;
             }
@@ -750,12 +845,22 @@ impl MergeFn {
 
 /// A flattened tree: path → (mode, oid). This is exactly the shape
 /// `sley_diff_merge::flatten_tree` returns, so a consumer feeds those straight
-/// in.
+/// in. A tree leaf has no worktree stat, so the engine seeds tree-sourced
+/// entries with no [`StatInfo`].
 pub type FlatTree = BTreeMap<Vec<u8>, (u32, ObjectId)>;
 
-/// The current index as a flat stage-0 map: path → (mode, oid). Consumers build
-/// this from the on-disk index's stage-0 entries.
-pub type FlatIndex = BTreeMap<Vec<u8>, (u32, ObjectId)>;
+/// One stage-0 entry of the current index as the engine consumes it:
+/// `(mode, oid, cached lstat info)`. The stat is what `git update-index` /
+/// the previous checkout recorded; the engine carries it forward on a kept
+/// entry so `diff-files` keeps reporting the right clean/dirty verdict, and the
+/// apply phase re-fills it on a (re)written entry. `None` for a fresh
+/// `intent-to-add`-style entry whose stat git stores as all-zero.
+pub type IndexInputEntry = (u32, ObjectId, Option<StatInfo>);
+
+/// The current index as a flat stage-0 map: path → `(mode, oid, stat)`.
+/// Consumers build this from the on-disk index's stage-0 entries, carrying
+/// each entry's cached `lstat` data so the merge preserves it.
+pub type FlatIndex = BTreeMap<Vec<u8>, IndexInputEntry>;
 
 /// Run git's `unpack_trees`: walk the union of paths across `index` and the
 /// supplied `trees`, dispatch each path's source slice to `merge_fn`, and
@@ -812,7 +917,7 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         // `merged_entry` clears the stage to 0 (git's `CE_STAGEMASK`).
         src[0] = index
             .get(path)
-            .map(|(mode, oid)| CacheEntry::stage0(*mode, *oid));
+            .map(|(mode, oid, stat)| CacheEntry::stage0_with_stat(*mode, *oid, *stat));
         for (i, tree) in trees.iter().enumerate() {
             let stage = (i + 1) as u8;
             src[i + 1] = tree
@@ -842,24 +947,39 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     })
 }
 
-/// git's `check_updates`: apply the merge result to the working tree. Removals
-/// run first (a path replaced by a blob in a subdir is unlinked before the
-/// directory is created), then `CE_UPDATE` entries are materialized. A no-op
-/// when `!opts.update || opts.index_only`.
+/// git's `check_updates`: apply the merge result to the working tree, then
+/// fold the post-write `lstat` data back into the result entries so the
+/// consumer serializes a stat-accurate index (git's `state.refresh_cache = 1`).
+///
+/// Ordering mirrors upstream exactly: every `CE_WT_REMOVE` path is unlinked
+/// first (so a path that was a file is gone before a sibling directory is
+/// created, and a directory being collapsed into a file is cleared), then each
+/// `CE_UPDATE` entry is written. The [`WorktreeWriter`] owns the per-path D/F
+/// removal, leading-directory creation, and symlink-vs-regular-file choice; it
+/// returns the written file's [`StatInfo`], which is stored into the matching
+/// entry here.
+///
+/// A no-op (other than the early return) when `!opts.update || opts.index_only`.
 pub fn check_updates<W: WorktreeWriter>(
-    result: &UnpackTreesResult,
+    result: &mut UnpackTreesResult,
     opts: &UnpackTreesOptions,
     writer: &mut W,
 ) -> Result<()> {
     if !opts.update || opts.index_only {
         return Ok(());
     }
+    // Removals before writes: git unlinks every CE_WT_REMOVE entry, then
+    // checks out the CE_UPDATE entries (so a file→dir or dir→file transition
+    // never collides with a stale path).
     for path in &result.removed_paths {
         writer.remove_path(path)?;
     }
-    for entry in &result.entries {
+    for entry in &mut result.entries {
         if entry.wt_update && entry.entry.stage == 0 {
-            writer.write_blob(&entry.path, entry.entry.mode, &entry.entry.oid)?;
+            let stat = writer.write_blob(&entry.path, entry.entry.mode, &entry.entry.oid)?;
+            // git's fill_stat_cache_info: stamp the freshly-written file's
+            // lstat onto the entry so a follow-up diff-files reports it clean.
+            entry.entry.stat = stat;
         }
     }
     Ok(())
@@ -880,13 +1000,182 @@ mod tests {
             .collect()
     }
 
+    /// A `FlatIndex` (path → `(mode, oid, stat)`) with no cached stat info, the
+    /// shape the engine sees for a stat-less / freshly-built index input.
+    fn idx(items: &[(&[u8], u8)]) -> FlatIndex {
+        items
+            .iter()
+            .map(|(p, b)| (p.to_vec(), (0o100644u32, oid(*b), None)))
+            .collect()
+    }
+
+    /// A `FlatIndex` whose single entry carries an explicit [`StatInfo`], used
+    /// to assert the merge carries cached stat through a kept entry.
+    fn idx_with_stat(path: &[u8], byte: u8, stat: StatInfo) -> FlatIndex {
+        [(path.to_vec(), (0o100644u32, oid(byte), Some(stat)))]
+            .into_iter()
+            .collect()
+    }
+
+    /// A non-zero sample stat, distinct enough to detect when it is preserved.
+    fn sample_stat() -> StatInfo {
+        StatInfo {
+            ctime_seconds: 111,
+            ctime_nanoseconds: 222,
+            mtime_seconds: 333,
+            mtime_nanoseconds: 444,
+            dev: 5,
+            ino: 6,
+            uid: 7,
+            gid: 8,
+            size: 9,
+        }
+    }
+
     fn opts() -> UnpackTreesOptions {
         UnpackTreesOptions::new(ObjectFormat::Sha1)
     }
 
+    /// A `WorktreeWriter` that records the order of `write_blob` / `remove_path`
+    /// calls and hands back a deterministic [`StatInfo`] per written path so the
+    /// stat-writeback can be asserted.
+    #[derive(Default)]
+    struct RecordingWriter {
+        ops: Vec<(Vec<u8>, &'static str)>,
+        /// `(mode, len)` per written path → used to synthesize a stat.
+        next_size: u32,
+    }
+
+    impl WorktreeWriter for RecordingWriter {
+        fn write_blob(
+            &mut self,
+            path: &[u8],
+            _mode: u32,
+            _oid: &ObjectId,
+        ) -> Result<Option<StatInfo>> {
+            self.ops.push((path.to_vec(), "write"));
+            self.next_size += 1;
+            Ok(Some(StatInfo {
+                size: self.next_size,
+                mtime_seconds: 1000 + self.next_size,
+                ..StatInfo::default()
+            }))
+        }
+        fn remove_path(&mut self, path: &[u8]) -> Result<()> {
+            self.ops.push((path.to_vec(), "remove"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn munge_size_matches_git() {
+        // Ordinary sizes truncate to their low 32 bits.
+        assert_eq!(StatInfo::munge_size(0), 0);
+        assert_eq!(StatInfo::munge_size(14), 14);
+        // A non-zero exact-4GiB multiple (low 32 bits zero) becomes 0x80000000
+        // so it isn't read as the racy-smudged "size 0" sentinel.
+        assert_eq!(StatInfo::munge_size(1u64 << 32), 0x8000_0000);
+        assert_eq!(StatInfo::munge_size(3u64 << 32), 0x8000_0000);
+        // A size whose low 32 bits are non-zero keeps them.
+        assert_eq!(StatInfo::munge_size((1u64 << 32) + 5), 5);
+    }
+
+    #[test]
+    fn identical_oneway_entry_carries_cached_stat() {
+        // index has `a`@1 with a real stat; tree has `a`@1 (identical) → the
+        // kept entry must carry the index's stat (git's oneway same() path).
+        let stat = sample_stat();
+        let index = idx_with_stat(b"a", 1, stat);
+        let tree = flat(&[(b"a", 1)]);
+        let res = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &NullWorktree)
+            .expect("oneway identical");
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(res.entries[0].entry.stat, Some(stat), "cached stat preserved");
+        assert!(!res.entries[0].wt_update, "identical entry is not rewritten");
+    }
+
+    #[test]
+    fn identical_merged_entry_carries_cached_stat() {
+        // twoway with current==new (an update that resolves to the same content)
+        // re-uses the old entry's stat via merged_entry's same() branch.
+        let stat = sample_stat();
+        // current=a@2 (with stat), oldtree=a@1, newtree=a@2 → merged_entry(new,
+        // current) sees same(old=current, merge=new) and copies the stat.
+        let index = idx_with_stat(b"a", 2, stat);
+        let oldtree = flat(&[(b"a", 1)]);
+        let newtree = flat(&[(b"a", 2)]);
+        let res = unpack_trees(
+            &index,
+            &[oldtree, newtree],
+            MergeFn::TwoWay,
+            &opts(),
+            &NullWorktree,
+        )
+        .expect("twoway same-as-new");
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(
+            res.entries[0].entry.stat,
+            Some(stat),
+            "stat carried when merged entry equals the old index entry"
+        );
+        assert!(!res.entries[0].wt_update);
+    }
+
+    #[test]
+    fn check_updates_orders_removals_before_writes_and_writes_back_stat() {
+        // oneway: index has `a`,`b`; tree has `b`(changed),`c` → `a` removed,
+        // `b` rewritten, `c` added. With -u, removals must run before writes and
+        // each written entry must get its post-write stat folded back.
+        let index = idx(&[(b"a", 1), (b"b", 2)]);
+        let tree = flat(&[(b"b", 9), (b"c", 3)]);
+        let mut o = opts();
+        o.update = true;
+        let mut res =
+            unpack_trees(&index, &[tree], MergeFn::OneWay, &o, &NullWorktree).expect("oneway -u");
+        let mut writer = RecordingWriter::default();
+        check_updates(&mut res, &o, &mut writer).expect("apply");
+        // The single removal (`a`) runs before any write.
+        let first_write = writer
+            .ops
+            .iter()
+            .position(|(_, kind)| *kind == "write")
+            .expect("a write happened");
+        let last_remove = writer
+            .ops
+            .iter()
+            .rposition(|(_, kind)| *kind == "remove")
+            .expect("a remove happened");
+        assert!(
+            last_remove < first_write,
+            "all removals precede all writes: {:?}",
+            writer.ops
+        );
+        // The written entries (`b`,`c`) carry the stat the writer returned.
+        for e in &res.entries {
+            assert!(
+                e.entry.stat.is_some(),
+                "written entry {:?} got stat back",
+                String::from_utf8_lossy(&e.path)
+            );
+        }
+    }
+
+    #[test]
+    fn check_updates_noop_without_update_leaves_stat_untouched() {
+        // Without -u, no worktree calls and no stat writeback happen.
+        let index = idx(&[(b"a", 1)]);
+        let tree = flat(&[(b"a", 9)]);
+        let mut res = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &NullWorktree)
+            .expect("oneway no -u");
+        let mut writer = RecordingWriter::default();
+        check_updates(&mut res, &opts(), &mut writer).expect("apply no-op");
+        assert!(writer.ops.is_empty(), "no worktree mutation without -u");
+        assert_eq!(res.entries[0].entry.stat, None);
+    }
+
     #[test]
     fn oneway_takes_tree_wholesale() {
-        let index = flat(&[(b"a", 1), (b"b", 2)]);
+        let index = idx(&[(b"a", 1), (b"b", 2)]);
         let tree = flat(&[(b"b", 9), (b"c", 3)]);
         let res = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &NullWorktree)
             .expect("oneway merge");
@@ -903,7 +1192,7 @@ mod tests {
     #[test]
     fn twoway_carries_local_addition() {
         // old=a, new=a (unchanged), index has a local addition `local`.
-        let index = flat(&[(b"a", 1), (b"local", 5)]);
+        let index = idx(&[(b"a", 1), (b"local", 5)]);
         let old = flat(&[(b"a", 1)]);
         let new = flat(&[(b"a", 1)]);
         let res = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
@@ -915,7 +1204,7 @@ mod tests {
     #[test]
     fn threeway_resolves_when_one_side_unchanged() {
         // base=a@1, ours=a@2 (changed), theirs=a@1 (unchanged) → take ours.
-        let index = flat(&[(b"a", 2)]);
+        let index = idx(&[(b"a", 2)]);
         let base = flat(&[(b"a", 1)]);
         let ours = flat(&[(b"a", 2)]);
         let theirs = flat(&[(b"a", 1)]);
@@ -936,7 +1225,7 @@ mod tests {
     #[test]
     fn threeway_conflict_emits_stages() {
         // base=a@1, ours=a@2, theirs=a@3 — all differ → stages 1/2/3.
-        let index = flat(&[(b"a", 2)]);
+        let index = idx(&[(b"a", 2)]);
         let base = flat(&[(b"a", 1)]);
         let ours = flat(&[(b"a", 2)]);
         let theirs = flat(&[(b"a", 3)]);
@@ -1020,11 +1309,19 @@ mod tests {
             .collect()
     }
 
+    /// A gitlink `FlatIndex` (path → `(mode, oid, stat)`, no cached stat).
+    fn gitlink_idx(items: &[(&[u8], u8)]) -> FlatIndex {
+        items
+            .iter()
+            .map(|(p, b)| (p.to_vec(), (GITLINK_MODE, oid(*b), None)))
+            .collect()
+    }
+
     #[test]
     fn move_head_hook_fires_for_new_gitlink() {
         // Empty index, tree adds a gitlink `sub` → the None arm of merged_entry
         // must call check_submodule_move_head with old == None.
-        let index = flat(&[]);
+        let index = idx(&[]);
         let tree = gitlink(&[(b"sub", 7)]);
         let probe = RecordingProbe::default();
         let mut opts = opts();
@@ -1041,7 +1338,7 @@ mod tests {
     fn move_head_hook_fires_for_changed_gitlink() {
         // Index has gitlink `sub`@1, tree moves it to `sub`@2 → the Some(old)
         // arm must call the hook with old == Some(1), new == 2.
-        let index = gitlink(&[(b"sub", 1)]);
+        let index = gitlink_idx(&[(b"sub", 1)]);
         let tree = gitlink(&[(b"sub", 2)]);
         let probe = RecordingProbe::default();
         unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe)
@@ -1056,7 +1353,7 @@ mod tests {
     #[test]
     fn move_head_hook_not_fired_for_regular_file() {
         // A plain blob change must NOT trigger the submodule hook.
-        let index = flat(&[(b"a", 1)]);
+        let index = idx(&[(b"a", 1)]);
         let tree = flat(&[(b"a", 2)]);
         let probe = RecordingProbe::default();
         unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe).expect("oneway blob");
@@ -1071,7 +1368,7 @@ mod tests {
         // Unchanged gitlink: oneway_merge's `same` fast-path keeps the entry
         // without entering merged_entry, so the hook is not called (git only
         // runs check_submodule_move_head inside merged_entry).
-        let index = gitlink(&[(b"sub", 5)]);
+        let index = gitlink_idx(&[(b"sub", 5)]);
         let tree = gitlink(&[(b"sub", 5)]);
         let probe = RecordingProbe::default();
         unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe).expect("oneway same gitlink");
@@ -1084,7 +1381,7 @@ mod tests {
     #[test]
     fn move_head_rejection_propagates() {
         // A WouldLose verdict (probe returns Err) must abort the whole run.
-        let index = gitlink(&[(b"sub", 1)]);
+        let index = gitlink_idx(&[(b"sub", 1)]);
         let tree = gitlink(&[(b"sub", 2)]);
         let probe = RecordingProbe {
             reject_path: Some(b"sub".to_vec()),
@@ -1099,7 +1396,7 @@ mod tests {
     fn move_head_hook_carries_reset_flag() {
         // `--reset` (OverwriteUntracked) must reach the probe so it can map to
         // the FORCE flag of check_submodule_move_head.
-        let index = gitlink(&[(b"sub", 1)]);
+        let index = gitlink_idx(&[(b"sub", 1)]);
         let tree = gitlink(&[(b"sub", 2)]);
         let probe = RecordingProbe::default();
         let mut opts = opts();
@@ -1117,7 +1414,7 @@ mod tests {
         // NullWorktree uses the trait default (Ok) for the new method, so a
         // gitlink move through it succeeds silently — index-only consumers are
         // unchanged.
-        let index = gitlink(&[(b"sub", 1)]);
+        let index = gitlink_idx(&[(b"sub", 1)]);
         let tree = gitlink(&[(b"sub", 2)]);
         let res = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &NullWorktree)
             .expect("NullWorktree default hook is a no-op");
