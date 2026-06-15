@@ -2358,12 +2358,35 @@ pub fn write_tree_from_index(git_dir: impl AsRef<Path>, format: ObjectFormat) ->
     write_tree_from_index_with_options(git_dir, format, WriteTreeOptions::default())
 }
 
+pub fn write_tree_from_index_with_odb(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    odb: &FileObjectDatabase,
+) -> Result<ObjectId> {
+    write_tree_from_index_with_options_and_odb(
+        git_dir.as_ref(),
+        format,
+        WriteTreeOptions::default(),
+        odb,
+    )
+}
+
 pub fn write_tree_from_index_with_options(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     options: WriteTreeOptions,
 ) -> Result<ObjectId> {
     let git_dir = git_dir.as_ref();
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    write_tree_from_index_with_options_and_odb(git_dir, format, options, &odb)
+}
+
+fn write_tree_from_index_with_options_and_odb(
+    git_dir: &Path,
+    format: ObjectFormat,
+    options: WriteTreeOptions,
+    odb: &FileObjectDatabase,
+) -> Result<ObjectId> {
     let index_path = repository_index_path(git_dir);
     // A repository with no index file yet (fresh init, nothing staged) is an
     // empty index: `git write-tree` / `git commit --allow-empty` produce the
@@ -2371,27 +2394,25 @@ pub fn write_tree_from_index_with_options(
     let index_bytes = match fs::read(&index_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let odb = FileObjectDatabase::from_git_dir(git_dir, format);
             let mut checker = odb.presence_checker();
             let empty: &[WriteTreeEntry<'_>] = &[];
             return write_tree_entries_stream(
                 empty,
                 b"",
                 None,
-                &odb,
+                odb,
                 &mut checker,
                 options.missing_ok,
             );
         }
         Err(err) => return Err(err.into()),
     };
-    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut checker = odb.presence_checker();
     match BorrowedIndex::parse(&index_bytes, format) {
-        Ok(index) => write_tree_from_borrowed_index(&index, format, &options, &odb, &mut checker),
+        Ok(index) => write_tree_from_borrowed_index(&index, format, &options, odb, &mut checker),
         Err(GitError::Unsupported(_)) => {
             let index = Index::parse(&index_bytes, format)?;
-            write_tree_from_owned_index(&index, format, &options, &odb, &mut checker)
+            write_tree_from_owned_index(&index, format, &options, odb, &mut checker)
         }
         Err(err) => Err(err),
     }

@@ -1318,7 +1318,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && let Some(max_count) = max_count
         && max_count > 0
     {
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = io::BufWriter::new(stdout.lock());
         let mut line = Vec::with_capacity(128);
         let output_encoding_is_utf8 = encoding_is_utf8(&output_encoding);
         let mut walk = sley_rev::RevWalk::new(&git_dir, format, &db, starts)
@@ -1398,7 +1399,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             } => (compiled, *final_newline),
             _ => unreachable!("metadata fast path requires compiled output"),
         };
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = io::BufWriter::new(stdout.lock());
         let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
         let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
         for (index, record) in selected.iter().enumerate() {

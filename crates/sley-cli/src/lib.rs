@@ -37,7 +37,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -9463,12 +9463,16 @@ fn repository_auto_abbrev_width(git_dir: &Path, format: ObjectFormat) -> Result<
 }
 
 fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Result<u64> {
-    let objects_dir = repository_objects_dir(git_dir);
-    let mut count = repository_loose_object_count(&objects_dir, format)?;
-    let pack_dir = objects_dir.join("pack");
+    let pack_dir = repository_objects_dir(git_dir).join("pack");
+    if let Some(packed_count) =
+        multi_pack_index_object_count(&pack_dir.join("multi-pack-index"), format)?
+    {
+        return Ok(packed_count);
+    }
     let Ok(entries) = fs::read_dir(&pack_dir) else {
-        return Ok(count);
+        return Ok(0);
     };
+    let mut count = 0u64;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -9480,36 +9484,78 @@ fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Resul
     Ok(count)
 }
 
-fn repository_loose_object_count(objects_dir: &Path, format: ObjectFormat) -> Result<u64> {
-    let mut count = 0u64;
-    let Ok(entries) = fs::read_dir(objects_dir) else {
-        return Ok(0);
+fn multi_pack_index_object_count(path: &Path, format: ObjectFormat) -> Result<Option<u64>> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
     };
-    let filename_len = format.hex_len().saturating_sub(2);
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(files) = fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for file in files {
-            let file = file?;
-            let name = file.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.len() == filename_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                count = count.saturating_add(1);
-            }
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).map_err(|_| {
+        GitError::InvalidFormat(format!("multi-pack-index {} is too short", path.display()))
+    })?;
+    if &header[..4] != b"MIDX" {
+        return Err(GitError::InvalidFormat(format!(
+            "missing multi-pack-index signature in {}",
+            path.display()
+        )));
+    }
+    let version = header[4];
+    if version != 1 && version != 2 {
+        return Err(GitError::Unsupported(format!(
+            "multi-pack-index version {version}"
+        )));
+    }
+    let expected_hash_id = match format {
+        ObjectFormat::Sha1 => 1,
+        ObjectFormat::Sha256 => 2,
+    };
+    let hash_id = header[5];
+    if u32::from(hash_id) != expected_hash_id {
+        return Err(GitError::InvalidFormat(format!(
+            "multi-pack-index hash id {hash_id} does not match {}",
+            format.name()
+        )));
+    }
+    let chunk_count = header[6] as usize;
+    let base_midx_count = header[7];
+    if base_midx_count != 0 {
+        return Err(GitError::Unsupported(format!(
+            "multi-pack-index base count {base_midx_count}"
+        )));
+    }
+
+    let mut lookup = vec![0u8; (chunk_count + 1).saturating_mul(12)];
+    file.read_exact(&mut lookup).map_err(|_| {
+        GitError::InvalidFormat(format!(
+            "truncated multi-pack-index chunk lookup in {}",
+            path.display()
+        ))
+    })?;
+    let mut oid_fanout_offset = None;
+    for chunk in lookup.chunks_exact(12).take(chunk_count) {
+        if &chunk[..4] == b"OIDF" {
+            oid_fanout_offset = Some(u64::from_be_bytes([
+                chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
+            ]));
+            break;
         }
     }
-    Ok(count)
+    let Some(oid_fanout_offset) = oid_fanout_offset else {
+        return Err(GitError::InvalidFormat(format!(
+            "multi-pack-index {} missing OIDF chunk",
+            path.display()
+        )));
+    };
+    file.seek(SeekFrom::Start(oid_fanout_offset + 255 * 4))?;
+    let mut count = [0u8; 4];
+    file.read_exact(&mut count).map_err(|_| {
+        GitError::InvalidFormat(format!(
+            "truncated multi-pack-index OIDF chunk in {}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(u64::from(u32::from_be_bytes(count))))
 }
 
 fn pack_index_object_count(path: &Path) -> Result<u32> {
