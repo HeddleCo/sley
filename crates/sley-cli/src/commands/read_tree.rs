@@ -1140,6 +1140,7 @@ fn attribute_priority_key(path: &[u8]) -> (Vec<u8>, u8, Vec<u8>) {
 ///   so [`check_updates`] folds it into the index entry — the size + mtime the
 ///   racy-clean machinery (`worktree_entry_is_uptodate`) keys on to keep a
 ///   freshly-checked-out file reported clean.
+#[allow(clippy::too_many_arguments)]
 fn write_blob_to_worktree(
     worktree_root: &Path,
     git_dir: &Path,
@@ -1175,12 +1176,16 @@ fn write_blob_to_worktree(
         )));
     }
 
-    // git's `write_entry` first removes whatever is in the way: a directory
-    // subtree (D/F dir→file), or any file/symlink. `force` is always set here.
-    remove_path_in_the_way(&file_path)?;
-    // Create leading directories, unlinking a non-dir in the way of a needed
-    // component (git's `create_directories`, the file→dir transition).
+    // Create leading directories FIRST, unlinking a non-dir in the way of a
+    // needed component (git's `create_directories`, the file→dir transition:
+    // a tracked file `p` being replaced by `p/child` must first become a dir).
+    // This must precede the final-path probe below, which would otherwise see
+    // ENOTDIR trying to stat `p/child` under a file `p`.
     create_leading_directories(worktree_root, &file_path)?;
+    // Then remove whatever currently occupies the final path: a directory
+    // subtree (the D/F dir→file transition, git's `remove_subtree`) or any
+    // file/symlink. `force` is always set here.
+    remove_path_in_the_way(&file_path)?;
 
     if (mode & 0o170000) == 0o120000 {
         // Symlink: the blob bytes are the link target, opaque to clean/smudge.
@@ -1248,7 +1253,13 @@ fn remove_path_in_the_way(file_path: &Path) -> Result<()> {
         Ok(_) => {
             fs::remove_file(file_path)?;
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        // Nothing there (`NotFound`) or a non-directory leading component
+        // (`NotADirectory`/ENOTDIR — only possible if a parent was not turned
+        // into a directory, which `create_leading_directories` already does)
+        // means there is nothing to clear.
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                || err.kind() == io::ErrorKind::NotADirectory => {}
         Err(err) => return Err(err.into()),
     }
     Ok(())
@@ -1263,15 +1274,12 @@ fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<
     let Some(parent) = file_path.parent() else {
         return Ok(());
     };
-    match fs::create_dir_all(parent) {
-        Ok(()) => return Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
-        // A non-directory in the way yields NotADirectory / other errors; fall
-        // through to the component-by-component repair below.
-        Err(_) => {}
-    }
-    // Walk each leading component; where a non-dir blocks a needed directory,
-    // unlink it and retry (git's `mkdir → EEXIST && force → unlink → mkdir`).
+    // NOTE: `fs::create_dir_all` treats an existing *file* at a needed component
+    // as success (the mkdir gets EEXIST, which create_dir_all swallows without
+    // checking the type), so it canNOT be trusted for the D/F file→dir
+    // transition. Walk each leading component and, where a non-directory blocks
+    // a needed directory, unlink it and create the directory (git's
+    // `mkdir → EEXIST && force → unlink → mkdir`).
     let mut cur = worktree_root.to_path_buf();
     let rel = parent.strip_prefix(worktree_root).unwrap_or(parent);
     for component in rel.components() {
@@ -1285,7 +1293,10 @@ fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<
                 fs::remove_file(&cur)?;
                 fs::create_dir(&cur)?;
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.kind() == io::ErrorKind::NotADirectory =>
+            {
                 fs::create_dir(&cur)?;
             }
             Err(err) => return Err(err.into()),
