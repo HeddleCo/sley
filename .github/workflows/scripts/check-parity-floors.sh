@@ -312,6 +312,36 @@
 # t3404-rebase-interactive 36->39. Neighbors held (measured==floor): t3403=16,
 # t3418=11, t3420=30, t3406=9, t1400=175, t1500=81, t2020=16, t7102=37. No
 # workspace test regressed (2206/0).
+#
+# smudge attr-precedence wave (2026-06-15, wave/smudge-precedence): the checkout
+# smudge filter resolved .gitattributes from the index ONLY, but git's default
+# attr direction (GIT_ATTR_CHECKIN, used by `checkout -- <pathspec>` / `restore`
+# and never overridden in builtin/checkout.c) reads each .gitattributes frame
+# from the WORKTREE FILE first, falling back to the staged blob only when no
+# worktree file exists (sparse). t0027 overwrites the worktree .gitattributes
+# without re-staging, so index-only resolution made checkout UNDER-convert line
+# endings — naked LFs that should gain CRLF stayed bare across ~150 checkout +
+# 74 ls-files cells. smudge_attribute_checks_from_index now walks the path
+# ancestry worktree-file-first (index fallback per frame), matching attr.c
+# read_attr. Also wired the smudge filter into read-tree -u / --reset -u /
+# --prefix materialization (write_blob_to_worktree previously wrote blobs raw),
+# with .gitattributes-first write ordering so a freshly-checked-out attributes
+# file governs its siblings in the same batch. Floor t0027-auto-crlf 2354->2578
+# (+224). NEW floors (sustained gains, NONE regressed): t0020-crlf added at 27
+# (REF 25, +2) and t0021-conversion added at 21 (REF 17, +4) — both convert-area
+# neighbors lifted by the same fix. Residual t0027 (22) = the NNO clean/commit
+# direction (separate engine). Shared-engine neighbors held (measured==floor):
+# t0008-ignores=306, t0001-init=102, t4014-format-patch=142, t7508-status=113;
+# convert family held: t0022=1, t0023=2, t0024=2, t0025=1, t0028=1, t1007=40,
+# t5004=8. t0026-eol-config stays UNFLOORED at 3/6 — its 3 fails now need diff/
+# status worktree clean-normalization (diff shows raw CRLF instead of cleaning
+# CRLF->LF before comparing), a distinct diff-engine gap exposed (not caused) by
+# the now-correct read-tree -u materialization. No workspace test regressed
+# (2235/0). Perf NEUTRAL-or-better on the affected materialization path:
+# `checkout -- .` on a CRLF-heavy 1000-file tree, interleaved n=8, REF 1.1475s
+# vs BRANCH 1.0662s (worktree-first ancestry read is cheaper than the old
+# full-index attribute scan); `read-tree --reset -u` now matches checkout's cost
+# (~1.1s) because it performs the EOL conversion git also does (REF skipped it).
 
 set -euo pipefail
 
@@ -338,7 +368,9 @@ declare -A FLOOR=(
     [t6300-for-each-ref.sh]=358
     [t7004-tag.sh]=159
     [t3200-branch.sh]=117
-    [t0027-auto-crlf.sh]=2354
+    [t0027-auto-crlf.sh]=2578
+    [t0020-crlf.sh]=27
+    [t0021-conversion.sh]=21
     [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10
     [t7810-grep.sh]=228

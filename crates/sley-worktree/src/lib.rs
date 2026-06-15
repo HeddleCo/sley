@@ -11088,6 +11088,129 @@ mod tests {
         GitConfig::parse(text.as_bytes()).expect("test operation should succeed")
     }
 
+    /// Conformance grid for git's `output_eol(crlf_action)` decision table
+    /// (convert.c) on the smudge side, exercised across the same
+    /// attr × autocrlf × eol × content matrix as upstream t0027/t0026.
+    ///
+    /// Each row asserts the smudge output for a representative content shape.
+    /// The cases that historically under-converted are the non-`auto` `text`
+    /// paths (the auto-only safety guard must NOT fire) and the
+    /// `autocrlf=true overrides core.eol` precedence rows.
+    #[test]
+    fn smudge_output_eol_decision_table() {
+        // Naked-LF-only blob (the canonical "should gain CRLF" case).
+        const LF: &[u8] = b"a\nb\nc\n";
+        // Mixed CRLF + naked LF: a non-auto crlf action converts the naked LFs
+        // to CRLF (whole file becomes CRLF); an auto action leaves it untouched.
+        const CRLF_MIX_LF: &[u8] = b"a\r\nb\nc\r\n";
+        // Naked LF plus a lone CR: non-auto converts LFs, keeping the lone CR.
+        const LF_MIX_CR: &[u8] = b"a\nb\rc\n";
+
+        let smudge = |cfg: &str, attrline: Option<&[u8]>, input: &[u8]| -> Vec<u8> {
+            let config = config_from(cfg);
+            let checks = match attrline {
+                Some(line) => {
+                    let mut matcher = AttributeMatcher::default();
+                    read_attribute_patterns_from_bytes(line, &mut matcher, &[]);
+                    matcher.attributes_for_path(b"f.txt", &filter_attribute_names(), false)
+                }
+                None => Vec::new(),
+            };
+            apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", input)
+                .expect("smudge must succeed")
+        };
+
+        // --- attr=text (CRLF_TEXT_*): non-auto, the safety guard must not fire.
+        // text + eol=crlf => CRLF_TEXT_CRLF: every naked LF gains CR.
+        let attr_text_crlf: &[u8] = b"*.txt text eol=crlf";
+        for cfg in [
+            "[core]\n\tautocrlf = false\n\teol = lf\n",
+            "[core]\n\tautocrlf = false\n\teol = crlf\n",
+            "[core]\n\tautocrlf = true\n\teol = lf\n",
+            "[core]\n\tautocrlf = input\n",
+        ] {
+            assert_eq!(
+                smudge(cfg, Some(attr_text_crlf), LF),
+                b"a\r\nb\r\nc\r\n",
+                "text eol=crlf must add CR to naked LF (cfg={cfg:?})"
+            );
+            assert_eq!(
+                smudge(cfg, Some(attr_text_crlf), CRLF_MIX_LF),
+                b"a\r\nb\r\nc\r\n",
+                "text eol=crlf must convert mixed content fully (cfg={cfg:?})"
+            );
+            assert_eq!(
+                smudge(cfg, Some(attr_text_crlf), LF_MIX_CR),
+                b"a\r\nb\rc\r\n",
+                "text eol=crlf keeps the lone CR but adds CR to naked LF (cfg={cfg:?})"
+            );
+        }
+
+        // --- attr=text, no eol attr: CRLF_TEXT, resolved by text_eol_is_crlf().
+        // autocrlf=true wins over core.eol=lf (the precedence fix).
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = true\n\teol = lf\n", Some(b"*.txt text"), LF),
+            b"a\r\nb\r\nc\r\n",
+            "autocrlf=true must override core.eol=lf for plain text attr"
+        );
+        // autocrlf unset, core.eol=crlf => CRLF.
+        assert_eq!(
+            smudge("[core]\n\teol = crlf\n", Some(b"*.txt text"), LF),
+            b"a\r\nb\r\nc\r\n",
+            "core.eol=crlf adds CR to naked LF for plain text attr"
+        );
+        // autocrlf unset, core.eol=lf (and native LF on this host) => no CR.
+        assert_eq!(
+            smudge("[core]\n\teol = lf\n", Some(b"*.txt text"), LF),
+            LF,
+            "core.eol=lf leaves naked LF untouched on smudge"
+        );
+        // text + autocrlf=input => CRLF_TEXT_INPUT: no CR on smudge.
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = input\n", Some(b"*.txt text"), LF),
+            LF,
+            "autocrlf=input overrides core.eol; no CR on smudge"
+        );
+
+        // --- attr=text=auto (CRLF_AUTO_*): the safety guard DOES fire.
+        // auto + autocrlf=true + naked-LF-only => convert.
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = true\n", Some(b"*.txt text=auto"), LF),
+            b"a\r\nb\r\nc\r\n",
+            "text=auto converts a clean naked-LF file"
+        );
+        // auto + already has a CR/CRLF => leave untouched (irreversible guard).
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = true\n", Some(b"*.txt text=auto"), CRLF_MIX_LF),
+            CRLF_MIX_LF,
+            "text=auto must not touch content that already has CRLF"
+        );
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = true\n", Some(b"*.txt text=auto"), LF_MIX_CR),
+            LF_MIX_CR,
+            "text=auto must not touch content that already has a lone CR"
+        );
+
+        // --- no attr, autocrlf=true => CRLF_AUTO_CRLF (auto guard applies).
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = true\n\teol = lf\n", None, LF),
+            b"a\r\nb\r\nc\r\n",
+            "autocrlf=true (no attr) converts clean naked-LF and overrides core.eol=lf"
+        );
+        // --- no attr, autocrlf=false => CRLF_BINARY: never convert.
+        assert_eq!(
+            smudge("[core]\n\teol = crlf\n", None, LF),
+            LF,
+            "no attr + autocrlf=false leaves content untouched even with core.eol=crlf"
+        );
+        // --- -text (CRLF_BINARY): never convert regardless of config.
+        assert_eq!(
+            smudge("[core]\n\tautocrlf = true\n", Some(b"*.txt -text"), LF),
+            LF,
+            "-text is binary: never convert"
+        );
+    }
+
     /// Resolve attribute checks against an on-disk `.gitattributes` in `root`.
     fn attrs(root: &Path, path: &[u8]) -> Vec<AttributeCheck> {
         filter_attribute_checks(root, path).expect("test operation should succeed")

@@ -101,6 +101,8 @@ jobs:
           SLEY_TESTS: >-
             t0001-init.sh
             t0008-ignores.sh
+            t0020-crlf.sh
+            t0021-conversion.sh
             t0027-auto-crlf.sh
             t1006-cat-file.sh
             t1007-hash-object.sh
