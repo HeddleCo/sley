@@ -162,7 +162,7 @@ where
         issues: Vec::new(),
         severity: options.severity.clone(),
         error_bits: 0,
-        ref_scope: false,
+        gitattributes_found: HashSet::new(),
     };
     let roots = roots.into_iter().collect::<Vec<_>>();
     let object_ids = object_ids.into_iter().collect::<Vec<_>>();
@@ -172,6 +172,9 @@ where
     for oid in object_ids.iter().cloned() {
         checker.check_object(oid);
     }
+    // git's deferred `fsck_blobs` pass: every blob a tree named `.gitattributes`
+    // gets a content check (line-length / size) it would not get as a plain blob.
+    checker.check_gitattributes_blobs();
     let notices = if options.report_unreachable {
         unreachable_notices(reader, format, &roots, &object_ids)
     } else if options.report_dangling {
@@ -192,12 +195,13 @@ struct FsckChecker<'a, R> {
     checked: HashSet<ObjectId>,
     issues: Vec<FsckIssue>,
     severity: SeverityConfig,
-    /// Accumulated git exit-code bits (`ERROR_REACHABLE`, `ERROR_REFS`).
+    /// Accumulated git exit-code bits (`ERROR_REACHABLE`).
     error_bits: i32,
-    /// True while walking a ref tip's own tree closure (not through parent
-    /// commits). A broken link found here sets `ERROR_REFS` as well as
-    /// `ERROR_REACHABLE`, matching git's `fsck_handle_ref` attribution.
-    ref_scope: bool,
+    /// Blob oids that some tree entry named `.gitattributes`, mirroring git's
+    /// `gitattributes_found` oidset. Content-checked in a deferred final pass
+    /// (`fsck_blobs`) so the blob is validated as a gitattributes file even
+    /// though it parses fine as a plain blob.
+    gitattributes_found: HashSet<ObjectId>,
 }
 
 impl<R> FsckChecker<'_, R>
@@ -239,17 +243,12 @@ where
         self.check_loaded_object(oid, &object);
     }
 
-    /// Check a ref-reachable root. A missing root object additionally sets
-    /// `ERROR_REFS` (git's `fsck_handle_ref` flags the ref). Its own tree
-    /// closure is walked in ref scope so a missing tip tree also sets REFS.
+    /// Check a ref-reachable root. The driver validates the ref tip itself
+    /// (`invalid sha1 pointer` / `not a commit`, and the ERROR_REACHABLE/REFS
+    /// attribution) via git's `snapshot_ref` rules before handing us only
+    /// readable tip oids, so the root walk is just an ordinary object check.
     fn check_object_root(&mut self, oid: ObjectId) {
-        if self.reader.read_object(&oid).is_err() {
-            self.error_bits |= ERROR_REFS;
-        }
-        let prev = self.ref_scope;
-        self.ref_scope = true;
         self.check_object(oid);
-        self.ref_scope = prev;
     }
 
     fn check_loaded_object(&mut self, oid: ObjectId, object: &EncodedObject) {
@@ -285,6 +284,11 @@ where
                 content::Severity::Warn => "warning in",
                 content::Severity::Ignore => continue,
             };
+            // git emits some raw `error: <msg>` stderr lines (e.g. tree-walk's
+            // "empty filename in tree entry") *before* the formatted finding.
+            if let Some(raw) = &f.raw_stderr {
+                self.issues.push(FsckIssue::content_error(format!("error: {raw}")));
+            }
             let msg = format!(
                 "{prefix} {} {oid}: {}: {}",
                 object.object_type.as_str(),
@@ -322,9 +326,6 @@ where
             object_type: ObjectType::Commit,
             oid,
         };
-        // The commit's own tree stays in ref scope (a missing tip tree sets
-        // ERROR_REFS); parent commits are reached via the commit-walk, which is
-        // not ref-attributed, so drop ref scope while descending them.
         self.check_object_link(
             Some(source.clone()),
             ObjectLink {
@@ -332,8 +333,6 @@ where
                 oid: commit.tree,
             },
         );
-        let prev = self.ref_scope;
-        self.ref_scope = false;
         for parent in sley_odb::grafted_parents(self.reader, &oid, commit.parents) {
             self.check_object_link(
                 Some(source.clone()),
@@ -343,7 +342,6 @@ where
                 },
             );
         }
-        self.ref_scope = prev;
     }
 
     fn check_tree(&mut self, oid: ObjectId, body: &[u8]) {
@@ -358,6 +356,17 @@ where
             oid,
         };
         for entry in entries {
+            let entry_object_type = fsck_tree_entry_object_type(entry.mode);
+            // git's `fsck_tree` records `.gitattributes`-named blob entries into
+            // `gitattributes_found` for the deferred content pass. Symlinks
+            // (mode S_IFLNK) get a different `gitattributesSymlink` report and
+            // are not content-checked; we only enroll regular-file blobs.
+            if entry_object_type == ObjectType::Blob
+                && entry.mode != 0o120000
+                && content::is_dotgitattributes_name(entry.name)
+            {
+                self.gitattributes_found.insert(entry.oid.clone());
+            }
             // A null-sha entry is reported by the content checker as a warning;
             // do not also walk it as a broken link (git skips null entries).
             if entry.oid.is_null() {
@@ -366,7 +375,7 @@ where
             self.check_object_link(
                 Some(source.clone()),
                 ObjectLink {
-                    object_type: fsck_tree_entry_object_type(entry.mode),
+                    object_type: entry_object_type,
                     oid: entry.oid,
                 },
             );
@@ -390,16 +399,55 @@ where
         );
     }
 
-    fn report_missing_link(&mut self, source: Option<ObjectLink>, link: ObjectLink) {
-        // A broken reachability link sets ERROR_REACHABLE; if it was found
-        // within a ref tip's own tree closure, it also sets ERROR_REFS.
-        self.error_bits |= ERROR_REACHABLE;
-        if self.ref_scope {
-            self.error_bits |= ERROR_REFS;
+    /// git's deferred `fsck_blobs` pass for `.gitattributes`: each enrolled blob
+    /// is loaded and content-checked for the line-length / size limits it would
+    /// not get as a plain blob. Findings render as `error in blob <oid>: ...` on
+    /// stderr; a content error sets ERROR_OBJECT (via the issue's stream).
+    fn check_gitattributes_blobs(&mut self) {
+        // Iterate in a stable order so output is deterministic.
+        let mut oids: Vec<ObjectId> = self.gitattributes_found.iter().cloned().collect();
+        oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for oid in oids {
+            let Ok(object) = self.reader.read_object(&oid) else {
+                // A missing .gitattributes blob is reported by the connectivity
+                // walk as a broken link already; git's gitattributesMissing path
+                // is for the same condition. Skip the content check here.
+                continue;
+            };
+            if object.object_type != ObjectType::Blob {
+                continue;
+            }
+            let findings = content::check_gitattributes_blob(&object.body, &self.severity);
+            for f in &findings {
+                if f.severity == content::Severity::Ignore {
+                    continue;
+                }
+                let prefix = match f.severity {
+                    content::Severity::Error => "error in",
+                    _ => "warning in",
+                };
+                let msg = format!("{prefix} blob {oid}: {}: {}", f.msg_id.camel(), f.detail);
+                let issue = match f.severity {
+                    content::Severity::Error => FsckIssue::content_error(msg),
+                    _ => FsckIssue::content_warning(msg),
+                };
+                self.issues.push(issue);
+            }
         }
+    }
+
+    fn report_missing_link(&mut self, source: Option<ObjectLink>, link: ObjectLink) {
+        // A broken reachability link sets only ERROR_REACHABLE. git's
+        // ERROR_REFS is reserved for `snapshot_ref`'s branch→non-commit check
+        // (handled in the driver), NOT for broken links reached through a ref
+        // tip's closure — so a tag pointing at a missing blob, or a ref tip
+        // whose subtree is missing, exits 2 (REACHABLE), not 10.
+        self.error_bits |= ERROR_REACHABLE;
         if let Some(source) = source {
+            // git: `printf_ln("broken link from %7s %s\n              to %7s %s")`
+            // — the object type is right-aligned in a 7-char field.
             self.issues.push(FsckIssue::error(format!(
-                "broken link from  {} {}\n              to    {} {}",
+                "broken link from {:>7} {}\n              to {:>7} {}",
                 source.object_type.as_str(),
                 source.oid,
                 link.object_type.as_str(),

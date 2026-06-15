@@ -693,6 +693,7 @@ enum PeelKind {
     Commit,
     Tree,
     Tag,
+    Blob,
 }
 
 fn split_revision_suffix(rev: &str) -> Result<Option<(&str, RevisionSuffix<'_>)>> {
@@ -758,6 +759,7 @@ fn parse_peel_suffix(rev: &str, suffix: &str) -> Result<Option<PeelKind>> {
         "commit" => PeelKind::Commit,
         "tree" => PeelKind::Tree,
         "tag" => PeelKind::Tag,
+        "blob" => PeelKind::Blob,
         other => {
             return Err(GitError::Unsupported(format!(
                 "revision peel suffix ^{{{other}}}"
@@ -1909,6 +1911,7 @@ fn peel_revision<R: ObjectReader>(
         }
         PeelKind::Commit => peel_to_commit(reader, format, oid),
         PeelKind::Tree => peel_to_tree(reader, format, oid),
+        PeelKind::Blob => peel_to_blob(reader, format, oid),
         PeelKind::Tag => {
             let object = read_revision_object(reader, oid)?;
             if object.object_type == ObjectType::Tag {
@@ -1970,6 +1973,28 @@ pub fn peel_to_commit<R: ObjectReader>(
         }
         other => Err(GitError::InvalidObject(format!(
             "expected commit-ish {oid}, found {}",
+            other.as_str()
+        ))),
+    }
+}
+
+/// `<rev>^{blob}` — follow tags down to a blob. git's `peel_to_type(OBJ_BLOB)`
+/// dereferences a tag chain; the final object must be a blob (a commit/tree does
+/// not peel to a blob and is an error).
+pub fn peel_to_blob<R: ObjectReader>(
+    reader: &R,
+    format: sley_core::ObjectFormat,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
+    let object = read_revision_object(reader, oid)?;
+    match object.object_type {
+        ObjectType::Blob => Ok(*oid),
+        ObjectType::Tag => {
+            let tag = Tag::parse_ref(format, &object.body)?;
+            peel_to_blob(reader, format, &tag.object)
+        }
+        other => Err(GitError::InvalidObject(format!(
+            "expected blob {oid}, found {}",
             other.as_str()
         ))),
     }
