@@ -944,6 +944,7 @@ pub fn add_exact_tracked_path_from_disk(
     format: ObjectFormat,
     git_path: &[u8],
     ignore_removal: bool,
+    config_parameters_env: Option<&str>,
 ) -> Result<AddExactTrackedPathResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
@@ -998,24 +999,53 @@ pub fn add_exact_tracked_path_from_disk(
         return Ok(AddExactTrackedPathResult::Handled(None));
     }
 
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let is_symlink = file_type.is_symlink();
     let body = if is_symlink {
         symlink_target_bytes(&absolute)?
     } else {
         let body = fs::read(&absolute)?;
+        // Resolve the effective config WITH command-line `-c` / `--config-env`
+        // overrides folded in (e.g. upstream t0027's `git -c core.autocrlf=true
+        // add`); the plain repo-config reader would drop them and the fast path
+        // would convert/warn against the wrong EOL policy.
+        let config = sley_config::read_repo_config(git_dir, config_parameters_env)
+            .unwrap_or_default();
         let mut clean_filter = None;
-        let clean_filter = tracked_only_clean_filter(&mut clean_filter, worktree_root, git_dir);
+        let clean_filter =
+            tracked_only_clean_filter_with_config(&mut clean_filter, worktree_root, &config);
         clean_filter.read_attributes_for_path(worktree_root, git_path)?;
         let checks =
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+        // git's index update folds in `global_conv_flags_eol`, so `git add`
+        // emits the `core.safecrlf` round-trip warning (default: warn). The
+        // current index blob (`entry.oid`) drives the auto-crlf
+        // `has_crlf_in_index` decision. Mirror the slow `add_update_tracked_path`
+        // path here so the exact-patch fast path does not silently drop the
+        // warning (upstream t0020 'safecrlf: print warning only once').
+        let conv_flags = ConvFlags::from_config(&clean_filter.config);
+        let index_blob = match conv_flags {
+            ConvFlags::Off => SafeCrlfIndexBlob::None,
+            _ => SafeCrlfIndexBlob::Lookup {
+                odb: &odb,
+                oid: entry.oid,
+            },
+        };
+        apply_clean_filter_with_attributes_cow_safecrlf(
+            &clean_filter.config,
+            &checks,
+            git_path,
+            &body,
+            conv_flags,
+            index_blob,
+        )?
+        .into_owned()
     };
     let object = EncodedObject::new(ObjectType::Blob, body);
     let oid = object.object_id(format)?;
     if oid != entry.oid {
-        let odb = FileObjectDatabase::from_git_dir(git_dir, format);
         odb.write_object(object)?;
     }
 

@@ -1279,6 +1279,7 @@ fn try_add_regular_exact_tracked_raw(
         format,
         &git_path,
         options.ignore_removal,
+        crate::effective_config_parameters_env().as_deref(),
     )?;
     match result {
         sley_worktree::AddExactTrackedPathResult::Handled(action) => action
