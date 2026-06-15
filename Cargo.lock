@@ -1096,6 +1096,8 @@ dependencies = [
 name = "sley-archive"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "sley-config",
  "sley-core",
  "sley-formats",

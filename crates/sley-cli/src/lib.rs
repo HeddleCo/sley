@@ -7738,6 +7738,35 @@ fn print_log_format(
     Ok(())
 }
 
+/// Render a single `$Format:<fmt>$` inner format against `record`, returning the
+/// expanded bytes. Backs `git archive`'s `export-subst` (the same pretty-format
+/// placeholders as `git log --pretty=format:`). `fmt` is the text between
+/// `$Format:` and the closing `$`.
+pub(crate) fn format_subst_for_commit(
+    record: &sley_rev::CommitRecord,
+    fmt: &[u8],
+) -> Result<Vec<u8>> {
+    let fmt = String::from_utf8_lossy(fmt);
+    let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
+    let decorations = HashMap::new();
+    let date_mode = DateMode::Default;
+    let context = LogFormatContext {
+        abbrev_len: None,
+        decorations: &decorations,
+        marker: '>',
+        dialect: LogFormatDialect::Log,
+        source: None,
+        date_mode: &date_mode,
+        source_oid: None,
+        describe: None,
+        color: false,
+        output_encoding: "UTF-8",
+    };
+    let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format(record, &compiled, &context, &mut out, 0..compiled.tokens.len())?;
+    Ok(out)
+}
+
 fn emit_compiled_log_format(
     record: &sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,

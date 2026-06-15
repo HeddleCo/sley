@@ -4,18 +4,31 @@
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
+/// An `--add-file` / `--add-virtual-file` entry: the output path (already
+/// prefixed) plus its content + mode. Disk-backed files are read at parse time
+/// so the base prefix in effect at that point is captured.
+struct ArchiveExtraFile {
+    path: Vec<u8>,
+    content: Vec<u8>,
+    mode: u32,
+}
+
 pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
-    let mut format_name = "tar";
+    let mut format_name: Option<String> = None;
     let mut prefix = Vec::new();
-    let mut output = None;
+    let mut output: Option<String> = None;
     let mut treeish = None;
     let mut pathspecs = Vec::new();
+    let mut list = false;
+    let mut mtime_option: Option<String> = None;
+    let mut compression_level: Option<u32> = None;
+    let mut extra_files: Vec<ArchiveExtraFile> = Vec::new();
     let mut positional_only = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if positional_only {
             if treeish.is_none() {
-                treeish = Some(arg.as_str());
+                treeish = Some(arg.clone());
             } else {
                 pathspecs.push(arg.as_bytes().to_vec());
             }
@@ -23,11 +36,16 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         }
         match arg.as_str() {
             "--" => positional_only = true,
+            "--end-of-options" => positional_only = true,
+            "-l" | "--list" => list = true,
             "--format" => {
-                format_name = iter
-                    .next()
-                    .map(String::as_str)
-                    .ok_or_else(|| GitError::Command("archive --format requires a value".into()))?;
+                format_name = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("archive --format requires a value".into())
+                        })?
+                        .clone(),
+                );
             }
             "--prefix" => {
                 prefix = iter
@@ -35,6 +53,13 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("archive --prefix requires a value".into()))?
                     .as_bytes()
                     .to_vec();
+            }
+            "--mtime" => {
+                mtime_option = Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command("archive --mtime requires a value".into()))?
+                        .clone(),
+                );
             }
             "-o" | "--output" => {
                 output = Some(
@@ -45,14 +70,39 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                         .to_string(),
                 );
             }
+            "--add-file" => {
+                let path = iter.next().ok_or_else(|| {
+                    GitError::Command("archive --add-file requires a value".into())
+                })?;
+                extra_files.push(archive_disk_extra_file(&prefix, path)?);
+            }
+            value if value.starts_with("--add-file=") => {
+                let path = &value["--add-file=".len()..];
+                extra_files.push(archive_disk_extra_file(&prefix, path)?);
+            }
+            value if value.starts_with("--add-virtual-file=") => {
+                let spec = &value["--add-virtual-file=".len()..];
+                extra_files.push(archive_virtual_extra_file(spec)?);
+            }
             value if value.starts_with("--format=") => {
-                format_name = &value["--format=".len()..];
+                format_name = Some(value["--format=".len()..].to_string());
             }
             value if value.starts_with("--prefix=") => {
                 prefix = value.as_bytes()["--prefix=".len()..].to_vec();
             }
+            value if value.starts_with("--mtime=") => {
+                mtime_option = Some(value["--mtime=".len()..].to_string());
+            }
             value if value.starts_with("--output=") => {
                 output = Some(value["--output=".len()..].to_string());
+            }
+            // `-N` (0..=9) compression level for the zip backend.
+            value
+                if value.len() == 2
+                    && value.starts_with('-')
+                    && value.as_bytes()[1].is_ascii_digit() =>
+            {
+                compression_level = Some((value.as_bytes()[1] - b'0') as u32);
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
@@ -61,37 +111,80 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             }
             value => {
                 if treeish.is_none() {
-                    treeish = Some(value);
+                    treeish = Some(value.to_string());
                 } else {
                     pathspecs.push(value.as_bytes().to_vec());
                 }
             }
         }
     }
-    if format_name != "tar" {
-        return Err(GitError::Command(format!(
-            "archive currently supports --format=tar, not {format_name}"
-        )));
+
+    if list {
+        // `--list` takes no tree-ish or pathspecs.
+        if treeish.is_some() || !pathspecs.is_empty() {
+            return Err(GitError::Exit(128));
+        }
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        for name in ["tar", "tgz", "tar.gz", "zip"] {
+            writeln!(lock, "{name}")?;
+        }
+        lock.flush()?;
+        return Ok(());
     }
+
+    // Format resolution: explicit `--format`, else inferred from the `--output`
+    // filename extension, else `tar` (upstream `archive_format_from_filename`).
+    let format_name = match format_name {
+        Some(name) => name,
+        None => output
+            .as_deref()
+            .and_then(archive_format_from_filename)
+            .unwrap_or("tar")
+            .to_string(),
+    };
+    let archive_format = match format_name.as_str() {
+        "tar" => ArchiveFormatKind::Tar,
+        "zip" => ArchiveFormatKind::Zip,
+        // `tgz` and `tar.gz` are the internal-gzip tar filter (git's
+        // `internal_gzip_command`): the tar stream wrapped in gzip.
+        "tgz" | "tar.gz" => ArchiveFormatKind::TarGz,
+        other => {
+            return Err(GitError::Command(format!(
+                "archive does not support --format={other}"
+            )));
+        }
+    };
+
     let treeish = treeish.ok_or_else(|| GitError::Command("archive requires a tree-ish".into()))?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let current_prefix = worktree_prefix(&cwd, &git_dir)?.into_bytes();
+    // A bare repo has no worktree, so the "current prefix" is empty (we are at
+    // the repository root); upstream `git archive` works in a bare repo.
+    let current_prefix = match sley_worktree::worktree_root_for_git_dir(&git_dir)? {
+        Some(_) => worktree_prefix(&cwd, &git_dir)?.into_bytes(),
+        None => Vec::new(),
+    };
     let pathspecs = archive_pathspecs_for_current_prefix(&current_prefix, pathspecs);
-    let oid = resolve_revision(&git_dir, format, treeish)?;
+    let oid = resolve_revision(&git_dir, format, &treeish)?;
     let object = db.read_object(&oid)?;
-    let (tree_oid, mtime, commit_id) = match object.object_type {
+    let (tree_oid, default_mtime, commit_id, commit_record) = match object.object_type {
         ObjectType::Commit => {
-            let commit = Commit::parse_ref(format, &object.body)?;
-            let mtime = commit_graph_commit_time_from_committer(commit.committer)?;
-            (commit.tree, mtime, Some(oid))
+            let commit = Commit::parse(format, &object.body)?;
+            let mtime = commit_graph_commit_time_from_committer(&commit.committer)?;
+            let record = sley_rev::CommitRecord {
+                oid,
+                parents: commit.parents.clone(),
+                commit,
+            };
+            (record.commit.tree, mtime, Some(oid), Some(record))
         }
-        ObjectType::Tree => (oid, current_unix_seconds().max(0) as u64, None),
+        ObjectType::Tree => (oid, current_unix_seconds().max(0) as u64, None, None),
         ObjectType::Tag => {
             let tree_oid = sley_rev::peel_to_tree(&db, format, &oid)?;
-            (tree_oid, current_unix_seconds().max(0) as u64, None)
+            (tree_oid, current_unix_seconds().max(0) as u64, None, None)
         }
         other => {
             return Err(GitError::InvalidObject(format!(
@@ -100,38 +193,244 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             )));
         }
     };
-    let options = sley_archive::TarArchiveOptions {
-        prefix,
-        strip_prefix: current_prefix,
-        mtime,
-        commit_id,
-        pathspecs,
+    // `--mtime` overrides the per-entry timestamp (upstream parses it via
+    // approxidate). Without it, the commit time (or now, for a tree-ish) is used.
+    let mtime = match &mtime_option {
+        Some(value) => crate::commands::approxidate::parse_approxidate(value)
+            .ok_or_else(|| GitError::Command(format!("invalid --mtime value: {value}")))?
+            .max(0) as u64,
+        None => default_mtime,
     };
 
     // Content conversion (smudge: EOL + filter drivers) per the archived tree's
-    // `.gitattributes`, matching `git archive`'s `convert_to_working_tree`. The
+    // `.gitattributes`, matching `git archive`'s `convert_to_working_tree`, plus
+    // `export-subst` keyword substitution against the archived commit. The
     // attribute root is the worktree (when non-bare) or the git dir (bare); the
     // git dir locates `info/attributes`. TODO(convert): `--worktree-attributes`
-    // (read live `.gitattributes`) and `export-subst`/`ident` are not wired yet.
+    // (read live `.gitattributes`) and the `ident` filter are not wired yet.
     let config = read_repo_config(&git_dir)?;
     let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.to_path_buf());
-    let convert =
-        sley_archive::ArchiveConvert::from_tree(&attr_root, &git_dir, &config, &db, format, &tree_oid)?;
+    let mut convert = sley_archive::ArchiveConvert::from_tree(
+        &attr_root, &git_dir, &config, &db, format, &tree_oid,
+    )?;
+    // export-subst only runs when archiving a commit (git sets `args->convert`
+    // only when a commit is available).
+    if let Some(record) = &commit_record {
+        convert = convert.with_subst(move |fmt| format_subst_for_commit(record, fmt));
+    }
+    // Text/binary classification for the zip backend, driven by the tree's
+    // `diff` userdiff attribute (the same `entry_is_binary` upstream uses). Read
+    // attributes from the archived *tree* (not the worktree). The
+    // `UserdiffResolver` resolves `diff=<name>` ⇒ `diff.<name>.binary` config and
+    // builtin driver flags.
+    let diff_attributes =
+        sley_worktree::TreeAttributes::from_tree(&attr_root, &git_dir, &db, format, &tree_oid)?;
+    let userdiff = commands::userdiff::UserdiffResolver::with_attributes(None, Some(config.clone()));
+    convert = convert.with_diff_binary(move |path| {
+        archive_diff_binary(&diff_attributes, &userdiff, path)
+    });
 
+    let extra = sley_archive::ArchiveExtras {
+        files: extra_files
+            .into_iter()
+            .map(|file| sley_archive::ArchiveExtraEntry {
+                path: file.path,
+                content: file.content,
+                mode: file.mode,
+            })
+            .collect(),
+    };
+
+    match archive_format {
+        ArchiveFormatKind::Tar => {
+            let options = sley_archive::TarArchiveOptions {
+                prefix,
+                strip_prefix: current_prefix,
+                mtime,
+                commit_id,
+                pathspecs,
+            };
+            with_archive_writer(output, |writer| {
+                handle_archive_result(sley_archive::write_tar_archive_full(
+                    writer, &db, format, &tree_oid, options, &convert, &extra,
+                ))
+            })
+        }
+        ArchiveFormatKind::TarGz => {
+            let options = sley_archive::TarArchiveOptions {
+                prefix,
+                strip_prefix: current_prefix,
+                mtime,
+                commit_id,
+                pathspecs,
+            };
+            with_archive_writer(output, |writer| {
+                handle_archive_result(sley_archive::write_tar_gz_archive_full(
+                    writer,
+                    &db,
+                    format,
+                    &tree_oid,
+                    options,
+                    &convert,
+                    &extra,
+                    // git defaults tgz to the zlib default level (6).
+                    compression_level.unwrap_or(6),
+                ))
+            })
+        }
+        ArchiveFormatKind::Zip => {
+            let options = sley_archive::ZipArchiveOptions {
+                prefix,
+                strip_prefix: current_prefix,
+                mtime,
+                commit_id,
+                pathspecs,
+                // git's default is the zlib default level (6); `-0` forces store.
+                compression_level: compression_level.unwrap_or(6),
+            };
+            with_archive_writer(output, |writer| {
+                handle_archive_result(sley_archive::write_zip_archive_full(
+                    writer, &db, format, &tree_oid, options, &convert, &extra,
+                ))
+            })
+        }
+    }
+}
+
+enum ArchiveFormatKind {
+    Tar,
+    TarGz,
+    Zip,
+}
+
+/// Run `body` with a writer that is either the `--output` file or stdout.
+fn with_archive_writer(
+    output: Option<String>,
+    body: impl FnOnce(&mut dyn io::Write) -> Result<()>,
+) -> Result<()> {
     if let Some(path) = output {
         let mut file = fs::File::create(path)?;
-        handle_archive_result(sley_archive::write_tar_archive_with_convert(
-            &mut file, &db, format, &tree_oid, options, &convert,
-        ))
+        body(&mut file)
     } else {
         let stdout = io::stdout();
         let mut lock = stdout.lock();
-        handle_archive_result(sley_archive::write_tar_archive_with_convert(
-            &mut lock, &db, format, &tree_oid, options, &convert,
-        ))?;
+        body(&mut lock)?;
         lock.flush()?;
         Ok(())
+    }
+}
+
+/// Infer the archive format from an `--output` filename, mirroring upstream
+/// `archive_format_from_filename` / `match_extension`: the extension must follow
+/// a non-empty basename and a literal `.`.
+fn archive_format_from_filename(filename: &str) -> Option<&'static str> {
+    for name in ["tar", "tgz", "tar.gz", "zip"] {
+        if archive_match_extension(filename, name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn archive_match_extension(filename: &str, ext: &str) -> bool {
+    let Some(prefix_len) = filename.len().checked_sub(ext.len()) else {
+        return false;
+    };
+    // Need 1 char for the '.' plus a non-empty basename before it.
+    if prefix_len < 2 || filename.as_bytes()[prefix_len - 1] != b'.' {
+        return false;
+    }
+    &filename[prefix_len..] == ext
+}
+
+/// Build an extra-file entry from a disk path: output path is
+/// `<current-prefix><basename>`, content is the file bytes, mode is canonicalized
+/// (regular 0644/0755, symlink, gitlink) like upstream `canon_mode`.
+fn archive_disk_extra_file(prefix: &[u8], path: &str) -> Result<ArchiveExtraFile> {
+    let metadata = fs::symlink_metadata(path)?;
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.as_encoded_bytes().to_vec())
+        .unwrap_or_else(|| path.as_bytes().to_vec());
+    let mut output_path = prefix.to_vec();
+    output_path.extend_from_slice(&basename);
+    use std::os::unix::fs::PermissionsExt;
+    let raw_mode = metadata.permissions().mode();
+    let mode = if metadata.file_type().is_symlink() {
+        0o120000
+    } else if raw_mode & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    };
+    let content = if metadata.file_type().is_symlink() {
+        fs::read_link(path)?.into_os_string().into_encoded_bytes()
+    } else {
+        fs::read(path)?
+    };
+    Ok(ArchiveExtraFile {
+        path: output_path,
+        content,
+        mode,
+    })
+}
+
+/// Parse an `--add-virtual-file=<path>:<content>` spec. The path may be
+/// double-quoted (to allow a literal colon); the content is everything after the
+/// first unquoted `:`.
+fn archive_virtual_extra_file(spec: &str) -> Result<ArchiveExtraFile> {
+    let bytes = spec.as_bytes();
+    let (path, content) = if bytes.first() == Some(&b'"') {
+        // Quoted path: find the closing quote, then the colon after it.
+        let close = bytes[1..]
+            .iter()
+            .position(|&b| b == b'"')
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                GitError::Command("archive --add-virtual-file: unterminated quote".into())
+            })?;
+        let path = bytes[1..close].to_vec();
+        let after = &bytes[close + 1..];
+        let colon = after.iter().position(|&b| b == b':').ok_or_else(|| {
+            GitError::Command("archive --add-virtual-file requires <path>:<content>".into())
+        })?;
+        (path, after[colon + 1..].to_vec())
+    } else {
+        let colon = bytes.iter().position(|&b| b == b':').ok_or_else(|| {
+            GitError::Command("archive --add-virtual-file requires <path>:<content>".into())
+        })?;
+        (bytes[..colon].to_vec(), bytes[colon + 1..].to_vec())
+    };
+    Ok(ArchiveExtraFile {
+        path,
+        content,
+        mode: 0o100644,
+    })
+}
+
+/// git's `entry_is_binary` driver lookup for a tree-relative path: resolve the
+/// `diff` attribute, returning the userdiff driver's binary tristate
+/// (`Some(true)` = binary, `Some(false)` = text, `None` = auto-detect via
+/// content). Mirrors `userdiff_find_by_path(...)->binary`.
+fn archive_diff_binary(
+    attributes: &sley_worktree::TreeAttributes,
+    userdiff: &commands::userdiff::UserdiffResolver,
+    path: &[u8],
+) -> Option<bool> {
+    match attributes.diff_attribute_for_path(path) {
+        // `diff` set ⇒ driver_true ⇒ text.
+        Some(sley_worktree::AttributeState::Set) => Some(false),
+        // `-diff` ⇒ driver_false ⇒ binary.
+        Some(sley_worktree::AttributeState::Unset) => Some(true),
+        // `diff=<name>` ⇒ resolve the named driver's `binary` flag.
+        Some(sley_worktree::AttributeState::Value(name)) => userdiff
+            .driver_by_name(&name)
+            .ok()
+            .flatten()
+            .and_then(|driver| driver.binary),
+        // unspecified ⇒ no driver override; auto-detect via content.
+        None => None,
     }
 }
 
@@ -3978,19 +4277,40 @@ pub(crate) fn cmd_bundle(args: &[String]) -> Result<()> {
     }
 }
 
+const COMMIT_GRAPH_USAGE: &str = "\
+usage: git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress]
+   or: git commit-graph write [--object-dir <dir>] [--append]
+                       [--split[=<strategy>]] [--reachable | --stdin-packs | --stdin-commits]
+                       [--changed-paths] [--[no-]max-new-filters <n>] [--[no-]progress]
+                       <split-options>
+";
+
 pub(crate) fn cmd_commit_graph(args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
-        return Err(GitError::Command(
-            "commit-graph requires <write|verify>".into(),
-        ));
+        // No sub-command ⇒ usage error (exit 129) with the usage block.
+        eprint!("{COMMIT_GRAPH_USAGE}");
+        return Err(GitError::Exit(129));
     };
     match subcommand {
         "write" => cmd_commit_graph_write(&args[1..]),
         "verify" => cmd_commit_graph_verify(&args[1..]),
-        other => Err(GitError::Command(format!(
-            "unsupported commit-graph subcommand {other}"
-        ))),
+        other => {
+            // Unknown sub-command ⇒ git's `error: unknown subcommand: \`<x>'`
+            // plus the usage block, exit 129.
+            eprintln!("error: unknown subcommand: `{other}'");
+            eprint!("{COMMIT_GRAPH_USAGE}");
+            Err(GitError::Exit(129))
+        }
     }
+}
+
+/// Which set of commits seeds the graph (mirrors git's mutually-exclusive
+/// `--reachable` / `--stdin-packs` / `--stdin-commits`; default = all packs).
+enum CommitGraphSource {
+    AllPacks,
+    Reachable,
+    StdinPacks,
+    StdinCommits,
 }
 
 fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
@@ -3998,12 +4318,16 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
-    let mut reachable = false;
+    let mut source = CommitGraphSource::AllPacks;
     let mut changed_paths: Option<bool> = None;
+    let mut append = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--reachable" => reachable = true,
+            "--reachable" => source = CommitGraphSource::Reachable,
+            "--stdin-packs" => source = CommitGraphSource::StdinPacks,
+            "--stdin-commits" => source = CommitGraphSource::StdinCommits,
+            "--append" => append = true,
             "--changed-paths" => changed_paths = Some(true),
             "--no-changed-paths" => changed_paths = Some(false),
             "--object-dir" => {
@@ -4019,15 +4343,15 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
                 object_dir = Some(resolve_cli_path(&cwd, value));
             }
+            // Any unrecognized option or positional arg is a usage error
+            // (git's parse-options exits 129); `commit-graph write` takes no
+            // positional arguments.
             other => {
-                return Err(GitError::Unsupported(format!(
-                    "commit-graph write option {other}"
-                )));
+                eprintln!("error: unknown option `{}'", other.trim_start_matches('-'));
+                eprint!("{COMMIT_GRAPH_USAGE}");
+                return Err(GitError::Exit(129));
             }
         }
-    }
-    if !reachable {
-        return Ok(());
     }
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
     let repo_config = sley_config::read_repo_config(&git_dir, None).ok();
@@ -4048,17 +4372,213 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             .unwrap_or(false)
             || existing_bloom_settings.is_some()
     });
-    let graph = commit_graph_for_reachable_refs(
-        &git_dir,
-        &object_dir,
-        format,
-        changed_paths,
-        bloom_settings,
-    )?;
+
+    let db = FileObjectDatabase::new(&object_dir, format);
+    let starts = match source {
+        CommitGraphSource::Reachable => {
+            return write_reachable_commit_graph(
+                &git_dir,
+                &object_dir,
+                format,
+                changed_paths,
+                bloom_settings,
+            );
+        }
+        CommitGraphSource::AllPacks => commit_graph_packed_commit_starts(&db, &object_dir, format)?,
+        CommitGraphSource::StdinPacks => {
+            commit_graph_stdin_packs_starts(&db, &object_dir, format)?
+        }
+        CommitGraphSource::StdinCommits => commit_graph_stdin_commits_starts(&db, format)?,
+    };
+
+    let mut starts = starts;
+    if append {
+        // `--append`: keep the commits already in the graph and add the new
+        // source on top (git's `COMMIT_GRAPH_WRITE_APPEND`).
+        let mut seen: HashSet<ObjectId> = starts.iter().copied().collect();
+        for oid in existing_commit_graph_oids(&object_dir, format)? {
+            if seen.insert(oid) {
+                starts.push(oid);
+            }
+        }
+    }
+
+    // No commits in scope ⇒ write no graph file (git's "write graph with no
+    // packs": the file must stay absent).
+    if starts.is_empty() {
+        return Ok(());
+    }
+    let graph = commit_graph_from_starts(&db, format, starts, changed_paths, bloom_settings)?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    fs::write(graph_dir.join("commit-graph"), graph)?;
+    write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
     Ok(())
+}
+
+/// The commit oids already recorded in the existing single-file commit-graph
+/// (empty when there is none). Used by `--append`.
+fn existing_commit_graph_oids(object_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let graph_path = object_dir.join("info").join("commit-graph");
+    if !graph_path.exists() {
+        return Ok(Vec::new());
+    }
+    let graph = CommitGraph::parse(&fs::read(graph_path)?, format)?;
+    Ok(graph.commits.into_iter().map(|entry| entry.oid).collect())
+}
+
+/// Write the commit-graph file with git's read-only mode `0444 & ~umask`,
+/// matching `mks_tempfile_m(..., 0444)` + `adjust_shared_perm`.
+///
+/// The umask is derived (without `unsafe`/libc) from the just-created file: the
+/// OS gives it `0666 & ~umask`, so its read bits (`& 0444`) equal `0444 &
+/// ~umask` exactly — which is the mode git lands on.
+fn write_commit_graph_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    // A prior graph is written read-only; remove it so the rewrite creates a
+    // fresh file with the OS default mode (`0666 & ~umask`), from which the
+    // umask can be recovered below.
+    let _ = fs::remove_file(path);
+    fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let created_mode = fs::metadata(path)?.permissions().mode();
+        let mode = created_mode & 0o444;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+/// `--reachable`: write the graph seeded from refs + HEAD. Always writes a file
+/// (matching git, which produces a header-only graph for an empty repo).
+fn write_reachable_commit_graph(
+    git_dir: &Path,
+    object_dir: &Path,
+    format: ObjectFormat,
+    changed_paths: bool,
+    bloom_settings: sley_formats::CommitGraphBloomSettings,
+) -> Result<()> {
+    let graph =
+        commit_graph_for_reachable_refs(git_dir, object_dir, format, changed_paths, bloom_settings)?;
+    let graph_dir = object_dir.join("info");
+    fs::create_dir_all(&graph_dir)?;
+    write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+    Ok(())
+}
+
+/// Seed commits for the default (all-packs) write: every commit object found in
+/// the object dir's packs (git's `fill_oids_from_all_packs`).
+fn commit_graph_packed_commit_starts(
+    db: &FileObjectDatabase,
+    object_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let mut starts = Vec::new();
+    let mut seen = HashSet::new();
+    for oid in sley_odb::packed_object_ids(object_dir, format)? {
+        let Ok(object) = db.read_object(&oid) else {
+            continue;
+        };
+        if object.object_type == ObjectType::Commit && seen.insert(oid) {
+            starts.push(oid);
+        }
+    }
+    Ok(starts)
+}
+
+/// `--stdin-packs`: read pack index paths from stdin and seed from the commits
+/// in those packs. A missing/invalid pack is a fatal "error adding pack".
+fn commit_graph_stdin_packs_starts(
+    db: &FileObjectDatabase,
+    object_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let mut starts = Vec::new();
+    let mut seen = HashSet::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let pack_path = resolve_cli_path(&env::current_dir()?, line);
+        // git resolves the named pack relative to the object dir's pack/ dir
+        // when it is not an absolute existing path.
+        let candidates = [pack_path.clone(), object_dir.join("pack").join(line)];
+        let resolved = candidates.iter().find(|path| path.exists());
+        let Some(resolved) = resolved else {
+            eprintln!("error: error adding pack {line}");
+            return Err(GitError::Exit(1));
+        };
+        let oids = commit_graph_commit_oids_in_pack(db, resolved, format).map_err(|_| {
+            eprintln!("error: error adding pack {line}");
+            GitError::Exit(1)
+        })?;
+        for oid in oids {
+            if seen.insert(oid) {
+                starts.push(oid);
+            }
+        }
+    }
+    Ok(starts)
+}
+
+/// Commit oids contained in a single pack, addressed by its `.idx` or `.pack`
+/// path.
+fn commit_graph_commit_oids_in_pack(
+    db: &FileObjectDatabase,
+    pack_path: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let idx_path = if pack_path.extension().and_then(|ext| ext.to_str()) == Some("pack") {
+        pack_path.with_extension("idx")
+    } else {
+        pack_path.to_path_buf()
+    };
+    let index_bytes = fs::read(&idx_path)?;
+    let index = sley_pack::PackIndex::parse(&index_bytes, format)?;
+    let mut oids = Vec::new();
+    for entry in index.entries {
+        if let Ok(object) = db.read_object(&entry.oid)
+            && object.object_type == ObjectType::Commit
+        {
+            oids.push(entry.oid);
+        }
+    }
+    Ok(oids)
+}
+
+/// `--stdin-commits`: read commit oids from stdin (each must be hex and resolve
+/// to an existing object), seed the closure from them. git's diagnostics:
+/// "unexpected non-hex object ID: <s>" and "invalid object <oid>".
+fn commit_graph_stdin_commits_starts(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let mut starts = Vec::new();
+    let mut seen = HashSet::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(oid) = ObjectId::from_hex(format, line) else {
+            eprintln!("error: unexpected non-hex object ID: {line}");
+            return Err(GitError::Exit(1));
+        };
+        let Ok(object) = db.read_object(&oid) else {
+            eprintln!("error: invalid object {line}");
+            return Err(GitError::Exit(1));
+        };
+        // Peel tags/commit; non-commit tree-ish (e.g. a tree oid) is silently
+        // skipped, matching git, which only graphs the commit objects.
+        if object.object_type == ObjectType::Commit && seen.insert(oid) {
+            starts.push(oid);
+        }
+    }
+    Ok(starts)
 }
 
 fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
@@ -4102,7 +4622,9 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
     if chain_path.exists() {
         return verify_split_commit_graph_chain(&chain_path, format);
     }
-    Err(GitError::not_found("commit-graph"))
+    // No commit-graph at all is not an error (git's `commit-graph verify`
+    // exits 0 when there is nothing to verify).
+    Ok(())
 }
 
 fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> Result<()> {
@@ -4183,7 +4705,20 @@ fn commit_graph_for_reachable_refs(
     {
         starts.push(commit);
     }
-    let records = sley_rev::walk_commits(&db, format, starts)?;
+    commit_graph_from_starts(&db, format, starts, changed_paths, bloom_settings)
+}
+
+/// Build the commit-graph bytes from a set of seed commit oids (their parent
+/// closure is walked). Shared by the `--reachable`, default-all-packs, and
+/// `--stdin-commits` paths.
+fn commit_graph_from_starts(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: Vec<ObjectId>,
+    changed_paths: bool,
+    bloom_settings: sley_formats::CommitGraphBloomSettings,
+) -> Result<Vec<u8>> {
+    let records = sley_rev::walk_commits(db, format, starts)?;
     let record_map = records
         .iter()
         .map(|record| (record.oid, record))
@@ -4193,7 +4728,7 @@ fn commit_graph_for_reachable_refs(
     for record in &records {
         let bloom_filter = if changed_paths {
             Some(commit_graph_bloom_filter_for_record(
-                &db,
+                db,
                 format,
                 record,
                 &record_map,

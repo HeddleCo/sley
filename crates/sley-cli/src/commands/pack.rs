@@ -1553,19 +1553,56 @@ fn filesystem_size_kib(metadata: &fs::Metadata) -> u64 {
     metadata.len().div_ceil(1024)
 }
 
+const MULTI_PACK_INDEX_USAGE: &str = "\
+usage: git multi-pack-index [--object-dir <dir>] [--[no-]bitmap]
+                            [--[no-]progress] <subcommand> [<options>]
+";
+
 pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
-    let Some(subcommand) = args.first().map(String::as_str) else {
-        return Err(GitError::Command(
-            "multi-pack-index requires <expire|write|verify>".into(),
-        ));
+    // git accepts the shared options (`--object-dir`, `--[no-]progress`,
+    // `--[no-]bitmap`) *before* the subcommand; collect them and prepend them to
+    // the subcommand's own args so the per-subcommand parser sees them too.
+    let mut global: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    let subcommand = loop {
+        let Some(arg) = iter.next() else {
+            // No subcommand ⇒ usage error (exit 129).
+            eprint!("{MULTI_PACK_INDEX_USAGE}");
+            return Err(GitError::Exit(129));
+        };
+        match arg.as_str() {
+            "--object-dir" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command("--object-dir requires a value".into()));
+                };
+                global.push("--object-dir".into());
+                global.push(value.clone());
+            }
+            value
+                if value.starts_with("--object-dir=")
+                    || matches!(value, "--progress" | "--no-progress" | "--bitmap" | "--no-bitmap") =>
+            {
+                global.push(value.to_string());
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                eprint!("{MULTI_PACK_INDEX_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            other => break other.to_string(),
+        }
     };
-    match subcommand {
-        "expire" => cmd_multi_pack_index_expire(&args[1..]),
-        "write" => cmd_multi_pack_index_write(&args[1..]),
-        "verify" => cmd_multi_pack_index_verify(&args[1..]),
-        other => Err(GitError::Command(format!(
-            "unsupported multi-pack-index subcommand {other}"
-        ))),
+    let rest: Vec<String> = iter.cloned().collect();
+    let combined: Vec<String> = global.into_iter().chain(rest).collect();
+    match subcommand.as_str() {
+        "expire" => cmd_multi_pack_index_expire(&combined),
+        "write" => cmd_multi_pack_index_write(&combined),
+        "verify" => cmd_multi_pack_index_verify(&combined),
+        other => {
+            eprintln!("error: unknown subcommand: `{other}'");
+            eprint!("{MULTI_PACK_INDEX_USAGE}");
+            Err(GitError::Exit(129))
+        }
     }
 }
 

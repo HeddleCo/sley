@@ -7123,6 +7123,39 @@ impl TreeAttributes {
             .attributes_for_path(path, &filter_attribute_names(), false);
         apply_smudge_filter_with_attributes(config, &checks, path, content)
     }
+
+    /// True when `path` has the `export-subst` attribute set (git's
+    /// `check_attr_export_subst`), meaning `git archive` should run
+    /// `$Format:…$` keyword substitution on its content.
+    pub fn export_subst_for_path(&self, path: &[u8]) -> bool {
+        self.attribute_is_set(path, b"export-subst")
+    }
+
+    /// True when `path` has the `export-ignore` attribute set (git's
+    /// `check_attr_export_ignore`), meaning `git archive` should omit the path
+    /// (and, for a directory, its whole subtree) from the archive.
+    pub fn export_ignore_for_path(&self, path: &[u8]) -> bool {
+        self.attribute_is_set(path, b"export-ignore")
+    }
+
+    fn attribute_is_set(&self, path: &[u8], attribute: &[u8]) -> bool {
+        let requested = [attribute.to_vec()];
+        let checks = self.matcher.attributes_for_path(path, &requested, false);
+        matches!(
+            checks.first().and_then(|check| check.state.as_ref()),
+            Some(AttributeState::Set)
+        )
+    }
+
+    /// The `diff` attribute state for `path` (`Set` for `diff`, `Unset` for
+    /// `-diff`, `Value(name)` for `diff=<name>`, `None` when unspecified). Used
+    /// by `git archive`'s zip backend to classify text vs. binary via the
+    /// path's userdiff driver.
+    pub fn diff_attribute_for_path(&self, path: &[u8]) -> Option<AttributeState> {
+        let requested = [b"diff".to_vec()];
+        let checks = self.matcher.attributes_for_path(path, &requested, false);
+        checks.into_iter().next().and_then(|check| check.state)
+    }
 }
 
 /// Like [`apply_clean_filter`] but takes already-resolved attribute checks,

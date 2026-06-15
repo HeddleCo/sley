@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+crc32fast = "1"
+# zip deflate. default-features=false + zlib-rs matches sley-pack so the
+# workspace resolves a single flate2 backend (no C toolchain).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
