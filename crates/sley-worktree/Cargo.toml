@@ -17,6 +17,7 @@ sley-object = { path = "../sley-object", version = "0.0.1" }
 sley-odb = { path = "../sley-odb", version = "0.0.1" }
 sley-pathspec = { path = "../sley-pathspec", version = "0.0.1" }
 sley-refs = { path = "../sley-refs", version = "0.0.1" }
+sley-rev = { path = "../sley-rev", version = "0.0.1" }
 
 [lints]
 workspace = true
