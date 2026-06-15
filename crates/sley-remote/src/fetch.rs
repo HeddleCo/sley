@@ -25,13 +25,15 @@ use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{
-    FileObjectDatabase, collect_reachable_object_ids, collect_reachable_object_ids_excluding,
+    FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
+    collect_reachable_object_ids_excluding,
 };
 #[cfg(feature = "http")]
 use sley_protocol::ProtocolVersion;
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec, encode_fetch_head,
-    fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refspec_map_source,
+    fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refname_matches,
+    refspec_map_source,
 };
 use sley_refs::{BundleRefUpdate, FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
@@ -88,9 +90,13 @@ pub struct FetchOptions {
     /// in-process local (`file://`/path) server, which computes the deepen
     /// boundary itself (see [`crate::local::compute_local_deepen`]).
     pub depth: Option<u32>,
-    /// When fetching configured remote refspecs, mark the update whose `src`
-    /// matches this value as eligible for merge in `FETCH_HEAD` (used by `pull`).
-    pub merge_src: Option<String>,
+    /// When fetching configured remote refspecs, mark updates whose `src`
+    /// matches one of these (possibly-abbreviated) `branch.<name>.merge` values
+    /// as eligible for merge in `FETCH_HEAD`. More than one entry is an octopus
+    /// merge config. Empty falls back to git's default (first ref of the first
+    /// non-pattern configured refspec). Used by `fetch` (current-branch merge
+    /// config) and `pull`.
+    pub merge_srcs: Vec<String>,
     /// Partial-clone object filter (`--filter=blob:none`): omit filtered
     /// objects from the transferred pack. Local-only today: HTTP and SSH do not
     /// send `filter` requests yet, so callers that require network filtering
@@ -243,6 +249,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 options: &options,
                 store: &store,
                 reachable: None,
+                local_db: None,
                 deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
@@ -289,7 +296,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     git_dir: request.git_dir,
                     store: &store,
                     options: &options,
-                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                 },
@@ -311,6 +317,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 options: &options,
                 store: &store,
                 reachable: None,
+                local_db: None,
                 deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
@@ -340,7 +347,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     git_dir: request.git_dir,
                     store: &store,
                     options: &options,
-                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                 },
@@ -359,6 +365,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 options: &options,
                 store: &store,
                 reachable: None,
+                local_db: None,
                 deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
@@ -386,7 +393,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     git_dir: request.git_dir,
                     store: &store,
                     options: &options,
-                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                 },
@@ -488,12 +494,14 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 heads
             };
             let mut deepen_plan = plan_deepen(&primary_heads)?;
+            let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
             let mut updates = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
                 options: &options,
                 store: &store,
                 reachable: Some((&remote_db, &advertisements)),
+                local_db: Some(&local_db),
                 deepen_excluded: deepen_plan.as_ref().map(|plan| &plan.excluded),
                 format: request.format,
                 configured_remote_fetch,
@@ -581,7 +589,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     git_dir: request.git_dir,
                     store: &store,
                     options: &options,
-                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                 },
@@ -667,6 +674,10 @@ struct FetchPlanInput<'a> {
     options: &'a FetchOptions,
     store: &'a FileRefStore,
     reachable: Option<(&'a FileObjectDatabase, &'a [RefAdvertisement])>,
+    /// The local repository's object database, used to follow tags whose target
+    /// is already present locally (git's `find_non_local_tags` `odb_has_object`
+    /// check). Only the local transport supplies it; auto-follow is local-only.
+    local_db: Option<&'a FileObjectDatabase>,
     deepen_excluded: Option<&'a HashSet<ObjectId>>,
     format: ObjectFormat,
     configured_remote_fetch: bool,
@@ -679,6 +690,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         options,
         store,
         reachable,
+        local_db,
         deepen_excluded,
         format,
         configured_remote_fetch,
@@ -693,6 +705,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
             append_reachable_auto_follow_tags(
                 advertisements,
                 remote_db,
+                local_db,
                 format,
                 refspecs,
                 &mut updates,
@@ -705,13 +718,35 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         for update in &mut updates {
             update.not_for_merge = true;
         }
-        if let Some(merge_src) = &options.merge_src {
+        if !options.merge_srcs.is_empty() {
+            // The current branch's `branch.<name>.merge` ref(s) are what we'll
+            // merge, so they are the for-merge entries in FETCH_HEAD. Each entry
+            // is matched with git's abbreviation rules (`branch_merge_matches`);
+            // more than one is an octopus merge config.
             for update in &mut updates {
-                if update.src == *merge_src {
+                if options
+                    .merge_srcs
+                    .iter()
+                    .any(|src| refname_matches(src, &update.src))
+                {
                     update.not_for_merge = false;
                 }
             }
+        } else if let Some(first) = refspecs.iter().find(|refspec| !refspec.negative)
+            && !first.pattern
+        {
+            // No merge config: mirror git's get_ref_map default, which marks the
+            // first matched ref of the first configured (non-pattern) fetch
+            // refspec as for-merge. Pattern-led configs (e.g. refs/heads/*) leave
+            // every entry not-for-merge.
+            if let Some(update) = updates.first_mut() {
+                update.not_for_merge = false;
+            }
         }
+        // git's store_updated_refs writes FETCH_HEAD in two passes: all for-merge
+        // entries first (in ref-map order), then all not-for-merge. Reorder
+        // stably to reproduce that layout.
+        updates.sort_by_key(|update| update.not_for_merge);
     }
     Ok(updates)
 }
@@ -723,7 +758,6 @@ struct FetchFinalize<'a> {
     git_dir: &'a Path,
     store: &'a FileRefStore,
     options: &'a FetchOptions,
-    remote_name: &'a str,
     fetch_head_source: &'a str,
     default_head_fetch: bool,
 }
@@ -737,7 +771,6 @@ fn finalize_fetch(
         git_dir,
         store,
         options,
-        remote_name,
         fetch_head_source,
         default_head_fetch,
     } = finalize;
@@ -751,7 +784,7 @@ fn finalize_fetch(
             && updates[0].src == "HEAD"
             && updates[0].dst.is_none()
         {
-            write_default_fetch_head(git_dir, remote_name, updates[0].oid, options.append)?;
+            write_default_fetch_head(git_dir, fetch_head_source, updates[0].oid, options.append)?;
         } else {
             write_fetch_head(git_dir, fetch_head_source, updates, options.append)?;
         }
@@ -877,6 +910,7 @@ pub fn retain_missing_auto_follow_tags(
 pub fn append_reachable_auto_follow_tags(
     advertisements: &[RefAdvertisement],
     remote_db: &FileObjectDatabase,
+    local_db: Option<&FileObjectDatabase>,
     format: ObjectFormat,
     refspecs: &[RefSpec],
     updates: &mut Vec<FetchRefUpdate>,
@@ -885,10 +919,31 @@ pub fn append_reachable_auto_follow_tags(
     if !updates.iter().any(|update| update.dst.is_some()) {
         return Ok(());
     }
-    let starts = updates
-        .iter()
-        .filter(|update| update.dst.is_some() && !update.src.starts_with("refs/tags/"))
-        .map(|update| update.oid);
+    // Drop any auto-follow tag entries the shared planner added: when we have the
+    // remote object database we are the authoritative tag follower (we peel
+    // annotated tags) and we re-add the full set sorted by refname, mirroring
+    // git's `find_non_local_tags`, which inserts into a sorted string-list.
+    updates.retain(|update| {
+        !(update.src.starts_with("refs/tags/")
+            && update.dst.as_deref() == Some(update.src.as_str())
+            && update.not_for_merge)
+    });
+    // Reachability seeds are every object we're fetching (git's `fetch_oids`):
+    // non-tag tips directly, and tag updates by their peeled target so an
+    // explicitly-requested `tag <name>` still seeds the auto-follow of its
+    // siblings.
+    let mut starts = Vec::new();
+    for update in updates.iter().filter(|update| update.dst.is_some()) {
+        if update.src.starts_with("refs/tags/") {
+            if let Some(target) = peel_tag_target(remote_db, format, &update.oid)? {
+                starts.push(target);
+            } else {
+                starts.push(update.oid);
+            }
+        } else {
+            starts.push(update.oid);
+        }
+    }
     // A deepen fetch must not auto-follow tags past the shallow boundary: only
     // tags whose target lands in the truncated pack are followed (upstream's
     // include-tag packs a tag only when its referenced object is packed).
@@ -898,27 +953,68 @@ pub fn append_reachable_auto_follow_tags(
         }
         None => collect_reachable_object_ids(remote_db, format, starts)?,
     };
-    let mut fetched_srcs = updates
+    let fetched_srcs = updates
         .iter()
         .map(|update| update.src.clone())
         .collect::<HashSet<_>>();
+    let mut followed = Vec::new();
     for reference in advertisements {
         if !reference.name.starts_with("refs/tags/")
             || fetched_srcs.contains(&reference.name)
-            || !reachable.contains(&reference.oid)
             || fetch_refspec_excludes(refspecs, &reference.name)?
         {
             continue;
         }
-        fetched_srcs.insert(reference.name.clone());
-        updates.push(FetchRefUpdate {
+        // A tag is auto-followed when the object it ultimately points at is
+        // either among the objects being fetched (reachable from a fetched tip)
+        // or already present in the local object database (git's
+        // `find_non_local_tags`: `oidset_contains(fetch_oids) || odb_has_object`).
+        // For lightweight tags the target is the advertised oid; for annotated
+        // tags it is the peeled target (the tag object is never reachable from a
+        // commit, so peel through the chain).
+        let target = peel_tag_target(remote_db, format, &reference.oid)?.unwrap_or(reference.oid);
+        let fetched = reachable.contains(&reference.oid) || reachable.contains(&target);
+        let present_locally = local_db
+            .map(|db| db.contains(&target))
+            .transpose()?
+            .unwrap_or(false);
+        if !fetched && !present_locally {
+            continue;
+        }
+        followed.push(FetchRefUpdate {
             src: reference.name.clone(),
             dst: Some(reference.name.clone()),
             oid: reference.oid,
             not_for_merge: true,
         });
     }
+    followed.sort_by(|a, b| a.src.cmp(&b.src));
+    updates.extend(followed);
     Ok(())
+}
+
+/// Peel an annotated-tag object to the non-tag object it ultimately references,
+/// following nested tag chains. Returns `None` if `oid` is not an annotated tag
+/// (a lightweight tag points directly at its target, already the advertised oid)
+/// or cannot be read from `db`.
+fn peel_tag_target(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let mut current = *oid;
+    let mut peeled = None;
+    loop {
+        let Ok(object) = db.read_object(&current) else {
+            return Ok(peeled);
+        };
+        if object.object_type != sley_object::ObjectType::Tag {
+            return Ok(peeled);
+        }
+        let tag = sley_object::Tag::parse(format, &object.body)?;
+        current = tag.object;
+        peeled = Some(current);
+    }
 }
 
 /// Whether any negative refspec excludes `name`.
@@ -1016,11 +1112,29 @@ pub fn write_fetch_head(
 /// The `FETCH_HEAD` source description for `source`: its configured URL (rewritten
 /// per `url.<base>.insteadOf`) if any, otherwise the rewritten `source`.
 pub fn fetch_head_source_description(config: &GitConfig, source: &str) -> String {
-    remote_config_values(config, source, "url")
+    let url = remote_config_values(config, source, "url")
         .into_iter()
         .next()
         .map(|url| rewrite_url_with_config(config, &url, false))
-        .unwrap_or_else(|| rewrite_url_with_config(config, source, false))
+        .unwrap_or_else(|| rewrite_url_with_config(config, source, false));
+    trim_fetch_head_display_url(&url)
+}
+
+/// Mirror git's `display_state` URL trimming (builtin/fetch.c): strip trailing
+/// slashes and a trailing `.git` so the `FETCH_HEAD` note reads `branch 'x' of
+/// ../` rather than `branch 'x' of ../.git/`.
+fn trim_fetch_head_display_url(url: &str) -> String {
+    let bytes = url.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    // `end` is the length excluding trailing slashes; git's `i` (index of the
+    // last non-slash byte) is `end - 1`, and it strips `.git` only when `i > 4`.
+    if end > 5 && &bytes[end - 4..end] == b".git" {
+        end -= 4;
+    }
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Prune remote-tracking refs for `remote` that are absent from `advertisements`,
@@ -1179,7 +1293,7 @@ mod tests {
             tag_option_explicit: true,
             prune_option_explicit: true,
             depth: None,
-            merge_src: None,
+            merge_srcs: Vec::new(),
             filter: None,
             cloning: false,
             update_shallow: false,

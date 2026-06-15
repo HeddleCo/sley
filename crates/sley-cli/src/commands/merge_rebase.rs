@@ -2192,19 +2192,20 @@ fn resolve_pull_remote_and_refspecs(
     store: &FileRefStore,
     remote: Option<String>,
     branch: Option<String>,
-) -> Result<(String, Vec<String>, Option<String>)> {
+) -> Result<(String, Vec<String>, Vec<String>)> {
     match (remote, branch) {
         (Some(remote), Some(branch)) => {
             let refspec = format!("refs/heads/{branch}");
-            Ok((remote, vec![refspec], Some(format!("refs/heads/{branch}"))))
+            Ok((remote, vec![refspec], vec![format!("refs/heads/{branch}")]))
         }
         (Some(remote), None) => {
-            let merge_src = store.current_branch().ok().flatten().and_then(|current| {
-                config
-                    .get("branch", Some(&current), "merge")
-                    .map(str::to_string)
-            });
-            Ok((remote, Vec::new(), merge_src))
+            let merge_srcs = store
+                .current_branch()
+                .ok()
+                .flatten()
+                .map(|current| branch_merge_values(config, &current))
+                .unwrap_or_default();
+            Ok((remote, Vec::new(), merge_srcs))
         }
         (None, None) => {
             let Some(current) = store.current_branch()? else {
@@ -2252,12 +2253,28 @@ fn resolve_pull_remote_and_refspecs(
                 eprintln!();
                 return Err(GitError::Exit(1));
             };
-            Ok((remote.to_string(), Vec::new(), Some(merge.to_string())))
+            let _ = merge;
+            Ok((
+                remote.to_string(),
+                Vec::new(),
+                branch_merge_values(config, &current),
+            ))
         }
         (None, Some(_)) => Err(GitError::Command(
             "pull currently requires a remote when a branch is specified".into(),
         )),
     }
+}
+
+/// All `branch.<name>.merge` values configured for `branch`, in config order
+/// (more than one is an octopus merge config).
+fn branch_merge_values(config: &GitConfig, branch: &str) -> Vec<String> {
+    config
+        .get_all("branch", Some(branch), "merge")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect()
 }
 
 fn fetch_head_merge_record(git_dir: &Path, format: ObjectFormat) -> Result<FetchHeadRecord> {
@@ -2366,7 +2383,7 @@ fn pull_fetch(
         };
         let store = FileRefStore::new(git_dir, format);
         let mut old_oids = HashMap::new();
-        if options.merge_src.is_some() {
+        if !options.merge_srcs.is_empty() {
             for update_dst in store.list_refs()? {
                 if let Some((oid, _)) = resolve_for_each_ref_target(&store, &update_dst)? {
                     old_oids.insert(update_dst.name, oid);
@@ -2474,7 +2491,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
-    let (remote, refspecs, merge_src) =
+    let (remote, refspecs, merge_srcs) =
         resolve_pull_remote_and_refspecs(&config, &store, remote, branch)?;
     let config_ff_only = config
         .get("pull", None, "ff")
@@ -2495,7 +2512,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         tag_option_explicit: false,
         prune_option_explicit: false,
         depth,
-        merge_src,
+        merge_srcs,
         filter: None,
         cloning: false,
         update_shallow: false,
@@ -2503,9 +2520,50 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
     };
+    // git captures `orig_head` (HEAD before the fetch). A refspec like
+    // `main:main` can create the current branch during the fetch, but the
+    // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
+    let orig_head_unborn = head_commit_oid(&store)?.is_none();
     pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    // Pulling into an unborn branch (git's `pull_into_void`): there is no HEAD to
+    // merge against, so we fast-forward to FETCH_HEAD's merge target by pointing
+    // HEAD at it (unless a refspec already moved the current branch there) and
+    // checking out its tree. Keyed off the *pre-fetch* state so a `main:main`
+    // refspec that created the branch still triggers the void checkout.
+    if orig_head_unborn {
+        let merge_oid = resolve_fetch_head_revision(&git_dir, format)?;
+        let target_ref = match store.read_ref("HEAD")? {
+            Some(RefTarget::Symbolic(branch)) => branch,
+            _ => "HEAD".to_string(),
+        };
+        // The branch may already point at `merge_oid` if a refspec like
+        // `main:main` updated it during the fetch; only move it when it doesn't.
+        if store.read_ref(&target_ref)? != Some(RefTarget::Direct(merge_oid)) {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: target_ref,
+                expected: None,
+                new: RefTarget::Direct(merge_oid),
+                reflog: Some(ReflogEntry {
+                    old_oid: zero_oid(format)?,
+                    new_oid: merge_oid,
+                    committer: commit_identity_from_env("COMMITTER")?,
+                    message: b"initial pull".to_vec(),
+                }),
+            });
+            tx.commit()?;
+        }
+        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &worktree_root,
+            &git_dir,
+            format,
+            &merge_oid,
+        )?;
+        return Ok(());
+    }
     let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;
     let theirs_oid = resolve_fetch_head_revision(&git_dir, format)?;
     let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;

@@ -321,7 +321,7 @@ fn clone_fetch_options(
         tag_option_explicit: false,
         prune_option_explicit: false,
         depth,
-        merge_src: None,
+        merge_srcs: Vec::new(),
         filter,
         cloning: true,
         update_shallow: false,

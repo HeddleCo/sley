@@ -617,6 +617,14 @@ fn fetch_refname_match_score(abbrev: &str, full: &str) -> usize {
     0
 }
 
+/// Whether `abbrev` (a possibly-abbreviated ref like `three` or `refs/heads/main`)
+/// matches the full ref `full` under git's `ref_rev_parse_rules` expansion, the
+/// way `refname_match`/`branch_merge_matches` (remote.c) compare a configured
+/// `branch.<name>.merge` value against an advertised ref name.
+pub fn refname_matches(abbrev: &str, full: &str) -> bool {
+    fetch_refname_match_score(abbrev, full) > 0
+}
+
 /// Qualify a fetch refspec destination the way upstream's `get_local_ref`
 /// (remote.c) does: `refs/...` stays as-is, `heads/`, `tags/` and `remotes/`
 /// gain a `refs/` prefix, and anything else lands under `refs/heads/`.
@@ -736,7 +744,15 @@ pub fn plan_push_commands(
         }
         match (refspec.src.as_deref(), refspec.dst.as_deref()) {
             (None, None) => {
+                // A bare ":" (matching) refspec pushes only refs the remote
+                // already has, by their fully-qualified `refs/...` name. git's
+                // matching source set is the local ref advertisement, which never
+                // includes `HEAD` or short-name aliases — push those would try to
+                // update the remote's `HEAD`, so skip anything not under `refs/`.
                 for local in local_refs {
+                    if !local.name.starts_with("refs/") {
+                        continue;
+                    }
                     validate_push_source_ref(format, local)?;
                     if let Some(remote) = remote_ref(remote_refs, &local.name) {
                         commands.push(ReceivePackCommand {

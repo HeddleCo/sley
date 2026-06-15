@@ -258,7 +258,7 @@ mod tests {
             tag_option_explicit: true,
             prune_option_explicit: true,
             depth,
-            merge_src: None,
+            merge_srcs: Vec::new(),
             filter: None,
             cloning: false,
             update_shallow: false,

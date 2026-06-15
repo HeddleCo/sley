@@ -1450,7 +1450,7 @@ fn clone_bare_or_mirror_local_repository(
             tag_option_explicit: options.tag_opt.is_some(),
             prune_option_explicit: false,
             depth: None,
-            merge_src: None,
+            merge_srcs: Vec::new(),
             filter: options.fetch_filter,
             cloning: false,
             update_shallow: false,
@@ -1912,6 +1912,49 @@ fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<
     ));
     write_repo_config(git_dir, &config)
 }
+
+/// The remote `git fetch` uses when given no remote argument, mirroring git's
+/// `remote_for_branch`: the current branch's `branch.<name>.remote` if set,
+/// otherwise the sole configured remote, otherwise `origin`.
+fn default_fetch_remote(git_dir: &Path, format: ObjectFormat) -> Result<String> {
+    let config = read_repo_config(git_dir)?;
+    if let Some(current) = FileRefStore::new(git_dir, format).current_branch()?
+        && let Some(remote) = config.get("branch", Some(&current), "remote")
+    {
+        return Ok(remote.to_string());
+    }
+    let remotes = remote_names(&config);
+    Ok(match remotes.as_slice() {
+        [only] => only.clone(),
+        _ => "origin".to_string(),
+    })
+}
+
+/// The current branch's `branch.<name>.merge` values, but only when its
+/// `branch.<name>.remote` is `remote` — git's `add_merge_config` only honors the
+/// merge config when the branch's remote matches the remote being fetched.
+fn current_branch_merge_for_remote(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+) -> Vec<String> {
+    let Ok(config) = read_repo_config(git_dir) else {
+        return Vec::new();
+    };
+    let Ok(Some(current)) = FileRefStore::new(git_dir, format).current_branch() else {
+        return Vec::new();
+    };
+    if config.get("branch", Some(&current), "remote") != Some(remote) {
+        return Vec::new();
+    }
+    config
+        .get_all("branch", Some(&current), "merge")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect()
+}
+
 pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let mut source = None::<String>;
     let mut refspecs = Vec::new();
@@ -1926,7 +1969,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         tag_option_explicit: false,
         prune_option_explicit: false,
         depth: None,
-        merge_src: None,
+        merge_srcs: Vec::new(),
         filter: None,
         cloning: false,
         update_shallow: false,
@@ -2012,14 +2055,37 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 let value = value.strip_prefix("--shallow-exclude=").unwrap_or_default();
                 options.deepen_not.push(value.to_string());
             }
+            // `git fetch <remote> tag <name>` is shorthand for the refspec
+            // `refs/tags/<name>:refs/tags/<name>` (builtin/fetch.c). Only after a
+            // remote has been seen, so a remote literally named "tag" still works.
+            "tag" if source.is_some() => {
+                let name = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("you need to specify a tag name".into()))?;
+                refspecs.push(format!("refs/tags/{name}:refs/tags/{name}"));
+            }
             _ if source.is_none() => source = Some(arg.clone()),
             _ => refspecs.push(arg.clone()),
         }
     }
-    let source = source.unwrap_or_else(|| "origin".to_string());
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    // With no remote argument, resolve the default the way git's
+    // `remote_for_branch` does: the current branch's `branch.<name>.remote`,
+    // else the sole configured remote, else `origin`.
+    let source = match source {
+        Some(source) => source,
+        None => default_fetch_remote(&git_dir, format)?,
+    };
+    // When no refspecs are given on the command line and the current branch's
+    // `branch.<name>.remote` is the remote we're fetching, git's get_ref_map adds
+    // the branch's `branch.<name>.merge` ref(s) as the FETCH_HEAD for-merge
+    // entries (`add_merge_config`). Resolve those so the configured-refspec fetch
+    // marks them correctly (and `pull` can find its merge target).
+    if refspecs.is_empty() {
+        options.merge_srcs = current_branch_merge_for_remote(&git_dir, format, &source);
+    }
     if unshallow {
         if options.depth.is_some() {
             eprintln!("fatal: --depth and --unshallow cannot be used together");
@@ -2183,6 +2249,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut delete = false;
     let mut force = false;
     let mut no_verify = false;
+    let mut dry_run = false;
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2191,6 +2258,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
             "--no-verify" => no_verify = true,
             "--verify" => no_verify = false,
             "-u" | "--set-upstream" => set_upstream = true,
@@ -2244,6 +2313,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         set_upstream,
         force,
         no_verify,
+        dry_run,
     };
     // All transports delegate the git work to `sley_remote::push`, picked purely
     // by the resolved `PushDestination`; this command keeps owning URL/repo
@@ -2300,6 +2370,7 @@ struct PushOptions {
     set_upstream: bool,
     force: bool,
     no_verify: bool,
+    dry_run: bool,
 }
 
 /// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
@@ -2345,6 +2416,17 @@ fn run_push(
     }
     if !options.no_verify {
         run_pre_push_hook(git_dir, remote, refspecs, &plan.commands)?;
+    }
+    // `--dry-run`: report what would happen, but neither send the pack/refs nor
+    // run receive-side hooks nor update local tracking refs (git's TRANSPORT_PUSH_DRY_RUN).
+    if options.dry_run {
+        if !options.quiet {
+            eprintln!("To {remote}");
+            for command in &plan.commands {
+                eprintln!("   {}  {}", command.new_id, command.name);
+            }
+        }
+        return Ok(());
     }
     run_local_receive_pre_hooks(destination, &plan.commands)?;
     let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
