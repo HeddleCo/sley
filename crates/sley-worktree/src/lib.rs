@@ -10514,6 +10514,9 @@ fn resolve_head_tree_oid(
     let Some(commit_oid) = resolve_head_commit_oid(git_dir, format)? else {
         return Ok(None);
     };
+    if let Some(tree_oid) = sley_rev::commit_graph_tree_oid(git_dir, format, &commit_oid)? {
+        return Ok(Some(tree_oid));
+    }
     let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
     let commit = Commit::parse_ref(format, &object.body)?;
     Ok(Some(commit.tree))
