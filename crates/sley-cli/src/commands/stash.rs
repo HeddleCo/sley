@@ -351,6 +351,10 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         )));
     }
     let index_commit = Commit::parse(format, &index_object.body)?;
+    // The stash carries no tracked-tree changes when its working tree equals its
+    // base tree (e.g. an untracked-only stash). merge-recursive prints
+    // "Already up to date." in that case, before the status.
+    let tracked_tree_unchanged = base_commit.tree == stash_commit.tree;
 
     // Apply the stash by 3-way-merging the stash's working tree (`theirs`) into
     // the CURRENT index/worktree (`ours`), using the stash's base tree as the
@@ -378,6 +382,9 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
     }
     if !options.quiet {
+        if tracked_tree_unchanged {
+            println!("Already up to date.");
+        }
         cmd_status(&[])?;
     }
     if let StashApplyOutcome::Conflict = outcome {
@@ -504,19 +511,18 @@ fn apply_stash_via_merge(
     }
 
     if let Some(index_map) = reinstated_index_map {
-        // `--index`: reinstate the stash's staged changes. git's
-        // `reset_tree(index_tree, 0, 0)` rewrites the index alone (cache only, not
-        // the worktree); write the merged index map as the new stage-0 index,
-        // carrying forward stat data for entries whose (mode, oid) is unchanged.
+        // `--index` with staged changes to reinstate (git's `has_index`): rewrite
+        // the index to the merged index tree. git's `reset_tree(index_tree, 0, 0)`
+        // touches the index alone (cache only, not the worktree); write the merged
+        // index map as the new stage-0 index, carrying forward stat data for
+        // entries whose (mode, oid) is unchanged.
         reinstate_stash_index(state.git_dir, format, &index_map)?;
-    } else if reinstate_index {
-        // `--index` requested but there were no staged changes to reinstate: the
-        // index already matches `ours`; leave it as the merge produced it.
     } else {
-        // Plain `apply`: git's `unstage_changes_unless_new` resets the index back
-        // to `ours` for every path that already existed there, keeping only
-        // brand-new paths staged. Stash restores changes to the *working tree*;
-        // the index should look untouched except for newly-introduced files.
+        // Plain `apply` — and `--index` when there were no staged changes (git's
+        // `has_index == 0` case): `unstage_changes_unless_new` resets the index
+        // back to `ours` for every path that already existed there, keeping only
+        // brand-new paths staged. Stash restores changes to the *working tree*; the
+        // index should look untouched except for newly-introduced files.
         unstage_changes_unless_new(state.git_dir, format, &ours_map, &results)?;
     }
     Ok(StashApplyOutcome::Clean)
@@ -992,11 +998,14 @@ fn drop_stash_entry(
 }
 
 fn parse_stash_drop_selector(spec: &str) -> Result<usize> {
+    // git accepts `stash@{n}`, `refs/stash@{n}`, and the bare shorthand `n`
+    // (`git stash drop 1`). A bare numeric token is treated as `stash@{n}`.
     let selector = spec
         .strip_prefix("stash@{")
         .or_else(|| spec.strip_prefix("refs/stash@{"))
-        .and_then(|rest| rest.strip_suffix('}'));
-    let Some(selector) = selector else {
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| spec.chars().all(|c| c.is_ascii_digit()).then_some(spec));
+    let Some(selector) = selector.filter(|value| !value.is_empty()) else {
         eprintln!("error: {spec} is not a valid reference");
         return Err(GitError::Exit(1));
     };
@@ -3767,4 +3776,74 @@ pub(crate) fn apply_stash_commit_quietly(stash_oid: &ObjectId) -> Result<bool> {
         restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sel(spec: &str) -> Option<usize> {
+        parse_stash_drop_selector(spec).ok()
+    }
+
+    #[test]
+    fn parses_stash_at_brace_forms() {
+        assert_eq!(sel("stash@{0}"), Some(0));
+        assert_eq!(sel("stash@{3}"), Some(3));
+        assert_eq!(sel("refs/stash@{2}"), Some(2));
+    }
+
+    #[test]
+    fn parses_bare_numeric_shorthand() {
+        // `git stash drop 1` — a bare integer is `stash@{1}`.
+        assert_eq!(sel("0"), Some(0));
+        assert_eq!(sel("1"), Some(1));
+        assert_eq!(sel("42"), Some(42));
+    }
+
+    #[test]
+    fn rejects_non_numeric_and_malformed_selectors() {
+        assert_eq!(sel("HEAD"), None);
+        assert_eq!(sel("stash@{x}"), None);
+        assert_eq!(sel("stash@{1"), None);
+        assert_eq!(sel(""), None);
+        assert_eq!(sel("-1"), None);
+        assert_eq!(sel("1a"), None);
+    }
+
+    fn assumed_ok(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        stash_reject_assumed_push_token(&owned).is_ok()
+    }
+
+    #[test]
+    fn assumed_push_allows_pure_option_invocations() {
+        // `git stash -k`, `git stash --staged`, `git stash -q -u` — all options,
+        // no bare positional, so push is assumable.
+        assert!(assumed_ok(&["-k"]));
+        assert!(assumed_ok(&["--staged"]));
+        assert!(assumed_ok(&["-q", "-u"]));
+        assert!(assumed_ok(&["--keep-index", "--message", "wip"]));
+    }
+
+    #[test]
+    fn assumed_push_allows_pathspecs_after_dashdash() {
+        assert!(assumed_ok(&["--", "file.txt"]));
+        assert!(assumed_ok(&["-q", "--", "a", "b"]));
+    }
+
+    #[test]
+    fn assumed_push_rejects_bare_positional_token() {
+        // `git stash -q drop` must NOT silently stash a pathspec named `drop`.
+        assert!(!assumed_ok(&["-q", "drop"]));
+        assert!(!assumed_ok(&["drop"]));
+        assert!(!assumed_ok(&["file.txt"]));
+    }
+
+    #[test]
+    fn assumed_push_patch_forces_assume() {
+        // `--patch` removes the positional ambiguity, so a following token is ok.
+        assert!(assumed_ok(&["-p", "anything"]));
+        assert!(assumed_ok(&["--patch", "file"]));
+    }
 }
