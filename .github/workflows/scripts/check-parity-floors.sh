@@ -194,6 +194,44 @@
 # t3401-rebase-and-am-rename=5, t4012-diff-binary=4, t4105-apply-fuzz=5; bonus:
 # t4104-apply-boundary 2->3 (the stricter boundary matching is more git-faithful).
 # No workspace test regressed (2203/0).
+# fsck-residual wave (2026-06-14, parity/fsck): t1450-fsck 67->82 (+15) across
+# six tractable sub-clusters. (A) loose-object integrity in sley-odb
+# verify_object: trailing bytes after the zlib stream now report `garbage at end
+# of loose object '<oid>'` + `unable to unpack contents of <path>` (cells 5/83/84),
+# and a body inflated short of its header size reports `corrupt loose object`
+# (cell 85); plus FileObjectDatabase::read_object prefers a packed copy over a
+# corrupt loose one (no spurious re-inflate, cell 82). (B) ref-target validation in
+# cmd_fsck (sley-cli plumbing): a branch ref pointing at a non-commit emits
+# `error: <ref>: not a commit` + ERROR_REFS (cell 6); an unreadable ref tip emits
+# `error: <ref>: invalid sha1 pointer <oid>` + ERROR_REACHABLE and is not walked;
+# the broken-link line now uses git's `%7s` type padding; ERROR_REFS is no longer
+# over-attributed to connectivity-walk broken links (cell 72 exit 10->2); a bogus
+# explicit head exits 2 not 1 (cell 90). (C) gitattributes blob content check
+# (sley-fsck content.rs check_gitattributes_blob + the deferred fsck_blobs pass):
+# a .gitattributes-named tree blob is line-length/size checked (cells 93/94). (D)
+# an empty tree-entry filename is now `error: empty filename in tree entry` +
+# fatal `badTree` (cell 25). (E) index fsck (fsck_index_roots): missing index blobs
+# report `missing blob <oid>` (annotated `(<index>:<name>)` under --name-objects,
+# cells 95/96), the index trailing checksum is verified under a full/--cache fsck
+# (`bad index file sha1 signature`, cell 91), and the cache-tree's tree oids are
+# validated (`invalid sha1 pointer in cache-tree`, ERROR_REFS). Cross-command
+# unblockers feeding the harness: reflog expire --expire=now routes through git's
+# approxidate parser (cell 1, sley-cli lib.rs); rev-parse `<tag>^{blob}` peels a
+# tag to a blob (cell 72 setup, sley-rev peel_to_blob); `git rm --cached` of a path
+# whose blob was removed succeeds by re-hashing the worktree content vs the cached
+# oid instead of reading the (gone) blob, while still honoring git's index-refresh
+# semantics for a stat-dirty-but-content-clean path (cell 90 cleanup; sley-worktree
+# check_local_mod). Residual 14 fails are larger separate clusters: HEAD/worktree
+# ref consistency (`git refs verify`, cells 7-12), rev-list --verify-objects
+# (cells 36/37, a rev-list feature), pack-object fsck (cells 80/81), alternate-odb
+# loose scan (cell 78), --connectivity-only type-only mode (cell 75),
+# --name-objects provenance through the object walk (cell 77), and update-index
+# --cacheinfo in a bare repo (cell 4). Neighbors held (measured==floor, none
+# regressed): t1006-cat-file=290, t5310-pack-bitmaps=221, t1400-update-ref=175,
+# t1461-refs-list=358, t6300-for-each-ref=358, t3600-rm=50, t7508-status=113,
+# t7102-reset=37, t1007-hash-object=40, t1500-rev-parse=81, t1462-refs-exists=12,
+# t1401-symbolic-ref=25, t7004-tag=159, t3200-branch=117, t3301-notes=144,
+# t1300-config=497, t2400-worktree-add=165. No workspace test regressed (2203/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -214,7 +252,7 @@ declare -A FLOOR=(
     [t1300-config.sh]=497
     [t1400-update-ref.sh]=175
     [t1401-symbolic-ref.sh]=25
-    [t1450-fsck.sh]=67
+    [t1450-fsck.sh]=82
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=165
     [t3070-wildmatch.sh]=1861

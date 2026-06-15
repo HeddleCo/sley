@@ -1057,6 +1057,15 @@ fn format_tz_offset(offset_minutes: i64) -> String {
 }
 
 /// git's `parse_expiry_date`: the public entry point. Returns `Some(timestamp)`
+/// git's `approxidate_careful`: parse an absolute-or-relative date string to a
+/// unix timestamp, returning `None` when it does not canonicalise. Unlike
+/// [`parse_expiry_date`], it does NOT special-case "now"/"all" (the caller owns
+/// those sentinels); "now" here resolves to the current time.
+pub(crate) fn parse_approxidate(date: &str) -> Option<i64> {
+    let (ts, had_error) = approxidate_careful(date.as_bytes());
+    if had_error { None } else { Some(ts) }
+}
+
 /// when the value canonicalises, `None` when it does not (git's `errors != 0`).
 pub(crate) fn parse_expiry_date(date: &str) -> Option<i64> {
     if date == "never" || date == "false" {

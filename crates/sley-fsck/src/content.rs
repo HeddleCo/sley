@@ -81,6 +81,9 @@ pub enum MsgId {
     TreeNotSorted,
     LargePathname,
     BadTree,
+    // gitattributes blob content (checked when a tree entry names .gitattributes)
+    GitattributesLarge,
+    GitattributesLineLength,
 }
 
 impl MsgId {
@@ -130,6 +133,8 @@ impl MsgId {
             MsgId::TreeNotSorted => "treeNotSorted",
             MsgId::LargePathname => "largePathname",
             MsgId::BadTree => "badTree",
+            MsgId::GitattributesLarge => "gitattributesLarge",
+            MsgId::GitattributesLineLength => "gitattributesLineLength",
         }
     }
 
@@ -165,6 +170,8 @@ impl MsgId {
             | MsgId::BadTimezone
             | MsgId::DuplicateEntries
             | MsgId::TreeNotSorted
+            | MsgId::GitattributesLarge
+            | MsgId::GitattributesLineLength
             | MsgId::BadTree => DefaultSeverity::Error,
             // WARN in git's table.
             MsgId::NulInCommit
@@ -197,6 +204,12 @@ pub struct ContentFinding {
     /// the rest of the buffer (git returns -1 immediately). Memory-safety in
     /// git; for us it just means later findings on the same object are skipped.
     pub fatal: bool,
+    /// A raw `error: <msg>` line git prints to stderr *before* the formatted
+    /// finding (e.g. tree-walk's `empty filename in tree entry`, emitted by
+    /// `decode_tree_entry` separately from the `badTree` `report()` line). The
+    /// caller prints `error: <raw_stderr>` ahead of the `error in <type> ...`
+    /// line. `None` for the common case.
+    pub raw_stderr: Option<String>,
 }
 
 /// git's default `max_tree_entry_len` (the `largePathname` threshold).
@@ -290,6 +303,61 @@ impl SeverityConfig {
     }
 }
 
+/// git's `ATTR_MAX_LINE_LENGTH` (attr.h): a `.gitattributes` line at or over
+/// this length is unparseable.
+pub const ATTR_MAX_LINE_LENGTH: usize = 2048;
+/// git's `ATTR_MAX_FILE_SIZE` (attr.h): a `.gitattributes` blob at or over this
+/// size is too large to parse.
+pub const ATTR_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+
+/// Content-check a blob that a tree entry named `.gitattributes`, mirroring
+/// git's `fsck_blob` gitattributes branch: a blob at/over `ATTR_MAX_FILE_SIZE`
+/// is `gitattributesLarge`; otherwise the first line at/over
+/// `ATTR_MAX_LINE_LENGTH` is `gitattributesLineLength`. Returns the resolved
+/// findings (rendered as `error in blob <oid>: <msgid>: <detail>`).
+pub fn check_gitattributes_blob(body: &[u8], config: &SeverityConfig) -> Vec<ContentFinding> {
+    let mut raw = Vec::new();
+    if body.len() >= ATTR_MAX_FILE_SIZE {
+        raw.push(finding(
+            MsgId::GitattributesLarge,
+            ".gitattributes too large to parse",
+            false,
+        ));
+    } else {
+        // git scans up to the NUL terminator of the in-memory buffer; a blob
+        // body has no implicit NUL, so we walk the whole body line by line.
+        let mut start = 0usize;
+        while start < body.len() {
+            let eol = body[start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|off| start + off)
+                .unwrap_or(body.len());
+            if eol - start >= ATTR_MAX_LINE_LENGTH {
+                raw.push(finding(
+                    MsgId::GitattributesLineLength,
+                    ".gitattributes has too long lines to parse",
+                    false,
+                ));
+                break;
+            }
+            start = if eol < body.len() { eol + 1 } else { eol };
+        }
+    }
+    raw.retain_mut(|finding| {
+        finding.severity = config.resolve(finding.msg_id);
+        finding.severity != Severity::Ignore
+    });
+    raw
+}
+
+/// Whether a tree-entry name is `.gitattributes` (HFS/NTFS spellings included,
+/// mirroring git's `is_hfs_dotgitattributes`/`is_ntfs_dotgitattributes`). For
+/// the parity suite the plain ASCII form is what the tests exercise.
+pub fn is_dotgitattributes_name(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b".gitattributes")
+}
+
 /// Validate a loaded object body, returning every content finding whose
 /// resolved severity is not [`Severity::Ignore`].
 pub fn check_object_content(
@@ -318,6 +386,21 @@ fn finding(msg_id: MsgId, detail: impl Into<String>, fatal: bool) -> ContentFind
         severity: Severity::Error,
         detail: detail.into(),
         fatal,
+        raw_stderr: None,
+    }
+}
+
+/// A finding that carries a preceding raw `error: <raw>` stderr line, mirroring
+/// git's tree-walk `error()` calls that fire before the `report()` finding.
+fn finding_with_raw(
+    msg_id: MsgId,
+    detail: impl Into<String>,
+    fatal: bool,
+    raw: impl Into<String>,
+) -> ContentFinding {
+    ContentFinding {
+        raw_stderr: Some(raw.into()),
+        ..finding(msg_id, detail, fatal)
     }
 }
 
@@ -793,6 +876,12 @@ fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
     let mut pos = 0usize;
     let mut prev: Option<(u32, Vec<u8>)> = None;
     let mut malformed = false;
+    // An empty tree-entry filename is caught by git's `decode_tree_entry`
+    // (`!*path` → `error("empty filename in tree entry")` + `badTree`), distinct
+    // from the in-bounds `emptyName` warning (which a real tree can never reach,
+    // since decode rejects it first). When set we emit the raw stderr line and a
+    // fatal `badTree` instead.
+    let mut empty_filename = false;
     // git's `df_dup_candidates`: non-directory names awaiting a later directory
     // that would collide via the implicitly-added '/'.
     let mut df_candidates: Vec<Vec<u8>> = Vec::new();
@@ -830,6 +919,15 @@ fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
             break;
         }
         let name = &body[name_start..pos];
+        // git's `decode_tree_entry` rejects an empty filename before recording
+        // the entry: a raw `error: empty filename in tree entry` on stderr, then
+        // the tree is `badTree` ("cannot be parsed as a tree"). This is fatal —
+        // distinct from the in-bounds `emptyName` warning.
+        if name.is_empty() {
+            empty_filename = true;
+            malformed = true;
+            break;
+        }
         pos += 1; // past NUL
         // oid
         if pos + oid_len > body.len() {
@@ -939,7 +1037,20 @@ fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
         ));
     }
     if malformed {
-        out.push(finding(MsgId::BadTree, "cannot be parsed as a tree", false));
+        if empty_filename {
+            // git: `decode_tree_entry` prints `error: empty filename in tree
+            // entry` (stderr) then `fsck_tree` reports `badTree`. The badTree is
+            // a hard object error (sets ERROR_OBJECT, exit 1) and is fatal so the
+            // link walk does not also run.
+            out.push(finding_with_raw(
+                MsgId::BadTree,
+                "cannot be parsed as a tree",
+                true,
+                "empty filename in tree entry",
+            ));
+        } else {
+            out.push(finding(MsgId::BadTree, "cannot be parsed as a tree", false));
+        }
     }
     out
 }

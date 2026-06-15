@@ -3404,6 +3404,13 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
+    /// Whether `oid` resides in some pack of this store (without decoding it).
+    /// Used to prefer a packed copy over a corrupt loose file without re-reading
+    /// the loose file.
+    fn has_packed_object(&self, oid: &ObjectId) -> Result<bool> {
+        Ok(self.find_pack_containing(oid)?.is_some())
+    }
+
     fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<Arc<EncodedObject>>> {
         // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
         // bases that resolve back through the store + repeated whole-object reads).
@@ -3942,11 +3949,23 @@ impl ObjectReader for FileObjectDatabase {
         if let Some(object) = implied_empty_tree_object(self.format, oid) {
             return Ok(object);
         }
-        match self.loose.read_object(oid) {
-            Ok(object) => return Ok(object),
-            Err(GitError::NotFound(_)) => {}
-            Err(err) => return Err(err),
+        // A corrupt loose copy must not shadow a good packed copy: git's
+        // `oid_object_info_extended` consults every source, so a repacked object
+        // whose loose file was later corrupted still reads fine from the pack. If
+        // a packed copy exists, prefer it WITHOUT touching the corrupt loose file
+        // (which would otherwise emit a spurious `inflate:` diagnostic on each
+        // probe). Only when no pack copy exists do we read (and, if corrupt,
+        // surface the error from) the loose file.
+        if self.has_packed_object(oid)?
+            && let Some(object) = self.read_packed_object(oid)?
+        {
+            return Ok(object);
         }
+        let loose_err = match self.loose.read_object(oid) {
+            Ok(object) => return Ok(object),
+            Err(GitError::NotFound(_)) => None,
+            Err(err) => Some(err),
+        };
         if let Some(object) = self.read_packed_object(oid)? {
             return Ok(object);
         }
@@ -3967,6 +3986,12 @@ impl ObjectReader for FileObjectDatabase {
             Ok(object) => return Ok(object),
             Err(GitError::NotFound(_)) => {}
             Err(err) => return Err(err),
+        }
+        // No good copy in any store. If the local loose copy was corrupt (not
+        // merely absent), surface that error — it is more specific than a plain
+        // "not found".
+        if let Some(err) = loose_err {
+            return Err(err);
         }
         Err(GitError::object_not_found_in(
             *oid,
@@ -4317,11 +4342,15 @@ impl LooseObjectStore {
         let mut framed = Vec::new();
         if decoder.read_to_end(&mut framed).is_err() {
             emit_inflate_diagnostic(&compressed);
-            // No NUL inside the header window means inflation died before the
-            // framing header materialized (`unpack_loose_header` != ULHR_OK);
-            // with the header intact it is the body that broke
-            // (`unpack_loose_rest`).
+            // git inflates the header first (`unpack_loose_header`), then the body
+            // (`unpack_loose_rest`). If the header inflated (its NUL is visible in
+            // the partial output) but the body broke, that is a *content*
+            // corruption: git's `unpack_loose_rest` prints `corrupt loose object
+            // '<oid>'` (status != Z_STREAM_END), then `read_loose_object` adds
+            // `unable to unpack contents of <path>`. If inflation died before the
+            // header materialized, only the header message fires.
             if framed_loose_header_terminated(&framed) {
+                eprintln!("error: corrupt loose object '{oid}'");
                 eprintln!("error: unable to unpack contents of {display_path}");
             } else {
                 eprintln!("error: unable to unpack header of {display_path}");
@@ -4333,6 +4362,35 @@ impl LooseObjectStore {
             // `read_loose_object` treats every non-OK `unpack_loose_header` alike.
             eprintln!("error: unable to unpack header of {display_path}");
             return Ok(Some(LooseObjectIntegrity::Corrupt));
+        }
+        // git's `unpack_loose_rest`/`check_stream_oid` reject trailing bytes after
+        // the zlib stream: a fully-inflated object whose compressed input was not
+        // entirely consumed is `garbage at end of loose object '<oid>'`, then
+        // `object corrupt or missing: <path>` from `fsck_loose`. (read_to_end
+        // stops at Z_STREAM_END and silently ignores the trailing bytes, so we
+        // compare consumed input against the file size ourselves.)
+        if (decoder.total_in() as usize) < compressed.len() {
+            // git's `unpack_loose_rest` prints `garbage at end of loose object`
+            // then returns NULL, so `read_loose_object` also prints `unable to
+            // unpack contents of <path>`.
+            eprintln!("error: garbage at end of loose object '{oid}'");
+            eprintln!("error: unable to unpack contents of {display_path}");
+            return Ok(Some(LooseObjectIntegrity::Corrupt));
+        }
+        // A truncated object can inflate to a clean stream end yet yield fewer
+        // body bytes than the header's declared size. git's `unpack_loose_rest`
+        // inflates exactly `size` bytes and, finding the stream ends short,
+        // prints `corrupt loose object '<oid>'`; `read_loose_object` then adds
+        // `unable to unpack contents of <path>`. Detect the short body here so it
+        // is not misreported as a header-parse failure.
+        if let Some(declared) = loose_header_declared_size(&framed) {
+            let nul = framed.iter().position(|&b| b == 0).unwrap_or(framed.len());
+            let body_len = framed.len() - (nul + 1).min(framed.len());
+            if body_len < declared {
+                eprintln!("error: corrupt loose object '{oid}'");
+                eprintln!("error: unable to unpack contents of {display_path}");
+                return Ok(Some(LooseObjectIntegrity::Corrupt));
+            }
         }
         let Ok(object) = parse_framed_object(&framed) else {
             // Distinguish git's two header-parse failures: a structurally valid
@@ -4386,6 +4444,16 @@ fn loose_header_with_unknown_type(framed: &[u8]) -> Option<String> {
         return None;
     }
     Some(header.to_string())
+}
+
+/// The size declared in a loose object's `"<type> <size>\0"` header, if the
+/// header is structurally a `<word> <decimal-size>` pair. Used to detect a body
+/// inflated short of its declared length (a truncated object).
+fn loose_header_declared_size(framed: &[u8]) -> Option<usize> {
+    let nul = framed.iter().position(|&b| b == 0)?;
+    let header = std::str::from_utf8(&framed[..nul]).ok()?;
+    let (_kind, size) = header.split_once(' ')?;
+    size.parse::<usize>().ok()
 }
 
 /// Read up to `prefix.len()` bytes from the start of `file`, returning how many
