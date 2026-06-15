@@ -136,11 +136,13 @@ jobs:
             t4014-format-patch.sh
             t4015-diff-whitespace.sh
             t4018-diff-funcname.sh
+            t4019-diff-wserror.sh
             t4027-diff-submodule.sh
             t4034-diff-words.sh
             t4045-diff-relative.sh
             t4047-diff-dirstat.sh
             t4052-stat-output.sh
+            t4124-apply-ws-rule.sh
             t4150-am.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh

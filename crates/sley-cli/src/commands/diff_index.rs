@@ -47,6 +47,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut cached = false;
     let mut quiet = false;
     let mut exit_code = false;
+    let mut check = false;
     let mut z = false;
     let mut reverse = false;
     let mut detect_renames = false;
@@ -83,6 +84,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
                 exit_code = true;
             }
             "--exit-code" => exit_code = true,
+            "--check" => check = true,
             "-z" => z = true,
             "-R" => reverse = true,
             // `-m`/`--merge-base` only matter for diffs against merge commits and
@@ -340,6 +342,29 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     };
 
     let has_differences = !entries.is_empty();
+    // `--check`: whitespace-error report instead of the diff body (exit 2 on a
+    // whitespace error, OR-ing in 1 when `--exit-code`/`--quiet` + changes).
+    if check {
+        let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(git_dir)?;
+        let check_failed = commands::diff::run_diff_check(
+            &entries,
+            db,
+            worktree_root.as_deref(),
+            !cached,
+            &resolver,
+        )?;
+        let mut code = 0;
+        if check_failed {
+            code |= 0o2;
+        }
+        if (quiet || exit_code) && has_differences {
+            code |= 0o1;
+        }
+        if code != 0 {
+            return Err(GitError::Exit(code));
+        }
+        return Ok(());
+    }
     if !quiet {
         render(
             &entries,
@@ -508,6 +533,7 @@ fn render(
                 word_diff: None,
                 no_index_contents: None,
                 dirty_submodules: None,
+                ws_error_rule: None,
             };
             write_diff_patch_entry(&mut stdout, entry, options)?;
         }

@@ -2325,6 +2325,7 @@ impl LogDiffContext<'_> {
                         word_diff: None,
                         no_index_contents: None,
                         dirty_submodules: None,
+                        ws_error_rule: None,
                     },
                 )?;
             }

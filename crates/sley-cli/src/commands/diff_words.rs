@@ -17,6 +17,9 @@ pub(crate) struct DiffColors {
     pub(crate) new: String,
     pub(crate) context: String,
     pub(crate) reset: String,
+    /// `color.diff.whitespace` — the highlight for whitespace errors
+    /// (`--ws-error-highlight`). Default `[7m` (reverse), matching git.
+    pub(crate) whitespace: String,
 }
 
 impl DiffColors {
@@ -43,6 +46,8 @@ impl DiffColors {
             new: lookup("new", "\x1b[32m"),
             context: lookup("context", ""),
             reset: "\x1b[m".to_string(),
+            // git's GIT_COLOR_BOLD_RED for whitespace by default.
+            whitespace: lookup("whitespace", "\x1b[1;31m"),
         }
     }
 }

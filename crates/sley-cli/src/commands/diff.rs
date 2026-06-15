@@ -80,6 +80,191 @@ fn diff_split_revisions(
     Ok((trees, rest))
 }
 
+/// The `whitespace` attribute + `core.whitespace` config, resolved into the
+/// per-path rule lookups `git diff --check` / `git apply` need.
+///
+/// `core.whitespace` forms the base rule; the per-path `whitespace` attribute
+/// (read from the real worktree's `.gitattributes`) overrides it the way git's
+/// `whitespace_rule` does.
+pub(crate) struct WhitespaceRuleResolver {
+    config_rule: sley_diff_merge::ws::WsRule,
+    matcher: Option<sley_worktree::StandardAttributeMatcher>,
+}
+
+impl WhitespaceRuleResolver {
+    /// Build a resolver from a git dir: reads `core.whitespace` and opens the
+    /// worktree attribute matcher (best-effort — a bare repo has no worktree).
+    ///
+    /// A conflicting `core.whitespace` (both `tab-in-indent` and
+    /// `indent-with-non-tab`) is fatal, mirroring git's `parse_whitespace_rule`
+    /// `die`.
+    pub(crate) fn from_git_dir(git_dir: &Path) -> Result<Self> {
+        let config_rule = match read_repo_config(git_dir)
+            .ok()
+            .and_then(|config| config.get("core", None, "whitespace").map(str::to_owned))
+        {
+            Some(value) => match sley_diff_merge::ws::parse_whitespace_rule(&value) {
+                Some(rule) => rule,
+                None => return Err(whitespace_conflict_error()),
+            },
+            None => sley_diff_merge::ws::WS_DEFAULT_RULE,
+        };
+        let matcher = worktree_root_for_git_dir(git_dir)
+            .ok()
+            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok());
+        Ok(Self {
+            config_rule,
+            matcher,
+        })
+    }
+
+    /// Resolve the effective rule for `path`. A conflicting attribute *value*
+    /// is fatal (git `die`s), like a conflicting `core.whitespace`.
+    pub(crate) fn rule_for_path(&self, path: &[u8]) -> Result<sley_diff_merge::ws::WsRule> {
+        use sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
+        let Some(matcher) = &self.matcher else {
+            return Ok(self.config_rule);
+        };
+        let requested = vec![b"whitespace".to_vec()];
+        let checks = matcher.attributes_for_path(path, &requested, false);
+        let value_storage;
+        let attr = match checks.first().and_then(|check| check.state.as_ref()) {
+            Some(sley_worktree::AttributeState::Set) => WsAttr::True,
+            Some(sley_worktree::AttributeState::Unset) => WsAttr::False,
+            Some(sley_worktree::AttributeState::Value(value)) => {
+                value_storage = String::from_utf8_lossy(value).into_owned();
+                WsAttr::Value(&value_storage)
+            }
+            None => WsAttr::Unset,
+        };
+        resolve_whitespace_rule(self.config_rule, attr).ok_or_else(whitespace_conflict_error)
+    }
+}
+
+/// git's fatal error for an unenforceable whitespace rule pair.
+fn whitespace_conflict_error() -> GitError {
+    eprintln!("fatal: cannot enforce both tab-in-indent and indent-with-non-tab");
+    GitError::Exit(128)
+}
+
+/// Run `git diff --check` over the computed diff entries. For each entry it
+/// diffs old vs new content, runs git's whitespace check on every introduced
+/// (`+`) line, and prints `<path>:<lineno>: <error>.` plus the offending line,
+/// mirroring git's `checkdiff`. Returns `true` if any whitespace error (or
+/// leftover conflict marker) was found.
+pub(crate) fn run_diff_check(
+    entries: &[sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    resolver: &WhitespaceRuleResolver,
+) -> Result<bool> {
+    let mut stdout = io::stdout();
+    let mut status = false;
+    for entry in entries {
+        // git only checks the new side, and skips entries with no new content
+        // (pure deletions) and gitlinks/symlinks-as-content edge cases handled
+        // by the content fetchers returning None.
+        if entry.new_mode == Some(0o160000) {
+            continue;
+        }
+        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+        let Some(new_content) = new_content else {
+            continue;
+        };
+        let old_content = diff_entry_old_content(entry, db)?.unwrap_or_default();
+        let path = status_quote_path(&entry.path, false);
+        // A symlink target being an incomplete line is not news (git clears
+        // WS_INCOMPLETE_LINE for symlinks). We don't track symlink mode here in
+        // a way that distinguishes, so leave the rule intact — the t-suite does
+        // exercise a symlink incomplete-line case in t4015.
+        let mut rule = resolver.rule_for_path(&entry.path)?;
+        if entry.new_mode == Some(0o120000) {
+            rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+        }
+        if check_one_diff(
+            &mut stdout,
+            &old_content,
+            &new_content,
+            &path,
+            rule,
+        )? {
+            status = true;
+        }
+    }
+    Ok(status)
+}
+
+/// Check a single old/new pair, writing the `checkdiff` report to `out`.
+fn check_one_diff(
+    out: &mut impl Write,
+    old_content: &[u8],
+    new_content: &[u8],
+    path: &str,
+    rule: sley_diff_merge::ws::WsRule,
+) -> Result<bool> {
+    use sley_diff_merge::ws;
+    let old = sley_diff_merge::split_lines(old_content);
+    let new = sley_diff_merge::split_lines(new_content);
+    let ops = sley_diff_merge::myers_diff_lines(&old, &new);
+
+    let mut status = false;
+    let mut new_lineno = 0usize; // 1-based number of the current new-side line
+    let mut new_idx = 0usize;
+    let mut last_kind = b' ';
+    for op in ops {
+        match op {
+            sley_diff_merge::DiffOp::Equal(n) => {
+                for _ in 0..n {
+                    new_lineno += 1;
+                    new_idx += 1;
+                    last_kind = b' ';
+                }
+            }
+            sley_diff_merge::DiffOp::Delete(_) => {
+                // Removed lines don't advance the new-side counter.
+            }
+            sley_diff_merge::DiffOp::Insert(n) => {
+                for _ in 0..n {
+                    new_lineno += 1;
+                    let line = new[new_idx].content;
+                    new_idx += 1;
+                    last_kind = b'+';
+                    // git strips the `+` prefix; our `line` is already prefix-free.
+                    let bad = ws::ws_check(line, rule);
+                    if bad != 0 {
+                        status = true;
+                        let err = ws::whitespace_error_string(bad);
+                        writeln!(out, "{path}:{new_lineno}: {err}.")?;
+                        // Echo the offending `+` line (no color).
+                        out.write_all(b"+")?;
+                        out.write_all(line)?;
+                        if !line.ends_with(b"\n") {
+                            out.write_all(b"\n")?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = last_kind;
+
+    // Blank-at-EOF is detected globally (not per inserted line): git compares
+    // the trailing-blank run of pre- and post-images.
+    if rule & ws::WS_BLANK_AT_EOF != 0 {
+        let l1 = ws::count_trailing_blank(old_content);
+        let l2 = ws::count_trailing_blank(new_content);
+        if l2 > l1 {
+            let at = ws::count_lines(new_content);
+            let blank_at_eof = at - l2 + 1;
+            let err = ws::whitespace_error_string(ws::WS_BLANK_AT_EOF);
+            writeln!(out, "{path}:{blank_at_eof}: {err}.")?;
+            status = true;
+        }
+    }
+    Ok(status)
+}
+
 pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let commands::diff_options::DiffOptions {
         output_format,
@@ -203,11 +388,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff find-object output is not supported for this output mode".into(),
         ));
     }
-    if check && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff check output is not supported".into(),
-        ));
-    }
+    // `--check` is handled below (after the entries are computed) rather than
+    // here, where the diff content isn't available yet.
     if pickaxe_all && !find_object_values.is_empty() {
         return diff_find_object_pickaxe_all_conflict_error();
     }
@@ -569,6 +751,31 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .collect()
     };
     let has_differences = !entries.is_empty();
+    // `--check`: report whitespace errors introduced by the new side, in place
+    // of the normal patch body (git's DIFF_FORMAT_CHECKDIFF). It exits 2 on a
+    // whitespace error; combined with `--exit-code`/`--quiet` (not exclusive)
+    // the change bit (1) is OR-ed in, matching git's exit codes.
+    if check && !name_status && !name_only {
+        let resolver = WhitespaceRuleResolver::from_git_dir(&git_dir)?;
+        let check_failed = run_diff_check(
+            &entries,
+            &db,
+            worktree_root.as_deref(),
+            use_worktree_new,
+            &resolver,
+        )?;
+        let mut code = 0;
+        if check_failed {
+            code |= 0o2;
+        }
+        if (quiet || exit_code) && has_differences {
+            code |= 0o1;
+        }
+        if code != 0 {
+            return Err(GitError::Exit(code));
+        }
+        return Ok(());
+    }
     if !quiet && !no_patch {
         let mut stdout = io::stdout();
         let show_raw = raw && !name_only && !name_status;
@@ -692,7 +899,17 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 userdiff_attributes,
                 read_repo_config(&git_dir).ok(),
             );
+            // Whitespace-error highlighting needs the per-path rule, but only
+            // when color is on (it does nothing otherwise) and word-diff is
+            // off (git suppresses ws-highlight under --word-diff).
+            let ws_resolver = (colors.is_some() && word_request.is_none())
+                .then(|| WhitespaceRuleResolver::from_git_dir(&git_dir))
+                .transpose()?;
             for entry in &entries {
+                let ws_error_rule = ws_resolver
+                    .as_ref()
+                    .map(|resolver| resolver.rule_for_path(&entry.path))
+                    .transpose()?;
                 let options = DiffPatchOptions {
                     db: &db,
                     worktree_root: worktree_root.as_deref(),
@@ -707,6 +924,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     word_diff: word_request.as_ref(),
                     no_index_contents: None,
                     dirty_submodules: Some(&dirty_submodules),
+                    ws_error_rule,
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1094,6 +1312,15 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             word_diff: word_request.as_ref(),
             no_index_contents: Some((Some(&old_content), Some(&new_content))),
             dirty_submodules: None,
+            // No-index has no attributes; the rule is core.whitespace (or the
+            // default), used only when color is on.
+            ws_error_rule: (colors.is_some() && word_request.is_none()).then(|| {
+                config
+                    .as_ref()
+                    .and_then(|cfg| cfg.get("core", None, "whitespace"))
+                    .and_then(sley_diff_merge::ws::parse_whitespace_rule)
+                    .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE)
+            }),
         };
         write_diff_patch_entry(&mut stdout, &entry, options)?;
     }

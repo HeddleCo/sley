@@ -232,6 +232,30 @@
 # t7102-reset=37, t1007-hash-object=40, t1500-rev-parse=81, t1462-refs-exists=12,
 # t1401-symbolic-ref=25, t7004-tag=159, t3200-branch=117, t3301-notes=144,
 # t1300-config=497, t2400-worktree-add=165. No workspace test regressed (2203/0).
+#
+# whitespace-engine wave (2026-06-15, wave/whitespace-engine): ported git's
+# ws.c into a new crate sley-diff-merge/src/ws.rs (parse_whitespace_rule /
+# ws_check / ws_check_emit / ws_fix_copy + the blank-at-EOF helpers) and wired
+# it into THREE call sites — `git diff/diff-index/diff-tree --check`, the
+# `--ws-error-highlight` (default new-only) paint in the patch render path, and
+# `git apply --whitespace=warn|error|error-all|nowarn|fix|strip`. Floors:
+# t4015-diff-whitespace 55->78 (+23 — the diff --check cells across
+# diff/diff-index/diff-tree plus the conflict-rule die and the ws-highlight
+# cells); t4124-apply-ws-rule added at 67 (NEW — the apply --whitespace= matrix:
+# warn/error/error-all/nowarn report paths + the fix/strip indent+trailing-ws
+# correction, including git's global-whitespace-error-flag semantics that
+# re-indents clean-on-their-own lines when a sibling line is dirty); and
+# t4019-diff-wserror added at 19 (NEW — `git diff --color` whitespace-error
+# highlighting, 90% of the file). Residual t4124 fails are the blank-at-EOF
+# fix-mode edge cases + autocrlf + incomplete-line clusters (deeper apply-engine
+# work); residual t4019 are the new-trailing-blank-line + context-CR paint
+# cases. Shared-engine neighbors held (measured==floor, NONE regressed):
+# t4013-diff-various=133, t4014-format-patch=142, t4018-diff-funcname=287. No
+# workspace test regressed (2218/0). Perf NEUTRAL: plain `diff` REF 3.24s vs
+# NEW 3.20s (interleaved n=8 — the ws resolver only builds when color is on);
+# `apply --whitespace=nowarn` REF 0.023s vs NEW 0.022s (the ws pass is skipped
+# entirely for nowarn). Raise a floor only after a real, sustained gain lands;
+# never lower one.
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -303,8 +327,10 @@ declare -A FLOOR=(
     [t4052-stat-output.sh]=76
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41
-    [t4015-diff-whitespace.sh]=55
+    [t4015-diff-whitespace.sh]=78
     [t4018-diff-funcname.sh]=287
+    [t4124-apply-ws-rule.sh]=67
+    [t4019-diff-wserror.sh]=19
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=10
     [t5500-fetch-pack.sh]=356

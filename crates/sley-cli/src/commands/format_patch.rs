@@ -2867,6 +2867,7 @@ pub(crate) fn render_colors(
         new: &colors.new,
         context: &colors.context,
         reset: &colors.reset,
+        whitespace: &colors.whitespace,
     }
 }
 
@@ -2951,6 +2952,7 @@ pub(crate) fn write_patch_hunks_with(
         word_diff: word_diff
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
+        ws_error: None,
     };
     sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);
 }

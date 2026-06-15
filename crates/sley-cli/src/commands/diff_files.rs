@@ -630,6 +630,7 @@ fn render_diff_files_entries(
                 word_diff: None,
                 no_index_contents: None,
                 dirty_submodules: None,
+                ws_error_rule: None,
             };
             write_diff_patch_entry(&mut stdout, entry, patch_options)?;
         }
