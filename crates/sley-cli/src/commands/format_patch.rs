@@ -2792,6 +2792,7 @@ fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStat
                 writeln_buf(out, &format!("new mode {new_mode:06o}"));
             }
         }
+        sley_diff_merge::NameStatus::Unmerged => {}
     }
 }
 
@@ -3052,6 +3053,7 @@ fn write_patch_summary_entry(
                 );
             }
         }
+        sley_diff_merge::NameStatus::Unmerged => {}
     }
     Ok(())
 }

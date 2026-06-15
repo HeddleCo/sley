@@ -1457,7 +1457,7 @@ pub(crate) fn conclude_in_progress_merge(
     )?;
     clear_in_progress_merge_state(git_dir);
     if !quiet {
-        print_branch_commit_summary(git_dir, format, &commit_oid, &message)?;
+        print_branch_commit_summary(&writer, git_dir, format, &commit_oid, &message)?;
     }
     Ok(())
 }
@@ -1790,7 +1790,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
     )?;
 
     if !quiet {
-        print_branch_commit_summary(git_dir, format, &commit_oid, &message)?;
+        print_branch_commit_summary(&db, git_dir, format, &commit_oid, &message)?;
         print_commit_shortstat_between_trees(&db, format, &parent_tree, &tree)?;
     }
     Ok(())
@@ -2107,6 +2107,7 @@ fn merge_commit_reflog_message(message: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn print_branch_commit_summary(
+    db: &FileObjectDatabase,
     git_dir: &Path,
     format: ObjectFormat,
     commit_oid: &ObjectId,
@@ -2126,6 +2127,15 @@ pub(crate) fn print_branch_commit_summary(
         format_log_abbrev_oid(commit_oid),
         commit_subject(message)
     );
+    // git's print_commit_summary appends `\n Author: <%an <%ae>>` when the
+    // author identity differs from the committer identity (sequencer.c).
+    let object = db.read_object(commit_oid)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
+    let author = crate::commit_author_identity(&commit.author);
+    let committer = crate::commit_author_identity(&commit.committer);
+    if author != committer {
+        println!(" Author: {author}");
+    }
     Ok(())
 }
 

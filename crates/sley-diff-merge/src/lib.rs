@@ -1118,6 +1118,10 @@ pub enum NameStatus {
     Modified,
     Renamed(u8),
     Copied(u8),
+    /// An unmerged (conflicted) path: the index holds higher-stage entries.
+    /// git emits a standalone `U <path>` pair (`diff_unmerge`) for it in
+    /// addition to the regular worktree-vs-stage-2 modify.
+    Unmerged,
 }
 
 impl NameStatus {
@@ -1128,6 +1132,7 @@ impl NameStatus {
             Self::Modified => 'M',
             Self::Renamed(_) => 'R',
             Self::Copied(_) => 'C',
+            Self::Unmerged => 'U',
         }
     }
 
@@ -1836,6 +1841,13 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
         entries: index,
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
+    // `read_index_snapshot` collapses each path to a single entry; for an
+    // unmerged path it keeps the last-written stage. To match git's
+    // `run_diff_files` we need the conflict stages, so read them separately:
+    // git diffs the worktree against the "ours" stage (stage 2, the default
+    // `diff_unmerged_stage`) and additionally emits a standalone `U <path>`
+    // pair via `diff_unmerge` (diff-lib.c).
+    let unmerged = read_unmerged_stages(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
     let staged_gitlinks = index_gitlinks
         .iter()
@@ -1846,6 +1858,10 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
         .collect();
     let mut changes = Vec::new();
     for (git_path, left) in &index {
+        // For a conflicted path git first queues the `U` pair, then compares the
+        // worktree against stage 2 (ours). The snapshot's collapsed `left` may
+        // be the wrong stage, so override it with the stage-2 entry when present.
+        let conflict_stages = unmerged.get(git_path);
         let right = worktree_entry_for_path(
             worktree_root,
             format,
@@ -1853,6 +1869,31 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
             &index_gitlinks,
             Some(&stat_cache),
         )?;
+        if conflict_stages.is_some() {
+            // git's `diff_unmerge` makes a pair with a null old side and the
+            // worktree mode on the new side (diff-lib.c `wt_mode`); the oids stay
+            // zero. The raw line is `:000000 <wt_mode> 0..0 0..0 U <path>`.
+            changes.push(NameStatusEntry {
+                status: NameStatus::Unmerged,
+                path: git_path.clone().into(),
+                old_path: None,
+                old_mode: None,
+                new_mode: right.as_ref().map(|entry| entry.mode),
+                old_oid: None,
+                new_oid: None,
+            });
+        }
+        // The index side for the modify comparison: stage 2 (ours) for a
+        // conflict, otherwise the normal stage-0 entry. If the conflict has no
+        // stage-2 (deleted on our side / added by them), git has no entry to
+        // diff the worktree against, so it emits only the `U` line.
+        let left = match conflict_stages {
+            Some(stages) => match stages.ours.as_ref() {
+                Some(ours) => ours,
+                None => continue,
+            },
+            None => left,
+        };
         let Some(right) = right else {
             changes.push(NameStatusEntry {
                 status: NameStatus::Deleted,
@@ -1881,6 +1922,43 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
         entries: changes,
         staged_gitlinks,
     })
+}
+
+/// The conflict stages recorded for one unmerged index path.
+struct ConflictStages {
+    ours: Option<TrackedEntry>,
+}
+
+/// Read the higher-stage (conflict) index entries, keyed by path, recording the
+/// "ours" (stage 2) entry git diffs the worktree against. Paths with only a
+/// stage-0 entry are absent from the result.
+fn read_unmerged_stages(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeMap<Vec<u8>, ConflictStages>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    let index_bytes = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let index = sley_index::Index::parse(&index_bytes, format)?;
+    let mut out: BTreeMap<Vec<u8>, ConflictStages> = BTreeMap::new();
+    for entry in &index.entries {
+        let stage = entry.stage();
+        if stage == sley_index::Stage::Normal {
+            continue;
+        }
+        let path = entry.path.clone().into_bytes();
+        let slot = out.entry(path).or_insert(ConflictStages { ours: None });
+        if stage == sley_index::Stage::Ours {
+            slot.ours = Some(TrackedEntry {
+                mode: entry.mode,
+                oid: entry.oid,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn apply_name_status_options_to_index_worktree_changes(

@@ -1968,6 +1968,8 @@ fn write_diff_summary_entry(
                 )?;
             }
         }
+        // Unmerged paths produce no `--summary` line.
+        sley_diff_merge::NameStatus::Unmerged => {}
     }
     Ok(())
 }
@@ -2037,7 +2039,7 @@ fn diff_raw_oid(
 }
 
 #[derive(Clone, Copy)]
-struct DiffPatchOptions<'a> {
+pub(crate) struct DiffPatchOptions<'a> {
     db: &'a FileObjectDatabase,
     worktree_root: Option<&'a Path>,
     use_worktree_new: bool,
@@ -2272,6 +2274,55 @@ fn collect_dirty_submodules_from_gitlinks(
     Ok(dirty)
 }
 
+/// Render the `git diff-tree -p`-equivalent patch between two trees, byte-for-byte
+/// matching what `git show`/`log_tree_commit` writes. Used by the sequencer's
+/// `make_patch` (`.git/rebase-merge/patch`) so the stopped-pick patch carries the
+/// real `index <old>..<new> <mode>` line, collapsed single-line hunk headers
+/// (`@@ -1 +1 @@`), and no spurious blank lines — exactly the renderer that drives
+/// porcelain diff output, rather than a hand-rolled approximation.
+///
+/// Matches git `make_patch`: `DEFAULT_ABBREV` (7) index hashes, three lines of
+/// context, no rename detection (`log_tree_commit` does not honor `diff.renames`),
+/// `a/`/`b/` prefixes.
+pub(crate) fn render_tree_to_tree_patch(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old_tree: &ObjectId,
+    new_tree: &ObjectId,
+) -> Result<Vec<u8>> {
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        old_tree,
+        new_tree,
+        sley_diff_merge::DiffNameStatusOptions::default(),
+    )?;
+    let mut out: Vec<u8> = Vec::new();
+    for entry in &entries {
+        write_diff_patch_entry(
+            &mut out,
+            entry,
+            DiffPatchOptions {
+                db,
+                worktree_root: None,
+                use_worktree_new: false,
+                format,
+                abbrev: 7,
+                src_prefix: "a/",
+                dst_prefix: "b/",
+                context: 3,
+                userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
+                dirty_submodules: None,
+                ws_error_rule: None,
+            },
+        )?;
+    }
+    Ok(out)
+}
+
 fn write_diff_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
@@ -2376,6 +2427,9 @@ fn write_diff_patch_entry(
                 write_diff_meta_line(stdout, colors, &format!("new mode {new_mode:06o}"))?;
             }
         }
+        // Unmerged paths are surfaced via the raw/name-status `U` line, not a
+        // patch hunk, so they carry no meta header here.
+        sley_diff_merge::NameStatus::Unmerged => {}
     }
     write_diff_similarity_headers(&mut *stdout, entry, &old_similarity_path, &similarity_path)?;
     if !content_changed {
@@ -2553,6 +2607,8 @@ fn write_diff_binary_patch_entry(
                 writeln!(stdout, "new mode {new_mode:06o}")?;
             }
         }
+        // Unmerged paths carry no patch meta header.
+        sley_diff_merge::NameStatus::Unmerged => {}
     }
     write_diff_similarity_headers(&mut *stdout, entry, &old_similarity_path, &similarity_path)?;
     if old_content.as_deref() == new_content.as_deref() {
@@ -3962,6 +4018,8 @@ fn reverse_diff_entry(entry: sley_diff_merge::NameStatusEntry) -> sley_diff_merg
             new_oid: None,
             ..entry
         },
+        // An unmerged marker has no directional content to flip.
+        sley_diff_merge::NameStatus::Unmerged => entry,
     }
 }
 
@@ -7187,7 +7245,7 @@ fn print_log_decorations(oid: &ObjectId, decorations: &HashMap<ObjectId, Vec<Str
     }
 }
 
-fn commit_author_identity(raw: &[u8]) -> String {
+pub(crate) fn commit_author_identity(raw: &[u8]) -> String {
     let author = String::from_utf8_lossy(raw);
     author
         .rsplit_once(' ')

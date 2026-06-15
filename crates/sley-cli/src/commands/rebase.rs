@@ -242,7 +242,12 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         index += 1;
     }
     for command in &out.exec {
-        if command.is_empty() {
+        // git (builtin/rebase.c) treats a command that is entirely blank
+        // (` \t\r\f\v`) as empty, not just the zero-length string.
+        if command
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))
+        {
             eprintln!("error: empty exec command");
             return Err(GitError::Exit(1));
         }
@@ -879,7 +884,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             None => ObjectId::empty_tree(ctx.format),
         };
         let new_tree = commit_tree_oid(&db, ctx.format, &onto)?;
-        print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree)?;
+        // Start "Changes from … to …" diffstat: includes the summary lines.
+        print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree, true)?;
     }
 
     // The apply backend's explicit fast-forward case.
@@ -1131,6 +1137,7 @@ fn print_rebase_diffstat(
     format: ObjectFormat,
     old_tree: &ObjectId,
     new_tree: &ObjectId,
+    with_summary: bool,
 ) -> Result<()> {
     let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
@@ -1146,6 +1153,11 @@ fn print_rebase_diffstat(
         return Ok(());
     }
     let mut stdout = io::stdout();
+    // The diffstat rows + the "N file changed …" trailer (already emitted by
+    // `write_diff_stat`). It is NOT followed by a separate shortstat — emitting
+    // one double-printed the "N file changed" line (t3404 "verbose flag is
+    // heeded"). Tree-to-tree diff: the "new" side is the target tree's blobs,
+    // never the worktree (so `use_worktree_new = false`).
     write_diff_stat(
         &mut stdout,
         &entries,
@@ -1158,7 +1170,16 @@ fn print_rebase_diffstat(
             color: false,
         },
     )?;
-    write_diff_shortstat(&mut stdout, &entries, db, None, true)?;
+    // The "Changes from … to …" start diffstat sets
+    // `DIFF_FORMAT_SUMMARY | DIFF_FORMAT_DIFFSTAT` (builtin/rebase.c), so it
+    // appends the per-entry create/delete-mode/rename summary lines. The finish
+    // diffstat (orig-head..HEAD, sequencer.c) uses `DIFF_FORMAT_DIFFSTAT` only
+    // — no summary lines.
+    if with_summary {
+        for entry in &entries {
+            write_diff_summary_entry(&mut stdout, entry)?;
+        }
+    }
     Ok(())
 }
 
@@ -1594,6 +1615,54 @@ fn checkout_onto(ctx: &Ctx, opts: &MachineOpts, onto_name: &str) -> Result<()> {
     checkout_onto_base(ctx, opts, onto_name, &opts.onto)
 }
 
+/// git's `reset_head`/`unpack_trees` aborts the detach-to-onto when checking out
+/// the target tree would clobber an untracked working-tree file (a path present
+/// in the onto tree whose worktree file is not tracked in the index and whose
+/// content differs). Mirror that precondition: the blind
+/// `reset_index_and_worktree_to_commit` would otherwise overwrite the file and
+/// leave the rebase half-started (t3404 "abort with error when new base cannot be
+/// checked out"). Returns the offending paths (empty ⇒ safe to proceed).
+fn checkout_would_overwrite_untracked(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    target_tree: &ObjectId,
+) -> Result<Vec<Vec<u8>>> {
+    let target = stash_tree_entry_map(db, ctx.format, target_tree)?;
+    let tracked: std::collections::BTreeSet<Vec<u8>> =
+        match sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? {
+            Some(index) => index
+                .entries
+                .iter()
+                .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+                .map(|entry| entry.path.clone().into_bytes())
+                .collect(),
+            None => std::collections::BTreeSet::new(),
+        };
+    let mut overwritten = Vec::new();
+    for (path, (mode, oid)) in &target {
+        if tracked.contains(path) {
+            continue;
+        }
+        // Gitlinks are not materialized as ordinary files; skip them.
+        if *mode == 0o160000 {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let worktree_path = ctx.worktree_root.join(rel);
+        let Ok(bytes) = fs::read(&worktree_path) else {
+            continue;
+        };
+        let on_disk = sley_core::object_id_for_bytes(ctx.format, "blob", &bytes)?;
+        if on_disk != *oid {
+            overwritten.push(path.clone());
+        }
+    }
+    overwritten.sort();
+    Ok(overwritten)
+}
+
 fn checkout_onto_base(
     ctx: &Ctx,
     opts: &MachineOpts,
@@ -1602,6 +1671,23 @@ fn checkout_onto_base(
 ) -> Result<()> {
     let refs = ctx.refs();
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let db = ctx.db();
+    let base_tree = commit_tree_oid(&db, ctx.format, base)?;
+    let overwritten = checkout_would_overwrite_untracked(ctx, &db, &base_tree)?;
+    if !overwritten.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by checkout:"
+        );
+        for path in &overwritten {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you switch branches.");
+        eprintln!("Aborting");
+        apply_autostash(ctx);
+        seq::remove_merge_state(&ctx.git_dir);
+        eprintln!("error: could not detach HEAD");
+        return Err(GitError::Exit(1));
+    }
     if let Err(err) = sley_worktree::reset_index_and_worktree_to_commit(
         &ctx.worktree_root,
         &ctx.git_dir,
@@ -1978,6 +2064,13 @@ fn pick_one_commit(
     let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
     let write_db = ctx.db();
+    // The conflict-marker label for the picked side is git's `msg.label`:
+    // "<short-oid> (<subject>)" (sequencer.c get_message), not the bare subject.
+    let theirs_label = format!(
+        "{} ({})",
+        find_unique_abbrev_hex(db, &record.oid),
+        commit_subject(&record.commit.message)
+    );
     let (results, conflicts) = three_way_merge_trees(
         &write_db,
         ctx.format,
@@ -1985,7 +2078,7 @@ fn pick_one_commit(
         &ours_map,
         &theirs_map,
         "HEAD",
-        &commit_subject(&record.commit.message),
+        &theirs_label,
     )?;
 
     // Compose the message (fixup/squash machinery).
@@ -2323,7 +2416,7 @@ fn stop_with_patch(
         Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
         None => ObjectId::empty_tree(ctx.format),
     };
-    let patch = render_patch_between_trees(db, ctx.format, &parent_tree, &record.commit.tree)
+    let patch = render_tree_to_tree_patch(db, ctx.format, &parent_tree, &record.commit.tree)
         .unwrap_or_default();
     fs::write(ctx.state_path("patch"), patch)?;
 
@@ -2347,118 +2440,19 @@ fn stop_with_patch(
         return Ok(PickOutcome::EditStop);
     }
     if exit_code != 0 {
+        // git error_with_patch prints the parsed commit subject (`%.*s`,
+        // subject_len/subject), not the raw todo arg (which carries the `# `
+        // prefix `pick <oid> # <subject>`).
         eprintln!(
             "Could not apply {}... {}",
             find_unique_abbrev_hex(db, &record.oid),
-            item.arg
+            commit_subject(&record.commit.message)
         );
         return Ok(PickOutcome::Fail(exit_code));
     }
     Ok(PickOutcome::EditStop)
 }
 
-fn render_patch_between_trees(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    old_tree: &ObjectId,
-    new_tree: &ObjectId,
-) -> Result<Vec<u8>> {
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
-        db,
-        format,
-        old_tree,
-        new_tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
-    )?;
-    let mut out = Vec::new();
-    for entry in &entries {
-        let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
-        let path = String::from_utf8_lossy(&entry.path).into_owned();
-        let old_display = String::from_utf8_lossy(old_path).into_owned();
-        out.extend_from_slice(format!("diff --git a/{old_display} b/{path}\n").as_bytes());
-        let old_content = entry
-            .old_oid
-            .as_ref()
-            .map(|oid| merge_read_blob(db, oid))
-            .transpose()?;
-        let new_content = entry
-            .new_oid
-            .as_ref()
-            .map(|oid| merge_read_blob(db, oid))
-            .transpose()?;
-        match entry.status {
-            sley_diff_merge::NameStatus::Added => {
-                if let Some(mode) = entry.new_mode {
-                    out.extend_from_slice(format!("new file mode {mode:06o}\n").as_bytes());
-                }
-            }
-            sley_diff_merge::NameStatus::Deleted => {
-                if let Some(mode) = entry.old_mode {
-                    out.extend_from_slice(format!("deleted file mode {mode:06o}\n").as_bytes());
-                }
-            }
-            _ => {}
-        }
-        let old_label = if old_content.is_some() {
-            format!("a/{old_display}")
-        } else {
-            "/dev/null".to_string()
-        };
-        let new_label = if new_content.is_some() {
-            format!("b/{path}")
-        } else {
-            "/dev/null".to_string()
-        };
-        out.extend_from_slice(format!("--- {old_label}\n+++ {new_label}\n").as_bytes());
-        let old_bytes = old_content.unwrap_or_default();
-        let new_bytes = new_content.unwrap_or_default();
-        let old_lines = sley_diff_merge::split_lines(&old_bytes);
-        let new_lines = sley_diff_merge::split_lines(&new_bytes);
-        let old_count = old_lines.len();
-        let new_count = new_lines.len();
-        let ops = sley_diff_merge::myers_diff_lines(&old_lines, &new_lines);
-        out.extend_from_slice(
-            format!(
-                "@@ -{},{old_count} +{},{new_count} @@\n",
-                if old_count == 0 { 0 } else { 1 },
-                if new_count == 0 { 0 } else { 1 }
-            )
-            .as_bytes(),
-        );
-        let mut old_index = 0usize;
-        let mut new_index = 0usize;
-        for op in ops {
-            match op {
-                sley_diff_merge::DiffOp::Equal(count) => {
-                    for _ in 0..count {
-                        out.push(b' ');
-                        out.extend_from_slice(old_lines[old_index].content);
-                        out.push(b'\n');
-                        old_index += 1;
-                        new_index += 1;
-                    }
-                }
-                sley_diff_merge::DiffOp::Delete(count) => {
-                    for _ in 0..count {
-                        out.push(b'-');
-                        out.extend_from_slice(old_lines[old_index].content);
-                        out.push(b'\n');
-                        old_index += 1;
-                    }
-                }
-                sley_diff_merge::DiffOp::Insert(count) => {
-                    for _ in 0..count {
-                        out.push(b'+');
-                        out.extend_from_slice(new_lines[new_index].content);
-                        out.push(b'\n');
-                        new_index += 1;
-                    }
-                }
-            }
-        }
-    }
-    Ok(out)
-}
 
 // ---------------------------------------------------------------------------
 // fixup / squash message machinery
@@ -2689,7 +2683,7 @@ fn machine_commit(
     let _ = fs::remove_file(ctx.git_dir.join("AUTO_MERGE"));
 
     if let Some(old_tree) = old_tree_for_summary {
-        print_branch_commit_summary(&ctx.git_dir, ctx.format, &new_oid, &message)?;
+        print_branch_commit_summary(db, &ctx.git_dir, ctx.format, &new_oid, &message)?;
         print_commit_shortstat_between_trees(db, ctx.format, &old_tree, &tree)?;
     }
 
@@ -2752,7 +2746,8 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         let db = ctx.db();
         let old_tree = commit_tree_oid(&db, ctx.format, &opts.orig_head)?;
         let new_tree = commit_tree_oid(&db, ctx.format, &head)?;
-        print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree)?;
+        // Finish (orig-head..HEAD) diffstat: DIFFSTAT only, no summary lines.
+        print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree, false)?;
     }
 
     run_post_rewrite_hook(ctx)?;
