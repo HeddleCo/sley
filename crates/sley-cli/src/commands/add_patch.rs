@@ -606,15 +606,16 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
                             rendered = None;
                         }
                     }
-                    '/' => {
-                        if let Some(target) = parse_search(&answer, fd, hunk_index) {
+                    '/' => match parse_search(&answer, fd, hunk_index, stdin) {
+                        Some(target) => {
                             hunk_index = target;
                             rendered = None;
-                        } else {
+                        }
+                        None => {
                             pending_err =
                                 Some("No hunk matches the given pattern\n".to_string());
                         }
-                    }
+                    },
                     'P' => {
                         rendered = None;
                     }
@@ -788,23 +789,42 @@ fn parse_goto(
     }
 }
 
-fn parse_search(answer: &str, fd: &FileDiff, from: usize) -> Option<usize> {
-    let pat = answer[1..].trim();
+fn parse_search(
+    answer: &str,
+    fd: &FileDiff,
+    from: usize,
+    stdin: &mut impl BufRead,
+) -> Option<usize> {
+    // Bare `/` prompts "search for regex? "; `/pat` carries the pattern inline.
+    let mut pat = answer[1..].trim().to_string();
     if pat.is_empty() {
-        return None;
+        print!("search for regex? ");
+        let _ = io::stdout().flush();
+        match read_line(stdin) {
+            Some(l) => pat = l.trim().to_string(),
+            None => return None,
+        }
+        if pat.is_empty() {
+            // Empty pattern: git just continues the loop (no move).
+            return Some(from);
+        }
     }
-    let re = regex_lite_compile(pat)?;
+    let re = regex_lite_compile(&pat)?;
     let nr = fd.hunks.len();
-    let mut i = (from + 1) % nr;
+    // Search starts at the CURRENT hunk (inclusive) and matches against the
+    // rendered hunk text (header line + body), wrapping once.
+    let mut i = from;
     loop {
-        let text: String = fd.hunks[i].body.join("\n");
+        let mut text = format_hunk_header(&fd.hunks[i], 0);
+        text.push('\n');
+        text.push_str(&fd.hunks[i].body.join("\n"));
         if re.is_match(&text) {
             return Some(i);
         }
+        i = (i + 1) % nr;
         if i == from {
             return None;
         }
-        i = (i + 1) % nr;
     }
 }
 
