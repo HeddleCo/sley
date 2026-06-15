@@ -577,6 +577,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let show_shortstat = shortstat && !name_only && !name_status;
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
+        let stat_entries = if show_numstat || show_stat || show_shortstat {
+            Some(collect_diff_stat_entries(
+                &entries,
+                &db,
+                worktree_root.as_deref(),
+                use_worktree_new,
+            )?)
+        } else {
+            None
+        };
         if show_raw {
             // git zeroes the worktree-side oid only when it cannot be trusted:
             // a stat-clean file keeps its index oid in raw output. The
@@ -610,14 +620,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             }
         }
         if show_numstat {
-            for entry in &entries {
-                write_diff_numstat_entry(
+            for entry in stat_entries
+                .as_ref()
+                .expect("stat entries collected for numstat")
+            {
+                write_diff_numstat_materialized_entry(
                     &mut stdout,
-                    entry,
+                    entry.entry,
+                    entry.stats,
                     z,
-                    &db,
-                    worktree_root.as_deref(),
-                    use_worktree_new,
                 )?;
             }
         }
@@ -628,12 +639,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             } else {
                 stat_widths.resolve_config_defaults();
             }
-            write_diff_stat_with_widths(
+            write_diff_stat_materialized_with_widths(
                 &mut stdout,
-                &entries,
-                &db,
-                worktree_root.as_deref(),
-                use_worktree_new,
+                stat_entries
+                    .as_ref()
+                    .expect("stat entries collected for diffstat"),
                 DiffStatOptions {
                     compact_summary,
                     stat_count,
@@ -643,12 +653,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             )?;
         }
         if show_shortstat {
-            write_diff_shortstat(
+            write_diff_shortstat_materialized(
                 &mut stdout,
-                &entries,
-                &db,
-                worktree_root.as_deref(),
-                use_worktree_new,
+                stat_entries
+                    .as_ref()
+                    .expect("stat entries collected for shortstat"),
             )?;
         }
         if let Some(dirstat_options) = dirstat

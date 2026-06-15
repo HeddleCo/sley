@@ -248,7 +248,6 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
 
 fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
     !compiled.tokens.is_empty()
-        && compiled.uses_oid()
         && !compiled.uses_decorations()
         && !compiled.uses_source()
         && compiled.tokens.iter().all(|token| {

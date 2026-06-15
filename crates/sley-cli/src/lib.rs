@@ -2627,6 +2627,15 @@ fn write_diff_numstat_entry(
     let old_content = diff_entry_old_content(entry, db)?;
     let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
     let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
+    write_diff_numstat_materialized_entry(stdout, entry, stats, z)
+}
+
+fn write_diff_numstat_materialized_entry(
+    stdout: &mut dyn Write,
+    entry: &sley_diff_merge::NameStatusEntry,
+    stats: DiffLineStats,
+    z: bool,
+) -> Result<()> {
     if z {
         write_diff_numstat_counts(stdout, stats)?;
         if let Some(old_path) = &entry.old_path {
@@ -2667,25 +2676,18 @@ fn write_diff_shortstat(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
 ) -> Result<()> {
+    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
+    write_diff_shortstat_materialized(stdout, &stat_entries)
+}
+
+fn write_diff_shortstat_materialized(
+    stdout: &mut dyn Write,
+    entries: &[DiffStatEntryData<'_>],
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let mut inserted = 0;
-    let mut deleted = 0;
-    for entry in entries {
-        let old_content = diff_entry_old_content(entry, db)?;
-        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-        match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
-            DiffLineStats::Binary => {}
-            DiffLineStats::Text {
-                inserted: entry_inserted,
-                deleted: entry_deleted,
-            } => {
-                inserted += entry_inserted;
-                deleted += entry_deleted;
-            }
-        }
-    }
+    let (inserted, deleted) = diff_stat_totals(entries);
     write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
 }
 
@@ -2828,6 +2830,16 @@ fn write_diff_stat_with_widths(
     options: DiffStatOptions,
     widths: DiffStatWidths,
 ) -> Result<()> {
+    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
+    write_diff_stat_materialized_with_widths(stdout, &stat_entries, options, widths)
+}
+
+fn write_diff_stat_materialized_with_widths(
+    stdout: &mut dyn Write,
+    entries: &[DiffStatEntryData<'_>],
+    options: DiffStatOptions,
+    widths: DiffStatWidths,
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -2836,13 +2848,7 @@ fn write_diff_stat_with_widths(
         stat_count,
         color,
     } = options;
-    let rows = diff_stat_rows(
-        entries,
-        db,
-        worktree_root,
-        use_worktree_new,
-        compact_summary,
-    )?;
+    let rows = diff_stat_rows_from_materialized(entries, compact_summary);
 
     let mut count = stat_count.unwrap_or(rows.len()).min(rows.len());
 
@@ -3013,15 +3019,25 @@ fn write_diff_stat_with_widths(
 
     // Totals cover every row (display truncation does not affect them);
     // binary rows count as changed files but contribute no line counts.
-    let mut adds = 0usize;
-    let mut dels = 0usize;
-    for row in &rows {
-        if let DiffStatStats::Text { inserted, deleted } = row.stats {
-            adds += inserted;
-            dels += deleted;
-        }
-    }
+    let (adds, dels) = diff_stat_totals(entries);
     write_diff_stat_summary_line(stdout, rows.len(), adds, dels)
+}
+
+fn write_diff_stat_materialized(
+    stdout: &mut dyn Write,
+    entries: &[DiffStatEntryData<'_>],
+    options: DiffStatOptions,
+) -> Result<()> {
+    let mut widths = DiffStatWidths::terminal();
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(git_dir) = discover_git_dir(&cwd)
+        && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
+    {
+        widths.resolve_config(&config);
+    } else {
+        widths.resolve_config_defaults();
+    }
+    write_diff_stat_materialized_with_widths(stdout, entries, options, widths)
 }
 
 /// `--dirstat` damage accounting mode.
@@ -3269,31 +3285,70 @@ struct DiffStatOptions {
     color: bool,
 }
 
-fn diff_stat_rows(
-    entries: &[sley_diff_merge::NameStatusEntry],
+struct DiffStatEntryData<'a> {
+    entry: &'a sley_diff_merge::NameStatusEntry,
+    old_content: Option<Vec<u8>>,
+    new_content: Option<Vec<u8>>,
+    stats: DiffLineStats,
+}
+
+fn collect_diff_stat_entries<'a>(
+    entries: &'a [sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
-    compact_summary: bool,
-) -> Result<Vec<DiffStatRow>> {
-    let mut rows = Vec::with_capacity(entries.len());
+) -> Result<Vec<DiffStatEntryData<'a>>> {
+    let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_content(entry, db)?;
         let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-        let stats = match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
+        let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
+        stat_entries.push(DiffStatEntryData {
+            entry,
+            old_content,
+            new_content,
+            stats,
+        });
+    }
+    Ok(stat_entries)
+}
+
+fn diff_stat_totals(entries: &[DiffStatEntryData<'_>]) -> (usize, usize) {
+    let mut inserted = 0;
+    let mut deleted = 0;
+    for entry in entries {
+        if let DiffLineStats::Text {
+            inserted: entry_inserted,
+            deleted: entry_deleted,
+        } = entry.stats
+        {
+            inserted += entry_inserted;
+            deleted += entry_deleted;
+        }
+    }
+    (inserted, deleted)
+}
+
+fn diff_stat_rows_from_materialized(
+    entries: &[DiffStatEntryData<'_>],
+    compact_summary: bool,
+) -> Vec<DiffStatRow> {
+    let mut rows = Vec::with_capacity(entries.len());
+    for data in entries {
+        let stats = match data.stats {
             DiffLineStats::Binary => DiffStatStats::Binary {
-                old_size: old_content.as_ref().map_or(0, Vec::len),
-                new_size: new_content.as_ref().map_or(0, Vec::len),
-                unchanged: old_content == new_content,
+                old_size: data.old_content.as_ref().map_or(0, Vec::len),
+                new_size: data.new_content.as_ref().map_or(0, Vec::len),
+                unchanged: data.old_content == data.new_content,
             },
             DiffLineStats::Text { inserted, deleted } => DiffStatStats::Text { inserted, deleted },
         };
         rows.push(DiffStatRow {
-            path: diff_stat_path(entry, compact_summary),
+            path: diff_stat_path(data.entry, compact_summary),
             stats,
         });
     }
-    Ok(rows)
+    rows
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
