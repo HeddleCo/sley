@@ -240,6 +240,11 @@
 # support, out of scope). Shared-engine neighbors held (measured==floor, none
 # regressed): t6030-bisect-porcelain=95, t6003-rev-list-topo-order=36,
 # t6012-rev-list-simplify=9. No workspace test regressed (2206/0).
+#
+# rev-parse ^rev (2026-06-15): rev-parse now accepts excluded `^rev` positional
+# args (resolve the remainder, prefix the rendered output with `^`), closing the
+# final t6002 cell. Floor t6002-rev-list-bisect 52->53 (now full pass).
+# t1500-rev-parse held at 81 (already full pass, no gain).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -282,7 +287,7 @@ declare -A FLOOR=(
     [t3510-cherry-pick-sequence.sh]=52
     [t4214-log-graph-octopus.sh]=17
     [t4215-log-skewed-merges.sh]=9
-    [t6002-rev-list-bisect.sh]=52
+    [t6002-rev-list-bisect.sh]=53
     [t6030-bisect-porcelain.sh]=95
     [t5310-pack-bitmaps.sh]=221
     [t5326-multi-pack-bitmaps.sh]=342
