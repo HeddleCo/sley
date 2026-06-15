@@ -113,6 +113,7 @@ pub(crate) fn is_builtin_command(command: &str) -> bool {
             | "--version"
             | "show"
             | "blame"
+            | "annotate"
             | "describe"
             | "shortlog"
             | "grep"

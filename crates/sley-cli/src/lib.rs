@@ -267,6 +267,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "-v" | "--version" => commands::utility::cmd_version(&[]),
         "show" => commands::show::cmd_show(&args[1..]),
         "blame" => commands::blame::cmd_blame(&args[1..]),
+        "annotate" => commands::blame::cmd_annotate(&args[1..]),
         "bugreport" => commands::utility::cmd_bugreport(&args[1..]),
         "describe" => commands::describe::cmd_describe(&args[1..]),
         "shortlog" => commands::shortlog::cmd_shortlog(&args[1..]),

@@ -74,6 +74,11 @@ struct BlameOptions {
     abbrev_override: Option<usize>,
     /// Line ranges requested with `-L`; empty means the whole file.
     ranges: Vec<RawRange>,
+    /// Follow only the first parent of merges (`--first-parent`).
+    first_parent: bool,
+    /// Emit `git annotate`-compatible output (`-c`, or the `annotate` command):
+    /// `<hex>\t(<author>\t<date>\t<lineno>)<content>`, no boundary `^`.
+    compat: bool,
 }
 
 /// A `-L` argument before it is resolved against the file's line count.
@@ -103,8 +108,24 @@ struct LineBlame {
 }
 
 pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
+    run_blame(args, false)
+}
+
+/// `git annotate` — `git blame` with the annotate-compatible output mode forced
+/// on (equivalent to `git blame -c`). Shares all of blame's parsing and the
+/// scoreboard; only the output format differs.
+pub(crate) fn cmd_annotate(args: &[String]) -> Result<()> {
+    run_blame(args, true)
+}
+
+fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     let options = match parse_blame_args(args)? {
-        BlameArgs::Run(options) => options,
+        BlameArgs::Run(mut options) => {
+            if force_compat {
+                options.compat = true;
+            }
+            options
+        }
         BlameArgs::Help => {
             print!("{BLAME_USAGE}");
             return Ok(());
@@ -148,7 +169,14 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
         }
     };
 
-    let lines = compute_blame(db, format, &start_commit, &repo_path, &final_blob)?;
+    let lines = compute_blame(
+        db,
+        format,
+        &start_commit,
+        &repo_path,
+        &final_blob,
+        options.first_parent,
+    )?;
 
     // Resolve the -L ranges against the real line count, then render. The
     // repo-relative path is used for any -L error message, matching git.
@@ -176,6 +204,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut show_root = false;
     let mut abbrev_override = None;
     let mut ranges = Vec::new();
+    let mut first_parent = false;
+    let mut compat = false;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -197,6 +227,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "-t" => date_field = DateField::Raw,
             "--root" => show_root = true,
             "--no-root" => show_root = false,
+            "--first-parent" => first_parent = true,
+            "-c" => compat = true,
             "--abbrev" => abbrev_override = Some(0),
             "-L" => {
                 let Some(value) = iter.next() else {
@@ -254,6 +286,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         show_root,
         abbrev_override,
         ranges,
+        first_parent,
+        compat,
     }))
 }
 
@@ -289,7 +323,6 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
         "-p" | "--porcelain"
             | "--line-porcelain"
             | "--incremental"
-            | "-c"
             | "-b"
             | "-f"
             | "--show-name"
@@ -466,107 +499,149 @@ fn lookup_tree_path(
     Ok(None)
 }
 
-/// Core blame: assign each final-image line to a commit.
+/// A contiguous run of final-image lines currently suspected to originate in
+/// one commit's version of the path. Mirrors git's `struct blame_entry`
+/// (blame.c): `lno` is the 0-based line in the *final image*, `s_lno` the
+/// 0-based line in the *suspect's* blob, and the entry covers `num_lines`
+/// consecutive lines in both. The invariant `final[lno + k] == suspect[s_lno +
+/// k]` for `k in 0..num_lines` is what lets us pass whole chunks to a parent.
+#[derive(Clone)]
+struct BlameEntry {
+    /// Commit currently suspected of introducing these lines.
+    suspect: ObjectId,
+    /// Whether the suspect is a rendered boundary (root, absent `--root`).
+    boundary: bool,
+    /// 0-based start line in the final image.
+    lno: usize,
+    /// 0-based start line in the suspect's blob.
+    s_lno: usize,
+    /// Number of lines this entry covers (in both the final image and the
+    /// suspect's blob).
+    num_lines: usize,
+}
+
+/// Core blame: assign each final-image line to a commit, mirroring git's
+/// diff-driven multi-pass scoreboard (blame.c `pass_blame` / `blame_chunk` /
+/// `split_overlap`).
 ///
-/// Maintains, per commit, the set of final lines still "owned" by that
-/// commit's version of the path together with each line's index inside that
-/// commit's blob. Commits are processed children-before-parents so that by the
-/// time a commit is examined, every line it might own has been propagated to
-/// it. A line is charged to a commit when it has no unchanged counterpart in
-/// any parent (or the commit is a root / the path is absent in every parent).
+/// Rather than routing each final line independently to the first parent that
+/// preserves it, we carry line *chunks* (`BlameEntry`) and, for each commit
+/// pulled off a commit-date priority queue, diff that commit's blob against
+/// each parent in turn. Lines a parent preserves migrate to the parent as
+/// (possibly split) chunks with their `s_lno` rebased onto the parent's blob;
+/// lines no parent preserves are charged to this commit. For a merge this
+/// gives the *correct* parent (parent 0 first, the residual to parent 1, …),
+/// which whole-line first-parent routing got wrong — and `-L` is simply a
+/// final-range filter applied at render time over correctly-attributed chunks.
 fn compute_blame(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     start_commit: &ObjectId,
     repo_path: &str,
     final_blob: &[u8],
+    first_parent: bool,
 ) -> Result<Vec<LineBlame>> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
 
-    // Result slot per final line; filled in as commits claim lines.
+    // Final attribution per line, filled in as commits are found guilty.
     let mut result: Vec<Option<LineBlame>> = (0..line_count).map(|_| None).collect();
+    if line_count == 0 {
+        return Ok(Vec::new());
+    }
 
-    // Per-commit pending work: for each owned final line, its index within
-    // that commit's blob. `pending[commit][final_line] = blob_index`.
-    let mut pending: HashMap<ObjectId, HashMap<usize, usize>> = HashMap::new();
-    // Each final line initially maps to the identically-indexed line of the
-    // start commit's blob (the final image is that blob).
-    let seed: HashMap<usize, usize> = (0..line_count).map(|line| (line, line)).collect();
-    pending.insert(start_commit.clone(), seed);
+    // Per-commit suspect chunks ("origin->suspects" in git). A commit is in the
+    // queue iff it has at least one suspect chunk. The blob for each commit's
+    // path is cached on first use.
+    let mut suspects: HashMap<ObjectId, Vec<BlameEntry>> = HashMap::new();
+    let mut blob_cache: HashMap<ObjectId, Option<Vec<u8>>> = HashMap::new();
+    let mut date_cache: HashMap<ObjectId, i64> = HashMap::new();
 
-    // Reverse-topological order: every commit precedes its parents, so each
-    // commit is finalized (all the lines it could own have propagated to it)
-    // by the time we reach it. Ties are broken newest-first by committer date.
-    let order = topo_order(db, format, start_commit)?;
+    // The start commit owns the entire final image as one chunk.
+    suspects.insert(
+        *start_commit,
+        vec![BlameEntry {
+            suspect: *start_commit,
+            boundary: false,
+            lno: 0,
+            s_lno: 0,
+            num_lines: line_count,
+        }],
+    );
 
-    for commit_oid in order {
-        let Some(owned) = pending.remove(&commit_oid) else {
+    // Commit-date priority queue, newest first (git's
+    // compare_commits_by_commit_date). We materialise the comparator lazily via
+    // `pop_newest_commit`, caching each commit's date.
+    let mut queue: Vec<ObjectId> = vec![*start_commit];
+
+    while let Some(commit_oid) = pop_newest_commit(&mut queue, db, format, &mut date_cache)? {
+        let Some(mut owned) = suspects.remove(&commit_oid) else {
             continue;
         };
         if owned.is_empty() {
             continue;
         }
 
+        // Resolve this commit and its blob for the path.
         let commit_obj = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &commit_obj.body)?;
-        let Some(child_blob) = read_path_blob(db, format, &commit_oid, repo_path)? else {
-            // Defensive: a commit that does not contain the path cannot own
-            // any line; charge them here to avoid losing lines.
-            assign_lines(&mut result, &commit_oid, false, &final_lines, owned);
+        let child_blob = cached_blob(db, format, &commit_oid, repo_path, &mut blob_cache)?;
+        let Some(child_blob) = child_blob else {
+            // The path is absent at this commit (shouldn't normally happen for a
+            // suspect): charge everything here so no line is lost.
+            charge_remaining(&mut result, &final_lines, &commit_oid, false, owned);
             continue;
         };
         let child_lines = sley_diff_merge::split_lines(&child_blob);
 
-        // Find, for each owned line, whether some parent preserves it. We try
-        // parents in order and route a line to the first parent that has an
-        // unchanged counterpart. Lines preserved by no parent are charged to
-        // this commit. A commit with no parents (root) charges everything.
-        let parents = commit.parents.clone();
+        let mut parents = commit.parents.clone();
+        if first_parent {
+            parents.truncate(1);
+        }
         if parents.is_empty() {
-            assign_lines(&mut result, &commit_oid, true, &final_lines, owned);
+            // Root commit (or `--first-parent` past a root): every remaining
+            // line is its own. Render as a boundary unless `--root`.
+            charge_remaining(&mut result, &final_lines, &commit_oid, true, owned);
             continue;
         }
 
-        // For each parent compute the child->parent line mapping once.
-        let mut parent_maps: Vec<(ObjectId, Vec<Option<usize>>)> = Vec::new();
+        // Pass blame to each parent in order. `owned` shrinks as parents claim
+        // chunks; whatever remains after the last parent is charged here.
         for parent in &parents {
-            match read_path_blob(db, format, parent, repo_path)? {
-                Some(parent_blob) => {
-                    let parent_lines = sley_diff_merge::split_lines(&parent_blob);
-                    let map = child_to_parent_map(&parent_lines, &child_lines);
-                    parent_maps.push((*parent, map));
-                }
-                None => {
-                    // Path absent in this parent: it preserves nothing.
-                    parent_maps.push((*parent, vec![None; child_lines.len()]));
-                }
+            if owned.is_empty() {
+                break;
+            }
+            let parent_blob = cached_blob(db, format, parent, repo_path, &mut blob_cache)?;
+            let Some(parent_blob) = parent_blob else {
+                // Path absent in this parent: it preserves nothing, so all
+                // chunks stay with the current commit for the next parent.
+                continue;
+            };
+
+            // Whole-file shortcut: if the parent's blob is byte-identical, every
+            // remaining chunk passes through unchanged (git's
+            // pass_whole_blame / oideq(blob_oid) fast path).
+            if parent_blob == child_blob {
+                let passed = std::mem::take(&mut owned);
+                queue_entries(&mut suspects, &mut queue, *parent, passed);
+                break;
+            }
+
+            let parent_lines = sley_diff_merge::split_lines(&parent_blob);
+            let mut still_ours = Vec::new();
+            let passed = pass_blame_to_parent(&parent_lines, &child_lines, *parent, &mut owned);
+            still_ours.append(&mut owned);
+            owned = still_ours;
+            if !passed.is_empty() {
+                queue_entries(&mut suspects, &mut queue, *parent, passed);
             }
         }
 
-        let mut charged: HashMap<usize, usize> = HashMap::new();
-        for (final_line, child_index) in owned {
-            let mut routed = false;
-            for (parent_oid, map) in &parent_maps {
-                if let Some(Some(parent_index)) = map.get(child_index) {
-                    pending
-                        .entry(*parent_oid)
-                        .or_default()
-                        .insert(final_line, *parent_index);
-                    routed = true;
-                    break;
-                }
-            }
-            if !routed {
-                charged.insert(final_line, child_index);
-            }
+        // Anything still suspected of this commit after every parent had a turn
+        // is genuinely this commit's: charge it (non-boundary — it has parents).
+        if !owned.is_empty() {
+            charge_remaining(&mut result, &final_lines, &commit_oid, false, owned);
         }
-        if !charged.is_empty() {
-            assign_lines(&mut result, &commit_oid, false, &final_lines, charged);
-        }
-        // No rescheduling is needed: `topo_order` emits every commit after all
-        // of its children (Kahn's algorithm over the child→parent DAG), so any
-        // parent we just routed lines to still lies ahead in `order`.
     }
 
     // Any line not resolved (shouldn't happen) falls back to the start commit
@@ -576,7 +651,7 @@ fn compute_blame(
         match slot {
             Some(blame) => out.push(blame),
             None => out.push(LineBlame {
-                commit: start_commit.clone(),
+                commit: *start_commit,
                 boundary: false,
                 content: final_lines[line_index].content.to_vec(),
             }),
@@ -585,163 +660,313 @@ fn compute_blame(
     Ok(out)
 }
 
-/// Record `owned` final lines as attributed to `commit_oid`.
-fn assign_lines(
-    result: &mut [Option<LineBlame>],
-    commit_oid: &ObjectId,
-    boundary: bool,
-    final_lines: &[sley_diff_merge::DiffLine<'_>],
-    owned: HashMap<usize, usize>,
-) {
-    for final_line in owned.into_keys() {
-        if let Some(slot) = result.get_mut(final_line)
-            && slot.is_none()
-        {
-            *slot = Some(LineBlame {
-                commit: *commit_oid,
-                boundary,
-                content: final_lines[final_line].content.to_vec(),
-            });
-        }
-    }
-}
-
-/// Build `child_index -> Some(parent_index)` for lines unchanged from parent to
-/// child (the `Equal` runs of the Myers diff); changed/inserted child lines map
-/// to `None`.
-fn child_to_parent_map(
+/// Diff the suspect blob (`child_lines`) against `parent_lines` and split every
+/// chunk in `owned` along the diff boundaries: lines unchanged from the parent
+/// migrate to `parent` (returned, with `s_lno` rebased onto the parent's blob);
+/// lines that differ remain in `owned` for the next parent (or to be charged to
+/// the suspect). This is the port of git's `blame_chunk` driven by
+/// `blame_chunk_cb` over `diff_hunks` (blame.c).
+///
+/// The diff is computed *parent → child* so a hunk `(start_a, count_a) ->
+/// (start_b, count_b)` says child lines `[start_b, start_b+count_b)` differ from
+/// the parent, while the run before each hunk (and after the last) is common.
+/// `offset = start_a - start_b` is how far the parent's line numbers lead the
+/// child's across a common run.
+fn pass_blame_to_parent(
     parent_lines: &[sley_diff_merge::DiffLine<'_>],
     child_lines: &[sley_diff_merge::DiffLine<'_>],
-) -> Vec<Option<usize>> {
-    let mut map = vec![None; child_lines.len()];
+    _parent: ObjectId,
+    owned: &mut Vec<BlameEntry>,
+) -> Vec<BlameEntry> {
+    let hunks = diff_hunks(parent_lines, child_lines);
+
+    let mut passed: Vec<BlameEntry> = Vec::new();
+    let mut still_ours: Vec<BlameEntry> = Vec::new();
+
+    // Process chunks in `s_lno` (child line) order so the running `offset`
+    // — how far the parent's line numbers lead the child's across the current
+    // common run — stays valid. `deferred` holds split tails to re-merge in
+    // order; `entries` is the original sorted suspect list.
+    owned.sort_by_key(|e| e.s_lno);
+    let mut entries = std::mem::take(owned).into_iter().peekable();
+    let mut deferred: Vec<BlameEntry> = Vec::new();
+    let mut offset: isize = 0;
+
+    for hunk in &hunks {
+        let tlno = hunk.start_b; // first child line that differs
+        let same = hunk.start_b + hunk.count_b; // first child line common again
+
+        // Pre-chunk region [.., tlno): common with the parent → pass it through.
+        while let Some(mut e) = take_next_before(&mut deferred, &mut entries, tlno) {
+            if e.s_lno + e.num_lines > tlno {
+                // Straddles the boundary: pass the common head, defer the tail.
+                let head_len = tlno - e.s_lno;
+                let tail = split_entry_at(&mut e, head_len);
+                pass_entry(&mut e, offset, &mut passed);
+                put_back(&mut deferred, tail);
+            } else {
+                pass_entry(&mut e, offset, &mut passed);
+            }
+        }
+
+        // Differing region [tlno, same): stays with the suspect; split a chunk
+        // that reaches past `same` so its common tail is handled by a later hunk.
+        while let Some(mut e) = take_next_before(&mut deferred, &mut entries, same) {
+            if e.s_lno + e.num_lines > same {
+                let head_len = same - e.s_lno;
+                let tail = split_entry_at(&mut e, head_len);
+                still_ours.push(e);
+                put_back(&mut deferred, tail);
+            } else {
+                still_ours.push(e);
+            }
+        }
+
+        // Advance the offset across this hunk (parent count - child count delta).
+        offset = hunk.start_a as isize + hunk.count_a as isize
+            - (hunk.start_b as isize + hunk.count_b as isize);
+    }
+
+    // Everything after the last hunk is common with the parent.
+    while let Some(mut e) = take_next_before(&mut deferred, &mut entries, usize::MAX) {
+        pass_entry(&mut e, offset, &mut passed);
+    }
+
+    *owned = still_ours;
+    passed
+}
+
+/// A changed region of a parent→child line diff: parent lines
+/// `[start_a, start_a+count_a)` were replaced by child lines
+/// `[start_b, start_b+count_b)`. Equivalent to one `xdl` hunk / one
+/// `blame_chunk_cb` call in git.
+struct DiffHunk {
+    start_a: usize,
+    count_a: usize,
+    start_b: usize,
+    count_b: usize,
+}
+
+/// Convert the run-length `DiffOp` script (parent → child) into the changed
+/// hunks git's `diff_hunks` yields: maximal runs of non-`Equal` ops collapse
+/// into a single `(start_a, count_a, start_b, count_b)` hunk; `Equal` runs are
+/// the common stretches between hunks.
+fn diff_hunks(
+    parent_lines: &[sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley_diff_merge::DiffLine<'_>],
+) -> Vec<DiffHunk> {
     let ops = sley_diff_merge::myers_diff_lines(parent_lines, child_lines);
-    let mut parent_idx = 0usize;
-    let mut child_idx = 0usize;
+    let mut hunks = Vec::new();
+    let mut a = 0usize; // parent line cursor
+    let mut b = 0usize; // child line cursor
+    let mut pending: Option<DiffHunk> = None;
     for op in ops {
         match op {
             sley_diff_merge::DiffOp::Equal(n) => {
-                for _ in 0..n {
-                    if child_idx < map.len() {
-                        map[child_idx] = Some(parent_idx);
-                    }
-                    parent_idx += 1;
-                    child_idx += 1;
+                if let Some(h) = pending.take() {
+                    hunks.push(h);
                 }
+                a += n;
+                b += n;
             }
             sley_diff_merge::DiffOp::Delete(n) => {
-                parent_idx += n;
+                let h = pending.get_or_insert(DiffHunk {
+                    start_a: a,
+                    count_a: 0,
+                    start_b: b,
+                    count_b: 0,
+                });
+                h.count_a += n;
+                a += n;
             }
             sley_diff_merge::DiffOp::Insert(n) => {
-                child_idx += n;
+                let h = pending.get_or_insert(DiffHunk {
+                    start_a: a,
+                    count_a: 0,
+                    start_b: b,
+                    count_b: 0,
+                });
+                h.count_b += n;
+                b += n;
             }
         }
     }
-    map
+    if let Some(h) = pending.take() {
+        hunks.push(h);
+    }
+    hunks
 }
 
-/// Reachable commits from `start`, ordered so that every commit precedes its
-/// parents (a reverse-topological / children-first order). Uses Kahn's
-/// algorithm over the in-degree induced by child→parent edges, breaking ties
-/// by descending committer timestamp to match git's tendency to surface newer
-/// commits first.
-fn topo_order(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    start: &ObjectId,
-) -> Result<Vec<ObjectId>> {
-    // Gather the reachable subgraph and each commit's parents + timestamp.
-    let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    let mut timestamp_of: HashMap<ObjectId, i64> = HashMap::new();
-    let mut stack = vec![start.clone()];
-    while let Some(oid) = stack.pop() {
-        if parents_of.contains_key(&oid) {
-            continue;
-        }
-        let object = db.read_object(&oid)?;
-        if object.object_type != ObjectType::Commit {
-            return Err(GitError::InvalidObject(format!(
-                "expected commit {oid}, found {}",
-                object.object_type.as_str()
-            )));
-        }
-        let commit = Commit::parse(format, &object.body)?;
-        let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
-        timestamp_of.insert(oid, ts);
-        let parents = commit.parents.clone();
-        for parent in &parents {
-            stack.push(*parent);
-        }
-        parents_of.insert(oid, parents);
-    }
-
-    // child_count[parent] = number of in-subgraph children pointing at it.
-    let mut child_count: HashMap<ObjectId, usize> = HashMap::new();
-    for oid in parents_of.keys() {
-        child_count.entry(*oid).or_insert(0);
-    }
-    for parents in parents_of.values() {
-        for parent in parents {
-            if parents_of.contains_key(parent) {
-                *child_count.entry(*parent).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Ready set: commits with no remaining children. `pop_newest` selects the
-    // newest deterministically each step, so the collection order here (a
-    // HashMap iteration) does not affect the result.
-    let mut ready: Vec<ObjectId> = child_count
-        .iter()
-        .filter(|(_, count)| **count == 0)
-        .map(|(oid, _)| *oid)
-        .collect();
-
-    let mut order = Vec::with_capacity(parents_of.len());
-    while let Some(next) = pop_newest(&mut ready, &timestamp_of) {
-        order.push(next.clone());
-        if let Some(parents) = parents_of.get(&next) {
-            for parent in parents.clone() {
-                if let Some(count) = child_count.get_mut(&parent) {
-                    *count -= 1;
-                    if *count == 0 {
-                        ready.push(parent);
-                    }
-                }
-            }
-        }
-    }
-
-    // If the graph had a cycle (corrupt history), append anything left so we
-    // never silently drop commits.
-    if order.len() < parents_of.len() {
-        for oid in parents_of.keys() {
-            if !order.contains(oid) {
-                order.push(*oid);
-            }
-        }
-    }
-    Ok(order)
+/// Pass `entry` to a parent: rebase its `s_lno` by `offset` (the parent leads
+/// the child by `offset` across this common run). The suspect id is left as the
+/// child's; [`queue_entries`] re-stamps it with the parent before enqueuing.
+fn pass_entry(entry: &mut BlameEntry, offset: isize, passed: &mut Vec<BlameEntry>) {
+    let s_lno = (entry.s_lno as isize + offset) as usize;
+    passed.push(BlameEntry {
+        suspect: entry.suspect,
+        boundary: false,
+        lno: entry.lno,
+        s_lno,
+        num_lines: entry.num_lines,
+    });
 }
 
-/// Remove and return the newest commit from `ready` (treated as a priority
-/// queue keyed by descending timestamp, ties broken by ascending hex id for
-/// determinism).
-fn pop_newest(
-    ready: &mut Vec<ObjectId>,
-    timestamp_of: &HashMap<ObjectId, i64>,
-) -> Option<ObjectId> {
-    if ready.is_empty() {
+/// Split `e` into a head of `head_len` lines (kept in `e`) and a returned tail
+/// covering the remainder, mirroring git's `split_blame_at`.
+fn split_entry_at(e: &mut BlameEntry, head_len: usize) -> BlameEntry {
+    let tail = BlameEntry {
+        suspect: e.suspect,
+        boundary: e.boundary,
+        lno: e.lno + head_len,
+        s_lno: e.s_lno + head_len,
+        num_lines: e.num_lines - head_len,
+    };
+    e.num_lines = head_len;
+    tail
+}
+
+/// Pop the next chunk whose `s_lno < limit`, in global `s_lno` order, drawing
+/// from `deferred` (split tails) and `entries` (the original sorted suspect
+/// chunks) — both individually sorted. Returns `None` when the next chunk in
+/// order starts at or past `limit` (or both streams are exhausted).
+fn take_next_before(
+    deferred: &mut Vec<BlameEntry>,
+    entries: &mut std::iter::Peekable<std::vec::IntoIter<BlameEntry>>,
+    limit: usize,
+) -> Option<BlameEntry> {
+    // Determine which stream has the smaller front without consuming it.
+    let from_deferred = match (deferred.first(), entries.peek()) {
+        (Some(d), Some(e)) => d.s_lno <= e.s_lno,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => return None,
+    };
+    let next_s_lno = if from_deferred {
+        deferred[0].s_lno
+    } else {
+        entries.peek().unwrap().s_lno
+    };
+    if next_s_lno >= limit {
         return None;
     }
+    if from_deferred {
+        Some(deferred.remove(0))
+    } else {
+        entries.next()
+    }
+}
+
+/// Return an entry to the deferred stream, keeping it sorted by `s_lno`.
+fn put_back(deferred: &mut Vec<BlameEntry>, e: BlameEntry) {
+    let pos = deferred
+        .iter()
+        .position(|d| d.s_lno > e.s_lno)
+        .unwrap_or(deferred.len());
+    deferred.insert(pos, e);
+}
+
+/// Queue a batch of chunks onto `parent`'s suspect list, stamping them with the
+/// parent id and enqueuing the parent commit if it was not already pending.
+fn queue_entries(
+    suspects: &mut HashMap<ObjectId, Vec<BlameEntry>>,
+    queue: &mut Vec<ObjectId>,
+    parent: ObjectId,
+    mut entries: Vec<BlameEntry>,
+) {
+    for e in &mut entries {
+        e.suspect = parent;
+    }
+    let slot = suspects.entry(parent).or_default();
+    let was_empty = slot.is_empty();
+    slot.extend(entries);
+    if was_empty {
+        queue.push(parent);
+    }
+}
+
+/// Charge every remaining chunk to `commit_oid` as a final attribution.
+fn charge_remaining(
+    result: &mut [Option<LineBlame>],
+    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    commit_oid: &ObjectId,
+    boundary: bool,
+    owned: Vec<BlameEntry>,
+) {
+    for entry in owned {
+        for k in 0..entry.num_lines {
+            let final_line = entry.lno + k;
+            if let Some(slot) = result.get_mut(final_line)
+                && slot.is_none()
+            {
+                *slot = Some(LineBlame {
+                    commit: *commit_oid,
+                    boundary,
+                    content: final_lines[final_line].content.to_vec(),
+                });
+            }
+        }
+    }
+}
+
+/// Read (and memoise) the blob for `repo_path` at `commit`. `None` means the
+/// path is absent (or names a non-blob) at that commit.
+fn cached_blob(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit: &ObjectId,
+    repo_path: &str,
+    cache: &mut HashMap<ObjectId, Option<Vec<u8>>>,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(hit) = cache.get(commit) {
+        return Ok(hit.clone());
+    }
+    let blob = read_path_blob(db, format, commit, repo_path)?;
+    cache.insert(*commit, blob.clone());
+    Ok(blob)
+}
+
+/// Pop the newest-by-committer-date commit from the working queue, mirroring
+/// git's commit-date priority queue (`compare_commits_by_commit_date`: larger
+/// date first, ties broken deterministically by ascending hex id). Commit dates
+/// are memoised in `date_cache`. Returns `None` when the queue is empty.
+///
+/// The queue may transiently hold the same commit twice (it is enqueued when
+/// its suspect list first becomes non-empty); a duplicate pops with an empty
+/// suspect list and the caller simply skips it, exactly as git's `assign_blame`
+/// does.
+fn pop_newest_commit(
+    queue: &mut Vec<ObjectId>,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    date_cache: &mut HashMap<ObjectId, i64>,
+) -> Result<Option<ObjectId>> {
+    if queue.is_empty() {
+        return Ok(None);
+    }
+    // Ensure every queued commit has a cached date.
+    for oid in queue.iter() {
+        if !date_cache.contains_key(oid) {
+            let object = db.read_object(oid)?;
+            if object.object_type != ObjectType::Commit {
+                return Err(GitError::InvalidObject(format!(
+                    "expected commit {oid}, found {}",
+                    object.object_type.as_str()
+                )));
+            }
+            let commit = Commit::parse(format, &object.body)?;
+            let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
+            date_cache.insert(*oid, ts);
+        }
+    }
     let mut best = 0usize;
-    for i in 1..ready.len() {
-        let ti = timestamp_of.get(&ready[i]).copied().unwrap_or(0);
-        let tb = timestamp_of.get(&ready[best]).copied().unwrap_or(0);
-        if ti > tb || (ti == tb && ready[i].to_hex() < ready[best].to_hex()) {
+    for i in 1..queue.len() {
+        let ti = date_cache.get(&queue[i]).copied().unwrap_or(0);
+        let tb = date_cache.get(&queue[best]).copied().unwrap_or(0);
+        if ti > tb || (ti == tb && queue[i].to_hex() < queue[best].to_hex()) {
             best = i;
         }
     }
-    Some(ready.swap_remove(best))
+    Ok(Some(queue.swap_remove(best)))
 }
 
 /// Resolve the `-L` ranges to a sorted, de-duplicated set of 1-based line
@@ -850,13 +1075,6 @@ fn render_blame(
     let mut handle = stdout.lock();
     for (display_idx, &line_no) in selected.iter().enumerate() {
         let blame = &lines[line_no - 1];
-        let sha = render_sha(
-            &blame.commit,
-            abbrev,
-            blame.boundary,
-            options.show_root,
-            hex_width,
-        );
 
         // Strip the trailing newline from the stored content; we always emit a
         // newline ourselves, matching git which prints one line per entry even
@@ -864,6 +1082,28 @@ fn render_blame(
         // written raw (not via a lossy String) so non-UTF-8 content round-trips
         // exactly.
         let content = strip_trailing_newline(&blame.content);
+
+        if options.compat {
+            // `git annotate` / `git blame -c` format:
+            // `<hex>\t(<author %10s>\t<date>\t<lineno>)<content>`. No boundary
+            // `^` marker (compat mode never prints it) and no space before the
+            // content.
+            let hex = render_compat_sha(&blame.commit, hex_width);
+            let author = &author_strings[display_idx];
+            let date = &date_strings[display_idx];
+            write!(handle, "{hex}\t({author:>10}\t{date}\t{line_no})")?;
+            handle.write_all(content)?;
+            handle.write_all(b"\n")?;
+            continue;
+        }
+
+        let sha = render_sha(
+            &blame.commit,
+            abbrev,
+            blame.boundary,
+            options.show_root,
+            hex_width,
+        );
 
         if options.suppress_author {
             // `<sha> <lineno>) <line>`
@@ -881,6 +1121,13 @@ fn render_blame(
         handle.write_all(b"\n")?;
     }
     Ok(())
+}
+
+/// Render the object-name column for annotate-compat (`-c`) mode: exactly
+/// `hex_width` hex digits, with no boundary `^` (compat output suppresses it,
+/// blame.c `emit_other`).
+fn render_compat_sha(commit: &ObjectId, hex_width: usize) -> String {
+    commit.to_hex().chars().take(hex_width).collect()
 }
 
 /// Compute the abbreviation length for object names. git blame displays
