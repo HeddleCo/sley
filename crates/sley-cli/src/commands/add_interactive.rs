@@ -309,7 +309,7 @@ fn read_line(stdin: &mut impl BufRead) -> Option<String> {
 /// Parse a selection token list ("2-5 8-", "*", "1", "-3") into selected flags
 /// toggled over `selected`. Returns the number of newly-selected entries seen
 /// in this call (git returns the running count of selected items).
-fn apply_choices(input: &str, selected: &mut [bool]) {
+fn apply_choices(input: &str, selected: &mut [bool], items: &[FileItem]) {
     let n = selected.len();
     for raw in input.split([' ', '\t', '\r', '\n', ',']) {
         if raw.is_empty() {
@@ -321,6 +321,17 @@ fn apply_choices(input: &str, selected: &mut [bool]) {
             (true, raw)
         };
         if tok.is_empty() {
+            continue;
+        }
+        // Non-numeric, non-wildcard tokens are unique-prefix name selections
+        // (e.g. `t` for "to-delete"). Match against the item paths by prefix.
+        let first = tok.as_bytes()[0];
+        if tok != "*" && !first.is_ascii_digit() {
+            if let Some(idx) = items.iter().position(|it| it.path.starts_with(tok)) {
+                if idx < n {
+                    selected[idx] = choose;
+                }
+            }
             continue;
         }
         let (from, to): (isize, isize) = if tok == "*" {
@@ -383,7 +394,7 @@ fn list_and_choose(
             print_choose_help();
             continue;
         }
-        apply_choices(&line, &mut selected);
+        apply_choices(&line, &mut selected, items);
         if immediate {
             return collect(&selected);
         }
@@ -547,10 +558,13 @@ fn run_revert(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
         }
     };
     let mut count = 0;
-    // Reset selected paths in the index back to HEAD (`reset -q HEAD -- path`).
+    // Reset selected paths in the index back to the HEAD version (or remove them
+    // when HEAD is unborn / the path is not in HEAD). `reset -q -- <path>` resets
+    // against HEAD-or-empty-tree, matching add-interactive.c's run_revert which
+    // diffs the index against HEAD (empty tree when initial).
     for &i in &chosen {
         let p = &items[i].path;
-        let _ = run_status(&["reset", "-q", "HEAD", "--", p.as_str()], None);
+        let _ = run_status(&["reset", "-q", "--", p.as_str()], None);
         count += 1;
     }
     if count == 1 {
