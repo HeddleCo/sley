@@ -557,17 +557,15 @@ fn unstage_changes_unless_new(
         if let MergePathResult::Conflict { .. } = result {
             continue;
         }
-        match ours_map.get(path) {
-            // Existed in `ours`: restore the index entry to ours' version.
-            Some((mode, oid)) => {
-                let entry = match stat_cache.get(path) {
-                    Some(old) if old.mode == *mode && old.oid == *oid => old.clone(),
-                    _ => merge_index_entry(path, *mode, *oid, 0),
-                };
-                stage0.insert(path.clone(), entry);
-            }
-            // New path (absent from `ours`): keep whatever the merge staged.
-            None => {}
+        // Existed in `ours`: restore the index entry to ours' version. A path
+        // absent from `ours` (newly added by the stash) keeps whatever the merge
+        // staged.
+        if let Some((mode, oid)) = ours_map.get(path) {
+            let entry = match stat_cache.get(path) {
+                Some(old) if old.mode == *mode && old.oid == *oid => old.clone(),
+                _ => merge_index_entry(path, *mode, *oid, 0),
+            };
+            stage0.insert(path.clone(), entry);
         }
     }
     let mut entries: Vec<IndexEntry> = index
