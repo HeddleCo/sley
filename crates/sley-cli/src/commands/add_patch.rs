@@ -362,10 +362,15 @@ pub(crate) fn run_add_patch(
 
     // Apply: for each file, reconstruct the index blob with USE_HUNK hunks and
     // stage it.
+    let mut applied_any = false;
     for fd in &files {
         if fd.hunks.iter().any(|h| h.use_hunk == HunkUse::Use) {
             apply_file_to_index(fd)?;
+            applied_any = true;
         }
+    }
+    if applied_any {
+        refresh_index();
     }
     Ok(())
 }
@@ -1017,10 +1022,22 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
 
 /// Apply the USE_HUNK hunks of one file to the index.
 fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
-    // Read the index version of the file (stage 0).
+    // A staged deletion: drop the path from the index entirely.
+    if fd.deleted {
+        let status = Command::new(self_bin())
+            .args(["update-index", "--force-remove", &fd.path])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|e| GitError::Io(e.to_string()))?;
+        if !status.success() {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
+    // Read the index version of the file (stage 0). For a brand-new addition the
+    // index entry is empty (intent-to-add), so a failed read means empty base.
     let spec = format!(":{}", fd.path);
-    let base = run_capture(&["cat-file", "blob", &spec], None)
-        .map_err(|e| GitError::Io(e.to_string()))?;
+    let base = run_capture(&["cat-file", "blob", &spec], None).unwrap_or_default();
     let base_text = String::from_utf8_lossy(&base).into_owned();
     let new_content = apply_hunks(&base_text, fd);
     // Write the result as a blob.
@@ -1037,6 +1054,18 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+/// After staging hunks, refresh the index stat cache so `git diff-files` stays
+/// clean for paths whose worktree now matches the freshly-staged blob (t3701
+/// "index is refreshed after applying patch").
+fn refresh_index() {
+    let _ = Command::new(self_bin())
+        .args(["update-index", "--refresh", "-q"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Apply the selected hunks to the index base text, line by line.
