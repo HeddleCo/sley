@@ -52,11 +52,69 @@ pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
         Some("save") => cmd_stash_save(&args[1..]),
         Some("show") => cmd_stash_show(&args[1..]),
         Some("store") => cmd_stash_store(&args[1..]),
-        Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only apply, branch, clear, create, drop, list, pop, push, save, show, and store; unsupported subcommand {other}"
-        ))),
+        // No subcommand: assume `git stash push` (git's `push_stash_unassumed`
+        // fallback). In this "assumed" mode a bare positional token that isn't a
+        // pathspec after `--` is rejected, so `git stash -q drop` errors instead
+        // of silently stashing a pathspec named `drop`.
+        Some(_) => {
+            stash_reject_assumed_push_token(args)?;
+            cmd_stash_push(args)
+        }
         None => cmd_stash_push(&[]),
     }
+}
+
+/// git's assumed-`push` guard: with no explicit subcommand, options are parsed up
+/// to the first non-option token (`STOP_AT_NON_OPTION`); if that token is not `--`
+/// (and `--patch` did not force the assume), die with the unexpected-token error.
+fn stash_reject_assumed_push_token(args: &[String]) -> Result<()> {
+    let mut force_assume = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        // `--patch`/`-p` forces the push assumption (patch mode has no positional
+        // pathspec ambiguity), so a following token is allowed.
+        if arg == "-p" || arg == "--patch" || (arg.starts_with("-p") && arg.len() > 2) {
+            force_assume = true;
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            return Ok(());
+        }
+        if arg.starts_with('-') {
+            // An option (possibly one that consumes the next arg). Treat
+            // value-taking short/long options conservatively: `-m`/`--message`,
+            // `-U`/`--unified`, `--inter-hunk-context`, `--pathspec-from-file`
+            // consume the following token when given separately.
+            if matches!(
+                arg.as_str(),
+                "-m" | "--message"
+                    | "-U"
+                    | "--unified"
+                    | "--inter-hunk-context"
+                    | "--pathspec-from-file"
+            ) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        // First bare positional token in assumed mode.
+        if force_assume {
+            return Ok(());
+        }
+        return Err(stash_assumed_push_unexpected_token(arg));
+    }
+    Ok(())
+}
+
+fn stash_assumed_push_unexpected_token(token: &str) -> GitError {
+    eprintln!(
+        "fatal: subcommand wasn't specified; 'push' can't be assumed due to unexpected token '{token}'"
+    );
+    GitError::Exit(128)
 }
 
 struct StashApplyOptions {
@@ -260,11 +318,6 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
         return Err(GitError::Exit(128));
     }
-    if !sley_worktree::short_status(&worktree_root, &git_dir, format)?.is_empty() {
-        return Err(GitError::Unsupported(
-            "stash apply currently requires a clean working tree and index".into(),
-        ));
-    }
     let entry_index = entries.len() - 1 - options.selector;
     let stash_oid = entries[entry_index].new_oid;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -272,7 +325,7 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let stash_object = db.read_object(&stash_oid)?;
     let stash_commit = Commit::parse(format, &stash_object.body)?;
     let head_store = FileRefStore::new(&git_dir, format);
-    let Some((head_oid, head_commit)) = stash_head_commit(&head_store, &db, format)? else {
+    let Some((_head_oid, _head_commit)) = stash_head_commit(&head_store, &db, format)? else {
         eprintln!("You do not have the initial commit yet");
         return Err(GitError::Exit(1));
     };
@@ -287,7 +340,6 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         )));
     }
     let base_commit = Commit::parse(format, &base_object.body)?;
-    let tracked_tree_unchanged = base_commit.tree == stash_commit.tree;
     let index_oid = stash_commit
         .parents
         .get(1)
@@ -299,33 +351,22 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         )));
     }
     let index_commit = Commit::parse(format, &index_object.body)?;
-    if base_oid == &head_oid {
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &worktree_root,
-            &git_dir,
-            format,
-            &stash_oid,
-        )?;
-        if options.reinstate_index {
-            sley_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, index_oid)?;
-        } else {
-            sley_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)?;
-        }
-    } else {
-        apply_stash_tracked_paths_to_moved_head(
-            &worktree_root,
-            &git_dir,
-            &db,
-            format,
-            StashMovedHeadApply {
-                base_tree: &base_commit.tree,
-                head_tree: &head_commit.tree,
-                stash_tree: &stash_commit.tree,
-                index_tree: &index_commit.tree,
-                reinstate_index: options.reinstate_index,
-            },
-        )?;
-    }
+
+    // Apply the stash by 3-way-merging the stash's working tree (`theirs`) into
+    // the CURRENT index/worktree (`ours`), using the stash's base tree as the
+    // merge-base — exactly git's `merge_ort_nonrecursive(c_tree, w_tree, b_tree)`
+    // in builtin/stash.c. This is the same merge primitive the rebase/cherry-pick
+    // porcelains use, so dirty trees, content conflicts, and conflict-marker /
+    // stage rendering all come for free.
+    let stash_state = StashApplyState {
+        worktree_root: &worktree_root,
+        git_dir: &git_dir,
+        base_tree: &base_commit.tree,
+        stash_tree: &stash_commit.tree,
+        index_tree: &index_commit.tree,
+    };
+    let outcome = apply_stash_via_merge(&db, format, &stash_state, options.reinstate_index)?;
+
     if let Some(untracked_oid) = stash_commit.parents.get(2) {
         let untracked_object = db.read_object(untracked_oid)?;
         if untracked_object.object_type != ObjectType::Commit {
@@ -337,10 +378,15 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
     }
     if !options.quiet {
-        if tracked_tree_unchanged {
-            println!("Already up to date.");
-        }
         cmd_status(&[])?;
+    }
+    if let StashApplyOutcome::Conflict = outcome {
+        // git leaves the conflict in the worktree/index and exits nonzero so the
+        // user resolves it; pop must NOT drop the entry on conflict.
+        if options.reinstate_index {
+            eprintln!("Index was not unstashed.");
+        }
+        return Err(GitError::Exit(1));
     }
     Ok(AppliedStash {
         common_git_dir,
@@ -350,60 +396,400 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     })
 }
 
-struct StashMovedHeadApply<'a> {
+/// The trees that drive a stash apply: the stash base (`merge-base`), the stashed
+/// working tree (`theirs`), and the stashed index tree (used for `--index`).
+struct StashApplyState<'a> {
+    worktree_root: &'a Path,
+    git_dir: &'a Path,
     base_tree: &'a ObjectId,
-    head_tree: &'a ObjectId,
     stash_tree: &'a ObjectId,
     index_tree: &'a ObjectId,
-    reinstate_index: bool,
 }
 
-fn apply_stash_tracked_paths_to_moved_head(
+enum StashApplyOutcome {
+    Clean,
+    Conflict,
+}
+
+/// Run the 3-way merge that applies a stash onto the current index + worktree and
+/// materialize the result. Mirrors `do_apply_stash` in git's builtin/stash.c.
+fn apply_stash_via_merge(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    state: &StashApplyState<'_>,
+    reinstate_index: bool,
+) -> Result<StashApplyOutcome> {
+    // `ours` (git's `c_tree`) is the current index written as a tree. Reject a
+    // half-finished merge — git refuses "cannot apply a stash in the middle of a
+    // merge" when the index has unmerged (stage>0) entries.
+    let index = read_repository_index(state.git_dir, format)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
+    if index
+        .entries
+        .iter()
+        .any(|entry| index_entry_stage(entry) != 0)
+    {
+        eprintln!("error: cannot apply a stash in the middle of a merge");
+        return Err(GitError::Exit(1));
+    }
+    let ours_map: MergeTreeMap = index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .map(|entry| (entry.path.as_bytes().to_vec(), (entry.mode, entry.oid)))
+        .collect();
+
+    // For `--index`: stage the stash's index-side changes by 3-way-merging the
+    // stash index tree onto the current index. We compute the would-be index map
+    // now (before the worktree merge moves things around) and reinstate it after a
+    // clean worktree merge, matching git's apply-cached-then-reset_tree dance. git
+    // skips this when the stash's base and index trees match (no staged changes) or
+    // when the current index already equals the stash index tree.
+    let reinstated_index_map = if reinstate_index && state.base_tree != state.index_tree {
+        let index_map = stash_tree_entry_map(db, format, state.index_tree)?;
+        if ours_map == index_map {
+            None
+        } else {
+            let (idx_results, idx_conflicts) = three_way_merge_trees(
+                db,
+                format,
+                &stash_tree_entry_map(db, format, state.base_tree)?,
+                &ours_map,
+                &index_map,
+                "Updated upstream",
+                "Stashed index",
+            )?;
+            if !idx_conflicts.is_empty() {
+                eprintln!("Conflicts in index. Try without --index.");
+                return Err(GitError::Exit(1));
+            }
+            let mut merged: MergeTreeMap = BTreeMap::new();
+            for (path, result) in &idx_results {
+                if let MergePathResult::Resolved(Some(entry)) = result {
+                    merged.insert(path.clone(), *entry);
+                }
+            }
+            Some(merged)
+        }
+    } else {
+        None
+    };
+
+    let base_map = stash_tree_entry_map(db, format, state.base_tree)?;
+    let theirs_map = stash_tree_entry_map(db, format, state.stash_tree)?;
+    let (results, conflicts) = three_way_merge_trees(
+        db,
+        format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        "Updated upstream",
+        "Stashed changes",
+    )?;
+
+    // Refuse to clobber local worktree modifications or untracked files that lie
+    // in the way of a path the merge would write (unpack_trees' verify steps).
+    verify_stash_apply_safe(state.worktree_root, format, &ours_map, &results)?;
+
+    apply_stash_merge_results(state.worktree_root, state.git_dir, db, format, &ours_map, &results)?;
+
+    if !conflicts.is_empty() {
+        // Conflicts stay in the worktree/index for the user to resolve; git does
+        // not unstage or reinstate in this case.
+        return Ok(StashApplyOutcome::Conflict);
+    }
+
+    if let Some(index_map) = reinstated_index_map {
+        // `--index`: reinstate the stash's staged changes. git's
+        // `reset_tree(index_tree, 0, 0)` rewrites the index alone (cache only, not
+        // the worktree); write the merged index map as the new stage-0 index,
+        // carrying forward stat data for entries whose (mode, oid) is unchanged.
+        reinstate_stash_index(state.git_dir, format, &index_map)?;
+    } else if reinstate_index {
+        // `--index` requested but there were no staged changes to reinstate: the
+        // index already matches `ours`; leave it as the merge produced it.
+    } else {
+        // Plain `apply`: git's `unstage_changes_unless_new` resets the index back
+        // to `ours` for every path that already existed there, keeping only
+        // brand-new paths staged. Stash restores changes to the *working tree*;
+        // the index should look untouched except for newly-introduced files.
+        unstage_changes_unless_new(state.git_dir, format, &ours_map, &results)?;
+    }
+    Ok(StashApplyOutcome::Clean)
+}
+
+/// git's `unstage_changes_unless_new(c_tree)`: after a clean plain-`apply` merge
+/// (which stages every cleanly-merged path), revert each touched index entry back
+/// to its pre-merge (`ours`) state — unless the path is new (absent from `ours`),
+/// in which case the staged addition is kept. The worktree is left as the merge
+/// materialized it.
+fn unstage_changes_unless_new(
+    git_dir: &Path,
+    format: ObjectFormat,
+    ours_map: &MergeTreeMap,
+    results: &BTreeMap<Vec<u8>, MergePathResult>,
+) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let mut stat_cache: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
+    for entry in &index.entries {
+        if index_entry_stage(entry) == 0 {
+            stat_cache.insert(entry.path.clone().into_bytes(), entry.clone());
+        }
+    }
+    let mut stage0: BTreeMap<Vec<u8>, IndexEntry> = stat_cache.clone();
+    for (path, result) in results {
+        // Only cleanly-merged paths were staged at stage 0 by the merge; conflicts
+        // keep their stage 1/2/3 entries untouched.
+        if let MergePathResult::Conflict { .. } = result {
+            continue;
+        }
+        match ours_map.get(path) {
+            // Existed in `ours`: restore the index entry to ours' version.
+            Some((mode, oid)) => {
+                let entry = match stat_cache.get(path) {
+                    Some(old) if old.mode == *mode && old.oid == *oid => old.clone(),
+                    _ => merge_index_entry(path, *mode, *oid, 0),
+                };
+                stage0.insert(path.clone(), entry);
+            }
+            // New path (absent from `ours`): keep whatever the merge staged.
+            None => {}
+        }
+    }
+    let mut entries: Vec<IndexEntry> = index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) != 0)
+        .cloned()
+        .collect();
+    entries.extend(stage0.into_values());
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
+    });
+    index.entries = entries;
+    index.extensions = Vec::new();
+    index.checksum = None;
+    fs::write(&index_path, index.write(format)?)?;
+    Ok(())
+}
+
+/// Rewrite the index to exactly `index_map` (stage 0). The worktree is left
+/// untouched — this is git's `reset_tree(index_tree, 0, 0)` for `--index`.
+fn reinstate_stash_index(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_map: &MergeTreeMap,
+) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let prior: BTreeMap<Vec<u8>, IndexEntry> = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+            .entries
+            .into_iter()
+            .filter(|entry| index_entry_stage(entry) == 0)
+            .map(|entry| (entry.path.clone().into_bytes(), entry))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let mut entries: Vec<IndexEntry> = index_map
+        .iter()
+        .map(|(path, (mode, oid))| match prior.get(path) {
+            Some(old) if old.mode == *mode && old.oid == *oid => old.clone(),
+            _ => merge_index_entry(path, *mode, *oid, 0),
+        })
+        .collect();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        &index_path,
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
+    Ok(())
+}
+
+/// Pre-flight clobber check: a path whose on-disk content diverges from `ours`
+/// (the index) cannot be safely overwritten, and an untracked file may not be
+/// clobbered by a newly-introduced path. Matches git's refusal to lose local
+/// changes during `stash apply`.
+fn verify_stash_apply_safe(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    ours_map: &MergeTreeMap,
+    results: &BTreeMap<Vec<u8>, MergePathResult>,
+) -> Result<()> {
+    let mut local_changes: Vec<Vec<u8>> = Vec::new();
+    let mut untracked: Vec<Vec<u8>> = Vec::new();
+    for (path, result) in results {
+        let (target, changes) = match result {
+            MergePathResult::Resolved(entry) => (*entry, ours_map.get(path) != entry.as_ref()),
+            MergePathResult::Conflict { .. } => (None, true),
+        };
+        if !changes {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let full = worktree_root.join(rel);
+        match ours_map.get(path) {
+            Some((_, ours_oid)) => {
+                let Ok(bytes) = fs::read(&full) else {
+                    continue;
+                };
+                let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+                if &on_disk != ours_oid {
+                    local_changes.push(path.clone());
+                }
+            }
+            None => {
+                let would_write =
+                    target.is_some() || matches!(result, MergePathResult::Conflict { .. });
+                if would_write && full.exists() {
+                    untracked.push(path.clone());
+                }
+            }
+        }
+    }
+    if !local_changes.is_empty() {
+        eprintln!(
+            "error: Your local changes to the following files would be overwritten by merge:"
+        );
+        for path in &local_changes {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please commit your changes or stash them before you merge.");
+        eprintln!("Aborting");
+        return Err(GitError::Exit(1));
+    }
+    if !untracked.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by merge:"
+        );
+        for path in &untracked {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you merge.");
+        eprintln!("Aborting");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+/// Apply merge results to the index (stage-0 for resolved paths, stages 1/2/3 for
+/// conflicts) and the worktree (write resolved/conflict-marker blobs, remove
+/// deletions). Mirrors replay.rs' `apply_merge_results_to_index_and_worktree`.
+fn apply_stash_merge_results(
     worktree_root: &Path,
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    options: StashMovedHeadApply<'_>,
+    ours_map: &MergeTreeMap,
+    results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
-    let base_entries = stash_tree_entry_map(db, format, options.base_tree)?;
-    let head_entries = stash_tree_entry_map(db, format, options.head_tree)?;
-    let stash_entries = stash_tree_entry_map(db, format, options.stash_tree)?;
-    let index_entries = stash_tree_entry_map(db, format, options.index_tree)?;
-    let worktree_paths = stash_tree_changed_paths(&base_entries, &stash_entries);
-    let index_paths = if options.reinstate_index {
-        stash_tree_changed_paths(&base_entries, &index_entries)
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let old_index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
-        BTreeSet::new()
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
     };
-    let mut affected_paths = worktree_paths.clone();
-    affected_paths.extend(index_paths.iter().cloned());
-    for path in &affected_paths {
-        if head_entries.get(path) != base_entries.get(path) {
-            return Err(GitError::Unsupported(
-                "stash apply currently requires stashed paths to be unchanged since the stash base"
-                    .into(),
-            ));
+    let mut old_entries: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
+    for entry in &old_index.entries {
+        if index_entry_stage(entry) == 0 {
+            old_entries.insert(entry.path.clone().into_bytes(), entry.clone());
         }
     }
-    let worktree_paths = stash_changed_pathbufs(&worktree_paths)?;
-    if !worktree_paths.is_empty() {
-        sley_worktree::restore_worktree_paths_from_tree(
-            worktree_root,
-            git_dir,
-            format,
-            options.stash_tree,
-            &worktree_paths,
-        )?;
+
+    let mut entries: Vec<IndexEntry> = Vec::new();
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if let Some(old) = old_entries.get(path)
+                    && old.mode == *mode
+                    && old.oid == *oid
+                {
+                    entries.push(old.clone());
+                } else {
+                    entries.push(merge_index_entry(path, *mode, *oid, 0));
+                }
+            }
+            MergePathResult::Resolved(None) => {}
+            MergePathResult::Conflict {
+                base, ours, theirs, ..
+            } => {
+                if let Some((mode, oid)) = base {
+                    entries.push(merge_index_entry(path, *mode, *oid, 1));
+                }
+                if let Some((mode, oid)) = ours {
+                    entries.push(merge_index_entry(path, *mode, *oid, 2));
+                }
+                if let Some((mode, oid)) = theirs {
+                    entries.push(merge_index_entry(path, *mode, *oid, 3));
+                }
+            }
+        }
     }
-    let index_paths = stash_changed_pathbufs(&index_paths)?;
-    if !index_paths.is_empty() {
-        sley_worktree::restore_index_paths_from_tree(
-            worktree_root,
-            git_dir,
-            format,
-            options.index_tree,
-            &index_paths,
-        )?;
+    // Preserve stage-0 index entries for paths the merge did not touch.
+    for (path, entry) in &old_entries {
+        if !results.contains_key(path) {
+            entries.push(entry.clone());
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
+    });
+    fs::write(
+        &index_path,
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
+
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = merge_read_blob(db, oid)?;
+                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => {
+                if ours_map.contains_key(path) {
+                    merge_remove_worktree_file(worktree_root, path)?;
+                }
+            }
+            MergePathResult::Conflict { worktree, .. } => match worktree {
+                Some((mode, content)) => {
+                    merge_write_worktree_file(worktree_root, path, content, *mode)?
+                }
+                None => merge_remove_worktree_file(worktree_root, path)?,
+            },
+        }
     }
     Ok(())
 }
@@ -3356,35 +3742,20 @@ pub(crate) fn apply_stash_commit_quietly(stash_oid: &ObjectId) -> Result<bool> {
     let Ok(index_commit) = Commit::parse(format, &index_object.body) else {
         return Ok(false);
     };
-    let applied = if base_oid == &head_oid {
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &worktree_root,
-            &git_dir,
-            format,
-            stash_oid,
-        )
-        .and_then(|_| {
-            sley_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)
-        })
-        .is_ok()
-    } else {
-        apply_stash_tracked_paths_to_moved_head(
-            &worktree_root,
-            &git_dir,
-            &db,
-            format,
-            StashMovedHeadApply {
-                base_tree: &base_commit.tree,
-                head_tree: &head_commit.tree,
-                stash_tree: &stash_commit.tree,
-                index_tree: &index_commit.tree,
-                reinstate_index: false,
-            },
-        )
-        .is_ok()
+    let _ = (&head_oid, &head_commit);
+    let stash_state = StashApplyState {
+        worktree_root: &worktree_root,
+        git_dir: &git_dir,
+        base_tree: &base_commit.tree,
+        stash_tree: &stash_commit.tree,
+        index_tree: &index_commit.tree,
     };
-    if !applied {
-        return Ok(false);
+    // Autostash apply must be clean; on conflict (or any error) the caller keeps
+    // the stash entry and lets the user recover it manually.
+    match apply_stash_via_merge(&db, format, &stash_state, false) {
+        Ok(StashApplyOutcome::Clean) => {}
+        Ok(StashApplyOutcome::Conflict) => return Ok(false),
+        Err(_) => return Ok(false),
     }
     if let Some(untracked_oid) = stash_commit.parents.get(2) {
         let Ok(untracked_object) = db.read_object(untracked_oid) else {
