@@ -109,6 +109,10 @@ enum RangeBound {
     /// A backward relative offset from the start (`-N`), only valid as the end:
     /// end = start - N (git's `-L X,-N`, which yields a reversed span).
     RelativeNeg(usize),
+    /// A `/regex/` bound: the first line matching `pattern` at or after the
+    /// search anchor (the previous range's end + 1, or line 1 when
+    /// `absolute`). `^/regex/` forces the absolute anchor.
+    Regex { pattern: String, absolute: bool },
 }
 
 /// The blame result for a single final-image line.
@@ -422,20 +426,37 @@ fn parse_line_range(value: &str) -> Result<RawRange> {
     if value.is_empty() {
         return Err(blame_usage_error());
     }
-    // The `:funcname` and `/regex/` range forms are recognized by git but not
-    // implemented here; report them as unsupported instead of misparsing.
-    if value.starts_with(':') || value.starts_with('/') {
+    // The `:funcname` / `:/regex/` function-name range forms are recognized by
+    // git but not implemented here; report them as unsupported.
+    if value.starts_with(':') || value.starts_with("^:") {
         return Err(GitError::Unsupported(format!(
-            "git blame -L {value} (function/regex range) is not supported by sley"
+            "git blame -L {value} (function-name range) is not supported by sley"
         )));
     }
-    let (start_raw, end_raw) = match value.split_once(',') {
-        Some((start, end)) => (start, end),
-        None => (value, ""),
-    };
+    // Split on the FIRST `,` that is not inside a `/regex/` (a regex may contain
+    // a comma), so `-L/a,b/,/c/` splits into `/a,b/` and `/c/`.
+    let (start_raw, end_raw) = split_range_at_comma(value);
     let start = parse_range_bound(start_raw, false)?;
     let end = parse_range_bound(end_raw, true)?;
     Ok(RawRange { start, end })
+}
+
+/// Split a `-L` argument at the first top-level `,` (one not inside a `/.../`
+/// regex). Returns `(start, end)`; `end` is empty when there is no comma.
+fn split_range_at_comma(value: &str) -> (&str, &str) {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    let mut in_regex = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_regex => i += 1, // skip the escaped char
+            b'/' => in_regex = !in_regex,
+            b',' if !in_regex => return (&value[..i], &value[i + 1..]),
+            _ => {}
+        }
+        i += 1;
+    }
+    (value, "")
 }
 
 /// Parse one `-L` bound. `is_end` allows the `+N` relative form. A token that
@@ -443,6 +464,24 @@ fn parse_line_range(value: &str) -> Result<RawRange> {
 fn parse_range_bound(raw: &str, is_end: bool) -> Result<RangeBound> {
     if raw.is_empty() {
         return Ok(RangeBound::Omitted);
+    }
+    // `/regex/` and `^/regex/` bounds: the first matching line at/after the
+    // search anchor; `^` forces the absolute (line-1) anchor.
+    let (regex_body, absolute) = match raw.strip_prefix('^') {
+        Some(rest) if rest.starts_with('/') => (Some(rest), true),
+        _ if raw.starts_with('/') => (Some(raw), false),
+        _ => (None, false),
+    };
+    if let Some(body) = regex_body {
+        // Strip the surrounding slashes; a trailing `/` is required.
+        let inner = body
+            .strip_prefix('/')
+            .and_then(|s| s.strip_suffix('/'))
+            .ok_or_else(blame_usage_error)?;
+        return Ok(RangeBound::Regex {
+            pattern: inner.to_string(),
+            absolute,
+        });
     }
     if let Some(rest) = raw.strip_prefix('+') {
         if !is_end {
@@ -1084,14 +1123,49 @@ fn select_lines(lines: &[LineBlame], options: &BlameOptions, path: &str) -> Resu
     if options.ranges.is_empty() {
         return Ok((1..=total).collect());
     }
+    // The line *contents* (newline-stripped) feed the `/regex/` bound search.
+    let contents: Vec<&[u8]> = lines
+        .iter()
+        .map(|l| strip_trailing_newline(&l.content))
+        .collect();
     let mut selected: BTreeSet<usize> = BTreeSet::new();
+    // git threads an `anchor` between ranges: a relative `/regex/` starts its
+    // search at the previous range's end + 1.
+    let mut anchor = 1usize;
     for range in &options.ranges {
-        let (lo, hi) = resolve_range(range, total, path)?;
+        let (lo, hi) = resolve_range(range, total, &contents, anchor, path)?;
         for line in lo..=hi {
             selected.insert(line);
         }
+        anchor = hi + 1;
     }
     Ok(selected.into_iter().collect())
+}
+
+/// Resolve a `/regex/` `-L` bound: the 1-based number of the first line at or
+/// after `from` (1-based) whose content matches `pattern`. git compiles the
+/// pattern as a POSIX *basic* regex (`regcomp` without `REG_EXTENDED`) with
+/// `REG_NEWLINE`; we mirror that with sley's BRE engine. No match is the fatal
+/// "no match" error git reports.
+fn resolve_regex_bound(
+    pattern: &str,
+    contents: &[&[u8]],
+    from: usize,
+    _total: usize,
+) -> Result<usize> {
+    use crate::grep_source::{Regex, RegexMode};
+    let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
+        eprintln!("fatal: -L parameter '{pattern}': invalid regex");
+        GitError::Exit(128)
+    })?;
+    let start_idx = from.saturating_sub(1); // 0-based
+    for (idx, line) in contents.iter().enumerate().skip(start_idx) {
+        if re.find_from(line, 0).is_some() {
+            return Ok(idx + 1);
+        }
+    }
+    eprintln!("fatal: -L parameter '{pattern}' starting at line {from}: No match");
+    Err(GitError::Exit(128))
 }
 
 /// Resolve one `-L` range against the file's `total` line count, applying git's
@@ -1104,10 +1178,22 @@ fn select_lines(lines: &[LineBlame], options: &BlameOptions, path: &str) -> Resu
 /// the *smaller* endpoint, not the literal start: `-L 100,2` lists lines 2..N
 /// (no error), while `-L 100,200` — whose smaller endpoint is also past the end
 /// — is the error. We mirror that exactly.
-fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, usize)> {
-    let start = match range.start {
+fn resolve_range(
+    range: &RawRange,
+    total: usize,
+    contents: &[&[u8]],
+    anchor: usize,
+    path: &str,
+) -> Result<(usize, usize)> {
+    let start = match &range.start {
         RangeBound::Omitted => 1,
-        RangeBound::Absolute(n) => n,
+        RangeBound::Absolute(n) => *n,
+        // The `/regex/` start searches from the running anchor (or line 1 for
+        // the `^/regex/` absolute form).
+        RangeBound::Regex { pattern, absolute } => {
+            let from = if *absolute { 1 } else { anchor };
+            resolve_regex_bound(pattern, contents, from, total)?
+        }
         // `±N` is only meaningful as an end bound; the parser already rejects a
         // relative start, so this is defensive and reports a usage error.
         RangeBound::Relative(_) | RangeBound::RelativeNeg(_) => return Err(blame_usage_error()),
@@ -1123,18 +1209,23 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
     // end (0 means "omitted", to be defaulted to end-of-file below — NOT to
     // `total` here, so a start past the end is still detected as an error).
     let mut begin = start;
-    let mut end = match range.end {
+    let mut end = match &range.end {
         RangeBound::Omitted => 0,
         RangeBound::Absolute(n) => {
-            if n == 0 {
+            if *n == 0 {
                 eprintln!("fatal: -L invalid line number: 0");
                 return Err(GitError::Exit(128));
             }
-            n
+            *n
+        }
+        // The `/regex/` end searches from `begin + 1` (git's `*begin + 1`).
+        RangeBound::Regex { pattern, absolute } => {
+            let from = if *absolute { 1 } else { start + 1 };
+            resolve_regex_bound(pattern, contents, from, total)?
         }
         // `start,+0` is an empty range git rejects; else end = start + count - 1.
         RangeBound::Relative(count) => {
-            if count == 0 {
+            if *count == 0 {
                 eprintln!("fatal: -L invalid empty range");
                 return Err(GitError::Exit(128));
             }
@@ -1142,7 +1233,7 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
         }
         // `start,-N` selects the N lines ending at `start`: span [start-N+1, start].
         RangeBound::RelativeNeg(count) => {
-            if count == 0 {
+            if *count == 0 {
                 eprintln!("fatal: -L invalid empty range");
                 return Err(GitError::Exit(128));
             }
