@@ -935,7 +935,27 @@ fn add_update_tracked_path(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+        // git's `add -u` index update folds in `global_conv_flags_eol`, so emit
+        // the `core.safecrlf` round-trip warning (default: warn). The current
+        // index blob (`entry.oid`) drives the auto-crlf `has_crlf_in_index`
+        // decision.
+        let conv_flags = ConvFlags::from_config(&clean_filter.config);
+        let index_blob = match conv_flags {
+            ConvFlags::Off => SafeCrlfIndexBlob::None,
+            _ => SafeCrlfIndexBlob::Lookup {
+                odb,
+                oid: entry.oid,
+            },
+        };
+        apply_clean_filter_with_attributes_cow_safecrlf(
+            &clean_filter.config,
+            &checks,
+            git_path,
+            &body,
+            conv_flags,
+            index_blob,
+        )?
+        .into_owned()
     };
     let object = EncodedObject::new(ObjectType::Blob, body);
     let oid = object.object_id(format)?;
@@ -1027,6 +1047,11 @@ fn update_index_paths_impl(
         Some(_) => Some(UpdateIndexCleanFilter::PathLocal),
         None => None,
     };
+    // git's index-update path (object-file.c `get_conv_flags`) folds in
+    // `global_conv_flags_eol`, so `git add`/`commit` emit the `core.safecrlf`
+    // round-trip warning (default: warn). It only applies when content filters
+    // run at all (i.e. when we have a config).
+    let conv_flags = clean_config.map_or(ConvFlags::Off, ConvFlags::from_config);
     let requested_filter_attrs = filter_attribute_names();
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
@@ -1129,6 +1154,16 @@ fn update_index_paths_impl(
             symlink_target_bytes(&absolute)?
         } else {
             let body = fs::read(&absolute)?;
+            // The safecrlf auto-crlf decision needs the path's *current* index
+            // blob (git's `has_crlf_in_index`); the stage-0 entry, if any, has it.
+            let index_blob = match conv_flags {
+                ConvFlags::Off => SafeCrlfIndexBlob::None,
+                _ => stage0_oid_in_range(&index.entries, existing_range.clone())
+                    .map_or(SafeCrlfIndexBlob::None, |oid| SafeCrlfIndexBlob::Lookup {
+                        odb: &odb,
+                        oid,
+                    }),
+            };
             match (clean_config, &clean_filter) {
                 (Some(config), Some(UpdateIndexCleanFilter::Full(matcher))) => {
                     // Identical to `apply_clean_filter`, but reuses the batch's
@@ -1136,10 +1171,17 @@ fn update_index_paths_impl(
                     // for this path.
                     let checks =
                         matcher.attributes_for_path(&git_path, &requested_filter_attrs, false);
-                    apply_clean_filter_with_attributes(config, &checks, &git_path, &body)?
+                    apply_clean_filter_with_attributes_cow_safecrlf(
+                        config, &checks, &git_path, &body, conv_flags, index_blob,
+                    )?
+                    .into_owned()
                 }
                 (Some(config), Some(UpdateIndexCleanFilter::PathLocal)) => {
-                    apply_clean_filter(worktree_root, git_dir, config, &git_path, &body)?
+                    let checks = filter_attribute_checks(worktree_root, &git_path)?;
+                    apply_clean_filter_with_attributes_cow_safecrlf(
+                        config, &checks, &git_path, &body, conv_flags, index_blob,
+                    )?
+                    .into_owned()
                 }
                 _ => body,
             }
@@ -1916,6 +1958,18 @@ fn normalize_index_version_for_extended_flags(index: &mut Index) {
 
 fn index_entry_stage(entry: &IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
+}
+
+/// The oid of the stage-0 entry in `range` (the path's currently-tracked blob),
+/// if any. Used by the safecrlf check to fetch `has_crlf_in_index`.
+fn stage0_oid_in_range(
+    entries: &[IndexEntry],
+    range: std::ops::Range<usize>,
+) -> Option<ObjectId> {
+    entries[range]
+        .iter()
+        .find(|entry| index_entry_stage(entry) == 0)
+        .map(|entry| entry.oid)
 }
 
 fn index_entry_skip_worktree(entry: &IndexEntry) -> bool {
@@ -5672,7 +5726,18 @@ impl ContentFilterPlan {
     ///
     /// An explicit `text`/`eol=crlf` (non-auto) path always converts naked LFs.
     fn will_convert_lf_to_crlf(&self, content: &[u8]) -> bool {
-        let stats = gather_convert_stats(content);
+        self.will_convert_lf_to_crlf_stats(&gather_convert_stats(content))
+    }
+
+    /// Stats-based variant of [`will_convert_lf_to_crlf`], mirroring convert.c
+    /// `will_convert_lf_to_crlf(struct text_stat *, ...)`. Used by the safecrlf
+    /// round-trip simulation, which mutates a copy of the stats rather than
+    /// re-scanning the buffer.
+    fn will_convert_lf_to_crlf_stats(&self, stats: &ConvertStats) -> bool {
+        // `output_eol(crlf_action) != EOL_CRLF` short-circuits in git.
+        if self.eol != EolConversion::Crlf {
+            return false;
+        }
         // No naked LF? Nothing to convert.
         if stats.lonelf == 0 {
             return false;
@@ -5682,11 +5747,70 @@ impl ContentFilterPlan {
             if stats.lonecr > 0 || stats.crlf > 0 {
                 return false;
             }
-            if convert_is_binary(&stats) {
+            if convert_is_binary(stats) {
                 return false;
             }
         }
         true
+    }
+
+    /// Whether this path is a candidate for the `core.safecrlf` round-trip check
+    /// at all: git only warns for non-`CRLF_BINARY` actions. `Binary` and
+    /// `Unspecified` (with autocrlf off) correspond to git's `CRLF_BINARY`.
+    fn safecrlf_applies(&self) -> bool {
+        matches!(self.text, TextDecision::Text | TextDecision::Auto)
+    }
+
+    /// Emit git's `core.safecrlf` round-trip warning for `path`, mirroring the
+    /// stderr side-effect of convert.c `crlf_to_git` (the `CONV_EOL_RNDTRP_*`
+    /// branch). `old_stats` are the stats of the *pre-conversion* worktree
+    /// content (already gathered by the caller so the buffer is scanned once);
+    /// `index_has_crlf` is whether the path's current index blob already has a
+    /// CRLF (git's `has_crlf_in_index`, used only for the auto-crlf decision).
+    ///
+    /// This never inspects or alters the bytes written to the object store; it is
+    /// purely the additive warning git prints alongside `git add`/`commit`.
+    /// Returns `Err` only under `core.safecrlf=true` when the round-trip is
+    /// irreversible (git `die`s).
+    fn check_safe_crlf_stats(
+        &self,
+        old_stats: &ConvertStats,
+        index_has_crlf: bool,
+        flags: ConvFlags,
+        path: &[u8],
+    ) -> Result<()> {
+        if flags == ConvFlags::Off || !self.safecrlf_applies() {
+            return Ok(());
+        }
+
+        // Replicate `crlf_to_git`'s `convert_crlf_into_lf` decision (the clean
+        // direction). It starts as "there is a CRLF to collapse"; auto paths
+        // suppress conversion for binary content or content whose index blob
+        // already carries a CRLF (the "new safer autocrlf").
+        let mut convert_crlf_into_lf = old_stats.crlf > 0;
+        if self.text == TextDecision::Auto {
+            if convert_is_binary(old_stats) {
+                // git returns 0 here: no conversion *and* no warning.
+                return Ok(());
+            }
+            if index_has_crlf {
+                convert_crlf_into_lf = false;
+            }
+        }
+
+        // Simulate the round-trip on a copy of the stats.
+        let mut new_stats = old_stats.clone();
+        // Simulate "git add" (clean: CRLF -> LF).
+        if convert_crlf_into_lf {
+            new_stats.lonelf += new_stats.crlf;
+            new_stats.crlf = 0;
+        }
+        // Simulate "git checkout" (smudge: LF -> CRLF).
+        if self.will_convert_lf_to_crlf_stats(&new_stats) {
+            new_stats.crlf += new_stats.lonelf;
+            new_stats.lonelf = 0;
+        }
+        check_safe_crlf(old_stats, &new_stats, flags, path)
     }
 }
 
@@ -6025,10 +6149,68 @@ pub fn apply_clean_filter_with_attributes_cow<'a>(
     path: &[u8],
     content: &'a [u8],
 ) -> Result<Cow<'a, [u8]>> {
+    apply_clean_filter_with_attributes_cow_safecrlf(
+        config,
+        attributes,
+        path,
+        content,
+        ConvFlags::Off,
+        SafeCrlfIndexBlob::None,
+    )
+}
+
+/// How the safecrlf check should learn whether this path's *current index blob*
+/// already contains a CRLF (git's `has_crlf_in_index`). Only consulted on the
+/// `text=auto` / `core.autocrlf` path.
+pub enum SafeCrlfIndexBlob<'a> {
+    /// No index blob is available (the staging caller has none, or safecrlf is
+    /// off) — treated as "no CRLF in index".
+    None,
+    /// The path's current index blob, read on demand from this object database
+    /// only when the auto-crlf decision actually needs it.
+    Lookup {
+        odb: &'a FileObjectDatabase,
+        oid: ObjectId,
+    },
+}
+
+impl SafeCrlfIndexBlob<'_> {
+    fn has_crlf(&self) -> bool {
+        match self {
+            SafeCrlfIndexBlob::None => false,
+            SafeCrlfIndexBlob::Lookup { odb, oid } => has_crlf_in_index(odb, oid),
+        }
+    }
+}
+
+/// [`apply_clean_filter_with_attributes_cow`] plus git's additive `core.safecrlf`
+/// round-trip warning (convert.c `crlf_to_git`).
+///
+/// The conversion result is byte-for-byte identical to the plain variant;
+/// `flags`/`index_blob` only drive the stderr warning git prints when a
+/// CRLF<->LF round-trip would not be reversible. The warning is computed on the
+/// *post-driver, pre-EOL-conversion* content, matching git's ordering in
+/// `convert_to_git` (apply_filter -> crlf_to_git).
+pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+    flags: ConvFlags,
+    index_blob: SafeCrlfIndexBlob<'_>,
+) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     let mut data = Cow::Borrowed(content);
     if let Some(driver) = &plan.driver {
         data = run_driver(driver, driver.clean.as_deref(), path, data)?;
+    }
+    // The safecrlf check scans the (post-driver) buffer once for line-ending
+    // stats. Gate it tightly so the extra scan never runs on the dominant
+    // pass-through paths: only when safecrlf is enabled, the path is a real
+    // conversion candidate (not `CRLF_BINARY`), and the buffer is non-empty.
+    if flags != ConvFlags::Off && !data.is_empty() && plan.safecrlf_applies() {
+        let old_stats = gather_convert_stats(&data);
+        plan.check_safe_crlf_stats(&old_stats, index_blob.has_crlf(), flags, path)?;
     }
     if plan.convert_eol(&data) {
         data = Cow::Owned(convert_crlf_to_lf(&data));
@@ -6194,6 +6376,7 @@ fn filter_attribute_names() -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// Line-ending statistics of a byte buffer, mirroring convert.c `gather_stats`.
+#[derive(Clone)]
 struct ConvertStats {
     nul: u32,
     lonecr: u32,
@@ -6255,6 +6438,27 @@ fn gather_convert_stats(buf: &[u8]) -> ConvertStats {
     stats
 }
 
+/// Mirror of convert.c `has_crlf_in_index`: whether the blob currently recorded
+/// in the index for this path is non-binary text containing a CRLF. Used only by
+/// the auto-crlf safecrlf decision to keep an already-CRLF index blob from being
+/// silently collapsed. A missing/unreadable blob (or a non-blob entry) counts as
+/// "no CRLF", matching git's `read_blob_data_from_index` returning NULL.
+fn has_crlf_in_index(odb: &FileObjectDatabase, oid: &ObjectId) -> bool {
+    let Ok(object) = odb.read_object(oid) else {
+        return false;
+    };
+    if object.object_type != ObjectType::Blob {
+        return false;
+    }
+    let data = &object.body;
+    // git short-circuits on the first '\r' via memchr before gathering stats.
+    if !data.contains(&b'\r') {
+        return false;
+    }
+    let stats = gather_convert_stats(data);
+    !convert_is_binary(&stats) && stats.crlf > 0
+}
+
 /// Mirror of convert.c `convert_is_binary`: a lone CR or NUL, or a high
 /// non-printable ratio, marks the content as binary.
 fn convert_is_binary(stats: &ConvertStats) -> bool {
@@ -6265,6 +6469,93 @@ fn convert_is_binary(stats: &ConvertStats) -> bool {
         return true;
     }
     (stats.printable >> 7) < stats.nonprintable
+}
+
+/// The `core.safecrlf` round-trip-warning mode, mirroring git's
+/// `global_conv_flags_eol` (environment.c). git's *default* — when
+/// `core.safecrlf` is unset — is [`ConvFlags::Warn`], so the warning fires even
+/// without any explicit config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvFlags {
+    /// `core.safecrlf=false`: never warn.
+    Off,
+    /// `core.safecrlf=warn` (and the unset default): emit a warning when a
+    /// CRLF<->LF round-trip would not be reversible.
+    Warn,
+    /// `core.safecrlf=true`: die instead of warn.
+    Die,
+}
+
+impl ConvFlags {
+    /// Resolve `core.safecrlf` from config, mirroring environment.c
+    /// `git_default_core_config`: `warn` -> [`ConvFlags::Warn`], a boolean-true
+    /// value -> [`ConvFlags::Die`], a boolean-false value -> [`ConvFlags::Off`].
+    /// When the key is absent git leaves `global_conv_flags_eol` at its initial
+    /// [`ConvFlags::Warn`], so unset also resolves to [`ConvFlags::Warn`].
+    pub fn from_config(config: &GitConfig) -> Self {
+        match config.get("core", None, "safecrlf") {
+            Some(value) if value.eq_ignore_ascii_case("warn") => ConvFlags::Warn,
+            Some(_) => {
+                if config.get_bool("core", None, "safecrlf") == Some(true) {
+                    ConvFlags::Die
+                } else {
+                    ConvFlags::Off
+                }
+            }
+            None => ConvFlags::Warn,
+        }
+    }
+}
+
+/// Mirror of convert.c `check_global_conv_flags_eol`: compare the pre-conversion
+/// `old_stats` against the simulated round-trip `new_stats` and, when the
+/// CRLF/LF content would not survive a clean+smudge cycle, warn (or die under
+/// `core.safecrlf=true`).
+///
+/// Returns `Err(GitError::Exit(128))` when `flags` is [`ConvFlags::Die`] and the
+/// round-trip is irreversible (git `die`s with exit 128 here); otherwise prints
+/// the warning to stderr and returns `Ok(())`. This is a pure stderr-side
+/// effect: it never changes the bytes written to the object store.
+fn check_safe_crlf(
+    old_stats: &ConvertStats,
+    new_stats: &ConvertStats,
+    flags: ConvFlags,
+    path: &[u8],
+) -> Result<()> {
+    if flags == ConvFlags::Off {
+        return Ok(());
+    }
+    let display = String::from_utf8_lossy(path);
+    if old_stats.crlf > 0 && new_stats.crlf == 0 {
+        // CRLFs would not be restored by checkout.
+        match flags {
+            ConvFlags::Die => {
+                eprintln!("fatal: CRLF would be replaced by LF in {display}");
+                return Err(GitError::Exit(128));
+            }
+            ConvFlags::Warn => {
+                eprintln!(
+                    "warning: in the working copy of '{display}', CRLF will be replaced by LF the next time Git touches it"
+                );
+            }
+            ConvFlags::Off => unreachable!("handled above"),
+        }
+    } else if old_stats.lonelf > 0 && new_stats.lonelf == 0 {
+        // CRLFs would be added by checkout.
+        match flags {
+            ConvFlags::Die => {
+                eprintln!("fatal: LF would be replaced by CRLF in {display}");
+                return Err(GitError::Exit(128));
+            }
+            ConvFlags::Warn => {
+                eprintln!(
+                    "warning: in the working copy of '{display}', LF will be replaced by CRLF the next time Git touches it"
+                );
+            }
+            ConvFlags::Off => unreachable!("handled above"),
+        }
+    }
+    Ok(())
 }
 
 /// Compute the `i/` or `w/` stat string for `content`, mirroring
@@ -10790,6 +11081,140 @@ mod tests {
             restored, worktree,
             "smudge must restore CRLF from the LF blob"
         );
+    }
+
+    #[test]
+    fn conv_flags_from_config_matches_git_defaults() {
+        // Unset core.safecrlf defaults to WARN (git's global_conv_flags_eol).
+        assert_eq!(ConvFlags::from_config(&config_from("")), ConvFlags::Warn);
+        assert_eq!(
+            ConvFlags::from_config(&config_from("[core]\n\tsafecrlf = warn\n")),
+            ConvFlags::Warn
+        );
+        assert_eq!(
+            ConvFlags::from_config(&config_from("[core]\n\tsafecrlf = WARN\n")),
+            ConvFlags::Warn
+        );
+        assert_eq!(
+            ConvFlags::from_config(&config_from("[core]\n\tsafecrlf = true\n")),
+            ConvFlags::Die
+        );
+        assert_eq!(
+            ConvFlags::from_config(&config_from("[core]\n\tsafecrlf = false\n")),
+            ConvFlags::Off
+        );
+    }
+
+    #[test]
+    fn safecrlf_warn_does_not_change_clean_bytes() {
+        // The warning is purely additive: byte output is identical whether
+        // safecrlf is off or warn.
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let worktree = b"a\nb\nc\n";
+        let plain = apply_clean_filter_with_attributes(&config, &checks, b"f.txt", worktree)
+            .expect("clean");
+        let warned = apply_clean_filter_with_attributes_cow_safecrlf(
+            &config,
+            &checks,
+            b"f.txt",
+            worktree,
+            ConvFlags::Warn,
+            SafeCrlfIndexBlob::None,
+        )
+        .expect("clean with safecrlf")
+        .into_owned();
+        assert_eq!(plain, warned, "safecrlf must not alter the cleaned bytes");
+    }
+
+    #[test]
+    fn safecrlf_die_errors_on_lf_to_crlf_round_trip() {
+        // autocrlf=true on a pure-LF file: checkout would add CRLF, so the
+        // round-trip is irreversible and safecrlf=true dies (exit 128).
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let err = apply_clean_filter_with_attributes_cow_safecrlf(
+            &config,
+            &checks,
+            b"f.txt",
+            b"a\nb\n",
+            ConvFlags::Die,
+            SafeCrlfIndexBlob::None,
+        )
+        .expect_err("die must error");
+        assert!(matches!(err, GitError::Exit(128)));
+    }
+
+    #[test]
+    fn safecrlf_die_errors_on_crlf_to_lf_round_trip() {
+        // autocrlf=input on a CRLF file: clean strips CRLF and checkout never
+        // restores it, so safecrlf=true dies.
+        let config = config_from("[core]\n\tautocrlf = input\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let err = apply_clean_filter_with_attributes_cow_safecrlf(
+            &config,
+            &checks,
+            b"f.txt",
+            b"a\r\nb\r\n",
+            ConvFlags::Die,
+            SafeCrlfIndexBlob::None,
+        )
+        .expect_err("die must error");
+        assert!(matches!(err, GitError::Exit(128)));
+    }
+
+    #[test]
+    fn safecrlf_reversible_round_trip_does_not_warn_or_die() {
+        // A CRLF file under autocrlf=true survives the round trip (clean to LF,
+        // smudge back to CRLF), so even safecrlf=true is silent.
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let out = apply_clean_filter_with_attributes_cow_safecrlf(
+            &config,
+            &checks,
+            b"f.txt",
+            b"a\r\nb\r\n",
+            ConvFlags::Die,
+            SafeCrlfIndexBlob::None,
+        )
+        .expect("reversible round trip must not die");
+        assert_eq!(out.as_ref(), b"a\nb\n");
+    }
+
+    #[test]
+    fn safecrlf_binary_content_is_silent() {
+        // autocrlf=true with NUL-containing (binary) content: no conversion and
+        // no warning/die, mirroring git's early-return in crlf_to_git.
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let body: &[u8] = b"a\nb\0c\n";
+        let out = apply_clean_filter_with_attributes_cow_safecrlf(
+            &config,
+            &checks,
+            b"f.bin",
+            body,
+            ConvFlags::Die,
+            SafeCrlfIndexBlob::None,
+        )
+        .expect("binary content must not die");
+        assert_eq!(out.as_ref(), body, "binary content is never converted");
+    }
+
+    #[test]
+    fn safecrlf_off_is_silent_even_on_irreversible_round_trip() {
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let out = apply_clean_filter_with_attributes_cow_safecrlf(
+            &config,
+            &checks,
+            b"f.txt",
+            b"a\nb\n",
+            ConvFlags::Off,
+            SafeCrlfIndexBlob::None,
+        )
+        .expect("safecrlf=off never errors");
+        // autocrlf=true does not convert on clean (only smudge), so bytes pass through.
+        assert_eq!(out.as_ref(), b"a\nb\n");
     }
 
     #[test]
