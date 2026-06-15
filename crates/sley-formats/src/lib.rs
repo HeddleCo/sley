@@ -754,6 +754,21 @@ impl CommitGraph {
         entries: &[CommitGraphWriteEntry],
         bloom_settings: CommitGraphBloomSettings,
     ) -> Result<Vec<u8>> {
+        // Default generation version is 2 ⇒ write the GDA2 corrected-commit-date
+        // chunk (matches git's `commitGraph.generationVersion` default).
+        Self::write_with_options(format, entries, bloom_settings, true)
+    }
+
+    /// Write a commit-graph, optionally including the GDA2/GDO2 generation-data
+    /// chunks. `write_generation_data == false` mirrors
+    /// `commitGraph.generationVersion=1`, in which git stores only the
+    /// topological level (in CDAT) and omits the corrected-commit-date chunks.
+    pub fn write_with_options(
+        format: ObjectFormat,
+        entries: &[CommitGraphWriteEntry],
+        bloom_settings: CommitGraphBloomSettings,
+        write_generation_data: bool,
+    ) -> Result<Vec<u8>> {
         validate_commit_graph_bloom_settings(bloom_settings)?;
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
@@ -764,11 +779,13 @@ impl CommitGraph {
             (*b"OIDF", write_commit_graph_fanout(&object_ids)?),
             (*b"OIDL", write_commit_graph_oid_lookup(&object_ids)),
             (*b"CDAT", cdat),
-            (*b"GDA2", write_commit_graph_generation_data(&entries)?),
         ];
-        let gdo2 = write_commit_graph_generation_overflow(&entries)?;
-        if !gdo2.is_empty() {
-            chunks.push((*b"GDO2", gdo2));
+        if write_generation_data {
+            chunks.push((*b"GDA2", write_commit_graph_generation_data(&entries)?));
+            let gdo2 = write_commit_graph_generation_overflow(&entries)?;
+            if !gdo2.is_empty() {
+                chunks.push((*b"GDO2", gdo2));
+            }
         }
         if !edge.is_empty() {
             chunks.push((*b"EDGE", edge));

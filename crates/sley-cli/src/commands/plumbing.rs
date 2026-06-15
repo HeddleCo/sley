@@ -2912,11 +2912,36 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // ERROR_REACHABLE / ERROR_REFS — not ERROR_OBJECT.
     exit_bits |= ref_error_bits;
     exit_bits |= index_error_bits;
+
+    // git's fsck verifies the commit-graph when `core.commitGraph` is true (the
+    // default; unset ⇒ true) by shelling out to `commit-graph verify`. We run the
+    // same verification inline and OR in ERROR_COMMIT_GRAPH on any failure.
+    if fsck_core_commit_graph_enabled(&git_dir) {
+        let object_dir = repository_objects_dir(&git_dir);
+        let graph_path = object_dir.join("info").join("commit-graph");
+        if let OpenResult::Bytes(graph_bytes) = open_commit_graph_bytes(&graph_path)
+            && verify_commit_graph_bytes(&object_dir, format, &graph_bytes, progress).is_err()
+        {
+            exit_bits |= ERROR_COMMIT_GRAPH;
+        }
+    }
+
     if exit_bits != 0 {
         Err(GitError::Exit(exit_bits))
     } else {
         Ok(())
     }
+}
+
+const ERROR_COMMIT_GRAPH: i32 = 0o20;
+
+/// `core.commitGraph` resolved with git's default of true (an unset value enables
+/// the fsck commit-graph check).
+fn fsck_core_commit_graph_enabled(git_dir: &Path) -> bool {
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "commitGraph"))
+        .unwrap_or(true)
 }
 
 /// Named root refs restricted to `refs/tags/*` (for `git fsck --tags`).
@@ -4321,6 +4346,9 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let mut source = CommitGraphSource::AllPacks;
     let mut changed_paths: Option<bool> = None;
     let mut append = false;
+    // git's write progress defaults to isatty(2); the harness redirects stderr,
+    // so only an explicit --progress emits the progress lines.
+    let mut progress = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -4336,7 +4364,8 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
                 object_dir = Some(resolve_cli_path(&cwd, value));
             }
-            "--progress" | "--no-progress" => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
             value if value.starts_with("--object-dir=") => {
                 let value = value
                     .strip_prefix("--object-dir=")
@@ -4354,7 +4383,11 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         }
     }
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
-    let repo_config = sley_config::read_repo_config(&git_dir, None).ok();
+    // Read config with the command-line `-c` overrides folded in (mirrors git),
+    // so `-c commitGraph.generationVersion=1` / `-c commitGraph.changedPaths=…`
+    // on the write invocation take effect.
+    let repo_config =
+        sley_config::read_repo_config(&git_dir, effective_config_parameters_env().as_deref()).ok();
     let changed_paths_version = commit_graph_changed_paths_version(repo_config.as_ref())?;
     if !(-1..=2).contains(&changed_paths_version) {
         eprintln!(
@@ -4365,6 +4398,9 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let existing_bloom_settings = existing_commit_graph_bloom_settings(&object_dir, format)?;
     let bloom_settings =
         commit_graph_bloom_settings_for_write(existing_bloom_settings, changed_paths_version);
+    // git: write_generation_data = (get_configured_generation_version(r) == 2).
+    // Default is 2; `commitGraph.generationVersion=1` omits the GDA2/GDO2 chunks.
+    let write_generation_data = commit_graph_generation_version(repo_config.as_ref()) == 2;
     let changed_paths = changed_paths.unwrap_or_else(|| {
         repo_config
             .as_ref()
@@ -4382,13 +4418,23 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                 format,
                 changed_paths,
                 bloom_settings,
+                write_generation_data,
+                progress,
             );
         }
         CommitGraphSource::AllPacks => commit_graph_packed_commit_starts(&db, &object_dir, format)?,
         CommitGraphSource::StdinPacks => {
             commit_graph_stdin_packs_starts(&db, &object_dir, format)?
         }
-        CommitGraphSource::StdinCommits => commit_graph_stdin_commits_starts(&db, format)?,
+        CommitGraphSource::StdinCommits => {
+            let starts = commit_graph_stdin_commits_starts(&db, format)?;
+            // git's `read_one_commit` loop drives a "Collecting commits from
+            // input" progress meter while reading the stdin oids.
+            if progress {
+                eprintln!("Collecting commits from input: {}, done.", starts.len());
+            }
+            starts
+        }
     };
 
     let mut starts = starts;
@@ -4408,7 +4454,15 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     if starts.is_empty() {
         return Ok(());
     }
-    let graph = commit_graph_from_starts(&db, format, starts, changed_paths, bloom_settings)?;
+    let graph = commit_graph_from_starts(
+        &db,
+        format,
+        starts,
+        changed_paths,
+        bloom_settings,
+        write_generation_data,
+        progress,
+    )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
     write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
@@ -4433,9 +4487,18 @@ fn existing_commit_graph_oids(object_dir: &Path, format: ObjectFormat) -> Result
 /// OS gives it `0666 & ~umask`, so its read bits (`& 0444`) equal `0444 &
 /// ~umask` exactly — which is the mode git lands on.
 fn write_commit_graph_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    // A prior graph is written read-only; remove it so the rewrite creates a
-    // fresh file with the OS default mode (`0666 & ~umask`), from which the
-    // umask can be recovered below.
+    // A prior graph is written read-only (and a corrupted-graph test may leave
+    // it chmod-000); make it writable first so the remove always succeeds, then
+    // remove it so the rewrite creates a fresh file with the OS default mode
+    // (`0666 & ~umask`), from which the umask can be recovered below. git
+    // unconditionally replaces the graph regardless of the old file's mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
     let _ = fs::remove_file(path);
     fs::write(path, bytes)?;
     #[cfg(unix)]
@@ -4456,9 +4519,18 @@ fn write_reachable_commit_graph(
     format: ObjectFormat,
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
+    write_generation_data: bool,
+    progress: bool,
 ) -> Result<()> {
-    let graph =
-        commit_graph_for_reachable_refs(git_dir, object_dir, format, changed_paths, bloom_settings)?;
+    let graph = commit_graph_for_reachable_refs(
+        git_dir,
+        object_dir,
+        format,
+        changed_paths,
+        bloom_settings,
+        write_generation_data,
+        progress,
+    )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
     write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
@@ -4586,6 +4658,10 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
+    // git: opts.progress defaults to isatty(2); --progress forces on,
+    // --no-progress forces off. Under the test harness stderr is redirected, so
+    // the default is off; only an explicit --progress emits the progress line.
+    let mut progress = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -4595,7 +4671,9 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
                 object_dir = Some(resolve_cli_path(&cwd, value));
             }
-            "--progress" | "--no-progress" => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
+            "--shallow" => {}
             value if value.starts_with("--object-dir=") => {
                 let value = value
                     .strip_prefix("--object-dir=")
@@ -4611,9 +4689,19 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
     }
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
     let graph_path = object_dir.join("info").join("commit-graph");
-    if graph_path.exists() {
-        CommitGraph::parse(&fs::read(graph_path)?, format)?;
-        return Ok(());
+    // git's `cmd_commit_graph_verify` prefers the single-file graph; only if it
+    // is absent (ENOENT) does it fall back to the chain. A graph that exists but
+    // cannot be opened (e.g. permissions) is a fatal `Could not open` error.
+    match open_commit_graph_bytes(&graph_path) {
+        OpenResult::Bytes(bytes) => {
+            return verify_commit_graph_bytes(&object_dir, format, &bytes, progress);
+        }
+        OpenResult::OpenError => {
+            // git: die_errno("Could not open commit-graph '%s'") ⇒ exit 128.
+            eprintln!("fatal: Could not open commit-graph '{}'", graph_path.display());
+            return Err(GitError::Exit(128));
+        }
+        OpenResult::NotFound => {}
     }
     let chain_path = object_dir
         .join("info")
@@ -4625,6 +4713,24 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
     // No commit-graph at all is not an error (git's `commit-graph verify`
     // exits 0 when there is nothing to verify).
     Ok(())
+}
+
+/// Outcome of trying to open + read the single-file commit-graph, mirroring
+/// git's `open_commit_graph` (which distinguishes ENOENT from other errno).
+enum OpenResult {
+    Bytes(Vec<u8>),
+    /// The path does not exist (ENOENT) — fall through to the chain.
+    NotFound,
+    /// The path exists but could not be read (e.g. permission denied).
+    OpenError,
+}
+
+fn open_commit_graph_bytes(path: &Path) -> OpenResult {
+    match fs::read(path) {
+        Ok(bytes) => OpenResult::Bytes(bytes),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => OpenResult::NotFound,
+        Err(_) => OpenResult::OpenError,
+    }
 }
 
 fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> Result<()> {
@@ -4678,12 +4784,563 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
     Ok(())
 }
 
+// === commit-graph verify ====================================================
+//
+// A byte-faithful reimplementation of git's `verify_commit_graph` /
+// `verify_one_commit_graph` (commit-graph.c) + the structural checks in
+// `parse_commit_graph` / `read_table_of_contents`. It re-parses the on-disk
+// graph from raw bytes (independent of `CommitGraph::parse`) so the exact
+// validation order and error strings match git's, and cross-checks every commit
+// against the object database. Each detected problem is reported with git's
+// exact `error:`/`fatal:` text; the command exits non-zero when any check fails.
+
+const GRAPH_HEADER_SIZE: usize = 8;
+const GRAPH_CHUNK_TOC_ENTRY_SIZE: usize = 12;
+const GRAPH_FANOUT_SIZE: usize = 4 * 256;
+const GRAPH_SIGNATURE: u32 = 0x4347_5048; // "CGPH"
+const GRAPH_VERSION: u8 = 1;
+const GRAPH_PARENT_NONE: u32 = 0x7000_0000;
+const GRAPH_EXTRA_EDGES_NEEDED: u32 = 0x8000_0000;
+const GRAPH_EDGE_LAST_MASK: u32 = 0x7fff_ffff;
+const GRAPH_LAST_EDGE: u32 = 0x8000_0000;
+const GENERATION_NUMBER_V1_MAX: u64 = 0x3fff_ffff;
+
+const CHUNK_OIDF: [u8; 4] = *b"OIDF";
+const CHUNK_OIDL: [u8; 4] = *b"OIDL";
+const CHUNK_CDAT: [u8; 4] = *b"CDAT";
+const CHUNK_EDGE: [u8; 4] = *b"EDGE";
+
+fn graph_min_size(hash_len: usize) -> usize {
+    GRAPH_HEADER_SIZE + 4 * GRAPH_CHUNK_TOC_ENTRY_SIZE + GRAPH_FANOUT_SIZE + hash_len
+}
+
+fn graph_data_width(hash_len: usize) -> usize {
+    hash_len + 16
+}
+
+fn read_be32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn read_be64(bytes: &[u8], offset: usize) -> u64 {
+    let mut value = 0u64;
+    for &byte in &bytes[offset..offset + 8] {
+        value = (value << 8) | u64::from(byte);
+    }
+    value
+}
+
+/// A parsed-but-unvalidated view of a chunk's byte range within the graph.
+struct GraphChunk {
+    id: [u8; 4],
+    start: usize,
+    size: usize,
+}
+
+/// The chunks + header fields needed for verification, parsed straight from raw
+/// bytes (mirrors git's `parse_commit_graph`). Returns `Err(Exit)` after
+/// printing the matching `error:` line when the graph cannot be parsed; the
+/// command then exits 1 — exactly git's `if (!graph) return 1;`.
+struct ParsedGraph<'a> {
+    bytes: &'a [u8],
+    format: ObjectFormat,
+    hash_len: usize,
+    num_commits: u32,
+    oid_fanout: usize,
+    oid_lookup: usize,
+    commit_data: usize,
+    extra_edges: Option<(usize, usize)>,
+}
+
+fn parse_commit_graph_for_verify<'a>(
+    bytes: &'a [u8],
+    format: ObjectFormat,
+) -> std::result::Result<ParsedGraph<'a>, GitError> {
+    let hash_len = format.raw_len();
+
+    if bytes.len() < graph_min_size(hash_len) {
+        eprintln!("error: commit-graph file is too small");
+        return Err(GitError::Exit(1));
+    }
+
+    let signature = read_be32(bytes, 0);
+    if signature != GRAPH_SIGNATURE {
+        eprintln!(
+            "error: commit-graph signature {signature:X} does not match signature {GRAPH_SIGNATURE:X}"
+        );
+        return Err(GitError::Exit(1));
+    }
+
+    let version = bytes[4];
+    if version != GRAPH_VERSION {
+        eprintln!(
+            "error: commit-graph version {version:X} does not match version {GRAPH_VERSION:X}"
+        );
+        return Err(GitError::Exit(1));
+    }
+
+    let hash_version = bytes[5];
+    let expected_hash_version = match format {
+        ObjectFormat::Sha1 => 1u8,
+        ObjectFormat::Sha256 => 2u8,
+    };
+    if hash_version != expected_hash_version {
+        eprintln!(
+            "error: commit-graph hash version {hash_version:X} does not match version {expected_hash_version:X}"
+        );
+        return Err(GitError::Exit(1));
+    }
+
+    let num_chunks = bytes[6] as usize;
+
+    if bytes.len()
+        < GRAPH_HEADER_SIZE
+            + (num_chunks + 1) * GRAPH_CHUNK_TOC_ENTRY_SIZE
+            + GRAPH_FANOUT_SIZE
+            + hash_len
+    {
+        eprintln!("error: commit-graph file is too small to hold {num_chunks} chunks");
+        return Err(GitError::Exit(1));
+    }
+
+    // Read the table of contents (mirrors read_table_of_contents with
+    // expected_alignment = 1 for commit-graph).
+    let mut chunks: Vec<GraphChunk> = Vec::with_capacity(num_chunks);
+    let mfile_size = bytes.len();
+    let mut toc = GRAPH_HEADER_SIZE;
+    for _ in 0..num_chunks {
+        let chunk_id = [
+            bytes[toc],
+            bytes[toc + 1],
+            bytes[toc + 2],
+            bytes[toc + 3],
+        ];
+        let chunk_offset = read_be64(bytes, toc + 4) as usize;
+        if chunk_id == [0, 0, 0, 0] {
+            eprintln!("error: terminating chunk id appears earlier than expected");
+            return Err(GitError::Exit(1));
+        }
+        let next_toc = toc + GRAPH_CHUNK_TOC_ENTRY_SIZE;
+        let next_chunk_offset = read_be64(bytes, next_toc + 4) as usize;
+        if next_chunk_offset < chunk_offset || next_chunk_offset > mfile_size - hash_len {
+            eprintln!(
+                "error: improper chunk offset(s) {chunk_offset:X} and {next_chunk_offset:X}"
+            );
+            return Err(GitError::Exit(1));
+        }
+        if chunks.iter().any(|chunk| chunk.id == chunk_id) {
+            eprintln!("error: duplicate chunk ID {} found", be32_of(&chunk_id));
+            return Err(GitError::Exit(1));
+        }
+        chunks.push(GraphChunk {
+            id: chunk_id,
+            start: chunk_offset,
+            size: next_chunk_offset - chunk_offset,
+        });
+        toc = next_toc;
+    }
+    let terminator_id = read_be32(bytes, toc);
+    if terminator_id != 0 {
+        eprintln!("error: final chunk has non-zero id {terminator_id:X}");
+        return Err(GitError::Exit(1));
+    }
+
+    let find = |id: [u8; 4]| chunks.iter().find(|chunk| chunk.id == id);
+
+    // Required: OID fanout.
+    let fanout_chunk = find(CHUNK_OIDF);
+    let (oid_fanout, num_commits) = match fanout_chunk {
+        Some(chunk) if chunk.size == 256 * 4 => {
+            // fanout out-of-order check
+            for i in 0..255usize {
+                let f1 = read_be32(bytes, chunk.start + i * 4);
+                let f2 = read_be32(bytes, chunk.start + (i + 1) * 4);
+                if f1 > f2 {
+                    eprintln!("error: commit-graph fanout values out of order");
+                    eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
+                    return Err(GitError::Exit(1));
+                }
+            }
+            (chunk.start, read_be32(bytes, chunk.start + 255 * 4))
+        }
+        Some(_) => {
+            eprintln!("error: commit-graph oid fanout chunk is wrong size");
+            eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
+            return Err(GitError::Exit(1));
+        }
+        None => {
+            eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
+            return Err(GitError::Exit(1));
+        }
+    };
+
+    // Required: OID lookup.
+    let oid_lookup = match find(CHUNK_OIDL) {
+        Some(chunk) if chunk.size / hash_len == num_commits as usize => chunk.start,
+        Some(_) => {
+            eprintln!("error: commit-graph OID lookup chunk is the wrong size");
+            eprintln!("error: commit-graph required OID lookup chunk missing or corrupted");
+            return Err(GitError::Exit(1));
+        }
+        None => {
+            eprintln!("error: commit-graph required OID lookup chunk missing or corrupted");
+            return Err(GitError::Exit(1));
+        }
+    };
+
+    // Required: commit data.
+    let commit_data = match find(CHUNK_CDAT) {
+        Some(chunk) if chunk.size / graph_data_width(hash_len) == num_commits as usize => {
+            chunk.start
+        }
+        Some(_) => {
+            eprintln!("error: commit-graph commit data chunk is wrong size");
+            eprintln!("error: commit-graph required commit data chunk missing or corrupted");
+            return Err(GitError::Exit(1));
+        }
+        None => {
+            eprintln!("error: commit-graph required commit data chunk missing or corrupted");
+            return Err(GitError::Exit(1));
+        }
+    };
+
+    let extra_edges = find(CHUNK_EDGE).map(|chunk| (chunk.start, chunk.size));
+
+    Ok(ParsedGraph {
+        bytes,
+        format,
+        hash_len,
+        num_commits,
+        oid_fanout,
+        oid_lookup,
+        commit_data,
+        extra_edges,
+    })
+}
+
+fn be32_of(id: &[u8; 4]) -> String {
+    format!("{:X}", u32::from_be_bytes(*id))
+}
+
+/// Full verify of a single-file commit-graph: re-parse + structural checks +
+/// per-commit cross-check against the ODB. Returns `Ok(())` only when the graph
+/// is fully valid (git's exit 0); otherwise prints the matching diagnostics and
+/// returns `Exit`.
+fn verify_commit_graph_bytes(
+    object_dir: &Path,
+    format: ObjectFormat,
+    bytes: &[u8],
+    progress: bool,
+) -> Result<()> {
+    let parsed = match parse_commit_graph_for_verify(bytes, format) {
+        Ok(parsed) => parsed,
+        Err(exit) => return Err(exit),
+    };
+
+    let db = FileObjectDatabase::new(object_dir, format);
+    let mut had_error = false;
+    // Tracks whether the only error so far is the checksum failure; git allows
+    // the per-commit cross-check to proceed past a checksum-only failure.
+    let mut non_checksum_error = false;
+
+    // Checksum validation (git: commit_graph_checksum_valid).
+    let hash_len = parsed.hash_len;
+    let checksum_offset = bytes.len() - hash_len;
+    let actual = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    let stored = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+    if actual != stored {
+        eprintln!("error: the commit-graph file has incorrect checksum and is likely corrupt");
+        had_error = true;
+    }
+
+    let num_commits = parsed.num_commits as usize;
+
+    // OID order + fanout consistency (first verify loop).
+    let mut prev_oid: Option<ObjectId> = None;
+    let mut cur_fanout_pos = 0u32;
+    for i in 0..num_commits {
+        let cur_oid = oid_at_lookup(&parsed, i)?;
+        if let Some(prev) = prev_oid
+            && prev.as_bytes() >= cur_oid.as_bytes()
+        {
+            eprintln!(
+                "error: commit-graph has incorrect OID order: {prev} then {cur_oid}"
+            );
+            had_error = true;
+            non_checksum_error = true;
+        }
+        prev_oid = Some(cur_oid);
+
+        let first_byte = u32::from(cur_oid.as_bytes()[0]);
+        while first_byte > cur_fanout_pos {
+            let fanout_value = read_be32(bytes, parsed.oid_fanout + cur_fanout_pos as usize * 4);
+            if i as u32 != fanout_value {
+                eprintln!(
+                    "error: commit-graph has incorrect fanout value: fanout[{}] = {} != {}",
+                    cur_fanout_pos, fanout_value, i
+                );
+                had_error = true;
+                non_checksum_error = true;
+            }
+            cur_fanout_pos += 1;
+        }
+    }
+    while cur_fanout_pos < 256 {
+        let fanout_value = read_be32(bytes, parsed.oid_fanout + cur_fanout_pos as usize * 4);
+        if parsed.num_commits != fanout_value {
+            eprintln!(
+                "error: commit-graph has incorrect fanout value: fanout[{}] = {} != {}",
+                cur_fanout_pos, fanout_value, num_commits
+            );
+            had_error = true;
+            non_checksum_error = true;
+        }
+        cur_fanout_pos += 1;
+    }
+
+    // git: if (verify_commit_graph_error & ~VERIFY_COMMIT_GRAPH_ERROR_HASH)
+    //          return verify_commit_graph_error;
+    // i.e. stop before the per-commit ODB cross-check if any *non-checksum*
+    // error fired above.
+    if non_checksum_error {
+        return Err(GitError::Exit(1));
+    }
+
+    // Per-commit cross-check against the object database (second verify loop).
+    // git drives a progress meter titled "Verifying commits in commit graph"
+    // here; emit the final, complete line when progress is requested.
+    if progress {
+        eprintln!(
+            "Verifying commits in commit graph: 100% ({num_commits}/{num_commits}), done."
+        );
+    }
+    let mut seen_gen_zero: Option<ObjectId> = None;
+    let mut seen_gen_non_zero: Option<ObjectId> = None;
+
+    for i in 0..num_commits {
+        let cur_oid = oid_at_lookup(&parsed, i)?;
+
+        // Parse the commit from the ODB.
+        let odb_object = match db.read_object(&cur_oid) {
+            Ok(object) if object.object_type == ObjectType::Commit => object,
+            _ => {
+                eprintln!(
+                    "error: failed to parse commit {cur_oid} from object database for commit-graph"
+                );
+                had_error = true;
+                continue;
+            }
+        };
+        let odb_commit = Commit::parse_ref(format, &odb_object.body)?;
+
+        // Decode the graph's record for this commit.
+        let record = decode_graph_commit(&parsed, i)?;
+
+        // Root tree OID.
+        if record.tree != odb_commit.tree {
+            eprintln!(
+                "error: root tree OID for commit {cur_oid} in commit-graph is {} != {}",
+                record.tree, odb_commit.tree
+            );
+            had_error = true;
+        }
+
+        // Parents: compare graph-encoded parents against the ODB parents.
+        let graph_parents = &record.parents;
+        let odb_parents = &odb_commit.parents;
+        let mut max_generation = 0u64;
+        let common = graph_parents.len().min(odb_parents.len());
+        for k in 0..common {
+            let graph_parent_oid = oid_at_lookup(&parsed, graph_parents[k] as usize)?;
+            if graph_parent_oid != odb_parents[k] {
+                eprintln!(
+                    "error: commit-graph parent for {cur_oid} is {graph_parent_oid} != {}",
+                    odb_parents[k]
+                );
+                had_error = true;
+            }
+            let parent_record = decode_graph_commit(&parsed, graph_parents[k] as usize)?;
+            if parent_record.generation > max_generation {
+                max_generation = parent_record.generation;
+            }
+        }
+        if graph_parents.len() > odb_parents.len() {
+            eprintln!(
+                "error: commit-graph parent list for commit {cur_oid} is too long"
+            );
+            had_error = true;
+        } else if odb_parents.len() > graph_parents.len() {
+            eprintln!(
+                "error: commit-graph parent list for commit {cur_oid} terminates early"
+            );
+            had_error = true;
+        }
+
+        if record.generation != 0 {
+            seen_gen_non_zero = Some(cur_oid);
+        } else {
+            seen_gen_zero = Some(cur_oid);
+        }
+
+        if seen_gen_zero.is_some() {
+            continue;
+        }
+
+        // V1 (topological level) generation check. This graph is written with
+        // generationVersion=1, so read_generation_data is false.
+        if max_generation == GENERATION_NUMBER_V1_MAX {
+            max_generation -= 1;
+        }
+        if record.generation < max_generation + 1 {
+            eprintln!(
+                "error: commit-graph generation for commit {cur_oid} is {} < {}",
+                record.generation,
+                max_generation + 1
+            );
+            had_error = true;
+        }
+
+        // Commit date cross-check.
+        let odb_date = odb_commit
+            .committer_signature()
+            .map(|sig| sig.time.seconds)
+            .unwrap_or(0);
+        if record.commit_date as i64 != odb_date {
+            eprintln!(
+                "error: commit date for commit {cur_oid} in commit-graph is {} != {}",
+                record.commit_date, odb_date
+            );
+            had_error = true;
+        }
+    }
+
+    if let (Some(zero), Some(non_zero)) = (seen_gen_zero, seen_gen_non_zero) {
+        eprintln!(
+            "error: commit-graph has both zero and non-zero generations (e.g., commits '{zero}' and '{non_zero}')"
+        );
+        had_error = true;
+    }
+
+    if had_error {
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
+    }
+}
+
+/// The OID at lexicographic position `index` in the OID lookup chunk.
+fn oid_at_lookup(parsed: &ParsedGraph<'_>, index: usize) -> Result<ObjectId> {
+    let off = parsed.oid_lookup + index * parsed.hash_len;
+    ObjectId::from_raw(parsed.format, &parsed.bytes[off..off + parsed.hash_len])
+}
+
+/// A commit record decoded straight from the graph's CDAT/EDGE chunks, mirroring
+/// git's `fill_commit_in_graph` + `fill_commit_graph_info` parent/date/gen
+/// decoding. `parents` are lexicographic positions into the OID lookup table.
+struct GraphCommitRecord {
+    tree: ObjectId,
+    parents: Vec<u32>,
+    generation: u64,
+    commit_date: u64,
+}
+
+fn decode_graph_commit(parsed: &ParsedGraph<'_>, index: usize) -> Result<GraphCommitRecord> {
+    let hash_len = parsed.hash_len;
+    let width = graph_data_width(hash_len);
+    let base = parsed.commit_data + index * width;
+    let bytes = parsed.bytes;
+
+    let tree = ObjectId::from_raw(parsed.format, &bytes[base..base + hash_len])?;
+
+    // Date / generation (fill_commit_graph_info, V1 path).
+    let date_high = u64::from(read_be32(bytes, base + hash_len + 8) & 0x3);
+    let date_low = u64::from(read_be32(bytes, base + hash_len + 12));
+    let commit_date = (date_high << 32) | date_low;
+    let generation = u64::from(read_be32(bytes, base + hash_len + 8) >> 2);
+
+    // Parents (fill_commit_in_graph). git `die`s on an out-of-range parent
+    // position; we mirror that with a fatal `invalid parent position` + exit
+    // 128, and on an out-of-bounds extra-edges pointer with the `error:`
+    // string + exit 1 (commit-graph extra-edges pointer out of bounds).
+    let num_total = parsed.num_commits;
+    let mut parents = Vec::new();
+
+    let insert = |pos: u32, parents: &mut Vec<u32>| -> Result<()> {
+        if pos >= num_total {
+            eprintln!("fatal: invalid parent position {pos}");
+            return Err(GitError::Exit(128));
+        }
+        parents.push(pos);
+        Ok(())
+    };
+
+    let edge0 = read_be32(bytes, base + hash_len);
+    if edge0 == GRAPH_PARENT_NONE {
+        return Ok(GraphCommitRecord {
+            tree,
+            parents,
+            generation,
+            commit_date,
+        });
+    }
+    insert(edge0, &mut parents)?;
+
+    let edge1 = read_be32(bytes, base + hash_len + 4);
+    if edge1 == GRAPH_PARENT_NONE {
+        return Ok(GraphCommitRecord {
+            tree,
+            parents,
+            generation,
+            commit_date,
+        });
+    }
+    if edge1 & GRAPH_EXTRA_EDGES_NEEDED == 0 {
+        insert(edge1, &mut parents)?;
+        return Ok(GraphCommitRecord {
+            tree,
+            parents,
+            generation,
+            commit_date,
+        });
+    }
+
+    // Octopus: walk the EDGE chunk.
+    let mut parent_data_pos = edge1 & GRAPH_EDGE_LAST_MASK;
+    let (edge_start, edge_size) = parsed.extra_edges.unwrap_or((0, 0));
+    loop {
+        if (edge_size / 4) as u32 <= parent_data_pos {
+            eprintln!("error: commit-graph extra-edges pointer out of bounds");
+            return Err(GitError::Exit(1));
+        }
+        let edge_value = read_be32(bytes, edge_start + parent_data_pos as usize * 4);
+        insert(edge_value & GRAPH_EDGE_LAST_MASK, &mut parents)?;
+        parent_data_pos += 1;
+        if edge_value & GRAPH_LAST_EDGE != 0 {
+            break;
+        }
+    }
+
+    Ok(GraphCommitRecord {
+        tree,
+        parents,
+        generation,
+        commit_date,
+    })
+}
+
 fn commit_graph_for_reachable_refs(
     git_dir: &Path,
     object_dir: &Path,
     format: ObjectFormat,
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
+    write_generation_data: bool,
+    progress: bool,
 ) -> Result<Vec<u8>> {
     let db = FileObjectDatabase::new(object_dir, format);
     let store = FileRefStore::new(git_dir, format);
@@ -4705,7 +5362,15 @@ fn commit_graph_for_reachable_refs(
     {
         starts.push(commit);
     }
-    commit_graph_from_starts(&db, format, starts, changed_paths, bloom_settings)
+    commit_graph_from_starts(
+        &db,
+        format,
+        starts,
+        changed_paths,
+        bloom_settings,
+        write_generation_data,
+        progress,
+    )
 }
 
 /// Build the commit-graph bytes from a set of seed commit oids (their parent
@@ -4717,8 +5382,24 @@ fn commit_graph_from_starts(
     starts: Vec<ObjectId>,
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
+    write_generation_data: bool,
+    progress: bool,
 ) -> Result<Vec<u8>> {
-    let records = sley_rev::walk_commits(db, format, starts)?;
+    // git's `close_reachable` walk parses every reachable commit (including
+    // parents pulled into the closure); a commit that cannot be parsed is fatal
+    // with `unable to parse commit <oid>` (exit 128). `walk_commits` surfaces a
+    // generic read/parse error instead, so map it to git's diagnostic by
+    // re-checking which oid in the closure is unparseable.
+    let records = match sley_rev::walk_commits(db, format, starts.clone()) {
+        Ok(records) => records,
+        Err(err) => {
+            if let Some(oid) = commit_graph_first_unparseable_commit(db, format, &starts) {
+                eprintln!("fatal: unable to parse commit {oid}");
+                return Err(GitError::Exit(128));
+            }
+            return Err(err);
+        }
+    };
     let record_map = records
         .iter()
         .map(|record| (record.oid, record))
@@ -4746,7 +5427,51 @@ fn commit_graph_from_starts(
             bloom_filter,
         });
     }
-    CommitGraph::write_with_bloom_settings(format, &entries, bloom_settings)
+    if progress {
+        let count = entries.len();
+        // git drives several delayed progress meters during a write; emit the
+        // generation-number + write-out lines (always) and the changed-path
+        // Bloom-filter line (only when changed-path filters are computed).
+        if changed_paths {
+            eprintln!(
+                "Computing commit changed paths Bloom filters: 100% ({count}/{count}), done."
+            );
+        }
+        eprintln!(
+            "Computing commit graph generation numbers: 100% ({count}/{count}), done."
+        );
+        eprintln!("Writing out commit graph in 3 passes: 100% ({}/{}), done.", count * 3, count * 3);
+    }
+    CommitGraph::write_with_options(format, &entries, bloom_settings, write_generation_data)
+}
+
+/// Walk the parent closure of `starts` and return the first oid that cannot be
+/// read + parsed as a commit object (git's closure walk dies on such a commit
+/// with `unable to parse commit <oid>`). Returns `None` if the whole closure
+/// parses (the original error was something else).
+fn commit_graph_first_unparseable_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: &[ObjectId],
+) -> Option<ObjectId> {
+    let mut seen = HashSet::new();
+    let mut pending: VecDeque<ObjectId> = starts.iter().copied().collect();
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        match db.read_object(&oid) {
+            Ok(object) if object.object_type == ObjectType::Commit => {
+                match Commit::parse_ref(format, &object.body) {
+                    Ok(commit) => pending.extend(commit.parents.iter().copied()),
+                    Err(_) => return Some(oid),
+                }
+            }
+            // Not a commit, or not readable at all ⇒ git cannot parse it.
+            _ => return Some(oid),
+        }
+    }
+    None
 }
 
 fn commit_graph_bloom_filter_for_record(
@@ -4794,6 +5519,18 @@ fn commit_graph_bloom_filter_for_record(
         changes.iter().map(|entry| entry.path.as_bytes()),
         bloom_settings,
     ))
+}
+
+/// `commitGraph.generationVersion` (git's `get_configured_generation_version`):
+/// defaults to 2, which writes the GDA2 corrected-commit-date chunk. A value of
+/// 1 selects the legacy topological-level-only layout (no GDA2/GDO2).
+fn commit_graph_generation_version(config: Option<&sley_config::GitConfig>) -> i64 {
+    config
+        .and_then(|config| match config.get_entry("commitGraph", None, "generationVersion") {
+            Some(Some(value)) => sley_config::parse_config_int(value),
+            _ => None,
+        })
+        .unwrap_or(2)
 }
 
 fn commit_graph_changed_paths_version(config: Option<&sley_config::GitConfig>) -> Result<i64> {
@@ -4846,7 +5583,16 @@ fn existing_commit_graph_bloom_settings(
     if !graph_path.exists() {
         return Ok(None);
     }
-    let graph = CommitGraph::parse(&fs::read(graph_path)?, format)?;
+    // git reads existing bloom settings best-effort: a corrupt or unreadable
+    // existing graph (e.g. mid-`corrupt_graph_verify`, which rewrites over a
+    // graph that just failed verify, or a chmod-000 graph) loads as NULL ⇒ no
+    // inherited settings, never a hard error.
+    let Ok(bytes) = fs::read(&graph_path) else {
+        return Ok(None);
+    };
+    let Ok(graph) = CommitGraph::parse(&bytes, format) else {
+        return Ok(None);
+    };
     Ok(graph.bloom_filters.map(|filters| {
         let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
         settings.hash_version = filters.hash_version;
