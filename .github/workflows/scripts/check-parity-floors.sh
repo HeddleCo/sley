@@ -232,6 +232,24 @@
 # t7102-reset=37, t1007-hash-object=40, t1500-rev-parse=81, t1462-refs-exists=12,
 # t1401-symbolic-ref=25, t7004-tag=159, t3200-branch=117, t3301-notes=144,
 # t1300-config=497, t2400-worktree-add=165. No workspace test regressed (2203/0).
+# update-ref --stdin lexer wave (2026-06-15, wave/update-ref-stdin):
+# t1400-update-ref 175->232 (+57 — replaced the split_whitespace tokenizer with
+# a git-faithful stateful RefCommandStream lexer in
+# crates/sley-cli/src/commands/ref_command_stream.rs: C-quoted args with
+# backslash/octal escapes, the four distinct die-messages (empty command in
+# input / whitespace before command / badly quoted argument / unexpected
+# character after quoted argument), per-cmd `<cmd> <ref>: extra input:`/`missing
+# <ref>`/`missing <new-oid>`/`invalid <new|old-oid>`/`unexpected end of input`
+# messages, and faithful empty-value (zero vs unspecified) semantics for the \n
+# vs -z paths. The split_whitespace bug also silently created refs from
+# malformed lines, which cascade-broke ~40 downstream tests via stale refs — the
+# lexer's strict rejection recovers those too). Neighbors held (measured==floor):
+# t1461-refs-list=358, t6300-for-each-ref=358, t1401-symbolic-ref=25,
+# t1462-refs-exists=12. Residual: 3 cells (-z "too many arguments" #136/139/140)
+# need git's batch-commit-at-end transaction model (sley writes eagerly, so a
+# prior command's lock failure fires before the trailing record is parsed as an
+# unknown command) — out of scope for the tokenizer; not a lexer gap. No
+# workspace test regressed (2215/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -250,7 +268,7 @@ declare -A FLOOR=(
     [t1006-cat-file.sh]=290
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=497
-    [t1400-update-ref.sh]=175
+    [t1400-update-ref.sh]=232
     [t1401-symbolic-ref.sh]=25
     [t1450-fsck.sh]=82
     [t1500-rev-parse.sh]=81

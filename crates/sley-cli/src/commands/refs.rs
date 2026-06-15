@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 // A glob of the crate root brings every shared helper/type into scope via
@@ -1060,27 +1060,93 @@ struct UpdateRefStdinWriteRequest<'a> {
     expected_oid: Option<&'a ObjectId>,
 }
 
+/// The three states git distinguishes for an old-value (`<old-oid>`) field
+/// parsed with PARSE_SHA1_OLD (no ALLOW_EMPTY): absent (no check), present but
+/// empty — which git treats as the all-zeros OID (`have_old = 1`), or a
+/// concrete value.
+enum OldOid {
+    Absent,
+    Zero,
+    Value(String),
+}
+
+/// The dispatch table for `update-ref --stdin`, mirroring git's
+/// `static const struct parse_cmd command[]` (builtin/update-ref.c). `args` is
+/// the number of NUL-terminated records the command consumes under `-z` (the
+/// command record itself plus its fixed arguments); it controls how many extra
+/// records the `-z` driver pre-reads before dispatch.
+struct RefStdinCommand {
+    prefix: &'static str,
+    /// Number of records (including the `<cmd> <ref>` record) the `-z` driver
+    /// stitches before handing the command to the dispatcher.
+    args: usize,
+}
+
+const REF_STDIN_COMMANDS: &[RefStdinCommand] = &[
+    RefStdinCommand { prefix: "update", args: 3 },
+    RefStdinCommand { prefix: "create", args: 2 },
+    RefStdinCommand { prefix: "delete", args: 2 },
+    RefStdinCommand { prefix: "verify", args: 2 },
+    RefStdinCommand { prefix: "symref-update", args: 4 },
+    RefStdinCommand { prefix: "symref-create", args: 2 },
+    RefStdinCommand { prefix: "symref-delete", args: 2 },
+    RefStdinCommand { prefix: "symref-verify", args: 2 },
+    RefStdinCommand { prefix: "option", args: 1 },
+    RefStdinCommand { prefix: "start", args: 0 },
+    RefStdinCommand { prefix: "prepare", args: 0 },
+    RefStdinCommand { prefix: "abort", args: 0 },
+    RefStdinCommand { prefix: "commit", args: 0 },
+];
+
+/// Match a command verb against the dispatch table the way git does: the input
+/// must start with the prefix, and the byte immediately after the prefix must
+/// be the expected separator — `SP` (byte 0x20) when the command takes
+/// arguments, or the record terminator when it does not. Returns the matched
+/// command and the byte offset at which its arguments begin.
+fn match_ref_stdin_command(input: &[u8], term: u8) -> Option<(&'static RefStdinCommand, usize)> {
+    for cmd in REF_STDIN_COMMANDS {
+        let prefix = cmd.prefix.as_bytes();
+        if !input.starts_with(prefix) {
+            continue;
+        }
+        let sep = if cmd.args > 0 { b' ' } else { term };
+        let after = input.get(prefix.len()).copied();
+        // git compares input.buf[strlen(prefix)] against the expected
+        // separator. For arg-less commands the buffer is terminator-stripped
+        // here, so end-of-buffer also counts as the terminator.
+        let matched = match after {
+            Some(c) => c == sep,
+            None => cmd.args == 0,
+        };
+        if matched {
+            // Arguments begin after the prefix and its separator (if the
+            // command takes one). git advances by `strlen(prefix) + !!args`.
+            let start = prefix.len() + usize::from(cmd.args > 0 && after.is_some());
+            return Some((cmd, start.min(input.len())));
+        }
+    }
+    None
+}
+
 fn update_ref_stdin(context: UpdateRefStdinContext<'_>, deref: bool, nul: bool) -> Result<()> {
     if nul {
         return update_ref_stdin_z(&context, deref);
     }
     let mut deref = deref;
     let mut transaction = UpdateRefStdinTransaction::default();
+    let stdin = io::stdin();
+    let mut reader =
+        crate::commands::stdin_stream::StdinRecordReader::new(stdin.lock(), b'\n');
     let mut stdout = io::stdout().lock();
-    crate::commands::stdin_stream::stream_stdin_records(b'\n', &mut stdout, |mut line, stdout| {
+    while let Some(mut line) = reader.read_record()? {
         crate::commands::stdin_stream::strip_trailing_cr(&mut line);
-        let line = String::from_utf8_lossy(&line);
-        if line.is_empty() {
-            return Ok(());
-        }
-        if let Err(err) =
-            update_ref_stdin_line(&context, &mut deref, &mut transaction, stdout, &line)
-        {
+        let result = update_ref_stdin_line(&context, &mut deref, &mut transaction, &mut stdout, &line);
+        if let Err(err) = result {
             let _ = transaction.restore(context.store);
             return Err(err);
         }
-        Ok(())
-    })?;
+        stdout.flush()?;
+    }
     transaction.finish_implicit(context.store)
 }
 
@@ -1089,241 +1155,67 @@ fn update_ref_stdin_line(
     deref: &mut bool,
     transaction: &mut UpdateRefStdinTransaction,
     stdout: &mut dyn Write,
-    line: &str,
+    line: &[u8],
 ) -> Result<()> {
-    let parts = line.split_whitespace().collect::<Vec<_>>();
-    let Some(command) = parts.first().copied() else {
-        return Ok(());
+    use crate::commands::ref_command_stream::{classify_line, ArgCursor, Terminator};
+
+    // git's first two guards: a bare terminator is `empty command in input`,
+    // leading whitespace is `whitespace before command: <line>`.
+    classify_line(line)?;
+
+    let Some((cmd, arg_start)) = match_ref_stdin_command(line, b'\n') else {
+        return update_ref_stdin_bad_command(&String::from_utf8_lossy(line));
     };
-    if transaction.is_closed() && command != "start" {
-        return update_ref_stdin_closed_transaction();
-    }
-    if transaction.is_prepared() && !matches!(command, "commit" | "abort") {
-        return update_ref_stdin_prepared_transaction();
-    }
-    match command {
-        "option" => {
-            if parts.len() == 2 && parts[1] == "no-deref" {
-                *deref = false;
-                return Ok(());
-            }
-            let option = parts.get(1).copied().unwrap_or("");
-            update_ref_stdin_unknown_option(option)
-        }
-        "update" => {
-            if parts.len() != 3 && parts.len() != 4 {
-                return update_ref_stdin_bad_command(command);
-            }
-            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let new_oid =
-                parse_update_ref_new_oid(context.git_dir, context.format, context.store, parts[2])?;
-            let expected = if let Some(old) = parts.get(3) {
-                Some(parse_update_ref_expected(
-                    context.git_dir,
-                    context.format,
-                    context.store,
-                    old,
-                )?)
-            } else {
-                None
-            };
-            if context.batch_updates {
-                return update_ref_stdin_write_batch(
-                    context,
-                    UpdateRefStdinWriteRequest {
-                        name,
-                        new_oid,
-                        expected_oid: expected.as_ref(),
-                    },
-                    stdout,
-                );
-            }
-            if transaction.capture(context.store, &name)? {
-                return Ok(());
-            }
-            update_ref_stdin_write(
-                context,
-                UpdateRefStdinWriteRequest {
-                    name,
-                    new_oid,
-                    expected_oid: expected.as_ref(),
-                },
-            )
-        }
-        "create" => {
-            if parts.len() != 3 {
-                return update_ref_stdin_bad_command(command);
-            }
-            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let new_oid =
-                parse_update_ref_new_oid(context.git_dir, context.format, context.store, parts[2])?;
-            if new_oid == zero_oid(context.format)? {
-                return update_ref_stdin_create_zero(parts[1]);
-            }
-            let zero = zero_oid(context.format)?;
-            if context.batch_updates {
-                return update_ref_stdin_write_batch(
-                    context,
-                    UpdateRefStdinWriteRequest {
-                        name,
-                        new_oid,
-                        expected_oid: Some(&zero),
-                    },
-                    stdout,
-                );
-            }
-            if transaction.capture(context.store, &name)? {
-                return Ok(());
-            }
-            update_ref_stdin_write(
-                context,
-                UpdateRefStdinWriteRequest {
-                    name,
-                    new_oid,
-                    expected_oid: Some(&zero),
-                },
-            )
-        }
-        "delete" => {
-            if parts.len() != 2 && parts.len() != 3 {
-                return update_ref_stdin_bad_command(command);
-            }
-            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let expected = if let Some(old) = parts.get(2) {
-                Some(parse_update_ref_expected(
-                    context.git_dir,
-                    context.format,
-                    context.store,
-                    old,
-                )?)
-            } else {
-                None
-            };
-            if context.batch_updates {
-                return update_ref_delete_stdin_batch(
-                    context.store,
-                    context.format,
-                    &name,
-                    expected.as_ref(),
-                    stdout,
-                );
-            }
-            if transaction.capture(context.store, &name)? {
-                return Ok(());
-            }
-            update_ref_delete_stdin(context.store, context.format, &name, expected.as_ref())
-        }
-        "verify" => {
-            if parts.len() != 2 && parts.len() != 3 {
-                return update_ref_stdin_bad_command(command);
-            }
-            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let expected = if let Some(old) = parts.get(2) {
-                parse_update_ref_expected(context.git_dir, context.format, context.store, old)?
-            } else {
-                zero_oid(context.format)?
-            };
-            let current = context.store.read_ref(&name)?;
-            if context.batch_updates {
-                return verify_update_ref_stdin_batch(
-                    context.format,
-                    &name,
-                    current.as_ref(),
-                    &expected,
-                    stdout,
-                );
-            }
-            check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
-        }
-        "symref-create" => {
-            if parts.len() != 3 {
-                return update_ref_stdin_bad_command(command);
-            }
-            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            if transaction.capture(context.store, &name)? {
-                return Ok(());
-            }
-            update_ref_stdin_symref_create(context.store, &name, parts[2])
-        }
-        "symref-update" => {
-            if parts.len() == 2 {
-                return update_ref_stdin_symref_update_missing_new_target(parts[1]);
-            }
-            if parts.len() == 4 {
-                return update_ref_stdin_symref_update_missing_old_value(parts[1]);
-            }
-            if parts.len() != 3 && parts.len() != 5 {
-                return update_ref_stdin_symref_update_bad(command, parts.get(1).copied());
-            }
-            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let expected = match parts.get(3).copied() {
-                None => None,
-                Some("ref") => Some(UpdateRefStdinSymrefExpected::Target(parts[4].to_string())),
-                Some("oid") => Some(UpdateRefStdinSymrefExpected::Oid(
-                    parse_update_ref_expected(
-                        context.git_dir,
-                        context.format,
-                        context.store,
-                        parts[4],
-                    )?,
-                )),
-                Some(kind) => {
-                    return update_ref_stdin_symref_update_invalid_old_kind(parts[1], kind);
-                }
-            };
-            if transaction.capture(context.store, &name)? {
-                return Ok(());
-            }
-            update_ref_stdin_symref_update(context.store, context.format, &name, parts[2], expected)
-        }
-        "symref-verify" => {
-            if *deref {
-                return update_ref_stdin_symref_verify_deref_mode();
-            }
-            if parts.len() != 2 && parts.len() != 3 {
-                return update_ref_stdin_bad_command(command);
-            }
-            update_ref_stdin_symref_verify(context.store, parts[1], parts.get(2).copied())
-        }
-        "symref-delete" => {
-            if *deref {
-                return update_ref_stdin_symref_delete_deref_mode();
-            }
-            if parts.len() != 2 && parts.len() != 3 {
-                return update_ref_stdin_bad_command(command);
-            }
-            if transaction.capture(context.store, parts[1])? {
-                return Ok(());
-            }
-            update_ref_stdin_symref_delete(context.store, parts[1], parts.get(2).copied())
-        }
-        "start" => transaction.start(stdout),
-        "prepare" => transaction.prepare(context.git_dir, context.store, stdout),
-        "commit" => transaction.commit(context.store, stdout),
-        "abort" => transaction.abort(context.store, stdout),
-        _ => update_ref_stdin_bad_command(command),
-    }
+    let cursor = ArgCursor::new(&line[arg_start..], Terminator::Newline);
+    dispatch_ref_stdin_command(context, deref, transaction, stdout, cmd, cursor)
 }
 
 fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Result<()> {
+    use crate::commands::ref_command_stream::{ArgCursor, Terminator};
+
     let stdin = io::stdin();
     let mut reader = crate::commands::stdin_stream::StdinRecordReader::new(stdin.lock(), b'\0');
     let mut stdout = io::stdout().lock();
     let mut deref = deref;
     let mut transaction = UpdateRefStdinTransaction::default();
-    while let Some(command) = reader.read_record()? {
-        let command = String::from_utf8_lossy(&command).into_owned();
-        if command.is_empty() {
-            continue;
+    while let Some(first) = reader.read_record()? {
+        // git guards: an empty command record is `empty command in input`; a
+        // record beginning with whitespace is `whitespace before command`.
+        // (Under -z, `echo "" | git update-ref -z --stdin` yields a record of
+        // "\n" which trips the whitespace guard, while `printf '\0'` yields a
+        // truly empty record which trips the empty-command guard.)
+        crate::commands::ref_command_stream::classify_line(&first)?;
+
+        let Some((cmd, arg_start)) =
+            match_ref_stdin_command(&first, b'\0')
+        else {
+            transaction.restore(context.store)?;
+            return update_ref_stdin_bad_command(&String::from_utf8_lossy(&first));
+        };
+
+        // Stitch the command record with `cmd.args - 1` additional NUL records,
+        // exactly as git pre-reads them in its main loop. The stitched buffer
+        // uses `\0` between records and a trailing `\0` so the cursor sees the
+        // same shape git's `input` strbuf has after the appends.
+        let mut stitched = first[arg_start..].to_vec();
+        let mut early_eof = false;
+        for _ in 1..cmd.args {
+            stitched.push(b'\0');
+            match reader.read_record()? {
+                Some(rec) => stitched.extend_from_slice(&rec),
+                None => {
+                    early_eof = true;
+                    break;
+                }
+            }
         }
-        let result = update_ref_stdin_z_command(
-            context,
-            &mut deref,
-            &mut reader,
-            &command,
-            &mut transaction,
-            &mut stdout,
-        );
+        if cmd.args > 0 && !early_eof {
+            stitched.push(b'\0');
+        }
+
+        let cursor = ArgCursor::new(&stitched, Terminator::Nul);
+        let result =
+            dispatch_ref_stdin_command(context, &mut deref, &mut transaction, &mut stdout, cmd, cursor);
         if let Err(err) = result {
             transaction.restore(context.store)?;
             return Err(err);
@@ -1333,48 +1225,101 @@ fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Resul
     transaction.finish_implicit(context.store)
 }
 
-fn update_ref_stdin_z_command<R: BufRead>(
+/// Shared dispatch for both the `\n` and `-z` paths, mirroring git's
+/// `parse_cmd_*` family. `cursor` is positioned at the first argument; the
+/// command's `Terminator` carries whether we are in text or binary mode.
+fn dispatch_ref_stdin_command(
     context: &UpdateRefStdinContext<'_>,
     deref: &mut bool,
-    reader: &mut crate::commands::stdin_stream::StdinRecordReader<R>,
-    command: &str,
     transaction: &mut UpdateRefStdinTransaction,
     stdout: &mut dyn Write,
+    cmd: &RefStdinCommand,
+    mut cursor: crate::commands::ref_command_stream::ArgCursor<'_>,
 ) -> Result<()> {
-    let (verb, name) = update_ref_stdin_z_verb_and_name(command);
+    use crate::commands::ref_command_stream::NextOid;
+
+    let verb = cmd.prefix;
     if transaction.is_closed() && verb != "start" {
         return update_ref_stdin_closed_transaction();
     }
     if transaction.is_prepared() && !matches!(verb, "commit" | "abort") {
         return update_ref_stdin_prepared_transaction();
     }
+
     match verb {
         "option" => {
-            if name == Some("no-deref") {
+            // git: `parse_cmd_option` checks the entire remainder against
+            // `no-deref<term>`; anything else dies with `option unknown: <rest>`
+            // where <rest> is the raw remainder (no C-unquoting). In `\n` mode
+            // git's `next` still carries the trailing newline, so the message
+            // gains an extra blank line; in `-z` mode the NUL is not printed.
+            let rest = cursor.remainder();
+            if rest == "no-deref" {
                 *deref = false;
-                return Ok(());
+                Ok(())
+            } else {
+                update_ref_stdin_unknown_option(&rest, cursor.terminator_byte())
             }
-            update_ref_stdin_unknown_option(name.unwrap_or(""))
         }
         "update" => {
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let new = update_ref_stdin_z_next(reader, command, "<new-oid>")?;
-            let old = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
-            let name = update_ref_effective_name(context.store, name, *deref)?;
-            let new_oid =
-                parse_update_ref_new_oid(context.git_dir, context.format, context.store, &new)?;
-            let expected = if old.is_empty() {
-                None
-            } else {
-                Some(parse_update_ref_expected(
+            // <new-oid> allows empty (treated as zero, with a -z warning).
+            let new = match cursor.parse_next_oid("update", &raw_name, true)? {
+                NextOid::Missing => return update_ref_stdin_missing_new_oid("update", &raw_name),
+                NextOid::Eof => {
+                    return update_ref_stdin_eof("update", &raw_name, "<new-oid>");
+                }
+                NextOid::Zero => {
+                    if cursor.terminator_byte() == b'\0' {
+                        eprintln!(
+                            "warning: update {raw_name}: missing <new-oid>, treating as zero"
+                        );
+                    }
+                    None
+                }
+                NextOid::Value(v) => Some(v),
+            };
+            // <old-oid> does NOT allow empty: a present empty value is a zero
+            // OID (verify the ref does not currently exist), distinct from an
+            // absent value (no old-value check).
+            let old = match cursor.parse_next_oid("update", &raw_name, false)? {
+                NextOid::Missing => OldOid::Absent,
+                NextOid::Zero => OldOid::Zero,
+                NextOid::Eof => {
+                    return update_ref_stdin_eof("update", &raw_name, "<old-oid>");
+                }
+                NextOid::Value(v) => OldOid::Value(v),
+            };
+            cursor.finish("update", &raw_name)?;
+
+            let new_oid = match new {
+                Some(v) => resolve_stdin_oid(
                     context.git_dir,
                     context.format,
                     context.store,
-                    &old,
-                )?)
+                    "update",
+                    &raw_name,
+                    "<new-oid>",
+                    &v,
+                )?,
+                None => zero_oid(context.format)?,
             };
+            let expected = match old {
+                OldOid::Absent => None,
+                OldOid::Zero => Some(zero_oid(context.format)?),
+                OldOid::Value(v) => Some(resolve_stdin_oid(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    "update",
+                    &raw_name,
+                    "<old-oid>",
+                    &v,
+                )?),
+            };
+            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
                     context,
@@ -1399,16 +1344,40 @@ fn update_ref_stdin_z_command<R: BufRead>(
             )
         }
         "create" => {
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let new = update_ref_stdin_z_next(reader, command, "<new-oid>")?;
-            let name = update_ref_effective_name(context.store, name, *deref)?;
-            let new_oid =
-                parse_update_ref_new_oid(context.git_dir, context.format, context.store, &new)?;
+            // create's <new-oid> does not allow empty: `-z` empty / absent is
+            // `missing <new-oid>`, while a `\n` empty value decodes to zero and
+            // falls through to the `zero <new-oid>` guard below.
+            let new = match cursor.parse_next_oid("create", &raw_name, false)? {
+                NextOid::Missing => {
+                    return update_ref_stdin_missing_new_oid("create", &raw_name);
+                }
+                NextOid::Eof => {
+                    return update_ref_stdin_eof("create", &raw_name, "<new-oid>");
+                }
+                NextOid::Zero => None,
+                NextOid::Value(v) => Some(v),
+            };
+            cursor.finish("create", &raw_name)?;
+
+            let new_oid = match new {
+                Some(v) => resolve_stdin_oid(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    "create",
+                    &raw_name,
+                    "<new-oid>",
+                    &v,
+                )?,
+                None => zero_oid(context.format)?,
+            };
             if new_oid == zero_oid(context.format)? {
-                return update_ref_stdin_create_zero(&name);
+                return update_ref_stdin_create_zero(&raw_name);
             }
+            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             let zero = zero_oid(context.format)?;
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
@@ -1434,21 +1403,42 @@ fn update_ref_stdin_z_command<R: BufRead>(
             )
         }
         "delete" => {
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let old = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
-            let name = update_ref_effective_name(context.store, name, *deref)?;
-            let expected = if old.is_empty() {
-                None
-            } else {
-                Some(parse_update_ref_expected(
-                    context.git_dir,
-                    context.format,
-                    context.store,
-                    &old,
-                )?)
+            let old = match cursor.parse_next_oid("delete", &raw_name, false)? {
+                NextOid::Missing => OldOid::Absent,
+                NextOid::Zero => OldOid::Zero,
+                NextOid::Eof => {
+                    return update_ref_stdin_eof("delete", &raw_name, "<old-oid>");
+                }
+                NextOid::Value(v) => OldOid::Value(v),
             };
+            cursor.finish("delete", &raw_name)?;
+
+            let expected = match old {
+                OldOid::Absent => None,
+                // git: a `\n`-empty <old-oid> for delete is a zero, which is an
+                // error.
+                OldOid::Zero => return update_ref_stdin_delete_zero(&raw_name),
+                OldOid::Value(v) => {
+                    let oid = resolve_stdin_oid(
+                        context.git_dir,
+                        context.format,
+                        context.store,
+                        "delete",
+                        &raw_name,
+                        "<old-oid>",
+                        &v,
+                    )?;
+                    // git: a resolved zero <old-oid> is also rejected.
+                    if oid == zero_oid(context.format)? {
+                        return update_ref_stdin_delete_zero(&raw_name);
+                    }
+                    Some(oid)
+                }
+            };
+            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             if context.batch_updates {
                 return update_ref_delete_stdin_batch(
                     context.store,
@@ -1464,16 +1454,33 @@ fn update_ref_stdin_z_command<R: BufRead>(
             update_ref_delete_stdin(context.store, context.format, &name, expected.as_ref())
         }
         "verify" => {
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let old = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
-            let name = update_ref_effective_name(context.store, name, *deref)?;
-            let expected = if old.is_empty() {
-                zero_oid(context.format)?
-            } else {
-                parse_update_ref_expected(context.git_dir, context.format, context.store, &old)?
+            // git's parse_cmd_verify clears <old-oid> to zero when absent, so
+            // both an absent and a present-empty value verify against zero.
+            let old = match cursor.parse_next_oid("verify", &raw_name, false)? {
+                NextOid::Missing | NextOid::Zero => None,
+                NextOid::Eof => {
+                    return update_ref_stdin_eof("verify", &raw_name, "<old-oid>");
+                }
+                NextOid::Value(v) => Some(v),
             };
+            cursor.finish("verify", &raw_name)?;
+
+            let expected = match old {
+                Some(v) => resolve_stdin_oid(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    "verify",
+                    &raw_name,
+                    "<old-oid>",
+                    &v,
+                )?,
+                None => zero_oid(context.format)?,
+            };
+            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
                 return verify_update_ref_stdin_batch(
@@ -1487,42 +1494,63 @@ fn update_ref_stdin_z_command<R: BufRead>(
             check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
         }
         "symref-create" => {
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let target = update_ref_stdin_z_next(reader, command, "<new-target>")?;
-            let name = update_ref_effective_name(context.store, name, *deref)?;
+            let Some(target) = cursor.parse_next_refname()? else {
+                return update_ref_stdin_symref_update_missing_new_target_for("symref-create", &raw_name);
+            };
+            cursor.finish("symref-create", &raw_name)?;
+
+            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
             update_ref_stdin_symref_create(context.store, &name, &target)
         }
         "symref-update" => {
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let target = update_ref_stdin_z_next(reader, command, "<new-target>")?;
-            let expected = match update_ref_stdin_z_peek(reader)?.as_deref() {
-                Some("ref") => {
-                    let _ = update_ref_stdin_z_next(reader, command, "")?;
-                    let old_target = update_ref_stdin_z_next(reader, command, "<old-target>")?;
-                    Some(UpdateRefStdinSymrefExpected::Target(old_target))
-                }
-                Some("oid") => {
-                    let _ = update_ref_stdin_z_next(reader, command, "")?;
-                    let old_oid = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
-                    Some(UpdateRefStdinSymrefExpected::Oid(
-                        parse_update_ref_expected(
-                            context.git_dir,
-                            context.format,
-                            context.store,
-                            &old_oid,
-                        )?,
-                    ))
-                }
-                _ => None,
+            let Some(target) = cursor.parse_next_refname()? else {
+                return update_ref_stdin_symref_update_missing_new_target(&raw_name);
             };
-            let name = update_ref_effective_name(context.store, name, *deref)?;
+            // Optional `<old-arg> <old-value>` pair: `ref <name>` or `oid <oid>`.
+            let expected = match cursor.parse_next_arg()? {
+                None => None,
+                Some(old_arg) => {
+                    let Some(old_value) = cursor.parse_next_arg()? else {
+                        return update_ref_stdin_symref_update_missing_old_value(&raw_name);
+                    };
+                    match old_arg.as_str() {
+                        "ref" => Some(UpdateRefStdinSymrefExpected::Target(old_value)),
+                        "oid" => Some(UpdateRefStdinSymrefExpected::Oid(
+                            match parse_update_ref_oidish(
+                                context.git_dir,
+                                context.format,
+                                context.store,
+                                &old_value,
+                            ) {
+                                Some(oid) => oid,
+                                None => {
+                                    eprintln!(
+                                        "fatal: symref-update {raw_name}: invalid oid: {old_value}"
+                                    );
+                                    return Err(GitError::Exit(128));
+                                }
+                            },
+                        )),
+                        other => {
+                            return update_ref_stdin_symref_update_invalid_old_kind(
+                                &raw_name, other,
+                            );
+                        }
+                    }
+                }
+            };
+            cursor.finish("symref-update", &raw_name)?;
+
+            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
@@ -1532,38 +1560,42 @@ fn update_ref_stdin_z_command<R: BufRead>(
             if *deref {
                 return update_ref_stdin_symref_verify_deref_mode();
             }
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let target = update_ref_stdin_z_next(reader, command, "<old-target>")?;
-            let expected = (!target.is_empty()).then_some(target.as_str());
-            update_ref_stdin_symref_verify(context.store, name, expected)
+            let expected = cursor.parse_next_refname()?;
+            cursor.finish("symref-verify", &raw_name)?;
+            update_ref_stdin_symref_verify(context.store, &raw_name, expected.as_deref())
         }
         "symref-delete" => {
             if *deref {
                 return update_ref_stdin_symref_delete_deref_mode();
             }
-            let Some(name) = name else {
-                return update_ref_stdin_bad_command(verb);
+            let Some(raw_name) = cursor.parse_refname()? else {
+                return update_ref_stdin_missing_ref(verb);
             };
-            let target = update_ref_stdin_z_next(reader, command, "<old-target>")?;
-            let expected = (!target.is_empty()).then_some(target.as_str());
-            if transaction.capture(context.store, name)? {
+            let expected = cursor.parse_next_refname()?;
+            cursor.finish("symref-delete", &raw_name)?;
+            if transaction.capture(context.store, &raw_name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_delete(context.store, name, expected)
+            update_ref_stdin_symref_delete(context.store, &raw_name, expected.as_deref())
         }
-        "start" | "prepare" | "commit" | "abort" => {
-            if name.is_some() {
-                return update_ref_stdin_bad_command(verb);
-            }
-            match verb {
-                "start" => transaction.start(stdout),
-                "prepare" => transaction.prepare(context.git_dir, context.store, stdout),
-                "commit" => transaction.commit(context.store, stdout),
-                "abort" => transaction.abort(context.store, stdout),
-                _ => unreachable!(),
-            }
+        "start" => {
+            cursor.finish("start", "")?;
+            transaction.start(stdout)
+        }
+        "prepare" => {
+            cursor.finish("prepare", "")?;
+            transaction.prepare(context.git_dir, context.store, stdout)
+        }
+        "commit" => {
+            cursor.finish("commit", "")?;
+            transaction.commit(context.store, stdout)
+        }
+        "abort" => {
+            cursor.finish("abort", "")?;
+            transaction.abort(context.store, stdout)
         }
         _ => update_ref_stdin_bad_command(verb),
     }
@@ -1782,45 +1814,59 @@ fn update_ref_stdin_remove_ref(store: &FileRefStore, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn update_ref_stdin_z_verb_and_name(command: &str) -> (&str, Option<&str>) {
-    command
-        .split_once(' ')
-        .map_or((command, None), |(verb, name)| (verb, Some(name)))
-}
-
-fn update_ref_stdin_z_next<R: BufRead>(
-    reader: &mut crate::commands::stdin_stream::StdinRecordReader<R>,
-    command: &str,
-    field: &str,
-) -> Result<String> {
-    let Some(field_value) = reader.read_record()? else {
-        eprintln!("fatal: {command}: unexpected end of input when reading {field}");
-        return Err(GitError::Exit(128));
-    };
-    Ok(String::from_utf8_lossy(&field_value).into_owned())
-}
-
-fn update_ref_stdin_z_peek<R: BufRead>(
-    reader: &mut crate::commands::stdin_stream::StdinRecordReader<R>,
-) -> Result<Option<String>> {
-    Ok(reader
-        .peek_record()?
-        .map(|record| String::from_utf8_lossy(record).into_owned()))
-}
-
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
     eprintln!("fatal: unknown command: {command}");
     Err(GitError::Exit(128))
 }
 
-fn update_ref_stdin_unknown_option(option: &str) -> Result<()> {
-    eprintln!("fatal: option unknown: {option}");
-    eprintln!();
+/// git's `<cmd>: missing <ref>` (e.g. `create: missing <ref>`).
+fn update_ref_stdin_missing_ref(command: &str) -> Result<()> {
+    eprintln!("fatal: {command}: missing <ref>");
+    Err(GitError::Exit(128))
+}
+
+/// git's `<cmd> <ref>: missing <new-oid>` for create/update.
+fn update_ref_stdin_missing_new_oid(command: &str, refname: &str) -> Result<()> {
+    eprintln!("fatal: {command} {refname}: missing <new-oid>");
+    Err(GitError::Exit(128))
+}
+
+/// git's `<cmd> <ref>: unexpected end of input when reading <field>` (only the
+/// `-z` path can hit this; the `\n` path treats a short line as `missing`).
+fn update_ref_stdin_eof(command: &str, refname: &str, field: &str) -> Result<()> {
+    eprintln!("fatal: {command} {refname}: unexpected end of input when reading {field}");
+    Err(GitError::Exit(128))
+}
+
+/// git's `<cmd> <ref>: missing <new-target>` for symref-create.
+fn update_ref_stdin_symref_update_missing_new_target_for(
+    command: &str,
+    refname: &str,
+) -> Result<()> {
+    eprintln!("fatal: {command} {refname}: missing <new-target>");
+    Err(GitError::Exit(128))
+}
+
+fn update_ref_stdin_unknown_option(option: &str, terminator: u8) -> Result<()> {
+    // git's `die("option unknown: %s", next)` prints `next` (the raw tail) and
+    // then a newline. In `\n` mode `next` still includes the line's trailing
+    // newline, producing a blank line after the message; in `-z` mode the NUL
+    // is not printed by `%s`, so there is only the single die newline.
+    if terminator == b'\n' {
+        eprintln!("fatal: option unknown: {option}\n");
+    } else {
+        eprintln!("fatal: option unknown: {option}");
+    }
     Err(GitError::Exit(128))
 }
 
 fn update_ref_stdin_create_zero(name: &str) -> Result<()> {
     eprintln!("fatal: create {name}: zero <new-oid>");
+    Err(GitError::Exit(128))
+}
+
+fn update_ref_stdin_delete_zero(name: &str) -> Result<()> {
+    eprintln!("fatal: delete {name}: zero <old-oid>");
     Err(GitError::Exit(128))
 }
 
@@ -1946,15 +1992,6 @@ fn update_ref_stdin_symref_exists(name: &str, symbolic: bool) -> Result<()> {
 
 fn update_ref_stdin_symref_unresolved(name: &str) -> Result<()> {
     eprintln!("fatal: cannot lock ref '{name}': unable to resolve reference '{name}'");
-    Err(GitError::Exit(128))
-}
-
-fn update_ref_stdin_symref_update_bad(command: &str, name: Option<&str>) -> Result<()> {
-    if let Some(name) = name {
-        eprintln!("fatal: {command} {name}: missing <new-target>");
-    } else {
-        eprintln!("fatal: unknown command: {command}");
-    }
     Err(GitError::Exit(128))
 }
 
@@ -2380,6 +2417,29 @@ fn parse_update_ref_expected(
             value.len()
         ))
     })
+}
+
+/// Resolve a `<new-oid>`/`<old-oid>` argument from `update-ref --stdin`,
+/// emitting git's command-stream-specific die-message on failure:
+/// `<cmd> <ref>: invalid <new-oid>: <value>` (or `<old-oid>`). git's
+/// `parse_next_oid` produces these, distinct from the generic resolver's
+/// message.
+fn resolve_stdin_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    command: &str,
+    refname: &str,
+    field: &str,
+    value: &str,
+) -> Result<ObjectId> {
+    match parse_update_ref_oidish(git_dir, format, store, value) {
+        Some(oid) => Ok(oid),
+        None => {
+            eprintln!("fatal: {command} {refname}: invalid {field}: {value}");
+            Err(GitError::Exit(128))
+        }
+    }
 }
 
 fn check_update_ref_expected(
