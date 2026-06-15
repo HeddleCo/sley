@@ -147,6 +147,16 @@ pub fn commit_tree_at_head(
     commit_tree_with_amend(git_dir, format, tree, options, false)
 }
 
+pub fn commit_tree_at_head_with_odb(
+    git_dir: impl AsRef<Path>,
+    format: sley_core::ObjectFormat,
+    tree: ObjectId,
+    options: CommitIndexOptions,
+    db: &FileObjectDatabase,
+) -> Result<CommitIndexResult> {
+    commit_tree_with_amend_with_odb(git_dir, format, tree, options, false, db)
+}
+
 fn commit_tree_with_amend(
     git_dir: impl AsRef<Path>,
     format: sley_core::ObjectFormat,
@@ -155,13 +165,25 @@ fn commit_tree_with_amend(
     amend: bool,
 ) -> Result<CommitIndexResult> {
     let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    commit_tree_with_amend_with_odb(git_dir, format, tree, options, amend, &db)
+}
+
+fn commit_tree_with_amend_with_odb(
+    git_dir: impl AsRef<Path>,
+    format: sley_core::ObjectFormat,
+    tree: ObjectId,
+    options: CommitIndexOptions,
+    amend: bool,
+    db: &FileObjectDatabase,
+) -> Result<CommitIndexResult> {
+    let git_dir = git_dir.as_ref();
     let refs = FileRefStore::new(git_dir, format);
     let (updated_ref, parent) = head_update_target(&refs)?;
     let commit_parents = if amend {
         let Some(parent) = &parent else {
             return Err(GitError::not_found("commit to amend"));
         };
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
         let object = db.read_object(parent)?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
@@ -174,9 +196,9 @@ fn commit_tree_with_amend(
     } else {
         parent.iter().cloned().collect()
     };
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut writer = db.clone();
     let oid = create_commit(
-        &mut db,
+        &mut writer,
         CommitCreate {
             tree: tree.clone(),
             parents: commit_parents,

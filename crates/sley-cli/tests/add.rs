@@ -412,6 +412,72 @@ fn add_clean_path_dry_run_is_quiet_like_upstream_git() {
 }
 
 #[test]
+fn add_touched_tracked_path_restats_without_verbose_action_like_upstream_git() {
+    let root = unique_temp_dir("add-touched-tracked");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join("tracked.txt"), b"same\n").expect("write tracked");
+            git(repo, &["add", "tracked.txt"]);
+            run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        for repo in [&upstream, &rust] {
+            fs::write(repo.join("tracked.txt"), b"same\n").expect("touch tracked content");
+        }
+
+        let args = ["add", "-v", "tracked.txt"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+
+        assert_eq!(
+            run(env!("CARGO_BIN_EXE_sley"), &rust, &["diff-files", "--name-only"]),
+            git(&upstream, &["diff-files", "--name-only"]),
+            "diff-files differed after restatting touched tracked path"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn add_exact_tracked_path_applies_attributes_like_upstream_git() {
+    let root = unique_temp_dir("add-exact-tracked-attrs");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(repo, &["config", "filter.upper.clean", "tr a-z A-Z"]);
+            fs::write(repo.join(".gitattributes"), b"*.dat filter=upper\n")
+                .expect("write attributes");
+            fs::write(repo.join("tracked.dat"), b"base\n").expect("write tracked");
+            git(repo, &["add", ".gitattributes", "tracked.dat"]);
+            run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+            fs::write(repo.join("tracked.dat"), b"mixed content\n").expect("modify tracked");
+        }
+
+        let args = ["add", "-v", "tracked.dat"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["show", ":tracked.dat"]),
+            git(&upstream, &["show", ":tracked.dat"]),
+            "staged blob differed after add with attributes"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn add_missing_pathspec_matches_upstream_git() {
     let root = unique_temp_dir("add-missing-pathspec");
     let upstream = root.join("upstream");
@@ -424,6 +490,48 @@ fn add_missing_pathspec_matches_upstream_git() {
         }
 
         let args = ["add", "missing.txt"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn add_path_inside_submodule_is_rejected_like_upstream_git() {
+    let root = unique_temp_dir("add-path-inside-submodule");
+    let sub_src = root.join("sub-src");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&sub_src).expect("create submodule source");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        git(&sub_src, &["init", "-q", "-b", "main"]);
+        fs::write(sub_src.join("inside.txt"), b"inside\n").expect("write submodule file");
+        git(&sub_src, &["add", "inside.txt"]);
+        run_with_identity(&sub_src, &["commit", "-m", "sub", "-q"]);
+
+        let sub_src_arg = sub_src.to_string_lossy().into_owned();
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    &sub_src_arg,
+                    "sub",
+                ],
+            );
+            run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+            fs::write(repo.join("sub/inside.txt"), b"changed\n").expect("modify submodule file");
+        }
+
+        let args = ["add", "sub/inside.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);

@@ -980,7 +980,34 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    die_on_pathspec_inside_submodule(&cwd, &worktree_root, &git_dir, format, &paths)?;
+    if !update
+        && !all
+        && let Some(actions) = try_add_regular_exact_tracked_raw(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &paths,
+            AddRegularOptions {
+                chmod,
+                force,
+                ignore_removal,
+                ignore_missing,
+                dry_run,
+            },
+        )?
+    {
+        if verbose {
+            print_add_actions(&worktree_root, &actions)?;
+        }
+        return Ok(());
+    }
+    let parsed_index = if paths.is_empty() {
+        None
+    } else {
+        sley_worktree::read_repository_index(&git_dir, format)?
+    };
+    die_on_pathspec_inside_submodule(&cwd, &worktree_root, parsed_index.as_ref(), &paths)?;
     // git's `add` re-stats every tracked path it touches, including ones whose
     // content is unchanged (a `touch`ed file): `builtin/add.c` calls
     // `refresh_index` over the pathspec before/after staging, so the cached stat
@@ -1077,7 +1104,11 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let actions = resolve_add_regular_actions(
+    let AddRegularResolution {
+        actions,
+        mut reusable_index,
+        exact_tracked,
+    } = resolve_add_regular_actions(
         &cwd,
         &worktree_root,
         &git_dir,
@@ -1090,9 +1121,33 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             ignore_missing,
             dry_run,
         },
+        parsed_index,
     )?;
     if dry_run {
         print_add_actions(&worktree_root, &actions)?;
+        return Ok(());
+    }
+    if let Some(exact) = exact_tracked {
+        let actions = if exact.needs_index_update {
+            let index = reusable_index.take().ok_or_else(|| {
+                GitError::Command("exact tracked add lost its parsed index".into())
+            })?;
+            sley_worktree::add_exact_tracked_path_with_index(
+                &worktree_root,
+                &git_dir,
+                format,
+                index,
+                &exact.git_path,
+            )?
+            .into_iter()
+            .map(|action| add_update_tracked_action_to_add_action(&worktree_root, action))
+            .collect::<Result<Vec<_>>>()?
+        } else {
+            actions
+        };
+        if verbose {
+            print_add_actions(&worktree_root, &actions)?;
+        }
         return Ok(());
     }
     let action_paths = actions
@@ -1106,33 +1161,54 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         // Snapshot the tracked paths before staging only when the warning can
         // actually fire. Ordinary file adds never need this second index pass.
         let previously_tracked: BTreeSet<Vec<u8>> = if warn_embedded {
-            sley_worktree::read_repository_index(&git_dir, format)?
-                .map(|index| {
-                    index
-                        .entries
-                        .into_iter()
-                        .map(|entry| entry.path.into_bytes())
-                        .collect()
-                })
-                .unwrap_or_default()
+            if let Some(index) = reusable_index.as_ref() {
+                index
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.as_bytes().to_vec())
+                    .collect()
+            } else {
+                sley_worktree::read_repository_index(&git_dir, format)?
+                    .map(|index| {
+                        index
+                            .entries
+                            .into_iter()
+                            .map(|entry| entry.path.into_bytes())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
         } else {
             BTreeSet::new()
         };
-        sley_worktree::update_index_paths_filtered(
-            &worktree_root,
-            git_dir.clone(),
-            format,
-            &action_paths,
-            sley_worktree::UpdateIndexOptions {
-                add: true,
-                remove: true,
-                force_remove: false,
-                chmod,
-                info_only: false,
-                ignore_skip_worktree_entries: false,
-            },
-            &config,
-        )?;
+        let update_options = sley_worktree::UpdateIndexOptions {
+            add: true,
+            remove: true,
+            force_remove: false,
+            chmod,
+            info_only: false,
+            ignore_skip_worktree_entries: false,
+        };
+        if let Some(index) = reusable_index.take() {
+            sley_worktree::update_index_paths_filtered_with_index(
+                &worktree_root,
+                &git_dir,
+                format,
+                index,
+                &action_paths,
+                update_options,
+                &config,
+            )?;
+        } else {
+            sley_worktree::update_index_paths_filtered(
+                &worktree_root,
+                &git_dir,
+                format,
+                &action_paths,
+                update_options,
+                &config,
+            )?;
+        }
         if warn_embedded {
             warn_on_embedded_repos(&git_dir, &worktree_root, &actions, &previously_tracked)?;
         }
@@ -1144,6 +1220,80 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         print_add_actions(&worktree_root, &actions)?;
     }
     Ok(())
+}
+
+fn add_update_tracked_action_to_add_action(
+    worktree_root: &Path,
+    action: sley_worktree::AddUpdateTrackedAction,
+) -> Result<AddAction> {
+    match action {
+        sley_worktree::AddUpdateTrackedAction::Add(path) => Ok(AddAction::Add(worktree_root.join(
+            std::str::from_utf8(&path).map_err(|err| GitError::InvalidPath(err.to_string()))?,
+        ))),
+        sley_worktree::AddUpdateTrackedAction::Remove(path) => {
+            Ok(AddAction::Remove(worktree_root.join(
+                std::str::from_utf8(&path).map_err(|err| GitError::InvalidPath(err.to_string()))?,
+            )))
+        }
+    }
+}
+
+fn try_add_regular_exact_tracked_raw(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: AddRegularOptions,
+) -> Result<Option<Vec<AddAction>>> {
+    if paths.len() != 1
+        || options.dry_run
+        || options.chmod.is_some()
+        || options.force
+        || options.ignore_missing
+    {
+        return Ok(None);
+    }
+    let path = &paths[0];
+    if add_pathspec_needs_status_walk(path) || add_pathspec_has_trailing_separator(path) {
+        return Ok(None);
+    }
+    let absolute = if path.is_absolute() {
+        path.clone()
+    } else {
+        cwd.join(path)
+    };
+    let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+        return Ok(None);
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let git_path = match add_git_path_bytes(relative) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let result = sley_worktree::add_exact_tracked_path_from_disk(
+        worktree_root,
+        git_dir,
+        format,
+        &git_path,
+        options.ignore_removal,
+    )?;
+    match result {
+        sley_worktree::AddExactTrackedPathResult::Handled(action) => action
+            .into_iter()
+            .map(|action| add_update_tracked_action_to_add_action(worktree_root, action))
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        sley_worktree::AddExactTrackedPathResult::Unsupported => Ok(None),
+    }
+}
+
+fn add_pathspec_has_trailing_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .ends_with(std::path::MAIN_SEPARATOR)
 }
 
 /// Re-stat the index entries `git add` touched so the cached stat matches the
@@ -1193,16 +1343,102 @@ fn refresh_index_after_add(
 fn die_on_pathspec_inside_submodule(
     cwd: &Path,
     worktree_root: &Path,
-    git_dir: &Path,
-    format: ObjectFormat,
+    index: Option<&Index>,
     paths: &[PathBuf],
 ) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(index) = index else {
         return Ok(());
     };
+    if paths
+        .iter()
+        .any(|path| add_pathspec_needs_status_walk(path))
+    {
+        return die_on_pathspec_inside_submodule_by_scan(cwd, worktree_root, index, paths);
+    }
+    let mut git_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        match add_pathspec_git_path_for_submodule_fast(cwd, worktree_root, path)? {
+            AddSubmodulePathspec::Inside(git_path) => git_paths.push((path, git_path)),
+            AddSubmodulePathspec::Outside => {}
+            AddSubmodulePathspec::Unsafe => {
+                return die_on_pathspec_inside_submodule_by_scan(cwd, worktree_root, index, paths);
+            }
+        }
+    }
+    for (path, git_path) in git_paths {
+        if let Some(link) = gitlink_ancestor_for_path(&index.entries, &git_path) {
+            eprintln!(
+                "fatal: Pathspec '{}' is in submodule '{}'",
+                path.to_string_lossy(),
+                String::from_utf8_lossy(link)
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
+}
+
+enum AddSubmodulePathspec {
+    Inside(Vec<u8>),
+    Outside,
+    Unsafe,
+}
+
+fn add_pathspec_git_path_for_submodule_fast(
+    cwd: &Path,
+    worktree_root: &Path,
+    path: &Path,
+) -> Result<AddSubmodulePathspec> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+        return Ok(AddSubmodulePathspec::Outside);
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+        )
+    }) {
+        return Ok(AddSubmodulePathspec::Unsafe);
+    }
+    Ok(AddSubmodulePathspec::Inside(add_git_path_bytes(relative)?))
+}
+
+fn gitlink_ancestor_for_path<'a>(entries: &'a [IndexEntry], git_path: &[u8]) -> Option<&'a [u8]> {
+    for (idx, byte) in git_path.iter().enumerate() {
+        if *byte != b'/' || idx == 0 {
+            continue;
+        }
+        if let Some(link) = index_gitlink_at_path(entries, &git_path[..idx]) {
+            return Some(link);
+        }
+    }
+    None
+}
+
+fn index_gitlink_at_path<'a>(entries: &'a [IndexEntry], path: &[u8]) -> Option<&'a [u8]> {
+    let range = add_index_entries_path_range(entries, path);
+    entries[range]
+        .iter()
+        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.mode == 0o160000)
+        .map(|entry| entry.path.as_bytes())
+}
+
+fn die_on_pathspec_inside_submodule_by_scan(
+    cwd: &Path,
+    worktree_root: &Path,
+    index: &Index,
+    paths: &[PathBuf],
+) -> Result<()> {
     let gitlinks: Vec<Vec<u8>> = index
         .entries
         .iter()
@@ -1355,6 +1591,22 @@ struct AddRegularOptions {
     dry_run: bool,
 }
 
+struct AddRegularResolution {
+    actions: Vec<AddAction>,
+    reusable_index: Option<Index>,
+    exact_tracked: Option<ExactTrackedAdd>,
+}
+
+struct ExactTrackedAdd {
+    git_path: Vec<u8>,
+    needs_index_update: bool,
+}
+
+struct TrackedExactResolution {
+    actions: Vec<AddAction>,
+    exact_tracked: Option<ExactTrackedAdd>,
+}
+
 fn resolve_add_regular_actions(
     cwd: &Path,
     worktree_root: &Path,
@@ -1362,16 +1614,21 @@ fn resolve_add_regular_actions(
     format: ObjectFormat,
     paths: Vec<PathBuf>,
     options: AddRegularOptions,
-) -> Result<Vec<AddAction>> {
-    if let Some(actions) = resolve_add_regular_tracked_exact_actions(
+    reusable_index: Option<Index>,
+) -> Result<AddRegularResolution> {
+    if let Some(exact) = resolve_add_regular_tracked_exact_actions(
         cwd,
         worktree_root,
         git_dir,
-        format,
         &paths,
         options,
+        reusable_index.as_ref(),
     )? {
-        return Ok(actions);
+        return Ok(AddRegularResolution {
+            actions: exact.actions,
+            reusable_index,
+            exact_tracked: exact.exact_tracked,
+        });
     }
     let pathspecs = paths
         .into_iter()
@@ -1450,30 +1707,35 @@ fn resolve_add_regular_actions(
             return Err(GitError::Exit(128));
         }
     }
-    Ok(actions)
+    Ok(AddRegularResolution {
+        actions,
+        reusable_index: None,
+        exact_tracked: None,
+    })
 }
 
 fn resolve_add_regular_tracked_exact_actions(
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
-    format: ObjectFormat,
     paths: &[PathBuf],
     options: AddRegularOptions,
-) -> Result<Option<Vec<AddAction>>> {
+    index: Option<&Index>,
+) -> Result<Option<TrackedExactResolution>> {
     if paths.is_empty() || options.chmod.is_some() || options.force || options.dry_run {
         return Ok(None);
     }
-    let index_path = sley_worktree::repository_index_path(git_dir);
-    if !index_path.exists() {
+    let Some(index) = index else {
         return Ok(None);
-    }
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    };
+    let index_path = sley_worktree::repository_index_path(git_dir);
     let index_mtime = fs::metadata(&index_path)
         .ok()
         .and_then(|metadata| sley_index::file_mtime_parts(&metadata));
     let stat_cache = sley_index::IndexStatCache::from_index_mtime_only(index_mtime);
     let mut actions = Vec::new();
+    let mut exact_tracked = None;
+    let single_path = paths.len() == 1;
     for path in paths {
         if add_pathspec_needs_status_walk(path) {
             return Ok(None);
@@ -1500,17 +1762,26 @@ fn resolve_add_regular_tracked_exact_actions(
         {
             return Ok(None);
         }
+        let entry = &index.entries[range.start];
+        if entry.mode == 0o160000 {
+            return Ok(None);
+        }
         match fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
-                if metadata.is_dir() {
+                let file_type = metadata.file_type();
+                if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
                     return Ok(None);
                 }
-                let entry = &index.entries[range.start];
-                if stat_cache
-                    .reusable_index_entry(entry, &metadata)
-                    .is_none()
-                {
+                let needs_index_update =
+                    stat_cache.reusable_index_entry(entry, &metadata).is_none();
+                if needs_index_update {
                     actions.push(AddAction::Add(absolute));
+                }
+                if single_path {
+                    exact_tracked = Some(ExactTrackedAdd {
+                        git_path: git_path.clone(),
+                        needs_index_update,
+                    });
                 }
             }
             Err(err)
@@ -1519,14 +1790,24 @@ fn resolve_add_regular_tracked_exact_actions(
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                 ) =>
             {
-                if !options.ignore_removal {
+                let needs_index_update = !options.ignore_removal;
+                if needs_index_update {
                     actions.push(AddAction::Remove(absolute));
+                }
+                if single_path {
+                    exact_tracked = Some(ExactTrackedAdd {
+                        git_path: git_path.clone(),
+                        needs_index_update,
+                    });
                 }
             }
             Err(err) => return Err(err.into()),
         }
     }
-    Ok(Some(actions))
+    Ok(Some(TrackedExactResolution {
+        actions,
+        exact_tracked,
+    }))
 }
 
 fn add_pathspec_needs_status_walk(path: &Path) -> bool {

@@ -42,6 +42,7 @@ sley-unpack-trees = { path = "../sley-unpack-trees" }
 sley-worktree = { path = "../sley-worktree" }
 
 [features]
+default = ["mmap", "fast-sha1"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback is a leaf-crate feature on
 # sley-odb / sley-pack: a no-C/wasm consumer that needs it depends on those
@@ -51,10 +52,10 @@ sley-worktree = { path = "../sley-worktree" }
 # forward could not actually swap the backend.
 #
 # Build the sley binary with the hardware-accelerated SHA-1 backend (forwarded to
-# sley-core). Default builds stay pure-Rust; OIDs are byte-identical either way.
+# sley-core). Default-on for CLI builds; OIDs are byte-identical either way.
 fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]
 # Build the sley binary with memory-mapped pack reads (forwarded to sley-odb).
-# Pulls in sley-mmap (the only unsafe); off by default.
+# Pulls in sley-mmap (the only unsafe); default-on for CLI/facade builds.
 mmap = ["sley-odb/mmap"]
 # TLS backend for HTTPS remotes (forwarded to sley-transport via sley-remote).
 tls-rustls = ["sley-transport/tls-rustls"]

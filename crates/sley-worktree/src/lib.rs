@@ -89,6 +89,12 @@ pub enum AddUpdateTrackedAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddExactTrackedPathResult {
+    Handled(Option<AddUpdateTrackedAction>),
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheInfoEntry {
     pub mode: u32,
     pub oid: ObjectId,
@@ -550,6 +556,15 @@ pub fn read_repository_index(
     Ok(Some(Index::parse(&fs::read(index_path)?, format)?))
 }
 
+fn empty_index() -> Index {
+    Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    }
+}
+
 /// Resolve the working-tree root for a repository identified by its git
 /// directory, returning `Ok(None)` for a bare repository.
 ///
@@ -689,11 +704,25 @@ pub fn update_index_paths(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
+    let git_dir = git_dir.as_ref();
+    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    update_index_paths_with_index(worktree_root, git_dir, format, index, paths, options)
+}
+
+pub fn update_index_paths_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: Index,
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+) -> Result<UpdateIndexResult> {
     let ordered = ordered_paths_from_plain(paths, options.chmod);
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
+        index,
         &ordered,
         options,
         None,
@@ -725,10 +754,35 @@ pub fn update_index_ordered_paths_filtered(
     config: &GitConfig,
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
+    let git_dir = git_dir.as_ref();
+    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    update_index_ordered_paths_filtered_with_index(
+        worktree_root,
+        git_dir,
+        format,
+        index,
+        paths,
+        options,
+        config,
+        verbose,
+    )
+}
+
+pub fn update_index_ordered_paths_filtered_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: Index,
+    paths: &[UpdateIndexPath],
+    options: UpdateIndexOptions,
+    config: &GitConfig,
+    verbose: bool,
+) -> Result<UpdateIndexResult> {
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
+        index,
         paths,
         options,
         Some(config),
@@ -776,11 +830,34 @@ pub fn update_index_paths_filtered(
     options: UpdateIndexOptions,
     config: &GitConfig,
 ) -> Result<UpdateIndexResult> {
+    let git_dir = git_dir.as_ref();
+    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    update_index_paths_filtered_with_index(
+        worktree_root,
+        git_dir,
+        format,
+        index,
+        paths,
+        options,
+        config,
+    )
+}
+
+pub fn update_index_paths_filtered_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: Index,
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+    config: &GitConfig,
+) -> Result<UpdateIndexResult> {
     let ordered = ordered_paths_from_plain(paths, options.chmod);
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
+        index,
         &ordered,
         options,
         Some(config),
@@ -838,7 +915,7 @@ pub fn add_update_all_tracked_filtered(
                     worktree_root,
                     git_dir,
                     format,
-                    clean_config,
+                    Some(clean_config),
                     &odb,
                     &stat_cache,
                     &mut clean_filter,
@@ -861,11 +938,359 @@ pub fn add_update_all_tracked_filtered(
     Ok(actions)
 }
 
+pub fn add_exact_tracked_path_from_disk(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    git_path: &[u8],
+    ignore_removal: bool,
+) -> Result<AddExactTrackedPathResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AddExactTrackedPathResult::Unsupported);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let mut index_bytes = fs::read(&index_path)?;
+    let Some(raw) = raw_exact_index_entry(&index_bytes, format, git_path)? else {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    };
+    if !raw_exact_entry_can_patch(&raw, git_path) {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+    if !raw_index_extensions_are_filterable(&index_bytes, raw.entries_end, raw.checksum_offset) {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+
+    let entry = raw.entry.clone();
+    if entry.stage() != Stage::Normal || index_entry_skip_worktree(&entry) || entry.mode == 0o160000
+    {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(if ignore_removal {
+                AddExactTrackedPathResult::Handled(None)
+            } else {
+                AddExactTrackedPathResult::Unsupported
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+    if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+    let index_mtime = file_mtime_parts(&index_metadata);
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    if stat_cache.reuse_index_entry(&entry, &metadata).is_some() {
+        return Ok(AddExactTrackedPathResult::Handled(None));
+    }
+
+    let is_symlink = file_type.is_symlink();
+    let body = if is_symlink {
+        symlink_target_bytes(&absolute)?
+    } else {
+        let body = fs::read(&absolute)?;
+        let mut clean_filter = None;
+        let clean_filter = tracked_only_clean_filter(&mut clean_filter, worktree_root, git_dir);
+        clean_filter.read_attributes_for_path(worktree_root, git_path)?;
+        let checks =
+            clean_filter
+                .matcher
+                .attributes_for_path(git_path, &clean_filter.requested, false);
+        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+    };
+    let object = EncodedObject::new(ObjectType::Blob, body);
+    let oid = object.object_id(format)?;
+    if oid != entry.oid {
+        let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+        odb.write_object(object)?;
+    }
+
+    let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+    if is_symlink {
+        updated_entry.mode = 0o120000;
+    }
+    if updated_entry == entry {
+        return Ok(AddExactTrackedPathResult::Handled(None));
+    }
+    if !raw_updated_entry_can_patch(&entry, &updated_entry, git_path) {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+    patch_raw_index_entry(&mut index_bytes, format, &raw, &updated_entry)?;
+    fs::write(index_path, index_bytes)?;
+    let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
+    Ok(AddExactTrackedPathResult::Handled(
+        changed.then(|| AddUpdateTrackedAction::Add(git_path.to_vec())),
+    ))
+}
+
+pub fn add_exact_tracked_path_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    mut index: Index,
+    git_path: &[u8],
+) -> Result<Option<AddUpdateTrackedAction>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let range = index_entries_path_range(&index.entries, git_path);
+    if range.len() != 1 {
+        return Ok(None);
+    }
+    let entry = &index.entries[range.start];
+    if entry.stage() != Stage::Normal || index_entry_skip_worktree(entry) {
+        return Ok(None);
+    }
+    let index_path = repository_index_path(git_dir);
+    let index_mtime = fs::metadata(&index_path)
+        .ok()
+        .and_then(|metadata| file_mtime_parts(&metadata));
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut clean_filter = None;
+    let (action, dirty) = add_update_tracked_path(
+        worktree_root,
+        git_dir,
+        format,
+        None,
+        &odb,
+        &stat_cache,
+        &mut clean_filter,
+        &mut index,
+        git_path,
+    )?;
+    if dirty {
+        normalize_index_version_for_extended_flags(&mut index);
+        index.extensions = index_extensions_without_cache_tree(&index.extensions);
+        fs::write(index_path, index.write(format)?)?;
+    }
+    Ok(action)
+}
+
+struct RawExactIndexEntry {
+    version: u32,
+    entry: IndexEntry,
+    entry_start: usize,
+    entries_end: usize,
+    checksum_offset: usize,
+}
+
+fn raw_exact_index_entry(
+    bytes: &[u8],
+    format: ObjectFormat,
+    git_path: &[u8],
+) -> Result<Option<RawExactIndexEntry>> {
+    let hash_len = format.raw_len();
+    if bytes.len() < 12 + hash_len {
+        return Err(GitError::InvalidFormat("index header too short".into()));
+    }
+    let checksum_offset = bytes.len() - hash_len;
+    let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    let expected_checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+    if actual_checksum != expected_checksum {
+        return Err(GitError::InvalidFormat(format!(
+            "index checksum mismatch: expected {expected_checksum}, got {actual_checksum}"
+        )));
+    }
+    if &bytes[..4] != b"DIRC" {
+        return Err(GitError::InvalidFormat("missing DIRC signature".into()));
+    }
+    let version = u32_from_be(&bytes[4..8]);
+    if !(2..=3).contains(&version) {
+        return Ok(None);
+    }
+    let count = u32_from_be(&bytes[8..12]) as usize;
+    let mut offset = 12;
+    let mut found = None;
+    for _ in 0..count {
+        let entry_header_len = 40 + hash_len + 2;
+        if checksum_offset.saturating_sub(offset) < entry_header_len {
+            return Err(GitError::InvalidFormat("truncated index entry".into()));
+        }
+        let start = offset;
+        let oid_start = offset + 40;
+        let oid_end = oid_start + hash_len;
+        let flags = u16_from_be(&bytes[oid_end..oid_end + 2]);
+        offset = oid_end + 2;
+        let flags_extended = if flags & INDEX_FLAG_EXTENDED != 0 {
+            if checksum_offset.saturating_sub(offset) < 2 {
+                return Err(GitError::InvalidFormat(
+                    "truncated index extended flags".into(),
+                ));
+            }
+            let flags_extended = u16_from_be(&bytes[offset..offset + 2]);
+            offset += 2;
+            flags_extended
+        } else {
+            0
+        };
+        let path_start = offset;
+        while bytes.get(offset).copied() != Some(0) {
+            offset += 1;
+            if offset >= checksum_offset {
+                return Err(GitError::InvalidFormat("unterminated index path".into()));
+            }
+        }
+        let path = &bytes[path_start..offset];
+        offset += 1;
+        while (offset - start) % 8 != 0 {
+            offset += 1;
+            if offset > checksum_offset {
+                return Err(GitError::InvalidFormat("truncated index padding".into()));
+            }
+        }
+        if path == git_path {
+            if found.is_some() {
+                return Ok(None);
+            }
+            let oid = ObjectId::from_raw(format, &bytes[oid_start..oid_end])?;
+            found = Some(RawExactIndexEntry {
+                version,
+                entry: IndexEntry {
+                    ctime_seconds: u32_from_be(&bytes[start..start + 4]),
+                    ctime_nanoseconds: u32_from_be(&bytes[start + 4..start + 8]),
+                    mtime_seconds: u32_from_be(&bytes[start + 8..start + 12]),
+                    mtime_nanoseconds: u32_from_be(&bytes[start + 12..start + 16]),
+                    dev: u32_from_be(&bytes[start + 16..start + 20]),
+                    ino: u32_from_be(&bytes[start + 20..start + 24]),
+                    mode: u32_from_be(&bytes[start + 24..start + 28]),
+                    uid: u32_from_be(&bytes[start + 28..start + 32]),
+                    gid: u32_from_be(&bytes[start + 32..start + 36]),
+                    size: u32_from_be(&bytes[start + 36..start + 40]),
+                    oid,
+                    flags,
+                    flags_extended,
+                    path: BString::from(path),
+                },
+                entry_start: start,
+                entries_end: 0,
+                checksum_offset,
+            });
+        } else if found.is_none() && path > git_path {
+            return Ok(None);
+        }
+    }
+    if let Some(mut found) = found {
+        found.entries_end = offset;
+        Ok(Some(found))
+    } else {
+        Ok(None)
+    }
+}
+
+fn raw_exact_entry_can_patch(raw: &RawExactIndexEntry, git_path: &[u8]) -> bool {
+    raw.version == 2
+        && raw.entry.flags_extended == 0
+        && raw.entry.flags & INDEX_FLAG_EXTENDED == 0
+        && raw.entry.flags == index_flags(git_path.len(), 0)
+        && raw.entry.path.as_bytes() == git_path
+}
+
+fn raw_updated_entry_can_patch(
+    previous: &IndexEntry,
+    updated: &IndexEntry,
+    git_path: &[u8],
+) -> bool {
+    updated.path.as_bytes() == git_path
+        && updated.flags_extended == 0
+        && updated.flags & INDEX_FLAG_EXTENDED == 0
+        && updated.flags == previous.flags
+}
+
+fn raw_index_extensions_are_filterable(bytes: &[u8], entries_end: usize, checksum_offset: usize) -> bool {
+    let mut offset = entries_end;
+    while offset < checksum_offset {
+        if checksum_offset.saturating_sub(offset) < 8 {
+            return false;
+        }
+        let size = u32_from_be(&bytes[offset + 4..offset + 8]) as usize;
+        let Some(end) = offset.checked_add(8).and_then(|offset| offset.checked_add(size)) else {
+            return false;
+        };
+        if end > checksum_offset {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+fn patch_raw_index_entry(
+    bytes: &mut Vec<u8>,
+    format: ObjectFormat,
+    raw: &RawExactIndexEntry,
+    entry: &IndexEntry,
+) -> Result<()> {
+    let hash_len = format.raw_len();
+    let start = raw.entry_start;
+    bytes[start..start + 4].copy_from_slice(&entry.ctime_seconds.to_be_bytes());
+    bytes[start + 4..start + 8].copy_from_slice(&entry.ctime_nanoseconds.to_be_bytes());
+    bytes[start + 8..start + 12].copy_from_slice(&entry.mtime_seconds.to_be_bytes());
+    bytes[start + 12..start + 16].copy_from_slice(&entry.mtime_nanoseconds.to_be_bytes());
+    bytes[start + 16..start + 20].copy_from_slice(&entry.dev.to_be_bytes());
+    bytes[start + 20..start + 24].copy_from_slice(&entry.ino.to_be_bytes());
+    bytes[start + 24..start + 28].copy_from_slice(&entry.mode.to_be_bytes());
+    bytes[start + 28..start + 32].copy_from_slice(&entry.uid.to_be_bytes());
+    bytes[start + 32..start + 36].copy_from_slice(&entry.gid.to_be_bytes());
+    bytes[start + 36..start + 40].copy_from_slice(&entry.size.to_be_bytes());
+    bytes[start + 40..start + 40 + hash_len].copy_from_slice(entry.oid.as_bytes());
+    bytes[start + 40 + hash_len..start + 40 + hash_len + 2]
+        .copy_from_slice(&entry.flags.to_be_bytes());
+
+    let mut extension_offset = raw.entries_end;
+    let mut removed_cache_tree = false;
+    let mut rewritten = Vec::new();
+    while extension_offset < raw.checksum_offset {
+        let signature = &bytes[extension_offset..extension_offset + 4];
+        let size = u32_from_be(&bytes[extension_offset + 4..extension_offset + 8]) as usize;
+        let end = extension_offset + 8 + size;
+        if signature == b"TREE" {
+            removed_cache_tree = true;
+        } else {
+            rewritten.extend_from_slice(&bytes[extension_offset..end]);
+        }
+        extension_offset = end;
+    }
+
+    if removed_cache_tree {
+        bytes.truncate(raw.entries_end);
+        bytes.extend_from_slice(&rewritten);
+        let checksum = sley_core::digest_bytes(format, bytes)?;
+        bytes.extend_from_slice(checksum.as_bytes());
+    } else {
+        let checksum = sley_core::digest_bytes(format, &bytes[..raw.checksum_offset])?;
+        bytes[raw.checksum_offset..raw.checksum_offset + hash_len]
+            .copy_from_slice(checksum.as_bytes());
+    }
+    Ok(())
+}
+
+fn u32_from_be(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn u16_from_be(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes[1]])
+}
+
 fn add_update_tracked_path(
     worktree_root: &Path,
-    _git_dir: &Path,
+    git_dir: &Path,
     format: ObjectFormat,
-    clean_config: &GitConfig,
+    clean_config: Option<&GitConfig>,
     odb: &FileObjectDatabase,
     stat_cache: &IndexStatCache,
     clean_filter: &mut Option<TrackedOnlyCleanFilter>,
@@ -928,8 +1353,12 @@ fn add_update_tracked_path(
         symlink_target_bytes(&absolute)?
     } else {
         let body = fs::read(&absolute)?;
-        let clean_filter =
-            tracked_only_clean_filter_with_config(clean_filter, worktree_root, clean_config);
+        let clean_filter = match clean_config {
+            Some(config) => {
+                tracked_only_clean_filter_with_config(clean_filter, worktree_root, config)
+            }
+            None => tracked_only_clean_filter(clean_filter, worktree_root, git_dir),
+        };
         clean_filter.read_attributes_for_path(worktree_root, git_path)?;
         let checks =
             clean_filter
@@ -1020,22 +1449,13 @@ fn update_index_paths_impl(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
+    mut index: Index,
     paths: &[UpdateIndexPath],
     options: UpdateIndexOptions,
     clean_config: Option<&GitConfig>,
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let index_path = repository_index_path(git_dir);
-    let mut index = if index_path.exists() {
-        Index::parse(&fs::read(&index_path)?, format)?
-    } else {
-        Index {
-            version: 2,
-            entries: Vec::new(),
-            extensions: Vec::new(),
-            checksum: None,
-        }
-    };
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     // For small batches, read only each path's `.gitattributes` chain; a
     // whole-worktree matcher can dominate `add -u` when only a few files are
@@ -1992,12 +2412,35 @@ pub fn write_tree_from_index(git_dir: impl AsRef<Path>, format: ObjectFormat) ->
     write_tree_from_index_with_options(git_dir, format, WriteTreeOptions::default())
 }
 
+pub fn write_tree_from_index_with_odb(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    odb: &FileObjectDatabase,
+) -> Result<ObjectId> {
+    write_tree_from_index_with_options_and_odb(
+        git_dir.as_ref(),
+        format,
+        WriteTreeOptions::default(),
+        odb,
+    )
+}
+
 pub fn write_tree_from_index_with_options(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     options: WriteTreeOptions,
 ) -> Result<ObjectId> {
     let git_dir = git_dir.as_ref();
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    write_tree_from_index_with_options_and_odb(git_dir, format, options, &odb)
+}
+
+fn write_tree_from_index_with_options_and_odb(
+    git_dir: &Path,
+    format: ObjectFormat,
+    options: WriteTreeOptions,
+    odb: &FileObjectDatabase,
+) -> Result<ObjectId> {
     let index_path = repository_index_path(git_dir);
     // A repository with no index file yet (fresh init, nothing staged) is an
     // empty index: `git write-tree` / `git commit --allow-empty` produce the
@@ -2005,27 +2448,25 @@ pub fn write_tree_from_index_with_options(
     let index_bytes = match fs::read(&index_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let odb = FileObjectDatabase::from_git_dir(git_dir, format);
             let mut checker = odb.presence_checker();
             let empty: &[WriteTreeEntry<'_>] = &[];
             return write_tree_entries_stream(
                 empty,
                 b"",
                 None,
-                &odb,
+                odb,
                 &mut checker,
                 options.missing_ok,
             );
         }
         Err(err) => return Err(err.into()),
     };
-    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut checker = odb.presence_checker();
     match BorrowedIndex::parse(&index_bytes, format) {
-        Ok(index) => write_tree_from_borrowed_index(&index, format, &options, &odb, &mut checker),
+        Ok(index) => write_tree_from_borrowed_index(&index, format, &options, odb, &mut checker),
         Err(GitError::Unsupported(_)) => {
             let index = Index::parse(&index_bytes, format)?;
-            write_tree_from_owned_index(&index, format, &options, &odb, &mut checker)
+            write_tree_from_owned_index(&index, format, &options, odb, &mut checker)
         }
         Err(err) => Err(err),
     }
@@ -2484,19 +2925,16 @@ pub fn short_status_with_options(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if options.untracked_mode == StatusUntrackedMode::None && !options.include_ignored {
-        let (index, stat_cache, head_matches_index) =
-            read_index_with_stat_cache_entries(git_dir, format, &db, false)?;
-        return short_status_tracked_only(
+    if !options.include_ignored
+        && let Some(entries) = short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
             format,
             &db,
-            &index,
-            &stat_cache,
-            head_matches_index,
-            StatusUntrackedMode::None,
-        );
+            options.untracked_mode,
+        )?
+    {
+        return Ok(entries);
     }
     // Parse the index once: the stat cache lets the worktree walk skip
     // re-hashing files whose stat proves they are unchanged since staging
@@ -2945,6 +3383,89 @@ fn short_status_tracked_only(
     Ok(entries)
 }
 
+fn short_status_borrowed_head_matches_index_if_possible(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Option<Vec<ShortStatusEntry>>> {
+    let index_path = repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && matches!(untracked_mode, StatusUntrackedMode::None) =>
+        {
+            return Ok(Some(Vec::new()));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let index_bytes = fs::read(&index_path)?;
+    let borrowed = match BorrowedIndex::parse(&index_bytes, format) {
+        Ok(index) => index,
+        Err(GitError::Unsupported(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
+        return Ok(None);
+    };
+    let stage0_entry_count = borrowed
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .count();
+    if !head_matches_borrowed_index_from_cache_tree(
+        &borrowed,
+        format,
+        &head_tree_oid,
+        stage0_entry_count,
+    )? {
+        return Ok(None);
+    }
+
+    let index_mtime = file_mtime_parts(&index_metadata);
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let mut entries = short_status_borrowed_tracked_only_head_matches_index_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        &borrowed,
+        &stat_cache,
+        untracked_mode,
+    )?;
+    if !matches!(untracked_mode, StatusUntrackedMode::None) {
+        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+        let untracked_paths = status_untracked_paths_from_borrowed_index(
+            worktree_root,
+            git_dir,
+            &borrowed,
+            &mut ignores,
+            untracked_mode,
+        )?;
+        for path in untracked_paths {
+            entries.push(ShortStatusEntry {
+                index: b'?',
+                worktree: b'?',
+                path,
+                head_mode: None,
+                index_mode: None,
+                worktree_mode: None,
+                head_oid: None,
+                index_oid: None,
+                submodule: None,
+            });
+        }
+        entries.sort_by(|left, right| {
+            status_sort_category(left)
+                .cmp(&status_sort_category(right))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+    }
+    Ok(Some(entries))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TrackedOnlyPrecheck {
     Deleted(usize),
@@ -3020,6 +3541,86 @@ fn short_status_tracked_only_head_matches_index_parallel(
                         index: b' ',
                         worktree: worktree_code,
                         path: path.to_vec(),
+                        head_mode: Some(index_entry.mode),
+                        index_mode: Some(index_entry.mode),
+                        worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
+                        head_oid: Some(index_entry.oid),
+                        index_oid: Some(index_entry.oid),
+                        submodule: submodule.filter(|sub| sub.any()),
+                    });
+                }
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        status_sort_category(left)
+            .cmp(&status_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+fn short_status_borrowed_tracked_only_head_matches_index_parallel(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &BorrowedIndex<'_>,
+    stat_cache: &IndexStatCache,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Vec<ShortStatusEntry>> {
+    let prechecks =
+        tracked_only_borrowed_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+
+    let mut clean_filter = None;
+    let mut entries = Vec::new();
+    for precheck in prechecks {
+        match precheck {
+            TrackedOnlyPrecheck::Deleted(idx) => {
+                let entry = &index.entries[idx];
+                entries.push(ShortStatusEntry {
+                    index: b' ',
+                    worktree: b'D',
+                    path: entry.path.to_vec(),
+                    head_mode: Some(entry.mode),
+                    index_mode: Some(entry.mode),
+                    worktree_mode: None,
+                    head_oid: Some(entry.oid),
+                    index_oid: Some(entry.oid),
+                    submodule: None,
+                });
+            }
+            TrackedOnlyPrecheck::Slow(idx) => {
+                let entry = &index.entries[idx];
+                let index_entry = TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                };
+                let worktree_entry = worktree_entry_for_index_entry_ref_with_attributes(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    stat_cache,
+                    &mut clean_filter,
+                )?;
+                let submodule = tracked_only_submodule_status(
+                    worktree_root,
+                    entry.path,
+                    &index_entry,
+                    worktree_entry.as_ref(),
+                    untracked_mode,
+                )?;
+                let worktree_code = match worktree_entry.as_ref() {
+                    None => b'D',
+                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    _ if submodule.is_some_and(|sub| sub.any()) => b'M',
+                    _ => b' ',
+                };
+                if worktree_code != b' ' {
+                    entries.push(ShortStatusEntry {
+                        index: b' ',
+                        worktree: worktree_code,
+                        path: entry.path.to_vec(),
                         head_mode: Some(index_entry.mode),
                         index_mode: Some(index_entry.mode),
                         worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
@@ -3240,6 +3841,89 @@ fn tracked_only_non_clean_prechecks_parallel(
     Ok(prechecks)
 }
 
+fn tracked_only_borrowed_non_clean_prechecks_parallel(
+    worktree_root: &Path,
+    index: &BorrowedIndex<'_>,
+    stat_cache: &IndexStatCache,
+) -> Result<Vec<TrackedOnlyPrecheck>> {
+    let normal_indices = index
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| (entry.stage() == Stage::Normal).then_some(idx))
+        .collect::<Vec<_>>();
+    if normal_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(16);
+    let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
+    if worker_count == 1 {
+        let mut prechecks = Vec::new();
+        let mut absolute = PathBuf::new();
+        for idx in normal_indices {
+            let entry = &index.entries[idx];
+            match tracked_only_borrowed_stat_precheck(
+                worktree_root,
+                entry,
+                stat_cache,
+                &mut absolute,
+            )? {
+                TrackedOnlyPrecheckOutcome::Clean => {}
+                TrackedOnlyPrecheckOutcome::Deleted => {
+                    prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                }
+                TrackedOnlyPrecheckOutcome::Slow => {
+                    prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                }
+            }
+        }
+        return Ok(prechecks);
+    }
+    let chunk_size = normal_indices.len().div_ceil(worker_count);
+    let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
+        let mut handles = Vec::new();
+        for chunk in normal_indices.chunks(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
+                let mut prechecks = Vec::new();
+                let mut absolute = PathBuf::new();
+                for &idx in chunk {
+                    let entry = &index.entries[idx];
+                    match tracked_only_borrowed_stat_precheck(
+                        worktree_root,
+                        entry,
+                        stat_cache,
+                        &mut absolute,
+                    )? {
+                        TrackedOnlyPrecheckOutcome::Clean => {}
+                        TrackedOnlyPrecheckOutcome::Deleted => {
+                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                        }
+                        TrackedOnlyPrecheckOutcome::Slow => {
+                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                        }
+                    }
+                }
+                Ok(prechecks)
+            }));
+        }
+        let mut prechecks = Vec::new();
+        for handle in handles {
+            let mut chunk = handle
+                .join()
+                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            prechecks.append(&mut chunk);
+        }
+        Ok(prechecks)
+    })?;
+    prechecks.sort_by_key(|precheck| match precheck {
+        TrackedOnlyPrecheck::Deleted(idx) | TrackedOnlyPrecheck::Slow(idx) => *idx,
+    });
+    Ok(prechecks)
+}
+
 fn tracked_only_stat_precheck(
     worktree_root: &Path,
     index_entry: &IndexEntry,
@@ -3269,6 +3953,42 @@ fn tracked_only_stat_precheck(
     }
     if stat_cache
         .reuse_index_entry(index_entry, &metadata)
+        .is_some()
+    {
+        Ok(TrackedOnlyPrecheckOutcome::Clean)
+    } else {
+        Ok(TrackedOnlyPrecheckOutcome::Slow)
+    }
+}
+
+fn tracked_only_borrowed_stat_precheck(
+    worktree_root: &Path,
+    index_entry: &IndexEntryRef<'_>,
+    stat_cache: &IndexStatCache,
+    absolute: &mut PathBuf,
+) -> Result<TrackedOnlyPrecheckOutcome> {
+    if index_entry.mode == 0o160000 {
+        return Ok(TrackedOnlyPrecheckOutcome::Slow);
+    }
+    set_worktree_path_from_repo_path(worktree_root, index_entry.path, absolute)?;
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(TrackedOnlyPrecheckOutcome::Deleted);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(TrackedOnlyPrecheckOutcome::Slow);
+    }
+    if stat_cache
+        .reuse_index_entry_ref(index_entry, &metadata)
         .is_some()
     {
         Ok(TrackedOnlyPrecheckOutcome::Clean)
@@ -3893,7 +4613,7 @@ fn status_untracked_paths_from_index(
     let tracked_dirs = stage0_tracked_directories(index);
     let mut context = StatusUntrackedWalk {
         git_dir,
-        stat_cache,
+        tracked: stat_cache,
         tracked_dirs: &tracked_dirs,
         ignores,
         untracked_mode,
@@ -3902,16 +4622,98 @@ fn status_untracked_paths_from_index(
     Ok(paths.into_iter().collect())
 }
 
-struct StatusUntrackedWalk<'a> {
+fn status_untracked_paths_from_borrowed_index(
+    root: &Path,
+    git_dir: &Path,
+    index: &BorrowedIndex<'_>,
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Vec<Vec<u8>>> {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(Vec::new());
+    }
+    let mut paths = BTreeSet::new();
+    let tracked = BorrowedIndexLookup::new(&index.entries);
+    let mut context = StatusUntrackedWalk {
+        git_dir,
+        tracked: &tracked,
+        tracked_dirs: &tracked.tracked_dirs,
+        ignores,
+        untracked_mode,
+    };
+    collect_status_untracked_paths(&mut context, root, &[], &mut paths)?;
+    Ok(paths.into_iter().collect())
+}
+
+trait StatusTrackedLookup {
+    fn contains_tracked(&self, git_path: &[u8]) -> bool;
+    fn is_tracked_gitlink(&self, git_path: &[u8]) -> bool;
+}
+
+impl StatusTrackedLookup for IndexStatCache {
+    fn contains_tracked(&self, git_path: &[u8]) -> bool {
+        self.contains(git_path)
+    }
+
+    fn is_tracked_gitlink(&self, git_path: &[u8]) -> bool {
+        self.gitlink_entry(git_path).is_some()
+    }
+}
+
+struct BorrowedIndexLookup<'a> {
+    tracked: HashSet<&'a [u8]>,
+    gitlinks: HashSet<&'a [u8]>,
+    tracked_dirs: HashSet<&'a [u8]>,
+}
+
+impl<'a> BorrowedIndexLookup<'a> {
+    fn new(entries: &'a [IndexEntryRef<'a>]) -> Self {
+        let mut tracked = HashSet::with_capacity(entries.len());
+        let mut gitlinks = HashSet::new();
+        let mut tracked_dirs = HashSet::new();
+        for entry in entries {
+            if entry.stage() != Stage::Normal {
+                continue;
+            }
+            let path = entry.path;
+            tracked.insert(path);
+            if entry.mode == 0o160000 {
+                gitlinks.insert(path);
+            }
+            for (idx, byte) in path.iter().enumerate() {
+                if *byte == b'/' && idx > 0 {
+                    tracked_dirs.insert(&path[..idx]);
+                }
+            }
+        }
+        Self {
+            tracked,
+            gitlinks,
+            tracked_dirs,
+        }
+    }
+}
+
+impl StatusTrackedLookup for BorrowedIndexLookup<'_> {
+    fn contains_tracked(&self, git_path: &[u8]) -> bool {
+        self.tracked.contains(git_path)
+    }
+
+    fn is_tracked_gitlink(&self, git_path: &[u8]) -> bool {
+        self.gitlinks.contains(git_path)
+    }
+}
+
+struct StatusUntrackedWalk<'a, T: StatusTrackedLookup + ?Sized> {
     git_dir: &'a Path,
-    stat_cache: &'a IndexStatCache,
-    tracked_dirs: &'a HashSet<Vec<u8>>,
+    tracked: &'a T,
+    tracked_dirs: &'a HashSet<&'a [u8]>,
     ignores: &'a mut IgnoreMatcher,
     untracked_mode: StatusUntrackedMode,
 }
 
-fn collect_status_untracked_paths(
-    context: &mut StatusUntrackedWalk<'_>,
+fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
+    context: &mut StatusUntrackedWalk<'_, T>,
     dir: &Path,
     dir_git_path: &[u8],
     paths: &mut BTreeSet<Vec<u8>>,
@@ -3920,11 +4722,10 @@ fn collect_status_untracked_paths(
         return Ok(());
     }
     let ignore_len = context.ignores.patterns.len();
-    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    let entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, context.ignores)?;
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in entries {
             let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
@@ -3934,7 +4735,7 @@ fn collect_status_untracked_paths(
             let path_len = git_path_push_component(&mut git_path, &file_name);
             let entry_result = (|| -> Result<()> {
                 if file_type.is_file() || file_type.is_symlink() {
-                    if !context.stat_cache.contains(&git_path)
+                    if !context.tracked.contains_tracked(&git_path)
                         && !context.ignores.is_ignored(&git_path, false)
                     {
                         paths.insert(git_path.clone());
@@ -3948,7 +4749,7 @@ fn collect_status_untracked_paths(
                     if is_same_path(&path, context.git_dir) {
                         return Ok(());
                     }
-                    if context.stat_cache.gitlink_entry(&git_path).is_some() {
+                    if context.tracked.is_tracked_gitlink(&git_path) {
                         return Ok(());
                     }
                     match context.untracked_mode {
@@ -3986,7 +4787,7 @@ fn collect_status_untracked_paths(
     result
 }
 
-fn stage0_tracked_directories(index: &Index) -> HashSet<Vec<u8>> {
+fn stage0_tracked_directories(index: &Index) -> HashSet<&[u8]> {
     let mut directories = HashSet::new();
     for entry in index
         .entries
@@ -3996,15 +4797,15 @@ fn stage0_tracked_directories(index: &Index) -> HashSet<Vec<u8>> {
         let path = entry.path.as_bytes();
         for (idx, byte) in path.iter().enumerate() {
             if *byte == b'/' && idx > 0 {
-                directories.insert(path[..idx].to_vec());
+                directories.insert(&path[..idx]);
             }
         }
     }
     directories
 }
 
-fn status_untracked_directory_has_file(
-    context: &mut StatusUntrackedWalk<'_>,
+fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
+    context: &mut StatusUntrackedWalk<'_, T>,
     dir: &Path,
     dir_git_path: &[u8],
 ) -> Result<bool> {
@@ -4012,11 +4813,10 @@ fn status_untracked_directory_has_file(
         return Ok(false);
     }
     let ignore_len = context.ignores.patterns.len();
-    read_dir_ignore_patterns_for_base(dir, dir_git_path, context.ignores)?;
+    let entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, context.ignores)?;
     let result = (|| -> Result<bool> {
         let mut git_path = dir_git_path.to_vec();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in entries {
             let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
@@ -4029,7 +4829,7 @@ fn status_untracked_directory_has_file(
                     return Ok(None);
                 }
                 if file_type.is_file() || file_type.is_symlink() {
-                    return Ok(Some(!context.stat_cache.contains(&git_path)));
+                    return Ok(Some(!context.tracked.contains_tracked(&git_path)));
                 }
                 if is_dir {
                     let path = entry.path();
@@ -4054,6 +4854,31 @@ fn status_untracked_directory_has_file(
     })();
     context.ignores.patterns.truncate(ignore_len);
     result
+}
+
+fn read_dir_entries_with_ignore_patterns(
+    dir: &Path,
+    base: &[u8],
+    matcher: &mut IgnoreMatcher,
+) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = Vec::new();
+    let mut ignore_path = None;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(".gitignore") {
+            ignore_path = Some(entry.path());
+        }
+        entries.push(entry);
+    }
+    if let Some(path) = ignore_path {
+        let mut source = base.to_vec();
+        if !source.is_empty() {
+            source.push(b'/');
+        }
+        source.extend_from_slice(b".gitignore");
+        read_ignore_patterns(path, &mut matcher.patterns, base, &source);
+    }
+    Ok(entries)
 }
 
 fn untracked_normal_rollup_path(
@@ -5892,7 +6717,10 @@ fn looks_binary(content: &[u8]) -> bool {
 /// Strip carriage returns that immediately precede a line feed (CRLF -> LF).
 /// A lone CR (old-Mac line ending) is left untouched, matching git, which only
 /// collapses CRLF pairs.
-fn convert_crlf_to_lf(content: &[u8]) -> Vec<u8> {
+fn convert_crlf_to_lf_cow(content: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+    if !content.windows(2).any(|window| window == b"\r\n") {
+        return content;
+    }
     let mut out = Vec::with_capacity(content.len());
     let mut index = 0;
     while index < content.len() {
@@ -5905,7 +6733,7 @@ fn convert_crlf_to_lf(content: &[u8]) -> Vec<u8> {
         out.push(byte);
         index += 1;
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Convert lone LF bytes to CRLF (LF -> CRLF). An LF already preceded by a CR
@@ -6213,7 +7041,7 @@ pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
         plan.check_safe_crlf_stats(&old_stats, index_blob.has_crlf(), flags, path)?;
     }
     if plan.convert_eol(&data) {
-        data = Cow::Owned(convert_crlf_to_lf(&data));
+        data = convert_crlf_to_lf_cow(data);
     }
     Ok(data)
 }
@@ -8008,6 +8836,17 @@ fn worktree_entry_is_uptodate(entry: &IndexEntry, metadata: &fs::Metadata) -> bo
         && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
 }
 
+fn worktree_entry_ref_is_uptodate(entry: &IndexEntryRef<'_>, metadata: &fs::Metadata) -> bool {
+    if u64::from(entry.size) != metadata.len() {
+        return false;
+    }
+    let Some((mtime_seconds, mtime_nanoseconds)) = file_mtime_parts(metadata) else {
+        return false;
+    };
+    u64::from(entry.mtime_seconds) == mtime_seconds
+        && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
+}
+
 /// The file's modification time split into whole seconds and the sub-second
 /// nanosecond remainder, matching how git stores `mtime` in the index.
 fn file_mtime_parts(metadata: &fs::Metadata) -> Option<(u64, u64)> {
@@ -9194,6 +10033,23 @@ impl IndexStatCache {
         index_mtime <= entry_mtime
     }
 
+    fn is_racily_clean_ref(&self, entry: &IndexEntryRef<'_>) -> bool {
+        let Some(index_mtime) = self.index_mtime else {
+            return true;
+        };
+        if index_mtime == (0, 0) {
+            return true;
+        }
+        let entry_mtime = (
+            u64::from(entry.mtime_seconds),
+            u64::from(entry.mtime_nanoseconds),
+        );
+        if entry_mtime == (0, 0) {
+            return true;
+        }
+        index_mtime <= entry_mtime
+    }
+
     /// Whether the index has a stage-0 entry for `git_path` (i.e. the path is
     /// tracked). Used to skip hashing untracked worktree files.
     fn contains(&self, git_path: &[u8]) -> bool {
@@ -9235,6 +10091,26 @@ impl IndexStatCache {
             return None;
         }
         if self.is_racily_clean(entry) {
+            return None;
+        }
+        Some(TrackedEntry {
+            mode: entry.mode,
+            oid: entry.oid,
+        })
+    }
+
+    fn reuse_index_entry_ref(
+        &self,
+        entry: &IndexEntryRef<'_>,
+        worktree_metadata: &fs::Metadata,
+    ) -> Option<TrackedEntry> {
+        if entry.mode != worktree_entry_mode(worktree_metadata) {
+            return None;
+        }
+        if !worktree_entry_ref_is_uptodate(entry, worktree_metadata) {
+            return None;
+        }
+        if self.is_racily_clean_ref(entry) {
             return None;
         }
         Some(TrackedEntry {
@@ -9330,6 +10206,28 @@ fn cache_tree_is_valid(tree: &CacheTree) -> bool {
 
 fn head_matches_index_from_cache_tree(
     index: &Index,
+    format: ObjectFormat,
+    head_tree_oid: &ObjectId,
+    stage0_entry_count: usize,
+) -> Result<bool> {
+    let cache_tree = match index.cache_tree(format) {
+        Ok(Some(cache_tree)) => cache_tree,
+        Ok(None) | Err(_) => return Ok(false),
+    };
+    if !cache_tree_is_valid(&cache_tree) {
+        return Ok(false);
+    }
+    let Some(root_oid) = cache_tree.oid.as_ref() else {
+        return Ok(false);
+    };
+    if root_oid != head_tree_oid {
+        return Ok(false);
+    }
+    Ok(cache_tree.entry_count as usize == stage0_entry_count)
+}
+
+fn head_matches_borrowed_index_from_cache_tree(
+    index: &BorrowedIndex<'_>,
     format: ObjectFormat,
     head_tree_oid: &ObjectId,
     stage0_entry_count: usize,
@@ -9721,6 +10619,80 @@ fn worktree_entry_for_index_entry_with_attributes(
     }
 
     if let Some(tracked) = stat_cache.reuse_index_entry(index_entry, &metadata) {
+        return Ok(Some(tracked));
+    }
+
+    let mode = worktree_entry_mode(&metadata);
+    let body = if file_type.is_symlink() {
+        symlink_target_bytes(&absolute)?
+    } else {
+        let body = fs::read(&absolute)?;
+        let clean_filter = tracked_only_clean_filter(clean_filter, worktree_root, git_dir);
+        clean_filter.read_attributes_for_path(worktree_root, git_path)?;
+        let checks =
+            clean_filter
+                .matcher
+                .attributes_for_path(git_path, &clean_filter.requested, false);
+        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+    };
+    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+    Ok(Some(TrackedEntry { mode, oid }))
+}
+
+fn worktree_entry_for_index_entry_ref_with_attributes(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entry: &IndexEntryRef<'_>,
+    stat_cache: &IndexStatCache,
+    clean_filter: &mut Option<TrackedOnlyCleanFilter>,
+) -> Result<Option<TrackedEntry>> {
+    let git_path = index_entry.path;
+    let expected_mode = index_entry.mode;
+    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+
+    if expected_mode == 0o160000 {
+        if !file_type.is_dir() {
+            return Ok(Some(TrackedEntry {
+                mode: worktree_entry_mode(&metadata),
+                oid: ObjectId::null(format),
+            }));
+        }
+        let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(index_entry.oid);
+        return Ok(Some(TrackedEntry {
+            mode: 0o160000,
+            oid,
+        }));
+    }
+
+    if file_type.is_dir() {
+        return Ok(Some(TrackedEntry {
+            mode: worktree_entry_mode(&metadata),
+            oid: ObjectId::null(format),
+        }));
+    }
+
+    if !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(Some(TrackedEntry {
+            mode: worktree_entry_mode(&metadata),
+            oid: ObjectId::null(format),
+        }));
+    }
+
+    if let Some(tracked) = stat_cache.reuse_index_entry_ref(index_entry, &metadata) {
         return Ok(Some(tracked));
     }
 
@@ -11279,11 +12251,20 @@ mod tests {
 
     #[test]
     fn crlf_to_lf_collapses_only_pairs() {
-        assert_eq!(convert_crlf_to_lf(b"a\r\nb\r\n"), b"a\nb\n");
+        assert_eq!(
+            convert_crlf_to_lf_cow(Cow::Borrowed(b"a\r\nb\r\n")).as_ref(),
+            b"a\nb\n"
+        );
         // A lone CR (no following LF) is preserved.
-        assert_eq!(convert_crlf_to_lf(b"a\rb"), b"a\rb");
+        assert_eq!(
+            convert_crlf_to_lf_cow(Cow::Borrowed(b"a\rb")).as_ref(),
+            b"a\rb"
+        );
         // An already-LF stream is unchanged.
-        assert_eq!(convert_crlf_to_lf(b"a\nb\n"), b"a\nb\n");
+        assert!(matches!(
+            convert_crlf_to_lf_cow(Cow::Borrowed(b"a\nb\n")),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

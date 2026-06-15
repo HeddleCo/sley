@@ -23,7 +23,7 @@ sley-worktree = { path = "../sley-worktree", version = "0.0.1" }
 sley-remote = { path = "../sley-remote", version = "0.0.1", optional = true }
 
 [features]
-default = ["remote"]
+default = ["remote", "mmap", "fast-sha1"]
 # Callable fetch/push/clone/ls-remote orchestration (heddle transport surface).
 # Enabled by default; disable with `default-features = false` for a smaller dep tree.
 remote = ["dep:sley-remote", "sley-remote/http"]
@@ -32,11 +32,11 @@ remote = ["dep:sley-remote", "sley-remote/http"]
 # as a leaf-crate feature (`--no-default-features --features pure-rust`); it is
 # not re-exported here because feature unification across this crate's other
 # sley-odb consumers re-enables the default zlib-rs, so a forward could not swap it.
-# Opt into the hardware-accelerated SHA-1 backend (forwarded to sley-core via
-# sley-odb). Default builds stay pure-Rust. OIDs are byte-identical either way.
+# Hardware-accelerated SHA-1 backend (forwarded to sley-core via sley-odb).
+# Default-on for facade builds. OIDs are byte-identical either way.
 fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1"]
 # Memory-map pack files (forwarded to sley-odb). Pulls in sley-mmap, the only crate
-# with unsafe; off by default. Benefits large-repo memory use / cold start.
+# with unsafe; default-on for the facade while remaining opt-in on sley-odb.
 mmap = ["sley-odb/mmap"]
 # TLS backend for HTTPS remotes (forwarded to sley-remote / sley-transport).
 # Default remote/http uses rustls; enable one of these to override.

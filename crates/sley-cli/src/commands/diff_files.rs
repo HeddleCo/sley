@@ -564,36 +564,23 @@ fn render_diff_files_entries(
     // stat-dirty-but-content-identical entries (a `touch`ed / `reset
     // --no-refresh`-restored file: shown `M` in raw/name-status, empty in stat)
     // must be excluded. The raw and name output keep the full set.
-    let content_entries: Vec<sley_diff_merge::NameStatusEntry> =
-        if show_numstat || show_stat || show_shortstat {
-            entries
-                .iter()
-                .filter(|entry| {
-                    diff_files_entry_has_content_change(
-                        entry,
-                        db,
-                        worktree_root,
-                        use_worktree_new,
-                    )
-                    .unwrap_or(true)
-                })
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let content_entries = if show_numstat || show_stat || show_shortstat {
+        collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?
+            .into_iter()
+            .filter(diff_files_stat_entry_has_content_change)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if show_numstat {
         for entry in &content_entries {
-            write_diff_numstat_entry(&mut stdout, entry, o.z, db, worktree_root, use_worktree_new)?;
+            write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, o.z)?;
         }
     }
     if show_stat {
-        write_diff_stat(
+        write_diff_stat_materialized(
             &mut stdout,
             &content_entries,
-            db,
-            worktree_root,
-            use_worktree_new,
             DiffStatOptions {
                 compact_summary: o.compact_summary,
                 stat_count: o.stat_count,
@@ -602,7 +589,7 @@ fn render_diff_files_entries(
         )?;
     }
     if show_shortstat {
-        write_diff_shortstat(&mut stdout, &content_entries, db, worktree_root, use_worktree_new)?;
+        write_diff_shortstat_materialized(&mut stdout, &content_entries)?;
     }
     if show_summary {
         for entry in entries {
@@ -648,25 +635,22 @@ fn render_diff_files_entries(
 /// identical (a stat-dirty-but-content-unchanged `diff-files` entry) returns
 /// `false`; every other entry (adds, deletes, real modifies, renames, copies, or
 /// mode flips) returns `true`. Mirrors the suppression in `write_diff_patch_entry`.
-fn diff_files_entry_has_content_change(
-    entry: &sley_diff_merge::NameStatusEntry,
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-) -> Result<bool> {
+fn diff_files_stat_entry_has_content_change(data: &DiffStatEntryData<'_>) -> bool {
+    let entry = data.entry;
     if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) {
-        return Ok(true);
+        return true;
     }
     let mode_unchanged = match (entry.old_mode, entry.new_mode) {
         (Some(old_mode), Some(new_mode)) => old_mode == new_mode,
         _ => true,
     };
     if !mode_unchanged {
-        return Ok(true);
+        return true;
     }
-    let old_content = diff_entry_old_content(entry, db)?;
-    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-    Ok(old_content.as_deref() != new_content.as_deref())
+    match data.stats {
+        DiffLineStats::Binary { unchanged, .. } => !unchanged,
+        DiffLineStats::Text { inserted, deleted } => inserted != 0 || deleted != 0,
+    }
 }
 
 /// Render a single entry for `--name-only` / `--name-status`, honouring `-z`

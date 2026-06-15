@@ -9,8 +9,8 @@ use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
 use sley_pack::{
-    MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexByteSource,
-    PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
+    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
+    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2668,6 +2668,11 @@ type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
 /// reparsing the same fanout/object tables for every read.
 type MultiPackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<MultiPackIndex>>>>;
 
+/// Raw multi-pack-index OID lookup tables keyed by path, shared across cloned
+/// handles. These avoid hashing and materializing every MIDX object when a
+/// command only needs point lookups.
+type MultiPackIndexOidLookupCache = Arc<Mutex<HashMap<PathBuf, Arc<MultiPackIndexOidLookup>>>>;
+
 /// One registered `.idx`/`.pack` pair from a pack directory. The index is parsed
 /// when the registry snapshot is built; pack bytes and per-pack decode/header
 /// caches hang directly off this record so repeated object lookups do not bounce
@@ -2850,6 +2855,7 @@ pub struct FileObjectDatabase {
     pack_bytes: PackBytesCache,
     pack_indexes: PackIndexCache,
     multi_pack_indexes: MultiPackIndexCache,
+    multi_pack_oid_lookups: MultiPackIndexOidLookupCache,
     pack_registry: PackRegistryCache,
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
@@ -2864,11 +2870,12 @@ pub struct FileObjectDatabase {
 pub struct ObjectPresenceChecker {
     db: FileObjectDatabase,
     pack_dir: PathBuf,
-    midx: Option<Arc<MultiPackIndex>>,
+    midx: Option<Arc<MultiPackIndexOidLookup>>,
     registry: Option<Arc<PackRegistrySnapshot>>,
     registry_indexes: Vec<Option<Arc<PackIndexViewData>>>,
     recent_pack: Option<usize>,
     prepared_packs: bool,
+    prepared_registry: bool,
 }
 
 impl ObjectPresenceChecker {
@@ -2882,6 +2889,7 @@ impl ObjectPresenceChecker {
             registry_indexes: Vec::new(),
             recent_pack: None,
             prepared_packs: false,
+            prepared_registry: false,
         }
     }
 
@@ -2916,10 +2924,11 @@ impl ObjectPresenceChecker {
     fn find_packed(&mut self, oid: &ObjectId, force_rescan: bool) -> Result<bool> {
         self.prepare_packs(force_rescan)?;
         if let Some(midx) = &self.midx
-            && midx.find(oid).is_some()
+            && midx.contains(oid)
         {
             return Ok(true);
         }
+        self.prepare_registry(force_rescan)?;
         self.find_in_registry(oid)
     }
 
@@ -2928,10 +2937,16 @@ impl ObjectPresenceChecker {
             return Ok(());
         }
         let midx_path = self.pack_dir.join("multi-pack-index");
-        self.midx = self.db.cached_multi_pack_index(&midx_path)?;
-        let registry = self
-            .db
-            .cached_pack_registry(&self.pack_dir, force_rescan)?;
+        self.midx = self.db.cached_multi_pack_index_oid_lookup(&midx_path)?;
+        self.prepared_packs = true;
+        Ok(())
+    }
+
+    fn prepare_registry(&mut self, force_rescan: bool) -> Result<()> {
+        if self.prepared_registry && !force_rescan {
+            return Ok(());
+        }
+        let registry = self.db.cached_pack_registry(&self.pack_dir, force_rescan)?;
         let registry_changed = match self.registry.as_ref() {
             Some(cached) => !Arc::ptr_eq(cached, &registry),
             None => true,
@@ -2941,7 +2956,7 @@ impl ObjectPresenceChecker {
             self.recent_pack = None;
             self.registry = Some(registry);
         }
-        self.prepared_packs = true;
+        self.prepared_registry = true;
         Ok(())
     }
 
@@ -3186,6 +3201,7 @@ impl FileObjectDatabase {
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            multi_pack_oid_lookups: Arc::new(Mutex::new(HashMap::new())),
             pack_registry: Arc::new(Mutex::new(None)),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
@@ -3204,6 +3220,7 @@ impl FileObjectDatabase {
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            multi_pack_oid_lookups: Arc::new(Mutex::new(HashMap::new())),
             pack_registry: Arc::new(Mutex::new(None)),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
@@ -3228,6 +3245,9 @@ impl FileObjectDatabase {
             cache.clear();
         }
         if let Ok(mut cache) = self.multi_pack_indexes.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.multi_pack_oid_lookups.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.pack_bytes.lock() {
@@ -3543,13 +3563,6 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
-    /// Whether `oid` resides in some pack of this store (without decoding it).
-    /// Used to prefer a packed copy over a corrupt loose file without re-reading
-    /// the loose file.
-    fn has_packed_object(&self, oid: &ObjectId) -> Result<bool> {
-        Ok(self.find_pack_containing(oid)?.is_some())
-    }
-
     fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<Arc<EncodedObject>>> {
         // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
         // bases that resolve back through the store + repeated whole-object reads).
@@ -3561,6 +3574,19 @@ impl FileObjectDatabase {
         let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
+        self.read_packed_object_at_lookup(oid, &pack_lookup).map(Some)
+    }
+
+    fn read_packed_object_at_lookup(
+        &self,
+        oid: &ObjectId,
+        pack_lookup: &PackLookup,
+    ) -> Result<Arc<EncodedObject>> {
+        if let Ok(mut cache) = self.decoded.lock()
+            && let Some(object) = cache.get(oid)
+        {
+            return Ok(object);
+        }
         let bytes = pack_lookup.pack_bytes(self)?;
         // Per-pack delta-base cache (keyed by in-pack offset). Resolving an
         // ofs-delta chain reuses already-decoded bases instead of re-inflating the
@@ -3603,7 +3629,7 @@ impl FileObjectDatabase {
         if let Ok(mut cache) = self.decoded.lock() {
             cache.put(*oid, Arc::clone(&object));
         }
-        Ok(Some(object))
+        Ok(object)
     }
 
     /// The per-pack delta-base cache for `pack_path`, creating it on first use.
@@ -3661,20 +3687,21 @@ impl FileObjectDatabase {
         Ok(index)
     }
 
-    /// Parsed multi-pack-index at `midx_path`, parsed at most once per database
-    /// handle. Returns `Ok(None)` when no MIDX exists. On a poisoned lock it
-    /// falls back to parsing without caching, preserving correctness.
-    fn cached_multi_pack_index(&self, midx_path: &Path) -> Result<Option<Arc<MultiPackIndex>>> {
+    fn cached_multi_pack_index_oid_lookup(
+        &self,
+        midx_path: &Path,
+    ) -> Result<Option<Arc<MultiPackIndexOidLookup>>> {
         if !midx_path.exists() {
             return Ok(None);
         }
-        if let Ok(cache) = self.multi_pack_indexes.lock()
+        if let Ok(cache) = self.multi_pack_oid_lookups.lock()
             && let Some(midx) = cache.get(midx_path)
         {
             return Ok(Some(Arc::clone(midx)));
         }
-        let midx = Arc::new(MultiPackIndex::parse(&fs::read(midx_path)?, self.format)?);
-        if let Ok(mut cache) = self.multi_pack_indexes.lock() {
+        let bytes = Arc::new(fs::read(midx_path)?);
+        let midx = Arc::new(MultiPackIndexOidLookup::parse(bytes, self.format)?);
+        if let Ok(mut cache) = self.multi_pack_oid_lookups.lock() {
             cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
         }
         Ok(Some(midx))
@@ -3754,8 +3781,8 @@ impl FileObjectDatabase {
         // names every pack, and locating `oid` in them is pure in-memory index
         // work. Try that first so a warm handle does not parse indexes or hash
         // pack paths on every lookup.
-        if let Some(midx) = self.cached_loaded_multi_pack_index()
-            && let Some(pack_paths) = self.midx_pack_paths(&pack_dir, &midx, oid)?
+        if let Some(midx) = self.cached_loaded_multi_pack_index_oid_lookup()
+            && let Some(pack_paths) = self.midx_oid_lookup_pack_paths(&pack_dir, &midx, oid)?
         {
             return Ok(Some(pack_paths));
         }
@@ -3835,28 +3862,22 @@ impl FileObjectDatabase {
         oid: &ObjectId,
     ) -> Result<Option<PackLookup>> {
         let midx_path = pack_dir.join("multi-pack-index");
-        let Some(midx) = self.cached_multi_pack_index(&midx_path)? else {
+        let Some(midx) = self.cached_multi_pack_index_oid_lookup(&midx_path)? else {
             return Ok(None);
         };
-        self.midx_pack_paths(pack_dir, &midx, oid)
+        self.midx_oid_lookup_pack_paths(pack_dir, &midx, oid)
     }
 
-    /// Resolve `oid` against an already-loaded multi-pack-index, returning the pack
-    /// path and in-pack offset. Pure in-memory index work; performs no filesystem
-    /// access. The named pack's existence was established when the midx was parsed
-    /// and cached, so the hot lookup path no longer re-`stat()`s it on every call —
-    /// a missing pack surfaces as an `open()` failure when the bytes are actually
-    /// read (`cached_pack_bytes`), not as a redundant per-lookup existence probe.
-    fn midx_pack_paths(
+    fn midx_oid_lookup_pack_paths(
         &self,
         pack_dir: &Path,
-        midx: &MultiPackIndex,
+        midx: &MultiPackIndexOidLookup,
         oid: &ObjectId,
     ) -> Result<Option<PackLookup>> {
-        let Some(entry) = midx.find(oid) else {
+        let Some(entry) = midx.find(oid)? else {
             return Ok(None);
         };
-        let Some(pack_name) = midx.pack_names.get(entry.pack_int_id as usize) else {
+        let Some(pack_name) = midx.pack_name(entry.pack_int_id) else {
             return Err(GitError::InvalidFormat(
                 "multi-pack-index object points past pack table".into(),
             ));
@@ -3864,17 +3885,14 @@ impl FileObjectDatabase {
         let pack_file_name = pack_name
             .strip_suffix(".idx")
             .map(|stem| format!("{stem}.pack"))
-            .unwrap_or_else(|| pack_name.clone());
+            .unwrap_or_else(|| pack_name.to_string());
         let pack = pack_dir.join(pack_file_name);
         Ok(Some(PackLookup::from_path(pack, entry.offset)))
     }
 
-    /// The multi-pack-index for this object store *only if already parsed and
-    /// cached* — never touches the filesystem. Used by the lookup hot path to skip
-    /// the per-call `multi-pack-index` existence stat when a handle is warm.
-    fn cached_loaded_multi_pack_index(&self) -> Option<Arc<MultiPackIndex>> {
+    fn cached_loaded_multi_pack_index_oid_lookup(&self) -> Option<Arc<MultiPackIndexOidLookup>> {
         let midx_path = self.objects_dir.join("pack").join("multi-pack-index");
-        let cache = self.multi_pack_indexes.lock().ok()?;
+        let cache = self.multi_pack_oid_lookups.lock().ok()?;
         cache.get(&midx_path).map(Arc::clone)
     }
 
@@ -4095,10 +4113,8 @@ impl ObjectReader for FileObjectDatabase {
         // (which would otherwise emit a spurious `inflate:` diagnostic on each
         // probe). Only when no pack copy exists do we read (and, if corrupt,
         // surface the error from) the loose file.
-        if self.has_packed_object(oid)?
-            && let Some(object) = self.read_packed_object(oid)?
-        {
-            return Ok(object);
+        if let Some(pack_lookup) = self.find_pack_containing(oid)? {
+            return self.read_packed_object_at_lookup(oid, &pack_lookup);
         }
         let loose_err = match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),

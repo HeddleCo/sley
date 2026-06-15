@@ -2363,6 +2363,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
+    let commit_odb = FileObjectDatabase::from_git_dir(&git_dir, format);
     let in_merge = git_dir.join("MERGE_HEAD").is_file();
     let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
     let in_revert = git_dir.join("REVERT_HEAD").is_file();
@@ -2610,14 +2611,20 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             quiet,
         );
     }
-    if !allow_empty
+    let precomputed_index_tree = if !allow_empty
         && !amend
         && fixup_reword_tree.is_none()
-        && commit_index_matches_head(&git_dir, format)?
     {
-        print_clean_commit_status(&git_dir, format)?;
-        return Err(GitError::Exit(1));
-    }
+        match commit_index_tree_if_changed(&git_dir, format, &commit_odb)? {
+            Some(tree) => Some(tree),
+            None => {
+                print_clean_commit_status(&git_dir, format)?;
+                return Err(GitError::Exit(1));
+            }
+        }
+    } else {
+        None
+    };
     let options = sley_sequencer::CommitIndexOptions {
         author,
         committer,
@@ -2629,6 +2636,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         sley_sequencer::amend_index(&git_dir, format, options)
     } else if let Some(tree) = fixup_reword_tree {
         sley_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
+    } else if let Some(tree) = precomputed_index_tree {
+        sley_sequencer::commit_tree_at_head_with_odb(&git_dir, format, tree, options, &commit_odb)
     } else {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
@@ -3493,23 +3502,26 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
     Ok(())
 }
 
-fn commit_index_matches_head(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
-    let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+fn commit_index_tree_if_changed(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<Option<ObjectId>> {
+    let tree = sley_worktree::write_tree_from_index_with_odb(git_dir, format, db)?;
     let store = FileRefStore::new(git_dir, format);
     let head = match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
         direct => direct,
     };
     let Some(RefTarget::Direct(parent)) = head else {
-        return Ok(false);
+        return Ok(Some(tree));
     };
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&parent)?;
     if object.object_type != ObjectType::Commit {
-        return Ok(false);
+        return Ok(Some(tree));
     }
     let commit = Commit::parse_ref(format, &object.body)?;
-    Ok(commit.tree == tree)
+    Ok((commit.tree != tree).then_some(tree))
 }
 
 fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {

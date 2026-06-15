@@ -248,7 +248,6 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
 
 fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
     !compiled.tokens.is_empty()
-        && compiled.uses_oid()
         && !compiled.uses_decorations()
         && !compiled.uses_source()
         && compiled.tokens.iter().all(|token| {
@@ -272,6 +271,53 @@ fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
         })
 }
 
+fn log_plain_oneline_format(compiled: &CompiledLogFormat) -> bool {
+    matches!(
+        compiled.tokens.as_slice(),
+        [
+            FormatToken::OidAbbrev,
+            FormatToken::Literal(space),
+            FormatToken::Subject
+        ] if space == " "
+    )
+}
+
+fn emit_plain_oneline_limited_commit(
+    db: &FileObjectDatabase,
+    record: &sley_rev::CommitMetadata,
+    abbrev_len: Option<usize>,
+    output_encoding: &str,
+    output_encoding_is_utf8: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let object = db.read_object(&record.oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            record.oid,
+            object.object_type.as_str()
+        )));
+    }
+    append_log_oid(out, &record.oid, abbrev_len);
+    out.push(b' ');
+    let (message, encoding) = commit_object_message_and_optional_encoding(&object.body);
+    if encoding.is_none() && output_encoding_is_utf8 {
+        out.extend_from_slice(commit_subject_bytes(message));
+        return Ok(());
+    }
+    let utf8_message = match encoding {
+        Some(encoding) => log_reencode_message(message, encoding.as_ref(), "UTF-8"),
+        None => std::borrow::Cow::Borrowed(message),
+    };
+    out.extend_from_slice(commit_subject_bytes(&utf8_message));
+    if !output_encoding_is_utf8 {
+        let reencoded = log_reencode_message(out, "UTF-8", output_encoding).into_owned();
+        out.clear();
+        out.extend_from_slice(&reencoded);
+    }
+    Ok(())
+}
+
 fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut setup_not = false;
@@ -279,6 +325,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut output = LogOutput::Default(LogDefaultKind::Medium);
     let mut notes_display = NotesDisplay::default();
     let mut preset_oneline: Option<bool> = None;
+    let mut plain_oneline = false;
     // Raw `--pretty=`/`--format=` spec captured during arg parse and resolved
     // after config is loaded (aliases live in `pretty.<name>`). The bool is the
     // "format kind" flag: `--format=`/`tformat:` terminate each entry with a
@@ -893,6 +940,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--oneline" => {
                 preset_oneline = Some(false);
                 pretty_spec = None;
+                plain_oneline = true;
             }
             // Built-in `short`/`medium` map to the default-output kinds (short
             // omits the `Date:` line); other named/custom formats fall through
@@ -901,11 +949,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 output = LogOutput::Default(LogDefaultKind::Short);
                 pretty_spec = None;
                 preset_oneline = None;
+                plain_oneline = false;
             }
             "--pretty=medium" | "--format=medium" => {
                 output = LogOutput::Default(LogDefaultKind::Medium);
                 pretty_spec = None;
                 preset_oneline = None;
+                plain_oneline = false;
             }
             "--pretty" | "--format" => {
                 let value = iter
@@ -913,10 +963,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?;
                 pretty_spec = Some((value.to_string(), arg == "--format"));
                 preset_oneline = None;
+                plain_oneline = false;
             }
             value if value.starts_with("--pretty=") => {
                 pretty_spec = Some((value["--pretty=".len()..].to_string(), false));
                 preset_oneline = None;
+                plain_oneline = false;
             }
             "-n" | "--max-count" => {
                 setup_args.push(arg.clone());
@@ -943,6 +995,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--format=") => {
                 pretty_spec = Some((value["--format=".len()..].to_string(), true));
                 preset_oneline = None;
+                plain_oneline = false;
             }
             value if value.starts_with("-n") && value.len() > 2 => {
                 setup_args.push(arg.clone());
@@ -1084,7 +1137,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
             Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
         };
-        let repo_abbrev = repository_abbrev(&git_dir, format)?;
+        let repo_abbrev = repository_abbrev_from_config(&git_dir, format, &config)?;
         Some(LogDiffContext {
             db: &db,
             format,
@@ -1108,6 +1161,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Resolve the captured `--pretty=`/`--format=` spec now that config (and its
     // `pretty.<name>` aliases) is available.
     if let Some((spec, format_kind)) = pretty_spec.take() {
+        plain_oneline = false;
         match resolve_pretty_spec(&spec, format_kind, &config)? {
             ResolvedPretty::Oneline => preset_oneline = Some(true),
             ResolvedPretty::Default => output = LogOutput::Default(LogDefaultKind::Medium),
@@ -1164,7 +1218,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         *compiled_children = show_children;
     }
     if !abbrev_len_explicit && log_output_needs_abbrev(&output, abbrev_commit, show_children) {
-        abbrev_len = repository_abbrev(&git_dir, format)?;
+        abbrev_len = repository_abbrev_from_config(&git_dir, format, &config)?;
     }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
@@ -1228,16 +1282,78 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             excluded.insert(record.oid);
         }
     }
+    if plain_oneline
+        && walk
+        && !graph
+        && line_prefix.is_none()
+        && ordering == RevListOrdering::Default
+        && pathspecs.is_empty()
+        && !full_history
+        && matches!(
+            &output,
+            LogOutput::Compiled {
+                compiled,
+                final_newline: true,
+                show_children: false,
+                inline_children: true
+            }
+            if log_plain_oneline_format(compiled))
+        && decoration == LogDecorationMode::Off
+        && !show_parents
+        && !show_children
+        && excluded.is_empty()
+        && starts.len() == 1
+        && !first_parent
+        && !reverse
+        && skip == 0
+        && author_filters.is_none()
+        && committer_filters.is_none()
+        && grep_filters.is_none()
+        && max_age.is_none()
+        && min_age.is_none()
+        && min_parents.is_none()
+        && max_parents.is_none()
+        && !null_terminate
+        && !abbrev_len_explicit
+        && let Some(max_count) = max_count
+        && max_count > 0
+    {
+        let stdout = io::stdout();
+        let mut stdout = io::BufWriter::new(stdout.lock());
+        let mut line = Vec::with_capacity(128);
+        let output_encoding_is_utf8 = encoding_is_utf8(&output_encoding);
+        let mut walk = sley_rev::RevWalk::new(&git_dir, format, &db, starts)
+            .order(sley_rev::RevWalkOrder::CommitDate)
+            .max_count(Some(max_count));
+        while let Some(metadata) = walk.try_next()? {
+            line.clear();
+            emit_plain_oneline_limited_commit(
+                &db,
+                &metadata,
+                abbrev_len,
+                &output_encoding,
+                output_encoding_is_utf8,
+                &mut line,
+            )?;
+            stdout.write_all(&line)?;
+            stdout.write_all(b"\n")?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
     if walk
         && !graph
         && line_prefix.is_none()
-        && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && ordering == RevListOrdering::Default
         && pathspecs.is_empty()
         && !full_history
         && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
             if compiled.is_metadata_emitable() && compiled.uses_oid() && !compiled.uses_decorations())
         && decoration == LogDecorationMode::Off
         && !show_children
+        && excluded.is_empty()
+        && starts.len() == 1
+        && !revision_options.had_ref_selector
         && author_filters.is_none()
         && committer_filters.is_none()
         && grep_filters.is_none()
@@ -1283,7 +1399,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             } => (compiled, *final_newline),
             _ => unreachable!("metadata fast path requires compiled output"),
         };
-        let mut stdout = io::stdout();
+        let stdout = io::stdout();
+        let mut stdout = io::BufWriter::new(stdout.lock());
         let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
         let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
         for (index, record) in selected.iter().enumerate() {
@@ -1321,7 +1438,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if walk
         && !graph
         && line_prefix.is_none()
-        && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && ordering == RevListOrdering::Default
         && pathspecs.is_empty()
         && !full_history
         && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
@@ -1329,6 +1446,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && decoration == LogDecorationMode::Off
         && !show_children
         && excluded.is_empty()
+        && starts.len() == 1
+        && !revision_options.had_ref_selector
         && author_filters.is_none()
         && committer_filters.is_none()
         && grep_filters.is_none()

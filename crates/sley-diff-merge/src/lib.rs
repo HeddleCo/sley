@@ -1170,6 +1170,18 @@ impl NameStatusEntry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexGitlinkEntry {
+    pub path: BString,
+    pub oid: ObjectId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWorktreeDiff {
+    pub entries: Vec<NameStatusEntry>,
+    pub staged_gitlinks: Vec<IndexGitlinkEntry>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffNameStatusOptions {
     pub detect_renames: bool,
@@ -1546,9 +1558,30 @@ pub fn diff_name_status_index_worktree_with_options(
     format: ObjectFormat,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let changes =
-        diff_name_status_index_worktree_changes(worktree_root.as_ref(), git_dir.as_ref(), format)?;
-    apply_name_status_options_to_index_worktree_changes(changes, options)
+    Ok(diff_name_status_index_worktree_with_options_and_gitlinks(
+        worktree_root,
+        git_dir,
+        format,
+        options,
+    )?
+    .entries)
+}
+
+pub fn diff_name_status_index_worktree_with_options_and_gitlinks(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: DiffNameStatusOptions,
+) -> Result<IndexWorktreeDiff> {
+    let IndexWorktreeDiff {
+        entries,
+        staged_gitlinks,
+    } = diff_name_status_index_worktree_changes(worktree_root.as_ref(), git_dir.as_ref(), format)?;
+    let entries = apply_name_status_options_to_index_worktree_changes(entries, options)?;
+    Ok(IndexWorktreeDiff {
+        entries,
+        staged_gitlinks,
+    })
 }
 
 /// Index-vs-worktree name-status with full rename/copy options, including inexact
@@ -1560,32 +1593,58 @@ pub fn diff_name_status_index_worktree_with_rename_options(
     format: ObjectFormat,
     options: RenameDetectionOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let changes =
-        diff_name_status_index_worktree_changes(worktree_root.as_ref(), git_dir.as_ref(), format)?;
+    Ok(
+        diff_name_status_index_worktree_with_rename_options_and_gitlinks(
+            worktree_root,
+            git_dir,
+            format,
+            options,
+        )?
+        .entries,
+    )
+}
+
+pub fn diff_name_status_index_worktree_with_rename_options_and_gitlinks(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: RenameDetectionOptions,
+) -> Result<IndexWorktreeDiff> {
+    let IndexWorktreeDiff {
+        entries,
+        staged_gitlinks,
+    } = diff_name_status_index_worktree_changes(worktree_root.as_ref(), git_dir.as_ref(), format)?;
     // Index-vs-worktree diffs only consider tracked index paths; untracked
     // worktree files are not additions, so rename/copy detection has no add
     // destinations to pair. Apply the base options for completeness.
-    apply_name_status_options_to_index_worktree_changes(changes, options.base)
+    let entries = apply_name_status_options_to_index_worktree_changes(entries, options.base)?;
+    Ok(IndexWorktreeDiff {
+        entries,
+        staged_gitlinks,
+    })
 }
 
 fn diff_name_status_index_worktree_changes(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-) -> Result<Vec<NameStatusEntry>> {
+) -> Result<IndexWorktreeDiff> {
     let index_path = sley_index::repository_index_path(git_dir);
     let index_metadata = match fs::metadata(&index_path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IndexWorktreeDiff {
+                entries: Vec::new(),
+                staged_gitlinks: Vec::new(),
+            });
+        }
         Err(err) => return Err(err.into()),
     };
     let index_bytes = fs::read(&index_path)?;
     if let Ok(index) = BorrowedIndex::parse(&index_bytes, format) {
-        if index
-            .entries
-            .iter()
-            .any(|entry| entry.stage() != sley_index::Stage::Normal)
-        {
+        let (has_non_normal_stage, staged_gitlinks) =
+            index_worktree_metadata_for_entries(&index.entries);
+        if has_non_normal_stage {
             return diff_name_status_index_worktree_changes_from_snapshot(
                 worktree_root,
                 git_dir,
@@ -1594,19 +1653,21 @@ fn diff_name_status_index_worktree_changes(
         }
         let stat_cache =
             IndexStatCache::from_index_mtime_only(sley_index::file_mtime_parts(&index_metadata));
-        return diff_name_status_index_worktree_changes_for_borrowed_entries(
+        let entries = diff_name_status_index_worktree_changes_for_borrowed_entries(
             worktree_root,
             format,
             &index.entries,
             &stat_cache,
-        );
+        )?;
+        return Ok(IndexWorktreeDiff {
+            entries,
+            staged_gitlinks,
+        });
     }
     let index = Index::parse(&index_bytes, format)?;
-    if index
-        .entries
-        .iter()
-        .any(|entry| entry.stage() != sley_index::Stage::Normal)
-    {
+    let (has_non_normal_stage, staged_gitlinks) =
+        index_worktree_metadata_for_entries(&index.entries);
+    if has_non_normal_stage {
         return diff_name_status_index_worktree_changes_from_snapshot(
             worktree_root,
             git_dir,
@@ -1615,12 +1676,16 @@ fn diff_name_status_index_worktree_changes(
     }
     let stat_cache =
         IndexStatCache::from_index_mtime_only(sley_index::file_mtime_parts(&index_metadata));
-    diff_name_status_index_worktree_changes_for_entries(
+    let entries = diff_name_status_index_worktree_changes_for_entries(
         worktree_root,
         format,
         &index.entries,
         &stat_cache,
-    )
+    )?;
+    Ok(IndexWorktreeDiff {
+        entries,
+        staged_gitlinks,
+    })
 }
 
 fn diff_name_status_index_worktree_changes_for_borrowed_entries(
@@ -1743,16 +1808,42 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
     Ok(changes)
 }
 
+fn index_worktree_metadata_for_entries(
+    entries: &[impl WorktreeIndexEntry],
+) -> (bool, Vec<IndexGitlinkEntry>) {
+    let mut has_non_normal_stage = false;
+    let mut staged_gitlinks = Vec::new();
+    for entry in entries {
+        if entry.stage() != sley_index::Stage::Normal {
+            has_non_normal_stage = true;
+        }
+        if entry.mode() == 0o160000 {
+            staged_gitlinks.push(IndexGitlinkEntry {
+                path: BString::from_bytes(entry.git_path()),
+                oid: entry.oid(),
+            });
+        }
+    }
+    (has_non_normal_stage, staged_gitlinks)
+}
+
 fn diff_name_status_index_worktree_changes_from_snapshot(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-) -> Result<Vec<NameStatusEntry>> {
+) -> Result<IndexWorktreeDiff> {
     let IndexSnapshot {
         entries: index,
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
     let index_gitlinks = index_gitlinks(&index);
+    let staged_gitlinks = index_gitlinks
+        .iter()
+        .map(|(path, oid)| IndexGitlinkEntry {
+            path: BString::from_bytes(path),
+            oid: *oid,
+        })
+        .collect();
     let mut changes = Vec::new();
     for (git_path, left) in &index {
         let right = worktree_entry_for_path(
@@ -1786,7 +1877,10 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
             });
         }
     }
-    Ok(changes)
+    Ok(IndexWorktreeDiff {
+        entries: changes,
+        staged_gitlinks,
+    })
 }
 
 fn apply_name_status_options_to_index_worktree_changes(
@@ -2836,6 +2930,7 @@ fn read_index_snapshot(git_dir: &Path, format: ObjectFormat) -> Result<IndexSnap
 
 trait WorktreeIndexEntry {
     fn git_path(&self) -> &[u8];
+    fn stage(&self) -> sley_index::Stage;
     fn mode(&self) -> u32;
     fn oid(&self) -> ObjectId;
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool;
@@ -2844,6 +2939,10 @@ trait WorktreeIndexEntry {
 impl WorktreeIndexEntry for sley_index::IndexEntry {
     fn git_path(&self) -> &[u8] {
         self.path.as_bytes()
+    }
+
+    fn stage(&self) -> sley_index::Stage {
+        sley_index::IndexEntry::stage(self)
     }
 
     fn mode(&self) -> u32 {
@@ -2862,6 +2961,10 @@ impl WorktreeIndexEntry for sley_index::IndexEntry {
 impl WorktreeIndexEntry for sley_index::IndexEntryRef<'_> {
     fn git_path(&self) -> &[u8] {
         self.path
+    }
+
+    fn stage(&self) -> sley_index::Stage {
+        sley_index::IndexEntryRef::stage(self)
     }
 
     fn mode(&self) -> u32 {
@@ -5604,6 +5707,61 @@ mod tests {
         let changes = diff_name_status_head_worktree(&root, &layout.git_dir, ObjectFormat::Sha1)
             .expect("test operation should succeed");
         assert_eq!(changes[0].line(), "A\thello.txt");
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn index_worktree_diff_returns_staged_gitlinks() {
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test operation should succeed");
+        let index = Index {
+            version: 2,
+            entries: vec![sley_index::IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid,
+                flags: "deps/sub".len() as u16,
+                flags_extended: 0,
+                path: BString::from(b"deps/sub"),
+            }],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        fs::write(
+            layout.git_dir.join("index"),
+            index
+                .write_v2_sha1()
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
+
+        let diff = diff_name_status_index_worktree_with_options_and_gitlinks(
+            &root,
+            &layout.git_dir,
+            ObjectFormat::Sha1,
+            DiffNameStatusOptions::default(),
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(diff.entries.len(), 1);
+        let gitlinks = diff.staged_gitlinks;
+        assert_eq!(gitlinks.len(), 1);
+        assert_eq!(gitlinks[0].path.as_bytes(), b"deps/sub");
+        assert_eq!(gitlinks[0].oid, oid);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

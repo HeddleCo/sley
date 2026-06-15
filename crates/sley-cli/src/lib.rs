@@ -37,7 +37,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -2210,16 +2210,35 @@ fn collect_dirty_submodules(
     format: ObjectFormat,
     worktree_root: &Path,
     config: &SubmoduleDiffConfig,
+    precomputed_gitlinks: Option<&[sley_diff_merge::IndexGitlinkEntry]>,
+) -> Result<HashSet<Vec<u8>>> {
+    if let Some(gitlinks) = precomputed_gitlinks {
+        return collect_dirty_submodules_from_gitlinks(entries, worktree_root, config, gitlinks);
+    }
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(HashSet::new());
+    };
+    let gitlinks = index
+        .entries
+        .iter()
+        .filter(|entry| entry.mode == 0o160000)
+        .map(|entry| sley_diff_merge::IndexGitlinkEntry {
+            path: BString::from_bytes(entry.path.as_bytes()),
+            oid: entry.oid,
+        })
+        .collect::<Vec<_>>();
+    collect_dirty_submodules_from_gitlinks(entries, worktree_root, config, &gitlinks)
+}
+
+fn collect_dirty_submodules_from_gitlinks(
+    entries: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    worktree_root: &Path,
+    config: &SubmoduleDiffConfig,
+    gitlinks: &[sley_diff_merge::IndexGitlinkEntry],
 ) -> Result<HashSet<Vec<u8>>> {
     let mut dirty = HashSet::new();
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
-        return Ok(dirty);
-    };
     let mut injected = false;
-    for entry in &index.entries {
-        if entry.mode != 0o160000 {
-            continue;
-        }
+    for entry in gitlinks {
         let path = entry.path.as_bytes();
         let mode = config.effective(path);
         if matches!(mode, SubmoduleIgnoreMode::All | SubmoduleIgnoreMode::Dirty) {
@@ -2644,6 +2663,15 @@ fn write_diff_numstat_entry(
     let old_content = diff_entry_old_content(entry, db)?;
     let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
     let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
+    write_diff_numstat_materialized_entry(stdout, entry, stats, z)
+}
+
+fn write_diff_numstat_materialized_entry(
+    stdout: &mut dyn Write,
+    entry: &sley_diff_merge::NameStatusEntry,
+    stats: DiffLineStats,
+    z: bool,
+) -> Result<()> {
     if z {
         write_diff_numstat_counts(stdout, stats)?;
         if let Some(old_path) = &entry.old_path {
@@ -2671,7 +2699,7 @@ fn write_diff_numstat_entry(
 
 fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Result<()> {
     match stats {
-        DiffLineStats::Binary => write!(stdout, "-\t-\t")?,
+        DiffLineStats::Binary { .. } => write!(stdout, "-\t-\t")?,
         DiffLineStats::Text { inserted, deleted } => write!(stdout, "{inserted}\t{deleted}\t")?,
     }
     Ok(())
@@ -2684,25 +2712,18 @@ fn write_diff_shortstat(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
 ) -> Result<()> {
+    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
+    write_diff_shortstat_materialized(stdout, &stat_entries)
+}
+
+fn write_diff_shortstat_materialized(
+    stdout: &mut dyn Write,
+    entries: &[DiffStatEntryData<'_>],
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let mut inserted = 0;
-    let mut deleted = 0;
-    for entry in entries {
-        let old_content = diff_entry_old_content(entry, db)?;
-        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-        match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
-            DiffLineStats::Binary => {}
-            DiffLineStats::Text {
-                inserted: entry_inserted,
-                deleted: entry_deleted,
-            } => {
-                inserted += entry_inserted;
-                deleted += entry_deleted;
-            }
-        }
-    }
+    let (inserted, deleted) = diff_stat_totals(entries);
     write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
 }
 
@@ -2845,6 +2866,16 @@ fn write_diff_stat_with_widths(
     options: DiffStatOptions,
     widths: DiffStatWidths,
 ) -> Result<()> {
+    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
+    write_diff_stat_materialized_with_widths(stdout, &stat_entries, options, widths)
+}
+
+fn write_diff_stat_materialized_with_widths(
+    stdout: &mut dyn Write,
+    entries: &[DiffStatEntryData<'_>],
+    options: DiffStatOptions,
+    widths: DiffStatWidths,
+) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -2853,13 +2884,7 @@ fn write_diff_stat_with_widths(
         stat_count,
         color,
     } = options;
-    let rows = diff_stat_rows(
-        entries,
-        db,
-        worktree_root,
-        use_worktree_new,
-        compact_summary,
-    )?;
+    let rows = diff_stat_rows_from_materialized(entries, compact_summary);
 
     let mut count = stat_count.unwrap_or(rows.len()).min(rows.len());
 
@@ -3030,15 +3055,25 @@ fn write_diff_stat_with_widths(
 
     // Totals cover every row (display truncation does not affect them);
     // binary rows count as changed files but contribute no line counts.
-    let mut adds = 0usize;
-    let mut dels = 0usize;
-    for row in &rows {
-        if let DiffStatStats::Text { inserted, deleted } = row.stats {
-            adds += inserted;
-            dels += deleted;
-        }
-    }
+    let (adds, dels) = diff_stat_totals(entries);
     write_diff_stat_summary_line(stdout, rows.len(), adds, dels)
+}
+
+fn write_diff_stat_materialized(
+    stdout: &mut dyn Write,
+    entries: &[DiffStatEntryData<'_>],
+    options: DiffStatOptions,
+) -> Result<()> {
+    let mut widths = DiffStatWidths::terminal();
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(git_dir) = discover_git_dir(&cwd)
+        && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
+    {
+        widths.resolve_config(&config);
+    } else {
+        widths.resolve_config_defaults();
+    }
+    write_diff_stat_materialized_with_widths(stdout, entries, options, widths)
 }
 
 /// `--dirstat` damage accounting mode.
@@ -3153,7 +3188,7 @@ fn write_diff_dirstat(
                     let new_content =
                         diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
                     match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
-                        DiffLineStats::Binary => {
+                        DiffLineStats::Binary { .. } => {
                             let bytes = old_content.as_ref().map_or(0, Vec::len)
                                 + new_content.as_ref().map_or(0, Vec::len);
                             (bytes as u64).div_ceil(64)
@@ -3286,31 +3321,71 @@ struct DiffStatOptions {
     color: bool,
 }
 
-fn diff_stat_rows(
-    entries: &[sley_diff_merge::NameStatusEntry],
+struct DiffStatEntryData<'a> {
+    entry: &'a sley_diff_merge::NameStatusEntry,
+    stats: DiffLineStats,
+}
+
+fn collect_diff_stat_entries<'a>(
+    entries: &'a [sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
-    compact_summary: bool,
-) -> Result<Vec<DiffStatRow>> {
-    let mut rows = Vec::with_capacity(entries.len());
+) -> Result<Vec<DiffStatEntryData<'a>>> {
+    let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_content(entry, db)?;
-        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-        let stats = match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
-            DiffLineStats::Binary => DiffStatStats::Binary {
-                old_size: old_content.as_ref().map_or(0, Vec::len),
-                new_size: new_content.as_ref().map_or(0, Vec::len),
-                unchanged: old_content == new_content,
+        let stats = if entry.old_oid.is_some() && entry.old_oid == entry.new_oid {
+            diff_line_stats(old_content.as_deref(), old_content.as_deref())
+        } else {
+            let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+            diff_line_stats(old_content.as_deref(), new_content.as_deref())
+        };
+        stat_entries.push(DiffStatEntryData { entry, stats });
+    }
+    Ok(stat_entries)
+}
+
+fn diff_stat_totals(entries: &[DiffStatEntryData<'_>]) -> (usize, usize) {
+    let mut inserted = 0;
+    let mut deleted = 0;
+    for entry in entries {
+        if let DiffLineStats::Text {
+            inserted: entry_inserted,
+            deleted: entry_deleted,
+        } = entry.stats
+        {
+            inserted += entry_inserted;
+            deleted += entry_deleted;
+        }
+    }
+    (inserted, deleted)
+}
+
+fn diff_stat_rows_from_materialized(
+    entries: &[DiffStatEntryData<'_>],
+    compact_summary: bool,
+) -> Vec<DiffStatRow> {
+    let mut rows = Vec::with_capacity(entries.len());
+    for data in entries {
+        let stats = match data.stats {
+            DiffLineStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
+            } => DiffStatStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
             },
             DiffLineStats::Text { inserted, deleted } => DiffStatStats::Text { inserted, deleted },
         };
         rows.push(DiffStatRow {
-            path: diff_stat_path(entry, compact_summary),
+            path: diff_stat_path(data.entry, compact_summary),
             stats,
         });
     }
-    Ok(rows)
+    rows
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3620,13 +3695,21 @@ fn repo_path_to_path(path: &[u8]) -> PathBuf {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffLineStats {
-    Binary,
+    Binary {
+        old_size: usize,
+        new_size: usize,
+        unchanged: bool,
+    },
     Text { inserted: usize, deleted: usize },
 }
 
 fn diff_line_stats(old: Option<&[u8]>, new: Option<&[u8]>) -> DiffLineStats {
     if old.is_some_and(is_binary_content) || new.is_some_and(is_binary_content) {
-        return DiffLineStats::Binary;
+        return DiffLineStats::Binary {
+            old_size: old.map_or(0, <[u8]>::len),
+            new_size: new.map_or(0, <[u8]>::len),
+            unchanged: old == new,
+        };
     }
     match (old, new) {
         (None, None) => DiffLineStats::Text {
@@ -3661,6 +3744,34 @@ fn is_binary_content(bytes: &[u8]) -> bool {
 fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     let old_lines = sley_diff_merge::split_lines(old);
     let new_lines = sley_diff_merge::split_lines(new);
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut old_end = old_lines.len();
+    let mut new_end = new_lines.len();
+    while old_end > prefix
+        && new_end > prefix
+        && old_lines[old_end - 1] == new_lines[new_end - 1]
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    let old_middle = &old_lines[prefix..old_end];
+    let new_middle = &new_lines[prefix..new_end];
+    if let Some(common) = trivial_lcs_len(old_middle, new_middle) {
+        return (new_middle.len() - common, old_middle.len() - common);
+    }
+    const NO_COMMON_SCAN_MIN_PRODUCT: usize = 1_000_000;
+    if old_middle.len().saturating_mul(new_middle.len()) >= NO_COMMON_SCAN_MIN_PRODUCT
+        && !diff_lines_have_any_common(old_middle, new_middle)
+    {
+        return (new_middle.len(), old_middle.len());
+    }
+
     let mut inserted = 0usize;
     let mut deleted = 0usize;
     for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
@@ -3671,6 +3782,40 @@ fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
         }
     }
     (inserted, deleted)
+}
+
+fn trivial_lcs_len(
+    old: &[sley_diff_merge::DiffLine<'_>],
+    new: &[sley_diff_merge::DiffLine<'_>],
+) -> Option<usize> {
+    if old.is_empty() || new.is_empty() {
+        return Some(0);
+    }
+    if old.len() == 1 {
+        return Some(usize::from(new.iter().any(|line| *line == old[0])));
+    }
+    if new.len() == 1 {
+        return Some(usize::from(old.iter().any(|line| *line == new[0])));
+    }
+    None
+}
+
+fn diff_lines_have_any_common(
+    old: &[sley_diff_merge::DiffLine<'_>],
+    new: &[sley_diff_merge::DiffLine<'_>],
+) -> bool {
+    let (small, large) = if old.len() <= new.len() {
+        (old, new)
+    } else {
+        (new, old)
+    };
+    let mut seen = HashSet::with_capacity(small.len());
+    for line in small {
+        seen.insert((line.content, line.has_newline));
+    }
+    large
+        .iter()
+        .any(|line| seen.contains(&(line.content, line.has_newline)))
 }
 
 fn count_diff_lines(bytes: &[u8]) -> usize {
@@ -8213,6 +8358,13 @@ fn emit_compiled_log_format_limited_commit(
 }
 
 fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'_, str>) {
+    let (message, encoding) = commit_object_message_and_optional_encoding(body);
+    (message, encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
+}
+
+fn commit_object_message_and_optional_encoding(
+    body: &[u8],
+) -> (&[u8], Option<std::borrow::Cow<'_, str>>) {
     let mut encoding = None;
     let mut offset = 0usize;
     while offset < body.len() {
@@ -8224,10 +8376,7 @@ fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'
         let line = &body[offset..line_end];
         if line.is_empty() {
             let message_start = line_end.saturating_add(1).min(body.len());
-            return (
-                &body[message_start..],
-                encoding.unwrap_or(std::borrow::Cow::Borrowed("")),
-            );
+            return (&body[message_start..], encoding);
         }
         if let Some(value) = line.strip_prefix(b"encoding ") {
             encoding = Some(
@@ -8241,7 +8390,7 @@ fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'
         }
         offset = line_end + 1;
     }
-    (&[], encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
+    (&[], encoding)
 }
 
 fn emit_compiled_log_format_metadata_inner(
@@ -9285,6 +9434,20 @@ fn repository_abbrev(git_dir: &Path, format: ObjectFormat) -> Result<Option<usiz
     parse_repository_abbrev_value(git_dir, format, value)
 }
 
+fn repository_abbrev_from_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Option<usize>> {
+    if let Some(value) = global_config_value("core.abbrev")? {
+        return parse_repository_abbrev_value(git_dir, format, &value);
+    }
+    let Some(value) = config.get("core", None, "abbrev") else {
+        return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
+    };
+    parse_repository_abbrev_value(git_dir, format, value)
+}
+
 fn parse_repository_abbrev_value(
     git_dir: &Path,
     format: ObjectFormat,
@@ -9317,12 +9480,16 @@ fn repository_auto_abbrev_width(git_dir: &Path, format: ObjectFormat) -> Result<
 }
 
 fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Result<u64> {
-    let objects_dir = repository_objects_dir(git_dir);
-    let mut count = repository_loose_object_count(&objects_dir, format)?;
-    let pack_dir = objects_dir.join("pack");
+    let pack_dir = repository_objects_dir(git_dir).join("pack");
+    if let Some(packed_count) =
+        multi_pack_index_object_count(&pack_dir.join("multi-pack-index"), format)?
+    {
+        return Ok(packed_count);
+    }
     let Ok(entries) = fs::read_dir(&pack_dir) else {
-        return Ok(count);
+        return Ok(0);
     };
+    let mut count = 0u64;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -9334,36 +9501,78 @@ fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Resul
     Ok(count)
 }
 
-fn repository_loose_object_count(objects_dir: &Path, format: ObjectFormat) -> Result<u64> {
-    let mut count = 0u64;
-    let Ok(entries) = fs::read_dir(objects_dir) else {
-        return Ok(0);
+fn multi_pack_index_object_count(path: &Path, format: ObjectFormat) -> Result<Option<u64>> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
     };
-    let filename_len = format.hex_len().saturating_sub(2);
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        let Ok(files) = fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for file in files {
-            let file = file?;
-            let name = file.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.len() == filename_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                count = count.saturating_add(1);
-            }
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).map_err(|_| {
+        GitError::InvalidFormat(format!("multi-pack-index {} is too short", path.display()))
+    })?;
+    if &header[..4] != b"MIDX" {
+        return Err(GitError::InvalidFormat(format!(
+            "missing multi-pack-index signature in {}",
+            path.display()
+        )));
+    }
+    let version = header[4];
+    if version != 1 && version != 2 {
+        return Err(GitError::Unsupported(format!(
+            "multi-pack-index version {version}"
+        )));
+    }
+    let expected_hash_id = match format {
+        ObjectFormat::Sha1 => 1,
+        ObjectFormat::Sha256 => 2,
+    };
+    let hash_id = header[5];
+    if u32::from(hash_id) != expected_hash_id {
+        return Err(GitError::InvalidFormat(format!(
+            "multi-pack-index hash id {hash_id} does not match {}",
+            format.name()
+        )));
+    }
+    let chunk_count = header[6] as usize;
+    let base_midx_count = header[7];
+    if base_midx_count != 0 {
+        return Err(GitError::Unsupported(format!(
+            "multi-pack-index base count {base_midx_count}"
+        )));
+    }
+
+    let mut lookup = vec![0u8; (chunk_count + 1).saturating_mul(12)];
+    file.read_exact(&mut lookup).map_err(|_| {
+        GitError::InvalidFormat(format!(
+            "truncated multi-pack-index chunk lookup in {}",
+            path.display()
+        ))
+    })?;
+    let mut oid_fanout_offset = None;
+    for chunk in lookup.chunks_exact(12).take(chunk_count) {
+        if &chunk[..4] == b"OIDF" {
+            oid_fanout_offset = Some(u64::from_be_bytes([
+                chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
+            ]));
+            break;
         }
     }
-    Ok(count)
+    let Some(oid_fanout_offset) = oid_fanout_offset else {
+        return Err(GitError::InvalidFormat(format!(
+            "multi-pack-index {} missing OIDF chunk",
+            path.display()
+        )));
+    };
+    file.seek(SeekFrom::Start(oid_fanout_offset + 255 * 4))?;
+    let mut count = [0u8; 4];
+    file.read_exact(&mut count).map_err(|_| {
+        GitError::InvalidFormat(format!(
+            "truncated multi-pack-index OIDF chunk in {}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(u64::from(u32::from_be_bytes(count))))
 }
 
 fn pack_index_object_count(path: &Path) -> Result<u32> {
@@ -9663,7 +9872,7 @@ fn default_committer() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::refname_pattern_matches;
+    use super::{count_line_diff, refname_pattern_matches};
 
     #[test]
     fn refname_patterns_match_git_style_wildcards() {
@@ -9683,5 +9892,24 @@ mod tests {
         assert!(refname_pattern_matches("release[", "release["));
         assert!(refname_pattern_matches(r"release\*", "release*"));
         assert!(!refname_pattern_matches(r"release\*", "release/1"));
+    }
+
+    #[test]
+    fn diff_stat_line_count_fast_paths_are_exact() {
+        let mut many_new = String::new();
+        for idx in 0..1024 {
+            many_new.push_str(&format!("new line {idx}\n"));
+        }
+        assert_eq!(count_line_diff(b"old line\n", many_new.as_bytes()), (1024, 1));
+
+        let mut old = String::from("shared prefix\n");
+        let mut new = String::from("shared prefix\n");
+        for idx in 0..1024 {
+            old.push_str(&format!("old middle {idx}\n"));
+            new.push_str(&format!("new middle {idx}\n"));
+        }
+        old.push_str("shared suffix\n");
+        new.push_str("shared suffix\n");
+        assert_eq!(count_line_diff(old.as_bytes(), new.as_bytes()), (1024, 1024));
     }
 }

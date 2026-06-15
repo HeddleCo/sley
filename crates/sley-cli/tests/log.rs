@@ -1593,6 +1593,55 @@ fn log_custom_format_placeholders_match_upstream_git() {
 }
 
 #[test]
+fn log_limited_subject_formats_match_upstream_git() {
+    let root = unique_temp_dir("log-limited-subject-formats");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        for idx in 0..60 {
+            let path = format!("file-{idx:02}.txt");
+            fs::write(root.join(&path), format!("content {idx}\n")).expect("write fixture");
+            git(&root, &["add", &path]);
+            git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "-m",
+                    &format!("subject {idx:02}"),
+                    "-q",
+                ],
+            );
+        }
+
+        for args in [
+            vec!["log", "--format=%s", "-1", "HEAD"],
+            vec!["log", "--format=%s", "-50", "HEAD"],
+            vec!["log", "--skip=5", "--max-count=7", "--format=%s", "HEAD"],
+            vec![
+                "log",
+                "--skip",
+                "3",
+                "--max-count",
+                "4",
+                "--format=%s",
+                "HEAD",
+            ],
+            vec!["log", "--decorate", "--format=%s", "-5", "HEAD"],
+            vec!["log", "--format=%H %s", "-50", "HEAD"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley log output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn log_reverse_matches_upstream_git() {
     let root = unique_temp_dir("log-reverse");
     fs::create_dir_all(&root).expect("create temp repo");
