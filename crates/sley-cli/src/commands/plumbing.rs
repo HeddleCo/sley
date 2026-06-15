@@ -1142,6 +1142,36 @@ fn init_config_bool(
 }
 
 pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
+    // `add -i` / `add --interactive` and `add -p` / `add --patch` route to the
+    // interactive engine. git treats `--patch` as implying interactive and lets
+    // a pathspec follow. We collect the non-flag pathspec args and forward.
+    {
+        let mut interactive = false;
+        let mut patch = false;
+        let mut spec: Vec<String> = Vec::new();
+        let mut after_dd = false;
+        for arg in args {
+            if after_dd {
+                spec.push(arg.clone());
+                continue;
+            }
+            match arg.as_str() {
+                "--" => after_dd = true,
+                "-i" | "--interactive" => interactive = true,
+                "-p" | "--patch" => patch = true,
+                other if other.starts_with('-') => {
+                    // Leave any other flags to the normal path (no -i/-p).
+                }
+                other => spec.push(other.to_string()),
+            }
+        }
+        if patch {
+            return commands::add_interactive::cmd_add_patch(&spec);
+        }
+        if interactive {
+            return commands::add_interactive::cmd_add_interactive(&spec);
+        }
+    }
     let mut paths = Vec::new();
     let mut dry_run = false;
     let mut verbose = false;

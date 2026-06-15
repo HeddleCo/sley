@@ -5,6 +5,8 @@
 //! modules' private items; the only items a submodule must expose are the
 //! `cmd_*` entry points the dispatcher in `run` calls, which are `pub(crate)`.
 
+pub(crate) mod add_interactive;
+pub(crate) mod add_patch;
 pub(crate) mod alias;
 pub(crate) mod am;
 pub(crate) mod approxidate;
