@@ -6338,9 +6338,19 @@ fn filter_attribute_checks(worktree_root: &Path, path: &[u8]) -> Result<Vec<Attr
     Ok(matcher.attributes_for_path(path, &requested, false))
 }
 
-/// Compute filtering attributes for a checkout (blob -> worktree), reading
-/// `.gitattributes` from the index so the rules in the tree being checked out
-/// apply even before the worktree files exist.
+/// Compute filtering attributes for a checkout (blob -> worktree).
+///
+/// `git checkout -- <pathspec>` / `git restore` materialize through git's
+/// **default** attr direction, which is `GIT_ATTR_CHECKIN` (attr.c: the static
+/// `direction` is zero-initialized and `builtin/checkout.c` never overrides it
+/// for the pathspec path). Under that direction `read_attr` reads each
+/// `.gitattributes` frame from the **worktree file first**, falling back to the
+/// staged blob only when no worktree file exists at that directory level
+/// (sparse-checkout). This is the precedence the smudge filter must use:
+/// t0027 commits an *empty* root `.gitattributes`, then overwrites the worktree
+/// copy with `*.txt text eol=crlf` *without re-staging* — and git's checkout
+/// still honours the worktree copy. Reading the index alone (or index-first)
+/// made checkout under-convert line endings, because the staged blob was empty.
 fn smudge_attribute_checks_from_index(
     worktree_root: &Path,
     git_dir: &Path,
@@ -6348,7 +6358,102 @@ fn smudge_attribute_checks_from_index(
     path: &[u8],
 ) -> Result<Vec<AttributeCheck>> {
     let requested = filter_attribute_names();
-    standard_attributes_for_path_from_index(worktree_root, git_dir, format, path, &requested, false)
+    let mut matcher = AttributeMatcher::default();
+    if !matcher.read_configured_attributes(worktree_root) {
+        matcher.read_default_global_attributes();
+    }
+
+    // Build the set of `.gitattributes` blobs the index carries, keyed by the
+    // directory they govern, so each ancestry frame can prefer the staged copy.
+    let index_attributes = index_gitattributes_by_base(git_dir, format)?;
+
+    // Walk root -> ... -> the file's parent directory, folding each frame's
+    // `.gitattributes` in shallow-to-deep order so deeper directories win.
+    fold_checkout_attribute_frame(
+        worktree_root,
+        &[],
+        &index_attributes,
+        &mut matcher,
+    )?;
+    let mut prefix = Vec::new();
+    let mut parts = path.split(|byte| *byte == b'/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(part);
+        let dir = worktree_root.join(repo_path_to_os_path(&prefix)?);
+        fold_checkout_attribute_frame(&dir, &prefix, &index_attributes, &mut matcher)?;
+    }
+
+    read_attribute_patterns(
+        worktree_root.join(".git").join("info").join("attributes"),
+        &mut matcher,
+        &[],
+        b".git/info/attributes",
+    );
+    Ok(matcher.attributes_for_path(path, &requested, false))
+}
+
+/// Fold the `.gitattributes` governing directory `base` (whose on-disk location
+/// is `dir`) into `matcher`, preferring the worktree file and falling back to
+/// the staged blob. Mirrors one attr-stack frame under `GIT_ATTR_CHECKIN`
+/// (git's default direction, used by `checkout -- <pathspec>` / `restore`).
+fn fold_checkout_attribute_frame(
+    dir: &Path,
+    base: &[u8],
+    index_attributes: &BTreeMap<Vec<u8>, Vec<u8>>,
+    matcher: &mut AttributeMatcher,
+) -> Result<()> {
+    let worktree_file = dir.join(".gitattributes");
+    if let Ok(contents) = fs::read(&worktree_file) {
+        // A worktree `.gitattributes` exists at this level: it wins outright
+        // (git only consults the index when the worktree file is absent).
+        read_attribute_patterns_from_bytes(&contents, matcher, base);
+    } else if let Some(contents) = index_attributes.get(base) {
+        read_attribute_patterns_from_bytes(contents, matcher, base);
+    }
+    Ok(())
+}
+
+/// Read every staged `.gitattributes` blob, keyed by the repo-relative directory
+/// it governs (`""` for the worktree root). Stage-0 blob entries only.
+fn index_gitattributes_by_base(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let mut map = BTreeMap::new();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(map);
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let entries = Index::parse(&fs::read(index_path)?, format)?.entries;
+    for entry in entries {
+        let is_attributes_file =
+            entry.path == b".gitattributes" || entry.path.as_bytes().ends_with(b"/.gitattributes");
+        if index_entry_stage(&entry) != 0
+            || tree_entry_object_type(entry.mode) != ObjectType::Blob
+            || !is_attributes_file
+        {
+            continue;
+        }
+        let base = match entry.path.as_bytes().strip_suffix(b".gitattributes") {
+            Some(b"") => Vec::new(),
+            Some(parent) => parent.strip_suffix(b"/").unwrap_or(parent).to_vec(),
+            None => continue,
+        };
+        let object = db
+            .read_object(&entry.oid)
+            .map_err(|err| expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob))?;
+        if object.object_type == ObjectType::Blob {
+            map.insert(base, object.body.clone());
+        }
+    }
+    Ok(map)
 }
 
 fn filter_attribute_names() -> Vec<Vec<u8>> {

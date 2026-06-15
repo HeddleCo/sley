@@ -97,7 +97,14 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let entries = read_tree_overlay(db, format, &tree_oids)?;
             if parsed.update_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
-                reset_worktree_to_entries(&worktree_root, git_dir, format, db, &entries)?;
+                reset_worktree_to_entries(
+                    &worktree_root,
+                    git_dir,
+                    format,
+                    db,
+                    repo.config(),
+                    &entries,
+                )?;
             }
             write_paired_entries(git_dir, format, entries)?;
         }
@@ -105,7 +112,14 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let entries = read_tree_prefix(git_dir, format, db, &tree_oids, prefix)?;
             if parsed.update_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
-                update_worktree_for_entries(&worktree_root, git_dir, format, db, &entries)?;
+                update_worktree_for_entries(
+                    &worktree_root,
+                    git_dir,
+                    format,
+                    db,
+                    repo.config(),
+                    &entries,
+                )?;
             }
             write_paired_entries(git_dir, format, entries)?;
         }
@@ -412,6 +426,7 @@ fn original_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet
 /// applies the result.
 struct ReadTreeWorktree<'a> {
     worktree_root: PathBuf,
+    git_dir: PathBuf,
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     /// Every path present in the *pre-merge* index (any stage). A merged-result
@@ -555,7 +570,15 @@ fn move_head_verdict_to_result(
 
 impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
     fn write_blob(&mut self, path: &[u8], _mode: u32, oid: &ObjectId) -> Result<()> {
-        write_blob_to_worktree(&self.worktree_root, self.db, path, oid)
+        write_blob_to_worktree(
+            &self.worktree_root,
+            &self.git_dir,
+            self.format,
+            self.db,
+            &self.repo_config,
+            path,
+            oid,
+        )
     }
 
     fn remove_path(&mut self, path: &[u8]) -> Result<()> {
@@ -615,6 +638,7 @@ fn merge_trees(
         submodules: load_superproject_submodules(&worktree_root),
         repo_config: read_repo_config(git_dir).unwrap_or_default(),
         worktree_root,
+        git_dir: git_dir.to_path_buf(),
         db,
         format,
         original_paths: original_index_paths(git_dir, format)?,
@@ -875,17 +899,18 @@ fn update_worktree_for_entries(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    config: &GitConfig,
     entries: &[(Vec<u8>, StagedEntry)],
 ) -> Result<()> {
     let original = current_index_stage0(git_dir, format)?;
-    for (path, entry) in entries {
+    for (path, entry) in worktree_write_order(entries) {
         if entry.stage != 0 {
             continue;
         }
         if original.get(path) == Some(&(entry.mode, entry.oid)) {
             continue;
         }
-        write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
+        write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, &entry.oid)?;
     }
     Ok(())
 }
@@ -897,6 +922,7 @@ fn reset_worktree_to_entries(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    config: &GitConfig,
     entries: &[(Vec<u8>, StagedEntry)],
 ) -> Result<()> {
     let target: BTreeSet<&Vec<u8>> = entries.iter().map(|(path, _)| path).collect();
@@ -907,17 +933,52 @@ fn reset_worktree_to_entries(
             }
         }
     }
-    for (path, entry) in entries {
-        write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
+    for (path, entry) in worktree_write_order(entries) {
+        write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, &entry.oid)?;
     }
     Ok(())
 }
 
+/// Order entries so each directory's `.gitattributes` is materialized before the
+/// other files in that directory. The smudge filter resolves attributes from the
+/// worktree `.gitattributes` first (git's default `GIT_ATTR_CHECKIN` direction),
+/// so a file relying on a freshly-checked-out `.gitattributes` would otherwise
+/// only see the staged fallback. Ordering by `.gitattributes`-first makes the
+/// worktree copy authoritative for siblings in the same batch, matching git's
+/// sorted unpack-trees materialization.
+fn worktree_write_order(
+    entries: &[(Vec<u8>, StagedEntry)],
+) -> Vec<(&Vec<u8>, &StagedEntry)> {
+    let mut ordered: Vec<(&Vec<u8>, &StagedEntry)> =
+        entries.iter().map(|(path, entry)| (path, entry)).collect();
+    // Stable sort with a key that ranks a directory's `.gitattributes` ahead of
+    // its siblings while otherwise preserving the original (already sorted) order.
+    ordered.sort_by(|(left, _), (right, _)| {
+        attribute_priority_key(left).cmp(&attribute_priority_key(right))
+    });
+    ordered
+}
+
+/// Sort key placing each directory's `.gitattributes` immediately before the
+/// directory's other entries: `(dir, is_not_gitattributes, basename)`.
+fn attribute_priority_key(path: &[u8]) -> (Vec<u8>, u8, Vec<u8>) {
+    let (dir, base) = match path.iter().rposition(|byte| *byte == b'/') {
+        Some(slash) => (path[..slash].to_vec(), &path[slash + 1..]),
+        None => (Vec::new(), path),
+    };
+    let is_not_attributes = u8::from(base != b".gitattributes");
+    (dir, is_not_attributes, base.to_vec())
+}
+
 /// Write a single blob from the object database to `path` under `worktree_root`,
-/// creating parent directories as needed. Non-blob targets are rejected.
+/// applying the smudge filter (EOL conversion + `filter.<name>.smudge`) so the
+/// materialized bytes match `git checkout`. Non-blob targets are rejected.
 fn write_blob_to_worktree(
     worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
+    config: &GitConfig,
     path: &[u8],
     oid: &ObjectId,
 ) -> Result<()> {
@@ -937,7 +998,9 @@ fn write_blob_to_worktree(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&file_path, &object.body)?;
+    let body =
+        sley_worktree::apply_smudge_filter(worktree_root, git_dir, format, config, path, &object.body)?;
+    fs::write(&file_path, &body)?;
     Ok(())
 }
 
