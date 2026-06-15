@@ -842,6 +842,302 @@ fn init_config_bool(
         .map(|value| value.as_deref().and_then(parse_config_bool))
 }
 
+/// Whether the `advice.<name>` hint is enabled (git's `advice_enabled`):
+/// honours the `GIT_ADVICE` env override, then the `advice.<name>` config key,
+/// defaulting to `true`. Used to gate the trailing "hint:" lines of the
+/// ignored-path / sparse-path advice blocks.
+fn advice_enabled(git_dir: &Path, name: &str) -> bool {
+    if let Ok(value) = env::var("GIT_ADVICE") {
+        let enabled = match parse_config_bool(&value) {
+            Some(value) => value,
+            None => !value.is_empty(),
+        };
+        if !enabled {
+            return false;
+        }
+    }
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| config.get_bool("advice", None, name))
+        .unwrap_or(true)
+}
+
+/// Find the topmost path component of `git_path` that a `.gitignore` rule
+/// excludes, mirroring git's `dir.c` directory walk: it descends component by
+/// component and records the first directory it is told to ignore (pruning the
+/// subtree), or — if no parent directory is ignored — the leaf itself.
+///
+/// `add sub/file` (with `sub/` ignored) reports `sub`; `add dir/sub/ign`
+/// reports `dir/sub`; `add ign` reports `ign`. Returns `None` when nothing on
+/// the path is ignored.
+fn topmost_ignored_prefix(
+    worktree_root: &Path,
+    git_path: &[u8],
+    absolute: &Path,
+) -> Result<Option<Vec<u8>>> {
+    // Check each leading directory prefix in order; the first ignored directory
+    // is the one git records (and stops descending into).
+    let mut start = 0;
+    while let Some(offset) = git_path[start..].iter().position(|byte| *byte == b'/') {
+        let end = start + offset;
+        let prefix = &git_path[..end];
+        if sley_worktree::path_matches_standard_ignore(worktree_root, prefix, true)? {
+            return Ok(Some(prefix.to_vec()));
+        }
+        start = end + 1;
+    }
+    // No ignored parent directory: classify the leaf as a file or directory.
+    let is_dir = fs::symlink_metadata(absolute)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false);
+    if sley_worktree::path_matches_standard_ignore(worktree_root, git_path, is_dir)? {
+        return Ok(Some(git_path.to_vec()));
+    }
+    Ok(None)
+}
+
+/// Whether a pathspec brings in at least one untracked, unignored worktree file
+/// — git's directory walk (`fill_directory` + `prune_directory`) setting
+/// `seen[i]`. A pathspec with such a "dense" untracked match never triggers the
+/// sparse warning even if it also matched a skip-worktree index entry
+/// (`git add "*_entry"` stages the new `dense_entry` and stays quiet).
+fn pathspec_matches_untracked_dense(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    git_path: &[u8],
+    is_glob: bool,
+    gate: &sley_worktree::SparseGate,
+) -> Result<bool> {
+    // Untracked, unignored worktree files are exactly the `??` entries of the
+    // status walk. A pathspec matches one when (glob) the matcher accepts it or
+    // (plain) it equals the path or is a leading directory of it. An untracked
+    // file that itself lies outside the sparse cone is NOT a dense match (git
+    // would not stage it), so skip those — they belong to the sparse gate.
+    for entry in sley_worktree::short_status(worktree_root, git_dir, format)? {
+        if entry.index != b'?' || entry.worktree != b'?' {
+            continue;
+        }
+        let candidate = &entry.path;
+        let matches = if git_path.is_empty() {
+            true
+        } else if is_glob {
+            sley_worktree::pathspec_item_matches(
+                git_path,
+                candidate,
+                sley_worktree::PathspecMatchMagic::default(),
+            )
+        } else {
+            candidate.as_slice() == git_path
+                || candidate.starts_with(git_path) && candidate.get(git_path.len()) == Some(&b'/')
+        };
+        if matches && gate.path_in_sparse_checkout(candidate) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The untracked, unignored worktree files matched by a pathspec that fall
+/// *outside* the sparse cone — git's `add_files` reports each such `dir->entries`
+/// name via the `advice.updateSparsePath` block (`add x/y/z/f` lists the
+/// resolved `x/y/z/f`). Only consulted when the pathspec matched no tracked or
+/// dense path; glob pathspecs are excluded (the walk prunes them differently).
+fn untracked_paths_outside_sparse(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    git_path: &[u8],
+    is_glob: bool,
+    gate: &sley_worktree::SparseGate,
+) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for entry in sley_worktree::short_status(worktree_root, git_dir, format)? {
+        if entry.index != b'?' || entry.worktree != b'?' {
+            continue;
+        }
+        let candidate = &entry.path;
+        let matches = if git_path.is_empty() {
+            true
+        } else if is_glob {
+            sley_worktree::pathspec_item_matches(
+                git_path,
+                candidate,
+                sley_worktree::PathspecMatchMagic::default(),
+            )
+        } else {
+            candidate.as_slice() == git_path
+                || candidate.starts_with(git_path) && candidate.get(git_path.len()) == Some(&b'/')
+        };
+        if matches && !gate.path_in_sparse_checkout(candidate) {
+            out.push(candidate.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Sparse / ignored explicit-path gate for `git add` (builtin/add.c).
+///
+/// For every explicitly-named pathspec, decide whether `add` must refuse it:
+/// * a pathspec matching tracked index entries that are *all* outside the
+///   sparse-checkout cone (or carry the skip-worktree bit) is reported via the
+///   `advice.updateSparsePath` block and makes `add` exit 1 (unless `--sparse`);
+/// * an untracked pathspec resolving only to `.gitignore`d worktree paths is
+///   reported via "The following paths are ignored …" and exits 1 (unless `-f`).
+///
+/// The pathspec is displayed using the *original* text the user typed (git lists
+/// `.`, `sparse_entry`, etc. — not the resolved index path). Dense pathspecs
+/// (matching at least one in-cone, unignored path) pass through silently.
+fn gate_add_explicit_paths(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    force: bool,
+    include_sparse: bool,
+) -> Result<()> {
+    let gate = sley_worktree::SparseGate::load(git_dir, format)?;
+    // Index entries (any stage) keyed by git path, so we can tell whether a
+    // pathspec matches a tracked entry and whether every match is out-of-cone.
+    let index_entries = sley_worktree::read_repository_index(git_dir, format)?
+        .map(|index| index.entries)
+        .unwrap_or_default();
+    let index_paths: Vec<Vec<u8>> = index_entries
+        .iter()
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
+
+    let mut sparse_pathspecs: Vec<Vec<u8>> = Vec::new();
+    let mut ignored_paths: Vec<Vec<u8>> = Vec::new();
+
+    for original in paths {
+        let absolute = if original.is_absolute() {
+            original.clone()
+        } else {
+            cwd.join(original)
+        };
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            continue;
+        };
+        let Ok(git_path) = add_git_path_bytes(relative) else {
+            continue;
+        };
+        let display = original.to_string_lossy().into_owned().into_bytes();
+        let is_glob = sley_worktree::pathspec_is_glob(&git_path);
+
+        // Which tracked index entries does this pathspec match? A plain pathspec
+        // matches a literal entry or any entry under that directory prefix; a
+        // glob pathspec matches by git's pathspec matcher.
+        let matched: Vec<&[u8]> = index_paths
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|entry| {
+                // The root pathspec (`.` / empty) matches every tracked entry.
+                if git_path.is_empty() {
+                    return true;
+                }
+                if is_glob {
+                    sley_worktree::pathspec_item_matches(
+                        &git_path,
+                        entry,
+                        sley_worktree::PathspecMatchMagic::default(),
+                    )
+                } else {
+                    *entry == git_path.as_slice()
+                        || entry.starts_with(&git_path)
+                            && entry.get(git_path.len()) == Some(&b'/')
+                }
+            })
+            .collect();
+
+        // Split the matched index entries into "dense" (in-cone, non-skip — git
+        // stages these) and "sparse" (skip-worktree or out-of-cone). Git's gate
+        // only warns about a pathspec when it matched a sparse entry AND brought
+        // in NO dense path (tracked-dense or untracked-unignored). So track both.
+        let mut matched_dense = matched
+            .iter()
+            .any(|entry| gate.classify(entry, false) == sley_worktree::PathspecClass::Tracked);
+        let matched_sparse = matched
+            .iter()
+            .any(|entry| gate.classify(entry, false) == sley_worktree::PathspecClass::OutsideSparse);
+
+        // Does the pathspec also pull in an untracked, unignored worktree file?
+        // `git add "*_entry"` matches the tracked-sparse `sparse_entry` AND the
+        // untracked `dense_entry`; the untracked dense match suppresses the
+        // sparse warning (git sets `seen[i]` during the directory walk).
+        if !matched_dense {
+            matched_dense = pathspec_matches_untracked_dense(
+                worktree_root,
+                git_dir,
+                format,
+                &git_path,
+                is_glob,
+                &gate,
+            )?;
+        }
+
+        // Sparse / skip-worktree gate: a pathspec whose only matches are outside
+        // the cone is refused with the `advice.updateSparsePath` block (unless
+        // `--sparse`). The original pathspec text is what git lists.
+        if matched_sparse && !matched_dense && !include_sparse {
+            sparse_pathspecs.push(display);
+            continue;
+        }
+        if matched_sparse || matched_dense {
+            continue;
+        }
+
+        // No tracked or in-cone untracked match. Two remaining cases for this
+        // untracked pathspec:
+        //  (a) it resolves to untracked files *outside* the sparse cone — git's
+        //      `add_files` reports each resolved name via `updateSparsePath`
+        //      (`add x/y/z/f` lists `x/y/z/f`); refused unless `--sparse`.
+        //  (b) it is `.gitignore`d — git records the topmost ignored component
+        //      (`add sub/file` reports `sub`); refused unless `-f`.
+        if !include_sparse && !gate.is_inert() {
+            let outside =
+                untracked_paths_outside_sparse(worktree_root, git_dir, format, &git_path, is_glob, &gate)?;
+            if !outside.is_empty() {
+                sparse_pathspecs.extend(outside);
+                continue;
+            }
+        }
+        if !force && !is_glob && !git_path.is_empty() {
+            if let Some(top) = topmost_ignored_prefix(worktree_root, &git_path, &absolute)? {
+                ignored_paths.push(top);
+            }
+        }
+    }
+
+    let mut exit_error = false;
+    if !ignored_paths.is_empty() {
+        ignored_paths.sort();
+        ignored_paths.dedup();
+        eprintln!("The following paths are ignored by one of your .gitignore files:");
+        for path in &ignored_paths {
+            eprintln!("{}", String::from_utf8_lossy(path));
+        }
+        if advice_enabled(git_dir, "addIgnoredFile") {
+            eprintln!("hint: Use -f if you really want to add them.");
+            eprintln!(
+                "hint: Disable this message with \"git config set advice.addIgnoredFile false\""
+            );
+        }
+        exit_error = true;
+    }
+    if !sparse_pathspecs.is_empty() {
+        let show_hint = advice_enabled(git_dir, "updateSparsePath");
+        let advice = sley_worktree::updating_sparse_paths_advice(&sparse_pathspecs, show_hint);
+        eprint!("{}", String::from_utf8_lossy(&advice));
+        exit_error = true;
+    }
+    if exit_error {
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut paths = Vec::new();
     let mut dry_run = false;
@@ -852,6 +1148,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut ignore_removal = false;
     let mut ignore_missing = false;
     let mut chmod = None;
+    let mut include_sparse = false;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
     let mut parsing_options = true;
@@ -900,7 +1197,9 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     .expect("prefix checked by match guard");
                 chmod = Some(parse_add_chmod(value)?);
             }
-            "--ignore-errors" | "--no-ignore-errors" | "--sparse" | "--no-sparse" => {}
+            "--sparse" => include_sparse = true,
+            "--no-sparse" => include_sparse = false,
+            "--ignore-errors" | "--no-ignore-errors" => {}
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -981,6 +1280,22 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     die_on_pathspec_inside_submodule(&cwd, &worktree_root, &git_dir, format, &paths)?;
+    // Sparse / ignored explicit-path gate (builtin/add.c): refuse to stage an
+    // explicitly-named path that is ignored (unless `-f`) or that exists outside
+    // the sparse-checkout definition / carries the skip-worktree bit (unless
+    // `--sparse`). Skipped for the bare `-u`/`-A` (empty-pathspec) forms, which
+    // operate over tracked paths and have their own sparse handling.
+    if !paths.is_empty() {
+        gate_add_explicit_paths(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &paths,
+            force,
+            include_sparse,
+        )?;
+    }
     // git's `add` re-stats every tracked path it touches, including ones whose
     // content is unchanged (a `touch`ed file): `builtin/add.c` calls
     // `refresh_index` over the pathspec before/after staging, so the cached stat

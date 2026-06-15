@@ -4475,6 +4475,44 @@ impl SparseMatcher {
             SparseMatcher::Cone(cone) => cone.includes_file(path),
         }
     }
+
+    /// Decide whether `path` is in the sparse cone the way git's
+    /// `dir.c::path_in_sparse_checkout_1` does: if the leaf is UNDECIDED (no
+    /// pattern matched it) inherit the verdict from the nearest ancestor
+    /// directory, recursively, falling back to NOT_MATCHED at the top.
+    ///
+    /// Cone matching never returns UNDECIDED, so this collapses to a single
+    /// [`Self::includes_file`] check there. Full (non-cone) matching needs the
+    /// parent walk so a directory pattern (`w`, `y/`) includes its descendants.
+    fn includes_path_with_parents(&self, path: &[u8]) -> bool {
+        let patterns = match self {
+            SparseMatcher::Cone(_) => return self.includes_file(path),
+            SparseMatcher::Full { patterns } => patterns,
+        };
+        // Walk leaf → root. `is_dir` is false for the leaf (DT_REG) and true for
+        // every ancestor (DT_DIR), mirroring git's `dtype` progression.
+        let mut end = path.len();
+        let mut is_dir = false;
+        while end > 0 {
+            let prefix = &path[..end];
+            let mut verdict: Option<bool> = None;
+            for pattern in patterns {
+                if pattern.matches_sparse_level(prefix, is_dir) {
+                    verdict = Some(!pattern.negated);
+                }
+            }
+            if let Some(included) = verdict {
+                return included;
+            }
+            // Move to the parent directory; `dtype` becomes DT_DIR.
+            end = match prefix.iter().rposition(|byte| *byte == b'/') {
+                Some(slash) => slash,
+                None => 0,
+            };
+            is_dir = true;
+        }
+        false
+    }
 }
 
 impl ConeMatcher {
@@ -4582,6 +4620,184 @@ fn sparse_has_glob_meta(body: &[u8]) -> bool {
     trimmed
         .iter()
         .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+}
+
+// --------------------------------------------------------------------------
+// Shared sparse / ignored explicit-path gate (dir.c::path_in_sparse_checkout)
+// --------------------------------------------------------------------------
+
+/// How an explicitly-named pathspec relates to the sparse cone and `.gitignore`,
+/// mirroring the gate git applies in `builtin/{add,rm,mv}.c` before touching an
+/// explicitly-named path. The classification is a single seam so the refusal /
+/// skip behaviour for add, rm, mv and reset stays correct-by-construction
+/// (lift-to-primitive) rather than re-derived per command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathspecClass {
+    /// The path is inside the sparse-checkout definition (or sparse-checkout is
+    /// not active) and is not ignored — the command may act on it normally.
+    Tracked,
+    /// The path is matched by a `.gitignore` rule. `git add` refuses it (exit 1)
+    /// with "The following paths are ignored by one of your .gitignore files"
+    /// unless `-f` is given.
+    Ignored,
+    /// The path exists outside the sparse-checkout cone (or its index entry has
+    /// the skip-worktree bit set). add/rm/mv refuse it (exit 1) with the
+    /// `advice.updateSparsePath` hint unless `--sparse` is given.
+    OutsideSparse,
+}
+
+/// The sparse-checkout gate for a repository: the compiled pattern matcher (when
+/// `core.sparseCheckout=true`) plus the set of index paths carrying the
+/// skip-worktree bit. Build once with [`SparseGate::load`], then query many
+/// paths with [`SparseGate::path_in_sparse_checkout`]. When sparse-checkout is
+/// disabled and no entries carry the skip-worktree bit the gate is a no-op:
+/// every path is reported in-cone, matching git's "accept if no patterns".
+#[derive(Debug)]
+pub struct SparseGate {
+    matcher: Option<SparseMatcher>,
+    skip_worktree: BTreeSet<Vec<u8>>,
+}
+
+impl SparseGate {
+    /// Load the sparse gate for the repository at `git_dir`. Reads
+    /// `core.sparseCheckout` / `core.sparseCheckoutCone` (honouring
+    /// `extensions.worktreeConfig`, where `git sparse-checkout init` writes
+    /// them), the `$GIT_DIR/info/sparse-checkout` pattern file, and the
+    /// skip-worktree bits already present in the index.
+    pub fn load(git_dir: &Path, format: ObjectFormat) -> Result<Self> {
+        let enabled = read_sparse_aware_bool(git_dir, "sparseCheckout").unwrap_or(false);
+        let matcher = if enabled {
+            read_sparse_checkout_patterns(git_dir)?.map(|patterns| {
+                let cone = read_sparse_aware_bool(git_dir, "sparseCheckoutCone").unwrap_or(false);
+                let mode = if cone {
+                    SparseCheckoutMode::Cone
+                } else {
+                    SparseCheckoutMode::Full
+                };
+                let sparse = SparseCheckout {
+                    patterns,
+                    sparse_index: false,
+                };
+                SparseMatcher::new(&sparse, mode)
+            })
+        } else {
+            None
+        };
+        let skip_worktree = skip_worktree_paths(git_dir, format)?;
+        Ok(Self {
+            matcher,
+            skip_worktree,
+        })
+    }
+
+    /// Whether this gate is a no-op (sparse-checkout disabled and no
+    /// skip-worktree entries). Callers can short-circuit the per-path
+    /// classification when there is nothing to gate.
+    pub fn is_inert(&self) -> bool {
+        self.matcher.is_none() && self.skip_worktree.is_empty()
+    }
+
+    /// Port of `dir.c::path_in_sparse_checkout`: returns `true` when `path`
+    /// should be present in the worktree under the current sparse-checkout.
+    ///
+    /// Git "defaults to accepting a path" when there are no patterns, so a
+    /// repository without an active sparse-checkout reports every path as
+    /// in-cone. When patterns are active, full (non-cone) matching walks the
+    /// path's parent directories the way git does for an UNDECIDED leaf so a
+    /// directory pattern includes its descendants.
+    pub fn path_in_sparse_checkout(&self, path: &[u8]) -> bool {
+        let Some(matcher) = self.matcher.as_ref() else {
+            return true;
+        };
+        if path.is_empty() {
+            return true;
+        }
+        matcher.includes_path_with_parents(path)
+    }
+
+    /// Whether `path` carries the skip-worktree bit in the index. Git's add/mv
+    /// gate treats a skip-worktree entry as outside the cone even when
+    /// `core.sparseCheckout` is false (t3705 `setup_sparse_entry`).
+    pub fn is_skip_worktree(&self, path: &[u8]) -> bool {
+        self.skip_worktree.contains(path)
+    }
+
+    /// Classify a single explicitly-named index path against the sparse gate.
+    /// `ignored` reports whether `.gitignore` excludes the path (only consulted
+    /// by `git add` for paths not already tracked; rm/mv pass `false`). The
+    /// result drives the refuse/skip decision in the calling command.
+    pub fn classify(&self, path: &[u8], ignored: bool) -> PathspecClass {
+        if ignored {
+            return PathspecClass::Ignored;
+        }
+        if self.is_skip_worktree(path) || !self.path_in_sparse_checkout(path) {
+            return PathspecClass::OutsideSparse;
+        }
+        PathspecClass::Tracked
+    }
+}
+
+/// Read a `core.<key>` boolean, honouring the per-worktree `config.worktree`
+/// when `extensions.worktreeConfig=true` (where `git sparse-checkout` stores
+/// `core.sparseCheckout*`). git reads worktree config transparently; sley's
+/// `read_repo_config` only reads the shared `config`, so consult the worktree
+/// file first (it takes precedence) and fall back to the shared config.
+fn read_sparse_aware_bool(git_dir: &Path, key: &str) -> Option<bool> {
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    if config.get_bool("extensions", None, "worktreeConfig") == Some(true) {
+        let worktree_config_path = git_dir.join("config.worktree");
+        if worktree_config_path.exists()
+            && let Ok(worktree_config) = GitConfig::read(&worktree_config_path)
+            && let Some(value) = worktree_config.get_bool("core", None, key)
+        {
+            return Some(value);
+        }
+    }
+    config.get_bool("core", None, key)
+}
+
+/// Read `$GIT_DIR/info/sparse-checkout` into pattern lines, dropping a single
+/// trailing newline's empty element. `None` when the file is absent.
+fn read_sparse_checkout_patterns(git_dir: &Path) -> Result<Option<Vec<Vec<u8>>>> {
+    let path = git_dir.join("info").join("sparse-checkout");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut lines: Vec<Vec<u8>> = bytes.split(|byte| *byte == b'\n').map(<[u8]>::to_vec).collect();
+    if lines.last().map(Vec::is_empty) == Some(true) {
+        lines.pop();
+    }
+    Ok(Some(lines))
+}
+
+/// The byte-text of the `advice.updateSparsePath` block git emits for paths that
+/// exist outside the sparse-checkout definition (`advise_on_updating_sparse_paths`
+/// in advice.c). The `paths` are listed verbatim in command-line order; the
+/// trailing hint lines are gated by `advice.updateSparsePath` (default true).
+/// Mirrors the header / body / `Disable this message` trailer byte-for-byte so a
+/// `test_cmp` of stderr matches.
+pub fn updating_sparse_paths_advice(paths: &[Vec<u8>], show_hint: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        b"The following paths and/or pathspecs matched paths that exist\n\
+          outside of your sparse-checkout definition, so will not be\n\
+          updated in the index:\n",
+    );
+    for path in paths {
+        out.extend_from_slice(path);
+        out.push(b'\n');
+    }
+    if show_hint {
+        out.extend_from_slice(
+            b"hint: If you intend to update such entries, try one of the following:\n\
+              hint: * Use the --sparse option.\n\
+              hint: * Disable or modify the sparsity rules.\n\
+              hint: Disable this message with \"git config set advice.updateSparsePath false\"\n",
+        );
+    }
+    out
 }
 
 fn read_core_excludes_file(root: &Path, patterns: &mut Vec<IgnorePattern>) -> bool {
@@ -4853,6 +5069,29 @@ impl IgnorePattern {
     /// comparison; only complex globs pay for the allocating wildcard engine.
     fn match_segment(&self, value: &[u8]) -> bool {
         self.match_path(value)
+    }
+
+    /// Decide whether this pattern matches `path` treated as a *single* entity
+    /// of the given `is_dir` type, the way git's `match_pathname` / `match_basename`
+    /// behave at one level of `path_in_sparse_checkout`'s leaf→root walk.
+    ///
+    /// Unlike [`Self::matches_with_basename`], this does NOT implicitly match a
+    /// file through one of its ancestor directories — the caller's walk visits
+    /// each ancestor explicitly. A directory-only pattern (`y/`) therefore only
+    /// matches when `is_dir` is true (git's MUSTBEDIR skip for `DT_REG`).
+    fn matches_sparse_level(&self, path: &[u8], is_dir: bool) -> bool {
+        // Strip the (sparse patterns carry no) per-directory base; sparse
+        // patterns are always compiled with an empty base.
+        debug_assert!(self.base.is_empty());
+        if self.directory_only && !is_dir {
+            return false;
+        }
+        if self.anchored || self.has_slash {
+            self.match_path(path)
+        } else {
+            let basename = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+            self.match_segment(basename)
+        }
     }
 }
 
