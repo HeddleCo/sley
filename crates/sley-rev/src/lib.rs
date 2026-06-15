@@ -1056,6 +1056,7 @@ struct RawCommitGraph {
     format: ObjectFormat,
     fanout: [u32; 256],
     commit_count: usize,
+    entry_len: usize,
     oidl: Range<usize>,
     cdat: Range<usize>,
     edge: Option<Range<usize>>,
@@ -1064,7 +1065,6 @@ struct RawCommitGraph {
 struct RawCommitGraphCountState {
     seen: Vec<u64>,
     pending: Vec<usize>,
-    parents: Vec<usize>,
 }
 
 impl RawCommitGraphCountState {
@@ -1072,7 +1072,6 @@ impl RawCommitGraphCountState {
         Self {
             seen: vec![0u64; commit_count.div_ceil(64)],
             pending: Vec::new(),
-            parents: Vec::new(),
         }
     }
 }
@@ -1255,6 +1254,7 @@ impl RawCommitGraph {
             format,
             fanout,
             commit_count,
+            entry_len,
             oidl,
             cdat,
             edge,
@@ -1303,8 +1303,7 @@ impl RawCommitGraph {
             }
             state.seen[word] |= bit;
             count += 1;
-            self.parent_indices_for_entry(idx, first_parent, &mut state.parents)?;
-            state.pending.extend(state.parents.iter().copied());
+            self.push_parent_indices_for_entry(idx, first_parent, &mut state.pending)?;
         }
         Ok(count)
     }
@@ -1364,30 +1363,20 @@ impl RawCommitGraph {
                 "commit-graph CDAT index points past table".into(),
             ));
         }
-        let entry_len = raw_commit_graph_entry_len(self.format)?;
-        let start = self
-            .cdat
-            .start
-            .checked_add(idx.checked_mul(entry_len).ok_or_else(|| {
-                GitError::InvalidFormat("commit-graph CDAT index overflow".into())
-            })?)
-            .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))?;
-        let end = start
-            .checked_add(entry_len)
-            .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))?;
+        let start = self.cdat.start + idx * self.entry_len;
+        let end = start + self.entry_len;
         self.bytes
             .as_ref()
             .get(start..end)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT index overflow".into()))
     }
 
-    fn parent_indices_for_entry(
+    fn push_parent_indices_for_entry(
         &self,
         idx: usize,
         first_parent: bool,
         out: &mut Vec<usize>,
     ) -> Result<()> {
-        out.clear();
         let entry = self.cdat_entry(idx)?;
         let hash_len = self.format.raw_len();
         let parent_one = read_u32_be(&entry[hash_len..hash_len + 4]);

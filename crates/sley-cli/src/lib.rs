@@ -932,7 +932,19 @@ fn resolve_add_update_actions(
         .iter()
         .map(|(_, _, matched)| *matched)
         .collect::<Vec<_>>();
-    let status = sley_worktree::short_status(worktree_root, git_dir, format)?;
+    let status = if include_untracked {
+        sley_worktree::short_status(worktree_root, git_dir, format)?
+    } else {
+        sley_worktree::short_status_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            sley_worktree::ShortStatusOptions {
+                untracked_mode: sley_worktree::StatusUntrackedMode::None,
+                ..Default::default()
+            },
+        )?
+    };
     let mut actions = Vec::new();
     for entry in status {
         if entry.index == b'?' && entry.worktree == b'?' {

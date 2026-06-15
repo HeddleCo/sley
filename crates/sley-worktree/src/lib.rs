@@ -3,9 +3,9 @@ use sley_core::{
     BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, RepoPath,
     Result,
 };
-use sley_index::{CacheTree, Index, IndexEntry, Stage};
+use sley_index::{BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, Stage};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
-use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
+use sley_odb::{FileObjectDatabase, ObjectPresenceChecker, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -80,6 +80,12 @@ pub struct ApplySparseResult {
 pub struct UpdateIndexResult {
     pub entries: usize,
     pub updated: Vec<ObjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddUpdateTrackedAction {
+    Add(Vec<u8>),
+    Remove(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -782,6 +788,214 @@ pub fn update_index_paths_filtered(
     )
 }
 
+pub fn add_update_all_tracked_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    clean_config: &GitConfig,
+) -> Result<Vec<AddUpdateTrackedAction>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let index_mtime = fs::metadata(&index_path)
+        .ok()
+        .and_then(|metadata| file_mtime_parts(&metadata));
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache)?;
+    if prechecks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pending = prechecks
+        .into_iter()
+        .map(|precheck| match precheck {
+            TrackedOnlyPrecheck::Deleted(idx) => {
+                (precheck, index.entries[idx].path.as_bytes().to_vec())
+            }
+            TrackedOnlyPrecheck::Slow(idx) => {
+                (precheck, index.entries[idx].path.as_bytes().to_vec())
+            }
+        })
+        .collect::<Vec<_>>();
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut actions = Vec::new();
+    let mut index_dirty = false;
+    let mut clean_filter = None;
+    for (precheck, path) in pending {
+        match precheck {
+            TrackedOnlyPrecheck::Deleted(_) => {
+                if remove_index_entries_with_path(&mut index.entries, &path) {
+                    actions.push(AddUpdateTrackedAction::Remove(path));
+                    index_dirty = true;
+                }
+            }
+            TrackedOnlyPrecheck::Slow(_) => {
+                let (action, dirty) = add_update_tracked_path(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    clean_config,
+                    &odb,
+                    &stat_cache,
+                    &mut clean_filter,
+                    &mut index,
+                    &path,
+                )?;
+                index_dirty |= dirty;
+                if let Some(action) = action {
+                    actions.push(action);
+                }
+            }
+        }
+    }
+
+    if index_dirty {
+        normalize_index_version_for_extended_flags(&mut index);
+        index.extensions = index_extensions_without_cache_tree(&index.extensions);
+        fs::write(index_path, index.write(format)?)?;
+    }
+    Ok(actions)
+}
+
+fn add_update_tracked_path(
+    worktree_root: &Path,
+    _git_dir: &Path,
+    format: ObjectFormat,
+    clean_config: &GitConfig,
+    odb: &FileObjectDatabase,
+    stat_cache: &IndexStatCache,
+    clean_filter: &mut Option<TrackedOnlyCleanFilter>,
+    index: &mut Index,
+    git_path: &[u8],
+) -> Result<(Option<AddUpdateTrackedAction>, bool)> {
+    let range = index_entries_path_range(&index.entries, git_path);
+    if range.is_empty() {
+        return Ok((None, false));
+    }
+    let entry = index.entries[range.start].clone();
+    if entry.stage() != Stage::Normal {
+        return Ok((None, false));
+    }
+    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            if remove_index_entries_with_path(&mut index.entries, git_path) {
+                return Ok((
+                    Some(AddUpdateTrackedAction::Remove(git_path.to_vec())),
+                    true,
+                ));
+            }
+            return Ok((None, false));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() {
+        if entry.mode != 0o160000 {
+            return Ok((None, false));
+        }
+        let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(entry.oid);
+        let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+        updated_entry.mode = 0o160000;
+        let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
+        if updated_entry != entry {
+            replace_index_entries_with_entry(&mut index.entries, updated_entry);
+            return Ok((
+                changed.then(|| AddUpdateTrackedAction::Add(git_path.to_vec())),
+                true,
+            ));
+        }
+        return Ok((None, false));
+    }
+    if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+        return Ok((None, false));
+    }
+    if stat_cache.reuse_index_entry(&entry, &metadata).is_some() {
+        return Ok((None, false));
+    }
+
+    let is_symlink = metadata.file_type().is_symlink();
+    let body = if is_symlink {
+        symlink_target_bytes(&absolute)?
+    } else {
+        let body = fs::read(&absolute)?;
+        let clean_filter =
+            tracked_only_clean_filter_with_config(clean_filter, worktree_root, clean_config);
+        clean_filter.read_attributes_for_path(worktree_root, git_path)?;
+        let checks =
+            clean_filter
+                .matcher
+                .attributes_for_path(git_path, &clean_filter.requested, false);
+        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+    };
+    let object = EncodedObject::new(ObjectType::Blob, body);
+    let oid = object.object_id(format)?;
+    if oid != entry.oid {
+        odb.write_object(object)?;
+    }
+    let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+    if is_symlink {
+        updated_entry.mode = 0o120000;
+    }
+    let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
+    if updated_entry != entry {
+        replace_index_entries_with_entry(&mut index.entries, updated_entry);
+        return Ok((
+            changed.then(|| AddUpdateTrackedAction::Add(git_path.to_vec())),
+            true,
+        ));
+    }
+    Ok((None, false))
+}
+
+enum UpdateIndexCleanFilter {
+    Full(AttributeMatcher),
+    PathLocal,
+}
+
+fn index_entries_path_range(entries: &[IndexEntry], path: &[u8]) -> std::ops::Range<usize> {
+    let mut start = match entries.binary_search_by(|entry| entry.path.as_bytes().cmp(path)) {
+        Ok(index) => index,
+        Err(insert) => return insert..insert,
+    };
+    while start > 0 && entries[start - 1].path.as_bytes() == path {
+        start -= 1;
+    }
+    let mut end = start;
+    while end < entries.len() && entries[end].path.as_bytes() == path {
+        end += 1;
+    }
+    start..end
+}
+
+fn remove_index_entries_with_path(entries: &mut Vec<IndexEntry>, path: &[u8]) -> bool {
+    let range = index_entries_path_range(entries, path);
+    if range.is_empty() {
+        return false;
+    }
+    entries.drain(range);
+    true
+}
+
+fn replace_index_entries_with_entry(entries: &mut Vec<IndexEntry>, entry: IndexEntry) {
+    let path = entry.path.as_bytes().to_vec();
+    let range = index_entries_path_range(entries, &path);
+    if range.is_empty() {
+        entries.insert(range.start, entry);
+    } else {
+        entries.splice(range, [entry]);
+    }
+}
+
 fn update_index_paths_impl(
     worktree_root: &Path,
     git_dir: &Path,
@@ -803,17 +1017,14 @@ fn update_index_paths_impl(
         }
     };
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
-    // Build the `.gitattributes` matcher ONCE for the whole batch when clean
-    // filters are in play. `apply_clean_filter` rebuilds it from scratch on every
-    // call — and `AttributeMatcher::from_worktree_root` walks the entire worktree
-    // (a stat per file) to collect `.gitattributes`. Calling it per staged path
-    // made `add -u` of D dirty files in an N-file tree cost D*N stats (sley#27's
-    // dominant remaining term after the fsync fix: 10 dirty x 1000 files ~ 11k
-    // statx vs git's ~1k). Resolving attributes per path against the shared
-    // matcher is byte-identical to the per-call rebuild, just without the
-    // redundant tree walks.
-    let attribute_matcher = match clean_config {
-        Some(_) => Some(AttributeMatcher::from_worktree_root(worktree_root)?),
+    // For small batches, read only each path's `.gitattributes` chain; a
+    // whole-worktree matcher can dominate `add -u` when only a few files are
+    // dirty in a huge checkout. Large batches still amortize the full matcher.
+    let clean_filter = match clean_config {
+        Some(_) if paths.len() >= 64 => Some(UpdateIndexCleanFilter::Full(
+            AttributeMatcher::from_worktree_root(worktree_root)?,
+        )),
+        Some(_) => Some(UpdateIndexCleanFilter::PathLocal),
         None => None,
     };
     let requested_filter_attrs = filter_attribute_names();
@@ -832,19 +1043,18 @@ fn update_index_paths_impl(
         })?;
         let git_path = git_path_bytes(relative)?;
         if options.force_remove {
-            index.entries.retain(|existing| existing.path != git_path);
+            remove_index_entries_with_path(&mut index.entries, &git_path);
             // git's update_one() reports `remove` for a --force-remove path.
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
             continue;
         }
-        if let Some(existing) = index
-            .entries
+        let existing_range = index_entries_path_range(&index.entries, &git_path);
+        if index.entries[existing_range.clone()]
             .iter()
-            .find(|existing| existing.path == git_path)
-            && index_entry_skip_worktree(existing)
+            .any(index_entry_skip_worktree)
         {
             if options.remove && !options.ignore_skip_worktree_entries {
-                index.entries.retain(|existing| existing.path != git_path);
+                index.entries.drain(existing_range);
             }
             continue;
         }
@@ -862,7 +1072,7 @@ fn update_index_paths_impl(
         };
         let Some(metadata) = symlink_metadata else {
             if options.remove {
-                index.entries.retain(|existing| existing.path != git_path);
+                remove_index_entries_with_path(&mut index.entries, &git_path);
                 // git's update_one() unconditionally reports `add '<path>'`
                 // after process_path(), even when the missing file was removed
                 // from the index via the `--remove` (not --force-remove) path.
@@ -872,12 +1082,7 @@ fn update_index_paths_impl(
             print_update_index_path_error(&git_path, "does not exist and --remove not passed");
             return Err(GitError::Exit(128));
         };
-        if !options.add
-            && !index
-                .entries
-                .iter()
-                .any(|existing| existing.path == git_path)
-        {
+        if !options.add && index_entries_path_range(&index.entries, &git_path).is_empty() {
             print_update_index_path_error(
                 &git_path,
                 "cannot add to the index - missing --add option?",
@@ -913,8 +1118,7 @@ fn update_index_paths_impl(
             let mut entry = index_entry_from_metadata(git_path.clone(), head_oid, &metadata);
             entry.mode = 0o160000;
             reports.push(format!("add '{display}'"));
-            index.entries.retain(|existing| existing.path != git_path);
-            index.entries.push(entry);
+            replace_index_entries_with_entry(&mut index.entries, entry);
             updated.push(head_oid);
             continue;
         }
@@ -925,14 +1129,17 @@ fn update_index_paths_impl(
             symlink_target_bytes(&absolute)?
         } else {
             let body = fs::read(&absolute)?;
-            match (clean_config, &attribute_matcher) {
-                (Some(config), Some(matcher)) => {
+            match (clean_config, &clean_filter) {
+                (Some(config), Some(UpdateIndexCleanFilter::Full(matcher))) => {
                     // Identical to `apply_clean_filter`, but reuses the batch's
                     // matcher instead of rebuilding it (and re-walking the tree)
                     // for this path.
                     let checks =
                         matcher.attributes_for_path(&git_path, &requested_filter_attrs, false);
                     apply_clean_filter_with_attributes(config, &checks, &git_path, &body)?
+                }
+                (Some(config), Some(UpdateIndexCleanFilter::PathLocal)) => {
+                    apply_clean_filter(worktree_root, git_dir, config, &git_path, &body)?
                 }
                 _ => body,
             }
@@ -970,13 +1177,9 @@ fn update_index_paths_impl(
                 String::from_utf8_lossy(&git_path)
             ));
         }
-        index.entries.retain(|existing| existing.path != git_path);
-        index.entries.push(entry);
+        replace_index_entries_with_entry(&mut index.entries, entry);
         updated.push(oid);
     }
-    index
-        .entries
-        .sort_by(|left, right| left.path.cmp(&right.path));
     normalize_index_version_for_extended_flags(&mut index);
     index.extensions = index_extensions_without_cache_tree(&index.extensions);
     fs::write(index_path, index.write(format)?)?;
@@ -1019,7 +1222,10 @@ pub fn refresh_index_paths(
     // sley re-hashed every tracked file on every refresh — the 3.2x slowdown in
     // sley#27. We build the cache from the same parsed index + the index file's
     // own mtime (the racy-clean reference) so no extra parse is needed.
-    let stat_cache = IndexStatCache::from_index(&index, &index_path);
+    let index_mtime = fs::metadata(&index_path)
+        .ok()
+        .and_then(|metadata| file_mtime_parts(&metadata));
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
     let selected_paths = paths
         .iter()
         .map(|path| {
@@ -1035,7 +1241,25 @@ pub fn refresh_index_paths(
         })
         .collect::<Result<Vec<_>>>()?;
     let selected_paths = selected_paths.into_iter().collect::<BTreeSet<_>>();
+    if selected_paths.is_empty()
+        && !really_refresh
+        && !index
+            .entries
+            .iter()
+            .any(|entry| entry.flags & INDEX_FLAG_ASSUME_UNCHANGED != 0)
+    {
+        return refresh_all_index_paths_parallel(
+            worktree_root,
+            &index_path,
+            format,
+            index,
+            stat_cache,
+            quiet,
+            ignore_missing,
+        );
+    }
     let mut needs_update = false;
+    let mut index_dirty = false;
     for entry in &mut index.entries {
         if index_entry_stage(entry) != 0 {
             continue;
@@ -1047,6 +1271,7 @@ pub fn refresh_index_paths(
                 continue;
             }
             entry.flags &= !INDEX_FLAG_ASSUME_UNCHANGED;
+            index_dirty = true;
         }
         let absolute = worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?);
         let Ok(metadata) = fs::metadata(&absolute) else {
@@ -1072,8 +1297,10 @@ pub fn refresh_index_paths(
         // refresh the stat fields from current metadata — byte-identical to the
         // clean arm below, since the oid stamped is the cached one and the
         // metadata is the same one that re-stamp would read.
-        if let Some(tracked) = stat_cache.reuse_tracked_entry(entry.path.as_bytes(), &metadata) {
-            *entry = index_entry_from_metadata(entry.path.clone(), tracked.oid, &metadata);
+        if stat_cache
+            .reuse_index_entry(entry, &metadata)
+            .is_some()
+        {
             continue;
         }
         let body = fs::read(&absolute)?;
@@ -1085,13 +1312,100 @@ pub fn refresh_index_paths(
             }
             needs_update = true;
             if selected_for_update {
-                *entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+                let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+                if updated_entry != *entry {
+                    *entry = updated_entry;
+                    index_dirty = true;
+                }
             }
             continue;
         }
-        *entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+        let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+        if updated_entry != *entry {
+            *entry = updated_entry;
+            index_dirty = true;
+        }
     }
-    fs::write(&index_path, index.write(format)?)?;
+    if index_dirty {
+        fs::write(&index_path, index.write(format)?)?;
+    }
+    if needs_update && !quiet {
+        return Err(GitError::Exit(1));
+    }
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+fn refresh_all_index_paths_parallel(
+    worktree_root: &Path,
+    index_path: &Path,
+    format: ObjectFormat,
+    mut index: Index,
+    stat_cache: IndexStatCache,
+    quiet: bool,
+    ignore_missing: bool,
+) -> Result<UpdateIndexResult> {
+    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache)?;
+    let mut needs_update = false;
+    let mut index_dirty = false;
+    for precheck in prechecks {
+        match precheck {
+            TrackedOnlyPrecheck::Deleted(idx) => {
+                if ignore_missing {
+                    continue;
+                }
+                if !quiet {
+                    print_update_index_needs_update(index.entries[idx].path.as_bytes());
+                }
+                needs_update = true;
+            }
+            TrackedOnlyPrecheck::Slow(idx) => {
+                let entry = &mut index.entries[idx];
+                let path = entry.path.as_bytes().to_vec();
+                let absolute = worktree_root.join(repo_path_to_os_path(&path)?);
+                let Ok(metadata) = fs::metadata(&absolute) else {
+                    if ignore_missing {
+                        continue;
+                    }
+                    if !quiet {
+                        print_update_index_needs_update(&path);
+                    }
+                    needs_update = true;
+                    continue;
+                };
+                if !metadata.is_file() {
+                    if !quiet {
+                        print_update_index_needs_update(&path);
+                    }
+                    needs_update = true;
+                    continue;
+                }
+                if stat_cache.reuse_index_entry(entry, &metadata).is_some() {
+                    continue;
+                }
+                let body = fs::read(&absolute)?;
+                let object = EncodedObject::new(ObjectType::Blob, body);
+                let oid = object.object_id(format)?;
+                if oid != entry.oid || file_mode(&metadata) != entry.mode {
+                    if !quiet {
+                        print_update_index_needs_update(&path);
+                    }
+                    needs_update = true;
+                    continue;
+                }
+                let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+                if updated_entry != *entry {
+                    *entry = updated_entry;
+                    index_dirty = true;
+                }
+            }
+        }
+    }
+    if index_dirty {
+        fs::write(index_path, index.write(format)?)?;
+    }
     if needs_update && !quiet {
         return Err(GitError::Exit(1));
     }
@@ -1634,66 +1948,188 @@ pub fn write_tree_from_index_with_options(
     // A repository with no index file yet (fresh init, nothing staged) is an
     // empty index: `git write-tree` / `git commit --allow-empty` produce the
     // empty tree rather than erroring.
-    let index = match fs::read(&index_path) {
-        Ok(bytes) => Index::parse(&bytes, format)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Index {
-            version: 2,
-            entries: Vec::new(),
-            extensions: Vec::new(),
-            checksum: None,
-        },
+    let index_bytes = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+            let mut checker = odb.presence_checker();
+            let empty: &[WriteTreeEntry<'_>] = &[];
+            return write_tree_entries_stream(
+                empty,
+                b"",
+                None,
+                &odb,
+                &mut checker,
+                options.missing_ok,
+            );
+        }
         Err(err) => return Err(err.into()),
     };
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut checker = odb.presence_checker();
+    match BorrowedIndex::parse(&index_bytes, format) {
+        Ok(index) => write_tree_from_borrowed_index(&index, format, &options, &odb, &mut checker),
+        Err(GitError::Unsupported(_)) => {
+            let index = Index::parse(&index_bytes, format)?;
+            write_tree_from_owned_index(&index, format, &options, &odb, &mut checker)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn write_tree_from_borrowed_index(
+    index: &BorrowedIndex<'_>,
+    format: ObjectFormat,
+    options: &WriteTreeOptions,
+    odb: &FileObjectDatabase,
+    checker: &mut ObjectPresenceChecker,
+) -> Result<ObjectId> {
+    let cache_tree = if options.prefix.is_none() {
+        index.cache_tree(format).ok().flatten()
+    } else {
+        None
+    };
+    if options.prefix.is_none() && !index.entries.iter().any(|entry| entry.is_intent_to_add()) {
+        return write_tree_entries_stream(
+            &index.entries,
+            b"",
+            cache_tree.as_ref(),
+            odb,
+            checker,
+            options.missing_ok,
+        );
+    }
     // intent-to-add entries (`git add -N`, `git reset -N`) are placeholders that do
     // NOT belong in a written tree — git's cache_tree_update skips CE_INTENT_TO_ADD.
     // Drop them before building, so `write-tree` succeeds and the tree omits them
     // (their empty-blob oid is also typically absent from the odb).
-    let tracked: Vec<IndexEntry> = index
-        .entries
-        .iter()
-        .filter(|entry| !entry.is_intent_to_add())
-        .cloned()
-        .collect();
-    let entries = write_tree_entries_for_prefix(&tracked, options.prefix.as_deref())?;
-    let mut root = TreeNode::default();
-    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
-    if !options.missing_ok {
-        let mut missing = false;
-        for entry in &entries {
-            // A gitlink's oid names a commit in the *submodule's* repository;
-            // it is never expected to exist in this odb (upstream
-            // update_one_entry: REF_OBJ check skips S_IFGITLINK entries).
-            if entry.mode == 0o160000 {
-                continue;
-            }
-            if !odb.contains(&entry.oid)? {
-                eprintln!(
-                    "error: invalid object {:o} {} for '{}'",
-                    entry.mode,
-                    entry.oid,
-                    String::from_utf8_lossy(entry.path.as_bytes())
-                );
-                missing = true;
-            }
-        }
-        if missing {
-            eprintln!("fatal: git-write-tree: error building trees");
-            return Err(GitError::Exit(128));
-        }
-    }
-    for entry in &entries {
-        root.insert(entry)?;
-    }
-    let mut odb = FileObjectDatabase::from_git_dir(git_dir, format);
-    write_tree_node(&root, &mut odb)
+    let entries = write_tree_entries_for_prefix(
+        index
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_intent_to_add()),
+        options.prefix.as_deref(),
+    )?;
+    write_tree_entries_stream(
+        &entries,
+        b"",
+        cache_tree.as_ref(),
+        odb,
+        checker,
+        options.missing_ok,
+    )
 }
 
-fn write_tree_entries_for_prefix(
-    entries: &[IndexEntry],
+fn write_tree_from_owned_index(
+    index: &Index,
+    format: ObjectFormat,
+    options: &WriteTreeOptions,
+    odb: &FileObjectDatabase,
+    checker: &mut ObjectPresenceChecker,
+) -> Result<ObjectId> {
+    let cache_tree = if options.prefix.is_none() {
+        index.cache_tree(format).ok().flatten()
+    } else {
+        None
+    };
+    if options.prefix.is_none() && !index.entries.iter().any(|entry| entry.is_intent_to_add()) {
+        return write_tree_entries_stream(
+            &index.entries,
+            b"",
+            cache_tree.as_ref(),
+            odb,
+            checker,
+            options.missing_ok,
+        );
+    }
+    let entries = write_tree_entries_for_prefix(
+        index
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_intent_to_add()),
+        options.prefix.as_deref(),
+    )?;
+    write_tree_entries_stream(
+        &entries,
+        b"",
+        cache_tree.as_ref(),
+        odb,
+        checker,
+        options.missing_ok,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct WriteTreeEntry<'a> {
+    path: &'a [u8],
+    mode: u32,
+    oid: ObjectId,
+}
+
+trait WriteTreeIndexEntry {
+    fn write_tree_path(&self) -> &[u8];
+    fn write_tree_mode(&self) -> u32;
+    fn write_tree_oid(&self) -> ObjectId;
+}
+
+impl WriteTreeIndexEntry for IndexEntry {
+    fn write_tree_path(&self) -> &[u8] {
+        self.path.as_bytes()
+    }
+
+    fn write_tree_mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn write_tree_oid(&self) -> ObjectId {
+        self.oid
+    }
+}
+
+impl WriteTreeIndexEntry for IndexEntryRef<'_> {
+    fn write_tree_path(&self) -> &[u8] {
+        self.path
+    }
+
+    fn write_tree_mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn write_tree_oid(&self) -> ObjectId {
+        self.oid
+    }
+}
+
+impl WriteTreeIndexEntry for WriteTreeEntry<'_> {
+    fn write_tree_path(&self) -> &[u8] {
+        self.path
+    }
+
+    fn write_tree_mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn write_tree_oid(&self) -> ObjectId {
+        self.oid
+    }
+}
+
+fn write_tree_entries_for_prefix<'a, E>(
+    entries: impl IntoIterator<Item = &'a E>,
     prefix: Option<&[u8]>,
-) -> Result<Vec<IndexEntry>> {
+) -> Result<Vec<WriteTreeEntry<'a>>>
+where
+    E: WriteTreeIndexEntry + 'a,
+{
     let Some(prefix) = prefix else {
-        return Ok(entries.to_vec());
+        return Ok(entries
+            .into_iter()
+            .map(|entry| WriteTreeEntry {
+                path: entry.write_tree_path(),
+                mode: entry.write_tree_mode(),
+                oid: entry.write_tree_oid(),
+            })
+            .collect());
     };
     let trimmed_len = prefix
         .iter()
@@ -1702,11 +2138,18 @@ fn write_tree_entries_for_prefix(
         .unwrap_or(0);
     let trimmed = &prefix[..trimmed_len];
     if trimmed.is_empty() {
-        return Ok(entries.to_vec());
+        return Ok(entries
+            .into_iter()
+            .map(|entry| WriteTreeEntry {
+                path: entry.write_tree_path(),
+                mode: entry.write_tree_mode(),
+                oid: entry.write_tree_oid(),
+            })
+            .collect());
     }
     let mut prefixed = Vec::new();
     for entry in entries {
-        let Some(remainder) = entry.path.as_bytes().strip_prefix(trimmed) else {
+        let Some(remainder) = entry.write_tree_path().strip_prefix(trimmed) else {
             continue;
         };
         let Some(stripped) = remainder.strip_prefix(b"/") else {
@@ -1715,9 +2158,11 @@ fn write_tree_entries_for_prefix(
         if stripped.is_empty() {
             continue;
         }
-        let mut entry = entry.clone();
-        entry.path = BString::from(stripped);
-        prefixed.push(entry);
+        prefixed.push(WriteTreeEntry {
+            path: stripped,
+            mode: entry.write_tree_mode(),
+            oid: entry.write_tree_oid(),
+        });
     }
     if prefixed.is_empty() {
         eprintln!(
@@ -1727,6 +2172,170 @@ fn write_tree_entries_for_prefix(
         return Err(GitError::Exit(128));
     }
     Ok(prefixed)
+}
+
+fn write_tree_entries_stream<E>(
+    entries: &[E],
+    prefix: &[u8],
+    cache_tree: Option<&CacheTree>,
+    odb: &FileObjectDatabase,
+    checker: &mut ObjectPresenceChecker,
+    missing_ok: bool,
+) -> Result<ObjectId>
+where
+    E: WriteTreeIndexEntry,
+{
+    if let Some(oid) = valid_cache_tree_oid(cache_tree, entries.len()) {
+        return Ok(oid);
+    }
+
+    let mut tree_entries = Vec::new();
+    let mut index = 0usize;
+    while index < entries.len() {
+        let entry = &entries[index];
+        let path = entry.write_tree_path();
+        let Some(remainder) = path.strip_prefix(prefix) else {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(path)
+            )));
+        };
+        if remainder.is_empty() || remainder[0] == b'/' {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(path)
+            )));
+        }
+
+        if let Some(slash) = remainder.iter().position(|byte| *byte == b'/') {
+            let name = &remainder[..slash];
+            if name.is_empty() {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid index path {}",
+                    String::from_utf8_lossy(path)
+                )));
+            }
+            let start = index;
+            let child_cache = cache_tree.and_then(|tree| {
+                tree.subtrees
+                    .iter()
+                    .find(|child| child.name.as_slice() == name)
+                    .map(|child| &child.tree)
+            });
+            if let Some(cached_count) = valid_cache_tree_entry_count(child_cache) {
+                let end = start.saturating_add(cached_count);
+                if cached_count > 0
+                    && end <= entries.len()
+                    && same_tree_component(entries[end - 1].write_tree_path(), prefix, name)?
+                    && (end == entries.len()
+                        || !same_tree_component(entries[end].write_tree_path(), prefix, name)?)
+                {
+                    index = end;
+                } else {
+                    index += 1;
+                    while index < entries.len()
+                        && same_tree_component(entries[index].write_tree_path(), prefix, name)?
+                    {
+                        index += 1;
+                    }
+                }
+            } else {
+                index += 1;
+                while index < entries.len()
+                    && same_tree_component(entries[index].write_tree_path(), prefix, name)?
+                {
+                    index += 1;
+                }
+            }
+            if let Some(oid) = valid_cache_tree_oid(child_cache, index - start) {
+                tree_entries.push(TreeEntry {
+                    mode: 0o040000,
+                    name: BString::from(name),
+                    oid,
+                });
+                continue;
+            }
+            let mut child_prefix = Vec::with_capacity(prefix.len() + name.len() + 1);
+            child_prefix.extend_from_slice(prefix);
+            child_prefix.extend_from_slice(name);
+            child_prefix.push(b'/');
+            let oid = write_tree_entries_stream(
+                &entries[start..index],
+                &child_prefix,
+                child_cache,
+                odb,
+                checker,
+                missing_ok,
+            )?;
+            tree_entries.push(TreeEntry {
+                mode: 0o040000,
+                name: BString::from(name),
+                oid,
+            });
+            continue;
+        }
+
+        let mode = entry.write_tree_mode();
+        let oid = entry.write_tree_oid();
+        if !missing_ok && mode != 0o160000 && !checker.contains(&oid)? {
+            eprintln!(
+                "error: invalid object {:o} {} for '{}'",
+                mode,
+                oid,
+                String::from_utf8_lossy(path)
+            );
+            eprintln!("fatal: git-write-tree: error building trees");
+            return Err(GitError::Exit(128));
+        }
+        tree_entries.push(TreeEntry {
+            mode,
+            name: BString::from(remainder),
+            oid,
+        });
+        index += 1;
+    }
+
+    tree_entries.sort_by(|left, right| {
+        git_tree_entry_cmp(
+            left.name.as_bytes(),
+            left.mode,
+            right.name.as_bytes(),
+            right.mode,
+        )
+    });
+    odb.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree {
+            entries: tree_entries,
+        }
+        .write(),
+    ))
+}
+
+fn valid_cache_tree_oid(tree: Option<&CacheTree>, entry_count: usize) -> Option<ObjectId> {
+    let tree = tree?;
+    if valid_cache_tree_entry_count(Some(tree))? != entry_count {
+        return None;
+    }
+    tree.oid
+}
+
+fn valid_cache_tree_entry_count(tree: Option<&CacheTree>) -> Option<usize> {
+    let tree = tree?;
+    if tree.entry_count < 0 || tree.oid.is_none() {
+        return None;
+    }
+    Some(tree.entry_count as usize)
+}
+
+fn same_tree_component(path: &[u8], prefix: &[u8], name: &[u8]) -> Result<bool> {
+    let Some(remainder) = path.strip_prefix(prefix) else {
+        return Err(GitError::InvalidPath(format!(
+            "invalid index path {}",
+            String::from_utf8_lossy(path)
+        )));
+    };
+    Ok(remainder.starts_with(name) && remainder.get(name.len()) == Some(&b'/'))
 }
 
 pub fn short_status(
@@ -2510,11 +3119,31 @@ fn tracked_only_non_clean_prechecks_parallel(
         .enumerate()
         .filter_map(|(idx, entry)| (entry.stage() == Stage::Normal).then_some(idx))
         .collect::<Vec<_>>();
+    if normal_indices.is_empty() {
+        return Ok(Vec::new());
+    }
     let max_workers = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
         .min(16);
     let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
+    if worker_count == 1 {
+        let mut prechecks = Vec::new();
+        let mut absolute = PathBuf::new();
+        for idx in normal_indices {
+            let entry = &index.entries[idx];
+            match tracked_only_stat_precheck(worktree_root, entry, stat_cache, &mut absolute)? {
+                TrackedOnlyPrecheckOutcome::Clean => {}
+                TrackedOnlyPrecheckOutcome::Deleted => {
+                    prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                }
+                TrackedOnlyPrecheckOutcome::Slow => {
+                    prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                }
+            }
+        }
+        return Ok(prechecks);
+    }
     let chunk_size = normal_indices.len().div_ceil(worker_count);
     let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
         let mut handles = Vec::new();
@@ -5500,7 +6129,31 @@ fn run_driver<'a>(
 /// `filter`) for `path` from the worktree `.gitattributes` chain.
 fn filter_attribute_checks(worktree_root: &Path, path: &[u8]) -> Result<Vec<AttributeCheck>> {
     let requested = filter_attribute_names();
-    standard_attributes_for_path(worktree_root, path, &requested, false)
+    let mut matcher = AttributeMatcher::default();
+    if !matcher.read_configured_attributes(worktree_root) {
+        matcher.read_default_global_attributes();
+    }
+    read_dir_attribute_patterns_for_base(worktree_root, &[], &mut matcher)?;
+    let mut prefix = Vec::new();
+    let mut parts = path.split(|byte| *byte == b'/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(part);
+        let dir = worktree_root.join(repo_path_to_os_path(&prefix)?);
+        read_dir_attribute_patterns_for_base(&dir, &prefix, &mut matcher)?;
+    }
+    read_attribute_patterns(
+        worktree_root.join(".git").join("info").join("attributes"),
+        &mut matcher,
+        &[],
+        b".git/info/attributes",
+    );
+    Ok(matcher.attributes_for_path(path, &requested, false))
 }
 
 /// Compute filtering attributes for a checkout (blob -> worktree), reading
@@ -8748,6 +9401,24 @@ fn tracked_only_clean_filter<'a>(
         .expect("tracked-only clean filter initialized")
 }
 
+fn tracked_only_clean_filter_with_config<'a>(
+    clean_filter: &'a mut Option<TrackedOnlyCleanFilter>,
+    worktree_root: &Path,
+    config: &GitConfig,
+) -> &'a mut TrackedOnlyCleanFilter {
+    if clean_filter.is_none() {
+        *clean_filter = Some(TrackedOnlyCleanFilter {
+            config: config.clone(),
+            matcher: AttributeMatcher::from_worktree_base(worktree_root),
+            requested: filter_attribute_names(),
+            attribute_dirs: BTreeSet::new(),
+        });
+    }
+    clean_filter
+        .as_mut()
+        .expect("tracked-only clean filter initialized")
+}
+
 struct WorktreeEntriesWalk<'a> {
     git_dir: &'a Path,
     format: ObjectFormat,
@@ -9106,86 +9777,6 @@ fn prune_empty_parents(root: &Path, mut dir: Option<&Path>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Default)]
-struct TreeNode {
-    files: Vec<TreeFile>,
-    directories: BTreeMap<Vec<u8>, TreeNode>,
-}
-
-#[derive(Debug)]
-struct TreeFile {
-    name: Vec<u8>,
-    mode: u32,
-    oid: ObjectId,
-}
-
-impl TreeNode {
-    fn insert(&mut self, entry: &IndexEntry) -> Result<()> {
-        let components = entry
-            .path
-            .as_bytes()
-            .split(|byte| *byte == b'/')
-            .collect::<Vec<_>>();
-        if components.iter().any(|component| component.is_empty()) {
-            return Err(GitError::InvalidPath(format!(
-                "invalid index path {}",
-                String::from_utf8_lossy(entry.path.as_bytes())
-            )));
-        }
-        self.insert_components(&components, entry)
-    }
-
-    fn insert_components(&mut self, components: &[&[u8]], entry: &IndexEntry) -> Result<()> {
-        match components {
-            [] => Err(GitError::InvalidPath("empty index path".into())),
-            [name] => {
-                self.files.push(TreeFile {
-                    name: name.to_vec(),
-                    mode: entry.mode,
-                    oid: entry.oid,
-                });
-                Ok(())
-            }
-            [directory, rest @ ..] => self
-                .directories
-                .entry(directory.to_vec())
-                .or_default()
-                .insert_components(rest, entry),
-        }
-    }
-}
-
-fn write_tree_node(node: &TreeNode, odb: &mut FileObjectDatabase) -> Result<ObjectId> {
-    let mut entries = Vec::with_capacity(node.files.len() + node.directories.len());
-    for file in &node.files {
-        entries.push(TreeEntry {
-            mode: file.mode,
-            name: BString::from(file.name.as_slice()),
-            oid: file.oid,
-        });
-    }
-    for (name, child) in &node.directories {
-        let oid = write_tree_node(child, odb)?;
-        entries.push(TreeEntry {
-            mode: 0o040000,
-            name: BString::from(name.as_slice()),
-            oid,
-        });
-    }
-    entries.sort_by(|left, right| {
-        git_tree_entry_cmp(
-            left.name.as_bytes(),
-            left.mode,
-            right.name.as_bytes(),
-            right.mode,
-        )
-    });
-    odb.write_object(EncodedObject::new(
-        ObjectType::Tree,
-        Tree { entries }.write(),
-    ))
 }
 
 fn git_tree_entry_cmp(
@@ -10134,6 +10725,35 @@ mod tests {
             matcher.attributes_for_path(path, &requested, false),
             per_path
         );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn filter_attribute_lookup_reads_only_path_chain() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".git").join("info")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("src").join("nested")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("sibling")).expect("test operation should succeed");
+        fs::write(root.join(".gitattributes"), b"*.txt text\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("src").join(".gitattributes"), b"*.txt -text\n")
+            .expect("test operation should succeed");
+        fs::write(
+            root.join("sibling").join(".gitattributes"),
+            b"*.txt eol=crlf\n",
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            root.join(".git").join("info").join("attributes"),
+            b"src/nested/*.txt eol=lf\n",
+        )
+        .expect("test operation should succeed");
+
+        let path = b"src/nested/file.txt";
+        let full = standard_attributes_for_path(&root, path, &filter_attribute_names(), false)
+            .expect("test operation should succeed");
+        assert_eq!(filter_attribute_checks(&root, path).unwrap(), full);
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

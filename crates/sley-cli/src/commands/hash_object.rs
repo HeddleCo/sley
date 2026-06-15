@@ -280,8 +280,18 @@ impl HashObjectInvocation {
         {
             self.format = repository_object_format(git_dir)?;
         }
-        let filter_context =
-            HashObjectFilterContext::new(self.object_type, &self.filters, repo_git_dir.as_deref())?;
+        // Caching the worktree `.gitattributes` chain pays for itself whenever
+        // more than one path is hashed in this process — `--stdin-paths` (many,
+        // count unknown up front) OR multiple positional paths. Gating only on
+        // `--stdin-paths` regressed `hash-object -w file1 file2 …` back to the
+        // per-path attribute re-walk this cache was added to avoid (sley#25).
+        let cache_attributes = self.read_stdin_paths || self.paths.len() > 1;
+        let filter_context = HashObjectFilterContext::new(
+            self.object_type,
+            &self.filters,
+            repo_git_dir.as_deref(),
+            cache_attributes,
+        )?;
         let mut stdout = io::stdout().lock();
 
         if self.read_stdin {
@@ -409,20 +419,19 @@ impl HashObjectFilterPolicy {
         else {
             return Ok(body);
         };
-        context
-            .attributes
-            .apply_clean_filter(&context.config, &git_path, &body)
+        context.apply_clean_filter(&git_path, &body)
     }
 }
 
 struct HashObjectFilterContext {
+    git_dir: PathBuf,
     worktree_root: PathBuf,
     config: GitConfig,
     // The worktree's `.gitattributes` chain, scanned once. `hash-object
     // --stdin-paths` hashes many paths in one process; without this the clean
     // filter re-walked the entire worktree and re-read every `.gitattributes`
     // per path (sley#25: ~163x slower than git for 200 paths).
-    attributes: sley_worktree::WorktreeAttributes,
+    attributes: Option<sley_worktree::WorktreeAttributes>,
 }
 
 impl HashObjectFilterContext {
@@ -430,6 +439,7 @@ impl HashObjectFilterContext {
         object_type: ObjectType,
         policy: &HashObjectFilterPolicy,
         git_dir: Option<&Path>,
+        cache_attributes: bool,
     ) -> Result<Option<Self>> {
         if object_type != ObjectType::Blob || !policy.enabled() {
             return Ok(None);
@@ -440,12 +450,28 @@ impl HashObjectFilterContext {
         let Ok(worktree_root) = worktree_root_for_git_dir(git_dir) else {
             return Ok(None);
         };
-        let attributes = sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root)?;
+        let attributes = cache_attributes
+            .then(|| sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root))
+            .transpose()?;
         Ok(Some(Self {
+            git_dir: git_dir.to_path_buf(),
             worktree_root,
             config: read_repo_config(git_dir)?,
             attributes,
         }))
+    }
+
+    fn apply_clean_filter(&self, path: &[u8], content: &[u8]) -> Result<Vec<u8>> {
+        match &self.attributes {
+            Some(attributes) => attributes.apply_clean_filter(&self.config, path, content),
+            None => sley_worktree::apply_clean_filter(
+                &self.worktree_root,
+                &self.git_dir,
+                &self.config,
+                path,
+                content,
+            ),
+        }
     }
 }
 

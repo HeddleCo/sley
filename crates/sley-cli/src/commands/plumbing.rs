@@ -1001,6 +1001,37 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         paths.clone()
     };
     let do_refresh = !dry_run && chmod.is_none();
+    if update && !all && paths.is_empty() && !dry_run && chmod.is_none() {
+        let config = read_repo_config(&git_dir)?;
+        let actions = sley_worktree::add_update_all_tracked_filtered(
+            &worktree_root,
+            &git_dir,
+            format,
+            &config,
+        )?
+        .into_iter()
+        .map(|action| -> Result<AddAction> {
+            match action {
+                sley_worktree::AddUpdateTrackedAction::Add(path) => Ok(AddAction::Add(
+                    worktree_root.join(
+                        std::str::from_utf8(&path)
+                            .map_err(|err| GitError::InvalidPath(err.to_string()))?,
+                    ),
+                )),
+                sley_worktree::AddUpdateTrackedAction::Remove(path) => Ok(AddAction::Remove(
+                    worktree_root.join(
+                        std::str::from_utf8(&path)
+                            .map_err(|err| GitError::InvalidPath(err.to_string()))?,
+                    ),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+        if verbose {
+            print_add_actions(&worktree_root, &actions)?;
+        }
+        return Ok(());
+    }
     if update || all {
         let actions = resolve_add_update_actions(
             &cwd,
@@ -1057,6 +1088,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             force,
             ignore_removal,
             ignore_missing,
+            dry_run,
         },
     )?;
     if dry_run {
@@ -1070,10 +1102,10 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     if !action_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
-        // Snapshot the tracked paths before staging: the embedded-repo warning
-        // fires only for *newly added* gitlinks (upstream only checks paths
-        // that came from the untracked-file listing).
-        let previously_tracked: BTreeSet<Vec<u8>> =
+        let warn_embedded = actions_may_add_embedded_repo(&actions);
+        // Snapshot the tracked paths before staging only when the warning can
+        // actually fire. Ordinary file adds never need this second index pass.
+        let previously_tracked: BTreeSet<Vec<u8>> = if warn_embedded {
             sley_worktree::read_repository_index(&git_dir, format)?
                 .map(|index| {
                     index
@@ -1082,7 +1114,10 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                         .map(|entry| entry.path.into_bytes())
                         .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
         sley_worktree::update_index_paths_filtered(
             &worktree_root,
             git_dir.clone(),
@@ -1098,9 +1133,11 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             },
             &config,
         )?;
-        warn_on_embedded_repos(&git_dir, &worktree_root, &actions, &previously_tracked)?;
+        if warn_embedded {
+            warn_on_embedded_repos(&git_dir, &worktree_root, &actions, &previously_tracked)?;
+        }
     }
-    if do_refresh {
+    if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &actions) {
         refresh_index_after_add(&worktree_root, &git_dir, format, &refresh_paths)?;
     }
     if verbose {
@@ -1266,6 +1303,38 @@ fn warn_on_embedded_repos(
     Ok(())
 }
 
+fn actions_may_add_embedded_repo(actions: &[AddAction]) -> bool {
+    actions.iter().any(|action| match action {
+        AddAction::Add(path) => path.is_dir() && sley_diff_merge::gitlink_git_dir(path).is_some(),
+        AddAction::Remove(_) => false,
+    })
+}
+
+fn add_refresh_is_redundant(
+    worktree_root: &Path,
+    refresh_paths: &[PathBuf],
+    actions: &[AddAction],
+) -> bool {
+    if refresh_paths.is_empty() || refresh_paths.len() != actions.len() {
+        return false;
+    }
+    let action_paths = actions.iter().map(AddAction::path).collect::<BTreeSet<_>>();
+    refresh_paths.iter().all(|path| {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        if fs::symlink_metadata(&absolute)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        action_paths.contains(&absolute)
+    })
+}
+
 fn parse_add_chmod(value: &str) -> Result<bool> {
     match value {
         "+x" => Ok(true),
@@ -1283,6 +1352,7 @@ struct AddRegularOptions {
     force: bool,
     ignore_removal: bool,
     ignore_missing: bool,
+    dry_run: bool,
 }
 
 fn resolve_add_regular_actions(
@@ -1293,6 +1363,16 @@ fn resolve_add_regular_actions(
     paths: Vec<PathBuf>,
     options: AddRegularOptions,
 ) -> Result<Vec<AddAction>> {
+    if let Some(actions) = resolve_add_regular_tracked_exact_actions(
+        cwd,
+        worktree_root,
+        git_dir,
+        format,
+        &paths,
+        options,
+    )? {
+        return Ok(actions);
+    }
     let pathspecs = paths
         .into_iter()
         .map(|path| {
@@ -1371,6 +1451,132 @@ fn resolve_add_regular_actions(
         }
     }
     Ok(actions)
+}
+
+fn resolve_add_regular_tracked_exact_actions(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: AddRegularOptions,
+) -> Result<Option<Vec<AddAction>>> {
+    if paths.is_empty() || options.chmod.is_some() || options.force || options.dry_run {
+        return Ok(None);
+    }
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let index_mtime = fs::metadata(&index_path)
+        .ok()
+        .and_then(|metadata| sley_index::file_mtime_parts(&metadata));
+    let stat_cache = sley_index::IndexStatCache::from_index_mtime_only(index_mtime);
+    let mut actions = Vec::new();
+    for path in paths {
+        if add_pathspec_needs_status_walk(path) {
+            return Ok(None);
+        }
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            return Ok(None);
+        };
+        let git_path = add_git_path_bytes(relative)?;
+        let range = add_index_entries_path_range(&index.entries, &git_path);
+        if range.is_empty() {
+            return Ok(None);
+        }
+        if range.len() != 1 {
+            return Ok(None);
+        }
+        if index.entries[range.clone()]
+            .iter()
+            .any(|entry| entry.stage() != sley_index::Stage::Normal || entry.is_skip_worktree())
+        {
+            return Ok(None);
+        }
+        match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    return Ok(None);
+                }
+                let entry = &index.entries[range.start];
+                if stat_cache
+                    .reusable_index_entry(entry, &metadata)
+                    .is_none()
+                {
+                    actions.push(AddAction::Add(absolute));
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                if !options.ignore_removal {
+                    actions.push(AddAction::Remove(absolute));
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(Some(actions))
+}
+
+fn add_pathspec_needs_status_walk(path: &Path) -> bool {
+    path.components().any(|component| {
+        let std::path::Component::Normal(value) = component else {
+            return false;
+        };
+        value.to_string_lossy().starts_with(':')
+    }) || path
+        .to_string_lossy()
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+}
+
+fn add_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(GitError::InvalidPath(format!(
+            "invalid index path {}",
+            path.display()
+        )));
+    }
+    Ok(path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+        .into_bytes())
+}
+
+fn add_index_entries_path_range(entries: &[IndexEntry], path: &[u8]) -> std::ops::Range<usize> {
+    let mut start = match entries.binary_search_by(|entry| entry.path.as_bytes().cmp(path)) {
+        Ok(index) => index,
+        Err(insert) => return insert..insert,
+    };
+    while start > 0 && entries[start - 1].path.as_bytes() == path {
+        start -= 1;
+    }
+    let mut end = start;
+    while end < entries.len() && entries[end].path.as_bytes() == path {
+        end += 1;
+    }
+    start..end
 }
 
 fn resolve_add_paths(
