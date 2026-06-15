@@ -5,33 +5,14 @@ use sley_core::Result;
 pub(crate) struct StdinRecordReader<R> {
     reader: R,
     terminator: u8,
-    peeked: Option<Vec<u8>>,
 }
 
 impl<R: BufRead> StdinRecordReader<R> {
     pub(crate) fn new(reader: R, terminator: u8) -> Self {
-        Self {
-            reader,
-            terminator,
-            peeked: None,
-        }
+        Self { reader, terminator }
     }
 
     pub(crate) fn read_record(&mut self) -> Result<Option<Vec<u8>>> {
-        if let Some(record) = self.peeked.take() {
-            return Ok(Some(record));
-        }
-        self.read_record_from_input()
-    }
-
-    pub(crate) fn peek_record(&mut self) -> Result<Option<&[u8]>> {
-        if self.peeked.is_none() {
-            self.peeked = self.read_record_from_input()?;
-        }
-        Ok(self.peeked.as_deref())
-    }
-
-    fn read_record_from_input(&mut self) -> Result<Option<Vec<u8>>> {
         let mut record = Vec::new();
         let read = self.reader.read_until(self.terminator, &mut record)?;
         if read == 0 {
