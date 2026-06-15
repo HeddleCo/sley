@@ -1698,10 +1698,18 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut reedit_message = false;
     let mut fixup_commit = None;
     let mut squash_commit = None;
-    let mut trailers = Vec::new();
+    // Raw `--trailer <arg>` strings, applied through the full interpret-trailers
+    // engine (so per-token `trailer.*` config — key/where/ifexists/ifmissing/
+    // command — applies, matching `git commit --trailer`).
+    let mut trailers: Vec<String> = Vec::new();
     let mut reset_author = false;
     let mut amend = false;
-    let mut cleanup_mode = None;
+    let mut verbose = false;
+    // The raw `--cleanup=<mode>` argument, if any. Resolution to a concrete mode
+    // is deferred until `use_editor` is known (git: `default`/`scissors` depend
+    // on whether an editor runs). `None` means "no --cleanup given" — fall back
+    // to `commit.cleanup` config, then the editor-dependent default.
+    let mut cleanup_arg: Option<String> = None;
     let mut include_without_paths = false;
     let mut only_without_paths = false;
     let mut status_mode = CommitStatusMode::Normal;
@@ -1863,10 +1871,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 let Some(value) = iter.next() else {
                     return commit_trailer_requires_value_error();
                 };
-                trailers.push(commands::tag::parse_tag_trailer(value));
+                trailers.push(value.clone());
             }
             value if value.starts_with("--trailer=") => {
-                trailers.push(parse_tag_trailer(&value["--trailer=".len()..]));
+                trailers.push(value["--trailer=".len()..].to_string());
             }
             "--no-trailer" => trailers.clear(),
             value if value.starts_with("--no-trailer=") => {
@@ -2126,7 +2134,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
-            "-v" | "--verbose" | "--no-verbose" => {}
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
             value if value.starts_with("--verbose=") => {
                 return commit_option_takes_no_value_error("verbose");
             }
@@ -2230,12 +2239,17 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 let Some(value) = iter.next() else {
                     return commit_cleanup_requires_value_error();
                 };
-                cleanup_mode = Some(parse_commit_cleanup_mode(value)?);
+                // Validate eagerly (git rejects a bad mode at parse time) but
+                // defer resolution until `use_editor` is known.
+                validate_commit_cleanup_mode(value)?;
+                cleanup_arg = Some(value.clone());
             }
             value if value.starts_with("--cleanup=") => {
-                cleanup_mode = Some(parse_commit_cleanup_mode(&value["--cleanup=".len()..])?);
+                let arg = &value["--cleanup=".len()..];
+                validate_commit_cleanup_mode(arg)?;
+                cleanup_arg = Some(arg.to_string());
             }
-            "--no-cleanup" => cleanup_mode = Some(CommitCleanupMode::Whitespace),
+            "--no-cleanup" => cleanup_arg = Some("whitespace".to_string()),
             value if value.starts_with("--no-cleanup=") => {
                 return commit_option_takes_no_value_error("no-cleanup");
             }
@@ -2501,16 +2515,14 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     // Emptiness is judged before the signoff trailer is added (git aborts
     // `commit -m "" -s`).
-    let empty_before_signoff = commit_message_is_empty(&commands::tag::tag_message_with_trailers(
-        message.clone(),
-        &trailers,
-    ));
+    let empty_before_signoff =
+        commit_message_is_empty(&commit_message_with_trailers(message.clone(), &trailers));
     let mut message = if signoff {
         commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
     } else {
         message
     };
-    message = tag_message_with_trailers(message, &trailers);
+    message = commit_message_with_trailers(message, &trailers);
     // Editor flow: a commit without an explicit message source launches the
     // editor over COMMIT_EDITMSG (the in-merge / rebase conclude paths keep
     // their historical no-editor behavior).
@@ -2553,15 +2565,17 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
     }
     message = fs::read(&editmsg)?;
-    if use_editor && cleanup_mode.is_none() {
-        message = commands::replay::strip_comment_lines(
-            &message,
-            commands::replay::comment_char(&git_dir),
-        );
-    }
-    if let Some(cleanup_mode) = cleanup_mode {
-        message = commit_cleanup_message(message, cleanup_mode);
-    }
+    // Resolve the cleanup mode now that `use_editor` is known. An explicit
+    // `--cleanup`/`--no-cleanup` wins; otherwise `commit.cleanup` config; absent
+    // both, git's editor-dependent default (ALL with an editor, SPACE without).
+    let cleanup_config = cleanup_arg.clone().or_else(|| {
+        read_repo_config(&git_dir)
+            .ok()
+            .and_then(|c| c.get("commit", None, "cleanup").map(str::to_string))
+    });
+    let cleanup_mode = resolve_commit_cleanup_mode(cleanup_config.as_deref(), use_editor);
+    let comment_char = commit_comment_string(&git_dir);
+    message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose);
     if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
@@ -2625,6 +2639,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         None
     };
+    // Retain copies for the post-commit summary (the options struct moves them).
+    let summary_author = author.clone();
+    let summary_committer = committer.clone();
+    let summary_message = message.clone();
     let options = sley_sequencer::CommitIndexOptions {
         author,
         committer,
@@ -2642,7 +2660,15 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
     if !quiet {
-        println!("{}", result.oid);
+        print_commit_summary(
+            &git_dir,
+            format,
+            &result.oid,
+            result.parent.as_ref(),
+            &summary_message,
+            &summary_author,
+            &summary_committer,
+        )?;
     }
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
@@ -2660,6 +2686,156 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Print git's post-commit summary (`print_commit_summary`), e.g.
+/// `[main (root-commit) 0bed67f] initial` followed by an optional `Author:`/
+/// `Committer:` line and the shortstat + `create/delete mode` summary of the diff
+/// against the parent. `new_oid` is the freshly written commit; `parent` is its
+/// first parent (None for a root commit, which diffs against the empty tree and
+/// adds the `(root-commit)` marker). `author`/`committer` are the raw identity
+/// buffers (`Name <email> seconds tz`); the `Author:` line is emitted only when
+/// they differ in name/email, matching git.
+fn print_commit_summary(
+    git_dir: &Path,
+    format: ObjectFormat,
+    new_oid: &ObjectId,
+    parent: Option<&ObjectId>,
+    message: &[u8],
+    author: &[u8],
+    committer: &[u8],
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    // HEAD branch name, or "detached HEAD" / "HEAD" when unresolvable.
+    let head = match repo_current_branch_name(git_dir) {
+        Some(name) => name,
+        None => "detached HEAD".to_string(),
+    };
+    let abbrev = commit_summary_abbrev(&db, new_oid);
+    let root = if parent.is_none() { " (root-commit)" } else { "" };
+    let subject = commit_subject(message);
+
+    let mut out = io::stdout();
+    write!(out, "[{head}{root} {abbrev}] {subject}\n")?;
+
+    // `Author:` line when the author identity (name <email>) differs from the
+    // committer's — git's `strbuf_cmp(&author_ident, &committer_ident)`.
+    let author_id = identity_name_email(author);
+    let committer_id = identity_name_email(committer);
+    if author_id != committer_id {
+        writeln!(out, " Author: {author_id}")?;
+    }
+
+    // Shortstat + summary of the diff against the parent tree (empty tree for a
+    // root commit), matching `DIFF_FORMAT_SHORTSTAT | DIFF_FORMAT_SUMMARY`.
+    let new_tree = read_commit_tree_for_summary(&db, format, new_oid)?;
+    let old_tree = match parent {
+        Some(p) => read_commit_tree_for_summary(&db, format, p)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+        &db,
+        format,
+        &old_tree,
+        &new_tree,
+        sley_diff_merge::RenameDetectionOptions::default(),
+    )?;
+    if !entries.is_empty() {
+        write_diff_shortstat(&mut out, &entries, &db, None, false)?;
+        for entry in &entries {
+            write_commit_summary_entry(&mut out, entry)?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// git's `find_unique_abbrev`: the shortest unambiguous hex prefix of `oid`
+/// (minimum 7), growing until it resolves to a single object.
+fn commit_summary_abbrev(db: &FileObjectDatabase, oid: &ObjectId) -> String {
+    let hex = oid.to_hex();
+    let mut width = 7usize.min(hex.len());
+    while width < hex.len() {
+        match db.resolve_prefix(&hex[..width]) {
+            Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
+            _ => break,
+        }
+    }
+    hex[..width].to_string()
+}
+
+/// Extract `Name <email>` from a raw git identity buffer (`Name <email> seconds
+/// tz`) by trimming the trailing ` seconds timezone`. Used to compare author and
+/// committer identities for the summary's `Author:` line.
+fn identity_name_email(identity: &[u8]) -> String {
+    let text = String::from_utf8_lossy(identity);
+    match text.rfind('>') {
+        Some(idx) => text[..=idx].to_string(),
+        None => text.trim_end().to_string(),
+    }
+}
+
+/// Read a commit's tree oid for the summary diff.
+fn read_commit_tree_for_summary(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<ObjectId> {
+    let object = db.read_object(commit_oid)?;
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(commit.tree)
+}
+
+/// The ` create mode`/` delete mode`/` rename`/` copy`/` mode change` summary
+/// line for one diff entry, matching git's `DIFF_FORMAT_SUMMARY`.
+fn write_commit_summary_entry(
+    out: &mut dyn Write,
+    entry: &sley_diff_merge::NameStatusEntry,
+) -> Result<()> {
+    match entry.status {
+        sley_diff_merge::NameStatus::Added => {
+            let mode = entry.new_mode.unwrap_or(0);
+            writeln!(out, " create mode {mode:06o} {}", entry.path)?;
+        }
+        sley_diff_merge::NameStatus::Deleted => {
+            let mode = entry.old_mode.unwrap_or(0);
+            writeln!(out, " delete mode {mode:06o} {}", entry.path)?;
+        }
+        sley_diff_merge::NameStatus::Renamed(score) => {
+            if let Some(old_path) = &entry.old_path {
+                writeln!(out, " rename {old_path} => {} ({score}%)", entry.path)?;
+            }
+        }
+        sley_diff_merge::NameStatus::Copied(score) => {
+            if let Some(old_path) = &entry.old_path {
+                writeln!(out, " copy {old_path} => {} ({score}%)", entry.path)?;
+            }
+        }
+        sley_diff_merge::NameStatus::Modified => {
+            if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
+                && old_mode != new_mode
+            {
+                writeln!(out, " mode change {old_mode:06o} => {new_mode:06o} {}", entry.path)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Apply `commit --trailer` arguments to a (byte) commit message through the
+/// full interpret-trailers engine (`commands::interpret_trailers`), so per-token
+/// `trailer.*` config governs placement/policy/key/command exactly as `git commit
+/// --trailer` does. A message with no queued trailers is returned untouched.
+///
+/// Commit messages are UTF-8 in practice; we losslessly round-trip via
+/// `from_utf8_lossy` so non-UTF-8 bytes don't crash the (text-oriented) engine.
+fn commit_message_with_trailers(message: Vec<u8>, trailers: &[String]) -> Vec<u8> {
+    if trailers.is_empty() {
+        return message;
+    }
+    let text = String::from_utf8_lossy(&message);
+    commands::interpret_trailers::apply_trailers_to_message(&text, trailers).into_bytes()
 }
 
 /// Conclude an in-progress cherry-pick / revert via `git commit`: commit the
@@ -3279,11 +3455,12 @@ fn commit_message_is_empty(message: &[u8]) -> bool {
     message.iter().all(u8::is_ascii_whitespace)
 }
 
-fn parse_commit_cleanup_mode(value: &str) -> Result<CommitCleanupMode> {
+/// Validate a `--cleanup`/`commit.cleanup` mode string. git's `get_cleanup_mode`
+/// `die`s on an unknown value (exit 128); the concrete mode is resolved later by
+/// [`resolve_commit_cleanup_mode`] once `use_editor` is known.
+fn validate_commit_cleanup_mode(value: &str) -> Result<()> {
     match value {
-        "strip" => Ok(CommitCleanupMode::Strip),
-        "whitespace" | "scissors" | "default" => Ok(CommitCleanupMode::Whitespace),
-        "verbatim" => Ok(CommitCleanupMode::Verbatim),
+        "strip" | "whitespace" | "scissors" | "default" | "verbatim" => Ok(()),
         _ => {
             eprintln!("fatal: Invalid cleanup mode {value}");
             Err(GitError::Exit(128))
@@ -4812,6 +4989,21 @@ impl PartialOrd for SummaryHeapEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// The effective `core.commentChar` string (git's `comment_line_str`), default
+/// `#`. May be multi-char; an empty or `auto` value falls back to `#` (we do not
+/// implement the `auto` scan, which picks an unused character). Used by
+/// commit-message cleanup (scissors detection + comment stripping).
+fn commit_comment_string(git_dir: &Path) -> String {
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|c| {
+            c.get("core", None, "commentChar")
+                .filter(|value| !value.is_empty() && *value != "auto")
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "#".to_string())
 }
 
 /// Comment prefix for `git status` output when `status.displayCommentPrefix` is

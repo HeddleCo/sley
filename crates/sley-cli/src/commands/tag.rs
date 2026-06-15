@@ -730,13 +730,45 @@ fn resolve_tag_contains_filter(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, rev) {
-        Ok(oid) => Ok(oid),
+    let oid = match resolve_revision(git_dir, format, rev) {
+        Ok(oid) => oid,
         Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
             eprintln!("error: malformed object name {rev}");
-            Err(GitError::Exit(129))
+            return Err(GitError::Exit(129));
         }
-        Err(err) => Err(err),
+        Err(err) => return Err(err),
+    };
+    // `--contains`/`--no-contains` need a commit-ish: git peels tags to a commit
+    // and rejects a tree/blob with `error: object <oid> is a tree, not a commit`
+    // / `error: no such commit <name>` (exit 129).
+    peel_to_commit_for_filter(git_dir, format, oid, rev)
+}
+
+/// Peel `oid` (following tag chains) to a commit for a list-filter that requires
+/// a commit-ish (`--contains`/`--merged`). On a non-commit terminal object, emit
+/// git's two-line diagnostic and exit 129.
+fn peel_to_commit_for_filter(
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: ObjectId,
+    name: &str,
+) -> Result<ObjectId> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut current = oid;
+    loop {
+        let object = db.read_object(&current)?;
+        match object.object_type {
+            ObjectType::Commit => return Ok(current),
+            ObjectType::Tag => {
+                let parsed = Tag::parse(format, &object.body)?;
+                current = parsed.object;
+            }
+            other => {
+                eprintln!("error: object {oid} is a {}, not a commit", other.as_str());
+                eprintln!("error: no such commit {name}");
+                return Err(GitError::Exit(129));
+            }
+        }
     }
 }
 
@@ -854,9 +886,24 @@ fn tag_create_reflog_entry(
     Ok(Some(ReflogEntry {
         old_oid,
         new_oid,
-        committer: commit_identity_from_env("COMMITTER")?,
+        committer: tag_reflog_committer_identity()?,
         message: tag_reflog_message(git_dir, format, target)?,
     }))
+}
+
+/// Build the committer identity for a tag reflog entry. Unlike the tag *object*,
+/// a reflog entry's timestamp is "now" (or `GIT_COMMITTER_DATE` when explicitly
+/// set) — never the `@0` epoch default. git's reflog reader rejects a `0`
+/// timestamp as uninitialised (`for-each-reflog-ent` skips it), so emitting the
+/// current time is required for the entry to be readable.
+fn tag_reflog_committer_identity() -> Result<Vec<u8>> {
+    match env::var("GIT_COMMITTER_DATE") {
+        Ok(date) if !date.is_empty() => commit_identity_from_env_with_date("COMMITTER", &date),
+        _ => {
+            let now = current_unix_seconds();
+            commit_identity_from_env_with_date("COMMITTER", &format!("@{now} +0000"))
+        }
+    }
 }
 
 fn tag_reflog_message(git_dir: &Path, format: ObjectFormat, target: &ObjectId) -> Result<Vec<u8>> {

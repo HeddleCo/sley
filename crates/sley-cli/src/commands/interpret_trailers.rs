@@ -111,6 +111,11 @@ enum IfMissing {
 
 /// A trailer queued by `--trailer`. `token`/`value` are already split on the
 /// argument separator but not yet whitespace-normalised for output.
+///
+/// `where_`/`if_exists`/`if_missing` are the *resolved* placement/policy (config
+/// item, then command-line override). `command`/`cmd` carry the configured shell
+/// command (if any) inherited from the matched config item, run lazily when the
+/// trailer is applied (git's `apply_item_command`).
 #[derive(Debug, Clone)]
 struct ArgTrailer {
     token: String,
@@ -118,6 +123,10 @@ struct ArgTrailer {
     where_: Where,
     if_exists: IfExists,
     if_missing: IfMissing,
+    /// `trailer.<token>.command`: shell command with `$ARG` substituted.
+    command: Option<String>,
+    /// `trailer.<token>.cmd`: shell command run with the argument appended.
+    cmd: Option<String>,
 }
 
 /// Fully parsed command-line options.
@@ -139,8 +148,31 @@ struct Options {
     separators: Vec<char>,
     /// Comment-line prefix (default '#').
     comment_prefix: String,
+    /// Per-token configured trailer items (`trailer.<name>.*`), in config order.
+    /// Used to resolve a `--trailer <token>` against an alias/key and to inherit
+    /// its placement/policy/command, and to seed config-command arg items.
+    conf_items: Vec<ConfItem>,
     trailers: Vec<ArgTrailer>,
     files: Vec<String>,
+}
+
+/// A configured trailer item (`trailer.<name>.key/command/cmd/where/ifexists/
+/// ifmissing`). git keeps one of these per distinct `<name>`; a `--trailer`
+/// whose token case-insensitively prefix-matches `name` (or `key`) inherits this
+/// item's settings and rewrites its output token to `key` when one is set.
+#[derive(Debug, Clone)]
+struct ConfItem {
+    /// The config subsection name (`trailer.<name>.*`).
+    name: String,
+    /// `trailer.<name>.key`: the canonical output token (may carry its own
+    /// trailing separator, e.g. `Bug #`).
+    key: Option<String>,
+    command: Option<String>,
+    cmd: Option<String>,
+    /// Placement/policy, defaulting to the global defaults when unset on the item.
+    where_: Where,
+    if_exists: IfExists,
+    if_missing: IfMissing,
 }
 
 /// Outcome of argument parsing: either run with options, or print help.
@@ -171,9 +203,15 @@ pub(crate) fn cmd_interpret_trailers(args: &[String]) -> Result<()> {
     }
 
     if options.files.is_empty() {
+        // git: `--in-place` with no file operands is a hard error (there is
+        // nothing to edit in place) — `die("no input file given for in-place
+        // editing")`, exit 128.
+        if options.in_place {
+            eprintln!("fatal: no input file given for in-place editing");
+            return Err(GitError::Exit(128));
+        }
         // No file operands: read the single message from stdin and stream the
-        // result to stdout. `--in-place` is meaningless without files (git
-        // simply ignores it here, treating stdin as the source).
+        // result to stdout.
         let mut input = Vec::new();
         io::stdin().read_to_end(&mut input)?;
         let text = String::from_utf8_lossy(&input).into_owned();
@@ -213,6 +251,69 @@ pub(crate) fn cmd_interpret_trailers(args: &[String]) -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+/// Apply a list of raw `--trailer <arg>` strings to a commit/tag message,
+/// returning the rewritten message. This is the same engine `git commit
+/// --trailer` / `git tag --trailer` use internally (`process_trailers` with the
+/// command's options), so per-token `trailer.*` configuration (key/where/
+/// ifexists/ifmissing/command/cmd), separators, and comment-char all apply
+/// exactly as in `git interpret-trailers`.
+///
+/// `trailer_args` are the raw argument strings as given on the command line
+/// (e.g. `"Acked-by: x"`, `"ack = Peff"`); each is split + resolved against
+/// config just like `--trailer`. The message is processed as a single input;
+/// configured command trailers (`trailer.<name>.command`) are also run.
+///
+/// Matching git's `amend_strbuf_with_trailers`, divider handling is disabled
+/// (`no_divider = true`): a `---` line in a commit/tag *body* is ordinary text,
+/// not a patch divider, so trailers append after it rather than before it.
+pub(crate) fn apply_trailers_to_message(message: &str, trailer_args: &[String]) -> String {
+    let config = load_trailer_config();
+    let default_where = config.where_;
+    let default_if_exists = config.if_exists;
+    let default_if_missing = config.if_missing;
+    let separators = config.separators.clone();
+    let conf_items = config.conf_items.clone();
+
+    let trailers: Vec<ArgTrailer> = trailer_args
+        .iter()
+        .map(|raw| {
+            parse_trailer_arg(
+                raw,
+                &separators,
+                &conf_items,
+                default_where,
+                default_if_exists,
+                default_if_missing,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+
+    let options = Options {
+        in_place: false,
+        trim_empty: false,
+        only_trailers: false,
+        only_input: false,
+        unfold: false,
+        // git's amend path sets `no_divider = 1`: in a commit/tag message a
+        // `---` line is body text, not a patch divider.
+        no_divider: true,
+        default_where,
+        default_if_exists,
+        default_if_missing,
+        out_separator: config.out_separator,
+        separators,
+        comment_prefix: config.comment_prefix,
+        conf_items,
+        trailers,
+        files: Vec::new(),
+    };
+
+    process_message(message, &options)
 }
 
 /// Render a libc-style `strerror` reason for the "could not read input file"
@@ -256,16 +357,20 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
         out_separator: config.out_separator,
         separators: config.separators,
         comment_prefix: config.comment_prefix,
+        conf_items: config.conf_items,
         trailers: Vec::new(),
         files: Vec::new(),
     };
 
     // Each queued `--trailer` captures the placement/policy in force *at the
     // time it appears*, so a later `--where`/`--if-exists`/`--if-missing` only
-    // affects subsequent trailers (matching git's per-arg conf snapshot).
-    let mut cur_where = opts.default_where;
-    let mut cur_if_exists = opts.default_if_exists;
-    let mut cur_if_missing = opts.default_if_missing;
+    // affects subsequent trailers. git models a command-line override as a
+    // `*_DEFAULT` sentinel that is replaced when explicitly set; we use `Option`
+    // (None = "no command-line override in force", so the matched config item or
+    // global default decides). `--no-where` etc. reset to None.
+    let mut cur_where: Option<Where> = None;
+    let mut cur_if_exists: Option<IfExists> = None;
+    let mut cur_if_missing: Option<IfMissing> = None;
 
     let mut idx = 0;
     let mut only_positional = false;
@@ -306,6 +411,10 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
                     let trailer = parse_trailer_arg(
                         &value,
                         &opts.separators,
+                        &opts.conf_items,
+                        opts.default_where,
+                        opts.default_if_exists,
+                        opts.default_if_missing,
                         cur_where,
                         cur_if_exists,
                         cur_if_missing,
@@ -313,27 +422,27 @@ fn parse_args(args: &[String]) -> Result<Invocation> {
                     opts.trailers.push(trailer);
                 } else if let Some(value) = match_value_option(args, &mut idx, "--where")? {
                     match parse_where(&value) {
-                        Some(w) => cur_where = w,
+                        Some(w) => cur_where = Some(w),
                         // git's enum callbacks fail silently here: exit 129 with
                         // no diagnostic on either stream.
                         None => return Err(GitError::Exit(129)),
                     }
                 } else if let Some(value) = match_value_option(args, &mut idx, "--if-exists")? {
                     match parse_if_exists(&value) {
-                        Some(v) => cur_if_exists = v,
+                        Some(v) => cur_if_exists = Some(v),
                         None => return Err(GitError::Exit(129)),
                     }
                 } else if let Some(value) = match_value_option(args, &mut idx, "--if-missing")? {
                     match parse_if_missing(&value) {
-                        Some(v) => cur_if_missing = v,
+                        Some(v) => cur_if_missing = Some(v),
                         None => return Err(GitError::Exit(129)),
                     }
                 } else if arg == "--no-where" {
-                    cur_where = opts.default_where;
+                    cur_where = None;
                 } else if arg == "--no-if-exists" {
-                    cur_if_exists = opts.default_if_exists;
+                    cur_if_exists = None;
                 } else if arg == "--no-if-missing" {
-                    cur_if_missing = opts.default_if_missing;
+                    cur_if_missing = None;
                 } else if arg == "--no-trailer" {
                     // `--no-trailer` clears all queued trailers in git.
                     opts.trailers.clear();
@@ -396,8 +505,10 @@ fn unknown_option(name: &str, is_switch: bool) -> Result<Invocation> {
     Err(GitError::Exit(129))
 }
 
+/// Parse a placement value. git's `trailer_set_where` compares with `strcasecmp`,
+/// so the value is matched case-insensitively (`AFTER`, `Before`, … all work).
 fn parse_where(value: &str) -> Option<Where> {
-    match value {
+    match value.to_ascii_lowercase().as_str() {
         "after" => Some(Where::After),
         "before" => Some(Where::Before),
         "end" => Some(Where::End),
@@ -406,20 +517,22 @@ fn parse_where(value: &str) -> Option<Where> {
     }
 }
 
+/// Parse an if-exists value (git's `trailer_set_if_exists`, case-insensitive).
 fn parse_if_exists(value: &str) -> Option<IfExists> {
-    match value {
-        "addIfDifferent" => Some(IfExists::AddIfDifferent),
-        "addIfDifferentNeighbor" => Some(IfExists::AddIfDifferentNeighbor),
+    match value.to_ascii_lowercase().as_str() {
+        "addifdifferent" => Some(IfExists::AddIfDifferent),
+        "addifdifferentneighbor" => Some(IfExists::AddIfDifferentNeighbor),
         "add" => Some(IfExists::Add),
         "replace" => Some(IfExists::Replace),
-        "doNothing" => Some(IfExists::DoNothing),
+        "donothing" => Some(IfExists::DoNothing),
         _ => None,
     }
 }
 
+/// Parse an if-missing value (git's `trailer_set_if_missing`, case-insensitive).
 fn parse_if_missing(value: &str) -> Option<IfMissing> {
-    match value {
-        "doNothing" => Some(IfMissing::DoNothing),
+    match value.to_ascii_lowercase().as_str() {
+        "donothing" => Some(IfMissing::DoNothing),
         "add" => Some(IfMissing::Add),
         _ => None,
     }
@@ -427,17 +540,31 @@ fn parse_if_missing(value: &str) -> Option<IfMissing> {
 
 /// Split a `--trailer` argument into token/value using git's `find_separator`
 /// with the separator set augmented by `=` (git always accepts `=` for
-/// command-line trailers). The token before the separator has trailing
-/// whitespace trimmed; the value after it is whitespace-trimmed. When no valid
-/// separator is found the whole argument is the token and the value is empty
-/// (so `Naïve=café`, whose token byte `ï` is not a valid token character, keeps
-/// the literal `Naïve=café` as its token).
+/// command-line trailers), then resolve it against the configured trailer items.
+///
+/// This mirrors git's `parse_trailer` + `add_arg_item`:
+///   * The token before the separator and the value after it are both
+///     whitespace-trimmed; with no valid separator the whole argument is the
+///     token and the value is empty (so `Naïve=café`, whose token byte `ï` is not
+///     a valid token character, keeps the literal `Naïve=café` as its token).
+///   * The trimmed token is matched (case-insensitively, over the token's length
+///     ignoring its own trailing separator) against each config item's `name` and
+///     `key`. The *first* match supplies the conf (placement/policy/command) and,
+///     when it has a `key`, rewrites the output token to that key.
+///   * A later command-line `--where`/`--if-exists`/`--if-missing` overrides the
+///     conf's placement/policy for this and subsequent trailers (`new_trailer_item`
+///     in git); `None` means "no override — use the conf / global default".
+#[allow(clippy::too_many_arguments)]
 fn parse_trailer_arg(
     raw: &str,
     separators: &[char],
-    where_: Where,
-    if_exists: IfExists,
-    if_missing: IfMissing,
+    conf_items: &[ConfItem],
+    default_where: Where,
+    default_if_exists: IfExists,
+    default_if_missing: IfMissing,
+    ov_where: Option<Where>,
+    ov_if_exists: Option<IfExists>,
+    ov_if_missing: Option<IfMissing>,
 ) -> ArgTrailer {
     // `=` plus the configured separators (deduplicated order does not matter:
     // find_separator returns the first matching byte).
@@ -447,7 +574,7 @@ fn parse_trailer_arg(
             arg_separators.push(sep);
         }
     }
-    let (token, value) = match find_separator(raw, &arg_separators) {
+    let (raw_token, value) = match find_separator(raw, &arg_separators) {
         Some(i) => {
             let token = &raw[..i];
             // The separator is a single ASCII byte for the '='/':'-class chars
@@ -457,13 +584,96 @@ fn parse_trailer_arg(
         }
         None => (raw, ""),
     };
+    let token = raw_token.trim().to_string();
+
+    // Resolve against the configured items. `token_len_without_separator` is the
+    // token length up to (but not including) any trailing separator the token
+    // itself carries (e.g. matching `Bug` against a `Bug #` token).
+    let tok_len = token_len_without_separator(&token, separators);
+    let mut out_token = token.clone();
+    let mut where_ = default_where;
+    let mut if_exists = default_if_exists;
+    let mut if_missing = default_if_missing;
+    let mut command = None;
+    let mut cmd = None;
+    for item in conf_items {
+        if token_matches_item(&token, item, tok_len) {
+            where_ = item.where_;
+            if_exists = item.if_exists;
+            if_missing = item.if_missing;
+            command = item.command.clone();
+            cmd = item.cmd.clone();
+            if let Some(key) = &item.key {
+                out_token = key.clone();
+            }
+            break;
+        }
+    }
+
+    // Command-line override (set by a preceding --where/--if-exists/--if-missing)
+    // wins over the conf, exactly like git's `new_trailer_item` fixup.
+    if let Some(w) = ov_where {
+        where_ = w;
+    }
+    if let Some(e) = ov_if_exists {
+        if_exists = e;
+    }
+    if let Some(m) = ov_if_missing {
+        if_missing = m;
+    }
+
     ArgTrailer {
-        token: token.trim_end().to_string(),
+        token: out_token,
         value: value.trim().to_string(),
         where_,
         if_exists,
         if_missing,
+        command,
+        cmd,
     }
+}
+
+/// git's `token_len_without_separator`: the length of the token up to (but not
+/// including) a trailing separator character or trailing whitespace. Used so a
+/// `--trailer Bug` matches a configured `trailer.bug.key = "Bug #"` whose own
+/// trailing `#`/space are not part of the comparable token.
+fn token_len_without_separator(token: &str, separators: &[char]) -> usize {
+    let bytes = token.as_bytes();
+    let mut len = bytes.len();
+    while len > 0 {
+        let c = bytes[len - 1] as char;
+        if c.is_ascii_whitespace() || separators.contains(&c) {
+            len -= 1;
+        } else {
+            break;
+        }
+    }
+    len
+}
+
+/// git's `token_matches_item`: case-insensitive prefix comparison of the first
+/// `tok_len` bytes of `tok` against the item's `name`, then (if set) its `key`.
+fn token_matches_item(tok: &str, item: &ConfItem, tok_len: usize) -> bool {
+    let tok_bytes = tok.as_bytes();
+    let n = tok_len.min(tok_bytes.len());
+    let prefix = &tok_bytes[..n];
+    if prefix_eq_ignore_case(prefix, item.name.as_bytes()) {
+        return true;
+    }
+    match &item.key {
+        Some(key) => prefix_eq_ignore_case(prefix, key.as_bytes()),
+        None => false,
+    }
+}
+
+/// `strncasecmp(prefix, full, prefix.len()) == 0`: compare `prefix` against the
+/// leading bytes of `full` case-insensitively. (git compares only `tok_len`
+/// bytes, so a short token prefix-matches a longer configured name.)
+fn prefix_eq_ignore_case(prefix: &[u8], full: &[u8]) -> bool {
+    if prefix.len() > full.len() {
+        return false;
+    }
+    prefix.eq_ignore_ascii_case(&full[..prefix.len()])
 }
 
 // ---------------------------------------------------------------------------
@@ -478,12 +688,17 @@ struct TrailerConfig {
     out_separator: char,
     separators: Vec<char>,
     comment_prefix: String,
+    /// Per-token configured items (`trailer.<name>.*`), in config order.
+    conf_items: Vec<ConfItem>,
 }
 
-/// Read the relevant config keys. `-c`/`GIT_CONFIG_*` overrides take precedence,
-/// then the repository config file when one is discoverable; absent everything,
-/// git's compiled-in defaults apply. Reading is entirely best-effort so the
-/// command still works outside a repository.
+/// Read the relevant config keys. The effective `GitConfig` (which already layers
+/// `-c`/`GIT_CONFIG_*` overrides on top of the repository config file) is read
+/// once and scanned: the bare `trailer.where/ifexists/ifmissing/separators` keys
+/// set the global defaults, `core.commentChar` sets the comment prefix, and every
+/// `trailer.<name>.<var>` populates a per-token [`ConfItem`]. Reading is entirely
+/// best-effort so the command still works outside a repository (git's
+/// compiled-in defaults then apply).
 fn load_trailer_config() -> TrailerConfig {
     let mut cfg = TrailerConfig {
         where_: Where::End,
@@ -492,24 +707,30 @@ fn load_trailer_config() -> TrailerConfig {
         out_separator: ':',
         separators: vec![':'],
         comment_prefix: "#".to_string(),
+        conf_items: Vec::new(),
     };
 
-    if let Some(value) = config_lookup("trailer.where")
-        && let Some(w) = parse_where(&value)
+    let Some(config) = effective_config() else {
+        return cfg;
+    };
+
+    // Global defaults (bare `trailer.<var>`, no subsection).
+    if let Some(value) = config.get("trailer", None, "where")
+        && let Some(w) = parse_where(value)
     {
         cfg.where_ = w;
     }
-    if let Some(value) = config_lookup("trailer.ifexists")
-        && let Some(v) = parse_if_exists(&value)
+    if let Some(value) = config.get("trailer", None, "ifexists")
+        && let Some(v) = parse_if_exists(value)
     {
         cfg.if_exists = v;
     }
-    if let Some(value) = config_lookup("trailer.ifmissing")
-        && let Some(v) = parse_if_missing(&value)
+    if let Some(value) = config.get("trailer", None, "ifmissing")
+        && let Some(v) = parse_if_missing(value)
     {
         cfg.if_missing = v;
     }
-    if let Some(value) = config_lookup("trailer.separators")
+    if let Some(value) = config.get("trailer", None, "separators")
         && !value.is_empty()
     {
         cfg.separators = value.chars().collect();
@@ -517,39 +738,79 @@ fn load_trailer_config() -> TrailerConfig {
             cfg.out_separator = first;
         }
     }
-    if let Some(value) = config_lookup("core.commentchar")
+    if let Some(value) = config.get("core", None, "commentchar")
         && !value.is_empty()
     {
-        cfg.comment_prefix = value;
+        cfg.comment_prefix = value.to_string();
     }
+
+    // Per-token items: every `trailer.<name>.<var>` subsection. We collect them in
+    // config order (first appearance of each `<name>` fixes its slot), mirroring
+    // git's `get_conf_item` which appends a new item the first time a name is
+    // seen and updates it in place thereafter (last value wins per var).
+    let mut items: Vec<ConfItem> = Vec::new();
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("trailer") {
+            continue;
+        }
+        let Some(sub) = &section.subsection else {
+            continue;
+        };
+        let idx = match items.iter().position(|it| it.name == *sub) {
+            Some(i) => i,
+            None => {
+                items.push(ConfItem {
+                    name: sub.clone(),
+                    key: None,
+                    command: None,
+                    cmd: None,
+                    where_: cfg.where_,
+                    if_exists: cfg.if_exists,
+                    if_missing: cfg.if_missing,
+                });
+                items.len() - 1
+            }
+        };
+        for entry in &section.entries {
+            let Some(value) = &entry.value else { continue };
+            match entry.key.to_ascii_lowercase().as_str() {
+                "key" => items[idx].key = Some(value.clone()),
+                "command" => items[idx].command = Some(value.clone()),
+                "cmd" => items[idx].cmd = Some(value.clone()),
+                "where" => {
+                    if let Some(w) = parse_where(value) {
+                        items[idx].where_ = w;
+                    }
+                }
+                "ifexists" => {
+                    if let Some(v) = parse_if_exists(value) {
+                        items[idx].if_exists = v;
+                    }
+                }
+                "ifmissing" => {
+                    if let Some(v) = parse_if_missing(value) {
+                        items[idx].if_missing = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    cfg.conf_items = items;
 
     cfg
 }
 
-/// Look up a single config value (case-insensitive key) honouring `-c`/env
-/// overrides first, then the repository config file when present.
-fn config_lookup(key: &str) -> Option<String> {
-    if let Ok(Some(value)) = global_config_value(key) {
-        return Some(value);
-    }
-    let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
-    let config = read_repo_config(&git_dir).ok()?;
-    let (section, sub, name) = split_config_key(key)?;
-    config
-        .get(section, sub, name)
-        .map(|value| value.to_string())
-}
-
-/// Split a dotted config key into (section, subsection, name). Only the simple
-/// two-component `section.name` form is needed for the keys we read.
-fn split_config_key(key: &str) -> Option<(&str, Option<&str>, &str)> {
-    let dot = key.find('.')?;
-    let section = &key[..dot];
-    let name = &key[dot + 1..];
-    if name.contains('.') {
-        return None;
-    }
-    Some((section, None, name))
+/// The effective config (repo file + `-c`/env overlay) when inside a repository.
+/// `read_repo_config` already layers command-line `-c` / `GIT_CONFIG_*` overrides
+/// on top of the repo config file, so a single read gives us every `trailer.*`
+/// key including overrides. Best-effort; returns `None` outside a repository
+/// (git's compiled-in defaults then apply, matching real interpret-trailers which
+/// runs fine outside a repo).
+fn effective_config() -> Option<GitConfig> {
+    let dir = env::current_dir().ok()?;
+    let git_dir = discover_git_dir(dir).ok()?;
+    read_repo_config(&git_dir).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -639,9 +900,28 @@ fn process_message(raw_input: &str, opts: &Options) -> String {
     let block_text = &input[block_start..end_of_log];
     let mut trailers = parse_trailers(block_text, opts);
 
-    // Apply queued --trailer args (unless --only-input).
+    // Apply queued args (unless --only-input). git builds the arg list as the
+    // config-command trailers (one per configured item with a `command`) spliced
+    // *before* the command-line `--trailer` args, then processes them in order.
     if !opts.only_input {
-        for arg in &opts.trailers {
+        let mut args: Vec<ArgTrailer> = Vec::new();
+        for item in &opts.conf_items {
+            if item.command.is_some() {
+                args.push(ArgTrailer {
+                    // git uses token_from_item(item, NULL): the key if set, else
+                    // the config name.
+                    token: item.key.clone().unwrap_or_else(|| item.name.clone()),
+                    value: String::new(),
+                    where_: item.where_,
+                    if_exists: item.if_exists,
+                    if_missing: item.if_missing,
+                    command: item.command.clone(),
+                    cmd: item.cmd.clone(),
+                });
+            }
+        }
+        args.extend(opts.trailers.iter().cloned());
+        for arg in &args {
             apply_arg(&mut trailers, arg, opts.out_separator);
         }
     }
@@ -791,10 +1071,10 @@ fn is_divider_at(input: &str, pos: usize) -> bool {
 /// spans the whole region is **not** trimmed and stays in the body. We model
 /// that by treating `boc == 0` exactly like "no run".
 fn ignored_log_message_bytes(buf: &str, len: usize, comment_prefix: &str) -> usize {
-    // We do not implement scissors detection (`wt_status_locate_end`); the
-    // common path has no scissors line, so the cutoff is `len`. A scissors line
-    // is itself a comment and so is absorbed into the trailing run anyway.
-    let cutoff = len;
+    // `cutoff` = the position of the scissors ("cut") line, if any: everything
+    // from there to `len` is below the cut and is ignored wholesale (git's
+    // `wt_status_locate_end`). Absent a scissors line, `cutoff == len`.
+    let cutoff = wt_status_locate_end(buf, len, comment_prefix);
     let mut boc = 0usize;
     let mut boc_set = false;
     let mut in_conflicts = false;
@@ -823,6 +1103,35 @@ fn ignored_log_message_bytes(buf: &str, len: usize, comment_prefix: &str) -> usi
     }
     // `boc ? len - boc : len - cutoff` — note boc == 0 is the falsy branch.
     if boc != 0 { len - boc } else { len - cutoff }
+}
+
+/// git's `wt_status_locate_end`: find the "scissors" (cut) line within
+/// `buf[..len]` and return the offset of its start (so everything from there on
+/// is below the cut). The scissors line is `<comment> ------------------------ >8
+/// ------------------------` on its own line. git matches the pattern
+/// `\n<comment> <cut_line>\n` (the leading `\n` anchors it to a line boundary,
+/// the trailing `\n` to a full line); when the buffer *starts* with the
+/// comment+cut_line (no leading newline needed), the whole buffer is below the
+/// cut (`len = 0`). Returns `len` when no scissors line is present.
+fn wt_status_locate_end(buf: &str, len: usize, comment_prefix: &str) -> usize {
+    const CUT_LINE: &str = "------------------------ >8 ------------------------\n";
+    let region = &buf[..len];
+    // pattern (without the leading '\n'): "<comment> <cut_line>"
+    let head = format!("{comment_prefix} {CUT_LINE}");
+    if region.starts_with(&head) {
+        return 0;
+    }
+    // full pattern: "\n<comment> <cut_line>"
+    let pattern = format!("\n{head}");
+    match region.find(&pattern) {
+        Some(p) => {
+            // newlen = (p - s) + 1: just past the matched leading '\n', i.e. the
+            // start of the scissors line itself.
+            let newlen = p + 1;
+            newlen.min(len)
+        }
+        None => len,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -887,12 +1196,23 @@ fn find_trailer_block_start(buf: &str, len: usize, opts: &Options) -> usize {
                 possible_continuation = 0;
                 recognized_prefix = true;
             } else if let Some(sep) = separator_index(line_at(buf, bol, len), &opts.separators) {
-                let _ = sep;
                 trailer_lines += 1;
                 possible_continuation = 0;
-                // (git additionally marks recognized_prefix when the token
-                // matches a configured trailer.<key>; we do not carry per-key
-                // config, so this only affects the obscure 25%-with-config path.)
+                // git also marks `recognized_prefix` when this trailer line's
+                // token matches a configured `trailer.<name>` item — a single
+                // configured trailer in the paragraph then enables the 25% rule
+                // (`trailer_lines * 3 >= non_trailer_lines`). The match uses the
+                // separator position as the token length (git's
+                // `token_matches_item(bol, item, separator_pos)`).
+                if !recognized_prefix {
+                    let line = line_at(buf, bol, len);
+                    for item in &opts.conf_items {
+                        if token_matches_item(line, item, sep) {
+                            recognized_prefix = true;
+                            break;
+                        }
+                    }
+                }
             } else if first_byte.is_ascii_whitespace() {
                 possible_continuation += 1;
             } else {
@@ -1020,7 +1340,14 @@ fn parse_trailers(block: &str, opts: &Options) -> Vec<Trailer> {
         }
         match separator_index(&line.head, &opts.separators) {
             Some(sep) => {
-                let token = line.head[..sep].trim_end().to_string();
+                // git's `parse_trailer` trims the token on both ends, then
+                // rewrites it to the configured `key` when it matches a config
+                // item — this happens even for *input* trailers (the conf=NULL
+                // path only skips storing the conf pointer, not the token
+                // rewrite), so a configured `trailer.<name>.key` reformats
+                // matching input trailers (e.g. `Acked-by:` → `Acked-by= `).
+                let raw_token = line.head[..sep].trim().to_string();
+                let token = rewrite_token_via_config(&raw_token, opts);
                 // git's `parse_trailer` takes the post-separator text of the
                 // whole merged trailer (continuation lines included, joined by
                 // the original newlines) and trims it once.
@@ -1043,6 +1370,19 @@ fn parse_trailers(block: &str, opts: &Options) -> Vec<Trailer> {
         }
     }
     trailers
+}
+
+/// Rewrite a parsed token to the configured `key` of the first config item it
+/// matches (git's unconditional token rewrite in `parse_trailer`). When no item
+/// matches, or the matched item has no `key`, the token is returned unchanged.
+fn rewrite_token_via_config(token: &str, opts: &Options) -> String {
+    let tok_len = token_len_without_separator(token, &opts.separators);
+    for item in &opts.conf_items {
+        if token_matches_item(token, item, tok_len) {
+            return item.key.clone().unwrap_or_else(|| token.to_string());
+        }
+    }
+    token.to_string()
 }
 
 /// Faithful port of git's `unfold_value`: each newline plus the whitespace run
@@ -1105,10 +1445,16 @@ fn same_trailer(item: &Trailer, arg: &ArgTrailer) -> bool {
 /// / `add_arg_to_input_list` from trailer.c, including the `on_tok` reference
 /// (the list head/tail for start/end, the matched item for after/before) and the
 /// neighbor-vs-whole-list distinction between the two `addIfDifferent` modes.
+///
+/// When the arg carries a `command`/`cmd`, git runs it (`apply_item_command`) at
+/// the point of application — *before* the duplicate comparison — replacing the
+/// arg value with the command output. The command argument is the arg's own value
+/// if non-empty, else the matched input trailer's value (or empty for the missing
+/// path). We resolve that value first, then proceed with the resolved trailer.
 fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
-    let new = Trailer::token_item(arg.token.clone(), arg.value.clone(), out_sep);
     let backwards = after_or_end(arg.where_);
     let middle = matches!(arg.where_, Where::After | Where::Before);
+    let has_command = arg.command.is_some() || arg.cmd.is_some();
 
     // find_same_and_apply_arg: locate the first same-token item in the search
     // direction. `start_idx` is the tail (backwards) or head (forwards).
@@ -1116,6 +1462,8 @@ fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
         // No existing trailers at all => if-missing applies; insertion falls back
         // to start/end since there is no reference item.
         if matches!(arg.if_missing, IfMissing::Add) {
+            let arg = resolve_command(arg, None, has_command);
+            let new = Trailer::token_item(arg.token.clone(), arg.value.clone(), out_sep);
             insert_relative(trailers, new, None, backwards);
         }
         return;
@@ -1126,6 +1474,8 @@ fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
     let Some(in_idx) = match_idx else {
         // if-missing path: no same-token trailer exists.
         if matches!(arg.if_missing, IfMissing::Add) {
+            let arg = resolve_command(arg, None, has_command);
+            let new = Trailer::token_item(arg.token.clone(), arg.value.clone(), out_sep);
             // on_tok is start_tok (head/tail); insert relative to it.
             insert_relative(trailers, new, Some(start_idx), backwards);
         }
@@ -1134,6 +1484,18 @@ fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
 
     // on_tok index: the matched item for after/before, else start_tok.
     let on_idx = if middle { in_idx } else { start_idx };
+
+    // Run the configured command (if any) against the matched input value, then
+    // build the new item from the resolved value. DoNothing never runs it.
+    let resolved;
+    let arg: &ArgTrailer = if matches!(arg.if_exists, IfExists::DoNothing) {
+        arg
+    } else {
+        let in_value = trailers[in_idx].value.clone();
+        resolved = resolve_command(arg, Some(&in_value), has_command);
+        &resolved
+    };
+    let new = Trailer::token_item(arg.token.clone(), arg.value.clone(), out_sep);
 
     match arg.if_exists {
         IfExists::DoNothing => {}
@@ -1166,6 +1528,68 @@ fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
         }
     }
 }
+
+/// Resolve `arg`'s value through its configured `command`/`cmd` if it has one,
+/// returning a copy of `arg` with the command output as its value. When the arg
+/// has no command this is a cheap clone. Mirrors `apply_item_command`: the
+/// command argument is `arg.value` if non-empty, else `in_value` (the matched
+/// input trailer's value), else the empty string.
+fn resolve_command(arg: &ArgTrailer, in_value: Option<&str>, has_command: bool) -> ArgTrailer {
+    if !has_command {
+        return arg.clone();
+    }
+    let cmd_arg: &str = if !arg.value.is_empty() {
+        &arg.value
+    } else {
+        in_value.unwrap_or("")
+    };
+    let output = run_trailer_command(arg.command.as_deref(), arg.cmd.as_deref(), cmd_arg);
+    let mut out = arg.clone();
+    out.value = output;
+    out
+}
+
+/// git's `apply_command`: run the configured shell command, returning its trimmed
+/// stdout (or `""` on failure). For `cmd`, the command is run as `sh -c <cmd>`
+/// with the argument appended as a positional parameter; for `command`, the
+/// literal `$ARG` token in the command string is replaced with the argument and
+/// the whole thing is run via the shell. git always uses `use_shell = 1`.
+fn run_trailer_command(command: Option<&str>, cmd: Option<&str>, arg: &str) -> String {
+    use std::process::Command;
+
+    // git's `use_shell` wraps the program in `sh -c "<prog> \"$@\"" <prog> <args>`
+    // when the program has no shell metacharacters it would otherwise just exec;
+    // we always route through `sh -c` to match the documented behaviour (cmd gets
+    // the arg as a positional; command has $ARG pre-substituted in the script).
+    let output = if let Some(cmd) = cmd {
+        // `<cmd> <arg>` — git pushes cmd then arg as argv, with use_shell. The
+        // shell receives the joined string and the arg as $1 via the trailing
+        // operands. Reproduce by running `sh -c '<cmd> "$@"' <cmd> <arg>`.
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("{cmd} \"$@\""))
+            .arg(cmd) // $0
+            .arg(arg) // $1
+            .output()
+    } else if let Some(command) = command {
+        let script = command.replace(TRAILER_ARG_STRING, arg);
+        Command::new("sh").arg("-c").arg(script).output()
+    } else {
+        return String::new();
+    };
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// git's `TRAILER_ARG_STRING`: the placeholder replaced by the argument in a
+/// `trailer.<token>.command` string.
+const TRAILER_ARG_STRING: &str = "$ARG";
 
 /// Find the index of the first same-token trailer scanning in `backwards`
 /// direction (from the tail when backwards, else from the head). Raw items never
@@ -1313,6 +1737,7 @@ mod tests {
             out_separator: ':',
             separators: vec![':'],
             comment_prefix: "#".to_string(),
+            conf_items: Vec::new(),
             trailers: Vec::new(),
             files: Vec::new(),
         }
@@ -1327,6 +1752,8 @@ mod tests {
                 where_: Where::End,
                 if_exists: IfExists::AddIfDifferentNeighbor,
                 if_missing: IfMissing::Add,
+                command: None,
+                cmd: None,
             });
         }
         opts
@@ -1508,33 +1935,29 @@ mod tests {
     #[test]
     fn arg_separator_first_of_either() {
         let seps = vec![':'];
-        let t = parse_trailer_arg(
-            "key=a:b",
-            &seps,
-            Where::End,
-            IfExists::AddIfDifferentNeighbor,
-            IfMissing::Add,
-        );
+        let no_conf: &[ConfItem] = &[];
+        let parse = |raw: &str| {
+            parse_trailer_arg(
+                raw,
+                &seps,
+                no_conf,
+                Where::End,
+                IfExists::AddIfDifferentNeighbor,
+                IfMissing::Add,
+                None,
+                None,
+                None,
+            )
+        };
+        let t = parse("key=a:b");
         assert_eq!(t.token, "key");
         assert_eq!(t.value, "a:b");
 
-        let t2 = parse_trailer_arg(
-            "key:a=b",
-            &seps,
-            Where::End,
-            IfExists::AddIfDifferentNeighbor,
-            IfMissing::Add,
-        );
+        let t2 = parse("key:a=b");
         assert_eq!(t2.token, "key");
         assert_eq!(t2.value, "a=b");
 
-        let t3 = parse_trailer_arg(
-            "keyonly",
-            &seps,
-            Where::End,
-            IfExists::AddIfDifferentNeighbor,
-            IfMissing::Add,
-        );
+        let t3 = parse("keyonly");
         assert_eq!(t3.token, "keyonly");
         assert_eq!(t3.value, "");
     }

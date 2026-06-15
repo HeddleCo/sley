@@ -659,7 +659,12 @@ fn merge_octopus(
             parents,
             author,
             committer: committer.clone(),
-            message: commit_cleanup_message(message.into_bytes(), CommitCleanupMode::Whitespace),
+            message: commit_cleanup_message(
+                message.into_bytes(),
+                CommitCleanupMode::Whitespace,
+                "#",
+                false,
+            ),
             encoding: None,
         },
     )?;
@@ -1243,7 +1248,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             &head_oid,
             &other_oid,
             merged_tree,
-            commit_cleanup_message(message.clone().into_bytes(), CommitCleanupMode::Whitespace),
+            commit_cleanup_message(
+                message.clone().into_bytes(),
+                CommitCleanupMode::Whitespace,
+                "#",
+                false,
+            ),
         )?;
         sley_worktree::reset_index_and_worktree_to_commit(
             &worktree_root,
@@ -1432,7 +1442,7 @@ pub(crate) fn conclude_in_progress_merge(
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
-    let message = commit_cleanup_message(message, CommitCleanupMode::Whitespace);
+    let message = commit_cleanup_message(message, CommitCleanupMode::Whitespace, "#", false);
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let commit_oid = sley_sequencer::create_commit(
