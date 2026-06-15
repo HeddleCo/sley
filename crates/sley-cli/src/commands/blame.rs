@@ -54,12 +54,19 @@ enum DateField {
     Raw,
 }
 
+/// Positional arguments to `git blame`, before rev-vs-path disambiguation
+/// (which needs the repository to test whether a token names a revision).
+struct BlamePositionals {
+    /// Positionals seen before any `--`.
+    bare: Vec<String>,
+    /// Paths seen after `--` (these are always paths, never revisions).
+    after_dd: Vec<String>,
+}
+
 /// Parsed `git blame` invocation.
 struct BlameOptions {
-    /// Optional starting revision; `None` means `HEAD`.
-    rev: Option<String>,
-    /// The (cwd-relative) path to blame.
-    path: String,
+    /// Raw positionals; resolved into (rev, path) in `run_blame`.
+    positionals: BlamePositionals,
     /// Show the full object name instead of an abbreviation (`-l`).
     long_sha: bool,
     /// Suppress the author and date columns (`-s`).
@@ -93,8 +100,12 @@ enum RangeBound {
     Omitted,
     /// An absolute 1-based line number.
     Absolute(usize),
-    /// A relative offset from the other bound (`+N`), only valid as the end.
+    /// A forward relative offset from the start (`+N`), only valid as the end:
+    /// end = start + N - 1.
     Relative(usize),
+    /// A backward relative offset from the start (`-N`), only valid as the end:
+    /// end = start - N (git's `-L X,-N`, which yields a reversed span).
+    RelativeNeg(usize),
 }
 
 /// The blame result for a single final-image line.
@@ -138,9 +149,31 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     let format = repo.format();
     let db = repo.objects();
 
+    // Disambiguate rev vs path now that the repository is available: a token
+    // "is a rev" if it resolves to an object, matching git's `is_a_rev`. A
+    // leading `^` marks a boundary rev (`git blame ^<rev>`); strip it before
+    // testing/resolving.
+    let (rev, path) = resolve_positionals(&options.positionals, |tok| {
+        let core = tok.strip_prefix('^').unwrap_or(tok);
+        repo.resolve_revision(core).is_ok()
+    })?;
+
+    // A `^<rev>` rev makes `<rev>` (and its ancestors) an uninteresting
+    // *boundary*: the blame walk stops there and renders it with `^`. The final
+    // image then comes from HEAD (the default), not from the boundary rev.
+    let (rev_spec, boundary_tip): (String, Option<ObjectId>) = match &rev {
+        Some(r) if r.starts_with('^') => {
+            let core = &r[1..];
+            let oid = repo.resolve_revision(core)?;
+            let tip = sley_rev::peel_to_commit(db, format, &oid)?;
+            ("HEAD".to_string(), Some(tip))
+        }
+        Some(r) => (r.clone(), None),
+        None => ("HEAD".to_string(), None),
+    };
+
     // Resolve the requested revision (default HEAD) to a commit.
-    let rev_spec = options.rev.as_deref().unwrap_or("HEAD");
-    let start_oid = repo.resolve_revision(rev_spec)?;
+    let start_oid = repo.resolve_revision(&rev_spec)?;
     let start_commit = sley_rev::peel_to_commit(db, format, &start_oid)?;
 
     // Turn the cwd-relative path into a repository-root-relative path the way
@@ -157,7 +190,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // and applying smudge would diverge from git. When the working-tree overlay
     // lands, route that worktree-sourced content through
     // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
-    let repo_path = blame_repo_relative_path(cwd, git_dir, &options.path)?;
+    let repo_path = blame_repo_relative_path(cwd, git_dir, &path)?;
     let final_blob = match read_path_blob(db, format, &start_commit, &repo_path)? {
         Some(blob) => blob,
         None => {
@@ -176,6 +209,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         &repo_path,
         &final_blob,
         options.first_parent,
+        boundary_tip,
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -230,6 +264,9 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--first-parent" => first_parent = true,
             "-c" => compat = true,
             "--abbrev" => abbrev_override = Some(0),
+            // `--no-abbrev` shows the full object name, like `-l` / `--abbrev`
+            // with the full hash length.
+            "--no-abbrev" => long_sha = true,
             "-L" => {
                 let Some(value) = iter.next() else {
                     return Err(blame_option_requires_value("L"));
@@ -271,14 +308,16 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         }
     }
 
-    // Resolve positionals into (optional rev, path). git accepts
-    // `blame <file>`, `blame <rev> <file>`, `blame <rev> -- <file>`, and
-    // `blame <file>` with `<rev>` omitted; paths after `--` take precedence.
-    let (rev, path) = resolve_positionals(positionals, paths_after_dd)?;
+    // Collect the positionals for rev/path disambiguation; the rev-vs-path
+    // decision for the ambiguous `blame X Y` form needs the repository (to test
+    // whether a token resolves as a revision), so it is deferred to `run_blame`.
+    let positionals = BlamePositionals {
+        bare: positionals,
+        after_dd: paths_after_dd,
+    };
 
     Ok(BlameArgs::Run(BlameOptions {
-        rev,
-        path,
+        positionals,
         long_sha,
         suppress_author,
         author_field,
@@ -291,26 +330,40 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     }))
 }
 
-/// Decide which positional is the revision and which is the path.
+/// Decide which positional is the revision and which is the path, using the
+/// repository to disambiguate the `blame X Y` form the way git's builtin does
+/// (blame.c cases 1a/1b/2a/2b): with no `--`, two positionals where the *last*
+/// names a revision are `blame <path> <rev>` (e.g. `git blame file main`);
+/// otherwise the last is the path and the first the rev.
 fn resolve_positionals(
-    positionals: Vec<String>,
-    paths_after_dd: Vec<String>,
+    positionals: &BlamePositionals,
+    is_rev: impl Fn(&str) -> bool,
 ) -> Result<(Option<String>, String)> {
-    if !paths_after_dd.is_empty() {
-        if paths_after_dd.len() > 1 {
+    let bare = &positionals.bare;
+    if !positionals.after_dd.is_empty() {
+        // `blame [<rev>] -- <path>` or `blame -- <path> <rev>`.
+        if positionals.after_dd.len() > 1 {
             return Err(blame_too_many_paths());
         }
-        let rev = match positionals.len() {
+        let rev = match bare.len() {
             0 => None,
-            1 => Some(positionals[0].clone()),
+            1 => Some(bare[0].clone()),
             _ => return Err(blame_usage_error()),
         };
-        return Ok((rev, paths_after_dd[0].clone()));
+        return Ok((rev, positionals.after_dd[0].clone()));
     }
-    match positionals.len() {
+    match bare.len() {
         0 => Err(blame_usage_error()),
-        1 => Ok((None, positionals[0].clone())),
-        2 => Ok((Some(positionals[0].clone()), positionals[1].clone())),
+        1 => Ok((None, bare[0].clone())),
+        2 => {
+            if is_rev(&bare[1]) {
+                // `blame <path> <rev>` — last token is the revision.
+                Ok((Some(bare[1].clone()), bare[0].clone()))
+            } else {
+                // `blame <rev> <path>` — last token is the path.
+                Ok((Some(bare[0].clone()), bare[1].clone()))
+            }
+        }
         _ => Err(blame_too_many_paths()),
     }
 }
@@ -393,8 +446,17 @@ fn parse_range_bound(raw: &str, is_end: bool) -> Result<RangeBound> {
         let count = rest.parse::<usize>().map_err(|_| blame_usage_error())?;
         return Ok(RangeBound::Relative(count));
     }
-    // Only absolute numbers and the `+N` end form are accepted; anything else
-    // (e.g. `abc`, `1.5`, a leading `-`) is a usage error, matching git.
+    if let Some(rest) = raw.strip_prefix('-') {
+        // `-N` is a backward-relative *end* bound (`-L X,-N`); as a start it is
+        // a usage error (git's parser rejects a leading-dash start too).
+        if !is_end {
+            return Err(blame_usage_error());
+        }
+        let count = rest.parse::<usize>().map_err(|_| blame_usage_error())?;
+        return Ok(RangeBound::RelativeNeg(count));
+    }
+    // Only absolute numbers and the `±N` end forms are accepted; anything else
+    // (e.g. `abc`, `1.5`) is a usage error, matching git.
     let number = raw.parse::<usize>().map_err(|_| blame_usage_error())?;
     Ok(RangeBound::Absolute(number))
 }
@@ -540,6 +602,7 @@ fn compute_blame(
     repo_path: &str,
     final_blob: &[u8],
     first_parent: bool,
+    boundary_tip: Option<ObjectId>,
 ) -> Result<Vec<LineBlame>> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -549,6 +612,14 @@ fn compute_blame(
     if line_count == 0 {
         return Ok(Vec::new());
     }
+
+    // `git blame ^<rev>`: `<rev>` and all its ancestors are uninteresting
+    // boundaries — when the walk reaches one, it charges the lines there as a
+    // boundary and does not recurse into parents. Precompute that closure.
+    let uninteresting = match boundary_tip {
+        Some(tip) => ancestors_closure(db, format, &tip)?,
+        None => HashSet::new(),
+    };
 
     // Per-commit suspect chunks ("origin->suspects" in git). A commit is in the
     // queue iff it has at least one suspect chunk. The blob for each commit's
@@ -579,6 +650,13 @@ fn compute_blame(
             continue;
         };
         if owned.is_empty() {
+            continue;
+        }
+
+        // Uninteresting (`^<rev>`) commits are boundaries: charge their lines
+        // with the boundary marker and stop — do not pass blame to parents.
+        if uninteresting.contains(&commit_oid) {
+            charge_remaining(&mut result, &final_lines, &commit_oid, true, owned);
             continue;
         }
 
@@ -908,6 +986,31 @@ fn charge_remaining(
     }
 }
 
+/// The set of `tip` and all commits reachable from it (its ancestor closure),
+/// used to mark `git blame ^<rev>` boundaries as uninteresting.
+fn ancestors_closure(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tip: &ObjectId,
+) -> Result<HashSet<ObjectId>> {
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut stack = vec![*tip];
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            continue;
+        }
+        let commit = Commit::parse(format, &object.body)?;
+        for parent in &commit.parents {
+            stack.push(*parent);
+        }
+    }
+    Ok(seen)
+}
+
 /// Read (and memoise) the blob for `repo_path` at `commit`. `None` means the
 /// path is absent (or names a non-blob) at that commit.
 fn cached_blob(
@@ -1000,9 +1103,9 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
     let start = match range.start {
         RangeBound::Omitted => 1,
         RangeBound::Absolute(n) => n,
-        // `+N` is only meaningful as an end bound; the parser already rejects a
+        // `±N` is only meaningful as an end bound; the parser already rejects a
         // relative start, so this is defensive and reports a usage error.
-        RangeBound::Relative(_) => return Err(blame_usage_error()),
+        RangeBound::Relative(_) | RangeBound::RelativeNeg(_) => return Err(blame_usage_error()),
     };
     // git validates the start line number before anything else (so `-L 0,+5` and
     // `-L 0,3` both report the zero error rather than an empty-range/clamp).
@@ -1028,11 +1131,29 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
             }
             start + count - 1
         }
+        // `start,-N` selects the N lines *ending* at `start`: the span is
+        // [start - N + 1, start]. So the resolved end is `start` and the start
+        // is pulled back by N-1 (handled below). `-0` is an empty range.
+        RangeBound::RelativeNeg(count) => {
+            if count == 0 {
+                eprintln!("fatal: -L invalid empty range");
+                return Err(GitError::Exit(128));
+            }
+            // The lower endpoint, clamped at line 1 the way git's parse_loc does.
+            let lo = start.saturating_sub(count - 1).max(1);
+            return finish_range(lo, start, total, path);
+        }
     };
-    // Order the endpoints, then bound-check the lower one and clamp the upper one
-    // to the file, matching git's blame range handling.
-    let lo = start.min(end);
-    let hi = start.max(end);
+    finish_range(start, end, total, path)
+}
+
+/// Order the two resolved endpoints, bound-check the lower one, and clamp the
+/// upper one to the file — git's blame range handling. A reversed range
+/// (`-L 5,2`) displays the inclusive span `[min, max]`; the "file has only N
+/// lines" error keys off the *smaller* endpoint.
+fn finish_range(a: usize, b: usize, total: usize, path: &str) -> Result<(usize, usize)> {
+    let lo = a.min(b);
+    let hi = a.max(b);
     if lo > total {
         eprintln!("fatal: file {path} has only {total} lines");
         return Err(GitError::Exit(128));
