@@ -232,6 +232,14 @@
 # t7102-reset=37, t1007-hash-object=40, t1500-rev-parse=81, t1462-refs-exists=12,
 # t1401-symbolic-ref=25, t7004-tag=159, t3200-branch=117, t3301-notes=144,
 # t1300-config=497, t2400-worktree-add=165. No workspace test regressed (2203/0).
+#
+# Bisection lift (2026-06-15): lifted the weighted-midpoint bisection engine out
+# of the private sley-cli bisect command into a shared sley_rev::bisect primitive
+# and wired rev-list --bisect/--bisect-vars/--bisect-all on top of it. NEW floor
+# t6002-rev-list-bisect=52 (was 0; the one remaining fail is rev-parse ^rev arg
+# support, out of scope). Shared-engine neighbors held (measured==floor, none
+# regressed): t6030-bisect-porcelain=95, t6003-rev-list-topo-order=36,
+# t6012-rev-list-simplify=9. No workspace test regressed (2206/0).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -274,6 +282,7 @@ declare -A FLOOR=(
     [t3510-cherry-pick-sequence.sh]=52
     [t4214-log-graph-octopus.sh]=17
     [t4215-log-skewed-merges.sh]=9
+    [t6002-rev-list-bisect.sh]=52
     [t6030-bisect-porcelain.sh]=95
     [t5310-pack-bitmaps.sh]=221
     [t5326-multi-pack-bitmaps.sh]=342

@@ -1133,8 +1133,7 @@ fn rev_list_emit_bisection(
     bisect_all: bool,
     first_parent: bool,
 ) -> Result<()> {
-    let owned: Vec<sley_rev::CommitRecord> = selected.iter().map(|r| (*r).clone()).collect();
-    let result = sley_rev::bisect::find_bisection(&owned, bisect_all, first_parent);
+    let result = sley_rev::bisect::find_bisection(selected, bisect_all, first_parent);
     let mut stdout = io::stdout();
 
     if bisect_vars {

@@ -197,8 +197,13 @@ pub struct FindBisection {
 /// their distances. `records` is the `bad ^good` reachable set in newest-first
 /// (rev-list) order; `first_parent` restricts each commit to its first interior
 /// parent (matching `--first-parent`). This is the entry point `rev-list
-/// --bisect[-vars|-all]` uses.
-pub fn find_bisection(records: &[CommitRecord], find_all: bool, first_parent: bool) -> FindBisection {
+/// --bisect[-vars|-all]` uses. Takes borrowed records (only oid + parents are
+/// read) so the caller need not deep-clone the parsed commit set.
+pub fn find_bisection(
+    records: &[&CommitRecord],
+    find_all: bool,
+    first_parent: bool,
+) -> FindBisection {
     // Oldest-first list with intra-set parent adjacency (upstream gives
     // find_bisection the limited commit list in this order).
     let oids: Vec<ObjectId> = records.iter().rev().map(|record| record.oid).collect();
