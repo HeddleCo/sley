@@ -1,0 +1,304 @@
+//! Combined / merge-commit diff (`-c` / `--cc` / `--combined-all-paths`).
+//!
+//! This is the single CLI-side wiring of the combined-diff renderer
+//! ([`sley_diff_merge::render::render_combined_with`]) shared by `diff-tree`,
+//! `show`, `log`, and `whatchanged`. It owns the repository-coupled half of
+//! git's `combine-diff.c`: discovering the set of paths that EVERY parent
+//! touches (`intersect_paths` / `find_paths_multitree`), reading the result and
+//! per-parent blobs, and emitting the combined-raw (`::`) lines and the
+//! `diff --cc`/`diff --combined` metainfo header. The renderer crate produces
+//! the `@@@`-style hunk body; this module produces everything around it.
+//!
+//! A glob of the crate root brings every shared helper/type into scope via
+//! descendant-privacy; see commands::stash for the rationale.
+use crate::*;
+
+/// One path of a combined merge diff: the merge result plus each parent's state
+/// for that path (mirrors git's `struct combine_diff_path`).
+pub(crate) struct CombinedPath {
+    pub path: Vec<u8>,
+    /// Result mode/oid (`0`/`None` when the result deleted the path).
+    pub result_mode: u32,
+    pub result_oid: Option<ObjectId>,
+    /// Per-parent state in parent order.
+    pub parents: Vec<CombinedParentEntry>,
+}
+
+pub(crate) struct CombinedParentEntry {
+    pub mode: u32,
+    pub oid: Option<ObjectId>,
+    /// The single-letter raw status (`M`, `A`, `D`, ...) of the result relative
+    /// to this parent.
+    pub status: char,
+}
+
+/// Compute the combined path set for a merge: the intersection of the per-parent
+/// recursive name-status diffs (parent tree -> result tree), in tree order.
+/// git always scans combined paths recursively and without rename detection.
+pub(crate) fn combined_paths(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    result_tree: &ObjectId,
+    parent_trees: &[ObjectId],
+) -> Result<Vec<CombinedPath>> {
+    let num_parent = parent_trees.len();
+    let rename_options = sley_diff_merge::RenameDetectionOptions {
+        base: sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: false,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
+        },
+        detect_inexact: false,
+        rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+    };
+    let mut per_parent: Vec<BTreeMap<Vec<u8>, sley_diff_merge::NameStatusEntry>> =
+        Vec::with_capacity(num_parent);
+    for parent_tree in parent_trees {
+        let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+            db,
+            format,
+            parent_tree,
+            result_tree,
+            rename_options,
+        )?;
+        per_parent.push(entries.into_iter().map(|e| (e.path.to_vec(), e)).collect());
+    }
+
+    let mut paths = Vec::new();
+    if let Some(first) = per_parent.first() {
+        'paths: for (path, first_entry) in first {
+            let mut parents = Vec::with_capacity(num_parent);
+            for map in &per_parent {
+                let Some(entry) = map.get(path) else {
+                    continue 'paths;
+                };
+                parents.push(CombinedParentEntry {
+                    mode: entry.old_mode.unwrap_or(0),
+                    oid: entry.old_oid,
+                    status: entry.status.code(),
+                });
+            }
+            paths.push(CombinedPath {
+                path: path.clone(),
+                result_mode: first_entry.new_mode.unwrap_or(0),
+                result_oid: first_entry.new_oid,
+                parents,
+            });
+        }
+    }
+    Ok(paths)
+}
+
+/// Options shared by the combined raw / patch writers.
+pub(crate) struct CombinedRenderCtx<'a> {
+    pub db: &'a FileObjectDatabase,
+    pub format: ObjectFormat,
+    /// `true` for `--cc` (dense simplification), `false` for `-c`.
+    pub dense: bool,
+    /// `--combined-all-paths`: list each parent's path on its own `---` line.
+    pub all_paths: bool,
+    /// Unified-context (always 3 for combined diffs today).
+    pub context: usize,
+    pub ws_ignore: sley_diff_merge::WsIgnore,
+    pub diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    pub src_prefix: &'a str,
+    pub dst_prefix: &'a str,
+    /// Patch index-line abbreviation width.
+    pub patch_abbrev: usize,
+    /// Raw-mode oid abbreviation (`None` = full id).
+    pub raw_abbrev: Option<usize>,
+}
+
+/// Emit one combined-raw (`::`) entry — git's `show_raw_diff` RAW format.
+pub(crate) fn write_combined_raw(
+    stdout: &mut dyn Write,
+    ctx: &CombinedRenderCtx<'_>,
+    path: &CombinedPath,
+    z: bool,
+) -> Result<()> {
+    let num_parent = path.parents.len();
+    for _ in 0..num_parent {
+        write!(stdout, ":")?;
+    }
+    for parent in &path.parents {
+        write!(stdout, "{:06o} ", parent.mode)?;
+    }
+    write!(stdout, "{:06o}", path.result_mode)?;
+    for parent in &path.parents {
+        write!(stdout, " {}", combined_raw_oid(parent.oid.as_ref(), ctx))?;
+    }
+    write!(stdout, " {} ", combined_raw_oid(path.result_oid.as_ref(), ctx))?;
+    for parent in &path.parents {
+        write!(stdout, "{}", parent.status)?;
+    }
+    if z {
+        stdout.write_all(b"\0")?;
+        if ctx.all_paths {
+            for _ in &path.parents {
+                stdout.write_all(&path.path)?;
+                stdout.write_all(b"\0")?;
+            }
+        }
+        stdout.write_all(&path.path)?;
+        stdout.write_all(b"\0")?;
+    } else {
+        write!(stdout, "\t")?;
+        if ctx.all_paths {
+            for _ in &path.parents {
+                write!(stdout, "{}\t", status_quote_path(&path.path, false))?;
+            }
+        }
+        writeln!(stdout, "{}", status_quote_path(&path.path, false))?;
+    }
+    Ok(())
+}
+
+/// Combined-raw name-status (`-c --name-status`): per-parent status letters +
+/// path, no `::mode oid` prefix.
+pub(crate) fn write_combined_name_status(
+    stdout: &mut dyn Write,
+    path: &CombinedPath,
+    z: bool,
+) -> Result<()> {
+    for parent in &path.parents {
+        write!(stdout, "{}", parent.status)?;
+    }
+    if z {
+        stdout.write_all(b"\0")?;
+        stdout.write_all(&path.path)?;
+        stdout.write_all(b"\0")?;
+    } else {
+        writeln!(stdout, "\t{}", status_quote_path(&path.path, false))?;
+    }
+    Ok(())
+}
+
+fn combined_raw_oid(oid: Option<&ObjectId>, ctx: &CombinedRenderCtx<'_>) -> String {
+    match oid {
+        Some(oid) => {
+            let hex = oid.to_hex();
+            let width = ctx.raw_abbrev.unwrap_or(hex.len()).min(hex.len());
+            hex[..width].to_string()
+        }
+        None => "0".repeat(ctx.raw_abbrev.unwrap_or(ctx.format.hex_len())),
+    }
+}
+
+/// Emit one combined-patch file — git's `show_patch_diff`. Returns `true` when a
+/// header+body was emitted (some hunks survived, or modes differ).
+pub(crate) fn write_combined_patch(
+    stdout: &mut dyn Write,
+    ctx: &CombinedRenderCtx<'_>,
+    path: &CombinedPath,
+) -> Result<bool> {
+    let num_parent = path.parents.len();
+    let result_blob = match &path.result_oid {
+        Some(oid) => read_blob(ctx.db, oid)?,
+        None => Vec::new(),
+    };
+    let mut parent_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_parent);
+    for parent in &path.parents {
+        parent_blobs.push(match &parent.oid {
+            Some(oid) => read_blob(ctx.db, oid)?,
+            None => Vec::new(),
+        });
+    }
+    let parent_refs: Vec<&[u8]> = parent_blobs.iter().map(|b| b.as_slice()).collect();
+
+    let mode_differs = path.parents.iter().any(|p| p.mode != path.result_mode);
+
+    let mut body = Vec::new();
+    let render_options = sley_diff_merge::render::CombinedRenderOptions {
+        dense: ctx.dense,
+        context: ctx.context,
+        algorithm: ctx.diff_algorithm,
+        ws_ignore: ctx.ws_ignore,
+    };
+    let show_hunks = sley_diff_merge::render::render_combined_with(
+        &mut body,
+        &result_blob,
+        &parent_refs,
+        &render_options,
+    );
+
+    if !show_hunks && !mode_differs {
+        return Ok(false);
+    }
+
+    let head = if ctx.dense { "diff --cc " } else { "diff --combined " };
+    writeln!(stdout, "{head}{}", status_quote_path(&path.path, false))?;
+
+    write!(stdout, "index ")?;
+    for (i, parent) in path.parents.iter().enumerate() {
+        if i > 0 {
+            write!(stdout, ",")?;
+        }
+        write!(
+            stdout,
+            "{}",
+            combined_patch_abbrev(parent.oid.as_ref(), ctx.patch_abbrev, ctx.format)
+        )?;
+    }
+    writeln!(
+        stdout,
+        "..{}",
+        combined_patch_abbrev(path.result_oid.as_ref(), ctx.patch_abbrev, ctx.format)
+    )?;
+
+    let deleted = path.result_mode == 0;
+    let added = !deleted && path.parents.iter().all(|p| p.status == 'A');
+    if mode_differs {
+        if added {
+            writeln!(stdout, "new file mode {:06o}", path.result_mode)?;
+        } else {
+            if deleted {
+                write!(stdout, "deleted file ")?;
+            }
+            write!(stdout, "mode ")?;
+            for (i, parent) in path.parents.iter().enumerate() {
+                if i > 0 {
+                    write!(stdout, ",")?;
+                }
+                write!(stdout, "{:06o}", parent.mode)?;
+            }
+            if path.result_mode != 0 {
+                write!(stdout, "..{:06o}", path.result_mode)?;
+            }
+            writeln!(stdout)?;
+        }
+    }
+
+    if ctx.all_paths {
+        for parent in &path.parents {
+            if parent.status == 'A' {
+                writeln!(stdout, "--- /dev/null")?;
+            } else {
+                writeln!(stdout, "--- {}{}", ctx.src_prefix, status_quote_path(&path.path, false))?;
+            }
+        }
+    } else if added {
+        writeln!(stdout, "--- /dev/null")?;
+    } else {
+        writeln!(stdout, "--- {}{}", ctx.src_prefix, status_quote_path(&path.path, false))?;
+    }
+    if deleted {
+        writeln!(stdout, "+++ /dev/null")?;
+    } else {
+        writeln!(stdout, "+++ {}{}", ctx.dst_prefix, status_quote_path(&path.path, false))?;
+    }
+
+    stdout.write_all(&body)?;
+    Ok(true)
+}
+
+fn combined_patch_abbrev(oid: Option<&ObjectId>, abbrev: usize, format: ObjectFormat) -> String {
+    match oid {
+        Some(oid) => {
+            let hex = oid.to_hex();
+            hex[..abbrev.min(hex.len())].to_string()
+        }
+        None => "0".repeat(abbrev.min(format.hex_len())),
+    }
+}
