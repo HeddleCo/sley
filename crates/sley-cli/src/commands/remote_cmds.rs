@@ -3065,11 +3065,25 @@ fn render_push_status(
     remote_db: &FileObjectDatabase,
 ) -> Result<()> {
     let summary_width = push_summary_width(report);
-    // git renders refs in the remote-ref list order, which `match_push_refs`
-    // builds sorted by destination ref name. Sort a view so the three status
-    // passes below each walk in that canonical order.
-    let mut ordered: Vec<&sley_remote::PushReportRef> = report.refs.iter().collect();
-    ordered.sort_by(|a, b| a.dst.cmp(&b.dst));
+    // git renders refs in `remote_refs` order: the refs that already exist on the
+    // remote first (the advertisement is sorted by ref name), then the
+    // newly-created refs appended in refspec/planning order. A "new" ref is a
+    // create (zero old id that is not a deletion). Reproduce that key, then the
+    // three status passes below each walk in this canonical order.
+    let mut ordered: Vec<(usize, &sley_remote::PushReportRef)> =
+        report.refs.iter().enumerate().collect();
+    ordered.sort_by(|(ai, a), (bi, b)| {
+        let a_new = a.old_id.is_null() && !a.is_deletion();
+        let b_new = b.old_id.is_null() && !b.is_deletion();
+        match (a_new, b_new) {
+            (false, false) => a.dst.cmp(&b.dst),
+            (true, true) => ai.cmp(bi),
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+        }
+    });
+    let ordered: Vec<&sley_remote::PushReportRef> =
+        ordered.into_iter().map(|(_, reference)| reference).collect();
     let mut first = true;
     let mut emit = |reference: &sley_remote::PushReportRef| {
         if first {
