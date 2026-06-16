@@ -1663,6 +1663,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             dst_prefix: line_log_dst_prefix.as_deref(),
             full_index: line_log_full_index,
             abbrev_len_explicit,
+            max_age,
+            min_age,
         });
     }
     if plain_oneline
@@ -2524,6 +2526,12 @@ struct LineLogOutputCtx<'a> {
     /// Whether `--abbrev=<n>` was given explicitly (so the diff `index` line
     /// honors it instead of the config-derived diff abbreviation).
     abbrev_len_explicit: bool,
+    /// `--since`/`--after` lower time bound (commits older than this are pruned
+    /// from the line-log walk). `None` == no lower bound.
+    max_age: Option<i64>,
+    /// `--until`/`--before` upper time bound (commits newer than this are
+    /// pruned). `None` == no upper bound.
+    min_age: Option<i64>,
 }
 
 /// `git log -L`: walk history with the line-log engine and emit each commit that
@@ -2554,10 +2562,14 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         dst_prefix,
         full_index,
         abbrev_len_explicit,
+        max_age,
+        min_age,
     } = ctx;
 
     // Reachable commits from the tip, in topological order (child before
-    // parent) — git forces `topo_order` for `-L`.
+    // parent) — git forces `topo_order` for `-L`. The line-log engine walks the
+    // FULL ancestry to map ranges; `--since`/`--until` only prune which of the
+    // resulting interesting commits are displayed (applied to `selected` below).
     let reachable = rev_list_walk_commits(db, format, [tip], first_parent)?;
     let refs: Vec<&sley_rev::CommitRecord> = reachable.iter().collect();
     let ordered_refs = rev_list_topo_order(refs)?;
@@ -2585,12 +2597,62 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
             .filter_map(|oid| by_oid.get(oid).copied())
             .collect()
     };
+    // `--since`/`--until` (`--after`/`--before`) limit which interesting commits
+    // are displayed, by committer date — applied before `-n` so the count runs
+    // over the post-filter range (mirrors the ordinary log walk).
+    if max_age.is_some() || min_age.is_some() {
+        selected.retain(|record| log_age_filters_match(record, max_age, min_age).unwrap_or(true));
+    }
     if let Some(max_count) = max_count {
         selected.truncate(max_count);
     }
     if reverse {
         selected.reverse();
     }
+
+    // `--parents`: rewrite each interesting commit's parents to its nearest
+    // interesting ancestors (revision.c rewrite_parents over the line-log
+    // history). An uninteresting parent is replaced by the union of *its*
+    // nearest-interesting ancestors, so commits that did not touch the tracked
+    // range collapse out of the displayed parent chain.
+    let rewritten_parents: Option<HashMap<ObjectId, Vec<ObjectId>>> = if show_parents {
+        let interesting_set: HashSet<ObjectId> = result.interesting.iter().copied().collect();
+        let by_oid: HashMap<ObjectId, &sley_rev::CommitRecord> =
+            ordered.iter().map(|r| (r.oid, r)).collect();
+        // Nearest interesting ancestors of `oid` (exclusive of `oid` itself),
+        // dedup-preserving order. Walks parent edges, collapsing uninteresting
+        // commits.
+        fn nearest_interesting(
+            oid: &ObjectId,
+            interesting: &HashSet<ObjectId>,
+            by_oid: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+            out: &mut Vec<ObjectId>,
+            seen: &mut HashSet<ObjectId>,
+        ) {
+            let Some(record) = by_oid.get(oid) else {
+                return;
+            };
+            for parent in &record.parents {
+                if interesting.contains(parent) {
+                    if seen.insert(*parent) {
+                        out.push(*parent);
+                    }
+                } else {
+                    nearest_interesting(parent, interesting, by_oid, out, seen);
+                }
+            }
+        }
+        let mut map = HashMap::new();
+        for oid in &interesting_set {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            nearest_interesting(oid, &interesting_set, &by_oid, &mut out, &mut seen);
+            map.insert(*oid, out);
+        }
+        Some(map)
+    } else {
+        None
+    };
 
     // Decorations (only when `--decorate` is on; the tests redirect output so
     // the default is off).
@@ -2628,6 +2690,22 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     let mut printed_entries = 0usize;
     for record in &selected {
         let files = result.printed.get(&record.oid);
+        // Under `--parents`, render the rewritten parent set (collapsing
+        // commits that did not touch the tracked range) for both the inline
+        // parent list and any `%p`/`%P` format placeholders.
+        let rewritten = rewritten_parents
+            .as_ref()
+            .and_then(|map| map.get(&record.oid));
+        let owned_record;
+        let record: &sley_rev::CommitRecord = match rewritten {
+            Some(parents) if parents.as_slice() != record.parents.as_slice() => {
+                let mut clone = (*record).clone();
+                clone.parents = parents.clone();
+                owned_record = clone;
+                &owned_record
+            }
+            _ => record,
+        };
         match output {
             LogOutput::Default(kind) => {
                 if printed_entries > 0 {
