@@ -123,6 +123,10 @@ where
     R: ObjectReader,
     W: Write + ?Sized,
 {
+    // Validate pathspecs before writing any output, matching git's
+    // `parse_pathspec_arg`: an unmatched pathspec must `die()` with no archive
+    // bytes on the stream.
+    crate::validate_archive_pathspecs(reader, format, tree_oid, &options.pathspecs)?;
     let prefix = crate::normalize_prefix(&options.prefix)?;
     let strip_prefix = crate::normalize_strip_prefix(&options.strip_prefix)?;
     let (zip_date, zip_time) = dos_time(options.mtime);

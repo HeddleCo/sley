@@ -384,6 +384,10 @@ where
     R: ObjectReader,
     W: Write + ?Sized,
 {
+    // Validate pathspecs before writing any output, matching git's
+    // `parse_pathspec_arg`: an unmatched pathspec must `die()` with no archive
+    // bytes on the stream (not even the pax global header).
+    validate_archive_pathspecs(reader, format, tree_oid, &options.pathspecs)?;
     let mut writer = CountingWriter::new(writer);
     // The global header writes first and clamps a far-future mtime; every entry
     // uses the clamped value (upstream sets `args->time = USTAR_MAX_MTIME`).
@@ -446,21 +450,26 @@ impl<W: Write + ?Sized> ArchiveSink for TarSink<'_, '_, W> {
 /// synthesis, and (when `convert` is set) smudge conversion — exactly the
 /// upstream `write_archive_entries` contract.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_archive_entries<R, S>(
-    sink: &mut S,
+/// Validate that every pathspec matches at least one tree entry, mirroring git's
+/// `parse_pathspec_arg` (`archive.c`). Git runs this check *before* writing any
+/// archive output and `die()`s on the first pathspec that matched nothing, so the
+/// archive writers call this up front — no header or entry byte may reach the
+/// output stream when a pathspec is unmatched. Returns a `GitError::InvalidPath`
+/// whose message begins with `pathspec '<spec>' did not match any files`, matching
+/// upstream's wording.
+pub(crate) fn validate_archive_pathspecs<R>(
     reader: &R,
     format: ObjectFormat,
     tree_oid: &ObjectId,
-    prefix: &[u8],
-    strip_prefix: &[u8],
     pathspecs: &[Vec<u8>],
-    convert: Option<&ArchiveConvert<'_>>,
 ) -> Result<()>
 where
     R: ObjectReader,
-    S: ArchiveSink + ?Sized,
 {
     let pathspecs = normalize_pathspecs(pathspecs)?;
+    if pathspecs.is_empty() {
+        return Ok(());
+    }
     let mut matched = vec![false; pathspecs.len()];
     mark_archive_pathspec_matches(
         reader,
@@ -481,6 +490,38 @@ where
             String::from_utf8_lossy(pathspec)
         )));
     }
+    Ok(())
+}
+
+pub(crate) fn write_archive_entries<R, S>(
+    sink: &mut S,
+    reader: &R,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: &[u8],
+    strip_prefix: &[u8],
+    pathspecs: &[Vec<u8>],
+    convert: Option<&ArchiveConvert<'_>>,
+) -> Result<()>
+where
+    R: ObjectReader,
+    S: ArchiveSink + ?Sized,
+{
+    let pathspecs = normalize_pathspecs(pathspecs)?;
+    // Pathspec match validation runs in `validate_archive_pathspecs`, called by
+    // the archive writers before any output byte is emitted (so an unmatched
+    // pathspec produces no partial archive). Here we only recompute the per-spec
+    // match state that drives the selective walk below.
+    let mut matched = vec![false; pathspecs.len()];
+    mark_archive_pathspec_matches(
+        reader,
+        format,
+        tree_oid,
+        b"",
+        &pathspecs,
+        false,
+        &mut matched,
+    )?;
     let mut emitted_directories = HashSet::new();
     if !prefix.is_empty() && prefix.ends_with(b"/") {
         sink.emit(ArchiveEntry::Directory {
