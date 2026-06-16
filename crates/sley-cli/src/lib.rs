@@ -73,6 +73,39 @@ pub(crate) struct PathspecFlags {
     pub icase: bool,
 }
 
+pub(crate) fn collect_short_status(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Vec<sley_worktree::ShortStatusEntry>> {
+    collect_short_status_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        sley_worktree::ShortStatusOptions::default(),
+    )
+}
+
+pub(crate) fn collect_short_status_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: sley_worktree::ShortStatusOptions,
+) -> Result<Vec<sley_worktree::ShortStatusEntry>> {
+    let mut entries = Vec::new();
+    sley_worktree::stream_short_status_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        options,
+        |entry| {
+            entries.push(entry.to_owned_entry());
+            Ok(sley_worktree::StreamControl::Continue)
+        },
+    )?;
+    Ok(entries)
+}
+
 mod commands;
 mod grep_source;
 mod log_format;
@@ -961,9 +994,9 @@ fn resolve_add_update_actions(
         .map(|(_, _, matched)| *matched)
         .collect::<Vec<_>>();
     let status = if include_untracked {
-        sley_worktree::short_status(worktree_root, git_dir, format)?
+        collect_short_status(worktree_root, git_dir, format)?
     } else {
-        sley_worktree::short_status_with_options(
+        collect_short_status_with_options(
             worktree_root,
             git_dir,
             format,

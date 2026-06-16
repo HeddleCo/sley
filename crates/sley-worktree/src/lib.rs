@@ -193,6 +193,34 @@ pub struct ShortStatusEntry {
     pub submodule: Option<SubmoduleStatus>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortStatusRow<'a> {
+    pub index: u8,
+    pub worktree: u8,
+    pub path: &'a [u8],
+    pub head_mode: Option<u32>,
+    pub index_mode: Option<u32>,
+    pub worktree_mode: Option<u32>,
+    pub head_oid: Option<ObjectId>,
+    pub index_oid: Option<ObjectId>,
+    /// For a tracked gitlink (submodule) path: how the submodule's working
+    /// state differs from the staged gitlink. `None` for ordinary paths.
+    pub submodule: Option<SubmoduleStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamControl {
+    #[default]
+    Continue,
+    Stop,
+}
+
+impl StreamControl {
+    fn is_stop(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
 /// Submodule-specific change detail for a status entry, mirroring upstream's
 /// `wt_status_change_data` trio: `new_submodule_commits` plus the
 /// `DIRTY_SUBMODULE_MODIFIED`/`DIRTY_SUBMODULE_UNTRACKED` dirty bits.
@@ -238,7 +266,8 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
     let Ok(format) = config.repository_object_format() else {
         return 0;
     };
-    let Ok(entries) = short_status_with_options(
+    let mut dirt = 0;
+    let status_result = stream_short_status_with_options(
         sub_root,
         &git_dir,
         format,
@@ -247,16 +276,22 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
             ignored_mode: StatusIgnoredMode::Traditional,
             untracked_mode: StatusUntrackedMode::Normal,
         },
-    ) else {
+        |entry| {
+            if entry.index == b'?' && entry.worktree == b'?' {
+                dirt |= DIRTY_SUBMODULE_UNTRACKED;
+            } else {
+                dirt |= DIRTY_SUBMODULE_MODIFIED;
+            }
+            let complete = DIRTY_SUBMODULE_MODIFIED | DIRTY_SUBMODULE_UNTRACKED;
+            Ok(if dirt == complete {
+                StreamControl::Stop
+            } else {
+                StreamControl::Continue
+            })
+        },
+    );
+    if status_result.is_err() {
         return 0;
-    };
-    let mut dirt = 0;
-    for entry in entries {
-        if entry.index == b'?' && entry.worktree == b'?' {
-            dirt |= DIRTY_SUBMODULE_UNTRACKED;
-        } else {
-            dirt |= DIRTY_SUBMODULE_MODIFIED;
-        }
     }
     dirt
 }
@@ -318,7 +353,7 @@ pub struct AtomicMetadataWriteResult {
 /// [`worktree_entry_state_by_git_path`]. The probe is trusted only when its path,
 /// mode, and object id match the expected entry and the cached stat is not
 /// racily clean; otherwise the helper falls back to the same content hashing
-/// path used by [`short_status_with_options`].
+/// path used by [`stream_short_status_with_options`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStatProbe {
     entry: IndexEntry,
@@ -705,12 +740,51 @@ pub struct MoveOptions {
 }
 
 impl ShortStatusEntry {
+    pub fn as_row(&self) -> ShortStatusRow<'_> {
+        ShortStatusRow {
+            index: self.index,
+            worktree: self.worktree,
+            path: &self.path,
+            head_mode: self.head_mode,
+            index_mode: self.index_mode,
+            worktree_mode: self.worktree_mode,
+            head_oid: self.head_oid,
+            index_oid: self.index_oid,
+            submodule: self.submodule,
+        }
+    }
+
     pub fn line(&self) -> String {
         format!(
             "{}{} {}",
             self.index as char,
             self.worktree as char,
             String::from_utf8_lossy(&self.path)
+        )
+    }
+}
+
+impl ShortStatusRow<'_> {
+    pub fn to_owned_entry(self) -> ShortStatusEntry {
+        ShortStatusEntry {
+            index: self.index,
+            worktree: self.worktree,
+            path: self.path.to_vec(),
+            head_mode: self.head_mode,
+            index_mode: self.index_mode,
+            worktree_mode: self.worktree_mode,
+            head_oid: self.head_oid,
+            index_oid: self.index_oid,
+            submodule: self.submodule,
+        }
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "{}{} {}",
+            self.index as char,
+            self.worktree as char,
+            String::from_utf8_lossy(self.path)
         )
     }
 }
@@ -774,7 +848,10 @@ pub fn update_index_paths_with_index(
 /// every path. Used by the `git add`-style callers that genuinely apply one
 /// mode to all paths; the positional `git update-index <flag> <path>...` path
 /// instead snapshots a distinct mode per path in the CLI parse walk.
-fn ordered_paths_from_plain(paths: &[PathBuf], options: UpdateIndexOptions) -> Vec<UpdateIndexPath> {
+fn ordered_paths_from_plain(
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+) -> Vec<UpdateIndexPath> {
     let mode = options.path_mode();
     paths
         .iter()
@@ -1054,8 +1131,8 @@ pub fn add_exact_tracked_path_from_disk(
         // overrides folded in (e.g. upstream t0027's `git -c core.autocrlf=true
         // add`); the plain repo-config reader would drop them and the fast path
         // would convert/warn against the wrong EOL policy.
-        let config = sley_config::read_repo_config(git_dir, config_parameters_env)
-            .unwrap_or_default();
+        let config =
+            sley_config::read_repo_config(git_dir, config_parameters_env).unwrap_or_default();
         let mut clean_filter = None;
         let clean_filter =
             tracked_only_clean_filter_with_config(&mut clean_filter, worktree_root, &config);
@@ -1285,14 +1362,21 @@ fn raw_updated_entry_can_patch(
         && updated.flags == previous.flags
 }
 
-fn raw_index_extensions_are_filterable(bytes: &[u8], entries_end: usize, checksum_offset: usize) -> bool {
+fn raw_index_extensions_are_filterable(
+    bytes: &[u8],
+    entries_end: usize,
+    checksum_offset: usize,
+) -> bool {
     let mut offset = entries_end;
     while offset < checksum_offset {
         if checksum_offset.saturating_sub(offset) < 8 {
             return false;
         }
         let size = u32_from_be(&bytes[offset + 4..offset + 8]) as usize;
-        let Some(end) = offset.checked_add(8).and_then(|offset| offset.checked_add(size)) else {
+        let Some(end) = offset
+            .checked_add(8)
+            .and_then(|offset| offset.checked_add(size))
+        else {
             return false;
         };
         if end > checksum_offset {
@@ -1748,11 +1832,10 @@ fn update_index_paths_impl(
             // blob (git's `has_crlf_in_index`); the stage-0 entry, if any, has it.
             let index_blob = match conv_flags {
                 ConvFlags::Off => SafeCrlfIndexBlob::None,
-                _ => stage0_oid_in_range(&index.entries, existing_range.clone())
-                    .map_or(SafeCrlfIndexBlob::None, |oid| SafeCrlfIndexBlob::Lookup {
-                        odb: &odb,
-                        oid,
-                    }),
+                _ => stage0_oid_in_range(&index.entries, existing_range.clone()).map_or(
+                    SafeCrlfIndexBlob::None,
+                    |oid| SafeCrlfIndexBlob::Lookup { odb: &odb, oid },
+                ),
             };
             match (clean_config, &clean_filter) {
                 (Some(config), Some(UpdateIndexCleanFilter::Full(matcher))) => {
@@ -1929,10 +2012,7 @@ pub fn refresh_index_paths(
         // refresh the stat fields from current metadata — byte-identical to the
         // clean arm below, since the oid stamped is the cached one and the
         // metadata is the same one that re-stamp would read.
-        if stat_cache
-            .reuse_index_entry(entry, &metadata)
-            .is_some()
-        {
+        if stat_cache.reuse_index_entry(entry, &metadata).is_some() {
             continue;
         }
         let body = fs::read(&absolute)?;
@@ -2552,10 +2632,7 @@ fn index_entry_stage(entry: &IndexEntry) -> u16 {
 
 /// The oid of the stage-0 entry in `range` (the path's currently-tracked blob),
 /// if any. Used by the safecrlf check to fetch `has_crlf_in_index`.
-fn stage0_oid_in_range(
-    entries: &[IndexEntry],
-    range: std::ops::Range<usize>,
-) -> Option<ObjectId> {
+fn stage0_oid_in_range(entries: &[IndexEntry], range: std::ops::Range<usize>) -> Option<ObjectId> {
     entries[range]
         .iter()
         .find(|entry| index_entry_stage(entry) == 0)
@@ -3003,17 +3080,63 @@ fn same_tree_component(path: &[u8], prefix: &[u8], name: &[u8]) -> Result<bool> 
     Ok(remainder.starts_with(name) && remainder.get(name.len()) == Some(&b'/'))
 }
 
-pub fn short_status(
+pub fn stream_short_status<F>(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
-) -> Result<Vec<ShortStatusEntry>> {
-    short_status_with_options(
+    emit: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+{
+    stream_short_status_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        ShortStatusOptions::default(),
+        emit,
+    )
+}
+
+pub fn short_status_count(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<usize> {
+    short_status_count_with_options(
         worktree_root,
         git_dir,
         format,
         ShortStatusOptions::default(),
     )
+}
+
+pub fn short_status_count_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: ShortStatusOptions,
+) -> Result<usize> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if !options.include_ignored
+        && let Some(count) = short_status_borrowed_head_matches_index_count_if_possible(
+            worktree_root,
+            git_dir,
+            format,
+            &db,
+            options.untracked_mode,
+        )?
+    {
+        return Ok(count);
+    }
+    let mut count = 0usize;
+    stream_short_status_with_options(worktree_root, git_dir, format, options, |_| {
+        count += 1;
+        Ok(StreamControl::Continue)
+    })?;
+    Ok(count)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3128,7 +3251,7 @@ pub fn worktree_entry_state(
 /// repository-relative git path (`/` separators, raw bytes).
 ///
 /// The comparison uses the same clean-filter, symlink-target, gitlink, and
-/// racy-clean stat shortcut rules as [`short_status_with_options`].
+/// racy-clean stat shortcut rules as [`stream_short_status_with_options`].
 pub fn worktree_entry_state_by_git_path(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -3161,7 +3284,40 @@ pub fn worktree_entry_state_by_git_path(
     }
 }
 
-pub fn short_status_with_options(
+pub fn stream_short_status_with_options<F>(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: ShortStatusOptions,
+    mut emit: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+{
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if !options.include_ignored
+        && let Some(()) = stream_short_status_borrowed_head_matches_index_if_possible(
+            worktree_root,
+            git_dir,
+            format,
+            &db,
+            options.untracked_mode,
+            &mut emit,
+        )?
+    {
+        return Ok(());
+    }
+    for entry in collect_short_status_with_options(worktree_root, git_dir, format, options)? {
+        if emit(entry.as_row())?.is_stop() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn collect_short_status_with_options(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -3271,7 +3427,8 @@ pub fn short_status_with_options(
         );
     }
     if options.include_ignored {
-        let ignored_paths = ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)?;
+        let ignored_paths =
+            ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)?;
         let ignored_paths: Vec<Vec<u8>> = match options.ignored_mode {
             StatusIgnoredMode::Matching => ignored_paths,
             StatusIgnoredMode::Traditional => {
@@ -3830,22 +3987,351 @@ fn short_status_borrowed_head_matches_index_if_possible(
     Ok(Some(entries))
 }
 
+fn stream_short_status_borrowed_head_matches_index_if_possible<F>(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    untracked_mode: StatusUntrackedMode,
+    emit: &mut F,
+) -> Result<Option<()>>
+where
+    F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+{
+    let index_path = repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && matches!(untracked_mode, StatusUntrackedMode::None) =>
+        {
+            return Ok(Some(()));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let index_bytes = fs::read(&index_path)?;
+    let borrowed = match BorrowedIndex::parse(&index_bytes, format) {
+        Ok(index) => index,
+        Err(GitError::Unsupported(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
+        return Ok(None);
+    };
+    let stage0_entry_count = borrowed
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .count();
+    if !head_matches_borrowed_index_from_cache_tree(
+        &borrowed,
+        format,
+        &head_tree_oid,
+        stage0_entry_count,
+    )? {
+        return Ok(None);
+    }
+
+    let index_mtime = file_mtime_parts(&index_metadata);
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let profile_enabled = StatusProfileCounters::enabled();
+    let mut profile = profile_enabled.then(|| StatusProfileCounters {
+        fast_path_borrowed: true,
+        ..StatusProfileCounters::default()
+    });
+
+    let tracked_start = Instant::now();
+    let tracked_control = stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        &borrowed,
+        &stat_cache,
+        untracked_mode,
+        emit,
+    )?;
+    if let Some(profile) = profile.as_mut() {
+        profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
+    }
+    if tracked_control.is_stop() {
+        if let Some(profile) = profile.as_ref() {
+            profile.emit();
+        }
+        return Ok(Some(()));
+    }
+
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        if let Some(profile) = profile.as_ref() {
+            profile.emit();
+        }
+        return Ok(Some(()));
+    }
+
+    if stage0_entry_count < 8192 {
+        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+        let untracked_start = Instant::now();
+        stream_status_untracked_paths_from_borrowed_index(
+            worktree_root,
+            git_dir,
+            &borrowed,
+            &mut ignores,
+            untracked_mode,
+            profile.as_mut(),
+            emit_untracked_status_entry(emit),
+        )?;
+        if let Some(profile) = profile.as_mut() {
+            profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
+            profile.emit();
+        }
+        return Ok(Some(()));
+    }
+
+    if let Some(profile) = profile.as_mut() {
+        profile.overlap_enabled = true;
+    }
+    let (untracked_paths, untracked_profile) = std::thread::scope(|scope| -> Result<_> {
+        let untracked = scope.spawn(|| -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
+            let mut local_profile = StatusProfileCounters::default();
+            let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+            let start = Instant::now();
+            let paths = status_untracked_paths_from_borrowed_index(
+                worktree_root,
+                git_dir,
+                &borrowed,
+                &mut ignores,
+                untracked_mode,
+                profile_enabled.then_some(&mut local_profile),
+            )?;
+            local_profile.untracked_elapsed_us = start.elapsed().as_micros();
+            local_profile.untracked_rows = paths.len() as u64;
+            Ok((paths, local_profile))
+        });
+        let (untracked_paths, untracked_profile) = untracked
+            .join()
+            .map_err(|_| GitError::Command("status worker panicked".into()))??;
+        Ok((
+            untracked_paths,
+            profile_enabled.then_some(untracked_profile),
+        ))
+    })?;
+    if let Some(profile) = profile.as_mut()
+        && let Some(untracked_profile) = untracked_profile
+    {
+        profile.merge_untracked(untracked_profile);
+    }
+    let render_start = Instant::now();
+    for path in untracked_paths {
+        let row = untracked_status_row(&path);
+        if emit(row)?.is_stop() {
+            break;
+        }
+    }
+    if let Some(profile) = profile.as_mut() {
+        profile.render_elapsed_us = render_start.elapsed().as_micros();
+        profile.emit();
+    }
+    Ok(Some(()))
+}
+
+fn short_status_borrowed_head_matches_index_count_if_possible(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<Option<usize>> {
+    let index_path = repository_index_path(git_dir);
+    let index_metadata = match fs::metadata(&index_path) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && matches!(untracked_mode, StatusUntrackedMode::None) =>
+        {
+            return Ok(Some(0));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let index_bytes = fs::read(&index_path)?;
+    let borrowed = match BorrowedIndex::parse(&index_bytes, format) {
+        Ok(index) => index,
+        Err(GitError::Unsupported(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
+        return Ok(None);
+    };
+    let stage0_entry_count = borrowed
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .count();
+    if !head_matches_borrowed_index_from_cache_tree(
+        &borrowed,
+        format,
+        &head_tree_oid,
+        stage0_entry_count,
+    )? {
+        return Ok(None);
+    }
+
+    let index_mtime = file_mtime_parts(&index_metadata);
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let profile_enabled = StatusProfileCounters::enabled();
+    let mut profile = profile_enabled.then(|| StatusProfileCounters {
+        fast_path_borrowed: true,
+        ..StatusProfileCounters::default()
+    });
+
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        let tracked_start = Instant::now();
+        let count = short_status_borrowed_tracked_only_head_matches_index_count_parallel(
+            worktree_root,
+            git_dir,
+            format,
+            &borrowed,
+            &stat_cache,
+            untracked_mode,
+        )?;
+        if let Some(profile) = profile.as_mut() {
+            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
+            profile.emit();
+        }
+        return Ok(Some(count));
+    }
+
+    if stage0_entry_count < 8192 {
+        let tracked_start = Instant::now();
+        let tracked_count = short_status_borrowed_tracked_only_head_matches_index_count_parallel(
+            worktree_root,
+            git_dir,
+            format,
+            &borrowed,
+            &stat_cache,
+            untracked_mode,
+        )?;
+        if let Some(profile) = profile.as_mut() {
+            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
+        }
+        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+        let untracked_start = Instant::now();
+        let untracked_count = status_untracked_count_from_borrowed_index(
+            worktree_root,
+            git_dir,
+            &borrowed,
+            &mut ignores,
+            untracked_mode,
+            profile.as_mut(),
+        )?;
+        if let Some(profile) = profile.as_mut() {
+            profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
+            profile.untracked_rows = untracked_count as u64;
+            profile.emit();
+        }
+        return Ok(Some(tracked_count + untracked_count));
+    }
+
+    if let Some(profile) = profile.as_mut() {
+        profile.overlap_enabled = true;
+    }
+    let (tracked_count, untracked_count, untracked_profile) =
+        std::thread::scope(|scope| -> Result<_> {
+            let tracked = scope.spawn(|| {
+                let start = Instant::now();
+                short_status_borrowed_tracked_only_head_matches_index_count_parallel(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    &borrowed,
+                    &stat_cache,
+                    untracked_mode,
+                )
+                .map(|count| (count, start.elapsed().as_micros()))
+            });
+            let untracked = scope.spawn(|| -> Result<(usize, StatusProfileCounters)> {
+                let mut local_profile = StatusProfileCounters::default();
+                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+                let start = Instant::now();
+                let count = status_untracked_count_from_borrowed_index(
+                    worktree_root,
+                    git_dir,
+                    &borrowed,
+                    &mut ignores,
+                    untracked_mode,
+                    profile_enabled.then_some(&mut local_profile),
+                )?;
+                local_profile.untracked_elapsed_us = start.elapsed().as_micros();
+                local_profile.untracked_rows = count as u64;
+                Ok((count, local_profile))
+            });
+            let (tracked_count, tracked_elapsed_us) = tracked
+                .join()
+                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            let (untracked_count, untracked_profile) = untracked
+                .join()
+                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            if let Some(profile) = profile.as_mut() {
+                profile.tracked_elapsed_us = tracked_elapsed_us;
+            }
+            Ok((
+                tracked_count,
+                untracked_count,
+                profile_enabled.then_some(untracked_profile),
+            ))
+        })?;
+    if let Some(profile) = profile.as_mut() {
+        if let Some(untracked_profile) = untracked_profile {
+            profile.merge_untracked(untracked_profile);
+        }
+        profile.emit();
+    }
+    Ok(Some(tracked_count + untracked_count))
+}
+
+fn emit_untracked_status_entry<'a, F>(
+    emit: &'a mut F,
+) -> impl FnMut(&[u8]) -> Result<StreamControl> + 'a
+where
+    F: for<'row> FnMut(ShortStatusRow<'row>) -> Result<StreamControl>,
+{
+    |path| emit(untracked_status_row(path))
+}
+
+fn untracked_status_entry(path: Vec<u8>) -> ShortStatusEntry {
+    ShortStatusEntry {
+        index: b'?',
+        worktree: b'?',
+        path,
+        head_mode: None,
+        index_mode: None,
+        worktree_mode: None,
+        head_oid: None,
+        index_oid: None,
+        submodule: None,
+    }
+}
+
+fn untracked_status_row(path: &[u8]) -> ShortStatusRow<'_> {
+    ShortStatusRow {
+        index: b'?',
+        worktree: b'?',
+        path,
+        head_mode: None,
+        index_mode: None,
+        worktree_mode: None,
+        head_oid: None,
+        index_oid: None,
+        submodule: None,
+    }
+}
+
 fn append_untracked_status_entries(
     entries: &mut Vec<ShortStatusEntry>,
     untracked_paths: Vec<Vec<u8>>,
 ) {
     for path in untracked_paths {
-        entries.push(ShortStatusEntry {
-            index: b'?',
-            worktree: b'?',
-            path,
-            head_mode: None,
-            index_mode: None,
-            worktree_mode: None,
-            head_oid: None,
-            index_oid: None,
-            submodule: None,
-        });
+        entries.push(untracked_status_entry(path));
     }
 }
 
@@ -4021,6 +4507,144 @@ fn short_status_borrowed_tracked_only_head_matches_index_parallel(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(entries)
+}
+
+fn stream_short_status_borrowed_tracked_only_head_matches_index_parallel<F>(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &BorrowedIndex<'_>,
+    stat_cache: &IndexStatCache,
+    untracked_mode: StatusUntrackedMode,
+    emit: &mut F,
+) -> Result<StreamControl>
+where
+    F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+{
+    let prechecks =
+        tracked_only_borrowed_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+
+    let mut clean_filter = None;
+    for precheck in prechecks {
+        match precheck {
+            TrackedOnlyPrecheck::Deleted(idx) => {
+                let entry = &index.entries[idx];
+                if emit(ShortStatusRow {
+                    index: b' ',
+                    worktree: b'D',
+                    path: entry.path,
+                    head_mode: Some(entry.mode),
+                    index_mode: Some(entry.mode),
+                    worktree_mode: None,
+                    head_oid: Some(entry.oid),
+                    index_oid: Some(entry.oid),
+                    submodule: None,
+                })?
+                .is_stop()
+                {
+                    return Ok(StreamControl::Stop);
+                }
+            }
+            TrackedOnlyPrecheck::Slow(idx) => {
+                let entry = &index.entries[idx];
+                let index_entry = TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                };
+                let worktree_entry = worktree_entry_for_index_entry_ref_with_attributes(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    stat_cache,
+                    &mut clean_filter,
+                )?;
+                let submodule = tracked_only_submodule_status(
+                    worktree_root,
+                    entry.path,
+                    &index_entry,
+                    worktree_entry.as_ref(),
+                    untracked_mode,
+                )?;
+                let worktree_code = match worktree_entry.as_ref() {
+                    None => b'D',
+                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    _ if submodule.is_some_and(|sub| sub.any()) => b'M',
+                    _ => b' ',
+                };
+                if worktree_code != b' ' {
+                    if emit(ShortStatusRow {
+                        index: b' ',
+                        worktree: worktree_code,
+                        path: entry.path,
+                        head_mode: Some(index_entry.mode),
+                        index_mode: Some(index_entry.mode),
+                        worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
+                        head_oid: Some(index_entry.oid),
+                        index_oid: Some(index_entry.oid),
+                        submodule: submodule.filter(|sub| sub.any()),
+                    })?
+                    .is_stop()
+                    {
+                        return Ok(StreamControl::Stop);
+                    }
+                }
+            }
+        }
+    }
+    Ok(StreamControl::Continue)
+}
+
+fn short_status_borrowed_tracked_only_head_matches_index_count_parallel(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &BorrowedIndex<'_>,
+    stat_cache: &IndexStatCache,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<usize> {
+    let prechecks =
+        tracked_only_borrowed_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+
+    let mut clean_filter = None;
+    let mut count = 0usize;
+    for precheck in prechecks {
+        match precheck {
+            TrackedOnlyPrecheck::Deleted(_) => count += 1,
+            TrackedOnlyPrecheck::Slow(idx) => {
+                let entry = &index.entries[idx];
+                let index_entry = TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                };
+                let worktree_entry = worktree_entry_for_index_entry_ref_with_attributes(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    stat_cache,
+                    &mut clean_filter,
+                )?;
+                let submodule = tracked_only_submodule_status(
+                    worktree_root,
+                    entry.path,
+                    &index_entry,
+                    worktree_entry.as_ref(),
+                    untracked_mode,
+                )?;
+                let worktree_code = match worktree_entry.as_ref() {
+                    None => b'D',
+                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    _ if submodule.is_some_and(|sub| sub.any()) => b'M',
+                    _ => b' ',
+                };
+                if worktree_code != b' ' {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn short_status_tracked_only_with_head_parallel(
@@ -5038,6 +5662,56 @@ fn status_untracked_paths_from_borrowed_index(
     Ok(paths)
 }
 
+fn stream_status_untracked_paths_from_borrowed_index<F>(
+    root: &Path,
+    git_dir: &Path,
+    index: &BorrowedIndex<'_>,
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+    profile: Option<&mut StatusProfileCounters>,
+    mut emit: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(&'a [u8]) -> Result<StreamControl>,
+{
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(());
+    }
+    let tracked = BorrowedIndexLookup::new(&index.entries);
+    let mut context = StatusUntrackedWalk {
+        git_dir,
+        tracked: &tracked,
+        ignores,
+        untracked_mode,
+        profile,
+    };
+    stream_status_untracked_paths(&mut context, root, &[], &mut emit).map(|_| ())
+}
+
+fn status_untracked_count_from_borrowed_index(
+    root: &Path,
+    git_dir: &Path,
+    index: &BorrowedIndex<'_>,
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+    profile: Option<&mut StatusProfileCounters>,
+) -> Result<usize> {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(0);
+    }
+    let tracked = BorrowedIndexLookup::new(&index.entries);
+    let mut context = StatusUntrackedWalk {
+        git_dir,
+        tracked: &tracked,
+        ignores,
+        untracked_mode,
+        profile,
+    };
+    let mut count = 0usize;
+    count_status_untracked_paths(&mut context, root, &[], &mut count)?;
+    Ok(count)
+}
+
 trait StatusTrackedLookup {
     fn tracked_kind(&self, git_path: &[u8]) -> Option<StatusTrackedKind>;
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind>;
@@ -5075,10 +5749,9 @@ struct IndexStatusLookup<'a> {
 
 impl StatusTrackedLookup for IndexStatusLookup<'_> {
     fn tracked_kind(&self, git_path: &[u8]) -> Option<StatusTrackedKind> {
-        self.stat_cache
-            .entries
-            .get(git_path)
-            .map(|entry| StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree()))
+        self.stat_cache.entries.get(git_path).map(|entry| {
+            StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree())
+        })
     }
 
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind> {
@@ -5156,8 +5829,12 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         return Ok(());
     }
     let ignore_len = context.ignores.patterns.len();
-    let entries =
-        read_dir_entries_with_ignore_patterns(dir, dir_git_path, context.ignores, context.profile.as_deref_mut())?;
+    let entries = read_dir_entries_with_ignore_patterns(
+        dir,
+        dir_git_path,
+        context.ignores,
+        context.profile.as_deref_mut(),
+    )?;
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
@@ -5194,18 +5871,20 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                 let file_type = entry.file_type()?;
                 let is_dir = file_type.is_dir();
                 if file_type.is_file() || file_type.is_symlink() {
-                    if !context
-                        .ignores
-                        .is_ignored_profiled(&git_path, false, context.profile.as_deref_mut())
-                    {
+                    if !context.ignores.is_ignored_profiled(
+                        &git_path,
+                        false,
+                        context.profile.as_deref_mut(),
+                    ) {
                         paths.push(git_path.clone());
                     }
                     return Ok(());
                 } else if is_dir {
-                    if context
-                        .ignores
-                        .is_ignored_profiled(&git_path, true, context.profile.as_deref_mut())
-                    {
+                    if context.ignores.is_ignored_profiled(
+                        &git_path,
+                        true,
+                        context.profile.as_deref_mut(),
+                    ) {
                         return Ok(());
                     }
                     let path = entry.path();
@@ -5223,8 +5902,7 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     match context.untracked_mode {
                         StatusUntrackedMode::All => {
-                            if tracked_directory.is_none() && is_nested_repository_boundary(&path)
-                            {
+                            if tracked_directory.is_none() && is_nested_repository_boundary(&path) {
                                 push_untracked_directory(paths, &git_path);
                             } else {
                                 collect_status_untracked_paths(context, &path, &git_path, paths)?;
@@ -5255,6 +5933,284 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
     result
 }
 
+fn stream_status_untracked_paths<T, F>(
+    context: &mut StatusUntrackedWalk<'_, T>,
+    dir: &Path,
+    dir_git_path: &[u8],
+    emit: &mut F,
+) -> Result<StreamControl>
+where
+    T: StatusTrackedLookup + ?Sized,
+    F: for<'a> FnMut(&'a [u8]) -> Result<StreamControl>,
+{
+    if is_same_path(dir, context.git_dir) {
+        return Ok(StreamControl::Continue);
+    }
+    let ignore_len = context.ignores.patterns.len();
+    let mut entries = read_dir_entries_with_ignore_patterns(
+        dir,
+        dir_git_path,
+        context.ignores,
+        context.profile.as_deref_mut(),
+    )?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let result = (|| -> Result<StreamControl> {
+        let mut git_path = dir_git_path.to_vec();
+        for entry in entries {
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<StreamControl> {
+                if let Some(tracked_kind) = context.tracked.tracked_kind(&git_path) {
+                    if let Some(profile) = context.profile.as_deref_mut() {
+                        profile.tracked_exact_hits += 1;
+                    }
+                    if !matches!(context.untracked_mode, StatusUntrackedMode::All)
+                        || tracked_kind == StatusTrackedKind::Gitlink
+                    {
+                        return Ok(StreamControl::Continue);
+                    }
+                    if let Some(profile) = context.profile.as_deref_mut() {
+                        profile.file_type_calls += 1;
+                    }
+                    let file_type = entry.file_type()?;
+                    if file_type.is_dir() {
+                        let path = entry.path();
+                        if !is_same_path(&path, context.git_dir) {
+                            if stream_status_untracked_paths(context, &path, &git_path, emit)?
+                                .is_stop()
+                            {
+                                return Ok(StreamControl::Stop);
+                            }
+                        }
+                    }
+                    return Ok(StreamControl::Continue);
+                }
+                if let Some(profile) = context.profile.as_deref_mut() {
+                    profile.file_type_calls += 1;
+                }
+                let file_type = entry.file_type()?;
+                let is_dir = file_type.is_dir();
+                if file_type.is_file() || file_type.is_symlink() {
+                    if !context.ignores.is_ignored_profiled(
+                        &git_path,
+                        false,
+                        context.profile.as_deref_mut(),
+                    ) {
+                        if emit_status_untracked_path(context, &git_path, emit)?.is_stop() {
+                            return Ok(StreamControl::Stop);
+                        }
+                    }
+                    return Ok(StreamControl::Continue);
+                } else if is_dir {
+                    if context.ignores.is_ignored_profiled(
+                        &git_path,
+                        true,
+                        context.profile.as_deref_mut(),
+                    ) {
+                        return Ok(StreamControl::Continue);
+                    }
+                    let path = entry.path();
+                    if is_same_path(&path, context.git_dir) {
+                        return Ok(StreamControl::Continue);
+                    }
+                    let tracked_directory = context.tracked.tracked_directory_kind(&git_path);
+                    if let Some(directory_kind) = tracked_directory {
+                        if let Some(profile) = context.profile.as_deref_mut() {
+                            profile.tracked_dir_prefix_hits += 1;
+                            if directory_kind == StatusTrackedDirectoryKind::TrackedExcluded {
+                                profile.tracked_skip_worktree_prefix_hits += 1;
+                            }
+                        }
+                    }
+                    match context.untracked_mode {
+                        StatusUntrackedMode::All => {
+                            if tracked_directory.is_none() && is_nested_repository_boundary(&path) {
+                                let directory_len = git_path.len();
+                                if git_path.last() != Some(&b'/') {
+                                    git_path.push(b'/');
+                                }
+                                let control =
+                                    emit_status_untracked_path(context, &git_path, emit)?;
+                                git_path.truncate(directory_len);
+                                if control.is_stop() {
+                                    return Ok(StreamControl::Stop);
+                                }
+                            } else {
+                                if stream_status_untracked_paths(context, &path, &git_path, emit)?
+                                    .is_stop()
+                                {
+                                    return Ok(StreamControl::Stop);
+                                }
+                            }
+                        }
+                        StatusUntrackedMode::Normal => {
+                            if tracked_directory.is_some() {
+                                if stream_status_untracked_paths(context, &path, &git_path, emit)?
+                                    .is_stop()
+                                {
+                                    return Ok(StreamControl::Stop);
+                                }
+                            } else if is_nested_repository_boundary(&path)
+                                || status_untracked_directory_has_file(context, &path, &git_path)?
+                            {
+                                let directory_len = git_path.len();
+                                if git_path.last() != Some(&b'/') {
+                                    git_path.push(b'/');
+                                }
+                                let control =
+                                    emit_status_untracked_path(context, &git_path, emit)?;
+                                git_path.truncate(directory_len);
+                                if control.is_stop() {
+                                    return Ok(StreamControl::Stop);
+                                }
+                            }
+                        }
+                        StatusUntrackedMode::None => {}
+                    }
+                }
+                Ok(StreamControl::Continue)
+            })();
+            git_path.truncate(path_len);
+            if entry_result?.is_stop() {
+                return Ok(StreamControl::Stop);
+            }
+        }
+        Ok(StreamControl::Continue)
+    })();
+    context.ignores.truncate(ignore_len);
+    result
+}
+
+fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
+    context: &mut StatusUntrackedWalk<'_, T>,
+    dir: &Path,
+    dir_git_path: &[u8],
+    count: &mut usize,
+) -> Result<()> {
+    if is_same_path(dir, context.git_dir) {
+        return Ok(());
+    }
+    let ignore_len = context.ignores.patterns.len();
+    let entries = read_dir_entries_with_ignore_patterns(
+        dir,
+        dir_git_path,
+        context.ignores,
+        context.profile.as_deref_mut(),
+    )?;
+    let result = (|| -> Result<()> {
+        let mut git_path = dir_git_path.to_vec();
+        for entry in entries {
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<()> {
+                if let Some(tracked_kind) = context.tracked.tracked_kind(&git_path) {
+                    if let Some(profile) = context.profile.as_deref_mut() {
+                        profile.tracked_exact_hits += 1;
+                    }
+                    if !matches!(context.untracked_mode, StatusUntrackedMode::All)
+                        || tracked_kind == StatusTrackedKind::Gitlink
+                    {
+                        return Ok(());
+                    }
+                    if let Some(profile) = context.profile.as_deref_mut() {
+                        profile.file_type_calls += 1;
+                    }
+                    let file_type = entry.file_type()?;
+                    if file_type.is_dir() {
+                        let path = entry.path();
+                        if !is_same_path(&path, context.git_dir) {
+                            count_status_untracked_paths(context, &path, &git_path, count)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                if let Some(profile) = context.profile.as_deref_mut() {
+                    profile.file_type_calls += 1;
+                }
+                let file_type = entry.file_type()?;
+                let is_dir = file_type.is_dir();
+                if file_type.is_file() || file_type.is_symlink() {
+                    if !context.ignores.is_ignored_profiled(
+                        &git_path,
+                        false,
+                        context.profile.as_deref_mut(),
+                    ) {
+                        *count += 1;
+                    }
+                    return Ok(());
+                } else if is_dir {
+                    if context.ignores.is_ignored_profiled(
+                        &git_path,
+                        true,
+                        context.profile.as_deref_mut(),
+                    ) {
+                        return Ok(());
+                    }
+                    let path = entry.path();
+                    if is_same_path(&path, context.git_dir) {
+                        return Ok(());
+                    }
+                    let tracked_directory = context.tracked.tracked_directory_kind(&git_path);
+                    if let Some(directory_kind) = tracked_directory {
+                        if let Some(profile) = context.profile.as_deref_mut() {
+                            profile.tracked_dir_prefix_hits += 1;
+                            if directory_kind == StatusTrackedDirectoryKind::TrackedExcluded {
+                                profile.tracked_skip_worktree_prefix_hits += 1;
+                            }
+                        }
+                    }
+                    match context.untracked_mode {
+                        StatusUntrackedMode::All => {
+                            if tracked_directory.is_none() && is_nested_repository_boundary(&path) {
+                                *count += 1;
+                            } else {
+                                count_status_untracked_paths(context, &path, &git_path, count)?;
+                            }
+                        }
+                        StatusUntrackedMode::Normal => {
+                            if tracked_directory.is_some() {
+                                count_status_untracked_paths(context, &path, &git_path, count)?;
+                            } else if is_nested_repository_boundary(&path)
+                                || status_untracked_directory_has_file(context, &path, &git_path)?
+                            {
+                                *count += 1;
+                            }
+                        }
+                        StatusUntrackedMode::None => {}
+                    }
+                }
+                Ok(())
+            })();
+            git_path.truncate(path_len);
+            entry_result?;
+        }
+        Ok(())
+    })();
+    context.ignores.truncate(ignore_len);
+    result
+}
+
+fn emit_status_untracked_path<T, F>(
+    context: &mut StatusUntrackedWalk<'_, T>,
+    path: &[u8],
+    emit: &mut F,
+) -> Result<StreamControl>
+where
+    T: StatusTrackedLookup + ?Sized,
+    F: for<'a> FnMut(&'a [u8]) -> Result<StreamControl>,
+{
+    if let Some(profile) = context.profile.as_deref_mut() {
+        profile.untracked_rows += 1;
+    }
+    emit(path)
+}
+
 fn stage0_tracked_directories(index: &Index) -> HashSet<&[u8]> {
     let mut directories = HashSet::new();
     for entry in index
@@ -5281,8 +6237,12 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
         return Ok(false);
     }
     let ignore_len = context.ignores.patterns.len();
-    let entries =
-        read_dir_entries_with_ignore_patterns(dir, dir_git_path, context.ignores, context.profile.as_deref_mut())?;
+    let entries = read_dir_entries_with_ignore_patterns(
+        dir,
+        dir_git_path,
+        context.ignores,
+        context.profile.as_deref_mut(),
+    )?;
     let result = (|| -> Result<bool> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
@@ -5297,10 +6257,11 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
                 }
                 let file_type = entry.file_type()?;
                 let is_dir = file_type.is_dir();
-                if context
-                    .ignores
-                    .is_ignored_profiled(&git_path, is_dir, context.profile.as_deref_mut())
-                {
+                if context.ignores.is_ignored_profiled(
+                    &git_path,
+                    is_dir,
+                    context.profile.as_deref_mut(),
+                ) {
                     return Ok(None);
                 }
                 if file_type.is_file() || file_type.is_symlink() {
@@ -5364,11 +6325,15 @@ fn read_dir_entries_with_ignore_patterns(
 }
 
 fn push_untracked_directory(paths: &mut Vec<Vec<u8>>, git_path: &[u8]) {
+    paths.push(untracked_directory_path(git_path));
+}
+
+fn untracked_directory_path(git_path: &[u8]) -> Vec<u8> {
     let mut directory = git_path.to_vec();
     if directory.last() != Some(&b'/') {
         directory.push(b'/');
     }
-    paths.push(directory);
+    directory
 }
 
 fn untracked_normal_rollup_path(
@@ -5608,8 +6573,12 @@ struct IgnorePatternBuckets {
     path_suffix_basename: HashMap<Vec<u8>, Vec<usize>>,
     glob_path_literal_basename: HashMap<Vec<u8>, Vec<usize>>,
     glob_directory_literal_basename: HashMap<Vec<u8>, Vec<usize>>,
-    suffix_basename: Vec<usize>,
-    prefix_basename: Vec<usize>,
+    glob_path_suffix_basename: Vec<usize>,
+    glob_path_prefix_basename: Vec<usize>,
+    glob_directory_suffix_basename: Vec<usize>,
+    glob_directory_prefix_basename: Vec<usize>,
+    suffix_basename: HashMap<u8, Vec<usize>>,
+    prefix_basename: HashMap<u8, Vec<usize>>,
     other: Vec<usize>,
 }
 
@@ -5632,7 +6601,10 @@ impl IgnorePatternBuckets {
                 .or_default()
                 .push(index),
             IgnoreBucketKind::PathSuffixBasename => {
-                let suffix = pattern.pattern.strip_prefix(b"**/").unwrap_or(&pattern.pattern);
+                let suffix = pattern
+                    .pattern
+                    .strip_prefix(b"**/")
+                    .unwrap_or(&pattern.pattern);
                 self.path_suffix_basename
                     .entry(path_basename(suffix).to_vec())
                     .or_default()
@@ -5648,10 +6620,62 @@ impl IgnorePatternBuckets {
                 .entry(path_basename(&pattern.pattern).to_vec())
                 .or_default()
                 .push(index),
-            IgnoreBucketKind::SuffixBasename => self.suffix_basename.push(index),
-            IgnoreBucketKind::PrefixBasename => self.prefix_basename.push(index),
+            IgnoreBucketKind::GlobPathSuffixBasename => self.glob_path_suffix_basename.push(index),
+            IgnoreBucketKind::GlobPathPrefixBasename => self.glob_path_prefix_basename.push(index),
+            IgnoreBucketKind::GlobDirectorySuffixBasename => {
+                self.glob_directory_suffix_basename.push(index)
+            }
+            IgnoreBucketKind::GlobDirectoryPrefixBasename => {
+                self.glob_directory_prefix_basename.push(index)
+            }
+            IgnoreBucketKind::SuffixBasename => self
+                .suffix_basename
+                .entry(*pattern.pattern.last().expect("suffix literal is non-empty"))
+                .or_default()
+                .push(index),
+            IgnoreBucketKind::PrefixBasename => self
+                .prefix_basename
+                .entry(pattern.pattern[0])
+                .or_default()
+                .push(index),
             IgnoreBucketKind::Other => self.other.push(index),
         }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        fn truncate_indices(indices: &mut Vec<usize>, len: usize) {
+            let keep = indices.partition_point(|index| *index < len);
+            indices.truncate(keep);
+        }
+        for indices in self.literal_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.directory_literal_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.literal_path_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.path_suffix_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.glob_path_literal_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.glob_directory_literal_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        truncate_indices(&mut self.glob_path_suffix_basename, len);
+        truncate_indices(&mut self.glob_path_prefix_basename, len);
+        truncate_indices(&mut self.glob_directory_suffix_basename, len);
+        truncate_indices(&mut self.glob_directory_prefix_basename, len);
+        for indices in self.suffix_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.prefix_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        truncate_indices(&mut self.other, len);
     }
 }
 
@@ -5671,6 +6695,7 @@ struct IgnorePattern {
     /// of which match without the allocating wildcard DP engine; only genuinely
     /// complex globs fall through to [`wildcard_path_matches`].
     match_kind: MatchKind,
+    glob_literal_prefix_len: usize,
 }
 
 /// Classification of an [`IgnorePattern`] that lets common shapes skip the
@@ -5701,6 +6726,10 @@ fn path_component_has_glob_meta(component: &[u8]) -> bool {
         .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
 }
 
+fn final_component_match_kind(pattern: &[u8]) -> MatchKind {
+    classify_ignore_pattern(path_basename(pattern))
+}
+
 fn directory_match_components(path: &[u8], is_dir: bool) -> Vec<&[u8]> {
     let mut components = path.split(|byte| *byte == b'/').peekable();
     let mut matches = Vec::new();
@@ -5720,6 +6749,10 @@ enum IgnoreBucketKind {
     PathSuffixBasename,
     GlobPathLiteralBasename,
     GlobDirectoryLiteralBasename,
+    GlobPathSuffixBasename,
+    GlobPathPrefixBasename,
+    GlobDirectorySuffixBasename,
+    GlobDirectoryPrefixBasename,
     SuffixBasename,
     PrefixBasename,
     Other,
@@ -5731,7 +6764,9 @@ enum IgnoreBucketKind {
 fn classify_ignore_pattern(pattern: &[u8]) -> MatchKind {
     if let Some(suffix) = pattern.strip_prefix(b"**/")
         && !suffix.is_empty()
-        && !suffix.iter().any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
+        && !suffix
+            .iter()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
     {
         return MatchKind::PathSuffix;
     }
@@ -5875,6 +6910,26 @@ impl IgnoreMatcher {
         if let Some(indices) = self.buckets.glob_path_literal_basename.get(basename) {
             self.match_bucket_candidates(indices, path, basename, is_dir, &mut best, &mut profile);
         }
+        self.match_final_component_candidates(
+            &self.buckets.glob_path_suffix_basename,
+            MatchKind::Suffix,
+            basename,
+            path,
+            basename,
+            is_dir,
+            &mut best,
+            &mut profile,
+        );
+        self.match_final_component_candidates(
+            &self.buckets.glob_path_prefix_basename,
+            MatchKind::Prefix,
+            basename,
+            path,
+            basename,
+            is_dir,
+            &mut best,
+            &mut profile,
+        );
         for component in directory_match_components(path, is_dir) {
             if let Some(indices) = self.buckets.directory_literal_basename.get(component) {
                 self.match_bucket_candidates(
@@ -5896,23 +6951,37 @@ impl IgnoreMatcher {
                     &mut profile,
                 );
             }
+            self.match_final_component_candidates(
+                &self.buckets.glob_directory_suffix_basename,
+                MatchKind::Suffix,
+                component,
+                path,
+                basename,
+                is_dir,
+                &mut best,
+                &mut profile,
+            );
+            self.match_final_component_candidates(
+                &self.buckets.glob_directory_prefix_basename,
+                MatchKind::Prefix,
+                component,
+                path,
+                basename,
+                is_dir,
+                &mut best,
+                &mut profile,
+            );
         }
-        self.match_bucket_candidates(
-            &self.buckets.suffix_basename,
-            path,
-            basename,
-            is_dir,
-            &mut best,
-            &mut profile,
-        );
-        self.match_bucket_candidates(
-            &self.buckets.prefix_basename,
-            path,
-            basename,
-            is_dir,
-            &mut best,
-            &mut profile,
-        );
+        if let Some(last) = basename.last()
+            && let Some(indices) = self.buckets.suffix_basename.get(last)
+        {
+            self.match_bucket_candidates(indices, path, basename, is_dir, &mut best, &mut profile);
+        }
+        if let Some(first) = basename.first()
+            && let Some(indices) = self.buckets.prefix_basename.get(first)
+        {
+            self.match_bucket_candidates(indices, path, basename, is_dir, &mut best, &mut profile);
+        }
         self.match_bucket_candidates(
             &self.buckets.other,
             path,
@@ -5938,6 +7007,52 @@ impl IgnoreMatcher {
                 break;
             }
             let pattern = &self.patterns[index];
+            if !pattern.glob_literal_prefix_matches(path, basename, is_dir) {
+                continue;
+            }
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.ignore_pattern_tests += 1;
+                if pattern.match_kind == MatchKind::Glob {
+                    profile.ignore_glob_fallback_tests += 1;
+                }
+            }
+            if pattern.matches_with_basename(path, basename, is_dir) {
+                *best = Some(index);
+                break;
+            }
+        }
+    }
+
+    fn match_final_component_candidates(
+        &self,
+        indices: &[usize],
+        kind: MatchKind,
+        component: &[u8],
+        path: &[u8],
+        basename: &[u8],
+        is_dir: bool,
+        best: &mut Option<usize>,
+        profile: &mut Option<&mut StatusProfileCounters>,
+    ) {
+        for &index in indices.iter().rev() {
+            if best.is_some_and(|best| index <= best) {
+                break;
+            }
+            let pattern = &self.patterns[index];
+            let final_component = path_basename(&pattern.pattern);
+            let candidate = match kind {
+                MatchKind::Suffix => component.ends_with(&final_component[1..]),
+                MatchKind::Prefix => {
+                    component.starts_with(&final_component[..final_component.len() - 1])
+                }
+                _ => false,
+            };
+            if !candidate {
+                continue;
+            }
+            if !pattern.glob_literal_prefix_matches(path, basename, is_dir) {
+                continue;
+            }
             if let Some(profile) = profile.as_deref_mut() {
                 profile.ignore_pattern_tests += 1;
                 if pattern.match_kind == MatchKind::Glob {
@@ -5968,7 +7083,7 @@ impl IgnoreMatcher {
             return;
         }
         self.patterns.truncate(len);
-        self.rebuild_buckets();
+        self.buckets.truncate(len);
     }
 
     fn rebuild_buckets(&mut self) {
@@ -6328,6 +7443,15 @@ fn parse_ignore_pattern(
     if pattern.is_empty() {
         return None;
     }
+    let match_kind = classify_ignore_pattern(pattern);
+    let glob_literal_prefix_len = if match_kind == MatchKind::Glob {
+        pattern
+            .iter()
+            .position(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
+            .unwrap_or(pattern.len())
+    } else {
+        0
+    };
     Some(IgnorePattern {
         base: base.to_vec(),
         pattern: pattern.to_vec(),
@@ -6338,7 +7462,8 @@ fn parse_ignore_pattern(
         directory_only,
         anchored,
         has_slash: pattern.contains(&b'/'),
-        match_kind: classify_ignore_pattern(pattern),
+        match_kind,
+        glob_literal_prefix_len,
     })
 }
 
@@ -6383,6 +7508,18 @@ impl IgnorePattern {
         {
             return IgnoreBucketKind::GlobDirectoryLiteralBasename;
         }
+        if self.has_slash && self.match_kind == MatchKind::Glob {
+            return match (
+                self.directory_only,
+                final_component_match_kind(&self.pattern),
+            ) {
+                (false, MatchKind::Suffix) => IgnoreBucketKind::GlobPathSuffixBasename,
+                (false, MatchKind::Prefix) => IgnoreBucketKind::GlobPathPrefixBasename,
+                (true, MatchKind::Suffix) => IgnoreBucketKind::GlobDirectorySuffixBasename,
+                (true, MatchKind::Prefix) => IgnoreBucketKind::GlobDirectoryPrefixBasename,
+                _ => IgnoreBucketKind::Other,
+            };
+        }
         if self.anchored || self.has_slash {
             return IgnoreBucketKind::Other;
         }
@@ -6407,6 +7544,34 @@ impl IgnorePattern {
     fn matches(&self, path: &[u8], is_dir: bool) -> bool {
         let basename = path_basename(path);
         self.matches_with_basename(path, basename, is_dir)
+    }
+
+    fn glob_literal_prefix_matches(&self, path: &[u8], basename: &[u8], is_dir: bool) -> bool {
+        if self.match_kind != MatchKind::Glob {
+            return true;
+        }
+        if self.glob_literal_prefix_len == 0 {
+            return true;
+        }
+        let prefix = &self.pattern[..self.glob_literal_prefix_len];
+        let scoped_path = if self.base.is_empty() {
+            path
+        } else {
+            let Some(rest) = path
+                .strip_prefix(self.base.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"/"))
+            else {
+                return false;
+            };
+            rest
+        };
+        if self.anchored || self.has_slash {
+            return scoped_path.starts_with(prefix);
+        }
+        if self.directory_only && !is_dir {
+            return true;
+        }
+        basename.starts_with(prefix)
     }
 
     fn matches_with_basename(&self, path: &[u8], basename: &[u8], is_dir: bool) -> bool {
@@ -8045,12 +9210,7 @@ fn smudge_attribute_checks_from_index(
 
     // Walk root -> ... -> the file's parent directory, folding each frame's
     // `.gitattributes` in shallow-to-deep order so deeper directories win.
-    fold_checkout_attribute_frame(
-        worktree_root,
-        &[],
-        &index_attributes,
-        &mut matcher,
-    )?;
+    fold_checkout_attribute_frame(worktree_root, &[], &index_attributes, &mut matcher)?;
     let mut prefix = Vec::new();
     let mut parts = path.split(|byte| *byte == b'/').peekable();
     while let Some(part) = parts.next() {
@@ -8755,11 +9915,15 @@ fn checkout_commit_to_index_and_worktree_filtered(
     target: &ObjectId,
     smudge_config: Option<&GitConfig>,
 ) -> Result<usize> {
-    let status = short_status(worktree_root, git_dir, format)?;
-    if status
-        .iter()
-        .any(|entry| !status_entry_is_untracked_or_ignored(entry))
-    {
+    let mut dirty = false;
+    stream_short_status(worktree_root, git_dir, format, |entry| {
+        if !status_row_is_untracked_or_ignored(entry) {
+            dirty = true;
+            return Ok(StreamControl::Stop);
+        }
+        Ok(StreamControl::Continue)
+    })?;
+    if dirty {
         return Err(GitError::Transaction(
             "checkout requires a clean working tree".into(),
         ));
@@ -8867,17 +10031,17 @@ fn checkout_commit_to_index_and_worktree_sparse(
 
     // Honor skip-worktree: a path whose worktree file is intentionally absent
     // must not be treated as a dirty (deleted) change blocking the checkout.
-    let status = short_status(worktree_root, git_dir, format)?;
-    if status.iter().any(|entry| {
-        if previously_skipped.contains(entry.path.as_slice()) {
-            return false;
+    let mut dirty = false;
+    stream_short_status(worktree_root, git_dir, format, |entry| {
+        if previously_skipped.contains(entry.path) {
+            return Ok(StreamControl::Continue);
         }
         // Submodule state never blocks a checkout: upstream unpack-trees
         // treats gitlinks as always up-to-date (ie_match_stat refuses to pay
         // for a submodule dirtiness probe), so new commits / dirty content in
         // a submodule must not fail the branch switch.
         if entry.index_mode == Some(0o160000) || entry.worktree_mode == Some(0o160000) {
-            return false;
+            return Ok(StreamControl::Continue);
         }
         // An untracked embedded repository where the target tree records a
         // gitlink is reused as-is (upstream entry.c write_entry: mkdir with
@@ -8886,16 +10050,18 @@ fn checkout_commit_to_index_and_worktree_sparse(
             let path = entry
                 .path
                 .strip_suffix(b"/")
-                .unwrap_or(entry.path.as_slice());
+                .unwrap_or(entry.path);
             if target_entries
                 .get(path)
                 .is_some_and(|target| target.mode == 0o160000)
             {
-                return false;
+                return Ok(StreamControl::Continue);
             }
         }
-        true
-    }) {
+        dirty = true;
+        Ok(StreamControl::Stop)
+    })?;
+    if dirty {
         return Err(GitError::Transaction(
             "checkout requires a clean working tree".into(),
         ));
@@ -9168,9 +10334,9 @@ fn restore_index_paths_from_entries(
                 // cached stat is preserved and `git diff-files` stays clean (t7102
                 // "resetting an unmodified path is a no-op"). Only when the entry
                 // genuinely changes does git write a fresh, stat-zeroed entry.
-                let unchanged = index_entries
-                    .get(&path)
-                    .is_some_and(|existing| existing.oid == entry.oid && existing.mode == entry.mode);
+                let unchanged = index_entries.get(&path).is_some_and(|existing| {
+                    existing.oid == entry.oid && existing.mode == entry.mode
+                });
                 if !unchanged {
                     index_entries.insert(
                         path.clone(),
@@ -10258,9 +11424,7 @@ pub fn remove_index_and_worktree_paths(
         let config =
             sley_config::read_repo_config(git_dir, config_parameters_env).unwrap_or_default();
         // advice.rmhints (default true) gates the parenthetical "(use ...)" hints.
-        let show_hints = config
-            .get_bool("advice", None, "rmhints")
-            .unwrap_or(true);
+        let show_hints = config.get_bool("advice", None, "rmhints").unwrap_or(true);
         // Map each selected path to its stage-0 index entry for the check; an
         // unmerged path (no stage 0) is skipped, exactly like git's loop
         // (index_name_pos fails, and a non-gitlink ours entry `continue`s).
@@ -10322,9 +11486,8 @@ pub fn remove_index_and_worktree_paths(
                                 path,
                                 &fs::read(&worktree_file)?,
                             )?;
-                            let worktree_oid =
-                                EncodedObject::new(ObjectType::Blob, worktree_bytes)
-                                    .object_id(format)?;
+                            let worktree_oid = EncodedObject::new(ObjectType::Blob, worktree_bytes)
+                                .object_id(format)?;
                             worktree_oid != index_entry.oid
                         }
                     }
@@ -11172,7 +12335,7 @@ fn resolve_head_commit_oid(git_dir: &Path, format: ObjectFormat) -> Result<Optio
     sley_refs::resolve_ref_peeled(&refs, "HEAD")
 }
 
-fn status_entry_is_untracked_or_ignored(entry: &ShortStatusEntry) -> bool {
+fn status_row_is_untracked_or_ignored(entry: ShortStatusRow<'_>) -> bool {
     matches!((entry.index, entry.worktree), (b'?', b'?') | (b'!', b'!'))
 }
 
@@ -12290,6 +13453,19 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn short_status(
+        worktree_root: impl AsRef<Path>,
+        git_dir: impl AsRef<Path>,
+        format: ObjectFormat,
+    ) -> Result<Vec<ShortStatusEntry>> {
+        let mut entries = Vec::new();
+        stream_short_status(worktree_root, git_dir, format, |entry| {
+            entries.push(entry.to_owned_entry());
+            Ok(StreamControl::Continue)
+        })?;
+        Ok(entries)
+    }
+
     #[test]
     fn atomic_metadata_writer_writes_and_reports_stat() {
         let root = temp_root();
@@ -12565,10 +13741,12 @@ mod tests {
     #[test]
     fn ignore_slash_glob_literal_basename_bucket_preserves_matches() {
         let matcher = ignore_matcher(&[b"**/android/**/GeneratedPluginRegistrant.java"]);
-        assert!(matcher
-            .buckets
-            .glob_path_literal_basename
-            .contains_key(b"GeneratedPluginRegistrant.java".as_slice()));
+        assert!(
+            matcher
+                .buckets
+                .glob_path_literal_basename
+                .contains_key(b"GeneratedPluginRegistrant.java".as_slice())
+        );
         assert!(matcher.is_ignored(
             b"packages/app/android/src/GeneratedPluginRegistrant.java",
             false
@@ -12577,19 +13755,46 @@ mod tests {
             b"android/app/src/main/java/io/flutter/GeneratedPluginRegistrant.java",
             false
         ));
-        assert!(!matcher.is_ignored(
-            b"android/app/src/main/java/io/flutter/Other.java",
-            false
-        ));
+        assert!(!matcher.is_ignored(b"android/app/src/main/java/io/flutter/Other.java", false));
 
         let matcher = ignore_matcher(&[b"**/ios/**/Pods/"]);
-        assert!(matcher
-            .buckets
-            .glob_directory_literal_basename
-            .contains_key(b"Pods".as_slice()));
+        assert!(
+            matcher
+                .buckets
+                .glob_directory_literal_basename
+                .contains_key(b"Pods".as_slice())
+        );
         assert!(matcher.is_ignored(b"ios/Runner/Pods", true));
         assert!(matcher.is_ignored(b"dev/app/ios/Runner/Pods/Manifest.lock", false));
         assert!(!matcher.is_ignored(b"dev/app/ios/Runner/Podfile", false));
+
+        let matcher = ignore_matcher(&[b"**/ios/**/*.mode1v3"]);
+        assert!(
+            !matcher.buckets.glob_path_suffix_basename.is_empty(),
+            "suffix-final slash glob should be prefiltered by basename suffix"
+        );
+        assert!(matcher.is_ignored(b"apps/ios/Runner/default.mode1v3", false));
+        assert!(!matcher.is_ignored(b"apps/ios/Runner/default.mode2v3", false));
+
+        let matcher = ignore_matcher(&[b"**/ios/Runner/GeneratedPluginRegistrant.*"]);
+        assert!(
+            !matcher.buckets.glob_path_prefix_basename.is_empty(),
+            "prefix-final slash glob should be prefiltered by basename prefix"
+        );
+        assert!(matcher.is_ignored(b"apps/ios/Runner/GeneratedPluginRegistrant.swift", false));
+        assert!(!matcher.is_ignored(
+            b"apps/ios/Runner/OtherGeneratedPluginRegistrant.swift",
+            false
+        ));
+
+        let matcher = ignore_matcher(&[b"ios/Scenarios/*.framework/"]);
+        assert!(
+            !matcher.buckets.glob_directory_suffix_basename.is_empty(),
+            "directory suffix-final slash glob should be prefiltered by directory component"
+        );
+        assert!(matcher.is_ignored(b"ios/Scenarios/App.framework", true));
+        assert!(matcher.is_ignored(b"ios/Scenarios/App.framework/Info.plist", false));
+        assert!(!matcher.is_ignored(b"ios/Scenarios/App.xcframework/Info.plist", false));
     }
 
     #[test]
@@ -12614,6 +13819,12 @@ mod tests {
             MatchKind::Glob
         ));
         assert!(matches!(classify_ignore_pattern(b"a*b*c"), MatchKind::Glob));
+
+        let matcher = ignore_matcher(&[b".vscode/*", b"dev/devicelab/ABresults*.json"]);
+        assert!(matcher.is_ignored(b".vscode/settings.json", false));
+        assert!(!matcher.is_ignored(b"pkg/.vscode/settings.json", false));
+        assert!(matcher.is_ignored(b"dev/devicelab/ABresults-1.json", false));
+        assert!(!matcher.is_ignored(b"dev/devicelab/results-1.json", false));
     }
 
     #[test]
@@ -13180,7 +14391,11 @@ mod tests {
         // --- attr=text, no eol attr: CRLF_TEXT, resolved by text_eol_is_crlf().
         // autocrlf=true wins over core.eol=lf (the precedence fix).
         assert_eq!(
-            smudge("[core]\n\tautocrlf = true\n\teol = lf\n", Some(b"*.txt text"), LF),
+            smudge(
+                "[core]\n\tautocrlf = true\n\teol = lf\n",
+                Some(b"*.txt text"),
+                LF
+            ),
             b"a\r\nb\r\nc\r\n",
             "autocrlf=true must override core.eol=lf for plain text attr"
         );
@@ -13212,12 +14427,20 @@ mod tests {
         );
         // auto + already has a CR/CRLF => leave untouched (irreversible guard).
         assert_eq!(
-            smudge("[core]\n\tautocrlf = true\n", Some(b"*.txt text=auto"), CRLF_MIX_LF),
+            smudge(
+                "[core]\n\tautocrlf = true\n",
+                Some(b"*.txt text=auto"),
+                CRLF_MIX_LF
+            ),
             CRLF_MIX_LF,
             "text=auto must not touch content that already has CRLF"
         );
         assert_eq!(
-            smudge("[core]\n\tautocrlf = true\n", Some(b"*.txt text=auto"), LF_MIX_CR),
+            smudge(
+                "[core]\n\tautocrlf = true\n",
+                Some(b"*.txt text=auto"),
+                LF_MIX_CR
+            ),
             LF_MIX_CR,
             "text=auto must not touch content that already has a lone CR"
         );

@@ -536,7 +536,7 @@ fn print_reset_unstaged_changes(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
-    let mut entries = sley_worktree::short_status(worktree_root, git_dir, format)?;
+    let mut entries = crate::collect_short_status(worktree_root, git_dir, format)?;
     entries.retain(|entry| matches!(entry.worktree, b'M' | b'D'));
     // git's post-reset summary omits skip-worktree paths: `update_index_refresh`
     // never marks a CE_SKIP_WORKTREE entry stat-dirty, so it never appears in the
@@ -2800,7 +2800,7 @@ fn print_commit_summary(
         Some(name) => name,
         None => "detached HEAD".to_string(),
     };
-    let abbrev = commit_summary_abbrev(&db, new_oid);
+    let abbrev = commit_summary_abbrev(git_dir, format, new_oid)?;
     let root = if parent.is_none() { " (root-commit)" } else { "" };
     let subject = commit_subject(message);
 
@@ -2839,18 +2839,19 @@ fn print_commit_summary(
     Ok(())
 }
 
-/// git's `find_unique_abbrev`: the shortest unambiguous hex prefix of `oid`
-/// (minimum 7), growing until it resolves to a single object.
-fn commit_summary_abbrev(db: &FileObjectDatabase, oid: &ObjectId) -> String {
+/// The post-commit summary uses the repository's effective abbreviation width.
+/// Avoid per-commit uniqueness scans here: on large packed repositories that
+/// turns a one-file commit into an all-object walk before the first line prints.
+fn commit_summary_abbrev(
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<String> {
     let hex = oid.to_hex();
-    let mut width = 7usize.min(hex.len());
-    while width < hex.len() {
-        match db.resolve_prefix(&hex[..width]) {
-            Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
-            _ => break,
-        }
-    }
-    hex[..width].to_string()
+    let width = repository_abbrev(git_dir, format)?
+        .map(|width| width.min(hex.len()))
+        .unwrap_or(hex.len());
+    Ok(hex[..width].to_string())
 }
 
 /// Extract `Name <email>` from a raw git identity buffer (`Name <email> seconds
@@ -3352,7 +3353,7 @@ fn cmd_commit_long_status_preview(
             _ => sley_worktree::StatusUntrackedMode::Normal,
         }
     });
-    let mut entries = sley_worktree::short_status_with_options(
+    let mut entries = crate::collect_short_status_with_options(
         &worktree_root,
         &git_dir,
         format,
@@ -4379,26 +4380,45 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     // the core.bare+core.worktree conflict) when one isn't available.
     let worktree_root = require_work_tree(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let mut entries = sley_worktree::short_status_with_options(
-        &worktree_root,
-        &git_dir,
-        format,
-        sley_worktree::ShortStatusOptions {
-            include_ignored: show_ignored,
-            ignored_mode,
-            untracked_mode,
-        },
-    )?;
+    let status_options = sley_worktree::ShortStatusOptions {
+        include_ignored: show_ignored,
+        ignored_mode,
+        untracked_mode,
+    };
     let pathspec = StatusPathspec::new(&cwd, &worktree_root, &path_args)?;
-    if pathspec.has_filters() {
-        entries.retain(|entry| pathspec.matches(&entry.path));
-    }
     // Resolve the per-submodule ignore setting (command line > `.git/config` >
     // `.gitmodules` > `diff.ignoreSubmodules`) and apply it to the worktree-side
     // submodule change detail, exactly as git's handle_ignore_submodules_arg ahead
     // of the diff. Computed before the relativePaths display rewrite so gitlink
     // lookups use worktree-root-relative paths.
     let ignore_resolver = SubmoduleIgnoreResolver::load(&git_dir, &config, ignore_submodules_arg)?;
+    if !porcelain_v2 && (z || short) {
+        print_status_short_stream(
+            &worktree_root,
+            &git_dir,
+            format,
+            status_options,
+            &pathspec,
+            &ignore_resolver,
+            StatusShortStreamDisplay {
+                branch,
+                ahead_behind,
+                z,
+                porcelain_v1,
+                relative_paths,
+            },
+        )?;
+        return Ok(());
+    }
+    let mut entries = crate::collect_short_status_with_options(
+        &worktree_root,
+        &git_dir,
+        format,
+        status_options,
+    )?;
+    if pathspec.has_filters() {
+        entries.retain(|entry| pathspec.matches(&entry.path));
+    }
     apply_submodule_ignore(&mut entries, &ignore_resolver);
     // The long-format `Submodule changes to be committed:` /
     // `Submodules changed but not updated:` sections (status.submodulesummary).
@@ -4534,6 +4554,93 @@ fn status_short_submodule_code(entry: &sley_worktree::ShortStatusEntry) -> u8 {
     } else {
         entry.worktree
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatusShortStreamDisplay {
+    branch: bool,
+    ahead_behind: bool,
+    z: bool,
+    porcelain_v1: bool,
+    relative_paths: bool,
+}
+
+fn print_status_short_stream(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    options: sley_worktree::ShortStatusOptions,
+    pathspec: &StatusPathspec,
+    ignore_resolver: &SubmoduleIgnoreResolver,
+    display: StatusShortStreamDisplay,
+) -> Result<()> {
+    if display.z {
+        let mut stdout = io::stdout().lock();
+        if display.branch {
+            stdout.write_all(
+                status_branch_header(git_dir, format, display.ahead_behind)?.as_bytes(),
+            )?;
+            stdout.write_all(&[0])?;
+        }
+        sley_worktree::stream_short_status_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            options,
+            |entry| {
+                if pathspec.has_filters() && !pathspec.matches(entry.path) {
+                    return Ok(sley_worktree::StreamControl::Continue);
+                }
+                let mut entry = entry.to_owned_entry();
+                if !apply_submodule_ignore_entry(&mut entry, ignore_resolver) {
+                    return Ok(sley_worktree::StreamControl::Continue);
+                }
+                write!(stdout, "{}{} ", entry.index as char, entry.worktree as char)?;
+                stdout.write_all(&entry.path)?;
+                stdout.write_all(&[0])?;
+                Ok(sley_worktree::StreamControl::Continue)
+            },
+        )?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    if display.branch {
+        println!(
+            "{}",
+            status_branch_header(git_dir, format, display.ahead_behind)?
+        );
+    }
+    sley_worktree::stream_short_status_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        options,
+        |entry| {
+            if pathspec.has_filters() && !pathspec.matches(entry.path) {
+                return Ok(sley_worktree::StreamControl::Continue);
+            }
+            let mut entry = entry.to_owned_entry();
+            if !apply_submodule_ignore_entry(&mut entry, ignore_resolver) {
+                return Ok(sley_worktree::StreamControl::Continue);
+            }
+            if !display.porcelain_v1 && display.relative_paths {
+                entry.path = pathspec.display(&entry.path);
+            }
+            let worktree_code = if display.porcelain_v1 {
+                entry.worktree
+            } else {
+                status_short_submodule_code(&entry)
+            };
+            println!(
+                "{}{} {}",
+                entry.index as char,
+                worktree_code as char,
+                status_quote_path(&entry.path, true)
+            );
+            Ok(sley_worktree::StreamControl::Continue)
+        },
+    )
 }
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
@@ -4858,6 +4965,13 @@ fn apply_submodule_ignore(
     entries: &mut Vec<sley_worktree::ShortStatusEntry>,
     resolver: &SubmoduleIgnoreResolver,
 ) {
+    entries.retain_mut(|entry| apply_submodule_ignore_entry(entry, resolver));
+}
+
+fn apply_submodule_ignore_entry(
+    entry: &mut sley_worktree::ShortStatusEntry,
+    resolver: &SubmoduleIgnoreResolver,
+) -> bool {
     // A bare `--ignore-submodules=all` on the COMMAND LINE sets the diffopt
     // ignore_submodules flag for the whole status run, hiding even the *staged*
     // gitlink change (`modified: sm` under "Changes to be committed"). A
@@ -4865,43 +4979,41 @@ fn apply_submodule_ignore(
     // only touches the worktree-side detail and the summary (cells #93/#94 keep
     // the staged line).
     let cli_all = resolver.cli == Some(IgnoreSubmodules::All);
-    entries.retain_mut(|entry| {
-        let is_gitlink = entry.head_mode == Some(0o160000)
-            || entry.index_mode == Some(0o160000)
-            || entry.worktree_mode == Some(0o160000);
-        if cli_all && is_gitlink {
-            return false;
+    let is_gitlink = entry.head_mode == Some(0o160000)
+        || entry.index_mode == Some(0o160000)
+        || entry.worktree_mode == Some(0o160000);
+    if cli_all && is_gitlink {
+        return false;
+    }
+    let Some(submodule) = entry.submodule.as_mut() else {
+        return true;
+    };
+    let ignore = resolver.for_path(&entry.path);
+    match ignore {
+        IgnoreSubmodules::None => {}
+        IgnoreSubmodules::Untracked => {
+            submodule.untracked_content = false;
         }
-        let Some(submodule) = entry.submodule.as_mut() else {
-            return true;
-        };
-        let ignore = resolver.for_path(&entry.path);
-        match ignore {
-            IgnoreSubmodules::None => {}
-            IgnoreSubmodules::Untracked => {
-                submodule.untracked_content = false;
-            }
-            IgnoreSubmodules::Dirty => {
-                submodule.untracked_content = false;
-                submodule.modified_content = false;
-            }
-            IgnoreSubmodules::All => {
-                submodule.new_commits = false;
-                submodule.modified_content = false;
-                submodule.untracked_content = false;
-            }
+        IgnoreSubmodules::Dirty => {
+            submodule.untracked_content = false;
+            submodule.modified_content = false;
         }
-        if !submodule.any() {
-            // No worktree-side submodule change survives the ignore. The gitlink
-            // may still carry a *staged* (index) change; keep the entry only if
-            // its index column is non-empty, and clear the worktree column so the
-            // "Changes not staged" section drops it.
-            entry.submodule = None;
-            entry.worktree = b' ';
-            return entry.index != b' ';
+        IgnoreSubmodules::All => {
+            submodule.new_commits = false;
+            submodule.modified_content = false;
+            submodule.untracked_content = false;
         }
-        true
-    });
+    }
+    if !submodule.any() {
+        // No worktree-side submodule change survives the ignore. The gitlink
+        // may still carry a *staged* (index) change; keep the entry only if
+        // its index column is non-empty, and clear the worktree column so the
+        // "Changes not staged" section drops it.
+        entry.submodule = None;
+        entry.worktree = b' ';
+        return entry.index != b' ';
+    }
+    true
 }
 
 /// The two rendered long-status submodule-summary sections. Each `Vec<String>`

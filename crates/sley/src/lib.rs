@@ -108,8 +108,8 @@ pub use sley_refs::{
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
     AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
-    ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
-    write_metadata_file_atomic,
+    ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusUntrackedMode, StreamControl,
+    WorktreeEntryState, write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;
@@ -408,17 +408,65 @@ impl Repository {
         self.short_status_with_options(ShortStatusOptions::default())
     }
 
+    /// Stream short-status entries for this repository's working tree using
+    /// sley's default status options.
+    ///
+    /// Bare repositories have no working tree and return
+    /// [`GitError::Unsupported`].
+    pub fn stream_short_status<F>(&self, emit: F) -> Result<()>
+    where
+        F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+    {
+        self.stream_short_status_with_options(ShortStatusOptions::default(), emit)
+    }
+
     /// Return short-status entries for this repository's working tree.
     ///
-    /// This is the facade form of [`sley_worktree::short_status_with_options`].
+    /// This facade collects entries from [`sley_worktree::stream_short_status_with_options`].
     pub fn short_status_with_options(
         &self,
         options: ShortStatusOptions,
     ) -> Result<Vec<ShortStatusEntry>> {
+        let mut entries = Vec::new();
+        self.stream_short_status_with_options(options, |entry| {
+            entries.push(entry.to_owned_entry());
+            Ok(StreamControl::Continue)
+        })?;
+        Ok(entries)
+    }
+
+    /// Stream short-status entries for this repository's working tree.
+    pub fn stream_short_status_with_options<F>(
+        &self,
+        options: ShortStatusOptions,
+        emit: F,
+    ) -> Result<()>
+    where
+        F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+    {
         let workdir = self.workdir().ok_or_else(|| {
             GitError::Unsupported("short status requires a repository worktree".into())
         })?;
-        sley_worktree::short_status_with_options(&workdir, &self.git_dir, self.format, options)
+        sley_worktree::stream_short_status_with_options(
+            &workdir,
+            &self.git_dir,
+            self.format,
+            options,
+            emit,
+        )
+    }
+
+    /// Count short-status entries for this repository's working tree.
+    pub fn short_status_count_with_options(&self, options: ShortStatusOptions) -> Result<usize> {
+        let workdir = self.workdir().ok_or_else(|| {
+            GitError::Unsupported("short status requires a repository worktree".into())
+        })?;
+        sley_worktree::short_status_count_with_options(
+            &workdir,
+            &self.git_dir,
+            self.format,
+            options,
+        )
     }
 
     /// Compare one tracked entry to this repository's worktree, using the same
