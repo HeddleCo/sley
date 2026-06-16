@@ -4945,6 +4945,72 @@ mod tests {
     }
 
     #[test]
+    fn read_header_detects_corruption_within_gits_header_window() {
+        // git's `unpack_loose_header` inflates only the first MAX_HEADER_LEN (32)
+        // bytes of output; a zlib data error inside that window makes `cat-file
+        // -s`/`-t` fail (ULHR_BAD → "unable to unpack header"). A byte-by-byte
+        // header read that stopped at the NUL would never inflate into the corrupt
+        // region and would silently return a bogus size — the t1060 "getting type
+        // of a corrupt blob fails" bug. Corrupt a byte inside the inflate stream of
+        // a tiny object so the damage lands within the first 32 inflated bytes.
+        let root = temp_root("sley-loose-header-corrupt");
+        let store = LooseObjectStore::new(root.join("objects"), ObjectFormat::Sha1);
+        let object = EncodedObject::new(ObjectType::Blob, b"content\n".to_vec());
+        let oid = store
+            .write_object(object)
+            .expect("test operation should succeed");
+        let path = store
+            .object_path(&oid)
+            .expect("test operation should succeed");
+        let mut bytes = fs::read(&path).expect("test operation should succeed");
+        // Offset 10 is inside the deflate stream (past the 2-byte zlib header) and,
+        // for an 8-byte blob, decodes into the first 32 output bytes. Zero it to
+        // break inflation, mirroring t1060's `corrupt_byte HEAD:content.t 10`.
+        bytes[10] = 0;
+        fs::write(&path, &bytes).expect("test operation should succeed");
+        store.invalidate_cache();
+        let err = store
+            .read_header(&oid)
+            .expect_err("corrupt loose header must fail like git's ULHR_BAD");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unable to unpack") && msg.contains(&oid.to_hex()),
+            "expected git's ULHR_BAD message, got: {msg}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_header_ignores_corruption_past_gits_header_window() {
+        // Mirror git: corruption deeper than the 32-byte header window is NOT
+        // detected by a header-only read (`cat-file -s` still returns the size);
+        // the full-object read path catches it instead. Over-detecting here would
+        // diverge from upstream on large objects with a clean header.
+        let root = temp_root("sley-loose-header-deep-corrupt");
+        let store = LooseObjectStore::new(root.join("objects"), ObjectFormat::Sha1);
+        // Incompressible body so the deflate stream is long and a deep byte is well
+        // past the 32 inflated header-window bytes.
+        let body: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761)) as u8).collect();
+        let object = EncodedObject::new(ObjectType::Blob, body.clone());
+        let oid = store
+            .write_object(object)
+            .expect("test operation should succeed");
+        let path = store
+            .object_path(&oid)
+            .expect("test operation should succeed");
+        let mut bytes = fs::read(&path).expect("test operation should succeed");
+        let deep = bytes.len() / 2;
+        bytes[deep] ^= 0xff;
+        fs::write(&path, &bytes).expect("test operation should succeed");
+        store.invalidate_cache();
+        let header = store
+            .read_header(&oid)
+            .expect("header-only read must still succeed for deep body corruption");
+        assert_eq!(header, Some((ObjectType::Blob, body.len() as u64)));
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_database_reads_object_from_pack_index() {
         let root = temp_root("sley-file-odb-pack");
         let git_dir = root.join(".git");
