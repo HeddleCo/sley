@@ -1530,6 +1530,13 @@ fn parse_for_each_ref_sort(value: &str) -> Result<ForEachRefSort> {
         "-*creatordate" => Ok(ForEachRefSort::PeeledCreatorDateDescending),
         "version:refname" | "v:refname" => Ok(ForEachRefSort::VersionRefname),
         "-version:refname" | "-v:refname" => Ok(ForEachRefSort::VersionRefnameDescending),
+        // git ref-filter applies `version:`/`v:` version comparison to any
+        // field. `version:tag` keys on the `tag` atom (the short name under
+        // refs/tags); every ref a `git tag` listing produces shares the
+        // `refs/tags/` prefix, so a version compare on the short name and on the
+        // full refname yield the same order — alias to VersionRefname.
+        "version:tag" | "v:tag" => Ok(ForEachRefSort::VersionRefname),
+        "-version:tag" | "-v:tag" => Ok(ForEachRefSort::VersionRefnameDescending),
         other => {
             if let Some((field, descending)) = parse_for_each_ref_identity_sort(other) {
                 Ok(if descending {

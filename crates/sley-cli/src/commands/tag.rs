@@ -1371,6 +1371,12 @@ fn parse_tag_list_sort(value: &str) -> Result<TagListSort> {
         "-refname" => Ok(TagListSort::RefnameDescending),
         "version:refname" | "v:refname" => Ok(TagListSort::VersionRefname),
         "-version:refname" | "-v:refname" => Ok(TagListSort::VersionRefnameDescending),
+        // `version:tag` / `v:tag`: version-compare the `tag` atom (the short
+        // name under refs/tags). Every listed tag shares the refs/tags/ prefix,
+        // so a version compare on the short name matches one on the full
+        // refname — reuse VersionRefname.
+        "version:tag" | "v:tag" => Ok(TagListSort::VersionRefname),
+        "-version:tag" | "-v:tag" => Ok(TagListSort::VersionRefnameDescending),
         "objectname" => Ok(TagListSort::Objectname),
         "-objectname" => Ok(TagListSort::ObjectnameDescending),
         "objecttype" => Ok(TagListSort::Objecttype),
