@@ -533,6 +533,15 @@ struct ReadTreeWorktree<'a> {
 
 impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
     fn verify_uptodate(&self, path: &[u8], ce: &sley_unpack_trees::CacheEntry) -> Result<()> {
+        // git's `verify_uptodate_1` short-circuits a gitlink (submodule):
+        // `if (S_ISGITLINK(ce->ce_mode)) return 0;` — a submodule is never
+        // "dirty" via a worktree blob hash (its working tree is a *directory*,
+        // not a blob), so the engine must not try to `fs::read` it. The
+        // submodule's own dirtiness is handled separately by
+        // `check_submodule_move_head`.
+        if (ce.mode & 0o170000) == 0o160000 {
+            return Ok(());
+        }
         // The engine hands us the *current index* entry for the path; reuse the
         // existing hash-the-worktree-blob comparison (a missing tracked file is
         // treated as up to date, matching git's re-materialization allowance).
@@ -772,6 +781,12 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
 /// `old_tree`/`new_tree` are the *tree* OIDs (already peeled from their
 /// commits). `old_tree` is `None` for an unborn HEAD (a fresh `checkout -b`
 /// from an empty repo), in which case the engine sees an empty `oldtree` side.
+///
+/// `porcelain` selects the abort wording (git's
+/// `setup_unpack_trees_porcelain`): `checkout`/`switch` use
+/// [`UnpackPorcelain::Checkout`]; `reset --keep`, which runs the identical
+/// `twoway_merge` from `reset.c`, uses [`UnpackPorcelain::ReadTree`] (the
+/// per-path `Entry '...' not uptodate. Cannot merge.` message its test asserts).
 pub(crate) fn checkout_two_way_engine(
     git_dir: &Path,
     worktree_root: &Path,
@@ -779,6 +794,7 @@ pub(crate) fn checkout_two_way_engine(
     db: &FileObjectDatabase,
     old_tree: Option<&ObjectId>,
     new_tree: &ObjectId,
+    porcelain: UnpackPorcelain,
 ) -> Result<()> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
 
@@ -810,7 +826,7 @@ pub(crate) fn checkout_two_way_engine(
         db,
         format,
         original_paths: original_index_paths(git_dir, format)?,
-        porcelain: UnpackPorcelain::Checkout,
+        porcelain,
     };
 
     // git's `merge_working_tree` runs the merge to *populate the result* with
@@ -1485,7 +1501,28 @@ fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
         return Ok(());
     };
     match fs::symlink_metadata(&file_path) {
-        Ok(md) if md.is_dir() => fs::remove_dir_all(&file_path)?,
+        // git's `unlink_entry`: a path whose worktree copy is a *directory* is a
+        // gitlink (a populated submodule) or a directory whose tracked children
+        // have already been removed first (check_updates unlinks every
+        // CE_WT_REMOVE entry before this one). git removes it with a *non-recursive*
+        // `rmdir` and, when the directory still holds untracked content (a dirty
+        // submodule), emits `warning: unable to rmdir '<path>': Directory not
+        // empty` and leaves it in place — it never recursively deletes a
+        // submodule's working tree.
+        Ok(md) if md.is_dir() => match fs::remove_dir(&file_path) {
+            Ok(()) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::DirectoryNotEmpty
+                    || err.raw_os_error() == Some(39) =>
+            {
+                eprintln!(
+                    "warning: unable to rmdir '{}': Directory not empty",
+                    String::from_utf8_lossy(path)
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        },
         Ok(_) => fs::remove_file(&file_path)?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),

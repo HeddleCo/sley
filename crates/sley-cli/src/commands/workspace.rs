@@ -60,6 +60,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             "--soft" => mode = ResetMode::Soft,
             "--hard" => mode = ResetMode::Hard,
             "--merge" => mode = ResetMode::Merge,
+            "--keep" => mode = ResetMode::Keep,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -111,6 +112,16 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    // git's `setup_work_tree()` (builtin/reset.c): every reset that touches the
+    // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
+    // a bare repository refuses with "this operation must be run in a work
+    // tree". `--soft` (HEAD-only) and `--mixed` (index-only) are exempt.
+    if matches!(
+        mode,
+        ResetMode::Hard | ResetMode::Merge | ResetMode::Keep
+    ) {
+        require_work_tree(&git_dir)?;
+    }
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let pathspec_from_file_provided = pathspec_from_file.is_some();
@@ -143,6 +154,77 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             }
             other => other,
         });
+    }
+    if mode == ResetMode::Keep {
+        // git's `reset --keep` (builtin/reset.c): a two-way merge from the
+        // current HEAD tree to the target tree, carrying forward local
+        // modifications where safe and refusing the reset (with the read-tree
+        // "not uptodate. Cannot merge." porcelain) when a touched file has
+        // local changes. It never accepts paths.
+        if pathspec_from_file_provided || (saw_separator && !positionals.is_empty()) {
+            eprintln!("fatal: Cannot do keep reset with paths.");
+            return Err(GitError::Exit(128));
+        }
+        let target = match positionals.as_slice() {
+            [] => "HEAD",
+            [target] => target.as_str(),
+            _ => {
+                eprintln!("fatal: Cannot do keep reset with paths.");
+                return Err(GitError::Exit(128));
+            }
+        };
+        // git's `die_if_unmerged_cache(KEEP)`: a pending merge (MERGE_HEAD) or
+        // unmerged index entries forbid `--keep` (same gate as `--soft`).
+        if reset_soft_blocked_by_merge(&git_dir, format)? {
+            eprintln!("fatal: Cannot do a keep reset in the middle of a merge.");
+            return Err(GitError::Exit(128));
+        }
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let head_oid = resolve_revision(&git_dir, format, "HEAD")
+            .map_err(|_| {
+                eprintln!("fatal: You do not have a valid HEAD.");
+                GitError::Exit(128)
+            })?;
+        let old_head = head_oid;
+        let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
+        let target_oid = resolve_revision(&git_dir, format, target)?;
+        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
+        write_reset_orig_head(&git_dir, &old_head, format)?;
+        // The structural lever: route `--keep` through the SAME twoway_merge
+        // engine as checkout, with the read-tree abort wording its test asserts.
+        // git's `reset_index(KEEP)`: a twoway_merge with `update=1` updates the
+        // worktree (carrying forward safe local modifications, aborting on a
+        // touched-file conflict). This may leave staged changes in the index.
+        commands::read_tree::checkout_two_way_engine(
+            &git_dir,
+            &worktree_root,
+            format,
+            &db,
+            Some(&head_tree),
+            &target_tree,
+            commands::read_tree::UnpackPorcelain::ReadTree,
+        )?;
+        // git's second pass: `if (reset_type == KEEP && !err) reset_index(MIXED)`
+        // — an index-only reset to the target tree, so the resulting index
+        // matches the target exactly (a staged-but-untouched change is dropped
+        // from the index while its worktree content is preserved by pass 1).
+        sley_worktree::reset_index_to_commit(
+            worktree_root.clone(),
+            git_dir.clone(),
+            format,
+            &target_commit,
+        )?;
+        update_reset_head_ref(
+            &git_dir,
+            format,
+            old_head,
+            target_commit,
+            target,
+            commit_identity_from_env("COMMITTER")?,
+        )?;
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        return Ok(());
     }
     if matches!(mode, ResetMode::Soft | ResetMode::Hard) {
         if pathspec_from_file_provided {
@@ -518,6 +600,7 @@ enum ResetMode {
     Soft,
     Hard,
     Merge,
+    Keep,
 }
 
 impl ResetMode {
@@ -527,6 +610,7 @@ impl ResetMode {
             Self::Soft => "soft",
             Self::Hard => "hard",
             Self::Merge => "merge",
+            Self::Keep => "keep",
         }
     }
 }
@@ -1342,6 +1426,13 @@ fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) 
     if quiet || force {
         return Ok(());
     }
+    // git's `new_branch_info->commit` guard: there is nothing to diff against
+    // when switching to an unborn branch (HEAD has no commit), so the zero OID
+    // suppresses the local-changes report. Without this a `checkout -B <name>`
+    // on a fresh `init` would run `diff-index 0000…0000` and fail.
+    if new_commit.is_null() {
+        return Ok(());
+    }
     // Reuse the shared `diff-index` renderer (byte-identical with git's
     // name-status output). It diffs the tree-ish against the working tree by
     // default — exactly git's `run_diff_index(&rev, 0)`.
@@ -1381,6 +1472,7 @@ fn checkout_twoway_dirty(
         &db,
         old_tree.as_ref(),
         &target_tree,
+        commands::read_tree::UnpackPorcelain::Checkout,
     )
 }
 
