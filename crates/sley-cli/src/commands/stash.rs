@@ -2738,6 +2738,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
                         ignore_blank_lines: false,
                         ignore_regexes: &[],
+                        line_ranges: None,
                     };
                     write_diff_patch_entry(&mut stdout, entry, options)?;
                 }

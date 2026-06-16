@@ -144,6 +144,24 @@ pub struct HunkRenderOptions<'a, 'h> {
     /// match a `-I` regex) are dropped from hunk emission, mirroring git's
     /// `xdl_mark_ignorable_lines` / `xdl_mark_ignorable_regex` + `xdl_get_hunk`.
     pub change_ignore: Option<&'a ChangeIgnore<'a>>,
+    /// `log -L`: restrict the emitted hunks to the new-side (post-image) line
+    /// ranges. Each range is 0-based, `[start, end)`. When set, the renderer
+    /// inflates context to the widest range span (so every change inside a
+    /// range merges into one xdiff hunk), then clips the emitted lines back to
+    /// the range boundaries — a port of diff.c's `line_range_*` callbacks.
+    /// Ranges must be sorted and disjoint. `None` disables the filter (every
+    /// non-line-log caller).
+    pub line_ranges: Option<&'a [LineRange]>,
+}
+
+/// A half-open `[start, end)` line range (0-based) for `log -L` hunk
+/// restriction. Mirrors diff.c's `struct range`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineRange {
+    /// 0-based inclusive start line (post-image).
+    pub start: i64,
+    /// 0-based exclusive end line (post-image).
+    pub end: i64,
 }
 
 /// Configuration for change-group suppression (`--ignore-blank-lines` and
@@ -187,6 +205,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             ws_ignore: WsIgnore::default(),
             algorithm: DiffAlgorithm::Myers,
             change_ignore: None,
+            line_ranges: None,
         }
     }
 }
@@ -209,6 +228,27 @@ pub fn render_hunks(
     new_content: Option<&[u8]>,
     options: &mut HunkRenderOptions<'_, '_>,
 ) {
+    // `log -L` hunk restriction: render with inflated context into a scratch
+    // buffer, then clip the emitted lines to the tracked ranges (diff.c's
+    // `line_range_*` callbacks). The widest range span is the upper bound on
+    // the context needed for every change in a range to land in one hunk.
+    if let Some(ranges) = options.line_ranges {
+        let max_span = ranges
+            .iter()
+            .map(|r| r.end - r.start)
+            .max()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let saved_context = options.context;
+        options.context = saved_context.max(max_span);
+        options.line_ranges = None;
+        let mut full = Vec::new();
+        render_hunks(&mut full, old_content, new_content, options);
+        options.context = saved_context;
+        options.line_ranges = Some(ranges);
+        filter_hunks_to_ranges(out, &full, ranges);
+        return;
+    }
     let old = split_lines(old_content.unwrap_or_default());
     let new = split_lines(new_content.unwrap_or_default());
     let ops = myers_diff_lines_ws(&old, &new, options.ws_ignore, options.algorithm);
@@ -284,6 +324,257 @@ pub fn render_hunks(
         let hunk_end = (last_change + options.context + 1).min(tagged.len());
         render_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
     }
+}
+
+/// State for [`filter_hunks_to_ranges`], a port of diff.c's
+/// `struct line_range_callback`. We drive it over the already-rendered
+/// unified-diff lines (with inflated context) rather than xdiff's raw line
+/// callback, but the algorithm is the same: buffer pending removals, open a
+/// range hunk when an in-range post-image line is seen, and emit the clipped
+/// `@@` header + body for each range.
+struct RangeFilter<'r> {
+    ranges: &'r [LineRange],
+    cur_range: usize,
+    /// Post/pre-image 1-based line counters seeded from each `@@` header.
+    lno_post: i64,
+    lno_pre: i64,
+    /// Function-name heading carried from the current `@@` header (the suffix
+    /// after `@@ ... @@ `), reused verbatim on every emitted range hunk.
+    func: Vec<u8>,
+    /// Range hunk being accumulated.
+    rhunk: Vec<u8>,
+    rhunk_old_begin: i64,
+    rhunk_old_count: i64,
+    rhunk_new_begin: i64,
+    rhunk_new_count: i64,
+    rhunk_active: bool,
+    rhunk_has_changes: bool,
+    /// Removal lines not yet known to be in-range.
+    pending_rm: Vec<u8>,
+    pending_rm_count: i64,
+    pending_rm_pre_begin: i64,
+}
+
+impl RangeFilter<'_> {
+    fn discard_pending_rm(&mut self) {
+        self.pending_rm.clear();
+        self.pending_rm_count = 0;
+    }
+
+    /// Port of diff.c:flush_rhunk — emit the accumulated range hunk (header +
+    /// body) into `out`, dropping context-only hunks.
+    fn flush_rhunk(&mut self, out: &mut Vec<u8>) {
+        if !self.rhunk_active {
+            return;
+        }
+        if self.pending_rm_count != 0 {
+            self.rhunk.extend_from_slice(&self.pending_rm);
+            self.rhunk_old_count += self.pending_rm_count;
+            self.rhunk_has_changes = true;
+            self.discard_pending_rm();
+        }
+        if !self.rhunk_has_changes {
+            self.rhunk_active = false;
+            self.rhunk.clear();
+            return;
+        }
+        out.extend_from_slice(b"@@ -");
+        out.extend_from_slice(format_hunk_range(usize_or_zero(self.rhunk_old_begin), usize_or_zero(self.rhunk_old_count)).as_bytes());
+        out.extend_from_slice(b" +");
+        out.extend_from_slice(format_hunk_range(usize_or_zero(self.rhunk_new_begin), usize_or_zero(self.rhunk_new_count)).as_bytes());
+        out.extend_from_slice(b" @@");
+        if !self.func.is_empty() {
+            out.push(b' ');
+            out.extend_from_slice(&self.func);
+        }
+        out.push(b'\n');
+        out.extend_from_slice(&self.rhunk);
+        self.rhunk_active = false;
+        self.rhunk.clear();
+    }
+
+    /// Port of diff.c:line_range_line_fn for one rendered body line. `marker`
+    /// is the first byte (`' '`/`'+'`/`'-'`/`'\\'`), `line` the full bytes.
+    fn body_line(&mut self, out: &mut Vec<u8>, marker: u8, line: &[u8]) {
+        if marker == b'-' {
+            if self.pending_rm_count == 0 {
+                self.pending_rm_pre_begin = self.lno_pre;
+            }
+            self.lno_pre += 1;
+            self.pending_rm.extend_from_slice(line);
+            self.pending_rm_count += 1;
+            return;
+        }
+        if marker == b'\\' {
+            if self.pending_rm_count != 0 {
+                self.pending_rm.extend_from_slice(line);
+            } else if self.rhunk_active {
+                self.rhunk.extend_from_slice(line);
+            }
+            return;
+        }
+        // marker is '+' or ' '
+        let lno_0 = self.lno_post - 1;
+        let cur_pre = self.lno_pre;
+        self.lno_post += 1;
+        if marker == b' ' {
+            self.lno_pre += 1;
+        }
+
+        while self.cur_range < self.ranges.len() && lno_0 >= self.ranges[self.cur_range].end {
+            if self.rhunk_active {
+                self.flush_rhunk(out);
+            }
+            self.discard_pending_rm();
+            self.cur_range += 1;
+        }
+        if self.cur_range >= self.ranges.len() {
+            self.discard_pending_rm();
+            return;
+        }
+        let cur = self.ranges[self.cur_range];
+        if lno_0 < cur.start {
+            self.discard_pending_rm();
+            return;
+        }
+        if !self.rhunk_active {
+            self.rhunk_active = true;
+            self.rhunk_has_changes = false;
+            self.rhunk_new_begin = lno_0 + 1;
+            self.rhunk_old_begin = if self.pending_rm_count != 0 {
+                self.pending_rm_pre_begin
+            } else {
+                cur_pre
+            };
+            self.rhunk_old_count = 0;
+            self.rhunk_new_count = 0;
+            self.rhunk.clear();
+        }
+        if self.pending_rm_count != 0 {
+            self.rhunk.extend_from_slice(&self.pending_rm);
+            self.rhunk_old_count += self.pending_rm_count;
+            self.rhunk_has_changes = true;
+            self.discard_pending_rm();
+        }
+        self.rhunk.extend_from_slice(line);
+        self.rhunk_new_count += 1;
+        if marker == b'+' {
+            self.rhunk_has_changes = true;
+        } else {
+            self.rhunk_old_count += 1;
+        }
+    }
+}
+
+fn usize_or_zero(v: i64) -> usize {
+    if v < 0 { 0 } else { v as usize }
+}
+
+/// Clip a fully-rendered unified-diff hunk body (`full`, produced with
+/// inflated context) down to the tracked `ranges`, mirroring diff.c's
+/// `line_range_hunk_fn` / `line_range_line_fn` / `flush_rhunk`. The renderer's
+/// `@@` header already carries the funcname suffix; we parse it back out and
+/// reuse it on every emitted range hunk. No-color path only (`log -L` test
+/// output is uncolored).
+fn filter_hunks_to_ranges(out: &mut Vec<u8>, full: &[u8], ranges: &[LineRange]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut filter = RangeFilter {
+        ranges,
+        cur_range: 0,
+        lno_post: 0,
+        lno_pre: 0,
+        func: Vec::new(),
+        rhunk: Vec::new(),
+        rhunk_old_begin: 0,
+        rhunk_old_count: 0,
+        rhunk_new_begin: 0,
+        rhunk_new_count: 0,
+        rhunk_active: false,
+        rhunk_has_changes: false,
+        pending_rm: Vec::new(),
+        pending_rm_count: 0,
+        pending_rm_pre_begin: 0,
+    };
+    for line in split_keep_newline(full) {
+        if line.starts_with(b"@@ ") {
+            // New xdiff hunk: any pending removals from the previous hunk are
+            // left in place (diff.c does the same — the next body line decides
+            // their fate), and the range hunk cursor is NOT reset across xdiff
+            // hunks. Parse the begin line numbers + funcname suffix.
+            if let Some((old_begin, new_begin, func)) = parse_hunk_header(line) {
+                filter.lno_post = new_begin;
+                filter.lno_pre = old_begin;
+                filter.func = func;
+            }
+            continue;
+        }
+        let marker = line.first().copied().unwrap_or(b' ');
+        filter.body_line(out, marker, line);
+    }
+    filter.flush_rhunk(out);
+}
+
+/// Split `buf` into lines, each INCLUDING its trailing `\n` (the final line may
+/// lack one). Empty input yields no lines.
+fn split_keep_newline(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        if start >= buf.len() {
+            return None;
+        }
+        let rel = buf[start..].iter().position(|&b| b == b'\n');
+        let end = match rel {
+            Some(pos) => start + pos + 1,
+            None => buf.len(),
+        };
+        let line = &buf[start..end];
+        start = end;
+        Some(line)
+    })
+}
+
+/// Parse a rendered `@@ -o[,c] +n[,c] @@[ func]` header, returning the 1-based
+/// old/new begin line numbers and the trailing funcname bytes (without the
+/// leading space, without a trailing newline). Begin is the value xdiff emits:
+/// 1-based when the count is non-zero, one-less when zero (unused in that case).
+fn parse_hunk_header(line: &[u8]) -> Option<(i64, i64, Vec<u8>)> {
+    // line = "@@ -A,B +C,D @@ func\n" (or "@@ -A +C @@\n", etc.)
+    let rest = line.strip_prefix(b"@@ -")?;
+    let plus = rest.iter().position(|&b| b == b'+')?;
+    let old_part = &rest[..plus];
+    // skip "+", parse new part up to " @@"
+    let after_plus = &rest[plus + 1..];
+    let close = find_subslice(after_plus, b" @@")?;
+    let new_part = &after_plus[..close];
+    let old_begin = parse_range_begin(old_part.split(|&b| b == b' ').next().unwrap_or(old_part))?;
+    let new_begin = parse_range_begin(new_part)?;
+    // Funcname suffix: everything after " @@ " (a single space separates it).
+    let tail = &after_plus[close + 3..];
+    let func = if let Some(f) = tail.strip_prefix(b" ") {
+        let mut f = f.to_vec();
+        if f.last() == Some(&b'\n') {
+            f.pop();
+        }
+        f
+    } else {
+        Vec::new()
+    };
+    Some((old_begin, new_begin, func))
+}
+
+/// Parse the "A" or "A,B" begin field of an `@@` range side into A.
+fn parse_range_begin(field: &[u8]) -> Option<i64> {
+    let begin = field.split(|&b| b == b',').next().unwrap_or(field);
+    std::str::from_utf8(begin).ok()?.trim().parse::<i64>().ok()
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// One contiguous change in the edit script (git's `xdchange`): the old/new

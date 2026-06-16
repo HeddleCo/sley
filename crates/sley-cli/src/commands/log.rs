@@ -372,6 +372,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Diff-output options (`-p`, `--stat`, ...): rendered per commit against
     // its first parent, mirroring git's log diff machinery.
     let mut diff_opts = LogDiffOptions::default();
+    // `-L<start>,<end>:<file>` / `-L:<funcname>:<file>` line-log arguments (the
+    // raw `<range>:<file>` strings). When non-empty, the log runs the line-log
+    // engine instead of the ordinary walk.
+    let mut line_log_args: Vec<crate::commands::line_log::LineLogArg> = Vec::new();
+    // `--follow` (incompatible with `-L`).
+    let mut saw_follow = false;
     // Raw `-I<regex>` (`--ignore-matching-lines`) patterns, compiled after the
     // option scan so a malformed regex fails like git's diff_opt_ignore_regex.
     let mut ignore_regex_patterns: Vec<String> = Vec::new();
@@ -1203,6 +1209,24 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
             "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
+            "--follow" => saw_follow = true,
+            // `-L<range>:<file>` (attached) or `-L <range>:<file>` (separate).
+            "-L" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("L"))?;
+                line_log_args.push(crate::commands::line_log::LineLogArg {
+                    raw: value.clone(),
+                });
+                // `-L` implies a patch unless `-s`/format suppresses output.
+                diff_opts.patch = true;
+            }
+            value if let Some(arg) = value.strip_prefix("-L") => {
+                line_log_args.push(crate::commands::line_log::LineLogArg {
+                    raw: arg.to_string(),
+                });
+                diff_opts.patch = true;
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported log option {value}")));
             }
@@ -1532,6 +1556,48 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         for record in rev_list_walk_commits(&db, format, [*oid], first_parent)? {
             excluded.insert(record.oid);
         }
+    }
+    // `log -L`: the line-log engine owns its own walk + restricted-patch output.
+    if !line_log_args.is_empty() {
+        // `-L` cannot be combined with a pathspec or `--follow` (cell: basic
+        // command line parsing). git checks pathspec first.
+        if !pathspecs.is_empty() {
+            eprintln!("fatal: -L<range>:<file> cannot be used with pathspec");
+            return Err(GitError::Exit(128));
+        }
+        if saw_follow {
+            eprintln!("fatal: --follow cannot be used with -L");
+            return Err(GitError::Exit(128));
+        }
+        if starts.len() != 1 {
+            eprintln!("fatal: only one rev expected with -L");
+            return Err(GitError::Exit(128));
+        }
+        // `--raw` is forbidden with `-L`.
+        if diff_opts.raw {
+            eprintln!("fatal: -L does not yet support diff formats besides -p and -s");
+            return Err(GitError::Exit(128));
+        }
+        return run_line_log_output(LineLogOutputCtx {
+            git_dir: &git_dir,
+            db: &db,
+            format,
+            config: &config,
+            tip: starts[0],
+            args: &line_log_args,
+            output: &output,
+            diff_opts: &diff_opts,
+            date_mode: &date_mode,
+            abbrev_len,
+            abbrev_commit,
+            detect_renames: filter_detect_renames,
+            first_parent,
+            max_count,
+            reverse,
+            show_parents,
+            decoration,
+            output_encoding: &output_encoding,
+        });
     }
     if plain_oneline
         && walk
@@ -2358,6 +2424,291 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Bundle of the context `run_line_log_output` needs (avoids a 20-arg fn).
+struct LineLogOutputCtx<'a> {
+    git_dir: &'a Path,
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    config: &'a GitConfig,
+    tip: ObjectId,
+    args: &'a [crate::commands::line_log::LineLogArg],
+    output: &'a LogOutput,
+    diff_opts: &'a LogDiffOptions,
+    date_mode: &'a DateMode,
+    abbrev_len: Option<usize>,
+    abbrev_commit: bool,
+    detect_renames: bool,
+    first_parent: bool,
+    max_count: Option<usize>,
+    reverse: bool,
+    show_parents: bool,
+    decoration: LogDecorationMode,
+    output_encoding: &'a str,
+}
+
+/// `git log -L`: walk history with the line-log engine and emit each commit that
+/// touched a tracked range, with its patch clipped to that range. Mirrors git's
+/// `line_log_filter` + the log-tree output loop (the `-s`/`-p`/format cases the
+/// test suite exercises).
+fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
+    let LineLogOutputCtx {
+        git_dir,
+        db,
+        format,
+        config,
+        tip,
+        args,
+        output,
+        diff_opts,
+        date_mode,
+        abbrev_len,
+        abbrev_commit,
+        detect_renames,
+        first_parent,
+        max_count,
+        reverse,
+        show_parents,
+        decoration,
+        output_encoding,
+    } = ctx;
+
+    // Reachable commits from the tip, in topological order (child before
+    // parent) — git forces `topo_order` for `-L`.
+    let reachable = rev_list_walk_commits(db, format, [tip], first_parent)?;
+    let refs: Vec<&sley_rev::CommitRecord> = reachable.iter().collect();
+    let ordered_refs = rev_list_topo_order(refs)?;
+    let ordered: Vec<sley_rev::CommitRecord> =
+        ordered_refs.into_iter().cloned().collect();
+
+    let result = crate::commands::line_log::run_line_log(
+        db,
+        format,
+        &ordered,
+        &tip,
+        args,
+        detect_renames,
+        first_parent,
+    )?;
+
+    // The interesting list is already in topo order (newest first). Apply
+    // `-n`/`--reverse`.
+    let mut selected: Vec<&sley_rev::CommitRecord> = {
+        let by_oid: HashMap<ObjectId, &sley_rev::CommitRecord> =
+            ordered.iter().map(|r| (r.oid, r)).collect();
+        result
+            .interesting
+            .iter()
+            .filter_map(|oid| by_oid.get(oid).copied())
+            .collect()
+    };
+    if let Some(max_count) = max_count {
+        selected.truncate(max_count);
+    }
+    if reverse {
+        selected.reverse();
+    }
+
+    // Decorations (only when `--decorate` is on; the tests redirect output so
+    // the default is off).
+    let decorations: HashMap<ObjectId, Vec<String>> = if decoration == LogDecorationMode::Off {
+        HashMap::new()
+    } else {
+        let include = ["HEAD", "refs/heads/", "refs/tags/", "refs/remotes/", "refs/stash", "refs/replace/"]
+            .map(str::to_string);
+        let filter = DecorationFilter::new(&include, &[], &[]);
+        log_decoration_map(git_dir, db, format, decoration, &filter)?
+    };
+    let describe_ctx = LogDescribeContext {
+        git_dir,
+        db,
+        format,
+    };
+    let patch_abbrev = repository_abbrev_from_config(git_dir, format, config)?
+        .unwrap_or(7)
+        .min(format.hex_len());
+
+    let mut stdout = io::stdout();
+    let mut printed_entries = 0usize;
+    for record in &selected {
+        let files = result.printed.get(&record.oid);
+        match output {
+            LogOutput::Default(kind) => {
+                if printed_entries > 0 {
+                    writeln!(stdout)?;
+                }
+                printed_entries += 1;
+                write!(
+                    stdout,
+                    "commit {}",
+                    format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
+                )?;
+                if let Some(labels) = decorations.get(&record.oid)
+                    && !labels.is_empty()
+                {
+                    write!(stdout, " ({})", labels.join(", "))?;
+                }
+                if show_parents {
+                    write!(stdout, " ")?;
+                    let merged: Vec<String> =
+                        record.parents.iter().map(format_log_abbrev_oid).collect();
+                    write!(stdout, "{}", merged.join(" "))?;
+                }
+                writeln!(stdout)?;
+                if record.parents.len() > 1 {
+                    let merged: Vec<String> =
+                        record.parents.iter().map(format_log_abbrev_oid).collect();
+                    writeln!(stdout, "Merge: {}", merged.join(" "))?;
+                }
+                writeln!(stdout, "Author: {}", commit_author_identity(&record.commit.author))?;
+                if *kind == LogDefaultKind::Medium {
+                    writeln!(
+                        stdout,
+                        "Date:   {}",
+                        commit_identity_date(&record.commit.author, date_mode)
+                    )?;
+                }
+                writeln!(stdout)?;
+                for line in String::from_utf8_lossy(&record.commit.message).lines() {
+                    if line.is_empty() {
+                        writeln!(stdout)?;
+                    } else {
+                        writeln!(stdout, "    {line}")?;
+                    }
+                }
+                if diff_opts.patch {
+                    let mut block = Vec::new();
+                    render_line_log_patch(
+                        &mut block,
+                        db,
+                        format,
+                        files,
+                        diff_opts,
+                        patch_abbrev,
+                    )?;
+                    if !block.is_empty() {
+                        stdout.write_all(diff_opts.block_separator())?;
+                        stdout.write_all(&block)?;
+                    }
+                }
+            }
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => {
+                if printed_entries > 0 && !*final_newline {
+                    stdout.write_all(b"\n")?;
+                }
+                printed_entries += 1;
+                let format_context = LogFormatContext {
+                    abbrev_len,
+                    decorations: &decorations,
+                    marker: '>',
+                    dialect: LogFormatDialect::Log,
+                    source: None,
+                    date_mode,
+                    source_oid: None,
+                    describe: Some(&describe_ctx),
+                    color: false,
+                    output_encoding,
+                };
+                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                emit_compiled_log_format(
+                    record,
+                    compiled,
+                    &format_context,
+                    &mut line,
+                    0..compiled.tokens.len(),
+                )?;
+                let line = log_reencode_message(&line, "UTF-8", output_encoding);
+                stdout.write_all(&line)?;
+                if *final_newline {
+                    stdout.write_all(b"\n")?;
+                }
+                if diff_opts.patch {
+                    let mut block = Vec::new();
+                    render_line_log_patch(
+                        &mut block,
+                        db,
+                        format,
+                        files,
+                        diff_opts,
+                        patch_abbrev,
+                    )?;
+                    if !block.is_empty() {
+                        if !*final_newline {
+                            stdout.write_all(b"\n")?;
+                        }
+                        stdout.write_all(&block)?;
+                    }
+                }
+            }
+        }
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Render the restricted patch block for one line-log commit: each printed file
+/// is emitted via the shared patch writer with its hunks clipped to the tracked
+/// post-image line ranges.
+#[allow(clippy::too_many_arguments)]
+fn render_line_log_patch(
+    out: &mut Vec<u8>,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    files: Option<&Vec<crate::commands::line_log::PrintedFile>>,
+    diff_opts: &LogDiffOptions,
+    patch_abbrev: usize,
+) -> Result<()> {
+    let files = match files {
+        Some(f) if !f.is_empty() => f,
+        _ => return Ok(()),
+    };
+    for file in files {
+        let entry = sley_diff_merge::NameStatusEntry {
+            status: file.status,
+            path: sley_rev::BString::from(file.new_path.as_bytes().to_vec()),
+            old_path: if file.old_path != file.new_path {
+                Some(sley_rev::BString::from(file.old_path.as_bytes().to_vec()))
+            } else {
+                None
+            },
+            old_mode: file.old_mode,
+            new_mode: file.new_mode,
+            old_oid: file.old_oid,
+            new_oid: file.new_oid,
+        };
+        crate::write_diff_patch_entry(
+            out,
+            &entry,
+            crate::DiffPatchOptions {
+                db,
+                worktree_root: None,
+                use_worktree_new: false,
+                format,
+                abbrev: patch_abbrev,
+                src_prefix: "a/",
+                dst_prefix: "b/",
+                context: 3,
+                userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
+                dirty_submodules: None,
+                ws_error_rule: None,
+                interhunk: 0,
+                ws_ignore: diff_opts.ws_ignore,
+                diff_algorithm: diff_opts.diff_algorithm,
+                ignore_blank_lines: diff_opts.ignore_blank_lines,
+                ignore_regexes: &diff_opts.ignore_regexes,
+                line_ranges: Some(&file.line_ranges),
+            },
+        )?;
     }
     Ok(())
 }
@@ -3253,6 +3604,7 @@ impl LogDiffContext<'_> {
                         diff_algorithm: self.opts.diff_algorithm,
                         ignore_blank_lines: self.opts.ignore_blank_lines,
                         ignore_regexes: &self.opts.ignore_regexes,
+                        line_ranges: None,
                     },
                 )?;
             }
