@@ -1561,6 +1561,7 @@ fn dispatch_ref_stdin_command(
                 );
             }
             check_update_ref_stdin_expected_named(
+                context.store,
                 context.format,
                 &effective.requested,
                 &name,
@@ -1982,7 +1983,7 @@ fn update_ref_stdin_symref_update(
         }
         Some(UpdateRefStdinSymrefExpected::Oid(expected)) => {
             let current = store.read_ref(name)?;
-            update_ref_stdin_symref_verify_oid(format, name, current.as_ref(), &expected)?;
+            update_ref_stdin_symref_verify_oid(store, format, name, current.as_ref(), &expected)?;
         }
         None => {}
     }
@@ -2020,6 +2021,7 @@ fn update_ref_stdin_symref_verify(
 }
 
 fn update_ref_stdin_symref_verify_oid(
+    store: &FileRefStore,
     format: ObjectFormat,
     name: &str,
     current: Option<&RefTarget>,
@@ -2030,7 +2032,7 @@ fn update_ref_stdin_symref_verify_oid(
         eprintln!("fatal: cannot lock ref '{name}': reference is missing but expected {expected}");
         return Err(GitError::Exit(128));
     }
-    check_update_ref_stdin_expected(format, name, current, expected)
+    check_update_ref_stdin_expected(store, format, name, current, expected)
 }
 
 fn update_ref_stdin_symref_delete(
@@ -2272,6 +2274,7 @@ fn update_ref_stdin_write(
     let current = context.store.read_ref(&request.name)?;
     if let Some(expected_oid) = request.expected_oid {
         check_update_ref_stdin_expected_named(
+            context.store,
             context.format,
             &request.requested,
             &request.name,
@@ -2436,7 +2439,26 @@ fn update_ref_delete_stdin_named(
                         &format!("is at {actual} but expected {expected}"),
                     );
                 }
-                Some(RefTarget::Symbolic(_)) | None => {
+                Some(RefTarget::Symbolic(_)) => {
+                    // no-deref delete over a symref: git resolves one chain to an
+                    // OID and compares it, reporting the symref name.
+                    match resolve_ref_peeled(store, effective)? {
+                        Some(actual) if &actual == expected => {}
+                        Some(actual) => {
+                            return update_ref_stdin_lock_failure(
+                                requested,
+                                &format!("is at {actual} but expected {expected}"),
+                            );
+                        }
+                        None => {
+                            return update_ref_stdin_lock_failure(
+                                requested,
+                                &format!("reference is missing but expected {expected}"),
+                            );
+                        }
+                    }
+                }
+                None => {
                     return update_ref_stdin_lock_failure(
                         requested,
                         &format!("unable to resolve reference '{effective}'"),
@@ -2594,12 +2616,13 @@ fn check_update_ref_expected(
 }
 
 fn check_update_ref_stdin_expected(
+    store: &FileRefStore,
     format: ObjectFormat,
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
-    check_update_ref_stdin_expected_named(format, name, name, current, expected)
+    check_update_ref_stdin_expected_named(store, format, name, name, current, expected)
 }
 
 /// As [`check_update_ref_stdin_expected`] but with the requested name
@@ -2607,7 +2630,14 @@ fn check_update_ref_stdin_expected(
 /// dereferenced name (`unable to resolve reference '<effective>'`). git uses the
 /// requested ref in the lock-failure prefix and the final dangling target in the
 /// resolve-failure reason; a non-symbolic update has them equal.
+///
+/// A `Symbolic` current arises only under `no-deref`: git still resolves the
+/// symref one level to compare the OID (`refs_read_ref_full`), so a `no-deref`
+/// update of a symref reports `is at <peeled> but expected <X>` (or `reference
+/// is missing but expected <X>` when the symref dangles), naming the symref —
+/// not `unable to resolve`.
 fn check_update_ref_stdin_expected_named(
+    store: &FileRefStore,
     format: ObjectFormat,
     requested: &str,
     effective: &str,
@@ -2628,7 +2658,21 @@ fn check_update_ref_stdin_expected_named(
             requested,
             &format!("is at {actual} but expected {expected}"),
         ),
-        Some(RefTarget::Symbolic(_)) | None => update_ref_stdin_lock_failure(
+        Some(RefTarget::Symbolic(_)) => {
+            // no-deref over a symref: resolve one chain to an OID and compare.
+            match resolve_ref_peeled(store, effective)? {
+                Some(actual) if &actual == expected => Ok(()),
+                Some(actual) => update_ref_stdin_lock_failure(
+                    requested,
+                    &format!("is at {actual} but expected {expected}"),
+                ),
+                None => update_ref_stdin_lock_failure(
+                    requested,
+                    &format!("reference is missing but expected {expected}"),
+                ),
+            }
+        }
+        None => update_ref_stdin_lock_failure(
             requested,
             &format!("unable to resolve reference '{effective}'"),
         ),
