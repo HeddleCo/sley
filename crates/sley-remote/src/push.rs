@@ -1423,14 +1423,23 @@ fn count_refspec_match_dst<'a>(pattern: &str, remote_refs: &'a [RefAdvertisement
 enum PushSourceKind {
     Branch,
     Tag,
+    /// A source ref that resolves but is neither under `refs/heads/` nor
+    /// `refs/tags/` (e.g. `HEAD`, a fully-qualified `refs/...` name). git's
+    /// `guess_ref` still guesses `refs/heads/<dst>` for these.
     Other,
+    /// A source that is NOT a ref at all (a raw object id or a rev-expression
+    /// like `main^`). git's `guess_ref` resolves nothing for these, so an
+    /// unqualified destination cannot be guessed and the push is rejected.
+    Unqualifiable,
 }
 
 fn normalize_push_source_refname(
     name: &str,
     local_refs: &[PushSourceRef],
 ) -> (String, PushSourceKind) {
-    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
+    // `@` is git's documented alias for `HEAD`; like `HEAD` it resolves to a
+    // branch, so `guess_ref` can still qualify an unqualified destination.
+    if name.is_empty() || name == "HEAD" || name == "@" || name.starts_with("refs/") {
         return (name.to_string(), PushSourceKind::Other);
     }
     let branch = format!("refs/heads/{name}");
@@ -1442,7 +1451,10 @@ fn normalize_push_source_refname(
     } else if has_branch {
         (branch, PushSourceKind::Branch)
     } else if local_refs.iter().any(|reference| reference.name == name) {
-        (name.to_string(), PushSourceKind::Other)
+        // A literal match outside heads/tags/HEAD/refs is a revision source
+        // injected by `add_revision_push_sources` (an oid or `main^`-style
+        // expression) — not a ref, so a partial dst cannot be guessed.
+        (name.to_string(), PushSourceKind::Unqualifiable)
     } else {
         (branch, PushSourceKind::Branch)
     }
@@ -1466,10 +1478,16 @@ fn normalize_push_destination_refname(
         DstMatch::Ambiguous => Err(GitError::Command(format!(
             "dst refspec {name} matches more than one"
         ))),
-        DstMatch::None => Ok(match src_kind {
-            PushSourceKind::Tag => format!("refs/tags/{name}"),
-            PushSourceKind::Branch | PushSourceKind::Other => format!("refs/heads/{name}"),
-        }),
+        DstMatch::None => match src_kind {
+            PushSourceKind::Tag => Ok(format!("refs/tags/{name}")),
+            PushSourceKind::Branch | PushSourceKind::Other => Ok(format!("refs/heads/{name}")),
+            // git's `guess_ref` returns NULL for a non-ref source, so the
+            // unqualified destination is unresolvable (the "destination is not a
+            // full refname … you must fully qualify the ref" error).
+            PushSourceKind::Unqualifiable => Err(GitError::Command(format!(
+                "the destination you provided is not a full refname (i.e., starting with \"refs/\"); unable to guess the destination for {name}"
+            ))),
+        },
     }
 }
 
