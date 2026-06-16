@@ -2889,7 +2889,11 @@ struct RunPushLocalReport<'a> {
 fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
 
-    let report = sley_remote::push_local_with_report(
+    // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
+    // This lets us run the receive-side pre-receive/update hooks before any ref
+    // is written, matching git's receive-pack ordering, and reject all refs when
+    // a hook declines.
+    let plan = sley_remote::push_local_with_report(
         sley_remote::PushReportRequest {
             git_dir: req.git_dir,
             common_git_dir: req.common_git_dir,
@@ -2899,7 +2903,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             refspecs: req.refspecs,
             force: req.options.force,
             atomic: req.atomic,
-            dry_run: req.options.dry_run,
+            dry_run: true,
             force_with_lease: req.force_with_lease,
             force_with_lease_default: req.force_with_lease_default,
         },
@@ -2908,13 +2912,13 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
 
     // A no-op push (no refspec matched anything) prints nothing and exits 0,
     // matching git's `transport_refs_pushed` short-circuit on an empty ref list.
-    if report.refs.is_empty() {
+    if plan.refs.is_empty() {
         return Ok(());
     }
 
     // pre-push hook (driven from the would-be commands), unless --no-verify.
     if !req.options.no_verify {
-        let commands: Vec<ReceivePackCommand> = report
+        let commands: Vec<ReceivePackCommand> = plan
             .refs
             .iter()
             .map(|reference| ReceivePackCommand {
@@ -2926,12 +2930,76 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         run_pre_push_hook(req.git_dir, req.remote, req.refspecs, &commands)?;
     }
 
-    // Run receive-side hooks for the refs that will actually be applied.
+    let ok_commands: Vec<ReceivePackCommand> = plan
+        .refs
+        .iter()
+        .filter(|reference| matches!(reference.status, sley_remote::PushRefStatus::Ok))
+        .map(|reference| ReceivePackCommand {
+            old_id: reference.old_id,
+            new_id: reference.new_id,
+            name: reference.dst.clone(),
+        })
+        .collect();
+
+    let destination = sley_remote::PushDestination::Local {
+        git_dir: req.remote_git_dir.to_path_buf(),
+        common_git_dir: req.remote_common_git_dir.to_path_buf(),
+    };
+
+    // Run the receive-side pre-receive + update hooks. A failure declines the
+    // whole push (git's receive-pack rejects every ref with "pre-receive hook
+    // declined"). Skipped under --dry-run.
+    let pre_receive_declined = if !req.options.dry_run && !ok_commands.is_empty() {
+        run_local_receive_pre_hooks(&destination, &ok_commands).is_err()
+    } else {
+        false
+    };
+
+    // Second pass: actually apply (unless dry-run or the hook declined).
+    let mut report = if req.options.dry_run || pre_receive_declined {
+        plan
+    } else {
+        sley_remote::push_local_with_report(
+            sley_remote::PushReportRequest {
+                git_dir: req.git_dir,
+                common_git_dir: req.common_git_dir,
+                format: req.format,
+                remote_git_dir: req.remote_git_dir,
+                remote_common_git_dir: req.remote_common_git_dir,
+                refspecs: req.refspecs,
+                force: req.options.force,
+                atomic: req.atomic,
+                dry_run: false,
+                force_with_lease: req.force_with_lease,
+                force_with_lease_default: req.force_with_lease_default,
+            },
+            &config,
+        )?
+    };
+
+    if pre_receive_declined {
+        for reference in &mut report.refs {
+            if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+                reference.status = sley_remote::PushRefStatus::RemoteReject(
+                    "pre-receive hook declined".to_string(),
+                );
+            }
+        }
+    }
+
+    // Post-apply side effects for the refs that landed: post-receive/post-update
+    // hooks, remote-tracking ref updates (git updates tracking for every
+    // non-rejected ref, including up-to-date ones), and set-upstream config.
     if !req.options.dry_run {
         let applied: Vec<ReceivePackCommand> = report
             .refs
             .iter()
-            .filter(|reference| matches!(reference.status, sley_remote::PushRefStatus::Ok))
+            .filter(|reference| {
+                matches!(
+                    reference.status,
+                    sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+                )
+            })
             .map(|reference| ReceivePackCommand {
                 old_id: reference.old_id,
                 new_id: reference.new_id,
@@ -2939,11 +3007,14 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             })
             .collect();
         if !applied.is_empty() {
-            let destination = sley_remote::PushDestination::Local {
-                git_dir: req.remote_git_dir.to_path_buf(),
-                common_git_dir: req.remote_common_git_dir.to_path_buf(),
-            };
-            run_local_receive_post_hooks(&destination, &applied)?;
+            let landed: Vec<ReceivePackCommand> = applied
+                .iter()
+                .filter(|command| command.old_id != command.new_id)
+                .cloned()
+                .collect();
+            if !landed.is_empty() {
+                run_local_receive_post_hooks(&destination, &landed)?;
+            }
             update_push_remote_tracking_refs(
                 req.git_dir,
                 req.format,
