@@ -24,14 +24,40 @@ struct IndexPackOptions {
     fsck: bool,
     /// Raw `<msg-id>=<severity>` override tokens from `--strict=`/`--fsck-objects=`.
     fsck_overrides: Vec<String>,
+    /// `--object-format=<algo>`: the hash algorithm. Lets `index-pack <pack>`
+    /// run outside a repository (where there is no config to read it from).
+    object_format: Option<ObjectFormat>,
 }
 
 pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     let options = parse_index_pack_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
+    // The hash algorithm is taken from `--object-format` when given, else from
+    // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
+    // run outside any repo, so only fall back to repo discovery when needed.
+    let repo = match discover_git_dir(env::current_dir()?) {
+        Ok(git_dir) => {
+            let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+            let format = repository_object_format(&common_git_dir)?;
+            Some((common_git_dir, format))
+        }
+        Err(err) => {
+            // Outside a repo, a file-mode index-pack is still valid: `git`
+            // falls back to the built-in hash (SHA-1) when no repository names
+            // one, and `--object-format` can override it. Only `--stdin`, which
+            // installs into the object store, genuinely needs the repository.
+            if options.stdin {
+                return Err(err);
+            }
+            None
+        }
+    };
+    let format = options
+        .object_format
+        .or_else(|| repo.as_ref().map(|(_, format)| *format))
+        .unwrap_or(ObjectFormat::Sha1);
     if options.stdin {
+        let (common_git_dir, _) = repo.as_ref().expect("stdin index-pack requires a repository");
+        let common_git_dir = common_git_dir.clone();
         let mut pack = Vec::new();
         io::stdin().read_to_end(&mut pack)?;
         // `index-pack -v` reports two phases on stderr: receiving the pack and
@@ -114,6 +140,7 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         index_version: None,
         fsck: false,
         fsck_overrides: Vec::new(),
+        object_format: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -162,6 +189,15 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
                         options.fsck_overrides.push(token.to_string());
                     }
                 }
+            }
+            "--object-format" => {
+                let Some(value) = iter.next() else {
+                    return index_pack_usage();
+                };
+                options.object_format = Some(parse_verify_pack_object_format(value)?);
+            }
+            value if let Some(value) = long_option_value(value, "object-format") => {
+                options.object_format = Some(parse_verify_pack_object_format(value)?);
             }
             value if value.starts_with("--threads=") || value.starts_with("--pack_header=") => {}
             value if value.starts_with('-') => return index_pack_usage(),
@@ -260,12 +296,10 @@ struct VerifyPackOptions {
 
 pub(crate) fn cmd_verify_pack(args: &[String]) -> Result<()> {
     let options = parse_verify_pack_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, options.format);
+    // verify-pack inspects the named pack files directly, so it works outside a
+    // repository (git resolves the hash from `--object-format`, else SHA-1).
     for index_path in &options.index_paths {
         verify_pack_one(
-            &db,
             options.format,
             index_path,
             options.verbose,
@@ -333,7 +367,6 @@ fn parse_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
 }
 
 fn verify_pack_one(
-    db: &FileObjectDatabase,
     format: ObjectFormat,
     index_path: &Path,
     verbose: bool,
@@ -414,7 +447,6 @@ fn verify_pack_one(
         }
     }
 
-    let _ = db;
     let mut entries = index.entries;
     entries.sort_by_key(|entry| entry.offset);
     let mut non_delta = 0usize;
