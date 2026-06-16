@@ -5,6 +5,7 @@
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use flate2::{Decompress, FlushDecompress};
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
@@ -13,7 +14,7 @@ use sley_pack::{
     PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -4482,61 +4483,38 @@ impl LooseObjectStore {
             return Ok(None);
         }
         let path = self.object_path(oid)?;
-        let mut file = match fs::File::open(&path) {
-            Ok(file) => file,
+        let compressed = match fs::read(&path) {
+            Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(GitError::Io(err.to_string())),
         };
-        // Capture the zlib stream's 2-byte header before inflating: when the stream
-        // is corrupt, those bytes identify zlib's diagnostic (incorrect header
-        // check, needs dictionary, ...) exactly as zlib's `inflate()` would report
-        // it through git's wrapper.
-        let mut stream_prefix = [0u8; 2];
-        let prefix_len = read_full_prefix(&mut file, &mut stream_prefix)?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|err| GitError::Io(err.to_string()))?;
-        let mut decoder = ZlibDecoder::new(file);
-        let mut header = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            // git inflates only the first `MAX_LOOSE_HEADER_LEN` bytes
-            // (object-file.c `unpack_loose_header`) and reports ULHR_TOO_LONG when no
-            // NUL terminator lands within them — whether the stream simply ends early
-            // or overflows the window. Both collapse to the same `error:`-level
-            // diagnostic, so a header that ends before its NUL is "too long" too.
-            // A stream that won't inflate at all is git's ULHR_BAD instead: the
-            // zlib wrapper's `error: inflate: ...` line, then "unable to unpack
-            // <oid> header".
-            let read = match decoder.read(&mut byte) {
-                Ok(read) => read,
-                Err(_) => {
-                    emit_inflate_diagnostic(&stream_prefix[..prefix_len]);
-                    return Err(loose_unpack_header_failed(oid));
-                }
-            };
-            if read == 0 {
-                return Err(loose_header_too_long(oid));
+        match inflate_loose_header(&compressed)? {
+            LooseHeader::Ok(header) => {
+                let header = std::str::from_utf8(&header)
+                    .map_err(|err| GitError::InvalidObject(err.to_string()))?;
+                let (kind, size) = header
+                    .split_once(' ')
+                    .ok_or_else(|| GitError::InvalidObject("missing object size".into()))?;
+                let object_type = kind.parse::<ObjectType>()?;
+                let size = size
+                    .parse::<u64>()
+                    .map_err(|_| GitError::InvalidObject("invalid object size".into()))?;
+                Ok(Some((object_type, size)))
             }
-            if byte[0] == 0 {
-                break;
+            LooseHeader::Bad => {
+                // git's ULHR_BAD: the zlib wrapper's `error: inflate: ...` line, then
+                // "unable to unpack <oid> header".
+                emit_inflate_diagnostic(compressed.get(..2).unwrap_or(&compressed));
+                Err(loose_unpack_header_failed(oid))
             }
-            header.push(byte[0]);
-            // A 31-byte header (NUL at the 32nd byte) is the longest that fits; 32
-            // non-NUL bytes overflow the window.
-            if header.len() >= MAX_LOOSE_HEADER_LEN {
-                return Err(loose_header_too_long(oid));
+            LooseHeader::TooLong => {
+                // git inflates only the first `MAX_LOOSE_HEADER_LEN` bytes
+                // (object-file.c `unpack_loose_header`) and reports ULHR_TOO_LONG when
+                // no NUL terminator lands within them — whether the stream simply ends
+                // early or overflows the window. Both collapse to the same diagnostic.
+                Err(loose_header_too_long(oid))
             }
         }
-        let header =
-            std::str::from_utf8(&header).map_err(|err| GitError::InvalidObject(err.to_string()))?;
-        let (kind, size) = header
-            .split_once(' ')
-            .ok_or_else(|| GitError::InvalidObject("missing object size".into()))?;
-        let object_type = kind.parse::<ObjectType>()?;
-        let size = size
-            .parse::<u64>()
-            .map_err(|_| GitError::InvalidObject("invalid object size".into()))?;
-        Ok(Some((object_type, size)))
     }
 
     /// Loose object ids in this store, sorted by hex.
@@ -4682,18 +4660,54 @@ fn loose_header_declared_size(framed: &[u8]) -> Option<usize> {
 
 /// Read up to `prefix.len()` bytes from the start of `file`, returning how many
 /// were available (short only when the file itself is shorter).
-fn read_full_prefix(file: &mut fs::File, prefix: &mut [u8]) -> Result<usize> {
-    let mut len = 0;
-    while len < prefix.len() {
-        let read = file
-            .read(&mut prefix[len..])
-            .map_err(|err| GitError::Io(err.to_string()))?;
-        if read == 0 {
-            break;
+/// Outcome of inflating a loose object's header, mirroring git's
+/// `unpack_loose_header` result codes (object-file.c `enum
+/// unpack_loose_header_result`).
+enum LooseHeader {
+    /// ULHR_OK: a NUL-terminated header was found within the window. Carries the
+    /// header bytes up to (not including) the NUL.
+    Ok(Vec<u8>),
+    /// ULHR_BAD: the zlib stream would not inflate (status != Z_OK/Z_STREAM_END).
+    Bad,
+    /// ULHR_TOO_LONG: the inflated output filled the header window with no NUL.
+    TooLong,
+}
+
+/// Inflate a loose object's *header* exactly as git's `unpack_loose_header` does
+/// (object-file.c): a single bounded inflate into a `MAX_LOOSE_HEADER_LEN`-byte
+/// output buffer, then look for the header-terminating NUL in what came out.
+///
+/// The byte budget is load-bearing for corruption parity: git inflates only up to
+/// `MAX_HEADER_LEN` (32) bytes of *output* before stopping, so a `cat-file -s`/`-t`
+/// header read detects a zlib data error only when it lands within those first 32
+/// inflated bytes (the header plus the start of the body for a small object) — and
+/// silently returns the header for corruption buried deeper in the body, which the
+/// full-object read path catches instead. A byte-by-byte loop that stopped at the
+/// NUL would never inflate into the corrupt region and miss the bit-error case
+/// (t1060 "getting type of a corrupt blob fails"); feeding too much output budget
+/// would over-detect relative to git. So this matches git's exact window.
+fn inflate_loose_header(compressed: &[u8]) -> Result<LooseHeader> {
+    let mut out = [0u8; MAX_LOOSE_HEADER_LEN];
+    let mut decompress = Decompress::new(true);
+    // git feeds the whole mapped file as `avail_in` and inflates once into a
+    // 32-byte `avail_out`; zlib stops at the output limit (Z_OK with avail_out==0)
+    // or at the stream's end, propagating Z_DATA_ERROR for a corrupt stream.
+    let status = decompress.decompress(compressed, &mut out, FlushDecompress::None);
+    let produced = decompress.total_out() as usize;
+    match status {
+        Ok(_) => {
+            let window = &out[..produced.min(MAX_LOOSE_HEADER_LEN)];
+            match window.iter().position(|&byte| byte == 0) {
+                Some(nul) => Ok(LooseHeader::Ok(window[..nul].to_vec())),
+                // No NUL within the window: either the stream ended early or the
+                // header overflows `MAX_LOOSE_HEADER_LEN`. git collapses both into
+                // ULHR_TOO_LONG (object-file.c `unpack_loose_header`).
+                None => Ok(LooseHeader::TooLong),
+            }
         }
-        len += read;
+        // Any zlib error before a NUL materializes is git's ULHR_BAD.
+        Err(_) => Ok(LooseHeader::Bad),
     }
-    Ok(len)
 }
 
 impl ObjectReader for LooseObjectStore {
