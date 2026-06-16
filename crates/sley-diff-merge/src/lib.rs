@@ -1975,11 +1975,16 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
 fn index_worktree_metadata_for_entries(
     entries: &[impl WorktreeIndexEntry],
 ) -> (bool, Vec<IndexGitlinkEntry>) {
-    let mut has_non_normal_stage = false;
+    let mut needs_snapshot = false;
     let mut staged_gitlinks = Vec::new();
     for entry in entries {
         if entry.stage() != sley_index::Stage::Normal {
-            has_non_normal_stage = true;
+            needs_snapshot = true;
+        }
+        // Intent-to-add entries (`git add -N`) must take the snapshot path, which
+        // diffs them as new files rather than loading their empty-blob id.
+        if entry.is_intent_to_add() {
+            needs_snapshot = true;
         }
         if entry.mode() == 0o160000 {
             staged_gitlinks.push(IndexGitlinkEntry {
@@ -1988,7 +1993,7 @@ fn index_worktree_metadata_for_entries(
             });
         }
     }
-    (has_non_normal_stage, staged_gitlinks)
+    (needs_snapshot, staged_gitlinks)
 }
 
 fn diff_name_status_index_worktree_changes_from_snapshot(
@@ -2000,6 +2005,11 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
         entries: index,
         stat_cache,
     } = read_index_snapshot(git_dir, format)?;
+    // Intent-to-add (`git add -N`) paths are placeholders: git's `run_diff_files`
+    // diffs them as a brand-new file (`/dev/null` → worktree), never loading the
+    // recorded empty-blob id. `read_index_snapshot` drops the ITA flag, so read
+    // the set of ITA stage-0 paths separately and override their verdict below.
+    let intent_to_add_paths = read_intent_to_add_paths(git_dir, format)?;
     // `read_index_snapshot` collapses each path to a single entry; for an
     // unmerged path it keeps the last-written stage. To match git's
     // `run_diff_files` we need the conflict stages, so read them separately:
@@ -2053,6 +2063,24 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
             },
             None => left,
         };
+        // Intent-to-add placeholder: git's `run_diff_files` diffs it as a new
+        // file. With the worktree file present, queue an `Added` pair whose old
+        // side is null (`/dev/null` → worktree blob); with the file gone, an ITA
+        // entry yields no diff-files entry (there is nothing to add).
+        if intent_to_add_paths.contains(git_path.as_slice()) {
+            if let Some(right) = right {
+                changes.push(NameStatusEntry {
+                    status: NameStatus::Added,
+                    path: git_path.clone().into(),
+                    old_path: None,
+                    old_mode: None,
+                    new_mode: Some(right.mode),
+                    old_oid: None,
+                    new_oid: Some(right.oid),
+                });
+            }
+            continue;
+        }
         let Some(right) = right else {
             changes.push(NameStatusEntry {
                 status: NameStatus::Deleted,
@@ -3131,6 +3159,26 @@ fn read_index_entries(
     Ok(read_index_snapshot(git_dir, format)?.entries)
 }
 
+/// Collect the set of stage-0 paths flagged intent-to-add (`git add -N`) in the
+/// index. These diff as new files rather than as modifications of their recorded
+/// empty-blob id.
+fn read_intent_to_add_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    Ok(index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal && entry.is_intent_to_add())
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect())
+}
+
 fn read_index_snapshot(git_dir: &Path, format: ObjectFormat) -> Result<IndexSnapshot> {
     let index_path = sley_index::repository_index_path(git_dir);
     let index_metadata = match fs::metadata(&index_path) {
@@ -3170,6 +3218,7 @@ trait WorktreeIndexEntry {
     fn stage(&self) -> sley_index::Stage;
     fn mode(&self) -> u32;
     fn oid(&self) -> ObjectId;
+    fn is_intent_to_add(&self) -> bool;
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool;
 }
 
@@ -3188,6 +3237,10 @@ impl WorktreeIndexEntry for sley_index::IndexEntry {
 
     fn oid(&self) -> ObjectId {
         self.oid
+    }
+
+    fn is_intent_to_add(&self) -> bool {
+        sley_index::IndexEntry::is_intent_to_add(self)
     }
 
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool {
@@ -3210,6 +3263,10 @@ impl WorktreeIndexEntry for sley_index::IndexEntryRef<'_> {
 
     fn oid(&self) -> ObjectId {
         self.oid
+    }
+
+    fn is_intent_to_add(&self) -> bool {
+        sley_index::IndexEntryRef::is_intent_to_add(self)
     }
 
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool {
