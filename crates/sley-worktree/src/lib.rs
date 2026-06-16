@@ -8151,9 +8151,8 @@ fn checkout_commit_to_index_and_worktree_filtered(
             _ => Cow::Borrowed(&object.body),
         };
         let file_path = worktree_path(worktree_root, path)?;
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        prepare_blob_parent_dirs(worktree_root, &file_path)?;
+        remove_existing_worktree_path(&file_path)?;
         fs::write(&file_path, &body)?;
         set_worktree_file_mode(&file_path, entry.mode)?;
         let metadata = fs::metadata(&file_path)?;
@@ -8713,9 +8712,15 @@ pub fn reset_index_and_worktree_to_commit(
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
 
-    for path in read_index_entries(git_dir, format)?.keys() {
-        if !target_entries.contains_key(path) {
-            remove_worktree_file(worktree_root, path)?;
+    // git's `reset --hard` runs a one-way merge through unpack-trees: EVERY path
+    // present in the current index (at ANY stage) that the target tree does not
+    // track is removed from the worktree. A conflicted D/F merge can leave a
+    // path like `dir~HEAD` at stage 2 only — those entries are dropped by the
+    // stage-0-only `read_index_entries`, so iterate the RAW index paths here
+    // (deduped across stages) to match git and delete the moved-aside file.
+    for path in current_index_paths(git_dir, format, &db)? {
+        if !target_entries.contains_key(&path) {
+            remove_worktree_file(worktree_root, &path)?;
         }
     }
 
@@ -8737,6 +8742,24 @@ pub fn reset_index_and_worktree_to_commit(
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
+}
+
+/// All paths the current index references, deduped across stages (a conflicted
+/// path appears at stages 1–3; we want it listed once). Unlike
+/// `read_index_entries`, which filters to stage 0, this keeps conflicted paths
+/// so a `reset --hard` worktree sweep removes moved-aside files (`dir~HEAD`) the
+/// target tree doesn't track — matching git's one-way unpack-trees behavior.
+fn current_index_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let (index, _stat_cache, _head_matches) = read_index_with_stat_cache(git_dir, format, db)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .map(|entry| entry.path.into_bytes())
+        .collect())
 }
 
 /// Write one target tree entry into the worktree and return its index entry —
@@ -8799,9 +8822,11 @@ fn write_worktree_blob_entry(
 ) -> Result<PathBuf> {
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // Clear any non-directory blocking an ancestor component (prior tree had
+    // `dir` as a FILE, target wants `dir/<child>`), creating the parent dirs.
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    // Clear whatever sits at the leaf — including a directory where the target
+    // wants a plain file (reverse D/F) — before writing.
     remove_existing_worktree_path(&file_path)?;
     if (entry.mode & 0o170000) == 0o120000 {
         // Symlink entry (mode 120000): the blob body is the link target.
@@ -8819,6 +8844,62 @@ fn write_worktree_blob_entry(
         set_worktree_file_mode(&file_path, entry.mode)?;
     }
     Ok(file_path)
+}
+
+/// Create the ancestor directories of a worktree blob path, removing any
+/// regular file or symlink that occupies an ancestor *component* first.
+///
+/// Mirrors git's `entry.c` `create_directories`: it walks each path component
+/// between `worktree_root` and the leaf and, for each, if a non-directory (a
+/// regular file or symlink left by a prior tree where `dir` was a FILE) blocks
+/// it, unlinks the blocker before `mkdir`. A plain `fs::create_dir_all` fails
+/// with `ENOTDIR`/`EEXIST` on such a D/F transition; this is the directory-side
+/// of git's force-checkout D/F clearing.
+///
+/// `worktree_root` itself is never touched. Only components strictly between the
+/// root and the leaf are cleared, matching `create_directories`' `base_dir_len`
+/// boundary.
+fn prepare_blob_parent_dirs(worktree_root: &Path, file_path: &Path) -> Result<()> {
+    let parent = match file_path.parent() {
+        Some(parent) => parent,
+        None => return Ok(()),
+    };
+    // Fast path: parent already a directory (the overwhelmingly common case).
+    if parent.is_dir() {
+        return Ok(());
+    }
+    // Collect the ancestor chain from worktree_root (exclusive) down to `parent`
+    // (inclusive). We can't `create_dir_all` blindly because a non-directory may
+    // sit on one of these components; walk them and clear blockers as git does.
+    let mut components: Vec<&Path> = Vec::new();
+    let mut cursor = Some(parent);
+    while let Some(dir) = cursor {
+        if dir == worktree_root {
+            break;
+        }
+        components.push(dir);
+        cursor = dir.parent();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    // Walk root → leaf so each parent exists before its child.
+    for dir in components.iter().rev() {
+        match fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                // A regular file or symlink occupies this component (the prior
+                // tree had `dir` as a FILE). Unlink it, then create the dir.
+                fs::remove_file(dir)?;
+                fs::create_dir(dir)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(dir)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Remove whatever currently occupies a worktree path before writing a new
@@ -9082,7 +9163,7 @@ pub fn apply_sparse_checkout_with_mode(
             clear_skip_worktree(entry);
             let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             if !file_path.exists() {
-                materialize_index_entry_file(&db, &file_path, entry)?;
+                materialize_index_entry_file(&db, worktree_root, &file_path, entry)?;
             }
             materialized.push(entry.path.as_bytes().to_vec());
         } else {
@@ -9275,13 +9356,13 @@ pub fn checkout_detached_sparse(
 
 fn materialize_index_entry_file(
     db: &FileObjectDatabase,
+    worktree_root: &Path,
     file_path: &Path,
     entry: &IndexEntry,
 ) -> Result<()> {
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_blob_parent_dirs(worktree_root, file_path)?;
+    remove_existing_worktree_path(file_path)?;
     fs::write(file_path, &object.body)?;
     set_worktree_file_mode(file_path, entry.mode)?;
     Ok(())
@@ -10075,9 +10156,8 @@ fn restore_index_entry(
         None => Cow::Borrowed(&object.body),
     };
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
     fs::write(&file_path, &body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
     Ok(())

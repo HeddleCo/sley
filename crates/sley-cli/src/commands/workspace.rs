@@ -1428,16 +1428,23 @@ fn checkout_twoway_dirty(
         eprintln!("Aborting");
         return Err(GitError::Exit(1));
     }
-    for (path, (mode, oid)) in &updates {
-        let content = commands::merge_rebase::merge_read_blob(&db, oid)?;
-        commands::merge_rebase::merge_write_worktree_file(worktree_root, path, &content, *mode)?;
-    }
+    // Deletions BEFORE updates: git's two-way unpack-trees removes the paths a
+    // switch drops before materializing the ones it adds. The order matters for a
+    // directory/file transition — e.g. the old tree had `dir/child` and the new
+    // tree wants `dir` as a plain file. If `dir` were written as a file first, the
+    // later removal of `dir/child` would lstat through a now-regular-file `dir`
+    // and fail with ENOTDIR. Removing `dir/child` first leaves a clean slot for
+    // the file. (`merge_write_worktree_file` already clears the reverse F→D case.)
     for path in &deletions {
         if stage0.get(path).is_some_and(|entry| entry.mode == 0o160000) {
             checkout_remove_gitlink_worktree_dir(worktree_root, path)?;
         } else {
             commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
         }
+    }
+    for (path, (mode, oid)) in &updates {
+        let content = commands::merge_rebase::merge_read_blob(&db, oid)?;
+        commands::merge_rebase::merge_write_worktree_file(worktree_root, path, &content, *mode)?;
     }
     let mut entries: Vec<IndexEntry> = Vec::new();
     for (path, (mode, oid)) in &target_map {
