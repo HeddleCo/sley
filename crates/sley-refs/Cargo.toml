@@ -1,6 +1,6 @@
 [package]
 name = "sley-refs"
-version = "0.0.1"
+version = "0.0.3"
 description = "Native-Rust Git reference store for the sley engine: loose refs, packed-refs, reftables, and reflogs."
 repository.workspace = true
 edition.workspace = true
@@ -8,9 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-config = { path = "../sley-config", version = "0.0.1" }
-sley-core = { path = "../sley-core", version = "0.0.1" }
-sley-formats = { path = "../sley-formats", version = "0.0.1" }
+sley-config = { path = "../sley-config", version = "0.0.3" }
+sley-core = { path = "../sley-core", version = "0.0.3" }
+sley-formats = { path = "../sley-formats", version = "0.0.3" }
 
 [lints]
 workspace = true
