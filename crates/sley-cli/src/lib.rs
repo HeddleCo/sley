@@ -41,7 +41,7 @@ use std::io::{self, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Accumulated sq-quoted fragment of command-line `-c` / `--config-env`
 /// parameters, in left-to-right order. Stands in for git's mutation of the
@@ -3635,6 +3635,20 @@ struct DiffStatEntryData<'a> {
     stats: DiffLineStats,
 }
 
+enum DiffBlobContent {
+    Object(Arc<EncodedObject>),
+    Owned(Vec<u8>),
+}
+
+impl DiffBlobContent {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            DiffBlobContent::Object(object) => &object.body,
+            DiffBlobContent::Owned(bytes) => bytes,
+        }
+    }
+}
+
 fn collect_diff_stat_entries<'a>(
     entries: &'a [sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
@@ -3643,12 +3657,17 @@ fn collect_diff_stat_entries<'a>(
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        let old_content = diff_entry_old_content(entry, db)?;
+        let old_content = diff_entry_old_stat_content(entry, db)?;
         let stats = if entry.old_oid.is_some() && entry.old_oid == entry.new_oid {
-            diff_line_stats(old_content.as_deref(), old_content.as_deref())
+            let old_bytes = old_content.as_ref().map(DiffBlobContent::as_slice);
+            diff_line_stats(old_bytes, old_bytes)
         } else {
-            let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-            diff_line_stats(old_content.as_deref(), new_content.as_deref())
+            let new_content =
+                diff_entry_new_stat_content(entry, db, worktree_root, use_worktree_new)?;
+            diff_line_stats(
+                old_content.as_ref().map(DiffBlobContent::as_slice),
+                new_content.as_ref().map(DiffBlobContent::as_slice),
+            )
         };
         stat_entries.push(DiffStatEntryData { entry, stats });
     }
@@ -3968,6 +3987,67 @@ pub(crate) fn diff_entry_produces_output(
     Ok(!probe.is_empty())
 }
 
+fn diff_entry_old_stat_content(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+) -> Result<Option<DiffBlobContent>> {
+    if entry.old_mode == Some(0o160000) {
+        return Ok(entry
+            .old_oid
+            .as_ref()
+            .map(|oid| DiffBlobContent::Owned(gitlink_diff_content(oid, false))));
+    }
+    entry
+        .old_oid
+        .as_ref()
+        .map(|oid| read_blob_content(db, oid))
+        .transpose()
+}
+
+fn diff_entry_new_stat_content(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree: bool,
+) -> Result<Option<DiffBlobContent>> {
+    if entry.new_mode.is_none() {
+        return Ok(None);
+    }
+    if entry.new_mode == Some(0o160000) {
+        // A gitlink's content never comes from reading the path (it's a
+        // directory): it is the recorded commit - the entry's oid, or for a
+        // worktree comparison (where changed-path oids are unresolved) the
+        // submodule's live HEAD, falling back to the old side's oid.
+        let oid = match entry.new_oid {
+            Some(oid) => Some(oid),
+            None => match (use_worktree, worktree_root) {
+                (true, Some(root)) => {
+                    let sub_root = root.join(repo_path_to_path(&entry.path));
+                    sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format())
+                        .or(entry.old_oid)
+                }
+                _ => entry.old_oid,
+            },
+        };
+        return Ok(oid.map(|oid| DiffBlobContent::Owned(gitlink_diff_content(&oid, false))));
+    }
+    if use_worktree {
+        let root = worktree_root.ok_or_else(|| {
+            GitError::Command("diff numstat requires a worktree for worktree comparisons".into())
+        })?;
+        let path = root.join(repo_path_to_path(&entry.path));
+        if path.exists() {
+            return Ok(Some(DiffBlobContent::Owned(fs::read(path)?)));
+        }
+        return Ok(None);
+    }
+    entry
+        .new_oid
+        .as_ref()
+        .map(|oid| read_blob_content(db, oid))
+        .transpose()
+}
+
 fn diff_entry_old_content(
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
@@ -4052,14 +4132,24 @@ fn diff_rename_limit_requires_integer_error() -> GitError {
     GitError::Exit(129)
 }
 
-fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
+fn read_blob_content(db: &FileObjectDatabase, oid: &ObjectId) -> Result<DiffBlobContent> {
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
             "diff expected blob object {oid}"
         )));
     }
-    Ok(object.body.clone())
+    Ok(DiffBlobContent::Object(object))
+}
+
+fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
+    match read_blob_content(db, oid)? {
+        DiffBlobContent::Owned(bytes) => Ok(bytes),
+        DiffBlobContent::Object(object) => match Arc::try_unwrap(object) {
+            Ok(object) => Ok(object.body),
+            Err(object) => Ok(object.body.clone()),
+        },
+    }
 }
 
 fn repo_path_to_path(path: &[u8]) -> PathBuf {

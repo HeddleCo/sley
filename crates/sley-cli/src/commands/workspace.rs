@@ -2752,6 +2752,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         print_commit_summary(
             &git_dir,
             format,
+            &commit_odb,
             &result.oid,
             result.parent.as_ref(),
             &summary_message,
@@ -2784,17 +2785,19 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
 /// first parent (None for a root commit, which diffs against the empty tree and
 /// adds the `(root-commit)` marker). `author`/`committer` are the raw identity
 /// buffers (`Name <email> seconds tz`); the `Author:` line is emitted only when
-/// they differ in name/email, matching git.
+/// they differ in name/email, matching git. The object database is borrowed from
+/// the caller so the summary reuses any hot pack/MIDX state from the commit path
+/// instead of opening a second database for the same repository.
 fn print_commit_summary(
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     new_oid: &ObjectId,
     parent: Option<&ObjectId>,
     message: &[u8],
     author: &[u8],
     committer: &[u8],
 ) -> Result<()> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     // HEAD branch name, or "detached HEAD" / "HEAD" when unresolvable.
     let head = match repo_current_branch_name(git_dir) {
         Some(name) => name,
@@ -2817,20 +2820,20 @@ fn print_commit_summary(
 
     // Shortstat + summary of the diff against the parent tree (empty tree for a
     // root commit), matching `DIFF_FORMAT_SHORTSTAT | DIFF_FORMAT_SUMMARY`.
-    let new_tree = read_commit_tree_for_summary(&db, format, new_oid)?;
+    let new_tree = read_commit_tree_for_summary(db, format, new_oid)?;
     let old_tree = match parent {
-        Some(p) => read_commit_tree_for_summary(&db, format, p)?,
+        Some(p) => read_commit_tree_for_summary(db, format, p)?,
         None => ObjectId::empty_tree(format),
     };
     let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
-        &db,
+        db,
         format,
         &old_tree,
         &new_tree,
         sley_diff_merge::RenameDetectionOptions::default(),
     )?;
     if !entries.is_empty() {
-        write_diff_shortstat(&mut out, &entries, &db, None, false)?;
+        write_diff_shortstat(&mut out, &entries, db, None, false)?;
         for entry in &entries {
             write_commit_summary_entry(&mut out, entry)?;
         }
@@ -4004,7 +4007,7 @@ fn render_commit_template_status(
             _ => sley_worktree::StatusUntrackedMode::Normal,
         }
     });
-    let mut entries = sley_worktree::short_status_with_options(
+    let mut entries = crate::collect_short_status_with_options(
         &worktree_root,
         git_dir,
         format,
