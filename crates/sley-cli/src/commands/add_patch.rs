@@ -661,9 +661,10 @@ fn patch_update_file(
             Some(l) => l,
             None => {
                 // EOF at the prompt: git's read_single_character returns EOF and
-                // breaks the loop, falling through to the single trailing
-                // `putchar('\n')` at function end. We do the same — break out and
-                // let the common tail print exactly one newline.
+                // sets patch_update_resp = file_diff_nr, which quits the whole
+                // session (the outer loop breaks). Mirror that so a `</dev/null`
+                // add -p stops after the first file rather than walking the rest.
+                nav = FileNav::Quit;
                 break;
             }
         };
