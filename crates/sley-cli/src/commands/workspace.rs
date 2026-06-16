@@ -2639,7 +2639,16 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
-    if in_rebase {
+    // `git commit` invoked manually during a conflicted rebase concludes the
+    // current rebase step (builtin: the sequencer's `do_commit` path). `--amend`
+    // is the exception: git's `commit` builtin is rebase-agnostic — it amends
+    // HEAD with the new tree/metadata and never re-derives a parent from the
+    // rebase state, so a clean tree (date/author-only amend) must still proceed.
+    // Without this guard a stale `rebase-merge/` directory wrongly routes
+    // `commit --amend` through the rebase-step concluder, which fires its own
+    // `tree == parent_tree -> "nothing to commit, working tree clean"` gate and
+    // exits 1 (t3436 date tests: amend after a leftover rebase dir).
+    if in_rebase && !amend {
         return conclude_rebase_step_via_commit(
             &git_dir,
             format,
