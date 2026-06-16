@@ -1228,10 +1228,12 @@ fn write_cruft_pack(
         &PackWriteOptions::new(),
     )?;
 
-    // `.idx` entries are sorted by oid; the `.mtimes` table follows the same
-    // order. Build the parallel mtimes vector from the sorted entries.
-    let mtimes_table: Vec<u32> = written
-        .entries
+    // The `.mtimes` table is stored in lexicographic (index) order, which is
+    // NOT the pack-emit order `written.entries` carries — sort a copy by oid
+    // first so the table lines up with the `.idx` fanout the reader walks.
+    let mut sorted_entries: Vec<&sley_pack::PackIndexEntry> = written.entries.iter().collect();
+    sorted_entries.sort_by(|a, b| a.oid.as_bytes().cmp(b.oid.as_bytes()));
+    let mtimes_table: Vec<u32> = sorted_entries
         .iter()
         .map(|entry| mtime_by_oid.get(&entry.oid).copied().unwrap_or(0))
         .collect();
