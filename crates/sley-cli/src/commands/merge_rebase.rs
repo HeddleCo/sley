@@ -2756,28 +2756,21 @@ fn resolve_fetch_head_revision(git_dir: &Path, format: ObjectFormat) -> Result<O
     Ok(fetch_head_merge_record(git_dir, format)?.oid)
 }
 
-fn ensure_pull_can_merge(config: &GitConfig) -> Result<()> {
-    if config.get("pull", None, "rebase").is_none() {
-        eprintln!("hint: You have divergent branches and need to specify how to reconcile them.");
-        eprintln!("hint: You can do so by running one of the following commands sometime before");
-        eprintln!("hint: your next pull:");
-        eprintln!("hint:");
-        eprintln!("hint:   git config pull.rebase false  # merge");
-        eprintln!("hint:   git config pull.rebase true   # rebase");
-        eprintln!("hint:   git config pull.ff only       # fast-forward only");
-        eprintln!("hint:");
-        eprintln!(
-            "hint: You can replace \"git config\" with \"git config --global\" to set a default"
-        );
-        eprintln!(
-            "hint: preference for all repositories. You can also pass --rebase, --no-rebase,"
-        );
-        eprintln!("hint: or --ff-only on the command line to override the configured default per");
-        eprintln!("hint: invocation.");
-        eprintln!("fatal: Need to specify how to reconcile divergent branches.");
-        return Err(GitError::Exit(128));
-    }
-    Ok(())
+fn ensure_pull_can_merge() -> Result<()> {
+    eprintln!("hint: You have divergent branches and need to specify how to reconcile them.");
+    eprintln!("hint: You can do so by running one of the following commands sometime before");
+    eprintln!("hint: your next pull:");
+    eprintln!("hint:");
+    eprintln!("hint:   git config pull.rebase false  # merge");
+    eprintln!("hint:   git config pull.rebase true   # rebase");
+    eprintln!("hint:   git config pull.ff only       # fast-forward only");
+    eprintln!("hint:");
+    eprintln!("hint: You can replace \"git config\" with \"git config --global\" to set a default");
+    eprintln!("hint: preference for all repositories. You can also pass --rebase, --no-rebase,");
+    eprintln!("hint: or --ff-only on the command line to override the configured default per");
+    eprintln!("hint: invocation.");
+    eprintln!("fatal: Need to specify how to reconcile divergent branches.");
+    Err(GitError::Exit(128))
 }
 
 fn print_fetch_status(
@@ -2975,9 +2968,29 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         .get("pull", None, "ff")
         .is_some_and(|value| value == "only");
     let effective_ff_only = ff_only || config_ff_only;
-    let effective_rebase = match rebase_flag {
-        Some(value) => value,
-        None => config.get("pull", None, "rebase") == Some("true"),
+    // Mirror git's `config_get_rebase` (builtin/pull.c): an explicit
+    // `--rebase`/`--no-rebase` wins; otherwise `branch.<name>.rebase` is
+    // consulted before the global `pull.rebase`. `rebase_unspecified` stays true
+    // only when *none* of those sources expressed a preference — that is the sole
+    // gate for the "Need to specify how to reconcile divergent branches" die, so
+    // a bare `--no-rebase` must clear it (was previously keyed off `pull.rebase`
+    // alone, which wrongly fired on `git pull --no-rebase`).
+    let current_branch_name = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => {
+            Some(name.strip_prefix("refs/heads/").unwrap_or(&name).to_string())
+        }
+        _ => None,
+    };
+    let branch_rebase = current_branch_name
+        .as_deref()
+        .and_then(|name| config.get("branch", Some(name), "rebase"));
+    let config_rebase = branch_rebase.or_else(|| config.get("pull", None, "rebase"));
+    let (effective_rebase, rebase_unspecified) = match rebase_flag {
+        Some(value) => (value, false),
+        None => match config_rebase {
+            Some(value) => (matches!(value, "true" | "interactive" | "merges"), false),
+            None => (false, true),
+        },
     };
     let fetch_options = FetchOptions {
         quiet,
@@ -3091,7 +3104,13 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
         }
     }
-    ensure_pull_can_merge(&config)?;
+    // git dies on divergence only when the rebase choice was entirely
+    // unspecified (no CLI flag, no branch/pull config) and `--ff-only` is not in
+    // play (builtin/pull.c: `if (!opt_ff && rebase_unspecified && divergent)`).
+    // `no_ff` corresponds to `opt_ff == "--no-ff"`, which also suppresses the die.
+    if !no_ff && !effective_ff_only && rebase_unspecified {
+        ensure_pull_can_merge()?;
+    }
     let mut merge_args = Vec::new();
     if no_ff {
         merge_args.push("--no-ff".to_string());
