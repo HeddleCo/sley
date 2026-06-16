@@ -512,21 +512,32 @@ pub fn refspec_map_source(refspec: &RefSpec, source: &str) -> Result<Option<Stri
 
 pub fn fetch_head_ref_description(refname: &str) -> Result<String> {
     validate_fetch_head_description_field(refname)?;
-    if let Some(branch) = refname.strip_prefix("refs/heads/") {
+    // Mirror git's `kind`/`what` split in builtin/fetch.c: `HEAD` yields an empty
+    // note (no `'…' of` prefix at all), the standard ref namespaces get their
+    // kind word, and any other ref name is quoted bare.
+    if refname == "HEAD" {
+        Ok(String::new())
+    } else if let Some(branch) = refname.strip_prefix("refs/heads/") {
         Ok(format!("branch '{branch}'"))
     } else if let Some(tag) = refname.strip_prefix("refs/tags/") {
         Ok(format!("tag '{tag}'"))
+    } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
+        Ok(format!("remote-tracking branch '{rest}'"))
     } else {
-        Ok(refname.to_string())
+        Ok(format!("'{refname}'"))
     }
 }
 
 pub fn fetch_head_remote_description(refname: &str, remote: &str) -> Result<String> {
     validate_fetch_head_description_field(remote)?;
-    Ok(format!(
-        "{} of {remote}",
-        fetch_head_ref_description(refname)?
-    ))
+    // git only appends `of <url>` when the note (`what`) is non-empty; a bare
+    // `HEAD` fetch records just the URL with an empty description.
+    let what = fetch_head_ref_description(refname)?;
+    if what.is_empty() {
+        Ok(remote.to_string())
+    } else {
+        Ok(format!("{what} of {remote}"))
+    }
 }
 
 pub fn parse_fetch_head(format: ObjectFormat, input: &[u8]) -> Result<Vec<FetchHeadRecord>> {
@@ -7549,10 +7560,11 @@ mod tests {
                 .expect("test operation should succeed"),
             "tag 'v1' of ../bundle.bdl"
         );
+        // A bare `HEAD` fetch records just the URL — git emits an empty note.
         assert_eq!(
             fetch_head_remote_description("HEAD", "../bundle.bdl")
                 .expect("test operation should succeed"),
-            "HEAD of ../bundle.bdl"
+            "../bundle.bdl"
         );
     }
 

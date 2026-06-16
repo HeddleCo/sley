@@ -15,6 +15,7 @@
 //! [`GitConfig::to_canonical_bytes`] remains for tests and green-field writes.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use crate::{ConfigEntry, ConfigSection, GitConfig};
 
@@ -134,6 +135,147 @@ pub fn remote_exists(config: &GitConfig, name: &str) -> bool {
         .sections
         .iter()
         .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
+}
+
+/// Whether `name` is a valid remote nickname, mirroring git's
+/// `valid_remote_nick`: non-empty, not `.`/`..`, and containing no path
+/// separators. Only such names trigger the legacy `remotes/`/`branches/` file
+/// lookup.
+fn valid_remote_nick(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+}
+
+/// The repository default branch name used to fill the missing `#frag` of a
+/// `branches/<name>` file, mirroring git's `repo_default_branch_name`:
+/// `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` env, then `init.defaultBranch`, then
+/// the compiled-in default (`master`).
+fn default_branch_name(config: &GitConfig) -> String {
+    if let Ok(name) = std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+        && !name.is_empty()
+    {
+        return name;
+    }
+    config
+        .get("init", None, "defaultBranch")
+        .filter(|name| !name.is_empty())
+        .unwrap_or("master")
+        .to_string()
+}
+
+/// Synthesize `[remote "<name>"]` sections from git's legacy file-based remote
+/// definitions in `$GIT_DIR/remotes/<name>` and `$GIT_DIR/branches/<name>`,
+/// appending them to `config`.
+///
+/// This mirrors git's `remote.c` lazy lookup order: a `remotes/`/`branches/`
+/// file is only consulted for a remote nickname that is *not* already a valid
+/// config remote (one with a `url`). For each such file, the parsed URL and
+/// refspecs are turned into the equivalent config entries so every downstream
+/// consumer (`resolve_remote_fetch_url`, the configured-fetch refspecs, push)
+/// sees a uniform `[remote "<name>"]` view.
+///
+/// `remotes/<name>` format (`read_remotes_file`):
+/// * `URL: <url>` → `url`
+/// * `Pull: <spec>` → `fetch`
+/// * `Push: <spec>` → `push`
+///
+/// `branches/<name>` format (`read_branches_file`): a single line `<url>` or
+/// `<url>#<branch>`. The fetch refspec is `refs/heads/<branch>:refs/heads/<name>`
+/// (the local branch matching the remote name), the push is `HEAD:refs/heads/
+/// <branch>`, and tags are always auto-followed.
+pub fn augment_with_legacy_remote_files(config: &mut GitConfig, git_dir: &Path) {
+    let mut new_sections = Vec::new();
+    augment_from_remotes_dir(config, git_dir, &mut new_sections);
+    augment_from_branches_dir(config, git_dir, &mut new_sections);
+    config.sections.extend(new_sections);
+}
+
+fn augment_from_remotes_dir(
+    config: &GitConfig,
+    git_dir: &Path,
+    out: &mut Vec<ConfigSection>,
+) {
+    let dir = git_dir.join("remotes");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !valid_remote_nick(&name) || remote_exists(config, &name) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut section_entries = Vec::new();
+        for line in contents.lines() {
+            let line = line.trim_end();
+            if let Some(url) = line.strip_prefix("URL:") {
+                section_entries.push(ConfigEntry::new("url", Some(url.trim_start().to_string())));
+            } else if let Some(spec) = line.strip_prefix("Pull:") {
+                section_entries
+                    .push(ConfigEntry::new("fetch", Some(spec.trim_start().to_string())));
+            } else if let Some(spec) = line.strip_prefix("Push:") {
+                section_entries.push(ConfigEntry::new("push", Some(spec.trim_start().to_string())));
+            }
+        }
+        if section_entries.iter().any(|e| e.key == "url") {
+            out.push(ConfigSection::new("remote", Some(name), section_entries));
+        }
+    }
+}
+
+fn augment_from_branches_dir(
+    config: &GitConfig,
+    git_dir: &Path,
+    out: &mut Vec<ConfigSection>,
+) {
+    let dir = git_dir.join("branches");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let default_branch = default_branch_name(config);
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !valid_remote_nick(&name)
+            || remote_exists(config, &name)
+            || out
+                .iter()
+                .any(|s| s.subsection.as_deref() == Some(name.as_str()))
+        {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let first = contents.lines().next().unwrap_or("").trim();
+        if first.is_empty() {
+            continue;
+        }
+        let (url, frag) = match first.split_once('#') {
+            Some((url, frag)) => (url, frag.to_string()),
+            None => (first, default_branch.clone()),
+        };
+        let section_entries = vec![
+            ConfigEntry::new("url", Some(url.to_string())),
+            ConfigEntry::new(
+                "fetch",
+                Some(format!("refs/heads/{frag}:refs/heads/{name}")),
+            ),
+            ConfigEntry::new("push", Some(format!("HEAD:refs/heads/{frag}"))),
+            // git sets remote->fetch_tags = 1 (always auto-follow tags). The
+            // tagopt config equivalent is `--tags`.
+            ConfigEntry::new("tagopt", Some("--tags".to_string())),
+        ];
+        out.push(ConfigSection::new("remote", Some(name), section_entries));
+    }
 }
 
 /// Failure modes shared by [`add_remote`] and [`remove_remote`].

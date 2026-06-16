@@ -406,6 +406,11 @@ pub fn read_repo_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<
         };
         append_injected_config_sections_with_includes(&mut config, &parameters, &context, &base)?;
     }
+    // git's `remote.c` lazily consults the legacy `$GIT_DIR/remotes/<name>` and
+    // `$GIT_DIR/branches/<name>` files for any remote nickname not already
+    // defined by a config `[remote "<name>"].url`. Synthesize the equivalent
+    // `[remote]` sections so every remote-aware command sees a uniform view.
+    remotes::augment_with_legacy_remote_files(&mut config, git_dir);
     Ok(config)
 }
 

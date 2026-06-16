@@ -1,0 +1,17 @@
+sley binary: /home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-transport-fetch-clone/release/sley
+
+Running upstream scripts against sley...
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t5515-fetch-merge-logic.sh   FAIL        27    38  rc=1 (1..65) |# failed 38 among 65 test(s)|1..65
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t5515-fetch-merge-logic.sh FAIL             27     38     65  41%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+Full report written to: /home/heddleco/dev/HeddleCo/workspace/parity-transport-fetch-clone/crates/sley-testkit/upstream-report.txt
+Machine-readable summary: /home/heddleco/dev/HeddleCo/workspace/parity-transport-fetch-clone/crates/sley-testkit/upstream-report-summary.csv
+Pass-rate history (appended): /home/heddleco/dev/HeddleCo/workspace/parity-transport-fetch-clone/crates/sley-testkit/upstream-history.csv

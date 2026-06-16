@@ -1,0 +1,10 @@
+#!/bin/sh
+SHIM_DIR='/home/heddleco/dev/HeddleCo/workspace/parity-transport-fetch-clone/.sley-shim'
+case "$1" in
+    --exec-path) echo "$SHIM_DIR"; exit 0 ;;
+    --exec-path=*) shift ;;
+    --html-path) echo "$SHIM_DIR"; exit 0 ;;
+    --man-path) echo "$SHIM_DIR"; exit 0 ;;
+    --info-path) echo "$SHIM_DIR"; exit 0 ;;
+esac
+exec "/home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-transport-fetch-clone/release/sley" "$@"
