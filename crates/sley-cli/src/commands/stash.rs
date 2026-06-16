@@ -2134,7 +2134,19 @@ fn resolve_stash_argument(
     };
     let oid = match resolve_revision(common_git_dir, format, &revision) {
         Ok(oid) => oid,
-        Err(_) => {
+        Err(err) => {
+            // A reflog selector whose log is too short (`stash@{99}`) dies the way
+            // git's rev parser does — `fatal: log for '<base>' only has N entries`,
+            // exit 128 — rather than the generic "is not a valid reference" git
+            // reserves for revisions that don't name a reflog at all (`bad`).
+            if let Some(message) = err
+                .not_found_kind()
+                .map(ToString::to_string)
+                .filter(|message| message.contains(" only has "))
+            {
+                eprintln!("fatal: {message}");
+                return Err(GitError::Exit(128));
+            }
             eprintln!("error: {revision} is not a valid reference");
             return Err(GitError::Exit(1));
         }

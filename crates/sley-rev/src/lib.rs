@@ -533,16 +533,47 @@ fn parse_at_count(rev: &str, text: &str) -> Result<usize> {
 
 /// Map a `<base>@{...}` base to the full ref name whose reflog should be read.
 ///
-/// An empty base means `HEAD`; `refs/...` is used verbatim; anything else is
-/// treated as a branch short-name under `refs/heads/`.
-fn reflog_ref_name(base: &str) -> String {
+/// An empty base means `HEAD`; `refs/...` is used verbatim. A short name is
+/// DWIM'd through git's `ref_rev_parse_rules` (`%s`, `refs/%s`, `refs/tags/%s`,
+/// `refs/heads/%s`, `refs/remotes/%s`, `refs/remotes/%s/HEAD`), picking the first
+/// candidate that has an existing reflog — exactly git's `repo_dwim_log`. This is
+/// what lets `stash@{N}` read `refs/stash`'s reflog (rule `refs/%s`) the same way
+/// `main@{N}` reads `refs/heads/main` (rule `refs/heads/%s`). When no candidate
+/// has a reflog, fall back to `refs/heads/<base>` so the "no reflog" error path
+/// keeps its historical shape.
+fn reflog_ref_name(refs: &FileRefStore, base: &str) -> String {
     if base.is_empty() || base == "HEAD" {
-        "HEAD".to_string()
-    } else if base.starts_with("refs/") {
-        base.to_string()
-    } else {
-        format!("refs/heads/{base}")
+        return "HEAD".to_string();
     }
+    if base.starts_with("refs/") {
+        return base.to_string();
+    }
+    for candidate in reflog_dwim_candidates(base) {
+        if reflog_has_entries(refs, &candidate) {
+            return candidate;
+        }
+    }
+    format!("refs/heads/{base}")
+}
+
+/// git's `ref_rev_parse_rules` expansions for a short ref name, in order.
+fn reflog_dwim_candidates(base: &str) -> [String; 6] {
+    [
+        base.to_string(),
+        format!("refs/{base}"),
+        format!("refs/tags/{base}"),
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/{base}"),
+        format!("refs/remotes/{base}/HEAD"),
+    ]
+}
+
+/// Whether `name` has a reflog with at least one entry. `read_reflog` returns an
+/// empty vec for an absent reflog, so a non-empty read means the reflog exists.
+fn reflog_has_entries(refs: &FileRefStore, name: &str) -> bool {
+    refs.read_reflog(name)
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(false)
 }
 
 /// Resolve `<base>@{N}` to the N-th prior value of `base` from its reflog.
@@ -558,8 +589,8 @@ fn resolve_reflog_nth(
     n: usize,
     rev: &str,
 ) -> Result<ObjectId> {
-    let ref_name = reflog_ref_name(base);
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let ref_name = reflog_ref_name(&refs, base);
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
         return Err(GitError::not_found(format!(
