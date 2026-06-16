@@ -561,8 +561,10 @@ fn write_commit_trailer(
     // For an off-mode merge only the stat family renders; for a combined merge,
     // a first-parent merge, and an ordinary commit the body renders fully.
     let body_renders = if combined_merge {
-        diff_active && (merge_renders_stat(options) || options.diff_mode == ShowDiffMode::Patch)
-            && !entries.is_empty()
+        // A combined merge renders a body for every active diff mode (the
+        // combined patch, the first-parent stat family, or the combined
+        // name/name-status listing).
+        diff_active && !entries.is_empty()
     } else if layout.is_merge && !first_parent_merge {
         diff_active && merge_renders_stat(options) && !entries.is_empty()
     } else {
@@ -578,7 +580,12 @@ fn write_commit_trailer(
         if !layout.text_self_terminated {
             writeln!(stdout)?;
         }
-        if layout.blank_before_diff {
+        // A combined merge separates the commit header from its diff with a
+        // blank line (git's diff_tree_combined `line_termination` separator),
+        // even for `--oneline` which abuts the diff for ordinary commits. The
+        // exception is `--pretty=format:` (text not self-terminated): there the
+        // text line's own newline above is the only separator, matching git.
+        if layout.blank_before_diff || (combined_merge && layout.text_self_terminated) {
             writeln!(stdout)?;
         }
         return if combined_merge {
@@ -690,16 +697,8 @@ fn write_show_combined(
     let options = context.options;
     let db = context.db;
     let format = context.format;
-
-    let stat_active = merge_renders_stat(options);
-    if stat_active {
-        write_merge_stat(stdout, db, context.config, options, entries)?;
-    }
-    if options.diff_mode != ShowDiffMode::Patch {
-        return Ok(());
-    }
-
     let dense = matches!(layout.merge_mode, ShowMergeMode::Combined { dense: true });
+
     let parent_trees = commit
         .parents
         .iter()
@@ -710,13 +709,6 @@ fn write_show_combined(
         })
         .collect::<Result<Vec<_>>>()?;
     let paths = commands::combined::combined_paths(db, format, &commit.tree, &parent_trees)?;
-
-    // git separates a preceding stat block from the combined patch with a blank
-    // line (the `--patch-with-stat` separator).
-    if stat_active && !paths.is_empty() {
-        writeln!(stdout)?;
-    }
-
     let render_ctx = commands::combined::CombinedRenderCtx {
         db,
         format,
@@ -730,6 +722,41 @@ fn write_show_combined(
         patch_abbrev: options.patch_abbrev.unwrap_or(7).min(format.hex_len()),
         raw_abbrev: None,
     };
+
+    // `--name-only`/`--name-status` print the combined name (status) listing.
+    match options.diff_mode {
+        ShowDiffMode::NameOnly => {
+            for path in &paths {
+                writeln!(stdout, "{}", status_quote_path(&path.path, false))?;
+            }
+            return Ok(());
+        }
+        ShowDiffMode::NameStatus => {
+            for path in &paths {
+                commands::combined::write_combined_name_status(stdout, path, false)?;
+            }
+            return Ok(());
+        }
+        ShowDiffMode::None => return Ok(()),
+        ShowDiffMode::Patch => {}
+    }
+
+    // Patch mode: the stat family (first-parent) renders first; the combined
+    // patch renders only when no stat/raw extra replaced it (git's `show_patch
+    // = !has_diff_extras()`).
+    let stat_active = merge_renders_stat(options);
+    if stat_active {
+        write_merge_stat(stdout, db, context.config, options, entries)?;
+    }
+    if options.has_diff_extras() {
+        return Ok(());
+    }
+
+    // git separates a preceding stat block from the combined patch with a blank
+    // line (the `--patch-with-stat` separator).
+    if stat_active && !paths.is_empty() {
+        writeln!(stdout)?;
+    }
     for path in &paths {
         commands::combined::write_combined_patch(stdout, &render_ctx, path)?;
     }
