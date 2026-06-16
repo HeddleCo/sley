@@ -3302,9 +3302,195 @@ enum LsRemoteSort {
     CreatorDateDescending,
 }
 
+/// Validate a single refname component the way git's `check_refname_component`
+/// (refs.c `refname_disposition` table) does, honoring the
+/// `REFNAME_REFSPEC_PATTERN` flag. Returns `false` for a malformed component and
+/// reports (via `pattern_seen`) whether this component consumed the single
+/// asterisk a refspec pattern is allowed.
+fn refspec_component_ok(component: &str, allow_pattern: bool, pattern_seen: &mut bool) -> bool {
+    if component.is_empty() {
+        return false;
+    }
+    if component.starts_with('.') {
+        return false;
+    }
+    if component.ends_with(".lock") {
+        return false;
+    }
+    let bytes = component.as_bytes();
+    for (idx, &byte) in bytes.iter().enumerate() {
+        match byte {
+            // disposition 4: control chars, space, and the forbidden set.
+            0x00..=0x20 | 0x7f | b'~' | b'^' | b':' | b'?' | b'[' | b'\\' => return false,
+            // disposition 2: ".." is forbidden.
+            b'.' if bytes.get(idx + 1) == Some(&b'.') => return false,
+            // disposition 3: "@{" is forbidden.
+            b'@' if bytes.get(idx + 1) == Some(&b'{') => return false,
+            // disposition 5: '*' is only allowed once, and only for patterns.
+            b'*' => {
+                if !allow_pattern || *pattern_seen {
+                    return false;
+                }
+                *pattern_seen = true;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Faithful port of git's `check_refname_format` for the refspec-validation path
+/// (refs.c). `allow_onelevel` mirrors `REFNAME_ALLOW_ONELEVEL`; `allow_pattern`
+/// mirrors `REFNAME_REFSPEC_PATTERN` (a single `*` somewhere in the ref).
+fn refspec_refname_ok(refname: &str, allow_onelevel: bool, allow_pattern: bool) -> bool {
+    if refname == "@" || refname.starts_with('/') || refname.ends_with('/') {
+        return false;
+    }
+    if refname.ends_with('.') {
+        return false;
+    }
+    let mut pattern_seen = false;
+    let mut component_count = 0;
+    for component in refname.split('/') {
+        if !refspec_component_ok(component, allow_pattern, &mut pattern_seen) {
+            return false;
+        }
+        component_count += 1;
+    }
+    if !allow_onelevel && component_count < 2 {
+        return false;
+    }
+    true
+}
+
+/// Validate a configured `remote.<name>.fetch`/`push` refspec the way git's
+/// `parse_refspec` (refspec.c) does, dying-equivalent (returns `false`) on the
+/// same inputs git rejects. `fetch` selects the fetch vs push rule set.
+fn configured_refspec_valid(refspec: &str, fetch: bool) -> bool {
+    // Leading '+' (force) or '^' (negative) are stripped first (mutually
+    // exclusive in git: a negative refspec never carries force, but the parser
+    // only inspects one prefix char).
+    let mut lhs = refspec;
+    let mut negative = false;
+    if let Some(rest) = lhs.strip_prefix('+') {
+        lhs = rest;
+    } else if let Some(rest) = lhs.strip_prefix('^') {
+        negative = true;
+        lhs = rest;
+    }
+
+    // git uses strrchr(lhs, ':') — the LAST colon splits src from dst.
+    let rhs = lhs.rfind(':');
+
+    // Negative refspecs only have one side.
+    if negative && rhs.is_some() {
+        return false;
+    }
+
+    // Special case ":" (or "+:") as the matching push refspec.
+    if !fetch && matches!(rhs, Some(0)) && lhs.len() == 1 {
+        return true;
+    }
+
+    let (src, dst) = match rhs {
+        Some(pos) => (&lhs[..pos], Some(&lhs[pos + 1..])),
+        None => (lhs, None),
+    };
+    let dst_has_glob = dst.is_some_and(|d| d.contains('*'));
+    let src_has_glob = src.contains('*');
+
+    let mut is_glob = dst_has_glob && !dst.unwrap_or("").is_empty();
+    if src_has_glob {
+        // LHS has a glob: for a fetch with no RHS the source must look like a
+        // pattern; with an RHS the RHS must also be a glob.
+        if (dst.is_some() && !is_glob) || (dst.is_none() && !negative && fetch) {
+            return false;
+        }
+        is_glob = true;
+    } else if dst.is_some() && is_glob {
+        // RHS globbed but LHS did not.
+        return false;
+    }
+
+    let src = if src == "@" { "HEAD" } else { src };
+
+    if negative {
+        // Negative refspecs: LHS only, non-empty, not an exact sha1, valid ref.
+        if src.is_empty() {
+            return false;
+        }
+        return refspec_refname_ok(src, true, is_glob);
+    }
+
+    if fetch {
+        // LHS: empty ok (means HEAD); exact sha1 ok; else must be a valid ref.
+        if !src.is_empty() && !refspec_refname_ok(src, true, is_glob) {
+            return false;
+        }
+        // RHS: missing/empty ok; else must be a valid ref.
+        match dst {
+            None => {}
+            Some(d) if d.is_empty() => {}
+            Some(d) => {
+                if !refspec_refname_ok(d, true, is_glob) {
+                    return false;
+                }
+            }
+        }
+    } else {
+        // Push LHS: empty ok (delete); globbed must be a valid ref; else anything.
+        if src.is_empty() {
+            // ok
+        } else if is_glob && !refspec_refname_ok(src, true, is_glob) {
+            return false;
+        }
+        // Push RHS: missing ok only if LHS is a valid ref; empty not allowed;
+        // else must be a valid ref.
+        match dst {
+            None => {
+                if !refspec_refname_ok(src, true, is_glob) {
+                    return false;
+                }
+            }
+            Some(d) if d.is_empty() => return false,
+            Some(d) => {
+                if !refspec_refname_ok(d, true, is_glob) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Mirror git's `remote_get` validating every configured `remote.<name>.fetch`
+/// and `remote.<name>.push` refspec via `refspec_append` (which dies on the
+/// first invalid value). Only runs when `repository` names a configured remote.
+fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let Ok(git_dir) = discover_git_dir(&cwd) else {
+        return Ok(());
+    };
+    let Ok(config) = read_repo_config(&git_dir) else {
+        return Ok(());
+    };
+    for (key, fetch) in [("fetch", true), ("push", false)] {
+        for value in config.get_all("remote", Some(repository), key) {
+            let Some(value) = value else { continue };
+            let value = value.trim_start_matches([' ', '\t']);
+            if !configured_refspec_valid(value, fetch) {
+                eprintln!("fatal: invalid refspec '{value}'");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let options = parse_ls_remote_options(args)?;
     let repository = options.repository.as_deref().unwrap_or("origin");
+    validate_configured_remote_refspecs(repository)?;
     if options.get_url {
         println!("{}", ls_remote_display_url(repository)?);
         return Ok(());
