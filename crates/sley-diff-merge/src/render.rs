@@ -999,6 +999,756 @@ fn write_patch_line_colored(
     }
 }
 
+// ===========================================================================
+// Combined / merge-commit diff renderer (`-c` / `--cc`).
+//
+// This is the byte-for-byte port of git's `combine-diff.c`
+// (`combine_diff` / `make_hunks` / `dump_sline`): the multi-parent
+// `@@@ -p1 -p2 +out @@@` hunk header (with one extra `@` per parent and one
+// `-pN,cN` column per parent), the per-parent prefix columns on each body
+// line, and the `--cc` "dense" simplification that drops hunks whose result
+// matches at least one parent ("uninteresting" hunks).
+//
+// The renderer is repository-agnostic, exactly like the unified-diff renderer
+// above: the caller supplies the *result* blob and one blob per parent (plus
+// the line-diff algorithm / whitespace flags), and we emit only the hunk body
+// — the per-file `diff --cc`/`index`/`---`/`+++` metainfo header stays with the
+// command, which owns the repository / oid / mode context.
+//
+// Data-structure correspondence with combine-diff.c:
+//   * `Sline`  <-> `struct sline` (one per result line, plus a trailing
+//     sentinel `sline[cnt]` whose `bol` is empty),
+//   * `Sline.lost` <-> `struct lline` list (lines deleted relative to some
+//     parent, hung before the surviving result line),
+//   * the `flag` bitset: bit `n` set => parent `n` did NOT have this result
+//     line (i.e. it was added relative to parent `n`); bit `num_parent`
+//     ("mark") => the line is part of a shown hunk; bit `num_parent+1`
+//     ("no_pre_delete") => suppress the leading deletions before this line.
+// ===========================================================================
+
+/// One result line in the combined-diff `sline` array, plus the deletions
+/// ("lost" lines) that hang in front of it.
+struct CdLine {
+    /// The surviving result line bytes, WITHOUT the trailing newline.
+    bol: Vec<u8>,
+    /// Deletions hung before this line, in display order. `parent_map` is the
+    /// bitset of parents that had the deleted line (git coalesces these across
+    /// parents via an LCS; we replicate that with [`coalesce_lost`]).
+    lost: Vec<CdLost>,
+    /// Pre-coalesce deletions accumulated for the parent currently being
+    /// folded (drained into `lost` after each parent, like git's `plost`).
+    plost: Vec<Vec<u8>>,
+    /// `flag` bitset (see module comment).
+    flag: u64,
+    /// `p_lno[n]` = 1-based line number in parent `n` at which a hunk starting
+    /// at this result line begins. Sized `num_parent`.
+    p_lno: Vec<u64>,
+}
+
+/// A single deleted ("lost") line and the set of parents it was removed from.
+struct CdLost {
+    line: Vec<u8>,
+    parent_map: u64,
+}
+
+/// Options controlling the combined-diff body emission.
+pub struct CombinedRenderOptions {
+    /// `--cc` dense simplification (drop hunks the result shares with a parent);
+    /// `-c` (plain combined) leaves it `false`.
+    pub dense: bool,
+    /// Unified-context line count (`-U`, default 3).
+    pub context: usize,
+    /// Line-diff algorithm used for each parent-vs-result 2-way diff.
+    pub algorithm: DiffAlgorithm,
+    /// Whitespace-ignore flags applied to each parent-vs-result 2-way diff and
+    /// to the lost-line coalescing match.
+    pub ws_ignore: WsIgnore,
+}
+
+impl Default for CombinedRenderOptions {
+    fn default() -> Self {
+        Self {
+            dense: true,
+            context: DEFAULT_CONTEXT,
+            algorithm: DiffAlgorithm::Myers,
+            ws_ignore: WsIgnore::default(),
+        }
+    }
+}
+
+/// Render a combined / merge diff body into `out`.
+///
+/// `result` is the merge-result blob; `parents` holds one blob per parent (in
+/// parent order). Returns `true` when at least one hunk survives the
+/// "interesting" filter — the caller uses this to decide whether to print the
+/// metainfo header at all (git only prints `diff --cc <path>` + body when
+/// `show_hunks || mode_differs`).
+///
+/// Mirrors `show_patch_diff`'s body half: build the `sline` array, fold each
+/// parent into it via [`combine_one_parent`], run [`make_hunks`], then
+/// [`dump_sline`].
+pub fn render_combined(out: &mut Vec<u8>, result: &[u8], parents: &[&[u8]]) -> bool {
+    render_combined_with(out, result, parents, &CombinedRenderOptions::default())
+}
+
+/// [`render_combined`] with explicit options.
+pub fn render_combined_with(
+    out: &mut Vec<u8>,
+    result: &[u8],
+    parents: &[&[u8]],
+    options: &CombinedRenderOptions,
+) -> bool {
+    let num_parent = parents.len();
+    debug_assert!(num_parent >= 1);
+
+    // Split the result into lines (without trailing newline), counting an
+    // unterminated final line as its own line — git's `cnt` counts '\n' plus an
+    // incomplete trailing line.
+    let result_lines = split_lines(result);
+    let cnt = result_lines.len();
+
+    // git allocates `cnt + 2` slines: indices `0..cnt-1` are the result lines,
+    // `sline[cnt]` is the trailing sentinel (where end-of-file deletions hang),
+    // and `sline[cnt+1]` carries the per-parent trailer p_lno that
+    // `show_parent_lno` reads for a hunk whose end touches the last line.
+    let mut sline: Vec<CdLine> = Vec::with_capacity(cnt + 2);
+    for line in &result_lines {
+        sline.push(CdLine {
+            bol: line.bytes_without_newline().to_vec(),
+            lost: Vec::new(),
+            plost: Vec::new(),
+            flag: 0,
+            p_lno: vec![0; num_parent],
+        });
+    }
+    for _ in 0..2 {
+        sline.push(CdLine {
+            bol: Vec::new(),
+            lost: Vec::new(),
+            plost: Vec::new(),
+            flag: 0,
+            p_lno: vec![0; num_parent],
+        });
+    }
+
+    // Fold each parent into the sline array. git reuses an earlier parent's
+    // result when two parents have the identical blob (`reuse_combine_diff`);
+    // we replicate that to keep p_lno / flags identical.
+    for n in 0..num_parent {
+        let mut reused = None;
+        for j in 0..n {
+            if parents[j] == parents[n] {
+                reused = Some(j);
+                break;
+            }
+        }
+        match reused {
+            Some(j) => reuse_combine_diff(&mut sline, cnt, n, j),
+            None => combine_one_parent(&mut sline, &result_lines, parents[n], n, options),
+        }
+    }
+
+    let show_hunks = make_hunks(&mut sline, cnt, num_parent, options.dense, options.context);
+    if show_hunks {
+        dump_sline(out, &sline, cnt, num_parent, options.context);
+    }
+    show_hunks
+}
+
+/// Fold one parent's 2-way diff against the result into the `sline` array
+/// (git's `combine_diff` + the consume_hunk/consume_line callbacks).
+fn combine_one_parent(
+    sline: &mut [CdLine],
+    result_lines: &[DiffLine<'_>],
+    parent: &[u8],
+    n: usize,
+    options: &CombinedRenderOptions,
+) {
+    let cnt = result_lines.len();
+    let nmask = 1u64 << n;
+    let parent_lines = split_lines(parent);
+    let ops = myers_diff_lines_ws(&parent_lines, result_lines, options.ws_ignore, options.algorithm);
+
+    // Walk the edit script, tracking the 1-based result line number (`lno`,
+    // git's `state->lno`) and the parent line number (`p_lno`/`ob`). For each
+    // hunk: deletions hang on `lost_bucket`; insertions set the nmask flag on
+    // the result line; the hunk start records the parent line number into
+    // `p_lno[n]` of the result line preceding the hunk.
+    //
+    // git groups the script into hunks (runs separated by Equal context); we
+    // mirror consume_hunk by detecting the boundary at each non-Equal run.
+    let mut old_idx: usize = 0; // 0-based parent line consumed
+    let mut new_idx: usize = 0; // 0-based result line consumed
+    let mut i = 0;
+    while i < ops.len() {
+        match ops[i] {
+            DiffOp::Equal(k) => {
+                old_idx += k;
+                new_idx += k;
+                i += 1;
+            }
+            _ => {
+                // Collect a maximal run of consecutive Delete/Insert ops as one
+                // hunk (git's xdiff emits one @@ hunk per such run).
+                let hunk_old_start = old_idx; // 0-based
+                let hunk_new_start = new_idx; // 0-based
+                let mut dels: Vec<&[u8]> = Vec::new();
+                while i < ops.len() {
+                    match ops[i] {
+                        DiffOp::Delete(k) => {
+                            for _ in 0..k {
+                                dels.push(parent_lines[old_idx].bytes_without_newline());
+                                old_idx += 1;
+                            }
+                            i += 1;
+                        }
+                        DiffOp::Insert(k) => {
+                            new_idx += k;
+                            i += 1;
+                        }
+                        DiffOp::Equal(_) => break,
+                    }
+                }
+                let _ = hunk_old_start;
+
+                // Lost bucket: deletions hang on the result line at the hunk
+                // start (sline[hunk_new_start]). git's distinction between the
+                // additions-present (`nb-1`) and pure-deletion (`nb`) cases
+                // collapses to the same index here because our `hunk_new_start`
+                // is the 0-based result line immediately *after* the preceding
+                // context, matching git's `nb-1` for the additions case and the
+                // bucket-after for the pure-deletion case once the result line
+                // numbering (1-based `nb`) is accounted for. The authoritative
+                // p_lno values are recomputed in the loop below, so we do not
+                // record them here.
+                for d in &dels {
+                    sline[hunk_new_start].plost.push(d.to_vec());
+                }
+                // Mark inserted result lines: flag bit n set => parent n lacked
+                // this line.
+                for r in hunk_new_start..new_idx {
+                    if r < cnt {
+                        sline[r].flag |= nmask;
+                    }
+                }
+            }
+        }
+    }
+
+    // Coalesce the plost lines into lost (git's coalesce_lines), then assign
+    // p_lno numbers per parent — git's second loop in combine_diff.
+    let mut p_lno: u64 = 1;
+    for lno in 0..=cnt {
+        sline[lno].p_lno[n] = p_lno;
+        if !sline[lno].plost.is_empty() {
+            let plost = std::mem::take(&mut sline[lno].plost);
+            coalesce_lost(&mut sline[lno].lost, plost, n, options);
+        }
+        // How many parent lines does this sline advance?
+        for ll in &sline[lno].lost {
+            if ll.parent_map & nmask != 0 {
+                p_lno += 1; // '-' means parent had it
+            }
+        }
+        if lno < cnt && (sline[lno].flag & nmask) == 0 {
+            p_lno += 1; // no '+' means parent had it
+        }
+    }
+    sline[cnt + 1].p_lno[n] = p_lno; // trailer (git's sline[cnt+1])
+}
+
+/// Coalesce a parent's freshly-collected deletions into the line's existing
+/// lost list (git's `coalesce_lines` LCS merge). A deletion that matches an
+/// already-present lost line (under the active whitespace flags) gets its
+/// parent bit OR'd into that line's `parent_map` instead of being added again.
+fn coalesce_lost(base: &mut Vec<CdLost>, newlines: Vec<Vec<u8>>, n: usize, options: &CombinedRenderOptions) {
+    let pmask = 1u64 << n;
+    if newlines.is_empty() {
+        return;
+    }
+    if base.is_empty() {
+        for line in newlines {
+            base.push(CdLost { line, parent_map: pmask });
+        }
+        return;
+    }
+
+    // LCS over (base lines, new lines) by whitespace-aware equality, exactly
+    // like git: MATCH => OR the parent bit into the base line; NEW => insert the
+    // new line at that position; BASE => keep base line as-is.
+    let m = base.len();
+    let k = newlines.len();
+    let mut lcs = vec![vec![0i32; k + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=k {
+            if combined_lines_match(&base[i - 1].line, &newlines[j - 1], options.ws_ignore) {
+                lcs[i][j] = lcs[i - 1][j - 1] + 1;
+            } else if lcs[i][j - 1] >= lcs[i - 1][j] {
+                lcs[i][j] = lcs[i][j - 1];
+            } else {
+                lcs[i][j] = lcs[i - 1][j];
+            }
+        }
+    }
+
+    // Backtrack, building the merged list in reverse.
+    let mut merged: Vec<CdLost> = Vec::with_capacity(m + k);
+    let mut i = m;
+    let mut j = k;
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && combined_lines_match(&base[i - 1].line, &newlines[j - 1], options.ws_ignore) {
+            let mut entry = std::mem::replace(
+                &mut base[i - 1],
+                CdLost { line: Vec::new(), parent_map: 0 },
+            );
+            entry.parent_map |= pmask;
+            merged.push(entry);
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || lcs[i][j - 1] >= lcs[i - 1][j]) {
+            merged.push(CdLost { line: newlines[j - 1].clone(), parent_map: pmask });
+            j -= 1;
+        } else {
+            let entry = std::mem::replace(
+                &mut base[i - 1],
+                CdLost { line: Vec::new(), parent_map: 0 },
+            );
+            merged.push(entry);
+            i -= 1;
+        }
+    }
+    merged.reverse();
+    *base = merged;
+}
+
+/// Whitespace-aware line equality used by the lost-line coalescer
+/// (git's `match_string_spaces`). Only the all-space / space-change flavours
+/// affect the comparison; otherwise it is a byte compare.
+fn combined_lines_match(a: &[u8], b: &[u8], ws: WsIgnore) -> bool {
+    if ws.all_space || ws.space_change || ws.space_at_eol {
+        let at = strip_trailing_ws(a);
+        let bt = strip_trailing_ws(b);
+        if !ws.all_space && !ws.space_change {
+            return at == bt;
+        }
+        return ws_squash_eq(at, bt, ws.space_change);
+    }
+    a == b
+}
+
+fn strip_trailing_ws(s: &[u8]) -> &[u8] {
+    let mut end = s.len();
+    while end > 0 && (s[end - 1] == b' ' || s[end - 1] == b'\t') {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Compare two lines ignoring whitespace runs (`-w`) or treating runs as a
+/// single space (`-b`).
+fn ws_squash_eq(a: &[u8], b: &[u8], change_only: bool) -> bool {
+    let is_ws = |c: u8| c == b' ' || c == b'\t';
+    let (mut ia, mut ib) = (0usize, 0usize);
+    while ia < a.len() && ib < b.len() {
+        let (ca, cb) = (a[ia], b[ib]);
+        if is_ws(ca) || is_ws(cb) {
+            if change_only && (!is_ws(ca) || !is_ws(cb)) {
+                return false;
+            }
+            // For -b, a whitespace run on both sides counts as equal; for -w,
+            // whitespace is skipped entirely. Skip the runs on both sides.
+            if change_only {
+                while ia < a.len() && is_ws(a[ia]) {
+                    ia += 1;
+                }
+                while ib < b.len() && is_ws(b[ib]) {
+                    ib += 1;
+                }
+                continue;
+            } else {
+                if is_ws(ca) {
+                    ia += 1;
+                    continue;
+                }
+                if is_ws(cb) {
+                    ib += 1;
+                    continue;
+                }
+            }
+        }
+        if ca != cb {
+            return false;
+        }
+        ia += 1;
+        ib += 1;
+    }
+    // Consume trailing whitespace.
+    while ia < a.len() && is_ws(a[ia]) {
+        ia += 1;
+    }
+    while ib < b.len() && is_ws(b[ib]) {
+        ib += 1;
+    }
+    ia == a.len() && ib == b.len()
+}
+
+/// git's `reuse_combine_diff`: when parent `i` has the same blob as a
+/// previously-folded parent `j`, copy `j`'s flags / lost parent-bits / p_lno
+/// across instead of re-diffing.
+fn reuse_combine_diff(sline: &mut [CdLine], cnt: usize, i: usize, j: usize) {
+    let imask = 1u64 << i;
+    let jmask = 1u64 << j;
+    for lno in 0..=cnt {
+        sline[lno].p_lno[i] = sline[lno].p_lno[j];
+        for ll in &mut sline[lno].lost {
+            if ll.parent_map & jmask != 0 {
+                ll.parent_map |= imask;
+            }
+        }
+        if sline[lno].flag & jmask != 0 {
+            sline[lno].flag |= imask;
+        }
+    }
+    // The overall trailer (sline[cnt+1]).
+    sline[cnt + 1].p_lno[i] = sline[cnt + 1].p_lno[j];
+}
+
+/// Is this result line "interesting" — does any parent lack it, or does it have
+/// deletions hung in front (git's `interesting`).
+fn cd_interesting(sline: &CdLine, all_mask: u64) -> bool {
+    (sline.flag & all_mask) != 0 || !sline.lost.is_empty()
+}
+
+/// git's `adjust_hunk_tail`.
+fn adjust_hunk_tail(sline: &[CdLine], all_mask: u64, hunk_begin: usize, mut i: usize) -> usize {
+    if hunk_begin + 1 <= i && (sline[i - 1].flag & all_mask) == 0 {
+        i -= 1;
+    }
+    i
+}
+
+/// git's `find_next`.
+fn find_next(
+    sline: &[CdLine],
+    mark: u64,
+    mut i: usize,
+    cnt: usize,
+    look_for_uninteresting: bool,
+) -> usize {
+    while i <= cnt {
+        let marked = (sline[i].flag & mark) != 0;
+        if look_for_uninteresting {
+            if !marked {
+                return i;
+            }
+        } else if marked {
+            return i;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// git's `give_context`: paint context lines (and bridge small gaps) around the
+/// interesting lines, using the `mark` bit. Returns whether any hunk shows.
+fn give_context(sline: &mut [CdLine], cnt: usize, num_parent: usize, context: usize) -> bool {
+    let all_mask = (1u64 << num_parent) - 1;
+    let mark = 1u64 << num_parent;
+    let no_pre_delete = 2u64 << num_parent;
+
+    let mut i = find_next(sline, mark, 0, cnt, false);
+    if cnt < i {
+        return false;
+    }
+
+    while i <= cnt {
+        let mut j = if context < i { i - context } else { 0 };
+        // Paint a few lines before the first interesting line.
+        while j < i {
+            if (sline[j].flag & mark) == 0 {
+                sline[j].flag |= no_pre_delete;
+            }
+            sline[j].flag |= mark;
+            j += 1;
+        }
+
+        loop {
+            // Where does the next uninteresting line start?
+            j = find_next(sline, mark, i, cnt, true);
+            if cnt < j {
+                // The rest are all interesting.
+                return true;
+            }
+            // Lookahead context lines.
+            let k = find_next(sline, mark, j, cnt, false);
+            let j2 = adjust_hunk_tail(sline, all_mask, i, j);
+
+            if k < j2 + context {
+                // Small gap: paint it interesting and continue.
+                let mut jj = j2;
+                while jj < k {
+                    sline[jj].flag |= mark;
+                    jj += 1;
+                }
+                i = k;
+                continue;
+            }
+
+            // No overlap within context: paint the trailing edge a bit.
+            i = k;
+            let kk = if j2 + context < cnt + 1 { j2 + context } else { cnt + 1 };
+            let mut jj = j2;
+            while jj < kk {
+                sline[jj].flag |= mark;
+                jj += 1;
+            }
+            break;
+        }
+    }
+    true
+}
+
+/// git's `make_hunks`: mark interesting lines, run the `--cc` dense
+/// simplification when requested, then `give_context`.
+fn make_hunks(
+    sline: &mut [CdLine],
+    cnt: usize,
+    num_parent: usize,
+    dense: bool,
+    context: usize,
+) -> bool {
+    let all_mask = (1u64 << num_parent) - 1;
+    let mark = 1u64 << num_parent;
+
+    for i in 0..=cnt {
+        if cd_interesting(&sline[i], all_mask) {
+            sline[i].flag |= mark;
+        } else {
+            sline[i].flag &= !mark;
+        }
+    }
+    if !dense {
+        return give_context(sline, cnt, num_parent, context);
+    }
+
+    // Dense simplification: for each marked hunk, drop it when the result
+    // differs from a single parent only (or matches all but one parent the
+    // same way) — git's "interesting" recomputation.
+    let mut i = 0;
+    while i <= cnt {
+        while i <= cnt && (sline[i].flag & mark) == 0 {
+            i += 1;
+        }
+        if cnt < i {
+            break;
+        }
+        let hunk_begin = i;
+        let mut j = i + 1;
+        while j <= cnt {
+            if (sline[j].flag & mark) == 0 {
+                // Look beyond the end for an interesting line within context.
+                let mut la = adjust_hunk_tail(sline, all_mask, hunk_begin, j);
+                la = if la + context < cnt + 1 { la + context } else { cnt + 1 };
+                let mut contin = false;
+                while la > 0 && j <= la - 1 {
+                    la -= 1;
+                    if (sline[la].flag & mark) != 0 {
+                        contin = true;
+                        break;
+                    }
+                }
+                if !contin {
+                    break;
+                }
+                j = la;
+            }
+            j += 1;
+        }
+        let hunk_end = j;
+
+        // Is the hunk "really" interesting? Check whether all changed lines
+        // record the same set of parents.
+        let mut same_diff: u64 = 0;
+        let mut has_interesting = false;
+        let mut jj = i;
+        while jj < hunk_end && !has_interesting {
+            let this_diff = sline[jj].flag & all_mask;
+            if this_diff != 0 {
+                if same_diff == 0 {
+                    same_diff = this_diff;
+                } else if same_diff != this_diff {
+                    has_interesting = true;
+                    break;
+                }
+            }
+            for ll in &sline[jj].lost {
+                if has_interesting {
+                    break;
+                }
+                let td = ll.parent_map;
+                if same_diff == 0 {
+                    same_diff = td;
+                } else if same_diff != td {
+                    has_interesting = true;
+                }
+            }
+            jj += 1;
+        }
+
+        if !has_interesting && same_diff != all_mask {
+            // Not interesting after all: unmark the whole hunk.
+            for x in hunk_begin..hunk_end {
+                sline[x].flag &= !mark;
+            }
+        }
+        i = hunk_end;
+    }
+
+    give_context(sline, cnt, num_parent, context)
+}
+
+/// git's `show_parent_lno`: emit one `-l0,len` column for parent `n`.
+fn show_parent_lno(out: &mut Vec<u8>, sline: &[CdLine], l0: usize, l1: usize, n: usize, null_context: u64) {
+    let a = sline[l0].p_lno[n];
+    let b = sline[l1].p_lno[n];
+    out.extend_from_slice(format!(" -{},{}", a, b - a - null_context).as_bytes());
+}
+
+/// git's `hunk_comment_line` test (used to append a function-context comment
+/// to the `@@@ ... @@@` header).
+fn hunk_comment_line(bol: &[u8]) -> bool {
+    if bol.is_empty() {
+        return false;
+    }
+    let ch = bol[0];
+    ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$'
+}
+
+/// git's `show_line_to_eol`: emit a line, preserving a trailing CR. The bytes
+/// here never include the newline; we add it.
+fn show_line_to_eol(out: &mut Vec<u8>, line: &[u8]) {
+    let saw_cr = line.last() == Some(&b'\r');
+    if saw_cr {
+        out.extend_from_slice(&line[..line.len() - 1]);
+        out.push(b'\r');
+    } else {
+        out.extend_from_slice(line);
+    }
+    out.push(b'\n');
+}
+
+/// git's `dump_sline`: emit the combined-diff hunk bodies for all marked hunks.
+fn dump_sline(out: &mut Vec<u8>, sline: &[CdLine], cnt: usize, num_parent: usize, context: usize) {
+    let mark = 1u64 << num_parent;
+    let no_pre_delete = 2u64 << num_parent;
+    let mut lno: usize = 0;
+
+    loop {
+        let mut hunk_comment: Option<&[u8]> = None;
+        while lno <= cnt && (sline[lno].flag & mark) == 0 {
+            if hunk_comment_line(&sline[lno].bol) {
+                hunk_comment = Some(&sline[lno].bol);
+            }
+            lno += 1;
+        }
+        if cnt < lno {
+            break;
+        }
+        let mut hunk_end = lno + 1;
+        while hunk_end <= cnt {
+            if (sline[hunk_end].flag & mark) == 0 {
+                break;
+            }
+            hunk_end += 1;
+        }
+
+        let mut rlines = (hunk_end - lno) as u64;
+        if cnt < hunk_end {
+            rlines -= 1; // pointing at the last delete hunk
+        }
+
+        let mut null_context: u64 = 0;
+        if context == 0 {
+            // --unified=0: count the all-blank-context result lines so the
+            // header line counts exclude them.
+            for sl in sline.iter().take(hunk_end).skip(lno) {
+                if (sl.flag & (mark - 1)) == 0 {
+                    null_context += 1;
+                }
+            }
+            rlines -= null_context;
+        }
+
+        // Header: `@@@`... (num_parent+1 markers), one -l,c column per parent,
+        // ` +out_start,out_len `, num_parent+1 markers again.
+        for _ in 0..=num_parent {
+            out.push(b'@');
+        }
+        for i in 0..num_parent {
+            show_parent_lno(out, sline, lno, hunk_end, i, null_context);
+        }
+        out.extend_from_slice(format!(" +{},{} ", lno + 1, rlines).as_bytes());
+        for _ in 0..=num_parent {
+            out.push(b'@');
+        }
+
+        if let Some(comment) = hunk_comment {
+            let mut comment_end = 0;
+            for (idx, &ch) in comment.iter().take(40).enumerate() {
+                if ch == b'\n' {
+                    break;
+                }
+                if !ch.is_ascii_whitespace() {
+                    comment_end = idx + 1;
+                }
+            }
+            if comment_end != 0 {
+                out.push(b' ');
+                out.extend_from_slice(&comment[..comment_end]);
+            }
+        }
+        out.push(b'\n');
+
+        // Body.
+        while lno < hunk_end {
+            let sl = &sline[lno];
+            lno += 1;
+            // Lost (deleted) lines hung before this result line.
+            if (sl.flag & no_pre_delete) == 0 {
+                for ll in &sl.lost {
+                    for j in 0..num_parent {
+                        if ll.parent_map & (1u64 << j) != 0 {
+                            out.push(b'-');
+                        } else {
+                            out.push(b' ');
+                        }
+                    }
+                    show_line_to_eol(out, &ll.line);
+                }
+            }
+            if cnt < lno {
+                break;
+            }
+            if (sl.flag & (mark - 1)) == 0 {
+                // This sline only existed to hang the lost lines in front.
+                if context == 0 {
+                    continue;
+                }
+            }
+            let mut p_mask = 1u64;
+            for _ in 0..num_parent {
+                if p_mask & sl.flag != 0 {
+                    out.push(b'+');
+                } else {
+                    out.push(b' ');
+                }
+                p_mask <<= 1;
+            }
+            show_line_to_eol(out, &sl.bol);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
