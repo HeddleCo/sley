@@ -342,6 +342,213 @@ fn status_porcelain_v2_tracked_changes_match_upstream_git() {
 }
 
 #[test]
+fn status_tracked_file_replaced_by_directory_matches_upstream_git() {
+    let root = unique_temp_dir("status-tracked-file-replaced-by-directory");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("path"), b"base\n").expect("write tracked file");
+        git(&root, &["add", "path"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::remove_file(root.join("path")).expect("remove tracked file");
+        fs::create_dir(root.join("path")).expect("create replacement directory");
+        fs::write(root.join("path").join("child"), b"untracked\n")
+            .expect("write child under replacement directory");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--short", "--untracked-files=all"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=v2", "--untracked-files=all"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn status_tracked_directory_replaced_by_file_matches_upstream_git() {
+    let root = unique_temp_dir("status-tracked-directory-replaced-by-file");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::create_dir(root.join("dir")).expect("create tracked directory");
+        fs::write(root.join("dir").join("file"), b"base\n").expect("write tracked file");
+        git(&root, &["add", "dir/file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::remove_dir_all(root.join("dir")).expect("remove tracked directory");
+        fs::write(root.join("dir"), b"replacement\n").expect("write replacement file");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--short", "--untracked-files=all"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=v2", "--untracked-files=all"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn status_ignored_directory_rollup_and_negation_match_upstream_git() {
+    let root = unique_temp_dir("status-ignored-directory-rollup-negation");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join(".gitignore"), b"ignored/*\n!ignored/keep.txt\nrollup/\n")
+            .expect("write ignore file");
+        git(&root, &["add", ".gitignore"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "ignore",
+                "-q",
+            ],
+        );
+
+        fs::create_dir_all(root.join("ignored")).expect("create ignored directory");
+        fs::write(root.join("ignored").join("drop.log"), b"ignored\n").expect("write ignored");
+        fs::write(root.join("ignored").join("keep.txt"), b"kept\n").expect("write kept");
+        fs::create_dir_all(root.join("rollup")).expect("create rollup directory");
+        fs::write(root.join("rollup").join("file.log"), b"ignored\n").expect("write rollup");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--short", "--ignored"],
+            vec!["status", "--short", "--ignored=matching"],
+            vec!["status", "--porcelain=v2", "--ignored"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn status_nested_repository_boundary_matches_upstream_git() {
+    let root = unique_temp_dir("status-nested-repository-boundary");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked file");
+        git(&root, &["add", "tracked.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested repo");
+        git(&nested, &["init", "-q", "-b", "main"]);
+        fs::write(nested.join("file.txt"), b"nested\n").expect("write nested file");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--short", "--untracked-files=all"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=v2", "--untracked-files=all"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn status_skip_worktree_untracked_modes_match_upstream_git() {
+    let root = unique_temp_dir("status-skip-worktree-untracked");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(root.join("sparse")).expect("create sparse directory");
+        fs::write(root.join("sparse").join("file.txt"), b"tracked\n")
+            .expect("write tracked file");
+        git(&root, &["add", "sparse/file.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+        git(&root, &["update-index", "--skip-worktree", "sparse/file.txt"]);
+        fs::write(root.join("sparse").join("extra.txt"), b"extra\n")
+            .expect("write untracked file");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--short", "--untracked-files=no"],
+            vec!["status", "--short", "--untracked-files=all"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=v2", "--untracked-files=all"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn status_long_matches_upstream_git() {
     let root = unique_temp_dir("status-long");
     fs::create_dir_all(&root).expect("create temp repo");
