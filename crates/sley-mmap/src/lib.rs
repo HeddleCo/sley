@@ -1,8 +1,8 @@
 //! The single, isolated home for sley's only `unsafe`: read-only memory maps of
 //! immutable git files. Every other crate in the workspace keeps
 //! `unsafe_code = "forbid"`; this crate exists so that the one unavoidable unsafe
-//! call (mapping a file) lives behind a small, audited, safe API instead of being
-//! scattered.
+//! call (mapping a file) lives behind a small, audited, safe API instead of
+//! being scattered.
 //!
 //! # Why mmap is `unsafe`
 //!
@@ -12,12 +12,13 @@
 //!
 //! # Safety invariant sley relies on
 //!
-//! sley only maps git files that are written by atomic rename of a fully-written
-//! temporary and are never truncated or rewritten in place: pack/index files and
-//! commit-graph files. A repack/gc or commit-graph write replaces the file by
-//! writing a new one and renaming it into place, and unlinking a still-mapped file
-//! keeps the inode (and the mapping) valid on Unix. So the backing bytes never
-//! shrink under a live map, which is the condition `Mmap::map` requires.
+//! sley only maps git files that are written by atomic rename of a
+//! fully-written temporary and are never truncated or rewritten in place:
+//! pack/index files, multi-pack-index files, and commit-graph files. A repack/gc
+//! or commit-graph write replaces the file by writing a new one and renaming it
+//! into place, and unlinking a still-mapped file keeps the inode (and the
+//! mapping) valid on Unix. So the backing bytes never shrink under a live map,
+//! which is the condition `Mmap::map` requires.
 
 use std::fs::File;
 use std::io;
@@ -87,6 +88,31 @@ impl MappedFile {
         }
         // SAFETY: `path` is a git pack file, which sley writes atomically and never
         // mutates in place (see the doc comment), so the mapped bytes stay valid.
+        unsafe { Self::open(path) }
+    }
+
+    /// Memory-map a git **multi-pack-index** file read-only.
+    ///
+    /// Git writes the `objects/pack/multi-pack-index` file by creating a new file
+    /// and atomically renaming it into place rather than mutating it in place.
+    /// This keeps already-mapped bytes stable for readers. Symlinks and
+    /// non-regular files are rejected.
+    pub fn open_multi_pack_index(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-pack-index path is not a regular file",
+            ));
+        }
+        if path.file_name().and_then(|name| name.to_str()) != Some("multi-pack-index") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-pack-index path must be named multi-pack-index",
+            ));
+        }
+        // SAFETY: git replaces multi-pack-index files atomically; it does not
+        // truncate or rewrite them while readers hold the old inode.
         unsafe { Self::open(path) }
     }
 
@@ -173,6 +199,21 @@ mod tests {
         let err = MappedFile::open_pack(&path).expect_err("reject non-pack path");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn maps_multi_pack_index_name() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("sley-mmap-midx-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("multi-pack-index");
+        {
+            let mut file = std::fs::File::create(&path).expect("create temp file");
+            file.write_all(b"MIDX bytes").expect("write payload");
+        }
+        let mapped = MappedFile::open_multi_pack_index(&path).expect("map multi-pack-index");
+        assert_eq!(mapped.as_bytes(), b"MIDX bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -2363,6 +2363,19 @@ fn load_pack_index_data(index_path: &Path) -> Result<Arc<dyn PackIndexByteSource
     Ok(Arc::new(fs::read(index_path)?))
 }
 
+#[cfg(feature = "mmap")]
+fn load_multi_pack_index_lookup_data(midx_path: &Path) -> Result<Arc<dyn PackIndexByteSource>> {
+    match sley_mmap::MappedFile::open_multi_pack_index(midx_path) {
+        Ok(mapped) => Ok(Arc::new(mapped)),
+        Err(_) => Ok(Arc::new(fs::read(midx_path)?)),
+    }
+}
+
+#[cfg(not(feature = "mmap"))]
+fn load_multi_pack_index_lookup_data(midx_path: &Path) -> Result<Arc<dyn PackIndexByteSource>> {
+    Ok(Arc::new(fs::read(midx_path)?))
+}
+
 /// Memory-capped LRU of recently decoded objects, shared across cloned handles,
 /// so hot delta bases and repeated reads during a walk aren't re-decoded. The
 /// cache is bounded by an approximate byte budget (not a fixed object count) so
@@ -3575,7 +3588,8 @@ impl FileObjectDatabase {
         let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
-        self.read_packed_object_at_lookup(oid, &pack_lookup).map(Some)
+        self.read_packed_object_at_lookup(oid, &pack_lookup)
+            .map(Some)
     }
 
     fn read_packed_object_at_lookup(
@@ -3700,7 +3714,7 @@ impl FileObjectDatabase {
         {
             return Ok(Some(Arc::clone(midx)));
         }
-        let bytes = Arc::new(fs::read(midx_path)?);
+        let bytes = load_multi_pack_index_lookup_data(midx_path)?;
         let midx = Arc::new(MultiPackIndexOidLookup::parse(bytes, self.format)?);
         if let Ok(mut cache) = self.multi_pack_oid_lookups.lock() {
             cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
@@ -4034,7 +4048,11 @@ fn scan_pack_registry(pack_dir: &Path, _format: ObjectFormat) -> Result<PackRegi
             continue;
         };
         let modified = pack_sort_modified(&metadata);
-        packs.push((modified, metadata.len(), Arc::new(RegisteredPack::new(idx, pack))));
+        packs.push((
+            modified,
+            metadata.len(),
+            Arc::new(RegisteredPack::new(idx, pack)),
+        ));
     }
     // Git keeps a most-recently-used pack order; seed ours with newer/larger
     // packs before falling back to the path. In repositories with many packs,
@@ -4600,9 +4618,7 @@ impl LooseObjectStore {
             // type yields `unable to parse type from header '<header>'`, while a
             // genuinely malformed header yields `unable to parse header`.
             if let Some(header) = loose_header_with_unknown_type(&framed) {
-                eprintln!(
-                    "error: unable to parse type from header '{header}' of {display_path}"
-                );
+                eprintln!("error: unable to parse type from header '{header}' of {display_path}");
             } else {
                 eprintln!("error: unable to parse header of {display_path}");
             }
