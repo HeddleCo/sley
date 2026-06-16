@@ -356,8 +356,15 @@ pub(crate) fn run_add_patch(
     let mut file_idx = 0;
     let nfiles = files.len();
     while file_idx < nfiles {
-        patch_update_file(&mut files[file_idx], stdin, cfg)?;
+        let quit = patch_update_file(&mut files[file_idx], stdin, cfg)?;
         file_idx += 1;
+        if quit {
+            // `q` aborts the whole session: the current file's already-decided
+            // hunks are still applied below (their use flags are set), but no
+            // further files are visited, so their hunks stay Undecided and are
+            // skipped by the apply pass.
+            break;
+        }
     }
 
     // Apply: for each file, reconstruct the index blob with USE_HUNK hunks and
@@ -416,13 +423,14 @@ fn build_suffix(
 }
 
 /// The per-file decision loop.
-fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConfig) -> Result<()> {
+fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConfig) -> Result<bool> {
     if fd.hunks.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut hunk_index = 0usize;
     let mut rendered: Option<usize> = None;
     let mut pending_err: Option<String> = None;
+    let mut quit = false;
 
     // The file's diff header (`diff --git ...`) is printed exactly once on entry.
     render_file_header(fd);
@@ -490,10 +498,11 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
         let line = match read_line(stdin) {
             Some(l) => l,
             None => {
-                // On EOF at the prompt git terminates the line it was waiting on
-                // with a newline, so the captured output ends in `...]? \n`.
-                println!();
-                return Ok(());
+                // EOF at the prompt: git's read_single_character returns EOF and
+                // breaks the loop, falling through to the single trailing
+                // `putchar('\n')` at function end. We do the same — break out and
+                // let the common tail print exactly one newline.
+                break;
             }
         };
         if line.is_empty() {
@@ -557,8 +566,12 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
                 }
             }
             'q' => {
-                // Mark all remaining undecided as skip and stop.
-                return Ok(());
+                // Mark all remaining undecided as skip and stop. git sets
+                // patch_update_resp = file_diff_nr and breaks, hitting the common
+                // trailing newline. We signal "quit the whole session" to the
+                // caller via the return flag below.
+                quit = true;
+                break;
             }
             'k' if ch == 'k' => {
                 if let Some(p) = undecided_prev {
@@ -650,7 +663,11 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
             }
         }
     }
-    Ok(())
+    // git's patch_update_file always ends with a single `putchar('\n')` after
+    // the decision loop (and after apply, in auto-advance mode). Mirror that so
+    // every file's prompt block is newline-terminated.
+    println!();
+    Ok(quit)
 }
 
 fn read_line(stdin: &mut impl BufRead) -> Option<String> {
