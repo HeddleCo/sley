@@ -18,6 +18,12 @@ struct IndexPackOptions {
     /// `--index-version=<n>` (or `<n>,<offset-threshold>`); `1` writes a v1
     /// `.idx`, anything else keeps the v2 default.
     index_version: Option<u32>,
+    /// `--strict` / `--fsck-objects`: fsck every packed object and report
+    /// content findings. The optional `=<msg-id>=<severity>...` suffix carries
+    /// severity overrides (e.g. `missingEmail=ignore`).
+    fsck: bool,
+    /// Raw `<msg-id>=<severity>` override tokens from `--strict=`/`--fsck-objects=`.
+    fsck_overrides: Vec<String>,
 }
 
 pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
@@ -28,6 +34,15 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     if options.stdin {
         let mut pack = Vec::new();
         io::stdin().read_to_end(&mut pack)?;
+        // `index-pack -v` reports two phases on stderr: receiving the pack and
+        // resolving deltas (builtin/index-pack.c start_progress messages). The
+        // object count is the pack header's 32-bit big-endian field at bytes
+        // 8..12.
+        if options.verbose && pack.len() >= 12 {
+            let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
+            eprintln!("Receiving objects: 100% ({count}/{count}), done.");
+            eprintln!("Resolving deltas: 100% ({count}/{count}), done.");
+        }
         let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let install = db.install_raw_pack(&pack)?;
         if options.keep {
@@ -47,6 +62,14 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     };
     let pack = fs::read(&pack_file)?;
     let indexed = PackFile::index_pack(&pack, format)?;
+    // `--strict` / `--fsck-objects`: fsck every object the pack carries and
+    // report content findings, mirroring index-pack.c's fsck_finish pass.
+    if options.fsck {
+        let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
+        if exit != 0 {
+            return Err(GitError::Exit(exit));
+        }
+    }
     if options.verify {
         return Ok(());
     }
@@ -89,6 +112,8 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         fix_thin: false,
         pack_file: None,
         index_version: None,
+        fsck: false,
+        fsck_overrides: Vec::new(),
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -128,11 +153,17 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             "--threads" => {
                 let _ = iter.next();
             }
-            value
-                if value.starts_with("--strict")
-                    || value.starts_with("--fsck-objects")
-                    || value.starts_with("--threads=")
-                    || value.starts_with("--pack_header=") => {}
+            "--strict" | "--fsck-objects" => options.fsck = true,
+            value if value.starts_with("--strict=") || value.starts_with("--fsck-objects=") => {
+                options.fsck = true;
+                let spec = value.split_once('=').map(|(_, rest)| rest).unwrap_or("");
+                for token in spec.split(',') {
+                    if !token.is_empty() {
+                        options.fsck_overrides.push(token.to_string());
+                    }
+                }
+            }
+            value if value.starts_with("--threads=") || value.starts_with("--pack_header=") => {}
             value if value.starts_with('-') => return index_pack_usage(),
             value => index_pack_add_pack_file(&mut options, value)?,
         }
@@ -152,6 +183,57 @@ fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Resu
     }
     options.pack_file = Some(PathBuf::from(value));
     Ok(())
+}
+
+/// fsck every object carried by `pack_bytes`, printing content findings in
+/// git's `index-pack --strict` format (`warning: object <oid>: <id>: <detail>`
+/// / `error: object <oid>: <id>: <detail>`). Returns the process exit code: 0
+/// when no error-severity finding fired, 1 otherwise. Warnings never fail the
+/// command, matching builtin/index-pack.c's fsck pass (which leaves the default
+/// severities intact rather than applying the connectivity `--strict` promote).
+fn fsck_pack_objects(pack_bytes: &[u8], format: ObjectFormat, overrides: &[String]) -> Result<i32> {
+    let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
+        Ok(pack) => pack,
+        // A pack that does not even parse is reported by the index step; the
+        // fsck pass simply has nothing to inspect.
+        Err(_) => return Ok(0),
+    };
+
+    let mut severity = sley_fsck::content::SeverityConfig::new(false);
+    for token in overrides {
+        if let Some((id, value)) = token.split_once('=') {
+            severity.set(id, value);
+        }
+    }
+
+    let mut had_error = false;
+    for object in &pack.entries {
+        let findings = sley_fsck::content::check_object_content(
+            object.object.object_type,
+            &object.object.body,
+            &severity,
+        );
+        for finding in findings {
+            let label = match finding.severity {
+                sley_fsck::content::Severity::Error => "error",
+                sley_fsck::content::Severity::Warn => "warning",
+                sley_fsck::content::Severity::Ignore => continue,
+            };
+            if let Some(raw) = &finding.raw_stderr {
+                eprintln!("error: {raw}");
+            }
+            eprintln!(
+                "{label}: object {}: {}: {}",
+                object.entry.oid,
+                finding.msg_id.camel(),
+                finding.detail
+            );
+            if matches!(finding.severity, sley_fsck::content::Severity::Error) {
+                had_error = true;
+            }
+        }
+    }
+    Ok(if had_error { 1 } else { 0 })
 }
 
 fn write_index_pack_output(path: &Path, index: &[u8]) -> Result<()> {
