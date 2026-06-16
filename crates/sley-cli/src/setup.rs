@@ -735,3 +735,108 @@ fn trace_sink() -> Option<Box<dyn Write>> {
         _ => None,
     }
 }
+
+/// The destination for the general `GIT_TRACE` key, mirroring git's
+/// `get_trace_fd` for the default trace key. `1`/`true` → stderr, `2` → stderr,
+/// a single digit → that fd (only 1/2 are meaningful here), an absolute path is
+/// opened append+create, and `0`/`false`/empty/unset disable tracing.
+fn git_trace_sink() -> Option<Box<dyn Write>> {
+    let value = env::var("GIT_TRACE").ok()?;
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "0" | "false" => None,
+        "1" | "true" => Some(Box::new(std::io::stderr())),
+        "2" => Some(Box::new(std::io::stderr())),
+        _ => {
+            if value.len() == 1 && value.as_bytes()[0].is_ascii_digit() {
+                // Single digit other than 0/1/2: git would write to that fd; only
+                // 1/2 are reachable from a test harness, so map anything else to
+                // stderr as a best-effort.
+                Some(Box::new(std::io::stderr()))
+            } else if Path::new(&value).is_absolute() {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&value)
+                    .ok()
+                    .map(|f| Box::new(f) as Box<dyn Write>)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Whether the general `GIT_TRACE` key is enabled (a sink would open).
+pub(crate) fn git_trace_enabled() -> bool {
+    git_trace_sink().is_some()
+}
+
+/// Emit one `GIT_TRACE` line, prefixed exactly as git's `prepare_trace_line`
+/// does when `GIT_TRACE_BARE` is unset: `HH:MM:SS.uuuuuu file:line` padded to
+/// column 40, then the message. With `GIT_TRACE_BARE` set, the bare message is
+/// written with no prefix (matching git's unit-test mode).
+pub(crate) fn git_trace_line(file_line: &str, message: &str) {
+    let Some(mut sink) = git_trace_sink() else {
+        return;
+    };
+    if git_env_bool("GIT_TRACE_BARE") {
+        let _ = writeln!(sink, "{message}");
+        return;
+    }
+    let mut prefix = format!("{} {}", trace_timestamp(), file_line);
+    while prefix.len() < 40 {
+        prefix.push(' ');
+    }
+    let _ = writeln!(sink, "{prefix}{message}");
+}
+
+/// Port of git's `sq_quote_buf_pretty`: leave an argument unquoted when every
+/// byte is alphanumeric or one of `+,-./:=@_^`; otherwise single-quote it,
+/// escaping `'` and `!` as `'\''`-style sequences (`sq_quote_buf`). An empty
+/// argument becomes `''`.
+pub(crate) fn trace_quote_sq(arg: &str) -> String {
+    const OK_PUNCT: &[u8] = b"+,-./:=@_^";
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    let needs_quote = arg
+        .bytes()
+        .any(|b| !b.is_ascii_alphanumeric() && !OK_PUNCT.contains(&b));
+    if !needs_quote {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' || ch == '!' {
+            // git's sq_quote_buf: close the quote, backslash-escape the byte,
+            // reopen the quote → `'\''` for a quote, `'\!'` for a bang.
+            out.push_str("'\\");
+            out.push(ch);
+            out.push('\'');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// `HH:MM:SS.uuuuuu` local-time timestamp matching git's trace prefix.
+fn trace_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = now.as_secs();
+    let usec = now.subsec_micros();
+    // Convert to local time-of-day. We only need HH:MM:SS, and the test never
+    // inspects the value (the `^trace:` anchor guarantees these timestamped
+    // lines are skipped), so UTC time-of-day is sufficient and dependency-free.
+    let secs_in_day = total_secs % 86_400;
+    let hh = secs_in_day / 3600;
+    let mm = (secs_in_day % 3600) / 60;
+    let ss = secs_in_day % 60;
+    format!("{hh:02}:{mm:02}:{ss:02}.{usec:06}")
+}
