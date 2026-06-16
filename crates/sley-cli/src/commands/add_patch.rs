@@ -458,17 +458,30 @@ pub(crate) fn run_add_patch(
         return Ok(());
     }
 
-    let mut file_idx = 0;
     let nfiles = files.len();
-    while file_idx < nfiles {
-        let quit = patch_update_file(&mut files[file_idx], stdin, &cfg)?;
-        file_idx += 1;
-        if quit {
-            // `q` aborts the whole session: the current file's already-decided
-            // hunks are still applied below (their use flags are set), but no
-            // further files are visited, so their hunks stay Undecided and are
-            // skipped by the apply pass.
+    let mut file_idx = 0usize;
+    loop {
+        if file_idx >= nfiles {
             break;
+        }
+        let nav = patch_update_file(&mut files[file_idx], stdin, &cfg, file_idx, nfiles)?;
+        match nav {
+            FileNav::Quit => {
+                // `q` aborts the whole session: the current file's already-decided
+                // hunks are still applied below (their use flags are set), but no
+                // further files are visited.
+                break;
+            }
+            FileNav::Next => {
+                // Default auto-advance + `>` both move forward; off the last file
+                // they end the session.
+                file_idx += 1;
+            }
+            FileNav::Prev => {
+                // `<` (only in --no-auto-advance): go to the previous file, or stay
+                // on the first (git errs "No previous file" inside the loop).
+                file_idx = file_idx.saturating_sub(1);
+            }
         }
     }
 
@@ -530,15 +543,33 @@ fn build_suffix(
     s
 }
 
+/// How the per-file decision loop wants the outer file loop to proceed.
+enum FileNav {
+    /// Move to the next file (auto-advance completion, `>`, or EOF).
+    Next,
+    /// Move to the previous file (`<`, only in --no-auto-advance).
+    Prev,
+    /// `q`: abort the whole session.
+    Quit,
+}
+
 /// The per-file decision loop.
-fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchConfig) -> Result<bool> {
+fn patch_update_file(
+    fd: &mut FileDiff,
+    stdin: &mut impl BufRead,
+    cfg: &PatchConfig,
+    file_idx: usize,
+    nfiles: usize,
+) -> Result<FileNav> {
     if fd.hunks.is_empty() {
-        return Ok(false);
+        return Ok(FileNav::Next);
     }
     let mut hunk_index = 0usize;
     let mut rendered: Option<usize> = None;
     let mut pending_err: Option<String> = None;
-    let mut quit = false;
+    // The directive returned to the outer file loop. Defaults to `Next` (the file
+    // is fully decided / EOF); `q` sets Quit; `>`/`<` set Next/Prev.
+    let mut nav = FileNav::Next;
     // In `--no-auto-advance` mode the loop does NOT exit when every hunk is
     // decided — it keeps prompting (so the user can revisit decisions), and the
     // `?` help then shows a HUNKS SUMMARY. In the default auto-advance mode the
@@ -613,7 +644,7 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
         } else {
             prompt_hunk()
         };
-        let suffix = build_suffix(fd, hunk_index, undecided_next, undecided_prev, cfg, 1);
+        let suffix = build_suffix(fd, hunk_index, undecided_next, undecided_prev, cfg, nfiles);
         let was = match fd.hunks[hunk_index].use_hunk {
             HunkUse::Use => " (was: y)",
             HunkUse::Skip => " (was: n)",
@@ -700,9 +731,25 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
                 // Mark all remaining undecided as skip and stop. git sets
                 // patch_update_resp = file_diff_nr and breaks, hitting the common
                 // trailing newline. We signal "quit the whole session" to the
-                // caller via the return flag below.
-                quit = true;
+                // caller via the return directive below.
+                nav = FileNav::Quit;
                 break;
+            }
+            '>' if !cfg.auto_advance => {
+                // Manual advance to the next file (only with --no-auto-advance and
+                // more than one file). git errs "No next file" on the last one.
+                if nfiles > 1 && file_idx + 1 < nfiles {
+                    nav = FileNav::Next;
+                    break;
+                }
+                pending_err = Some("No next file\n".to_string());
+            }
+            '<' if !cfg.auto_advance => {
+                if nfiles > 1 && file_idx > 0 {
+                    nav = FileNav::Prev;
+                    break;
+                }
+                pending_err = Some("No previous file\n".to_string());
             }
             'k' if ch == 'k' => {
                 if let Some(p) = undecided_prev {
@@ -790,7 +837,7 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
                                 }
                                 EditResult::Eof => {
                                     println!();
-                                    return Ok(false);
+                                    return Ok(FileNav::Quit);
                                 }
                             }
                         }
@@ -842,7 +889,7 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
     // the decision loop (and after apply, in auto-advance mode). Mirror that so
     // every file's prompt block is newline-terminated.
     println!();
-    Ok(quit)
+    Ok(nav)
 }
 
 fn read_line(stdin: &mut impl BufRead) -> Option<String> {
