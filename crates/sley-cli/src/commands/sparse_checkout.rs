@@ -61,6 +61,10 @@ struct SparseContext {
     git_dir: PathBuf,
     worktree_root: PathBuf,
     format: ObjectFormat,
+    /// The repo-relative path from the worktree top to the user's cwd, with a
+    /// trailing `/` (git's `prefix`), or empty at the top level. Cone-mode
+    /// directory arguments are resolved against this.
+    prefix: Vec<u8>,
 }
 
 pub(crate) fn cmd_sparse_checkout(args: &[String]) -> Result<()> {
@@ -184,10 +188,13 @@ fn cmd_sparse_set(args: &[String]) -> Result<()> {
             }
         }
     };
+    // Resolve a subdirectory prefix into the directory arguments (cone) or
+    // reject a non-cone invocation from a subdir, before any validation.
+    let patterns = sanitize_set_paths(&ctx, &parsed.patterns, cone_mode, parsed.skip_checks)?;
     // Validate and serialize the new pattern file before mutating any state, so a
     // rejected pattern (e.g. a leading slash in cone mode) leaves the config and
     // pattern file untouched.
-    let content = build_pattern_content(cone_mode, &parsed.patterns, parsed.skip_checks)?;
+    let content = build_pattern_content(cone_mode, &patterns, parsed.skip_checks)?;
     enable_sparse_checkout(&ctx, cone_mode)?;
     apply_sparse_index_flag(&ctx, parsed.sparse_index)?;
     write_sparse_file(&ctx, &content)?;
@@ -205,19 +212,22 @@ fn cmd_sparse_add(args: &[String]) -> Result<()> {
     // `add` does not accept the cone toggles (they are not in its option set).
     let parsed = parse_set_like(args, ADD_HELP, false)?;
     let cone_mode = sparse_cone_enabled(&ctx)?;
+    // Resolve a subdir prefix into the directory arguments (cone) or reject the
+    // non-cone-from-subdir case, exactly like `set`.
+    let new_patterns = sanitize_set_paths(&ctx, &parsed.patterns, cone_mode, parsed.skip_checks)?;
     let existing = read_sparse_patterns(&ctx)?.unwrap_or_default();
     // Build (and validate) the merged pattern file before writing anything.
     let content = if cone_mode {
         // Recover the directory set from the existing cone file and union it with
         // the new directories, then regenerate.
         let mut dirs = cone_list_entries(&existing);
-        for pattern in &parsed.patterns {
+        for pattern in &new_patterns {
             dirs.push(validate_cone_dir(pattern, parsed.skip_checks)?);
         }
         build_cone_file(&dirs)
     } else {
         let mut lines = existing;
-        for pattern in &parsed.patterns {
+        for pattern in &new_patterns {
             lines.push(pattern.clone());
         }
         serialize_noncone_lines(&lines)
@@ -691,6 +701,101 @@ fn build_pattern_content(
     }
 }
 
+/// Applies git's `sanitize_paths` to the user's `set`/`add` arguments:
+///
+/// * In cone mode, a non-empty `prefix` (the command was run from a subdir) is
+///   prepended to every argument and `..` components are resolved, so
+///   `git -C sub sparse-checkout set ../foo bar` records `foo` and `sub/bar`.
+/// * In non-cone mode, running from a subdirectory is an error.
+///
+/// Returns the prefixed argument list (cone) or the originals (non-cone, top).
+fn sanitize_set_paths(
+    ctx: &SparseContext,
+    args: &[Vec<u8>],
+    cone_mode: bool,
+    skip_checks: bool,
+) -> Result<Vec<Vec<u8>>> {
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefix = &ctx.prefix;
+    let resolved: Vec<Vec<u8>> = if cone_mode && !prefix.is_empty() {
+        args.iter().map(|arg| prefix_path(prefix, arg)).collect()
+    } else {
+        args.to_vec()
+    };
+
+    if skip_checks {
+        return Ok(resolved);
+    }
+
+    if !cone_mode && !prefix.is_empty() {
+        eprintln!("fatal: please run from the toplevel directory in non-cone mode");
+        return Err(GitError::Exit(128));
+    }
+
+    // Reject (cone) or warn (non-cone) when an argument names a *tracked file*
+    // rather than a directory — git's index_name_pos / S_ISSPARSEDIR check.
+    let tracked = tracked_file_paths(ctx)?;
+    for arg in &resolved {
+        if tracked.contains(arg.as_slice()) {
+            if cone_mode {
+                eprintln!(
+                    "fatal: '{}' is not a directory; to treat it as a directory anyway, rerun with --skip-checks",
+                    String::from_utf8_lossy(arg)
+                );
+                return Err(GitError::Exit(128));
+            }
+            eprintln!(
+                "warning: pass a leading slash before paths such as '{}' if you want a single file (see NON-CONE PROBLEMS in the git-sparse-checkout manual).",
+                String::from_utf8_lossy(arg)
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+/// Collects the set of tracked (stage-0) file paths in the index, used by
+/// `sanitize_set_paths` to detect a directory argument that is actually a file.
+fn tracked_file_paths(ctx: &SparseContext) -> Result<std::collections::HashSet<Vec<u8>>> {
+    use std::collections::HashSet;
+    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let mut set = HashSet::new();
+    if !index_path.exists() {
+        return Ok(set);
+    }
+    let bytes = fs::read(&index_path)?;
+    Index::for_each_path(&bytes, ctx.format, |path| {
+        set.insert(path.to_vec());
+        Ok(())
+    })?;
+    Ok(set)
+}
+
+/// Resolves a path argument against `prefix` (a worktree-relative directory with
+/// a trailing `/`), collapsing `.` and `..` components, mirroring git's
+/// `prefix_path`. An absolute argument (leading `/`) is returned unchanged so
+/// the cone validator can later reject it.
+fn prefix_path(prefix: &[u8], arg: &[u8]) -> Vec<u8> {
+    if arg.first() == Some(&b'/') {
+        return arg.to_vec();
+    }
+    // Join prefix + arg, then normalize the component stack.
+    let mut joined = prefix.to_vec();
+    joined.extend_from_slice(arg);
+    let mut stack: Vec<&[u8]> = Vec::new();
+    for component in joined.split(|byte| *byte == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    stack.join(&b"/"[..])
+}
+
 /// Validates and normalizes one cone-mode directory argument: leading/trailing
 /// slashes are stripped, and (unless `--skip-checks`) a leading slash is rejected
 /// the way upstream rejects "patterns" passed where a directory is expected.
@@ -911,11 +1016,33 @@ fn sparse_context() -> Result<SparseContext> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = require_work_tree(&git_dir)?;
+    let prefix = sparse_prefix(&worktree_root)?;
     Ok(SparseContext {
         git_dir,
         worktree_root,
         format,
+        prefix,
     })
+}
+
+/// Computes git's `prefix`: the worktree-relative path from the worktree top to
+/// the current directory, with a trailing `/` (empty at the top). Used to
+/// resolve cone-mode directory arguments supplied from a subdirectory.
+fn sparse_prefix(worktree_root: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let cwd = env::current_dir()?;
+    let canonical_root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.into());
+    let canonical_cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let Ok(rel) = canonical_cwd.strip_prefix(&canonical_root) else {
+        return Ok(Vec::new());
+    };
+    let bytes = rel.as_os_str().as_bytes();
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut prefix = bytes.to_vec();
+    prefix.push(b'/');
+    Ok(prefix)
 }
 
 /// Resolves a context for `check-rules`, which upstream does *not* gate behind
@@ -932,6 +1059,7 @@ fn sparse_context_no_worktree() -> Result<SparseContext> {
         git_dir,
         worktree_root,
         format,
+        prefix: Vec::new(),
     })
 }
 
