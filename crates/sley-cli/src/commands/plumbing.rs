@@ -1155,6 +1155,9 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         // means "fall back to diff.context / diff.interHunkContext config".
         let mut context: Option<i64> = None;
         let mut interhunk: Option<i64> = None;
+        // `--auto-advance`/`--no-auto-advance`. git's default is auto-advance ON;
+        // `Some(false)` is `--no-auto-advance`.
+        let mut auto_advance: Option<bool> = None;
         let mut after_dd = false;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -1166,6 +1169,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 "--" => after_dd = true,
                 "-i" | "--interactive" => interactive = true,
                 "-p" | "--patch" => patch = true,
+                "--auto-advance" => auto_advance = Some(true),
+                "--no-auto-advance" => auto_advance = Some(false),
                 "-U" | "--unified" => {
                     context = iter.next().and_then(|v| v.parse::<i64>().ok());
                 }
@@ -1185,6 +1190,39 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     // Leave any other flags to the normal path (no -i/-p).
                 }
                 other => spec.push(other.to_string()),
+            }
+        }
+        // builtin/add.c validation order: negative context dies first (independent
+        // of -p), then the "requires --interactive/--patch" checks fire only when
+        // NOT in interactive/patch mode.
+        if let Some(value) = context
+            && value < -1
+        {
+            eprintln!("fatal: '--unified' cannot be negative");
+            return Err(GitError::Exit(128));
+        }
+        if let Some(value) = interhunk
+            && value < -1
+        {
+            eprintln!("fatal: '--inter-hunk-context' cannot be negative");
+            return Err(GitError::Exit(128));
+        }
+        if !patch && !interactive {
+            if context.is_some() {
+                eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
+                return Err(GitError::Exit(128));
+            }
+            if interhunk.is_some() {
+                eprintln!(
+                    "fatal: the option '--inter-hunk-context' requires '--interactive/--patch'"
+                );
+                return Err(GitError::Exit(128));
+            }
+            if auto_advance == Some(false) {
+                eprintln!(
+                    "fatal: the option '--no-auto-advance' requires '--interactive/--patch'"
+                );
+                return Err(GitError::Exit(128));
             }
         }
         if patch {
