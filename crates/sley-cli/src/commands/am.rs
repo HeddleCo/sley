@@ -1925,14 +1925,31 @@ fn parse_patch_index_oids(diff: &[u8]) -> BTreeMap<Vec<u8>, String> {
     map
 }
 
-/// Extract the `b/<path>` component from a `diff --git a/<path> b/<path>` line.
+/// Extract the new-side path from a `diff --git <old> <new>` line. The usual
+/// form carries `a/<path> b/<path>` prefixes, but a `--no-prefix` patch emits
+/// `diff --git <path> <path>` (identical, unprefixed paths) — handle both.
 fn parse_diff_git_new_path(rest: &[u8]) -> Option<Vec<u8>> {
     let text = String::from_utf8_lossy(rest);
-    // The new side begins at the last " b/" occurrence (paths may contain spaces
-    // but format-patch emits unquoted `a/… b/…` for ordinary names).
-    let marker = text.rfind(" b/")?;
-    let path = &text[marker + 3..];
-    Some(path.as_bytes().to_vec())
+    // Prefixed form: the new side begins at the last " b/" occurrence (paths may
+    // contain spaces but format-patch emits unquoted `a/… b/…` for ordinary
+    // names).
+    if let Some(marker) = text.rfind(" b/") {
+        return Some(text[marker + 3..].as_bytes().to_vec());
+    }
+    // No-prefix form: `diff --git <path> <path>` with the same path twice. The
+    // separator is the exact midpoint space, so the two halves are byte-equal
+    // (this disambiguates paths that themselves contain spaces).
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    if trimmed.len() >= 3 && trimmed.len() % 2 == 1 {
+        let mid = trimmed.len() / 2;
+        if trimmed.as_bytes()[mid] == b' ' {
+            let (left, right) = (&trimmed[..mid], &trimmed[mid + 1..]);
+            if !left.is_empty() && left == right {
+                return Some(right.as_bytes().to_vec());
+            }
+        }
+    }
+    None
 }
 
 /// Read the pre-image blob for `path`: resolve the patch's recorded old OID in

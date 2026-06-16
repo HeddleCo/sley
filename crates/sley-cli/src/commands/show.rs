@@ -221,7 +221,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     let decorations: HashMap<ObjectId, Vec<String>> = if decoration_mode == LogDecorationMode::Off {
         HashMap::new()
     } else {
-        log_decoration_map(git_dir, db, format, decoration_mode)?
+        log_decoration_map(git_dir, db, format, decoration_mode, &crate::DecorationFilter::default())?
     };
 
     let mut setup_args = vec!["--default".to_string(), "HEAD".to_string()];

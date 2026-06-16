@@ -834,7 +834,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     let decorations = match &pretty {
         RevListPretty::Compiled { compiled, .. } if compiled.uses_decorations() => {
-            log_decoration_map(&git_dir, &db, format, LogDecorationMode::Short)?
+            log_decoration_map(&git_dir, &db, format, LogDecorationMode::Short, &crate::DecorationFilter::default())?
         }
         _ => HashMap::new(),
     };
@@ -1169,7 +1169,7 @@ fn rev_list_emit_bisection(
         // Every candidate, newest-first by distance, decorated with `dist=N`
         // alongside its ref decorations (upstream `best_bisection_sorted` +
         // `revs.show_decorations`).
-        let decorations = log_decoration_map(git_dir, db, format, LogDecorationMode::Short)?;
+        let decorations = log_decoration_map(git_dir, db, format, LogDecorationMode::Short, &crate::DecorationFilter::default())?;
         for (oid, distance) in &result.picks {
             let mut labels: Vec<String> = decorations.get(oid).cloned().unwrap_or_default();
             labels.push(format!("dist={distance}"));

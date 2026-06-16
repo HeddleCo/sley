@@ -1136,6 +1136,7 @@ dependencies = [
  "sley-odb",
  "sley-options",
  "sley-pack",
+ "sley-pathspec",
  "sley-protocol",
  "sley-ref-filter",
  "sley-refs",

@@ -6884,6 +6884,42 @@ fn log_grep_requires_value_error() -> GitError {
     GitError::Exit(128)
 }
 
+/// `git log -S`/`-G` with no value: parse-options "switch requires a value"
+/// (exit 129). `kind` is the single letter (`S`/`G`).
+fn log_pickaxe_requires_value_error(kind: &str) -> GitError {
+    eprintln!("error: switch `{kind}' requires a value");
+    GitError::Exit(129)
+}
+
+/// `git log -S ""`/`-G ""` with an empty value (exit 129).
+fn log_pickaxe_empty_error(kind: &str) -> GitError {
+    eprintln!("error: -{kind} requires a non-empty argument");
+    GitError::Exit(129)
+}
+
+/// Combining multiple pickaxe kinds (`-S`/`-G`/`--find-object`) — git rejects
+/// with exit 128.
+fn log_pickaxe_kinds_conflict_error() -> GitError {
+    eprintln!("fatal: options '-G', '-S', and '--find-object' cannot be used together");
+    GitError::Exit(128)
+}
+
+/// `-G` with `--pickaxe-regex` (exit 128).
+fn log_pickaxe_g_regex_conflict_error() -> GitError {
+    eprintln!(
+        "fatal: options '-G' and '--pickaxe-regex' cannot be used together, use '--pickaxe-regex' with '-S'"
+    );
+    GitError::Exit(128)
+}
+
+/// `--pickaxe-all` with `--find-object` (exit 128).
+fn log_pickaxe_all_objfind_conflict_error() -> GitError {
+    eprintln!(
+        "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'"
+    );
+    GitError::Exit(128)
+}
+
 fn log_date_mode(value: &str) -> Result<DateMode> {
     match DateMode::parse(value) {
         Some(mode) => Ok(mode),
@@ -7511,31 +7547,129 @@ enum LogDecorationMode {
     Full,
 }
 
-fn log_decoration_map(
+/// A single normalized decoration ref-filter pattern. git's
+/// `normalize_glob_ref`: a pattern not starting with `refs/` (and not `HEAD`)
+/// is prefixed with `refs/`; a trailing `/` is stripped; the pattern matches
+/// either as a glob (`wildmatch`) or, when it has no glob metacharacters, as a
+/// path-prefix (`refs/foo` matches `refs/foo` and `refs/foo/...`).
+#[derive(Debug, Clone)]
+struct DecorationPattern {
+    normalized: String,
+    is_glob: bool,
+}
+
+impl DecorationPattern {
+    fn new(pattern: &str) -> Self {
+        let mut normalized = String::new();
+        if !pattern.starts_with("refs/") && pattern != "HEAD" {
+            normalized.push_str("refs/");
+        }
+        normalized.push_str(pattern);
+        while normalized.ends_with('/') {
+            normalized.pop();
+        }
+        let is_glob = pattern.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
+        DecorationPattern {
+            normalized,
+            is_glob,
+        }
+    }
+
+    fn matches(&self, refname: &str) -> bool {
+        if self.is_glob {
+            sley_pathspec::wildmatch(self.normalized.as_bytes(), refname.as_bytes(), 0)
+        } else {
+            // Prefix match: refname == pattern, or refname starts with
+            // "pattern/".
+            match refname.strip_prefix(&self.normalized) {
+                Some(rest) => rest.is_empty() || rest.starts_with('/'),
+                None => false,
+            }
+        }
+    }
+}
+
+/// Decoration ref filter mirroring git's `decoration_filter` / `ref_filter_match`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DecorationFilter {
+    include: Vec<DecorationPattern>,
+    exclude: Vec<DecorationPattern>,
+    exclude_config: Vec<DecorationPattern>,
+}
+
+impl DecorationFilter {
+    pub(crate) fn new(include: &[String], exclude: &[String], exclude_config: &[String]) -> Self {
+        DecorationFilter {
+            include: include.iter().map(|p| DecorationPattern::new(p)).collect(),
+            exclude: exclude.iter().map(|p| DecorationPattern::new(p)).collect(),
+            exclude_config: exclude_config
+                .iter()
+                .map(|p| DecorationPattern::new(p))
+                .collect(),
+        }
+    }
+
+    /// Whether `refname` survives the filter (git `ref_filter_match`): explicit
+    /// excludes first, then include-only (any include patterns ⇒ refname must
+    /// match one), then config excludes, else keep.
+    fn matches(&self, refname: &str) -> bool {
+        if self.exclude.iter().any(|p| p.matches(refname)) {
+            return false;
+        }
+        if !self.include.is_empty() {
+            return self.include.iter().any(|p| p.matches(refname));
+        }
+        if self.exclude_config.iter().any(|p| p.matches(refname)) {
+            return false;
+        }
+        true
+    }
+}
+
+pub(crate) fn log_decoration_map(
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     mode: LogDecorationMode,
+    filter: &DecorationFilter,
 ) -> Result<HashMap<ObjectId, Vec<String>>> {
     let store = FileRefStore::new(git_dir, format);
     let head_ref = store.current_branch_ref()?;
     let mut decorations = HashMap::<ObjectId, Vec<String>>::new();
+    // The branch HEAD points at survives the filter independently of "HEAD"; we
+    // only collapse to "HEAD -> branch" when both survive (git's
+    // current_pointed_by_HEAD). Track whether the pointed-at branch is filtered
+    // so the loop below can emit it standalone when HEAD itself is excluded.
+    let mut head_branch_shown_inline = false;
     if let Some(head_target) = store.read_ref("HEAD")? {
+        let head_kept = filter.matches("HEAD");
         match head_target {
             RefTarget::Symbolic(name) => {
                 if let Some(target) = store.read_ref(&name)?
                     && let RefTarget::Direct(oid) = target
                     && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
                 {
-                    let name = log_decoration_ref_name(&name, mode);
-                    decorations
-                        .entry(commit)
-                        .or_default()
-                        .push(format!("HEAD -> {name}"));
+                    let branch_kept = filter.matches(&name);
+                    if head_kept && branch_kept {
+                        let label = log_decoration_ref_name(&name, mode);
+                        decorations
+                            .entry(commit)
+                            .or_default()
+                            .push(format!("HEAD -> {label}"));
+                        head_branch_shown_inline = true;
+                    } else if head_kept {
+                        decorations
+                            .entry(commit)
+                            .or_default()
+                            .push("HEAD".to_string());
+                    }
+                    // If only the branch survives, the loop below emits it.
                 }
             }
             RefTarget::Direct(oid) => {
-                if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
+                if head_kept
+                    && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+                {
                     decorations
                         .entry(commit)
                         .or_default()
@@ -7549,7 +7683,10 @@ fn log_decoration_map(
     let mut remote_labels = Vec::new();
     let mut other_labels = Vec::new();
     for reference in store.list_refs()? {
-        if head_ref.as_deref() == Some(reference.name.as_str()) {
+        if head_branch_shown_inline && head_ref.as_deref() == Some(reference.name.as_str()) {
+            continue;
+        }
+        if !filter.matches(&reference.name) {
             continue;
         }
         let RefTarget::Direct(oid) = reference.target else {

@@ -340,6 +340,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut abbrev_len = Some(7usize);
     let mut abbrev_len_explicit = false;
     let mut decoration = LogDecorationMode::Off;
+    // Whether `--decorate`/`--no-decorate`/`--decorate=<mode>` was given on the
+    // command line (a CLI flag overrides `log.decorate` config).
+    let mut decoration_explicit = false;
+    // `--decorate-refs=<glob>` (include-only) and
+    // `--decorate-refs-exclude=<glob>` plus `--clear-decorations`.
+    let mut decorate_refs_include: Vec<String> = Vec::new();
+    let mut decorate_refs_exclude: Vec<String> = Vec::new();
+    let mut clear_decorations = false;
+    // `--simplify-by-decoration`: accepted (so the option doesn't error); the
+    // decoration-keeping simplification itself is not yet wired, but accepting
+    // it matches git for the common pathspec-limited walks.
+    let mut _simplify_by_decoration = false;
     let mut read_stdin = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
@@ -348,6 +360,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
     let mut pattern_kind = crate::grep_source::PatternKind::Basic;
+    // Whether a CLI pattern-type flag (`-F`/`-E`/`-P`/`--basic-regexp`) was
+    // given; if not, `grep.patternType` config supplies the default.
+    let mut pattern_kind_explicit = false;
     let mut date_mode = DateMode::Default;
     let mut date_explicit = false;
     // `-z` / `--null`: separate/terminate compiled-format entries with NUL
@@ -360,6 +375,30 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Raw `-I<regex>` (`--ignore-matching-lines`) patterns, compiled after the
     // option scan so a malformed regex fails like git's diff_opt_ignore_regex.
     let mut ignore_regex_patterns: Vec<String> = Vec::new();
+    // Pickaxe filtering: `-S<string>` (string-count change), `-G<regex>`
+    // (added/removed line matches regex), `--find-object=<oid>`. Only the LAST
+    // of these wins (git overwrites pickaxe/objfind each time), with
+    // `--pickaxe-regex` switching `-S` to a regex needle and `--pickaxe-all`
+    // showing the whole changeset when any filepair matches.
+    let mut pickaxe: Option<PickaxeSpec> = None;
+    let mut pickaxe_regex = false;
+    let mut pickaxe_all = false;
+    let mut find_object_patterns: Vec<String> = Vec::new();
+    // `--diff-filter=<bits>`: accumulated positive bits and negated bits, git's
+    // `filter` / `filter_not`. Resolved into a single mask after the scan.
+    let mut diff_filter_bits: u32 = 0;
+    let mut diff_filter_not_bits: u32 = 0;
+    let mut diff_filter_given = false;
+    // Explicit rename/copy detection overrides from `-M`/`-C`/`--no-renames`
+    // (the command-line wins over `diff.renames` config for pickaxe/diff-filter
+    // commit selection). `None` = defer to config.
+    let mut renames_override: Option<bool> = None;
+    let mut copies_override: Option<bool> = None;
+    // Track which pickaxe *kinds* were requested (git OR-s the bits and rejects
+    // any combination of -G / -S / --find-object). `-S`/`-G` overwrite the
+    // needle but each still records its kind-bit for the conflict check.
+    let mut saw_s = false;
+    let mut saw_g = false;
     // `--root` flag; falls back to the log.showRoot config (default true).
     let mut show_root_flag: Option<bool> = None;
     let mut line_prefix: Option<String> = None;
@@ -445,10 +484,91 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--all-match" => grep_all_match = true,
             "--invert-grep" => invert_grep = true,
             "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
-            "-F" | "--fixed-strings" => pattern_kind = crate::grep_source::PatternKind::Fixed,
-            "--basic-regexp" => pattern_kind = crate::grep_source::PatternKind::Basic,
-            "-E" | "--extended-regexp" => pattern_kind = crate::grep_source::PatternKind::Extended,
-            "-P" | "--perl-regexp" => pattern_kind = crate::grep_source::PatternKind::Perl,
+            "-F" | "--fixed-strings" => {
+                pattern_kind = crate::grep_source::PatternKind::Fixed;
+                pattern_kind_explicit = true;
+            }
+            "--basic-regexp" => {
+                pattern_kind = crate::grep_source::PatternKind::Basic;
+                pattern_kind_explicit = true;
+            }
+            "-E" | "--extended-regexp" => {
+                pattern_kind = crate::grep_source::PatternKind::Extended;
+                pattern_kind_explicit = true;
+            }
+            "-P" | "--perl-regexp" => {
+                pattern_kind = crate::grep_source::PatternKind::Perl;
+                pattern_kind_explicit = true;
+            }
+            // Pickaxe: `-S<string>`, `-G<regex>`, `--find-object=<oid>`. git's
+            // parse-options treats a bare `-S`/`-G` (no value) as a "switch
+            // requires a value" error (exit 129); an empty value is a distinct
+            // `error: -S requires a non-empty argument` (also 129).
+            "-S" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_pickaxe_requires_value_error("S"))?;
+                if value.is_empty() {
+                    return Err(log_pickaxe_empty_error("S"));
+                }
+                saw_s = true;
+                pickaxe = Some(PickaxeSpec::String(value.to_string()));
+            }
+            value if value.starts_with("-S") => {
+                if value.len() == 2 {
+                    return Err(log_pickaxe_empty_error("S"));
+                }
+                saw_s = true;
+                pickaxe = Some(PickaxeSpec::String(value[2..].to_string()));
+            }
+            "-G" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_pickaxe_requires_value_error("G"))?;
+                if value.is_empty() {
+                    return Err(log_pickaxe_empty_error("G"));
+                }
+                saw_g = true;
+                pickaxe = Some(PickaxeSpec::Grep(value.to_string()));
+            }
+            value if value.starts_with("-G") => {
+                if value.len() == 2 {
+                    return Err(log_pickaxe_empty_error("G"));
+                }
+                saw_g = true;
+                pickaxe = Some(PickaxeSpec::Grep(value[2..].to_string()));
+            }
+            "--find-object" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("find-object"))?;
+                find_object_patterns.push(value.to_string());
+            }
+            value if value.starts_with("--find-object=") => {
+                find_object_patterns.push(value["--find-object=".len()..].to_string());
+            }
+            "--pickaxe-regex" => pickaxe_regex = true,
+            "--pickaxe-all" => pickaxe_all = true,
+            "-a" | "--text" => diff_opts.text = true,
+            "--diff-filter" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("diff-filter"))?;
+                parse_diff_filter_arg(
+                    value,
+                    &mut diff_filter_bits,
+                    &mut diff_filter_not_bits,
+                )?;
+                diff_filter_given = true;
+            }
+            value if let Some(arg) = value.strip_prefix("--diff-filter=") => {
+                parse_diff_filter_arg(arg, &mut diff_filter_bits, &mut diff_filter_not_bits)?;
+                diff_filter_given = true;
+            }
+            "--no-pickaxe-regex" => {
+                eprintln!("fatal: unrecognized argument: --no-pickaxe-regex");
+                return Err(GitError::Exit(128));
+            }
             "-g" | "--walk-reflogs" => walk_reflogs = true,
             "--no-walk-reflogs" => walk_reflogs = false,
             "--max-age" => {
@@ -492,24 +612,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--no-mailmap"
             | "--show-signature"
             | "--no-show-signature"
-            | "--no-decorate"
-            | "--decorate=no"
-            | "--decorate=auto"
-            | "--decorate="
-            | "--decorate=false"
-            | "--decorate=0"
-            | "--decorate=off"
-            | "--clear-decorations"
-            | "--no-decorate-refs"
-            | "--no-decorate-refs-exclude"
             | "--full-diff"
             | "--relative"
             | "--no-relative"
             | "--ext-diff"
             | "--no-ext-diff"
-            | "--no-renames"
-            | "--find-renames"
-            | "--find-copies"
             | "--find-copies-harder"
             | "--no-find-copies-harder"
             | "--indent-heuristic"
@@ -528,13 +635,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--no-color-moved"
             | "--ita-visible-in-index"
             | "--ita-invisible-in-index"
-            | "--pickaxe-all"
-            | "--pickaxe-regex"
-            | "-M"
-            | "-C"
             | "-B"
             | "-D"
             | "-W" => {}
+            "--no-renames" => {
+                renames_override = Some(false);
+                copies_override = Some(false);
+            }
+            "--find-renames" | "-M" => renames_override = Some(true),
+            "--find-copies" | "-C" => {
+                renames_override = Some(true);
+                copies_override = Some(true);
+            }
             "--minimal" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
             "--patience" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
             "--histogram" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
@@ -545,18 +657,46 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--ignore-cr-at-eol" => diff_opts.ws_ignore.cr_at_eol = true,
             "--ignore-blank-lines" => diff_opts.ignore_blank_lines = true,
             "--decorate" | "--decorate=short" | "--decorate=true" | "--decorate=1"
-            | "--decorate=on" | "--decorate=yes" => decoration = LogDecorationMode::Short,
-            "--decorate=full" => decoration = LogDecorationMode::Full,
+            | "--decorate=on" | "--decorate=yes" => {
+                decoration = LogDecorationMode::Short;
+                decoration_explicit = true;
+            }
+            "--decorate=full" => {
+                decoration = LogDecorationMode::Full;
+                decoration_explicit = true;
+            }
+            "--decorate=auto" => {
+                // `auto` means "decorate iff stdout is a tty"; tests redirect
+                // to a file, so this resolves to off.
+                decoration = LogDecorationMode::Off;
+                decoration_explicit = true;
+            }
+            "--no-decorate" | "--decorate=no" | "--decorate=" | "--decorate=false"
+            | "--decorate=0" | "--decorate=off" => {
+                decoration = LogDecorationMode::Off;
+                decoration_explicit = true;
+            }
             value if value.starts_with("--decorate=") => {
                 return Err(GitError::Command(format!(
                     "invalid --decorate option {value}"
                 )));
             }
+            "--clear-decorations" => {
+                clear_decorations = true;
+                decorate_refs_include.clear();
+                decorate_refs_exclude.clear();
+            }
+            "--no-decorate-refs" => decorate_refs_include.clear(),
+            "--no-decorate-refs-exclude" => decorate_refs_exclude.clear(),
+            "--simplify-by-decoration" => _simplify_by_decoration = true,
             value if value.starts_with("-M") => {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
+                renames_override = Some(true);
             }
             value if value.starts_with("-C") => {
                 log_validate_similarity_option(&value[2..], "find-copies")?;
+                renames_override = Some(true);
+                copies_override = Some(true);
             }
             value if value.starts_with("-B") => {
                 log_validate_break_rewrites_option(&value[2..])?;
@@ -913,15 +1053,24 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 return log_fatal_unrecognized_argument(value);
             }
             "--decorate-refs" => {
-                iter.next()
+                let value = iter
+                    .next()
                     .ok_or_else(|| log_option_requires_value_error("decorate-refs"))?;
+                decorate_refs_include.push(value.to_string());
             }
             "--decorate-refs-exclude" => {
-                iter.next()
+                let value = iter
+                    .next()
                     .ok_or_else(|| log_option_requires_value_error("decorate-refs-exclude"))?;
+                decorate_refs_exclude.push(value.to_string());
             }
-            value if value.starts_with("--decorate-refs=") => {}
-            value if value.starts_with("--decorate-refs-exclude=") => {}
+            value if value.starts_with("--decorate-refs=") => {
+                decorate_refs_include.push(value["--decorate-refs=".len()..].to_string());
+            }
+            value if value.starts_with("--decorate-refs-exclude=") => {
+                decorate_refs_exclude
+                    .push(value["--decorate-refs-exclude=".len()..].to_string());
+            }
             value if value.starts_with("--use-mailmap=") => {
                 return log_option_takes_no_value_error("use-mailmap");
             }
@@ -1133,6 +1282,81 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Compile any `-I<regex>` patterns now (a malformed regex fails like git's
     // diff_opt_ignore_regex, exit 129).
     diff_opts.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
+    // Resolve and validate pickaxe (`-S`/`-G`/`--find-object`). git OR-s the
+    // kind bits and rejects any combination of the three kinds; `-G` cannot be
+    // combined with `--pickaxe-regex`; `--pickaxe-all` cannot be combined with
+    // `--find-object`.
+    let has_find_object = !find_object_patterns.is_empty();
+    {
+        let kind_count = (saw_s as u8) + (saw_g as u8) + (has_find_object as u8);
+        if kind_count > 1 {
+            return Err(log_pickaxe_kinds_conflict_error());
+        }
+        if saw_g && pickaxe_regex {
+            return Err(log_pickaxe_g_regex_conflict_error());
+        }
+        if pickaxe_all && has_find_object {
+            return Err(log_pickaxe_all_objfind_conflict_error());
+        }
+    }
+    let compiled_pickaxe = if has_find_object {
+        let mut oids = HashSet::new();
+        for pat in &find_object_patterns {
+            let oid = resolve_revision(&git_dir, format, pat).map_err(|_| {
+                eprintln!("error: unable to resolve '{pat}'");
+                GitError::Exit(128)
+            })?;
+            oids.insert(oid);
+        }
+        Some(CompiledPickaxe::FindObject { oids })
+    } else if let Some(spec) = &pickaxe {
+        match spec {
+            PickaxeSpec::Grep(pattern) => Some(CompiledPickaxe::Grep {
+                regex: compile_pickaxe_regex(pattern, regexp_ignore_case)?,
+            }),
+            PickaxeSpec::String(needle) if pickaxe_regex => Some(CompiledPickaxe::StringRegex {
+                regex: compile_pickaxe_regex(needle, regexp_ignore_case)?,
+            }),
+            PickaxeSpec::String(needle) => Some(CompiledPickaxe::StringLiteral {
+                needle: if regexp_ignore_case {
+                    needle.to_ascii_lowercase().into_bytes()
+                } else {
+                    needle.clone().into_bytes()
+                },
+            }),
+            PickaxeSpec::FindObject(_) => unreachable!("find-object handled above"),
+        }
+    } else {
+        None
+    };
+    let pickaxe_ignore_case = regexp_ignore_case;
+    // Rename/copy detection for the commit-selection filters (pickaxe,
+    // diff-filter): a command-line `-M`/`-C`/`--no-renames` wins, else
+    // `diff.renames` config (git's default is rename-on, copy-off).
+    let config_detect_renames = !matches!(
+        config
+            .get("diff", None, "renames")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("false") | Some("no") | Some("off") | Some("0")
+    );
+    let config_detect_copies = matches!(
+        config
+            .get("diff", None, "renames")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("copies") | Some("copy")
+    );
+    let filter_detect_renames = renames_override.unwrap_or(config_detect_renames);
+    let filter_detect_copies = copies_override.unwrap_or(config_detect_copies);
+    let pickaxe_detect_renames = filter_detect_renames;
+    let pickaxe_text = diff_opts.text;
+    // Resolve the `--diff-filter` mask now that the full option scan is done.
+    let diff_filter_mask = if diff_filter_given {
+        Some(resolve_diff_filter_mask(diff_filter_bits, diff_filter_not_bits))
+    } else {
+        None
+    };
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
     let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
@@ -1140,15 +1364,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             .unwrap_or_else(|| config.get_bool("log", None, "showroot").unwrap_or(true));
         // diff.renames: false disables detection, "copies"/"copy" adds copy
         // detection, anything else (or unset) means rename detection.
-        let (detect_renames, detect_copies) = match config
-            .get("diff", None, "renames")
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("false") | Some("no") | Some("off") | Some("0") => (false, false),
-            Some("copies") | Some("copy") => (true, true),
-            _ => (true, false),
-        };
+        // A command-line `-M`/`-C`/`--no-renames` overrides `diff.renames`.
+        let (detect_renames, detect_copies) =
+            (filter_detect_renames, filter_detect_copies);
         let diff_pathspec = if pathspecs.is_empty() {
             None
         } else {
@@ -1239,6 +1457,20 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if !abbrev_len_explicit && log_output_needs_abbrev(&output, abbrev_commit, show_children) {
         abbrev_len = repository_abbrev_from_config(&git_dir, format, &config)?;
     }
+    // When no CLI pattern-type flag was given, `grep.patternType` config
+    // supplies the default (git's `grep_config`). `default` means "fall back to
+    // the basic/extended toggle", which for log is BRE.
+    if !pattern_kind_explicit
+        && let Some(value) = config.get("grep", None, "patterntype")
+    {
+        pattern_kind = match value.trim().to_ascii_lowercase().as_str() {
+            "fixed" => crate::grep_source::PatternKind::Fixed,
+            "basic" => crate::grep_source::PatternKind::Basic,
+            "extended" => crate::grep_source::PatternKind::Extended,
+            "perl" => crate::grep_source::PatternKind::Perl,
+            _ => pattern_kind,
+        };
+    }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let committer_filters =
@@ -1328,6 +1560,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && author_filters.is_none()
         && committer_filters.is_none()
         && grep_filters.is_none()
+        && compiled_pickaxe.is_none()
+        && diff_filter_mask.is_none()
         && max_age.is_none()
         && min_age.is_none()
         && min_parents.is_none()
@@ -1376,6 +1610,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && author_filters.is_none()
         && committer_filters.is_none()
         && grep_filters.is_none()
+        && compiled_pickaxe.is_none()
+        && diff_filter_mask.is_none()
         && max_age.is_none()
         && min_age.is_none()
         && min_parents.is_none()
@@ -1470,6 +1706,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && author_filters.is_none()
         && committer_filters.is_none()
         && grep_filters.is_none()
+        && compiled_pickaxe.is_none()
+        && diff_filter_mask.is_none()
         && max_age.is_none()
         && min_age.is_none()
         && min_parents.is_none()
@@ -1572,6 +1810,60 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         }
         selected.push(record);
     }
+    // Pickaxe (`-S`/`-G`/`--find-object`): keep only commits whose first-parent
+    // diff contains a matching filepair. Applied after the cheap header filters
+    // so we read blobs for as few commits as possible.
+    if let Some(pickaxe) = &compiled_pickaxe {
+        let pickaxe_pathspec = if pathspecs.is_empty() {
+            None
+        } else {
+            let cwd = env::current_dir()?;
+            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+        };
+        let mut kept = Vec::with_capacity(selected.len());
+        for record in selected {
+            if pickaxe_commit_matches(
+                &db,
+                format,
+                record,
+                pickaxe,
+                pickaxe_ignore_case,
+                pickaxe_text,
+                pickaxe_detect_renames,
+                pickaxe_pathspec.as_ref(),
+            )? {
+                kept.push(record);
+            }
+        }
+        selected = kept;
+    }
+    // `--diff-filter`: keep only commits whose first-parent diff has a filepair
+    // whose status is in the requested mask.
+    if let Some(mask) = diff_filter_mask {
+        let filter_pathspec = if pathspecs.is_empty() {
+            None
+        } else {
+            let cwd = env::current_dir()?;
+            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+        };
+        let mut kept = Vec::with_capacity(selected.len());
+        for record in selected {
+            if diff_filter_commit_matches(
+                &db,
+                format,
+                record,
+                mask,
+                filter_detect_renames,
+                filter_detect_copies,
+                filter_pathspec.as_ref(),
+            )? {
+                kept.push(record);
+            }
+        }
+        selected = kept;
+    }
     selected = match ordering {
         // `--graph` implies topological ordering (upstream sets
         // `revs->topo_order = 1`); `--date-order`/`--author-date-order` pick
@@ -1633,6 +1925,57 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if reverse {
         selected.reverse();
     }
+    // `log.decorate` config sets the default decoration mode when no
+    // `--decorate*` flag was given. `auto` (and unset) means tty-dependent,
+    // which resolves to off for the redirected output these tests use.
+    if !decoration_explicit
+        && let Some(value) = config.get("log", None, "decorate")
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
+            "full" => decoration = LogDecorationMode::Full,
+            "no" | "false" | "off" | "0" | "auto" => decoration = LogDecorationMode::Off,
+            _ => decoration = LogDecorationMode::Short,
+        }
+    }
+    // Build the decoration ref filter: `--decorate-refs` (include-only globs),
+    // `--decorate-refs-exclude`, and `log.excludeDecoration` config (a missing
+    // value is reported but non-fatal).
+    let mut exclude_config: Vec<String> = Vec::new();
+    for entry in config.get_all("log", None, "excludedecoration") {
+        match entry {
+            Some(pattern) => exclude_config.push(pattern.to_string()),
+            None => {
+                eprintln!("error: missing value for 'log.excludeDecoration'");
+                // git still produces output (exit 0) but with no excludes.
+            }
+        }
+    }
+    // git's set_default_decoration_filter: when no `--decorate-refs*`,
+    // `--clear-decorations`, or `log.excludeDecoration` was given, restrict
+    // decorations to the standard decorating namespaces (so refs/prefetch,
+    // refs/rebase-merge, refs/bundle, &c. are not shown). `--clear-decorations`
+    // disables this default so all refs decorate.
+    let mut include = decorate_refs_include.clone();
+    if !clear_decorations
+        && include.is_empty()
+        && decorate_refs_exclude.is_empty()
+        && exclude_config.is_empty()
+    {
+        include.extend(
+            [
+                "HEAD",
+                "refs/heads/",
+                "refs/tags/",
+                "refs/remotes/",
+                "refs/stash",
+                "refs/replace/",
+            ]
+            .map(str::to_string),
+        );
+    }
+    let decoration_filter =
+        DecorationFilter::new(&include, &decorate_refs_exclude, &exclude_config);
     let custom_decoration_mode = match &output {
         LogOutput::Compiled { compiled, .. } if compiled.uses_decorations() => {
             Some(if decoration == LogDecorationMode::Full {
@@ -1651,6 +1994,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &db,
             format,
             custom_decoration_mode.unwrap_or(decoration),
+            &decoration_filter,
         )?
     };
     // Object access for `%(describe)`.
@@ -2277,6 +2621,8 @@ struct LogDiffOptions {
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<crate::grep_source::Regex>,
+    /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
+    text: bool,
 }
 
 impl Default for LogDiffOptions {
@@ -2297,6 +2643,7 @@ impl Default for LogDiffOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            text: false,
         }
     }
 }
@@ -2322,6 +2669,406 @@ impl LogDiffOptions {
             || self.shortstat
             || self.summary
             || self.compact_summary
+    }
+}
+
+/// Which pickaxe kind a `-S`/`-G`/`--find-object` requested. Only one kind may
+/// be active at a time (git rejects combinations).
+#[derive(Debug, Clone)]
+enum PickaxeSpec {
+    /// `-S<string>`: count occurrences of the needle in the old vs new blob; a
+    /// filepair matches when the counts differ. With `--pickaxe-regex` the
+    /// needle is a regex (occurrence count), else a literal substring.
+    String(String),
+    /// `-G<regex>`: the regex matches some added or removed line of the textual
+    /// diff (the leading `+`/`-` is trimmed before matching).
+    Grep(String),
+    /// `--find-object=<oid>`: a filepair matches when either side's blob oid is
+    /// in the object set.
+    FindObject(Vec<String>),
+}
+
+/// A compiled pickaxe predicate, ready to test a commit's diff filepairs.
+enum CompiledPickaxe {
+    /// Literal-substring `-S`: count occurrences of `needle`.
+    StringLiteral { needle: Vec<u8> },
+    /// Regex `-S --pickaxe-regex`: count regex matches.
+    StringRegex { regex: crate::grep_source::Regex },
+    /// `-G<regex>`: regex matches an added/removed diff line.
+    Grep { regex: crate::grep_source::Regex },
+    /// `--find-object`: blob oid set.
+    FindObject { oids: HashSet<ObjectId> },
+}
+
+// `--diff-filter` status bits (git `diff_status_letters` order is independent;
+// we key by the status letter directly).
+const DIFF_FILTER_ADDED: u32 = 1 << 0;
+const DIFF_FILTER_COPIED: u32 = 1 << 1;
+const DIFF_FILTER_DELETED: u32 = 1 << 2;
+const DIFF_FILTER_MODIFIED: u32 = 1 << 3;
+const DIFF_FILTER_RENAMED: u32 = 1 << 4;
+const DIFF_FILTER_TYPE_CHANGED: u32 = 1 << 5;
+const DIFF_FILTER_UNMERGED: u32 = 1 << 6;
+const DIFF_FILTER_UNKNOWN: u32 = 1 << 7;
+const DIFF_FILTER_BROKEN: u32 = 1 << 8;
+// `*` (all-or-none): show the whole changeset if any filepair matches.
+const DIFF_FILTER_AON: u32 = 1 << 9;
+// All status bits except the `*` (all-or-none) sentinel — the base set a
+// negation-only `--diff-filter` starts from before clearing the negated bits.
+const DIFF_FILTER_ALL: u32 = DIFF_FILTER_ADDED
+    | DIFF_FILTER_COPIED
+    | DIFF_FILTER_DELETED
+    | DIFF_FILTER_MODIFIED
+    | DIFF_FILTER_RENAMED
+    | DIFF_FILTER_TYPE_CHANGED
+    | DIFF_FILTER_UNMERGED
+    | DIFF_FILTER_UNKNOWN
+    | DIFF_FILTER_BROKEN;
+
+/// Map a `--diff-filter` status letter (uppercased) to its bit.
+fn diff_filter_letter_bit(letter: char) -> u32 {
+    match letter {
+        'A' => DIFF_FILTER_ADDED,
+        'C' => DIFF_FILTER_COPIED,
+        'D' => DIFF_FILTER_DELETED,
+        'M' => DIFF_FILTER_MODIFIED,
+        'R' => DIFF_FILTER_RENAMED,
+        'T' => DIFF_FILTER_TYPE_CHANGED,
+        'U' => DIFF_FILTER_UNMERGED,
+        'X' => DIFF_FILTER_UNKNOWN,
+        'B' => DIFF_FILTER_BROKEN,
+        '*' => DIFF_FILTER_AON,
+        _ => 0,
+    }
+}
+
+/// Parse a `--diff-filter` argument: each uppercase letter adds a positive bit,
+/// each lowercase letter adds a negated bit (git `diff_opt_diff_filter`).
+fn parse_diff_filter_arg(arg: &str, filter: &mut u32, filter_not: &mut u32) -> Result<()> {
+    for ch in arg.chars() {
+        let (negate, upper) = if ch.is_ascii_lowercase() {
+            (true, ch.to_ascii_uppercase())
+        } else {
+            (false, ch)
+        };
+        let bit = diff_filter_letter_bit(upper);
+        if bit == 0 {
+            eprintln!("fatal: unknown change class '{ch}' in --diff-filter={arg}");
+            return Err(GitError::Exit(128));
+        }
+        if negate {
+            *filter_not |= bit;
+        } else {
+            *filter |= bit;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the final `--diff-filter` mask after the option scan (git applies the
+/// `filter_not` negation against the all-bits base when no positive bits exist).
+fn resolve_diff_filter_mask(filter: u32, filter_not: u32) -> u32 {
+    if filter_not != 0 {
+        let base = if filter == 0 { DIFF_FILTER_ALL } else { filter };
+        base & !filter_not
+    } else {
+        filter
+    }
+}
+
+/// The status bit for a name-status entry (git `match_filter`: a `Modified`
+/// entry with a break score counts as Broken).
+fn diff_filter_entry_bit(entry: &sley_diff_merge::NameStatusEntry) -> u32 {
+    diff_filter_letter_bit(entry.status.code())
+}
+
+/// Whether a commit's first-parent diff contains a filepair matching the
+/// `--diff-filter` mask. With rename/copy bits requested, rename detection runs.
+fn diff_filter_commit_matches(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    mask: u32,
+    detect_renames: bool,
+    detect_copies: bool,
+    pathspec: Option<&DiffPathspec>,
+) -> Result<bool> {
+    let parents = &record.commit.parents;
+    let parent_tree = match parents.first() {
+        Some(parent) => {
+            let object = db.read_object(parent)?;
+            Some(Commit::parse_ref(format, &object.body)?.tree)
+        }
+        None => None,
+    };
+    let tree = &record.commit.tree;
+    let base = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames,
+        detect_copies,
+        find_copies_harder: false,
+        rename_empty: true,
+    };
+    let entries = match (&parent_tree, detect_renames) {
+        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            db,
+            format,
+            parent,
+            tree,
+            sley_diff_merge::RenameDetectionOptions {
+                base,
+                detect_inexact: true,
+                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            },
+        )?,
+        (Some(parent), false) => {
+            sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
+        }
+        (None, _) => {
+            sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
+        }
+    };
+    let entries = match pathspec {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    };
+    // The `*` (all-or-none) bit doesn't change the "is any filepair a match"
+    // question for commit selection (it only affects which filepairs are kept
+    // for output), so test the status bits directly.
+    let status_mask = mask & !DIFF_FILTER_AON;
+    Ok(entries
+        .iter()
+        .any(|entry| diff_filter_entry_bit(entry) & status_mask != 0))
+}
+
+/// Whether a commit's diff (against its first parent, or the empty tree for a
+/// root) contains a filepair matching the pickaxe. Mirrors git's pickaxe diff
+/// transform: it runs on the post-rename filepair queue, so we diff with rename
+/// detection enabled and test every resulting old/new blob pair.
+#[allow(clippy::too_many_arguments)]
+fn pickaxe_commit_matches(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    pickaxe: &CompiledPickaxe,
+    ignore_case: bool,
+    text: bool,
+    detect_renames: bool,
+    pathspec: Option<&DiffPathspec>,
+) -> Result<bool> {
+    let parents = &record.commit.parents;
+    let parent_tree = match parents.first() {
+        Some(parent) => {
+            let object = db.read_object(parent)?;
+            Some(Commit::parse_ref(format, &object.body)?.tree)
+        }
+        None => None,
+    };
+    let tree = &record.commit.tree;
+    let base = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames,
+        detect_copies: false,
+        find_copies_harder: false,
+        rename_empty: true,
+    };
+    let entries = match (&parent_tree, detect_renames) {
+        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            db,
+            format,
+            parent,
+            tree,
+            sley_diff_merge::RenameDetectionOptions {
+                base,
+                detect_inexact: true,
+                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            },
+        )?,
+        (Some(parent), false) => {
+            sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
+        }
+        (None, _) => {
+            sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
+        }
+    };
+    let entries = match pathspec {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    };
+    // --find-object: match purely on blob oids, no blob reads.
+    if let CompiledPickaxe::FindObject { oids } = pickaxe {
+        return Ok(entries.iter().any(|entry| {
+            entry.old_oid.as_ref().is_some_and(|oid| oids.contains(oid))
+                || entry.new_oid.as_ref().is_some_and(|oid| oids.contains(oid))
+        }));
+    }
+    let skips_binary = pickaxe.skips_binary() && !text;
+    for entry in &entries {
+        let old = match entry.old_oid.as_ref() {
+            Some(oid) => Some(pickaxe_read_blob(db, oid)?),
+            None => None,
+        };
+        let new = match entry.new_oid.as_ref() {
+            Some(oid) => Some(pickaxe_read_blob(db, oid)?),
+            None => None,
+        };
+        // -G skips a filepair where either side is binary (unless --text).
+        if skips_binary
+            && (old.as_deref().is_some_and(pickaxe_is_binary)
+                || new.as_deref().is_some_and(pickaxe_is_binary))
+        {
+            continue;
+        }
+        if pickaxe.filepair_matches(old.as_deref(), new.as_deref(), ignore_case) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read a blob body for pickaxe inspection.
+fn pickaxe_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
+    let object = db.read_object(oid)?;
+    Ok(object.body.to_vec())
+}
+
+/// git's `buffer_is_binary`: a NUL byte in the first 8000 bytes.
+fn pickaxe_is_binary(bytes: &[u8]) -> bool {
+    let scan = &bytes[..bytes.len().min(8000)];
+    scan.contains(&0)
+}
+
+/// `-G<regex>`: run a textual diff between `old` and `new` and report whether
+/// the regex matches any added or removed line (the leading `+`/`-` is trimmed
+/// before matching, like git's `diffgrep_consume`).
+fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &crate::grep_source::Regex) -> bool {
+    let old_lines = sley_diff_merge::split_lines(old);
+    let new_lines = sley_diff_merge::split_lines(new);
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
+        match op {
+            sley_diff_merge::DiffOp::Equal(n) => {
+                old_idx += n;
+                new_idx += n;
+            }
+            sley_diff_merge::DiffOp::Delete(n) => {
+                for line in &old_lines[old_idx..old_idx + n] {
+                    if regex.is_match_with_case(line.bytes_without_newline(), false) {
+                        return true;
+                    }
+                }
+                old_idx += n;
+            }
+            sley_diff_merge::DiffOp::Insert(n) => {
+                for line in &new_lines[new_idx..new_idx + n] {
+                    if regex.is_match_with_case(line.bytes_without_newline(), false) {
+                        return true;
+                    }
+                }
+                new_idx += n;
+            }
+        }
+    }
+    false
+}
+
+/// Compile a pickaxe regex. git uses POSIX ERE (`REG_EXTENDED | REG_NEWLINE`,
+/// plus `REG_ICASE` under `-i`) for both `-G` and `-S --pickaxe-regex`.
+fn compile_pickaxe_regex(
+    pattern: &str,
+    ignore_case: bool,
+) -> Result<crate::grep_source::Regex> {
+    crate::grep_source::Regex::compile(
+        pattern,
+        crate::grep_source::RegexMode::Ere,
+        ignore_case,
+        false,
+    )
+    .map_err(|_| {
+        eprintln!("fatal: invalid regex: {pattern}");
+        GitError::Exit(128)
+    })
+}
+
+impl CompiledPickaxe {
+    /// `-G` ignores binary files unless `--text`. The other kinds always look.
+    fn skips_binary(&self) -> bool {
+        matches!(self, CompiledPickaxe::Grep { .. })
+    }
+
+    /// Count occurrences of a literal needle (lowercasing the haystack when the
+    /// needle was pre-lowercased for `-i`), capped at `limit` (0 = uncapped).
+    fn count_literal(needle: &[u8], data: &[u8], ignore_case: bool, limit: usize) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        let mut cnt = 0;
+        let mut i = 0;
+        while i + needle.len() <= data.len() {
+            let window = &data[i..i + needle.len()];
+            let matched = if ignore_case {
+                window.eq_ignore_ascii_case(needle)
+            } else {
+                window == needle
+            };
+            if matched {
+                cnt += 1;
+                if limit != 0 && cnt == limit {
+                    return cnt;
+                }
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        cnt
+    }
+
+    /// Count non-overlapping regex matches in `data`, capped at `limit`.
+    fn count_regex(regex: &crate::grep_source::Regex, data: &[u8], limit: usize) -> usize {
+        let mut cnt = 0;
+        let mut from = 0;
+        while from <= data.len() {
+            match regex.find_from(data, from) {
+                Some((start, end)) => {
+                    cnt += 1;
+                    if limit != 0 && cnt == limit {
+                        return cnt;
+                    }
+                    from = if end > start { end } else { start + 1 };
+                }
+                None => break,
+            }
+        }
+        cnt
+    }
+
+    /// Whether this filepair (old/new blob bytes) matches the pickaxe.
+    fn filepair_matches(
+        &self,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+        ignore_case: bool,
+    ) -> bool {
+        match self {
+            CompiledPickaxe::StringLiteral { needle } => {
+                let c1 = old.map_or(0, |d| Self::count_literal(needle, d, ignore_case, 0));
+                let c2 = new.map_or(0, |d| Self::count_literal(needle, d, ignore_case, c1 + 1));
+                c1 != c2
+            }
+            CompiledPickaxe::StringRegex { regex } => {
+                let c1 = old.map_or(0, |d| Self::count_regex(regex, d, 0));
+                let c2 = new.map_or(0, |d| Self::count_regex(regex, d, c1 + 1));
+                c1 != c2
+            }
+            CompiledPickaxe::Grep { regex } => {
+                let old = old.unwrap_or(&[]);
+                let new = new.unwrap_or(&[]);
+                pickaxe_diff_grep(old, new, regex)
+            }
+            CompiledPickaxe::FindObject { .. } => false,
+        }
     }
 }
 

@@ -120,8 +120,20 @@ struct FormatPatchOptions {
     /// the prefix instead of inserting `t ` before it).
     rfc: RfcMode,
     /// `-v<n>`/`--reroll-count=<n>`: appends ` v<n>` to the subject prefix and
-    /// is woven into cover-letter/output naming (only the prefix part is wired).
+    /// prepends a sanitized `v<n>-` to each output filename.
     reroll_count: Option<String>,
+    /// `--filename-max-length=<n>` / `format.filenameMaxLength`: the maximum
+    /// length of a patch filename (basename), default 64. `None` resolves to
+    /// the config value or the default.
+    filename_max_length: Option<usize>,
+    /// Diff path prefixes. `Some(false)` = `--no-prefix`/`format.noprefix` (empty
+    /// prefixes); `Some(true)` = `--default-prefix` (force `a/`,`b/`); `None`
+    /// defers to `format.noprefix` config.
+    prefix_mode: Option<bool>,
+    /// Resolved (src, dst) diff prefixes — `("a/", "b/")` by default, empty
+    /// under no-prefix. Filled by [`cmd_format_patch`] once config is read.
+    src_prefix: String,
+    dst_prefix: String,
     /// `-k`/`--keep-subject`: emit the commit subject verbatim with no
     /// `[PATCH ...]` prefix.
     keep_subject: bool,
@@ -224,6 +236,10 @@ impl Default for FormatPatchOptions {
             subject_prefix: None,
             rfc: RfcMode::Unset,
             reroll_count: None,
+            filename_max_length: None,
+            prefix_mode: None,
+            src_prefix: "a/".to_string(),
+            dst_prefix: "b/".to_string(),
             keep_subject: false,
             cli_to: Vec::new(),
             cli_cc: Vec::new(),
@@ -288,7 +304,7 @@ struct ResolvedFormat {
 }
 
 pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
-    let options = parse_format_patch_args(args)?;
+    let mut options = parse_format_patch_args(args)?;
 
     let repo = RepositoryContext::discover_current()?;
     let cwd = repo.cwd();
@@ -296,6 +312,24 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
+
+    // Resolve diff path prefixes: `--no-prefix`/`--default-prefix` win over the
+    // `format.noprefix` config. A non-boolean `format.noprefix` is fatal (git
+    // tightened this from "any value = true").
+    let no_prefix = match options.prefix_mode {
+        Some(force_prefix) => !force_prefix,
+        None => match config.get_all("format", None, "noprefix").last() {
+            // A bare `[format] noprefix` (no value) is boolean true.
+            Some(None) => true,
+            Some(Some(value)) => parse_format_noprefix_bool(value)?,
+            None => false,
+        },
+    };
+    if no_prefix {
+        options.src_prefix.clear();
+        options.dst_prefix.clear();
+    }
+    let options = options;
 
     let resolved = resolve_format(&options, config)?;
 
@@ -432,6 +466,16 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let out_dir = options.output_directory.as_deref().unwrap_or(".");
     let out_dir_path = resolve_cli_path(cwd, out_dir);
     fs::create_dir_all(&out_dir_path)?;
+    // Resolve the filename length cap: CLI `--filename-max-length`, else
+    // `format.filenameMaxLength`, else 64 (git FORMAT_PATCH_NAME_MAX_DEFAULT).
+    // A floor of len("0000-") + len(".patch") keeps room for the number+suffix.
+    let patch_name_max = resolve_patch_name_max(&options, config);
+    // The sanitized `v<reroll>-` filename prefix (empty when no reroll count).
+    let reroll_prefix = options
+        .reroll_count
+        .as_deref()
+        .map(reroll_filename_prefix)
+        .unwrap_or_default();
     let mut stdout = io::stdout();
     if let Some(cover) = &cover {
         // The cover is patch number `start_number - 1` (0 when numbering starts
@@ -441,7 +485,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         let file_name = if options.numbered_files {
             cover_seq.to_string()
         } else {
-            format!("{cover_seq:04}-cover-letter.patch")
+            build_patch_filename(&reroll_prefix, cover_seq, "cover-letter", patch_name_max)
         };
         let file_path = out_dir_path.join(&file_name);
         fs::write(&file_path, cover)?;
@@ -469,7 +513,8 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         let file_name = if options.numbered_files {
             seq.to_string()
         } else {
-            patch_file_name(seq, &record.commit.message)
+            let slug = sanitize_patch_subject(&record.commit.message);
+            build_patch_filename(&reroll_prefix, seq, &slug, patch_name_max)
         };
         let file_path = out_dir_path.join(&file_name);
         fs::write(&file_path, &buffer)?;
@@ -2611,19 +2656,93 @@ fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
     (!rev.starts_with('^') && !rev.contains("..")).then_some(rev)
 }
 
-/// Build the output file name `NNNN-<slug>.patch` for the patch numbered `seq`.
-fn patch_file_name(seq: usize, message: &[u8]) -> String {
-    let slug = sanitize_patch_subject(message);
-    format!("{seq:04}-{slug}.patch")
+/// Parse a `format.noprefix` config value as a strict boolean. git tightened
+/// this from "any value is treated as true" and now errors on a non-boolean,
+/// printing the migration hints.
+fn parse_format_noprefix_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => {
+            eprintln!("fatal: bad boolean config value '{value}' for 'format.noprefix'");
+            eprintln!(
+                "hint: 'format.noprefix' used to accept any value and treat that as 'true'."
+            );
+            eprintln!(
+                "hint: Now it only accepts boolean values, like what 'diff.noprefix' does."
+            );
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// Default `patch_name_max` (git `FORMAT_PATCH_NAME_MAX_DEFAULT`).
+const FORMAT_PATCH_NAME_MAX_DEFAULT: usize = 64;
+/// The `.patch` suffix used by output filenames.
+const PATCH_SUFFIX: &str = ".patch";
+
+/// Parse a `--filename-max-length=<n>` / `format.filenameMaxLength` value.
+fn parse_filename_max_length(value: &str) -> Result<usize> {
+    value
+        .trim()
+        .parse::<i64>()
+        .map(|n| n.max(0) as usize)
+        .map_err(|_| GitError::Command(format!("could not parse '{value}'")))
+}
+
+/// Resolve the filename length cap: CLI flag, else `format.filenameMaxLength`,
+/// else the default. git clamps anything `<= len("0000-") + len(suffix)` up to
+/// that floor so the number and suffix always fit.
+fn resolve_patch_name_max(options: &FormatPatchOptions, config: &GitConfig) -> usize {
+    let raw = options
+        .filename_max_length
+        .or_else(|| {
+            config
+                .get("format", None, "filenamemaxlength")
+                .and_then(|value| parse_filename_max_length(value).ok())
+        })
+        .unwrap_or(FORMAT_PATCH_NAME_MAX_DEFAULT);
+    let floor = "0000-".len() + PATCH_SUFFIX.len();
+    raw.max(floor)
+}
+
+/// git `fmt_output_subject` reroll prefix: a sanitized `v<reroll>-`. The reroll
+/// string itself runs through `format_sanitized_subject` (so non-pathname
+/// characters collapse to `-`), then a literal `-` is appended.
+fn reroll_filename_prefix(reroll: &str) -> String {
+    let sanitized = sanitize_filename_component(format!("v{reroll}").as_bytes());
+    format!("{sanitized}-")
+}
+
+/// Build a patch output basename: `<reroll>NNNN-<slug>.patch`, hard-truncated so
+/// the whole basename fits in `patch_name_max` (git `fmt_output_subject`: the
+/// part before the suffix is capped at `patch_name_max - (len(suffix) + 1)`).
+fn build_patch_filename(
+    reroll_prefix: &str,
+    seq: usize,
+    slug: &str,
+    patch_name_max: usize,
+) -> String {
+    let mut stem = format!("{reroll_prefix}{seq:04}-{slug}");
+    let max_len = patch_name_max - (PATCH_SUFFIX.len() + 1);
+    if stem.len() > max_len {
+        stem.truncate(max_len);
+    }
+    format!("{stem}{PATCH_SUFFIX}")
+}
+
+/// git's `format_sanitized_subject` over the commit subject (no length cap; the
+/// caller truncates the assembled filename).
+fn sanitize_patch_subject(message: &[u8]) -> String {
+    let subject = commit_subject(message);
+    sanitize_filename_component(subject.as_bytes())
 }
 
 /// git's `format_sanitized_subject`: keep alphanumerics, `.` and `_`; collapse
 /// each run of other characters to a single `-`; collapse consecutive dots; no
-/// leading separator; trim trailing `-`/`.`; then hard-truncate to 52 bytes.
-fn sanitize_patch_subject(message: &[u8]) -> String {
-    const MAX: usize = 52;
-    let subject = commit_subject(message);
-    let bytes = subject.as_bytes();
+/// leading separator; trim trailing `-`/`.`.
+fn sanitize_filename_component(input: &[u8]) -> String {
+    let bytes = input;
     let mut out = String::new();
     // `space` tracks whether a separator is pending: 2 = at start (suppress a
     // leading dash), 1 = a separator was seen, 0 = last char was kept.
@@ -2650,9 +2769,6 @@ fn sanitize_patch_subject(message: &[u8]) -> String {
     }
     while out.ends_with(['-', '.']) {
         out.pop();
-    }
-    if out.len() > MAX {
-        out.truncate(MAX);
     }
     out
 }
@@ -2685,8 +2801,8 @@ fn write_patch_diff_entry(
     let content_changed = old_content.as_deref() != new_content.as_deref();
 
     let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
-    let diff_old_path = patch_prefixed_path("a/", old_path);
-    let diff_new_path = patch_prefixed_path("b/", &entry.path);
+    let diff_old_path = patch_prefixed_path(&options.src_prefix, old_path);
+    let diff_new_path = patch_prefixed_path(&options.dst_prefix, &entry.path);
     writeln_buf(out, &format!("diff --git {diff_old_path} {diff_new_path}"));
     write_patch_mode_headers(out, entry);
     write_patch_similarity_headers(out, entry, old_path, &entry.path);
@@ -2717,12 +2833,12 @@ fn write_patch_diff_entry(
             ),
         );
         let old = if old_content.is_some() {
-            patch_prefixed_path("a/", old_path)
+            patch_prefixed_path(&options.src_prefix, old_path)
         } else {
             "/dev/null".to_string()
         };
         let new = if new_content.is_some() {
-            patch_prefixed_path("b/", &entry.path)
+            patch_prefixed_path(&options.dst_prefix, &entry.path)
         } else {
             "/dev/null".to_string()
         };
@@ -2752,16 +2868,18 @@ fn write_patch_diff_entry(
             patch_mode_suffix(entry)
         ),
     );
-    let _ = options; // reserved for future patch knobs; keeps the signature stable.
     match entry.status {
         sley_diff_merge::NameStatus::Added => writeln_buf(out, "--- /dev/null"),
-        _ => writeln_buf(out, &format!("--- {}", patch_header_path("a/", old_path))),
+        _ => writeln_buf(
+            out,
+            &format!("--- {}", patch_header_path(&options.src_prefix, old_path)),
+        ),
     }
     match entry.status {
         sley_diff_merge::NameStatus::Deleted => writeln_buf(out, "+++ /dev/null"),
         _ => writeln_buf(
             out,
-            &format!("+++ {}", patch_header_path("b/", &entry.path)),
+            &format!("+++ {}", patch_header_path(&options.dst_prefix, &entry.path)),
         ),
     }
     write_patch_hunks(out, old_content.as_deref(), new_content.as_deref());
@@ -3283,6 +3401,15 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value if let Some(n) = value.strip_prefix("-v") => {
                 options.reroll_count = Some(n.to_string());
             }
+            "--filename-max-length" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--filename-max-length requires a value".into())
+                })?;
+                options.filename_max_length = Some(parse_filename_max_length(value)?);
+            }
+            value if let Some(n) = value.strip_prefix("--filename-max-length=") => {
+                options.filename_max_length = Some(parse_filename_max_length(n)?);
+            }
             "-k" | "--keep-subject" => options.keep_subject = true,
             // Recipient / extra-header injection.
             "--to" => {
@@ -3367,10 +3494,11 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--no-indent-heuristic"
             | "--binary"
             | "--no-binary"
-            | "--no-prefix"
             | "--text"
             | "-a"
             | "--ita-invisible-in-index" => {}
+            "--no-prefix" => options.prefix_mode = Some(false),
+            "--default-prefix" => options.prefix_mode = Some(true),
             value if value.starts_with("--color=") => {}
             // Message threading: bare `--thread` is shallow; `--thread=deep` /
             // `--thread=shallow` pick the style; `--no-thread` clears it.
@@ -3441,6 +3569,12 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             }
             value if value.starts_with('^') && value.len() > 1 => {
                 options.setup_args.push(value.to_string());
+            }
+            // git explicitly rejects these diff output formats for format-patch
+            // (`builtin/log.c`: "--%s does not make sense").
+            "--name-only" | "--name-status" | "--check" => {
+                eprintln!("fatal: {arg} does not make sense");
+                return Err(GitError::Exit(128));
             }
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
