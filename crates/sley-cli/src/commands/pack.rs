@@ -27,6 +27,8 @@ struct IndexPackOptions {
     /// `--object-format=<algo>`: the hash algorithm. Lets `index-pack <pack>`
     /// run outside a repository (where there is no config to read it from).
     object_format: Option<ObjectFormat>,
+    /// `--max-input-size=<n>`: reject a pack whose byte length exceeds `<n>`.
+    max_input_size: Option<u64>,
 }
 
 pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
@@ -87,6 +89,17 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
         return index_pack_usage();
     };
     let pack = fs::read(&pack_file)?;
+    // `--max-input-size`: refuse a pack larger than the cap, mirroring
+    // index-pack.c's `pack exceeds maximum allowed size` die.
+    if let Some(limit) = options.max_input_size
+        && pack.len() as u64 > limit
+    {
+        eprintln!(
+            "fatal: pack exceeds maximum allowed size ({})",
+            humanise_byte_count(limit)
+        );
+        return Err(GitError::Exit(128));
+    }
     let indexed = PackFile::index_pack(&pack, format)?;
     // `--strict` / `--fsck-objects`: fsck every object the pack carries and
     // report content findings, mirroring index-pack.c's fsck_finish pass.
@@ -149,6 +162,7 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         fsck: false,
         fsck_overrides: Vec::new(),
         object_format: None,
+        max_input_size: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -207,6 +221,12 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             value if let Some(value) = long_option_value(value, "object-format") => {
                 options.object_format = Some(parse_verify_pack_object_format(value)?);
             }
+            value if value.starts_with("--max-input-size=") => {
+                let spec = &value["--max-input-size=".len()..];
+                options.max_input_size = Some(spec.parse().map_err(|_| {
+                    GitError::Command(format!("bad max-input-size '{spec}'"))
+                })?);
+            }
             value if value.starts_with("--threads=") || value.starts_with("--pack_header=") => {}
             value if value.starts_with('-') => return index_pack_usage(),
             value => index_pack_add_pack_file(&mut options, value)?,
@@ -227,6 +247,30 @@ fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Resu
     }
     options.pack_file = Some(PathBuf::from(value));
     Ok(())
+}
+
+/// Render `bytes` the way git's `strbuf_humanise_bytes` does: `<n> byte[s]`
+/// under 1 KiB, otherwise `<x>.<yy> KiB/MiB/GiB` with truncating fixed-point.
+fn humanise_byte_count(bytes: u64) -> String {
+    if bytes > 1 << 30 {
+        let whole = bytes >> 30;
+        let frac = (bytes & ((1 << 30) - 1)) / 10_737_419;
+        format!("{whole}.{frac:02} GiB")
+    } else if bytes > 1 << 20 {
+        let x = bytes + 5243;
+        let whole = x >> 20;
+        let frac = ((x & ((1 << 20) - 1)) * 100) >> 20;
+        format!("{whole}.{frac:02} MiB")
+    } else if bytes > 1 << 10 {
+        let x = bytes + 5;
+        let whole = x >> 10;
+        let frac = ((x & ((1 << 10) - 1)) * 100) >> 10;
+        format!("{whole}.{frac:02} KiB")
+    } else if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 /// True when some object in the pack references an object that is not itself in
