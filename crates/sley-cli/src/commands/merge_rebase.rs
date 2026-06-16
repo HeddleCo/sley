@@ -829,6 +829,35 @@ fn merge_octopus(
     Ok(())
 }
 
+/// The default merge commit subject for a single-parent merge of `target`,
+/// mirroring git's `merge_name` + `fmt_merge_msg`: dwim the target to a ref and
+/// pick `Merge tag '<n>'` / `Merge branch '<n>'` / `Merge remote-tracking branch
+/// '<n>'` / `Merge commit '<n>'`. Precedence follows git's `ref_rev_parse_rules`
+/// (tags before heads), so a tag wins a name it shares with a branch. FETCH_HEAD
+/// keeps its own fetch-record-derived description.
+fn merge_default_message(
+    refs: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &str,
+) -> Result<String> {
+    if target == "FETCH_HEAD" {
+        return Ok(fetch_head_merge_record(git_dir, format)
+            .map(|record| format!("Merge {}", record.description))
+            .unwrap_or_else(|_| format!("Merge commit '{target}'")));
+    }
+    let exists = |name: &str| -> Result<bool> { Ok(refs.read_ref(name)?.is_some()) };
+    if exists(&format!("refs/tags/{target}"))? {
+        Ok(format!("Merge tag '{target}'"))
+    } else if exists(&format!("refs/heads/{target}"))? {
+        Ok(format!("Merge branch '{target}'"))
+    } else if exists(&format!("refs/remotes/{target}"))? {
+        Ok(format!("Merge remote-tracking branch '{target}'"))
+    } else {
+        Ok(format!("Merge commit '{target}'"))
+    }
+}
+
 struct MergeOptions {
     message: Option<String>,
     no_ff: bool,
@@ -1294,19 +1323,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         }
         fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
         let head_tree = commit_tree_oid(&db, format, &head_oid)?;
-        let target_is_branch = match branch_ref_name(&target) {
-            Ok(name) => refs.read_ref(&name)?.is_some(),
-            Err(_) => false,
-        };
-        let default_message = if target == "FETCH_HEAD" {
-            fetch_head_merge_record(&git_dir, format)
-                .map(|record| format!("Merge {}", record.description))
-                .unwrap_or_else(|_| format!("Merge commit '{target}'"))
-        } else if target_is_branch {
-            format!("Merge branch '{target}'")
-        } else {
-            format!("Merge commit '{target}'")
-        };
+        let default_message = merge_default_message(&refs, &git_dir, format, &target)?;
         let message = options.message.clone().unwrap_or(default_message);
         if options.no_commit {
             fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
@@ -1435,19 +1452,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         options.favor,
     )?;
 
-    let target_is_branch = match branch_ref_name(&target) {
-        Ok(name) => refs.read_ref(&name)?.is_some(),
-        Err(_) => false,
-    };
-    let default_message = if target == "FETCH_HEAD" {
-        fetch_head_merge_record(&git_dir, format)
-            .map(|record| format!("Merge {}", record.description))
-            .unwrap_or_else(|_| format!("Merge commit '{target}'"))
-    } else if target_is_branch {
-        format!("Merge branch '{target}'")
-    } else {
-        format!("Merge commit '{target}'")
-    };
+    let default_message = merge_default_message(&refs, &git_dir, format, &target)?;
     let message = options.message.clone().unwrap_or(default_message);
 
     if conflicts.is_empty() {
