@@ -210,6 +210,9 @@ jobs:
             t5548-push-porcelain.sh
             t6430-merge-recursive.sh
             t5702-protocol-v2.sh
+            t7103-reset-bare.sh
+            t7110-reset-merge.sh
+            t7201-co.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.

@@ -483,6 +483,9 @@ declare -A FLOOR=(
     [t5548-push-porcelain.sh]=11
     [t6430-merge-recursive.sh]=23
     [t5702-protocol-v2.sh]=5
+    [t7103-reset-bare.sh]=12
+    [t7110-reset-merge.sh]=21
+    [t7201-co.sh]=19
 )
 
 fail=0
