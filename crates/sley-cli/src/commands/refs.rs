@@ -1400,6 +1400,7 @@ fn dispatch_ref_stdin_command(
                     expected_oid: expected.as_ref(),
                 },
             )
+            .map_err(|err| transaction.reshape_df_conflict(err))
         }
         "create" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1462,6 +1463,7 @@ fn dispatch_ref_stdin_command(
                     expected_oid: Some(&zero),
                 },
             )
+            .map_err(|err| transaction.reshape_df_conflict(err))
         }
         "delete" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1677,6 +1679,15 @@ fn dispatch_ref_stdin_command(
     }
 }
 
+/// Pull `(new_ref, existing_ref)` out of the backend's D/F-conflict message
+/// `cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'`.
+fn parse_df_conflict_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("cannot lock ref '")?;
+    let (new_ref, rest) = rest.split_once("': '")?;
+    let (existing_ref, _) = rest.split_once("' exists; cannot create '")?;
+    Some((new_ref.to_string(), existing_ref.to_string()))
+}
+
 struct UpdateRefStdinTransaction {
     active: bool,
     explicit: bool,
@@ -1702,6 +1713,51 @@ impl Default for UpdateRefStdinTransaction {
 }
 
 impl UpdateRefStdinTransaction {
+    /// Was `name` newly created within this batch (absent at batch start)? Used
+    /// to tell git's two D/F-conflict messages apart: a conflict against a
+    /// *pre-existing* ref is `'<dir>' exists; cannot create '<ref>'`, but a
+    /// conflict against another ref *queued in the same batch* is
+    /// `cannot process '<dir>' and '<ref>' at the same time`
+    /// (git's refs_verify_refnames_available distinguishing existing refs from
+    /// the `extras` set).
+    fn is_batch_create(&self, name: &str) -> bool {
+        matches!(self.originals.get(name), Some(None))
+    }
+
+    /// Reshape a backend D/F-conflict error into the git-shaped `fatal:` exit-128
+    /// failure. git distinguishes two cases (refs_verify_refnames_available):
+    ///
+    ///   * the conflicting ref is *also queued in this batch* (an `extras`
+    ///     conflict) — `cannot process '<parent>' and '<child>' at the same
+    ///     time`, parent (shorter path) first to match git's sorted order;
+    ///   * the conflicting ref *pre-exists* (e.g. delete-short + add-long) —
+    ///     keep git's `'<dir>' exists; cannot create '<ref>'` text but surface it
+    ///     as a `fatal:` / exit-128 die rather than the generic `transaction
+    ///     failed` (exit 1) the backend's `Transaction` error renders as.
+    ///
+    /// Returns the original error if the message is not a D/F conflict.
+    fn reshape_df_conflict(&self, err: GitError) -> GitError {
+        let GitError::Transaction(message) = &err else {
+            return err;
+        };
+        // Backend message: "cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'".
+        let Some((new_ref, existing_ref)) = parse_df_conflict_message(message) else {
+            return err;
+        };
+        if self.is_batch_create(&existing_ref) {
+            // Parent (shorter path) first, child second — matching git's sorted order.
+            let (parent, child) = if existing_ref.len() <= new_ref.len() {
+                (existing_ref, new_ref)
+            } else {
+                (new_ref, existing_ref)
+            };
+            eprintln!("fatal: cannot process '{parent}' and '{child}' at the same time");
+        } else {
+            eprintln!("fatal: {message}");
+        }
+        GitError::Exit(128)
+    }
+
     fn capture(&mut self, store: &FileRefStore, name: &str) -> Result<bool> {
         if self.active {
             if self.originals.contains_key(name) {
