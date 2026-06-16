@@ -60,6 +60,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             "--soft" => mode = ResetMode::Soft,
             "--hard" => mode = ResetMode::Hard,
             "--merge" => mode = ResetMode::Merge,
+            "--keep" => mode = ResetMode::Keep,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -111,6 +112,16 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    // git's `setup_work_tree()` (builtin/reset.c): every reset that touches the
+    // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
+    // a bare repository refuses with "this operation must be run in a work
+    // tree". `--soft` (HEAD-only) and `--mixed` (index-only) are exempt.
+    if matches!(
+        mode,
+        ResetMode::Hard | ResetMode::Merge | ResetMode::Keep
+    ) {
+        require_work_tree(&git_dir)?;
+    }
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let pathspec_from_file_provided = pathspec_from_file.is_some();
@@ -143,6 +154,77 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             }
             other => other,
         });
+    }
+    if mode == ResetMode::Keep {
+        // git's `reset --keep` (builtin/reset.c): a two-way merge from the
+        // current HEAD tree to the target tree, carrying forward local
+        // modifications where safe and refusing the reset (with the read-tree
+        // "not uptodate. Cannot merge." porcelain) when a touched file has
+        // local changes. It never accepts paths.
+        if pathspec_from_file_provided || (saw_separator && !positionals.is_empty()) {
+            eprintln!("fatal: Cannot do keep reset with paths.");
+            return Err(GitError::Exit(128));
+        }
+        let target = match positionals.as_slice() {
+            [] => "HEAD",
+            [target] => target.as_str(),
+            _ => {
+                eprintln!("fatal: Cannot do keep reset with paths.");
+                return Err(GitError::Exit(128));
+            }
+        };
+        // git's `die_if_unmerged_cache(KEEP)`: a pending merge (MERGE_HEAD) or
+        // unmerged index entries forbid `--keep` (same gate as `--soft`).
+        if reset_soft_blocked_by_merge(&git_dir, format)? {
+            eprintln!("fatal: Cannot do a keep reset in the middle of a merge.");
+            return Err(GitError::Exit(128));
+        }
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let head_oid = resolve_revision(&git_dir, format, "HEAD")
+            .map_err(|_| {
+                eprintln!("fatal: You do not have a valid HEAD.");
+                GitError::Exit(128)
+            })?;
+        let old_head = head_oid;
+        let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
+        let target_oid = resolve_revision(&git_dir, format, target)?;
+        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
+        write_reset_orig_head(&git_dir, &old_head, format)?;
+        // The structural lever: route `--keep` through the SAME twoway_merge
+        // engine as checkout, with the read-tree abort wording its test asserts.
+        // git's `reset_index(KEEP)`: a twoway_merge with `update=1` updates the
+        // worktree (carrying forward safe local modifications, aborting on a
+        // touched-file conflict). This may leave staged changes in the index.
+        commands::read_tree::checkout_two_way_engine(
+            &git_dir,
+            &worktree_root,
+            format,
+            &db,
+            Some(&head_tree),
+            &target_tree,
+            commands::read_tree::UnpackPorcelain::ReadTree,
+        )?;
+        // git's second pass: `if (reset_type == KEEP && !err) reset_index(MIXED)`
+        // — an index-only reset to the target tree, so the resulting index
+        // matches the target exactly (a staged-but-untouched change is dropped
+        // from the index while its worktree content is preserved by pass 1).
+        sley_worktree::reset_index_to_commit(
+            worktree_root.clone(),
+            git_dir.clone(),
+            format,
+            &target_commit,
+        )?;
+        update_reset_head_ref(
+            &git_dir,
+            format,
+            old_head,
+            target_commit,
+            target,
+            commit_identity_from_env("COMMITTER")?,
+        )?;
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        return Ok(());
     }
     if matches!(mode, ResetMode::Soft | ResetMode::Hard) {
         if pathspec_from_file_provided {
@@ -518,6 +600,7 @@ enum ResetMode {
     Soft,
     Hard,
     Merge,
+    Keep,
 }
 
 impl ResetMode {
@@ -527,6 +610,7 @@ impl ResetMode {
             Self::Soft => "soft",
             Self::Hard => "hard",
             Self::Merge => "merge",
+            Self::Keep => "keep",
         }
     }
 }
@@ -865,6 +949,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 "reference-transaction",
                 commands::hooks::HookRun::default(),
             )?;
+            checkout_show_local_changes(&target_oid, quiet, force)?;
             return Ok(());
         }
         CheckoutBranchMode::Existing => {
@@ -918,6 +1003,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     "reference-transaction",
                     commands::hooks::HookRun::default(),
                 )?;
+                checkout_show_local_changes(&target_oid, quiet, force)?;
                 return Ok(());
             }
             CheckoutMessage::Existing {
@@ -1003,6 +1089,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     if !quiet {
         checkout_message.print();
     }
+    // git's `show_local_changes`: report carried-forward worktree modifications
+    // relative to the newly checked-out commit (`M\t<path>`, etc.).
+    checkout_show_local_changes(&checkout_new_head, quiet, force)?;
     Ok(())
 }
 
@@ -1310,11 +1399,49 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Dirty-tolerant two-way checkout fallback: paths whose content is the same
-/// in the current HEAD and the target carry their index/worktree state across
-/// the switch (git's twoway_merge); paths that must change are updated only
-/// when clean, and staged changes that conflict with the target refuse the
-/// switch. `target` of `None` switches to the empty tree (`switch --orphan`).
+/// Two-way checkout through the shared `sley_unpack_trees::twoway_merge`
+/// engine (git's `merge_working_tree` in `builtin/checkout.c`): switch the
+/// index + working tree from the current HEAD's tree to `target`'s tree,
+/// carrying forward local modifications where the merge is safe and aborting
+/// with git's exact "would be overwritten by checkout" porcelain otherwise.
+///
+/// This is the SINGLE two-way path behind `git checkout <branch>`,
+/// `git switch`, and `git checkout --detach`. It replaces the former bespoke
+/// path-by-path two-way reimplementation: the engine owns `verify_uptodate` /
+/// `verify_absent` / staged-deletion semantics, so the whole checkout class
+/// inherits git's behaviour from one primitive rather than a parallel copy.
+///
+/// `target` of `None` switches to the empty tree (`switch --orphan`).
+/// git's `show_local_changes` (`builtin/checkout.c`): after a successful branch
+/// switch, print the `--name-status` diff of the *worktree* against the newly
+/// checked-out commit so a carried-forward local modification is reported (e.g.
+/// `M\tsame`). This is `git diff-index --name-status <new_commit>` against the
+/// (just-rebuilt) index + worktree, run for output only.
+///
+/// git gates this on `!opts->discard_changes && !opts->quiet &&
+/// new_branch_info->commit`: a force checkout (`-f`, which discards local
+/// changes) and a quiet checkout (`-q`) print nothing, and there is nothing to
+/// diff against when the target has no commit (an unborn branch).
+fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) -> Result<()> {
+    if quiet || force {
+        return Ok(());
+    }
+    // git's `new_branch_info->commit` guard: there is nothing to diff against
+    // when switching to an unborn branch (HEAD has no commit), so the zero OID
+    // suppresses the local-changes report. Without this a `checkout -B <name>`
+    // on a fresh `init` would run `diff-index 0000…0000` and fail.
+    if new_commit.is_null() {
+        return Ok(());
+    }
+    // Reuse the shared `diff-index` renderer (byte-identical with git's
+    // name-status output). It diffs the tree-ish against the working tree by
+    // default — exactly git's `run_diff_index(&rev, 0)`.
+    commands::diff_index::cmd_diff_index(&[
+        "--name-status".to_string(),
+        new_commit.to_hex(),
+    ])
+}
+
 fn checkout_twoway_dirty(
     git_dir: &Path,
     worktree_root: &Path,
@@ -1322,188 +1449,31 @@ fn checkout_twoway_dirty(
     target: Option<&ObjectId>,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let target_map = match target {
-        Some(target) => {
-            let tree = commands::merge_rebase::commit_tree_oid(&db, format, target)?;
-            stash_tree_entry_map(&db, format, &tree)?
-        }
-        None => BTreeMap::new(),
-    };
-    let refs = FileRefStore::new(git_dir, format);
-    let head_map = match commands::merge_rebase::head_commit_oid(&refs)? {
-        Some(head) => {
-            let tree = commands::merge_rebase::commit_tree_oid(&db, format, &head)?;
-            stash_tree_entry_map(&db, format, &tree)?
-        }
-        None => BTreeMap::new(),
-    };
-    let index_path = sley_worktree::repository_index_path(git_dir);
-    let old_index = if index_path.exists() {
-        Index::parse(&fs::read(&index_path)?, format)?
-    } else {
-        Index {
-            version: 2,
-            entries: Vec::new(),
-            extensions: Vec::new(),
-            checksum: None,
-        }
-    };
-    let mut stage0: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
-    for entry in &old_index.entries {
-        if index_entry_stage(entry) > 0 {
-            eprintln!("error: you need to resolve your current index first");
-            return Err(GitError::Exit(1));
-        }
-        stage0.insert(entry.path.clone().into_bytes(), entry.clone());
-    }
-    let all_paths: BTreeSet<Vec<u8>> = stage0
-        .keys()
-        .cloned()
-        .chain(target_map.keys().cloned())
-        .chain(head_map.keys().cloned())
-        .collect();
-    let mut blocked: Vec<Vec<u8>> = Vec::new();
-    let mut updates: Vec<(Vec<u8>, (u32, ObjectId))> = Vec::new();
-    let mut deletions: Vec<Vec<u8>> = Vec::new();
-    // Paths the new index keeps from the old index even though the target
-    // tree disagrees (the twoway "carry" rule: HEAD and target agree).
-    let mut carried: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for path in &all_paths {
-        let current = stage0.get(path).map(|entry| (entry.mode, entry.oid));
-        let wanted = target_map.get(path).copied();
-        let in_head = head_map.get(path).copied();
-        if in_head == wanted {
-            // Same on both sides of the switch: carry local state verbatim.
-            if current.is_some() && wanted != current {
-                carried.insert(path.clone());
-            }
-            continue;
-        }
-        if current == wanted {
-            continue;
-        }
-        if current != in_head {
-            // Staged (or missing) state conflicts with the switch.
-            blocked.push(path.clone());
-            continue;
-        }
-        let rel = String::from_utf8_lossy(path).into_owned();
-        let full = worktree_root.join(&rel);
-        if let Some(entry) = stage0.get(path) {
-            if let Ok(bytes) = fs::read(&full) {
-                let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
-                if on_disk != entry.oid {
-                    blocked.push(path.clone());
-                    continue;
-                }
-            }
-        } else if let Some((_, oid)) = &wanted
-            && let Ok(bytes) = fs::read(&full)
-        {
-            // Untracked file in the way: only identical content may be adopted.
-            let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
-            if &on_disk != oid {
-                eprintln!(
-                    "error: The following untracked working tree files would be overwritten by checkout:"
-                );
-                eprintln!("\t{rel}");
-                eprintln!("Please move or remove them before you switch branches.");
-                eprintln!("Aborting");
-                return Err(GitError::Exit(1));
-            }
-        }
-        match wanted {
-            Some(entry) => updates.push((path.clone(), entry)),
-            None => deletions.push(path.clone()),
-        }
-    }
-    if !blocked.is_empty() {
-        eprintln!(
-            "error: Your local changes to the following files would be overwritten by checkout:"
-        );
-        for path in &blocked {
-            eprintln!("\t{}", String::from_utf8_lossy(path));
-        }
-        eprintln!("Please commit your changes or stash them before you switch branches.");
-        eprintln!("Aborting");
-        return Err(GitError::Exit(1));
-    }
-    // Deletions BEFORE updates: git's two-way unpack-trees removes the paths a
-    // switch drops before materializing the ones it adds. The order matters for a
-    // directory/file transition — e.g. the old tree had `dir/child` and the new
-    // tree wants `dir` as a plain file. If `dir` were written as a file first, the
-    // later removal of `dir/child` would lstat through a now-regular-file `dir`
-    // and fail with ENOTDIR. Removing `dir/child` first leaves a clean slot for
-    // the file. (`merge_write_worktree_file` already clears the reverse F→D case.)
-    for path in &deletions {
-        if stage0.get(path).is_some_and(|entry| entry.mode == 0o160000) {
-            checkout_remove_gitlink_worktree_dir(worktree_root, path)?;
-        } else {
-            commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
-        }
-    }
-    for (path, (mode, oid)) in &updates {
-        let content = commands::merge_rebase::merge_read_blob(&db, oid)?;
-        commands::merge_rebase::merge_write_worktree_file(worktree_root, path, &content, *mode)?;
-    }
-    let mut entries: Vec<IndexEntry> = Vec::new();
-    for (path, (mode, oid)) in &target_map {
-        if carried.contains(path) {
-            continue;
-        }
-        if let Some(old) = stage0.get(path)
-            && old.mode == *mode
-            && old.oid == *oid
-        {
-            entries.push(old.clone());
-        } else {
-            entries.push(commands::merge_rebase::merge_index_entry(
-                path, *mode, *oid, 0,
-            ));
-        }
-    }
-    for path in &carried {
-        if let Some(old) = stage0.get(path) {
-            entries.push(old.clone());
-        }
-    }
-    // Staged adds whose path is in neither tree are carried too.
-    for (path, entry) in &stage0 {
-        if !target_map.contains_key(path) && !head_map.contains_key(path) && !carried.contains(path)
-        {
-            entries.push(entry.clone());
-        }
-    }
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
-    Ok(())
-}
 
-fn checkout_remove_gitlink_worktree_dir(worktree_root: &Path, path: &[u8]) -> Result<()> {
-    let rel = std::str::from_utf8(path)
-        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
-    let full = worktree_root.join(rel);
-    if !full.exists() {
-        return Ok(());
-    }
-    if full.is_dir() {
-        match fs::remove_dir(&full) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(err) => return Err(err.into()),
-        }
-        return Ok(());
-    }
-    commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)
+    // The tree being checked out. `None` (orphan switch) maps to the empty tree
+    // so every currently-tracked path is removed.
+    let target_tree = match target {
+        Some(target) => commands::merge_rebase::commit_tree_oid(&db, format, target)?,
+        None => ObjectId::empty_tree(format),
+    };
+
+    // The tree of the HEAD being left (git's `old_branch_info->commit`). `None`
+    // when HEAD is unborn — the engine then sees an empty `oldtree` side.
+    let refs = FileRefStore::new(git_dir, format);
+    let old_tree = match commands::merge_rebase::head_commit_oid(&refs)? {
+        Some(head) => Some(commands::merge_rebase::commit_tree_oid(&db, format, &head)?),
+        None => None,
+    };
+
+    commands::read_tree::checkout_two_way_engine(
+        git_dir,
+        worktree_root,
+        format,
+        &db,
+        old_tree.as_ref(),
+        &target_tree,
+        commands::read_tree::UnpackPorcelain::Checkout,
+    )
 }
 
 fn checkout_is_dirty_tree_error(err: &GitError) -> bool {

@@ -484,6 +484,25 @@ fn original_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet
     Ok(out)
 }
 
+/// Which command's porcelain error strings the engine's safety checks should
+/// emit, mirroring git's `setup_unpack_trees_porcelain(o, cmd)`. The merge
+/// rules are identical across commands; only the *user-facing abort text*
+/// differs ("...by checkout" vs "...by merge", and the trailing
+/// "switch branches" vs "merge" hint). `checkout <branch>` / `switch` /
+/// `checkout --detach` all use [`UnpackPorcelain::Checkout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnpackPorcelain {
+    /// `read-tree -m`'s historic per-path messages (`Entry '...' not uptodate.
+    /// Cannot merge.` / `Untracked working tree file '...' would be overwritten
+    /// by merge.`). The default for the plumbing `read-tree` consumer.
+    ReadTree,
+    /// `git checkout` / `git switch` porcelain: the collected-path abort block
+    /// (`Your local changes to the following files would be overwritten by
+    /// checkout:\n\t<path>\nPlease commit your changes or stash them before you
+    /// switch branches.\nAborting`).
+    Checkout,
+}
+
 /// The working-tree side of a `-m` merge, supplying the `sley-unpack-trees`
 /// engine with read-tree's I/O: how to tell whether a path is up to date
 /// (hashing the worktree blob), whether materializing/removing a path would
@@ -506,10 +525,23 @@ struct ReadTreeWorktree<'a> {
     /// `is_submodule_active` resolution (`submodule.<name>.active` /
     /// `submodule.active` / `submodule.<name>.url`).
     repo_config: GitConfig,
+    /// Which command's abort text the safety checks emit (git's
+    /// `setup_unpack_trees_porcelain`). `read-tree` keeps its historic
+    /// per-path messages; `checkout`/`switch` use the collected-path block.
+    porcelain: UnpackPorcelain,
 }
 
 impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
     fn verify_uptodate(&self, path: &[u8], ce: &sley_unpack_trees::CacheEntry) -> Result<()> {
+        // git's `verify_uptodate_1` short-circuits a gitlink (submodule):
+        // `if (S_ISGITLINK(ce->ce_mode)) return 0;` — a submodule is never
+        // "dirty" via a worktree blob hash (its working tree is a *directory*,
+        // not a blob), so the engine must not try to `fs::read` it. The
+        // submodule's own dirtiness is handled separately by
+        // `check_submodule_move_head`.
+        if (ce.mode & 0o170000) == 0o160000 {
+            return Ok(());
+        }
         // The engine hands us the *current index* entry for the path; reuse the
         // existing hash-the-worktree-blob comparison (a missing tracked file is
         // treated as up to date, matching git's re-materialization allowance).
@@ -518,6 +550,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
             self.format,
             path,
             Some(&(ce.mode, ce.oid)),
+            self.porcelain,
         )
     }
 
@@ -552,8 +585,22 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         if metadata.is_dir() {
             return self.verify_clean_subdirectory(path, &file_path);
         }
-        let display = String::from_utf8_lossy(path);
-        eprintln!("error: Untracked working tree file '{display}' would be overwritten by merge.");
+        match self.porcelain {
+            UnpackPorcelain::ReadTree => {
+                let display = String::from_utf8_lossy(path);
+                eprintln!(
+                    "error: Untracked working tree file '{display}' would be overwritten by merge."
+                );
+            }
+            UnpackPorcelain::Checkout => {
+                eprintln!(
+                    "error: The following untracked working tree files would be overwritten by checkout:"
+                );
+                eprintln!("\t{}", String::from_utf8_lossy(path));
+                eprintln!("Please move or remove them before you switch branches.");
+                eprintln!("Aborting");
+            }
+        }
         Err(GitError::Exit(128))
     }
 
@@ -712,6 +759,105 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
     }
 }
 
+/// Run git's `merge_working_tree` two-way checkout (`builtin/checkout.c`)
+/// through the shared [`sley_unpack_trees`] engine: switch the index + working
+/// tree from `old_tree` (the HEAD being left) to `new_tree` (the branch/commit
+/// being checked out), carrying forward local modifications where the merge is
+/// safe and aborting with git's exact "would be overwritten by checkout"
+/// message when an unsafe overwrite is detected.
+///
+/// This is the single two-way path behind `git checkout <branch>`,
+/// `git switch`, and `git checkout --detach`: it replaces the bespoke
+/// path-by-path two-way merge that previously lived in `workspace.rs` with the
+/// real `twoway_merge` primitive, so the whole checkout class inherits git's
+/// `verify_uptodate` / `verify_absent` / staged-deletion semantics.
+///
+/// Mirrors `init_topts(..., old_branch_info->commit)`: `merge = update = 1`,
+/// `fn = twoway_merge`, `initial_checkout = is_index_unborn`, `reset = NONE`,
+/// `trees = [old_HEAD_tree, new_tree]`. The resulting index is written to disk
+/// (`write_paired_entries`) and the worktree is updated in place via
+/// [`sley_unpack_trees::check_updates`].
+///
+/// `old_tree`/`new_tree` are the *tree* OIDs (already peeled from their
+/// commits). `old_tree` is `None` for an unborn HEAD (a fresh `checkout -b`
+/// from an empty repo), in which case the engine sees an empty `oldtree` side.
+///
+/// `porcelain` selects the abort wording (git's
+/// `setup_unpack_trees_porcelain`): `checkout`/`switch` use
+/// [`UnpackPorcelain::Checkout`]; `reset --keep`, which runs the identical
+/// `twoway_merge` from `reset.c`, uses [`UnpackPorcelain::ReadTree`] (the
+/// per-path `Entry '...' not uptodate. Cannot merge.` message its test asserts).
+pub(crate) fn checkout_two_way_engine(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    old_tree: Option<&ObjectId>,
+    new_tree: &ObjectId,
+    porcelain: UnpackPorcelain,
+) -> Result<()> {
+    use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
+
+    let index = current_index_flat(git_dir, format)?;
+
+    // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
+    // (empty when HEAD is unborn), `trees[1]` = the tree being checked out.
+    let old_leaves = match old_tree {
+        Some(oid) => tree_leaf_map(db, format, oid)?,
+        None => sley_unpack_trees::FlatTree::new(),
+    };
+    let new_leaves = tree_leaf_map(db, format, new_tree)?;
+    let trees = vec![old_leaves, new_leaves];
+
+    let mut opts = UnpackTreesOptions::new(format);
+    opts.merge = true;
+    opts.update = true;
+    // `init_topts`: `o.initial_checkout = is_index_unborn(...)`. An unborn (empty)
+    // index has no staged deletion to honour, so twoway_merge takes a path from
+    // the new tree rather than its "deletion was staged" arm dropping it.
+    opts.initial_checkout = index.is_empty();
+    opts.index_only = false;
+
+    let mut wt = ReadTreeWorktree {
+        submodules: load_superproject_submodules(worktree_root),
+        repo_config: read_repo_config(git_dir).unwrap_or_default(),
+        worktree_root: worktree_root.to_path_buf(),
+        git_dir: git_dir.to_path_buf(),
+        db,
+        format,
+        original_paths: original_index_paths(git_dir, format)?,
+        porcelain,
+    };
+
+    // git's `merge_working_tree` runs the merge to *populate the result* with
+    // every up-to-date / clobber rejection collected first, then applies the
+    // worktree side only if nothing was rejected. `unpack_trees` here aborts on
+    // the first rejection (before `check_updates` touches the worktree), so a
+    // failed checkout leaves the working tree exactly as it was — matching git's
+    // "Aborting" guarantee.
+    let mut result = unpack_trees(&index, &trees, MergeFn::TwoWay, &opts, &wt)?;
+    check_updates(&mut result, &opts, &mut wt)?;
+
+    // Serialize the merged index. check_updates folded the post-write `lstat`
+    // back into each freshly-written entry, so the stat info is accurate.
+    let pairs: Vec<(Vec<u8>, StagedEntry)> = result
+        .entries
+        .into_iter()
+        .map(|e| {
+            (
+                e.path,
+                StagedEntry {
+                    mode: e.entry.mode,
+                    oid: e.entry.oid,
+                    stage: e.entry.stage,
+                    stat: e.entry.stat,
+                },
+            )
+        })
+        .collect();
+    write_paired_entries(git_dir, format, pairs)
+}
+
 /// Perform git's trivial fast-forward / two-way / three-way merge of the listed
 /// trees through the shared [`sley_unpack_trees`] engine, producing the
 /// resulting (possibly multi-stage) index entries. With `update_worktree`, the
@@ -775,6 +921,7 @@ fn merge_trees(
         db,
         format,
         original_paths: original_index_paths(git_dir, format)?,
+        porcelain: UnpackPorcelain::ReadTree,
     };
 
     let mut result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
@@ -934,6 +1081,7 @@ fn verify_uptodate_path(
     format: ObjectFormat,
     path: &[u8],
     expected: Option<&(u32, ObjectId)>,
+    porcelain: UnpackPorcelain,
 ) -> Result<()> {
     let Some((_mode, expected_oid)) = expected else {
         // Untracked path: nothing in the index to be out of date with.
@@ -949,8 +1097,24 @@ fn verify_uptodate_path(
     };
     let actual = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
     if &actual != expected_oid {
-        let display = String::from_utf8_lossy(path);
-        eprintln!("error: Entry '{display}' not uptodate. Cannot merge.");
+        match porcelain {
+            UnpackPorcelain::ReadTree => {
+                let display = String::from_utf8_lossy(path);
+                eprintln!("error: Entry '{display}' not uptodate. Cannot merge.");
+            }
+            UnpackPorcelain::Checkout => {
+                // git's ERROR_NOT_UPTODATE_FILE under the "checkout" porcelain:
+                // the collected-path "local changes would be overwritten" block.
+                eprintln!(
+                    "error: Your local changes to the following files would be overwritten by checkout:"
+                );
+                eprintln!("\t{}", String::from_utf8_lossy(path));
+                eprintln!(
+                    "Please commit your changes or stash them before you switch branches."
+                );
+                eprintln!("Aborting");
+            }
+        }
         return Err(GitError::Exit(128));
     }
     Ok(())
@@ -1337,7 +1501,28 @@ fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
         return Ok(());
     };
     match fs::symlink_metadata(&file_path) {
-        Ok(md) if md.is_dir() => fs::remove_dir_all(&file_path)?,
+        // git's `unlink_entry`: a path whose worktree copy is a *directory* is a
+        // gitlink (a populated submodule) or a directory whose tracked children
+        // have already been removed first (check_updates unlinks every
+        // CE_WT_REMOVE entry before this one). git removes it with a *non-recursive*
+        // `rmdir` and, when the directory still holds untracked content (a dirty
+        // submodule), emits `warning: unable to rmdir '<path>': Directory not
+        // empty` and leaves it in place — it never recursively deletes a
+        // submodule's working tree.
+        Ok(md) if md.is_dir() => match fs::remove_dir(&file_path) {
+            Ok(()) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::DirectoryNotEmpty
+                    || err.raw_os_error() == Some(39) =>
+            {
+                eprintln!(
+                    "warning: unable to rmdir '{}': Directory not empty",
+                    String::from_utf8_lossy(path)
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        },
         Ok(_) => fs::remove_file(&file_path)?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
