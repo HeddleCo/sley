@@ -1298,6 +1298,31 @@ fn make_script_commits(
     Ok(out)
 }
 
+/// `format_subject(sb, msg, " ")`: the subject paragraph (lines up to the first
+/// blank line) folded into one line joined with spaces. Autosquash matches
+/// `fixup!`/`squash!` against this folded subject, so a multi-line original
+/// subject (`To\nfixup`) is matched by `fixup! To fixup`.
+fn format_subject(message: &[u8]) -> String {
+    let text = String::from_utf8_lossy(message);
+    let mut out = String::new();
+    let mut first = true;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if first {
+                // leading blank lines are skipped
+                continue;
+            }
+            break;
+        }
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(line);
+        first = false;
+    }
+    out
+}
+
 /// `skip_fixupish`: strip one `fixup! `/`amend! `/`squash! ` prefix, returning
 /// the remainder.
 fn skip_fixupish(subject: &str) -> Option<&str> {
@@ -1337,7 +1362,7 @@ fn rearrange_squash(
         // The subject is read off the commit, not the (potentially custom)
         // instruction-format arg.
         let record = read_rev_list_commit_record(db, ctx.format, item.oid.expect("checked"))?;
-        let subject = commit_subject(&record.commit.message);
+        let subject = format_subject(&record.commit.message);
         subjects[i] = Some(subject.clone());
 
         let mut i2: i64 = -1;
