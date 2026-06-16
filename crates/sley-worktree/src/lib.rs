@@ -4041,34 +4041,51 @@ where
         ..StatusProfileCounters::default()
     });
 
-    let tracked_start = Instant::now();
-    let tracked_control = stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
-        worktree_root,
-        git_dir,
-        format,
-        &borrowed,
-        &stat_cache,
-        untracked_mode,
-        emit,
-    )?;
-    if let Some(profile) = profile.as_mut() {
-        profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
-    }
-    if tracked_control.is_stop() {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        let tracked_start = Instant::now();
+        let tracked_control =
+            stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
+                worktree_root,
+                git_dir,
+                format,
+                &borrowed,
+                &stat_cache,
+                untracked_mode,
+                emit,
+            )?;
+        if let Some(profile) = profile.as_mut() {
+            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
+        }
         if let Some(profile) = profile.as_ref() {
             profile.emit();
         }
-        return Ok(Some(()));
-    }
-
-    if matches!(untracked_mode, StatusUntrackedMode::None) {
-        if let Some(profile) = profile.as_ref() {
-            profile.emit();
+        if tracked_control.is_stop() {
+            return Ok(Some(()));
         }
         return Ok(Some(()));
     }
 
     if stage0_entry_count < 8192 {
+        let tracked_start = Instant::now();
+        let tracked_control =
+            stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
+                worktree_root,
+                git_dir,
+                format,
+                &borrowed,
+                &stat_cache,
+                untracked_mode,
+                emit,
+            )?;
+        if let Some(profile) = profile.as_mut() {
+            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
+        }
+        if tracked_control.is_stop() {
+            if let Some(profile) = profile.as_ref() {
+                profile.emit();
+            }
+            return Ok(Some(()));
+        }
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
         let untracked_start = Instant::now();
         stream_status_untracked_paths_from_borrowed_index(
@@ -4090,31 +4107,57 @@ where
     if let Some(profile) = profile.as_mut() {
         profile.overlap_enabled = true;
     }
-    let (untracked_paths, untracked_profile) = std::thread::scope(|scope| -> Result<_> {
-        let untracked = scope.spawn(|| -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
-            let mut local_profile = StatusProfileCounters::default();
-            let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-            let start = Instant::now();
-            let paths = status_untracked_paths_from_borrowed_index(
-                worktree_root,
-                git_dir,
-                &borrowed,
-                &mut ignores,
-                untracked_mode,
-                profile_enabled.then_some(&mut local_profile),
-            )?;
-            local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-            local_profile.untracked_rows = paths.len() as u64;
-            Ok((paths, local_profile))
-        });
-        let (untracked_paths, untracked_profile) = untracked
-            .join()
-            .map_err(|_| GitError::Command("status worker panicked".into()))??;
-        Ok((
-            untracked_paths,
-            profile_enabled.then_some(untracked_profile),
-        ))
-    })?;
+    let (tracked_control, untracked_paths, untracked_profile) =
+        std::thread::scope(|scope| -> Result<_> {
+            let untracked = scope.spawn(|| -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
+                let mut local_profile = StatusProfileCounters::default();
+                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+                let start = Instant::now();
+                let paths = status_untracked_paths_from_borrowed_index(
+                    worktree_root,
+                    git_dir,
+                    &borrowed,
+                    &mut ignores,
+                    untracked_mode,
+                    profile_enabled.then_some(&mut local_profile),
+                )?;
+                local_profile.untracked_elapsed_us = start.elapsed().as_micros();
+                local_profile.untracked_rows = paths.len() as u64;
+                Ok((paths, local_profile))
+            });
+            let tracked_start = Instant::now();
+            let tracked_control =
+                stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    &borrowed,
+                    &stat_cache,
+                    untracked_mode,
+                    emit,
+                )?;
+            let tracked_elapsed_us = tracked_start.elapsed().as_micros();
+            let (untracked_paths, untracked_profile) = untracked
+                .join()
+                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            if let Some(profile) = profile.as_mut() {
+                profile.tracked_elapsed_us = tracked_elapsed_us;
+            }
+            Ok((
+                tracked_control,
+                untracked_paths,
+                profile_enabled.then_some(untracked_profile),
+            ))
+        })?;
+    if tracked_control.is_stop() {
+        if let Some(profile) = profile.as_mut()
+            && let Some(untracked_profile) = untracked_profile
+        {
+            profile.merge_untracked(untracked_profile);
+            profile.emit();
+        }
+        return Ok(Some(()));
+    }
     if let Some(profile) = profile.as_mut()
         && let Some(untracked_profile) = untracked_profile
     {
@@ -6570,7 +6613,9 @@ struct IgnorePatternBuckets {
     literal_basename: HashMap<Vec<u8>, Vec<usize>>,
     directory_literal_basename: HashMap<Vec<u8>, Vec<usize>>,
     literal_path_basename: HashMap<Vec<u8>, Vec<usize>>,
+    directory_literal_path_basename: HashMap<Vec<u8>, Vec<usize>>,
     path_suffix_basename: HashMap<Vec<u8>, Vec<usize>>,
+    directory_path_suffix_basename: HashMap<Vec<u8>, Vec<usize>>,
     glob_path_literal_basename: HashMap<Vec<u8>, Vec<usize>>,
     glob_directory_literal_basename: HashMap<Vec<u8>, Vec<usize>>,
     glob_path_suffix_basename: Vec<usize>,
@@ -6600,12 +6645,27 @@ impl IgnorePatternBuckets {
                 .entry(path_basename(&pattern.pattern).to_vec())
                 .or_default()
                 .push(index),
+            IgnoreBucketKind::DirectoryLiteralPathBasename => self
+                .directory_literal_path_basename
+                .entry(path_basename(&pattern.pattern).to_vec())
+                .or_default()
+                .push(index),
             IgnoreBucketKind::PathSuffixBasename => {
                 let suffix = pattern
                     .pattern
                     .strip_prefix(b"**/")
                     .unwrap_or(&pattern.pattern);
                 self.path_suffix_basename
+                    .entry(path_basename(suffix).to_vec())
+                    .or_default()
+                    .push(index);
+            }
+            IgnoreBucketKind::DirectoryPathSuffixBasename => {
+                let suffix = pattern
+                    .pattern
+                    .strip_prefix(b"**/")
+                    .unwrap_or(&pattern.pattern);
+                self.directory_path_suffix_basename
                     .entry(path_basename(suffix).to_vec())
                     .or_default()
                     .push(index);
@@ -6656,7 +6716,13 @@ impl IgnorePatternBuckets {
         for indices in self.literal_path_basename.values_mut() {
             truncate_indices(indices, len);
         }
+        for indices in self.directory_literal_path_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
         for indices in self.path_suffix_basename.values_mut() {
+            truncate_indices(indices, len);
+        }
+        for indices in self.directory_path_suffix_basename.values_mut() {
             truncate_indices(indices, len);
         }
         for indices in self.glob_path_literal_basename.values_mut() {
@@ -6730,15 +6796,23 @@ fn final_component_match_kind(pattern: &[u8]) -> MatchKind {
     classify_ignore_pattern(path_basename(pattern))
 }
 
-fn directory_match_components(path: &[u8], is_dir: bool) -> Vec<&[u8]> {
-    let mut components = path.split(|byte| *byte == b'/').peekable();
-    let mut matches = Vec::new();
-    while let Some(component) = components.next() {
-        if is_dir || components.peek().is_some() {
-            matches.push(component);
+fn visit_directory_match_components(
+    path: &[u8],
+    is_dir: bool,
+    mut visit: impl FnMut(&[u8]),
+) {
+    let mut start = 0usize;
+    for (index, byte) in path.iter().enumerate() {
+        if *byte == b'/' {
+            if index > start {
+                visit(&path[start..index]);
+            }
+            start = index + 1;
         }
     }
-    matches
+    if is_dir && start < path.len() {
+        visit(&path[start..]);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6746,7 +6820,9 @@ enum IgnoreBucketKind {
     LiteralBasename,
     DirectoryLiteralBasename,
     LiteralPathBasename,
+    DirectoryLiteralPathBasename,
     PathSuffixBasename,
+    DirectoryPathSuffixBasename,
     GlobPathLiteralBasename,
     GlobDirectoryLiteralBasename,
     GlobPathSuffixBasename,
@@ -6930,8 +7006,32 @@ impl IgnoreMatcher {
             &mut best,
             &mut profile,
         );
-        for component in directory_match_components(path, is_dir) {
+        visit_directory_match_components(path, is_dir, |component| {
             if let Some(indices) = self.buckets.directory_literal_basename.get(component) {
+                self.match_bucket_candidates(
+                    indices,
+                    path,
+                    basename,
+                    is_dir,
+                    &mut best,
+                    &mut profile,
+                );
+            }
+            if let Some(indices) = self
+                .buckets
+                .directory_literal_path_basename
+                .get(component)
+            {
+                self.match_bucket_candidates(
+                    indices,
+                    path,
+                    basename,
+                    is_dir,
+                    &mut best,
+                    &mut profile,
+                );
+            }
+            if let Some(indices) = self.buckets.directory_path_suffix_basename.get(component) {
                 self.match_bucket_candidates(
                     indices,
                     path,
@@ -6971,7 +7071,7 @@ impl IgnoreMatcher {
                 &mut best,
                 &mut profile,
             );
-        }
+        });
         if let Some(last) = basename.last()
             && let Some(indices) = self.buckets.suffix_basename.get(last)
         {
@@ -7007,6 +7107,9 @@ impl IgnoreMatcher {
                 break;
             }
             let pattern = &self.patterns[index];
+            if !pattern.base_matches(path) {
+                continue;
+            }
             if !pattern.glob_literal_prefix_matches(path, basename, is_dir) {
                 continue;
             }
@@ -7039,6 +7142,9 @@ impl IgnoreMatcher {
                 break;
             }
             let pattern = &self.patterns[index];
+            if !pattern.base_matches(path) {
+                continue;
+            }
             let final_component = path_basename(&pattern.pattern);
             let candidate = match kind {
                 MatchKind::Suffix => component.ends_with(&final_component[1..]),
@@ -7485,14 +7591,19 @@ fn normalize_ignore_trailing_spaces(line: &mut Vec<u8>) {
 
 impl IgnorePattern {
     fn bucket_kind(&self) -> IgnoreBucketKind {
-        if self.match_kind == MatchKind::PathSuffix && !self.directory_only {
-            return IgnoreBucketKind::PathSuffixBasename;
+        if self.match_kind == MatchKind::PathSuffix {
+            return if self.directory_only {
+                IgnoreBucketKind::DirectoryPathSuffixBasename
+            } else {
+                IgnoreBucketKind::PathSuffixBasename
+            };
         }
-        if (self.anchored || self.has_slash)
-            && self.match_kind == MatchKind::Literal
-            && !self.directory_only
-        {
-            return IgnoreBucketKind::LiteralPathBasename;
+        if (self.anchored || self.has_slash) && self.match_kind == MatchKind::Literal {
+            return if self.directory_only {
+                IgnoreBucketKind::DirectoryLiteralPathBasename
+            } else {
+                IgnoreBucketKind::LiteralPathBasename
+            };
         }
         if self.has_slash
             && self.match_kind == MatchKind::Glob
@@ -7530,6 +7641,14 @@ impl IgnorePattern {
             (false, MatchKind::Prefix) => IgnoreBucketKind::PrefixBasename,
             _ => IgnoreBucketKind::Other,
         }
+    }
+
+    fn base_matches(&self, path: &[u8]) -> bool {
+        if self.base.is_empty() {
+            return true;
+        }
+        path.strip_prefix(self.base.as_slice())
+            .is_some_and(|rest| rest.starts_with(b"/"))
     }
 
     fn to_match(&self) -> IgnoreMatch {
