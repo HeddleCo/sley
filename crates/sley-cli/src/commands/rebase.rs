@@ -2807,7 +2807,24 @@ fn machine_commit(
 
     if commit.edit {
         let path = ctx.git_dir.join("COMMIT_EDITMSG");
-        fs::write(&path, &message)?;
+        let comment = comment_char(&ctx.git_dir);
+        let mut template = message.clone();
+        if !template.ends_with(b"\n") {
+            template.push(b'\n');
+        }
+        // git seeds COMMIT_EDITMSG with the message followed by a blank line and
+        // the standard help comment block; the trailing blank line is what lets
+        // an appended line (e.g. `fixup -c`'s amended subject) land in its own
+        // paragraph after stripspace.
+        template.push(b'\n');
+        let c = comment as char;
+        template.extend_from_slice(
+            format!(
+                "{c} Please enter the commit message for your changes. Lines starting\n{c} with '{c}' will be ignored, and an empty message aborts the commit.\n"
+            )
+            .as_bytes(),
+        );
+        fs::write(&path, template)?;
         launch_editor(&ctx.git_dir, &path)?;
         message = fs::read(&path)?;
     }
