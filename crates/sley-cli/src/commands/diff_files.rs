@@ -98,6 +98,15 @@ struct DiffFilesOptions {
     src_prefix: String,
     dst_prefix: String,
     diff_filter: DiffFilter,
+    // `-U<n>` / `--unified=<n>`: explicit context line count. `None` falls back to
+    // `diff.context` config, then git's default of 3.
+    context: Option<usize>,
+    // `--inter-hunk-context=<n>`: lines of context between adjacent hunks. `None`
+    // falls back to 0.
+    interhunk: Option<usize>,
+    // `--diff-algorithm=<algo>`: which LCS engine to use. add-patch passes this
+    // from `diff.algorithm`; bare diff-files defaults to Myers.
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
     path_args: Vec<String>,
 }
 
@@ -135,6 +144,9 @@ impl Default for DiffFilesOptions {
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             diff_filter: DiffFilter::default(),
+            context: None,
+            interhunk: None,
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             path_args: Vec::new(),
         }
     }
@@ -248,6 +260,50 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
                 o.patch_abbrev = Some(7);
             }
             "--no-abbrev" => o.raw_abbrev = Some(None),
+            // `-U<n>` / `-U <n>` / `--unified=<n>` / `--unified <n>`: context lines.
+            "-U" | "--unified" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("--unified requires a value".into()))?;
+                o.context = Some(parse_diff_files_context(value)?);
+            }
+            value if let Some(rest) = value.strip_prefix("-U") => {
+                o.context = Some(parse_diff_files_context(rest)?);
+            }
+            value if let Some(rest) = value.strip_prefix("--unified=") => {
+                o.context = Some(parse_diff_files_context(rest)?);
+            }
+            "--inter-hunk-context" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GitError::Command("--inter-hunk-context requires a value".into())
+                })?;
+                o.interhunk = Some(parse_diff_files_context(value)?);
+            }
+            value if let Some(rest) = value.strip_prefix("--inter-hunk-context=") => {
+                o.interhunk = Some(parse_diff_files_context(rest)?);
+            }
+            "--diff-algorithm" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GitError::Command("--diff-algorithm requires a value".into())
+                })?;
+                o.diff_algorithm = parse_diff_files_algorithm(value)?;
+            }
+            value if let Some(rest) = value.strip_prefix("--diff-algorithm=") => {
+                o.diff_algorithm = parse_diff_files_algorithm(rest)?;
+            }
+            "--minimal" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            // add-patch spawns `diff-files --no-color --ignore-submodules=dirty`.
+            // Plumbing diff-files never colorizes, and the index-vs-worktree path
+            // already treats dirty submodules as unchanged, so both are no-ops.
+            "--color" | "--no-color" => {}
+            "--ignore-submodules" => {}
+            value
+                if value.starts_with("--color=") || value.starts_with("--ignore-submodules=") => {}
             "--full-index" => o.patch_full_index = true,
             "--no-prefix" => {
                 o.src_prefix.clear();
@@ -381,6 +437,34 @@ fn diff_files_name_select_conflict() -> GitError {
     GitError::Exit(128)
 }
 
+/// Map a `--diff-algorithm=<name>` value to a [`DiffAlgorithm`], rejecting an
+/// unknown name with git's `set_diff_algorithm` error. This is the validation
+/// point for `diff.algorithm=bogus` flowing through `add -p` (t3701 #69).
+fn parse_diff_files_algorithm(name: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
+    match name.trim() {
+        "myers" | "default" => Ok(sley_diff_merge::DiffAlgorithm::Myers),
+        "minimal" => Ok(sley_diff_merge::DiffAlgorithm::Minimal),
+        "patience" => Ok(sley_diff_merge::DiffAlgorithm::Patience),
+        "histogram" => Ok(sley_diff_merge::DiffAlgorithm::Histogram),
+        _ => {
+            eprintln!(
+                "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
+            );
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+/// Parse the value of `-U`/`--unified`/`--inter-hunk-context`. git's
+/// parse-options reports `option `unified' expects a numerical value` on a
+/// non-numeric value; negative values are rejected by add-patch, not here.
+fn parse_diff_files_context(value: &str) -> Result<usize> {
+    value.trim().parse::<usize>().map_err(|_| {
+        eprintln!("error: option `unified' expects a numerical value");
+        GitError::Exit(129)
+    })
+}
+
 /// Run the index-vs-worktree diff and render it according to `options`.
 fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     // Combined-diff output (`-c`/`--cc`) requires unmerged index stages, which
@@ -491,6 +575,15 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             .collect()
     };
 
+    // Patch context: `git diff-files` is plumbing and does NOT read `diff.context`
+    // on its own — it honors only the explicit `-U`/`--unified` flag (the porcelain
+    // `git diff` and `add -p`'s spawned `diff-files --unified=<n>` carry it). So an
+    // explicit flag wins, otherwise git's default of 3. `--diff-algorithm` likewise
+    // arrives as an explicit flag from add-patch; bare diff-files stays on Myers.
+    let context = o.context.unwrap_or(3);
+    let interhunk = o.interhunk.unwrap_or(0);
+    let diff_algorithm = o.diff_algorithm;
+
     let has_differences = !entries.is_empty();
     if !o.quiet && !o.no_patch {
         render_diff_files_entries(
@@ -501,6 +594,9 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             raw_abbrev,
             patch_abbrev,
             format,
+            context,
+            interhunk,
+            diff_algorithm,
         )?;
     }
     if (o.quiet || o.exit_code) && has_differences {
@@ -520,6 +616,9 @@ fn render_diff_files_entries(
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
     format: ObjectFormat,
+    context: usize,
+    interhunk: usize,
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
 ) -> Result<()> {
     let mut stdout = io::stdout();
     // diff-files always compares the working tree, so the new-side object is the
@@ -611,16 +710,16 @@ fn render_diff_files_entries(
                 abbrev: patch_abbrev,
                 src_prefix: &o.src_prefix,
                 dst_prefix: &o.dst_prefix,
-                context: 3,
+                context,
                 userdiff: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
                 dirty_submodules: None,
                 ws_error_rule: None,
-                interhunk: 0,
+                interhunk,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                diff_algorithm,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,

@@ -1144,13 +1144,20 @@ fn init_config_bool(
 pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     // `add -i` / `add --interactive` and `add -p` / `add --patch` route to the
     // interactive engine. git treats `--patch` as implying interactive and lets
-    // a pathspec follow. We collect the non-flag pathspec args and forward.
+    // a pathspec follow. We collect the non-flag pathspec args plus the diff-tuning
+    // flags add-patch forwards to the spawned `diff-files` (`-U`/`--unified`,
+    // `--inter-hunk-context`) and forward them.
     {
         let mut interactive = false;
         let mut patch = false;
         let mut spec: Vec<String> = Vec::new();
+        // Explicit `-U<n>` / `--inter-hunk-context=<n>` from add's own argv. `None`
+        // means "fall back to diff.context / diff.interHunkContext config".
+        let mut context: Option<i64> = None;
+        let mut interhunk: Option<i64> = None;
         let mut after_dd = false;
-        for arg in args {
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
             if after_dd {
                 spec.push(arg.clone());
                 continue;
@@ -1159,6 +1166,21 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 "--" => after_dd = true,
                 "-i" | "--interactive" => interactive = true,
                 "-p" | "--patch" => patch = true,
+                "-U" | "--unified" => {
+                    context = iter.next().and_then(|v| v.parse::<i64>().ok());
+                }
+                value if value.starts_with("-U") => {
+                    context = value[2..].parse::<i64>().ok();
+                }
+                value if let Some(rest) = value.strip_prefix("--unified=") => {
+                    context = rest.parse::<i64>().ok();
+                }
+                "--inter-hunk-context" => {
+                    interhunk = iter.next().and_then(|v| v.parse::<i64>().ok());
+                }
+                value if let Some(rest) = value.strip_prefix("--inter-hunk-context=") => {
+                    interhunk = rest.parse::<i64>().ok();
+                }
                 other if other.starts_with('-') => {
                     // Leave any other flags to the normal path (no -i/-p).
                 }
@@ -1166,7 +1188,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
         }
         if patch {
-            return super::add_interactive::cmd_add_patch(&spec);
+            return super::add_interactive::cmd_add_patch(&spec, context, interhunk);
         }
         if interactive {
             return super::add_interactive::cmd_add_interactive(&spec);

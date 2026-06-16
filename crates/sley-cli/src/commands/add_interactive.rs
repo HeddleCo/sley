@@ -15,7 +15,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use sley_core::Result;
+use sley_core::{GitError, Result};
 
 use crate::{discover_git_dir, worktree_root_for_git_dir};
 
@@ -689,18 +689,82 @@ pub(crate) fn cmd_add_interactive(paths: &[String]) -> Result<()> {
     run_main_loop(paths)
 }
 
-/// `git add --patch [-- <pathspec>...]`.
-pub(crate) fn cmd_add_patch(paths: &[String]) -> Result<()> {
+/// `git add --patch [-U<n>] [--inter-hunk-context=<n>] [-- <pathspec>...]`.
+///
+/// `context` / `interhunk` carry an explicit `-U` / `--inter-hunk-context` from
+/// add's own argv (`None` → fall back to config). They mirror `opts->context` /
+/// `opts->interhunkcontext` in add-patch.c, which override the config values.
+pub(crate) fn cmd_add_patch(
+    paths: &[String],
+    context: Option<i64>,
+    interhunk: Option<i64>,
+) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let _ = worktree_root_for_git_dir(&git_dir)?;
+    let cfg = resolve_patch_config(&git_dir, context, interhunk, true)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
-    super::add_patch::run_add_patch(
-        super::add_patch::PatchMode::Add,
-        paths,
-        &mut handle,
-        Default::default(),
-    )
+    super::add_patch::run_add_patch(super::add_patch::PatchMode::Add, paths, &mut handle, cfg)
+}
+
+/// Resolve the diff-tuning [`PatchConfig`] the way add-patch.c's
+/// `init_interactive_config` does: read `diff.context` / `diff.interHunkContext`
+/// / `diff.algorithm` config (rejecting negative context), then let an explicit
+/// `-U` / `--inter-hunk-context` from the command line override (also rejecting
+/// negatives). The die messages match git byte-for-byte (t3701 #88/#90/#91).
+fn resolve_patch_config(
+    git_dir: &std::path::Path,
+    cli_context: Option<i64>,
+    cli_interhunk: Option<i64>,
+    auto_advance: bool,
+) -> Result<super::add_patch::PatchConfig> {
+    let config = crate::read_repo_config(git_dir).ok();
+    let read_int = |key: &str| -> Option<i64> {
+        config
+            .as_ref()
+            .and_then(|c| c.get("diff", None, key))
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    };
+    // diff.context (config), validated non-negative.
+    let mut context = read_int("context");
+    if let Some(value) = context
+        && value < 0
+    {
+        eprintln!("fatal: diff.context cannot be negative");
+        return Err(GitError::Exit(128));
+    }
+    let mut interhunk = read_int("interHunkContext");
+    if let Some(value) = interhunk
+        && value < 0
+    {
+        eprintln!("fatal: diff.interHunkContext cannot be negative");
+        return Err(GitError::Exit(128));
+    }
+    // Command-line `-U` / `--inter-hunk-context` override the config, validated.
+    if let Some(value) = cli_context {
+        if value < 0 {
+            eprintln!("fatal: --unified cannot be negative");
+            return Err(GitError::Exit(128));
+        }
+        context = Some(value);
+    }
+    if let Some(value) = cli_interhunk {
+        if value < 0 {
+            eprintln!("fatal: --inter-hunk-context cannot be negative");
+            return Err(GitError::Exit(128));
+        }
+        interhunk = Some(value);
+    }
+    let diff_algorithm = config
+        .as_ref()
+        .and_then(|c| c.get("diff", None, "algorithm"))
+        .map(|v| v.trim().to_string());
+    Ok(super::add_patch::PatchConfig {
+        auto_advance,
+        context: context.map(|v| v as usize),
+        interhunk: interhunk.map(|v| v as usize),
+        diff_algorithm,
+    })
 }
 
 /// Drain all of stdin (used when a command path needs the buffered input but

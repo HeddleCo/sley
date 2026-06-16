@@ -24,14 +24,25 @@ pub(crate) enum PatchMode {
 }
 
 /// Per-session config knobs (context, inter-hunk-context, auto-advance).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct PatchConfig {
     pub auto_advance: bool,
+    /// Resolved diff context (lines), already validated non-negative.
+    pub context: Option<usize>,
+    /// Resolved inter-hunk context, already validated non-negative.
+    pub interhunk: Option<usize>,
+    /// `diff.algorithm` value to forward to the spawned `diff-files`, if set.
+    pub diff_algorithm: Option<String>,
 }
 
 impl Default for PatchConfig {
     fn default() -> Self {
-        PatchConfig { auto_advance: true }
+        PatchConfig {
+            auto_advance: true,
+            context: None,
+            interhunk: None,
+            diff_algorithm: None,
+        }
     }
 }
 
@@ -78,6 +89,10 @@ struct Hunk {
     use_hunk: HunkUse,
     /// Number of independent pieces this hunk could split into.
     splittable_into: usize,
+    /// True for the synthetic "mode change" pseudo-hunk git inserts at index 0
+    /// when the diff carries `old mode`/`new mode`. It renders no `@@` header (its
+    /// body is the mode lines) and stages via `--chmod` rather than blob rewrite.
+    is_mode_change: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -102,6 +117,10 @@ struct FileDiff {
     deleted: bool,
     /// True when the diff reports the file as binary.
     is_binary: bool,
+    /// `Some(new_mode)` when the diff carries `old mode`/`new mode` lines. git
+    /// represents this as a "mode change" pseudo-hunk at index 0 (decided
+    /// separately from the content hunks), staged via `update-index --chmod`.
+    mode_change: Option<u32>,
 }
 
 /// Parse a multi-file unified diff (as produced by `diff-files -p`) into
@@ -120,6 +139,12 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
             let mut added = false;
             let mut deleted = false;
             let mut is_binary = false;
+            // git's add-patch pulls `old mode`/`new mode` OUT of the diff header
+            // and renders them as the body of a "mode change" pseudo-hunk that sits
+            // at index 0, decided independently of the content hunks. Collect them
+            // separately so the file header (rendered once) excludes them.
+            let mut mode_lines: Vec<String> = Vec::new();
+            let mut new_mode_value: Option<u32> = None;
             header.push(line.to_string());
             i += 1;
             while i < lines.len()
@@ -133,16 +158,26 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                 if let Some(rest) = h.strip_prefix("new file mode ") {
                     mode = u32::from_str_radix(rest.trim(), 8).unwrap_or(mode);
                     added = true;
+                    header.push(h.to_string());
                 } else if h.starts_with("deleted file mode ") {
                     deleted = true;
+                    header.push(h.to_string());
+                } else if h.starts_with("old mode ") {
+                    // Mode-change line: route to the pseudo-hunk, not the header.
+                    mode_lines.push(h.to_string());
+                } else if let Some(rest) = h.strip_prefix("new mode ") {
+                    new_mode_value = u32::from_str_radix(rest.trim(), 8).ok();
+                    mode_lines.push(h.to_string());
                 } else if let Some(rest) = h.strip_prefix("+++ b/") {
                     if path.is_empty() {
                         path = rest.to_string();
                     }
+                    header.push(h.to_string());
                 } else if let Some(rest) = h.strip_prefix("--- a/") {
                     if path.is_empty() && rest != "/dev/null" {
                         path = rest.to_string();
                     }
+                    header.push(h.to_string());
                 } else if let Some(rest) = h.strip_prefix("index ") {
                     // index <a>..<b> <mode>
                     if let Some(sp) = rest.rfind(' ') {
@@ -150,14 +185,21 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                             mode = m;
                         }
                     }
+                    header.push(h.to_string());
+                } else {
+                    header.push(h.to_string());
                 }
-                header.push(h.to_string());
                 i += 1;
             }
             // Fallback path from the `diff --git a/X b/X` line.
             if path.is_empty() {
                 path = parse_git_header_path(line);
             }
+            let mode_change = if mode_lines.is_empty() {
+                None
+            } else {
+                new_mode_value
+            };
             let mut fd = FileDiff {
                 path,
                 mode,
@@ -166,7 +208,24 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                 added,
                 deleted,
                 is_binary,
+                mode_change,
             };
+            // A mode change becomes the pseudo-hunk at index 0: its body is the
+            // `old mode`/`new mode` lines, with zero `@@` offsets so render_hunk
+            // prints the body verbatim (no synthesized `@@` header).
+            if mode_change.is_some() {
+                fd.hunks.push(Hunk {
+                    old_offset: 0,
+                    old_count: 0,
+                    new_offset: 0,
+                    new_count: 0,
+                    heading: String::new(),
+                    body: mode_lines,
+                    use_hunk: HunkUse::Undecided,
+                    splittable_into: 1,
+                    is_mode_change: true,
+                });
+            }
             // Parse hunks.
             while i < lines.len() && lines[i].starts_with("@@ ") {
                 let (hunk, next) = parse_hunk(&lines, i);
@@ -226,6 +285,7 @@ fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
             body,
             use_hunk: HunkUse::Undecided,
             splittable_into: splittable,
+            is_mode_change: false,
         },
         i,
     )
@@ -329,14 +389,30 @@ pub(crate) fn run_add_patch(
     stdin: &mut impl BufRead,
     cfg: PatchConfig,
 ) -> Result<()> {
-    // Produce the diff for the requested paths.
-    let mut args = vec!["diff-files", "-p"];
+    // Produce the diff for the requested paths, mirroring add-patch.c's
+    // `parse_diff` command build: `diff-files [--unified=<n>]
+    // [--inter-hunk-context=<n>] [--diff-algorithm=<algo>] --no-color
+    // --ignore-submodules=dirty -p -- <pathspec>...`.
+    let mut owned: Vec<String> = vec!["diff-files".to_string()];
+    if let Some(context) = cfg.context {
+        owned.push(format!("--unified={context}"));
+    }
+    if let Some(interhunk) = cfg.interhunk {
+        owned.push(format!("--inter-hunk-context={interhunk}"));
+    }
+    if let Some(algorithm) = &cfg.diff_algorithm {
+        owned.push(format!("--diff-algorithm={algorithm}"));
+    }
+    owned.push("--no-color".to_string());
+    owned.push("--ignore-submodules=dirty".to_string());
+    owned.push("-p".to_string());
     if !paths.is_empty() {
-        args.push("--");
+        owned.push("--".to_string());
     }
     for p in paths {
-        args.push(p.as_str());
+        owned.push(p.clone());
     }
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
     let diff = run_capture(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
     let diff_text = String::from_utf8_lossy(&diff).into_owned();
     let mut files = parse_diff(&diff_text);
@@ -356,7 +432,7 @@ pub(crate) fn run_add_patch(
     let mut file_idx = 0;
     let nfiles = files.len();
     while file_idx < nfiles {
-        let quit = patch_update_file(&mut files[file_idx], stdin, cfg)?;
+        let quit = patch_update_file(&mut files[file_idx], stdin, &cfg)?;
         file_idx += 1;
         if quit {
             // `q` aborts the whole session: the current file's already-decided
@@ -388,7 +464,7 @@ fn build_suffix(
     hunk_index: usize,
     undecided_next: Option<usize>,
     undecided_prev: Option<usize>,
-    cfg: PatchConfig,
+    cfg: &PatchConfig,
     nfiles: usize,
 ) -> String {
     let mut s = String::new();
@@ -411,7 +487,10 @@ fn build_suffix(
     if fd.hunks[hunk_index].splittable_into > 1 {
         s.push_str(",s");
     }
-    if !fd.deleted {
+    // `,e` (edit): git allows it when `hunk_index + 1 > file_diff->mode_change`
+    // (i.e. NOT on the mode-change pseudo-hunk) and the file is not a deletion.
+    let mode_change_count = if fd.mode_change.is_some() { 1 } else { 0 };
+    if !fd.deleted && hunk_index + 1 > mode_change_count {
         s.push_str(",e");
     }
     if !cfg.auto_advance && nfiles > 1 {
@@ -423,7 +502,7 @@ fn build_suffix(
 }
 
 /// The per-file decision loop.
-fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConfig) -> Result<bool> {
+fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchConfig) -> Result<bool> {
     if fd.hunks.is_empty() {
         return Ok(false);
     }
@@ -474,11 +553,14 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: PatchConf
             let _ = io::stdout().flush();
         }
 
-        // Build prompt.
+        // Build prompt. git's selection: deletion > addition > (mode_change at
+        // index 0) > hunk.
         let kind = if fd.deleted {
             prompt_deletion()
         } else if fd.added {
             prompt_addition()
+        } else if fd.mode_change.is_some() && hunk_index == 0 {
+            prompt_mode_change()
         } else {
             prompt_hunk()
         };
@@ -873,10 +955,12 @@ fn regex_lite_compile(pat: &str) -> Option<LiteRe> {
 /// Render a hunk to stdout: the `@@` header (with `delta`-adjusted offset for
 /// printing the live hunk, which is 0) plus body lines.
 fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
-    // Print the file diff header before the FIRST hunk's render only once per
-    // session; git prints the header before the first hunk of each file.
     let h = &fd.hunks[hunk_index];
-    println!("{}", format_hunk_header(h, 0));
+    // The mode-change pseudo-hunk has no `@@` header (its offsets are zero, like
+    // git's special hunks): print just its body (the `old mode`/`new mode` lines).
+    if !h.is_mode_change {
+        println!("{}", format_hunk_header(h, 0));
+    }
     for line in &h.body {
         println!("{line}");
     }
@@ -1031,6 +1115,7 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
             body: piece.clone(),
             use_hunk: HunkUse::Undecided,
             splittable_into: 1,
+            is_mode_change: false,
         });
         old_cursor += old_count;
         new_cursor += new_count;
@@ -1039,6 +1124,21 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
     // Replace the single hunk with the pieces.
     fd.hunks.splice(hunk_index..hunk_index + 1, new_hunks);
     n
+}
+
+/// Whether any content (non-mode-change) hunk in this file was selected.
+fn any_content_hunk_used(fd: &FileDiff) -> bool {
+    fd.hunks
+        .iter()
+        .any(|h| !h.is_mode_change && h.use_hunk == HunkUse::Use)
+}
+
+/// Whether the mode-change pseudo-hunk (index 0) was selected.
+fn mode_change_used(fd: &FileDiff) -> bool {
+    fd.hunks
+        .first()
+        .map(|h| h.is_mode_change && h.use_hunk == HunkUse::Use)
+        .unwrap_or(false)
 }
 
 /// Apply the USE_HUNK hunks of one file to the index.
@@ -1055,6 +1155,34 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
         }
         return Ok(());
     }
+
+    let content_used = any_content_hunk_used(fd);
+    let mode_used = mode_change_used(fd);
+
+    // A mode change with no content change: stage just the new mode via
+    // `update-index --chmod`, leaving the blob as-is. (git stages the mode bit
+    // independently of the file content.)
+    if fd.mode_change.is_some() && mode_used && !content_used {
+        let chmod = if fd.mode_change == Some(0o100755) {
+            "+x"
+        } else {
+            "-x"
+        };
+        let status = Command::new(self_bin())
+            .args(["update-index", "--chmod", chmod, "--", &fd.path])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|e| GitError::Io(e.to_string()))?;
+        if !status.success() {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
+
+    if !content_used && !mode_used {
+        return Ok(());
+    }
+
     // Read the index version of the file (stage 0). For a brand-new addition the
     // index entry is empty (intent-to-add), so a failed read means empty base.
     let spec = format!(":{}", fd.path);
@@ -1065,7 +1193,16 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
     let oid = run_capture(&["hash-object", "-w", "--stdin"], Some(new_content.as_bytes()))
         .map_err(|e| GitError::Io(e.to_string()))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
-    let mode = format!("{:o}", fd.mode);
+    // Stage mode: the new mode when the mode change was taken, otherwise the
+    // existing (old) index mode. `fd.mode` is the new-side mode from the diff's
+    // `index` line; when the mode change is NOT staged we keep the executable bit
+    // off (the pre-change 100644). For non-mode-change files `fd.mode` is correct.
+    let staged_mode = if fd.mode_change.is_some() && !mode_used {
+        0o100644
+    } else {
+        fd.mode
+    };
+    let mode = format!("{:o}", staged_mode);
     let status = Command::new(self_bin())
         .args(["update-index", "--cacheinfo", &mode, &oid, &fd.path])
         .stdin(Stdio::null())
@@ -1102,6 +1239,11 @@ fn apply_hunks(base: &str, fd: &FileDiff) -> String {
 
     for h in &fd.hunks {
         if h.use_hunk != HunkUse::Use {
+            continue;
+        }
+        // The mode-change pseudo-hunk carries no content lines (its body is the
+        // `old mode`/`new mode` header); skip it in the content apply.
+        if h.is_mode_change {
             continue;
         }
         // old_offset is 1-based line where the hunk's old side begins.
