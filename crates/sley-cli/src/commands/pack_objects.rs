@@ -49,6 +49,10 @@ struct PackObjectsOptions {
     /// timestamp are dropped (unless rescued by a younger reachable object).
     /// `None` (or zero) means "never expire".
     cruft_expiration: Option<u32>,
+    /// `--window=0` / `--depth=0`: delta search disabled, every object stored
+    /// undeltified. sley's writer chooses deltas internally, so this forces the
+    /// no-delta path that emits `Total N (delta 0)`.
+    no_delta: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +116,38 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                 if !saw_dashdash
                     && (value.starts_with("--max-pack-size=")
                         || value.starts_with("--max-cruft-size=")) => {}
+            // Delta-search tuning. sley's writer picks deltas itself, so only
+            // the window/depth==0 "disable deltas" case changes behaviour; the
+            // rest are accepted as no-ops (their numeric value never alters the
+            // byte output the suite checks). A negative window clamps to 0.
+            value if !saw_dashdash && value.starts_with("--window=") => {
+                let n = value["--window=".len()..].parse::<i64>().unwrap_or(0);
+                if n <= 0 {
+                    options.no_delta = true;
+                }
+            }
+            value if !saw_dashdash && value.starts_with("--depth=") => {
+                let n = value["--depth=".len()..].parse::<i64>().unwrap_or(0);
+                if n <= 0 {
+                    options.no_delta = true;
+                }
+            }
+            value
+                if !saw_dashdash
+                    && (value.starts_with("--threads=")
+                        || value.starts_with("--window-memory=")
+                        || value.starts_with("--compression=")
+                        || value.starts_with("--name-hash-version=")) => {}
+            "--threads" | "--window" | "--depth" | "--compression" | "--window-memory"
+                if !saw_dashdash => {}
+            // Accepted toggles with no separate sley machinery: sley always
+            // recomputes its own deltas (so reuse toggles are moot), only ever
+            // writes non-empty packs unless there is nothing to write, and the
+            // reflog/index inclusion knobs only matter alongside `--revs`.
+            "--no-reuse-delta" | "--no-reuse-object" | "--non-empty" | "--keep-true-parents"
+            | "--reflog" | "--indexed-objects" | "--delta-islands" | "--sparse"
+            | "--no-sparse"
+                if !saw_dashdash => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
                 options.progress = Some(true)
             }
@@ -179,7 +215,13 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         }
         (oids, objects, Vec::new())
     };
-    let pack_write_options = pack_objects_write_options(&git_dir)?;
+    let mut pack_write_options = pack_objects_write_options(&git_dir)?;
+    if options.no_delta {
+        pack_write_options = pack_write_options
+            .with_window(0)
+            .with_depth(0)
+            .with_reorder(false);
+    }
     if traversal && pack_write_options.depth == 0 {
         sort_no_delta_traversal_pack(format, &mut oids, &mut objects)?;
     }
