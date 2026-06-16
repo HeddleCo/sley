@@ -12,21 +12,27 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{
+    Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
+};
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
     build_and_install_reachable_pack_filtered, build_reachable_pack, collect_reachable_object_ids,
 };
 use sley_protocol::{
-    PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchShallowInfo, ReceivePackFeatures,
-    ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
-    SideBandChannel, SideBandPacket, UploadPackFeatures, UploadPackNegotiationRequest,
-    UploadPackPackfileResponse, UploadPackRawPackfileResponse, UploadPackRequest,
-    apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
+    PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment,
+    ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
+    ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
+    ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest,
+    RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
+    UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     encode_receive_pack_features, encode_upload_pack_features,
-    read_upload_pack_negotiation_request, read_upload_pack_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    read_protocol_v2_command_request, read_upload_pack_negotiation_request, read_upload_pack_request,
+    write_protocol_v2_advertisement, write_protocol_v2_fetch_response,
+    write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_refs::{DeleteRef, FileRefStore, Ref, RefPrecondition, RefTarget};
 
@@ -881,4 +887,288 @@ fn trace2_fetch_info(
         use std::io::Write as _;
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol v2 upload-pack server (`GIT_PROTOCOL=version=2`).
+//
+// Mirrors upstream `upload-pack.c::upload_pack_v2` / `serve.c`: advertise the
+// v2 capabilities, then read `command=ls-refs` / `command=fetch` requests until
+// EOF, answering each with the protocol-v2 response. The transport (file://
+// spawned process, git:// daemon child) hands us a connected stdin/stdout pair;
+// everything below is transport-independent.
+// ---------------------------------------------------------------------------
+
+/// The v2 capabilities advertised by the upload-pack server, in the order git
+/// emits them: `agent`, `ls-refs=unborn`, `fetch=shallow wait-for-done`,
+/// `server-option`, `object-format=<hash>`.
+fn upload_pack_v2_capabilities(format: ObjectFormat) -> Vec<Capability> {
+    vec![
+        Capability {
+            name: "agent".into(),
+            value: Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}")),
+        },
+        Capability {
+            name: "ls-refs".into(),
+            value: Some("unborn".into()),
+        },
+        Capability {
+            name: "fetch".into(),
+            value: Some("shallow wait-for-done".into()),
+        },
+        Capability {
+            name: "server-option".into(),
+            value: None,
+        },
+        Capability {
+            name: "object-format".into(),
+            value: Some(format.name().into()),
+        },
+    ]
+}
+
+/// Resolve the symref target of `HEAD` (e.g. `refs/heads/main`) for the
+/// `symrefs`/symref-target ls-refs attribute, following one level of symbolic
+/// indirection. Returns `None` for a detached or missing `HEAD`.
+fn head_symref_target(store: &FileRefStore) -> Result<Option<String>> {
+    match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => Ok(Some(name)),
+        _ => Ok(None),
+    }
+}
+
+/// Build the protocol-v2 `ls-refs` records for the repository at `git_dir`,
+/// honoring the request's `ref-prefix`, `peel`, `symrefs`, and `unborn`
+/// arguments. Mirrors `ls-refs.c::ls_refs`.
+fn local_ls_refs_v2_records(
+    git_dir: &Path,
+    format: ObjectFormat,
+    request: &ProtocolV2LsRefsRequest,
+) -> Result<Vec<ProtocolV2LsRefsRecord>> {
+    let store = FileRefStore::new(git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head_symref = head_symref_target(&store)?;
+
+    // Build the (name -> oid, symref) list in git's advertisement order: HEAD
+    // first (when present), then the sorted ref list from `for-each-ref`.
+    let mut entries: Vec<(String, ObjectId, Option<String>)> = Vec::new();
+    if let Some(target) = store.read_ref("HEAD")? {
+        let reference = Ref {
+            name: "HEAD".to_string(),
+            target,
+        };
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
+            entries.push(("HEAD".to_string(), oid, head_symref.clone()));
+        } else if request.unborn {
+            // An unborn HEAD (points at a not-yet-created branch) is reported as
+            // an `unborn` record carrying its symref-target.
+            entries.push(("HEAD".to_string(), ObjectId::null(format), head_symref.clone()));
+        }
+    }
+    for reference in store.list_refs()? {
+        let name = reference.name.clone();
+        let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
+            continue;
+        };
+        entries.push((name, oid, symref));
+    }
+
+    let matches_prefix = |name: &str| -> bool {
+        if request.ref_prefixes.is_empty() {
+            return true;
+        }
+        request
+            .ref_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+    };
+
+    let mut records = Vec::new();
+    for (name, oid, symref) in entries {
+        if !matches_prefix(&name) {
+            continue;
+        }
+        // Unborn HEAD: only the all-zero placeholder reaches here with `unborn`.
+        if name == "HEAD" && oid == ObjectId::null(format) {
+            records.push(ProtocolV2LsRefsRecord::Unborn {
+                name,
+                symref_target: if request.symrefs { symref } else { None },
+                attributes: Vec::new(),
+            });
+            continue;
+        }
+        let peeled = if request.peel {
+            let object = db.read_object(&oid)?;
+            if object.object_type == ObjectType::Tag {
+                Some(sley_rev::peel_tags(&db, format, &oid)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let symref_target = if request.symrefs { symref } else { None };
+        records.push(ProtocolV2LsRefsRecord::Ref(ProtocolV2LsRefsRef {
+            oid,
+            name,
+            peeled,
+            symref_target,
+            attributes: Vec::new(),
+        }));
+    }
+    Ok(records)
+}
+
+/// Chunk a raw packfile into sideband channel-1 (`SideBandChannel::Data`)
+/// pkt-lines for the v2 fetch `packfile` section, matching the upstream
+/// `0001`-prefixed framing. Each chunk carries at most
+/// `PKT_LINE_MAX_PAYLOAD_LEN - 1` packfile bytes (the leading byte is the
+/// channel marker).
+fn packfile_section_lines(pack: &[u8]) -> Vec<Vec<u8>> {
+    let chunk = PKT_LINE_MAX_PAYLOAD_LEN - 1;
+    let mut lines = Vec::new();
+    for slice in pack.chunks(chunk) {
+        let mut payload = Vec::with_capacity(slice.len() + 1);
+        payload.push(1u8); // SideBandChannel::Data
+        payload.extend_from_slice(slice);
+        lines.push(payload);
+    }
+    lines
+}
+
+/// Build the protocol-v2 `fetch` response sections for a request against the
+/// repository at `git_dir`. Mirrors `upload-pack.c::upload_pack_v2`'s
+/// stateless single-round behavior: the client always sends `done` (the v2
+/// clone/fetch path negotiates haves up front and finishes with `done`), so the
+/// acknowledgments section is omitted and the response is just the packfile.
+fn local_fetch_v2_sections(
+    git_dir: &Path,
+    format: ObjectFormat,
+    request: &ProtocolV2FetchRequest,
+) -> Result<Vec<ProtocolV2FetchResponseSection>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    let mut sections = Vec::new();
+
+    // Acknowledgments: per gitprotocol-v2, when the client sends `done` the
+    // acknowledgments section MUST be omitted. Without `done` (multi-round
+    // negotiation) we answer NAK/ACK for the haves we have in common; the v2
+    // file:// client always finishes with `done` so this branch is the
+    // negotiation fallback.
+    if !request.done {
+        let mut acks: Vec<ProtocolV2FetchAcknowledgment> = Vec::new();
+        for have in &request.haves {
+            if db.contains(have)? {
+                acks.push(ProtocolV2FetchAcknowledgment::Ack(*have));
+            }
+        }
+        if acks.is_empty() {
+            acks.push(ProtocolV2FetchAcknowledgment::Nak);
+        }
+        sections.push(ProtocolV2FetchResponseSection::Acknowledgments(acks));
+        // Without `done` and no `ready`, the server stops here to let the
+        // client continue negotiating; it would re-issue fetch with `done`.
+        if !request.wait_for_done {
+            return Ok(sections);
+        }
+    }
+
+    // Wanted-refs: resolve each `want-ref <name>` to its current oid.
+    if !request.want_refs.is_empty() {
+        let store = FileRefStore::new(git_dir, format);
+        let mut wanted = Vec::new();
+        for name in &request.want_refs {
+            let reference = Ref {
+                name: name.clone(),
+                target: store
+                    .read_ref(name)?
+                    .ok_or_else(|| GitError::not_found(format!("want-ref {name}")))?,
+            };
+            let (oid, _) = resolve_for_each_ref_target(&store, &reference)?
+                .ok_or_else(|| GitError::not_found(format!("want-ref {name}")))?;
+            wanted.push(sley_protocol::ProtocolV2FetchWantedRef {
+                oid,
+                name: name.clone(),
+            });
+        }
+        sections.push(ProtocolV2FetchResponseSection::WantedRefs(wanted));
+    }
+
+    // Resolve want-refs into concrete wants for the pack walk.
+    let mut wants: Vec<ObjectId> = request.wants.clone();
+    if !request.want_refs.is_empty() {
+        if let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
+            .iter()
+            .find(|s| matches!(s, ProtocolV2FetchResponseSection::WantedRefs(_)))
+        {
+            for w in wanted {
+                wants.push(w.oid);
+            }
+        }
+    }
+
+    // Packfile section: build the reachable pack excluding the client's haves.
+    let mut known_haves: Vec<ObjectId> = Vec::new();
+    for have in &request.haves {
+        if db.contains(have)? {
+            known_haves.push(*have);
+        }
+    }
+    let excluded = collect_reachable_object_ids(&db, format, known_haves)?;
+    let pack = build_reachable_pack(&db, format, wants, &excluded)?
+        .map(|pack| pack.pack)
+        .unwrap_or_default();
+
+    sections.push(ProtocolV2FetchResponseSection::Packfile(
+        packfile_section_lines(&pack),
+    ));
+    Ok(sections)
+}
+
+/// Serve a protocol-v2 upload-pack session over `reader`/`writer` for the
+/// repository at `git_dir`. Writes the capability advertisement, then loops
+/// reading `command=` requests (`ls-refs` / `fetch`) until the client closes
+/// the connection (EOF). Mirrors `upload-pack.c::upload_pack_v2` driven by
+/// `serve.c`.
+pub fn serve_upload_pack_v2(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    let handshake = TransportHandshake {
+        protocol: ProtocolVersion::V2,
+        capabilities: upload_pack_v2_capabilities(format),
+    };
+    write_protocol_v2_advertisement(writer, &handshake)?;
+    writer.flush()?;
+
+    loop {
+        let request = match read_protocol_v2_command_request(reader) {
+            Ok(request) => request,
+            // EOF / a lone flush after the advertisement ends the session: the
+            // client disconnected (e.g. `ls-remote` reads the refs and leaves).
+            Err(_) => break,
+        };
+        match request.command.as_str() {
+            "ls-refs" => {
+                let ls_refs = ProtocolV2LsRefsRequest::from_command_request(&request)?;
+                let records = local_ls_refs_v2_records(git_dir, format, &ls_refs)?;
+                write_protocol_v2_ls_refs_response(writer, &records)?;
+                writer.flush()?;
+            }
+            "fetch" => {
+                let fetch = ProtocolV2FetchRequest::from_command_request(format, &request)?;
+                let sections = local_fetch_v2_sections(git_dir, format, &fetch)?;
+                write_protocol_v2_fetch_response(writer, &sections)?;
+                writer.flush()?;
+            }
+            other => {
+                return Err(GitError::InvalidFormat(format!(
+                    "unsupported protocol v2 command {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

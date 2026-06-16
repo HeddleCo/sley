@@ -186,6 +186,11 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         print_usage();
         return Err(GitError::Command("missing command".into()));
     };
+    // GIT_TRACE_PACKET identity: git's `packet_trace_identity` is the running
+    // program's basename (the subcommand here). The transports' pkt-line traces
+    // are prefixed `packet: %12s` with this value (e.g. `ls-remote`, `clone`,
+    // `fetch`, `upload-pack`).
+    sley_protocol::set_packet_trace_identity(command);
     match command {
         "init" => commands::plumbing::cmd_init(&args[1..], global_config),
         "add" => commands::plumbing::cmd_add(&args[1..]),
@@ -249,6 +254,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "unpack-objects" => commands::pack::cmd_unpack_objects(&args[1..]),
         "receive-pack" => commands::remote_cmds::cmd_receive_pack(&args[1..]),
         "upload-pack" => commands::remote_cmds::cmd_upload_pack(&args[1..]),
+        "daemon" => commands::daemon::cmd_daemon(&args[1..]),
         "write-tree" => commands::trees::cmd_write_tree(&args[1..]),
         "worktree" => commands::worktree::cmd_worktree(&args[1..]),
         "update-index" => commands::index::cmd_update_index(&args[1..]),
