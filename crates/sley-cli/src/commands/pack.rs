@@ -1580,6 +1580,7 @@ fn parse_prune_options(args: &[String]) -> Result<PruneOptions> {
                 heads.extend(iter.cloned());
                 break;
             }
+            "-h" | "--help" => return prune_help(),
             "-n" | "--dry-run" => dry_run = true,
             "--no-dry-run" => dry_run = false,
             "-v" | "--verbose" => verbose = true,
@@ -1683,6 +1684,22 @@ fn prune_usage<T>() -> Result<T> {
     eprintln!("    --[no-]exclude-promisor-objects");
     eprintln!("                          limit traversal to objects outside promisor packfiles");
     eprintln!();
+    Err(GitError::Exit(129))
+}
+
+/// `git prune -h`: the same usage text as `prune_usage`, but printed to stdout
+/// (git's parse-options `-h` writes to stdout and exits 129).
+fn prune_help<T>() -> Result<T> {
+    println!("usage: git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]");
+    println!();
+    println!("    -n, --[no-]dry-run    do not remove, show only");
+    println!("    -v, --[no-]verbose    report pruned objects");
+    println!("    --[no-]progress       show progress");
+    println!("    --[no-]expire <expiry-date>");
+    println!("                          expire objects older than <time>");
+    println!("    --[no-]exclude-promisor-objects");
+    println!("                          limit traversal to objects outside promisor packfiles");
+    println!();
     Err(GitError::Exit(129))
 }
 
