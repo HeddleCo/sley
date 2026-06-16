@@ -472,6 +472,11 @@ declare -A FLOOR=(
     [t7502-commit-porcelain.sh]=74
     [t7600-merge.sh]=38
     [t7900-maintenance.sh]=12
+    [t1060-object-corruption.sh]=13
+    [t2203-add-intent.sh]=11
+    [t3701-add-interactive.sh]=85
+    [t4011-diff-symlink.sh]=1
+    [t6402-merge-rename.sh]=30
 )
 
 fail=0

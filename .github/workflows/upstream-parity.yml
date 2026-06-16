@@ -199,6 +199,11 @@ jobs:
             t7502-commit-porcelain.sh
             t7600-merge.sh
             t7900-maintenance.sh
+            t1060-object-corruption.sh
+            t2203-add-intent.sh
+            t3701-add-interactive.sh
+            t4011-diff-symlink.sh
+            t6402-merge-rename.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.
