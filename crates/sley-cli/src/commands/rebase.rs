@@ -1025,7 +1025,7 @@ fn print_missing_upstream_advice(ctx: &Ctx, refs: &FileRefStore) {
 }
 
 fn require_clean_work_tree(ctx: &Ctx, action: &str, with_hint: bool) -> Result<()> {
-    let status = sley_worktree::short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
+    let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
     let has_unstaged = status
         .iter()
         .any(|entry| entry.worktree != b' ' && entry.worktree != b'?' && entry.index != b'?');
@@ -1887,7 +1887,7 @@ fn do_exec(ctx: &Ctx, command: &str, quiet: bool) -> Result<i32> {
         .env_remove("GIT_CHERRY_PICK_HELP")
         .status()?;
     let code = status.code().unwrap_or(1);
-    let dirty = sley_worktree::short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)
+    let dirty = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)
         .map(|status| {
             status
                 .iter()
@@ -2843,7 +2843,7 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     let opts = read_basic_state(ctx)?;
 
     // Unstaged changes gate.
-    let status = sley_worktree::short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
+    let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
     let unmerged = status.iter().any(|entry| {
         matches!(entry.index, b'U' | b'A' | b'D') && matches!(entry.worktree, b'U' | b'A' | b'D')
     });
@@ -3142,7 +3142,7 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn create_autostash(ctx: &Ctx) -> Result<()> {
-    let status = sley_worktree::short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
+    let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
     let dirty = status
         .iter()
         .any(|entry| entry.index != b'?' && (entry.index != b' ' || entry.worktree != b' '));

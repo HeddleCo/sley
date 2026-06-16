@@ -932,9 +932,19 @@ fn describe_dirty_suffix(
         return Ok(None);
     }
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
-    match sley_worktree::short_status(&worktree_root, git_dir, format) {
-        Ok(entries) => {
-            if options.dirty.is_some() && describe_status_is_dirty(&entries) {
+    let mut dirty = false;
+    match sley_worktree::stream_short_status(&worktree_root, git_dir, format, |entry| {
+        let index_dirty = entry.index != b' ' && entry.index != b'?' && entry.index != b'!';
+        let worktree_dirty =
+            entry.worktree != b' ' && entry.worktree != b'?' && entry.worktree != b'!';
+        if index_dirty || worktree_dirty {
+            dirty = true;
+            return Ok(sley_worktree::StreamControl::Stop);
+        }
+        Ok(sley_worktree::StreamControl::Continue)
+    }) {
+        Ok(()) => {
+            if options.dirty.is_some() && dirty {
                 return Ok(options.dirty.clone());
             }
             Ok(None)
@@ -947,17 +957,6 @@ fn describe_dirty_suffix(
             }
         }
     }
-}
-
-/// True when any tracked path is staged or modified/deleted in the working tree.
-/// Untracked (`?`) and ignored (`!`) entries are not considered dirty by git.
-fn describe_status_is_dirty(entries: &[sley_worktree::ShortStatusEntry]) -> bool {
-    entries.iter().any(|entry| {
-        let index_dirty = entry.index != b' ' && entry.index != b'?' && entry.index != b'!';
-        let worktree_dirty =
-            entry.worktree != b' ' && entry.worktree != b'?' && entry.worktree != b'!';
-        index_dirty || worktree_dirty
-    })
 }
 
 // ---------------------------------------------------------------------------

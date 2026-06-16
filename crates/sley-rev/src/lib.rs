@@ -141,6 +141,24 @@ pub struct CommitMetadata {
     pub commit_time: i64,
 }
 
+/// Resolve a commit's root tree oid directly from the commit-graph, when a
+/// usable monolithic graph covers `oid`.
+///
+/// Commit-graphs are optional acceleration data, so a missing, unsupported, or
+/// corrupt graph is reported as `Ok(None)` and callers should fall back to
+/// reading the commit object for parity.
+pub fn commit_graph_tree_oid(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    match graph.direct_graph() {
+        DirectCommitGraph::Raw(graph) => graph.tree_oid(oid).or(Ok(None)),
+        DirectCommitGraph::Missing | DirectCommitGraph::Invalid => Ok(None),
+    }
+}
+
 /// Terms that name the new/bad and old/good sides of an active bisect.
 ///
 /// Git stores these as two LF-terminated lines in `$GIT_DIR/BISECT_TERMS`.
@@ -1405,6 +1423,18 @@ impl RawCommitGraph {
             parents: self.parent_oids(parent_one, parent_two)?,
             commit_time: i64::try_from(commit_time).unwrap_or(i64::MAX),
         }))
+    }
+
+    fn tree_oid(&self, oid: &ObjectId) -> Result<Option<ObjectId>> {
+        if oid.format() != self.format {
+            return Ok(None);
+        }
+        let Some(idx) = self.find_index(oid)? else {
+            return Ok(None);
+        };
+        let entry = self.cdat_entry(idx)?;
+        let hash_len = self.format.raw_len();
+        ObjectId::from_raw(self.format, &entry[..hash_len]).map(Some)
     }
 
     fn count_reachable_indices(
@@ -6689,6 +6719,27 @@ mod tests {
             2,
             "only commits newer than the partial graph should be object-read"
         );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn commit_graph_tree_oid_returns_tree_without_object_read() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let commits = build_linear_history(&git_dir, 3);
+        write_commit_graph_file(&git_dir, format, &db, &commits);
+
+        for oid in &commits {
+            let object = db.read_object(oid).expect("test operation should succeed");
+            let commit =
+                Commit::parse_ref(format, &object.body).expect("test operation should succeed");
+            assert_eq!(
+                commit_graph_tree_oid(&git_dir, format, oid)
+                    .expect("test operation should succeed"),
+                Some(commit.tree)
+            );
+        }
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 

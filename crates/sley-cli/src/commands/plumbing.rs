@@ -2126,15 +2126,15 @@ fn resolve_add_regular_actions(
         .collect::<Vec<_>>();
     let mut actions = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in sley_worktree::short_status(worktree_root, git_dir, format)? {
+    sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
         let actionable = (entry.index == b'?' && entry.worktree == b'?')
             || entry.worktree == b'M'
             || entry.worktree == b'D';
         if !actionable {
-            continue;
+            return Ok(sley_worktree::StreamControl::Continue);
         }
         let path = worktree_root.join(
-            std::str::from_utf8(&entry.path)
+            std::str::from_utf8(entry.path)
                 .map_err(|err| GitError::InvalidPath(err.to_string()))?,
         );
         let mut path_matches = false;
@@ -2145,10 +2145,10 @@ fn resolve_add_regular_actions(
             }
         }
         if !path_matches {
-            continue;
+            return Ok(sley_worktree::StreamControl::Continue);
         }
         if entry.worktree == b'D' && options.ignore_removal {
-            continue;
+            return Ok(sley_worktree::StreamControl::Continue);
         }
         if seen.insert(path.clone()) {
             let action = if entry.worktree == b'D' {
@@ -2158,7 +2158,8 @@ fn resolve_add_regular_actions(
             };
             actions.push(action);
         }
-    }
+        Ok(sley_worktree::StreamControl::Continue)
+    })?;
     if options.chmod.is_some() || options.force {
         // `--force` stages paths the status walk never reports (gitignored
         // files; gitignored embedded repositories as gitlinks), so resolve the

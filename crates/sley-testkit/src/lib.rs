@@ -3834,7 +3834,11 @@ pub fn add_status_parity_for_format(format: ObjectFormat) -> Result<AddStatusPar
             &[],
         )?)
         .to_string();
-        let entries = sley_worktree::short_status(&root, root.join(".git"), format)?;
+        let mut entries = Vec::new();
+        sley_worktree::stream_short_status(&root, root.join(".git"), format, |entry| {
+            entries.push(entry.to_owned_entry());
+            Ok(sley_worktree::StreamControl::Continue)
+        })?;
         let rust = entries
             .iter()
             .map(|entry| format!("{}\n", entry.line()))

@@ -1410,6 +1410,7 @@ dependencies = [
  "sley-odb",
  "sley-pathspec",
  "sley-refs",
+ "sley-rev",
 ]
 
 [[package]]

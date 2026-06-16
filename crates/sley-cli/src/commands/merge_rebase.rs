@@ -2061,7 +2061,7 @@ fn rebase_onto_upstream(
     };
     let upstream_commit = sley_rev::peel_to_commit(&db, format, &upstream_oid)?;
 
-    let status = sley_worktree::short_status(worktree_root, git_dir, format)?;
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     if !status.is_empty() {
         let has_staged = status.iter().any(|entry| entry.index != b' ');
         let has_unstaged = status.iter().any(|entry| entry.worktree != b' ');
