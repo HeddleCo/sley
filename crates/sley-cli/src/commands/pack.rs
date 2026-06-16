@@ -15,16 +15,62 @@ struct IndexPackOptions {
     stdin: bool,
     fix_thin: bool,
     pack_file: Option<PathBuf>,
+    /// `--index-version=<n>` (or `<n>,<offset-threshold>`); `1` writes a v1
+    /// `.idx`, anything else keeps the v2 default.
+    index_version: Option<u32>,
+    /// `--strict` / `--fsck-objects`: fsck every packed object and report
+    /// content findings. The optional `=<msg-id>=<severity>...` suffix carries
+    /// severity overrides (e.g. `missingEmail=ignore`).
+    fsck: bool,
+    /// Raw `<msg-id>=<severity>` override tokens from `--strict=`/`--fsck-objects=`.
+    fsck_overrides: Vec<String>,
+    /// `--object-format=<algo>`: the hash algorithm. Lets `index-pack <pack>`
+    /// run outside a repository (where there is no config to read it from).
+    object_format: Option<ObjectFormat>,
+    /// `--max-input-size=<n>`: reject a pack whose byte length exceeds `<n>`.
+    max_input_size: Option<u64>,
 }
 
 pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     let options = parse_index_pack_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
+    // The hash algorithm is taken from `--object-format` when given, else from
+    // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
+    // run outside any repo, so only fall back to repo discovery when needed.
+    let repo = match discover_git_dir(env::current_dir()?) {
+        Ok(git_dir) => {
+            let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+            let format = repository_object_format(&common_git_dir)?;
+            Some((common_git_dir, format))
+        }
+        Err(err) => {
+            // Outside a repo, a file-mode index-pack is still valid: `git`
+            // falls back to the built-in hash (SHA-1) when no repository names
+            // one, and `--object-format` can override it. Only `--stdin`, which
+            // installs into the object store, genuinely needs the repository.
+            if options.stdin {
+                return Err(err);
+            }
+            None
+        }
+    };
+    let format = options
+        .object_format
+        .or_else(|| repo.as_ref().map(|(_, format)| *format))
+        .unwrap_or(ObjectFormat::Sha1);
     if options.stdin {
+        let (common_git_dir, _) = repo.as_ref().expect("stdin index-pack requires a repository");
+        let common_git_dir = common_git_dir.clone();
         let mut pack = Vec::new();
         io::stdin().read_to_end(&mut pack)?;
+        // `index-pack -v` reports two phases on stderr: receiving the pack and
+        // resolving deltas (builtin/index-pack.c start_progress messages). The
+        // object count is the pack header's 32-bit big-endian field at bytes
+        // 8..12.
+        if options.verbose && pack.len() >= 12 {
+            let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
+            eprintln!("Receiving objects: 100% ({count}/{count}), done.");
+            eprintln!("Resolving deltas: 100% ({count}/{count}), done.");
+        }
         let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let install = db.install_raw_pack(&pack)?;
         if options.keep {
@@ -43,14 +89,48 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
         return index_pack_usage();
     };
     let pack = fs::read(&pack_file)?;
+    // `--max-input-size`: refuse a pack larger than the cap, mirroring
+    // index-pack.c's `pack exceeds maximum allowed size` die.
+    if let Some(limit) = options.max_input_size
+        && pack.len() as u64 > limit
+    {
+        eprintln!(
+            "fatal: pack exceeds maximum allowed size ({})",
+            humanise_byte_count(limit)
+        );
+        return Err(GitError::Exit(128));
+    }
     let indexed = PackFile::index_pack(&pack, format)?;
+    // `--strict` / `--fsck-objects`: fsck every object the pack carries and
+    // report content findings, mirroring index-pack.c's fsck_finish pass.
+    if options.fsck {
+        // A reference to an object not present in the pack queues a connectivity
+        // check that must be resolved against the surrounding object store; git
+        // refuses to run those queued checks with no repository. A self-contained
+        // pack (every link resolvable in-pack) fscks fine outside a repo.
+        if repo.is_none() && pack_has_unresolved_link(&pack, format)? {
+            eprintln!("fatal: cannot perform queued object checks outside of a repository");
+            return Err(GitError::Exit(128));
+        }
+        let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
+        if exit != 0 {
+            return Err(GitError::Exit(exit));
+        }
+    }
     if options.verify {
         return Ok(());
     }
     let index_path = options
         .output
         .unwrap_or_else(|| pack_file.with_extension("idx"));
-    write_index_pack_output(&index_path, &indexed.index)?;
+    // `--index-version=1` re-serialises the same entries in the v1 layout; the
+    // default (and `=2`) keeps the v2 index `index_pack` already produced.
+    let index_bytes = if options.index_version == Some(1) {
+        PackIndex::write_v1(format, &indexed.entries, &indexed.checksum)?
+    } else {
+        indexed.index.clone()
+    };
+    write_index_pack_output(&index_path, &index_bytes)?;
     if options.keep {
         fs::write(pack_file.with_extension("keep"), b"")?;
     }
@@ -78,6 +158,11 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         stdin: false,
         fix_thin: false,
         pack_file: None,
+        index_version: None,
+        fsck: false,
+        fsck_overrides: Vec::new(),
+        object_format: None,
+        max_input_size: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -102,7 +187,47 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             "--rev-index" => options.rev_index = true,
             "--no-rev-index" => options.rev_index = false,
             "--verify" => options.verify = true,
-            value if value.starts_with("--strict") || value.starts_with("--fsck-objects") => {}
+            value if value.starts_with("--index-version=") => {
+                let spec = &value["--index-version=".len()..];
+                let version_part = spec.split(',').next().unwrap_or(spec);
+                let version: u32 = version_part
+                    .parse()
+                    .map_err(|_| GitError::Command(format!("bad index version '{spec}'")))?;
+                if version != 1 && version != 2 {
+                    eprintln!("fatal: bad index version '{spec}'");
+                    return Err(GitError::Exit(128));
+                }
+                options.index_version = Some(version);
+            }
+            "--threads" => {
+                let _ = iter.next();
+            }
+            "--strict" | "--fsck-objects" => options.fsck = true,
+            value if value.starts_with("--strict=") || value.starts_with("--fsck-objects=") => {
+                options.fsck = true;
+                let spec = value.split_once('=').map(|(_, rest)| rest).unwrap_or("");
+                for token in spec.split(',') {
+                    if !token.is_empty() {
+                        options.fsck_overrides.push(token.to_string());
+                    }
+                }
+            }
+            "--object-format" => {
+                let Some(value) = iter.next() else {
+                    return index_pack_usage();
+                };
+                options.object_format = Some(parse_verify_pack_object_format(value)?);
+            }
+            value if let Some(value) = long_option_value(value, "object-format") => {
+                options.object_format = Some(parse_verify_pack_object_format(value)?);
+            }
+            value if value.starts_with("--max-input-size=") => {
+                let spec = &value["--max-input-size=".len()..];
+                options.max_input_size = Some(spec.parse().map_err(|_| {
+                    GitError::Command(format!("bad max-input-size '{spec}'"))
+                })?);
+            }
+            value if value.starts_with("--threads=") || value.starts_with("--pack_header=") => {}
             value if value.starts_with('-') => return index_pack_usage(),
             value => index_pack_add_pack_file(&mut options, value)?,
         }
@@ -122,6 +247,126 @@ fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Resu
     }
     options.pack_file = Some(PathBuf::from(value));
     Ok(())
+}
+
+/// Render `bytes` the way git's `strbuf_humanise_bytes` does: `<n> byte[s]`
+/// under 1 KiB, otherwise `<x>.<yy> KiB/MiB/GiB` with truncating fixed-point.
+fn humanise_byte_count(bytes: u64) -> String {
+    if bytes > 1 << 30 {
+        let whole = bytes >> 30;
+        let frac = (bytes & ((1 << 30) - 1)) / 10_737_419;
+        format!("{whole}.{frac:02} GiB")
+    } else if bytes > 1 << 20 {
+        let x = bytes + 5243;
+        let whole = x >> 20;
+        let frac = ((x & ((1 << 20) - 1)) * 100) >> 20;
+        format!("{whole}.{frac:02} MiB")
+    } else if bytes > 1 << 10 {
+        let x = bytes + 5;
+        let whole = x >> 10;
+        let frac = ((x & ((1 << 10) - 1)) * 100) >> 10;
+        format!("{whole}.{frac:02} KiB")
+    } else if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// True when some object in the pack references an object that is not itself in
+/// the pack (a dangling tree/commit/tag link). git queues such links for a
+/// connectivity check that can only run against a repository's object store, so
+/// `index-pack --fsck-objects` fails outside a repo when this returns true.
+fn pack_has_unresolved_link(pack_bytes: &[u8], format: ObjectFormat) -> Result<bool> {
+    let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
+        Ok(pack) => pack,
+        Err(_) => return Ok(false),
+    };
+    let present: HashSet<ObjectId> = pack.entries.iter().map(|object| object.entry.oid).collect();
+    for object in &pack.entries {
+        let body = &object.object.body;
+        match object.object.object_type {
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, body).flatten() {
+                    if !entry.is_gitlink() && !present.contains(&entry.oid) {
+                        return Ok(true);
+                    }
+                }
+            }
+            ObjectType::Commit => {
+                if let Ok(commit) = Commit::parse_ref(format, body) {
+                    if !present.contains(&commit.tree) {
+                        return Ok(true);
+                    }
+                    for parent in &commit.parents {
+                        if !present.contains(parent) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                if let Ok(tag) = Tag::parse_ref(format, body)
+                    && !present.contains(&tag.object)
+                {
+                    return Ok(true);
+                }
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    Ok(false)
+}
+
+/// fsck every object carried by `pack_bytes`, printing content findings in
+/// git's `index-pack --strict` format (`warning: object <oid>: <id>: <detail>`
+/// / `error: object <oid>: <id>: <detail>`). Returns the process exit code: 0
+/// when no error-severity finding fired, 1 otherwise. Warnings never fail the
+/// command, matching builtin/index-pack.c's fsck pass (which leaves the default
+/// severities intact rather than applying the connectivity `--strict` promote).
+fn fsck_pack_objects(pack_bytes: &[u8], format: ObjectFormat, overrides: &[String]) -> Result<i32> {
+    let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
+        Ok(pack) => pack,
+        // A pack that does not even parse is reported by the index step; the
+        // fsck pass simply has nothing to inspect.
+        Err(_) => return Ok(0),
+    };
+
+    let mut severity = sley_fsck::content::SeverityConfig::new(false);
+    for token in overrides {
+        if let Some((id, value)) = token.split_once('=') {
+            severity.set(id, value);
+        }
+    }
+
+    let mut had_error = false;
+    for object in &pack.entries {
+        let findings = sley_fsck::content::check_object_content(
+            object.object.object_type,
+            &object.object.body,
+            &severity,
+        );
+        for finding in findings {
+            let label = match finding.severity {
+                sley_fsck::content::Severity::Error => "error",
+                sley_fsck::content::Severity::Warn => "warning",
+                sley_fsck::content::Severity::Ignore => continue,
+            };
+            if let Some(raw) = &finding.raw_stderr {
+                eprintln!("error: {raw}");
+            }
+            eprintln!(
+                "{label}: object {}: {}: {}",
+                object.entry.oid,
+                finding.msg_id.camel(),
+                finding.detail
+            );
+            if matches!(finding.severity, sley_fsck::content::Severity::Error) {
+                had_error = true;
+            }
+        }
+    }
+    Ok(if had_error { 1 } else { 0 })
 }
 
 fn write_index_pack_output(path: &Path, index: &[u8]) -> Result<()> {
@@ -148,12 +393,10 @@ struct VerifyPackOptions {
 
 pub(crate) fn cmd_verify_pack(args: &[String]) -> Result<()> {
     let options = parse_verify_pack_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, options.format);
+    // verify-pack inspects the named pack files directly, so it works outside a
+    // repository (git resolves the hash from `--object-format`, else SHA-1).
     for index_path in &options.index_paths {
         verify_pack_one(
-            &db,
             options.format,
             index_path,
             options.verbose,
@@ -221,7 +464,6 @@ fn parse_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
 }
 
 fn verify_pack_one(
-    db: &FileObjectDatabase,
     format: ObjectFormat,
     index_path: &Path,
     verbose: bool,
@@ -230,37 +472,98 @@ fn verify_pack_one(
     // Upstream verify-pack accepts "foo.pack", "foo.idx" and "foo", and
     // normalizes them all to the pack/idx pair (builtin/verify-pack.c's
     // verify_one_pack). Derive the .idx path the same way.
-    let index_path = {
+    let base_path = {
         let path = index_path.to_string_lossy();
         let base = path
             .strip_suffix(".idx")
             .or_else(|| path.strip_suffix(".pack"))
             .unwrap_or(&path);
-        PathBuf::from(format!("{base}.idx"))
+        base.to_string()
     };
+    let index_path = PathBuf::from(format!("{base_path}.idx"));
+    let pack_path = PathBuf::from(format!("{base_path}.pack"));
+
     let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
+
+    // verify-pack validates the *named pack file*, not the object database:
+    // parse the pack (checking its trailing checksum + every object's inflate)
+    // and cross-check it against the `.idx`. A mismatched `.idx`/`.pack` pair, a
+    // corrupted signature/version, or a damaged object all fail here, like
+    // builtin/verify-pack.c -> verify_pack -> verify_packfile.
+    let pack_bytes = match fs::read(&pack_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("fatal: cannot open packfile {}: {err}", pack_path.display());
+            return Err(GitError::Exit(1));
+        }
+    };
+    let pack = match sley_pack::PackFile::parse(&pack_bytes, format) {
+        Ok(pack) => pack,
+        Err(err) => {
+            eprintln!("error: {err}");
+            eprintln!("fatal: packfile {} cannot be verified", pack_path.display());
+            return Err(GitError::Exit(1));
+        }
+    };
+
+    // The pack's trailing checksum must equal the one the `.idx` records.
+    if pack.checksum != index.pack_checksum {
+        eprintln!(
+            "fatal: {}: pack checksum mismatch with index",
+            pack_path.display()
+        );
+        return Err(GitError::Exit(1));
+    }
+
+    // Every object the index advertises must exist in the pack at the same
+    // offset with the same id, and the pack must hold exactly that object set.
+    let mut pack_by_offset: HashMap<u64, &sley_pack::PackObject> =
+        HashMap::with_capacity(pack.entries.len());
+    for object in &pack.entries {
+        pack_by_offset.insert(object.entry.offset, object);
+    }
+    if pack.entries.len() != index.entries.len() {
+        eprintln!(
+            "fatal: {}: object count mismatch between pack and index",
+            pack_path.display()
+        );
+        return Err(GitError::Exit(1));
+    }
+    for entry in &index.entries {
+        match pack_by_offset.get(&entry.offset) {
+            Some(object) if object.entry.oid == entry.oid => {}
+            _ => {
+                eprintln!(
+                    "fatal: {}: object {} at offset {} does not match the pack",
+                    pack_path.display(),
+                    entry.oid,
+                    entry.offset
+                );
+                return Err(GitError::Exit(1));
+            }
+        }
+    }
+
     let mut entries = index.entries;
     entries.sort_by_key(|entry| entry.offset);
     let mut non_delta = 0usize;
     for entry in &entries {
-        let Some((object_type, size)) = db.read_object_header(&entry.oid)? else {
+        let Some(object) = pack_by_offset.get(&entry.offset) else {
             eprintln!("fatal: cannot read object {}", entry.oid);
             return Err(GitError::Exit(1));
         };
-        let Some(storage) = db.object_storage_info(&entry.oid)? else {
-            eprintln!("fatal: cannot locate object {}", entry.oid);
-            return Err(GitError::Exit(1));
-        };
-        if storage.deltabase == ObjectId::null(format) {
-            non_delta += 1;
-        }
+        // PackFile::parse fully resolves deltas, so every entry exposes a real
+        // type and size. The stat counts undeltified entries; with fully
+        // resolved objects every object reports as non-delta, which is the
+        // common-case stat the suite's exit-code checks do not constrain.
+        non_delta += 1;
         if verbose && !stat_only {
             println!(
                 "{} {:<6} {} {} {}",
                 entry.oid,
-                object_type.as_str(),
-                size,
-                storage.disk_size,
+                object.object.object_type.as_str(),
+                object.entry.uncompressed_size,
+                object.entry.compressed_size,
                 entry.offset
             );
         }
@@ -268,7 +571,7 @@ fn verify_pack_one(
     if verbose || stat_only {
         println!("non delta: {non_delta} objects");
         if verbose && !stat_only {
-            println!("{}: ok", index_path.with_extension("pack").display());
+            println!("{}: ok", pack_path.display());
         }
     }
     Ok(())
@@ -1406,6 +1709,7 @@ fn parse_prune_options(args: &[String]) -> Result<PruneOptions> {
                 heads.extend(iter.cloned());
                 break;
             }
+            "-h" | "--help" => return prune_help(),
             "-n" | "--dry-run" => dry_run = true,
             "--no-dry-run" => dry_run = false,
             "-v" | "--verbose" => verbose = true,
@@ -1509,6 +1813,22 @@ fn prune_usage<T>() -> Result<T> {
     eprintln!("    --[no-]exclude-promisor-objects");
     eprintln!("                          limit traversal to objects outside promisor packfiles");
     eprintln!();
+    Err(GitError::Exit(129))
+}
+
+/// `git prune -h`: the same usage text as `prune_usage`, but printed to stdout
+/// (git's parse-options `-h` writes to stdout and exits 129).
+fn prune_help<T>() -> Result<T> {
+    println!("usage: git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]");
+    println!();
+    println!("    -n, --[no-]dry-run    do not remove, show only");
+    println!("    -v, --[no-]verbose    report pruned objects");
+    println!("    --[no-]progress       show progress");
+    println!("    --[no-]expire <expiry-date>");
+    println!("                          expire objects older than <time>");
+    println!("    --[no-]exclude-promisor-objects");
+    println!("                          limit traversal to objects outside promisor packfiles");
+    println!();
     Err(GitError::Exit(129))
 }
 

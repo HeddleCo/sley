@@ -3768,6 +3768,47 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
+    /// Read `oid` from any pack *other than* the one named by `exclude`, used as
+    /// a corruption fallback: a redundant packed copy survives one pack's
+    /// damage. Scans the on-disk `.idx` files directly (bypassing the registry
+    /// cache, whose first hit is the excluded pack) and decodes from the first
+    /// other pack that both indexes the object and parses cleanly.
+    fn read_packed_object_from_other_packs(
+        &self,
+        oid: &ObjectId,
+        exclude: &PackLookup,
+    ) -> Result<Option<Arc<EncodedObject>>> {
+        let pack_dir = self.objects_dir.join("pack");
+        let Ok(entries) = fs::read_dir(&pack_dir) else {
+            return Ok(None);
+        };
+        let excluded_pack = exclude.pack_path().to_path_buf();
+        for entry in entries {
+            let idx_path = entry?.path();
+            if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+                continue;
+            }
+            let pack_path = idx_path.with_extension("pack");
+            if pack_path == excluded_pack {
+                continue;
+            }
+            let Ok(idx_bytes) = fs::read(&idx_path) else {
+                continue;
+            };
+            let Ok(index) = PackIndex::parse(&idx_bytes, self.format) else {
+                continue;
+            };
+            let Some(entry) = index.find(oid) else {
+                continue;
+            };
+            let candidate = PackLookup::from_path(pack_path, entry.offset);
+            if let Ok(object) = self.read_packed_object_at_lookup(oid, &candidate) {
+                return Ok(Some(object));
+            }
+        }
+        Ok(None)
+    }
+
     fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackLookup>> {
         if oid.format() != self.format {
             return Err(GitError::InvalidObjectId(format!(
@@ -4114,7 +4155,35 @@ impl ObjectReader for FileObjectDatabase {
         // probe). Only when no pack copy exists do we read (and, if corrupt,
         // surface the error from) the loose file.
         if let Some(pack_lookup) = self.find_pack_containing(oid)? {
-            return self.read_packed_object_at_lookup(oid, &pack_lookup);
+            match self.read_packed_object_at_lookup(oid, &pack_lookup) {
+                Ok(object) => return Ok(object),
+                Err(GitError::NotFound(_)) => {}
+                // A corrupt packed copy must not be fatal when another good copy
+                // exists: git's `oid_object_info_extended` keeps consulting the
+                // remaining sources (loose, other packs, alternates) when a pack
+                // read fails. Fall through to the loose/other-pack probes and
+                // only surface the packed error if every source comes up empty.
+                Err(packed_err) => {
+                    if let Ok(object) = self.loose.read_object(oid) {
+                        return Ok(object);
+                    }
+                    // Try any *other* pack that also holds the object (a
+                    // redundant copy survives one pack's corruption).
+                    if let Some(object) =
+                        self.read_packed_object_from_other_packs(oid, &pack_lookup)?
+                    {
+                        return Ok(object);
+                    }
+                    for alternate in &self.alternates {
+                        if let Ok(object) =
+                            Self::without_alternates(alternate, self.format).read_object(oid)
+                        {
+                            return Ok(object);
+                        }
+                    }
+                    return Err(packed_err);
+                }
+            }
         }
         let loose_err = match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),
