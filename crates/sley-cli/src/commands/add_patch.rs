@@ -232,6 +232,23 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                 fd.hunks.push(hunk);
                 i = next;
             }
+            // A deletion or an empty addition produces NO `@@` hunk (e.g. deleting
+            // or adding a zero-byte file). git still presents it as a single
+            // stageable pseudo-hunk ("Stage deletion" / "Stage addition"). Add one
+            // when the metadata says deleted/added but no content hunk was parsed.
+            if fd.hunks.is_empty() && (fd.deleted || fd.added) && !fd.is_binary {
+                fd.hunks.push(Hunk {
+                    old_offset: 0,
+                    old_count: 0,
+                    new_offset: 0,
+                    new_count: 0,
+                    heading: String::new(),
+                    body: Vec::new(),
+                    use_hunk: HunkUse::Undecided,
+                    splittable_into: 1,
+                    is_mode_change: false,
+                });
+            }
             files.push(fd);
         } else {
             i += 1;
@@ -956,9 +973,12 @@ fn regex_lite_compile(pat: &str) -> Option<LiteRe> {
 /// printing the live hunk, which is 0) plus body lines.
 fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
     let h = &fd.hunks[hunk_index];
-    // The mode-change pseudo-hunk has no `@@` header (its offsets are zero, like
-    // git's special hunks): print just its body (the `old mode`/`new mode` lines).
-    if !h.is_mode_change {
+    // Special pseudo-hunks (mode change, or a deletion / empty addition with no
+    // real content) have zero `@@` offsets and render no `@@` header — just their
+    // body (the mode lines, or nothing). git's render_hunk skips the header when
+    // both offsets are zero.
+    let special = h.is_mode_change || (h.old_offset == 0 && h.new_offset == 0 && h.body.is_empty());
+    if !special {
         println!("{}", format_hunk_header(h, 0));
     }
     for line in &h.body {
