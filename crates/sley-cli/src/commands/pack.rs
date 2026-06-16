@@ -536,9 +536,19 @@ pub(crate) fn cmd_maintenance(args: &[String]) -> Result<()> {
         return maintenance_usage();
     };
     match subcommand {
+        // `-h` before any subcommand prints the top-level usage (rc 129). Unlike
+        // the error paths, an explicit help request goes to STDOUT with a
+        // trailing blank line, matching parse-options' usage_with_options.
+        "-h" | "--help" => {
+            println!("usage: git maintenance <subcommand> [<options>]");
+            println!();
+            Err(GitError::Exit(129))
+        }
         "run" => cmd_maintenance_run(&args[1..]),
+        // git's parse-options subcommand dispatch quotes the offending token with
+        // a backtick + apostrophe, not a matched pair (parse-options.c).
         _ => {
-            eprintln!("error: unknown subcommand: `{subcommand}`");
+            eprintln!("error: unknown subcommand: `{subcommand}'");
             maintenance_usage()
         }
     }
@@ -561,34 +571,59 @@ fn maintenance_run_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
+/// The maintenance task names git's `builtin/gc.c` `tasks[]` table recognises,
+/// in declaration order. `--task=<name>` is case-insensitive against this set.
+const MAINTENANCE_TASKS: &[&str] = &[
+    "prefetch",
+    "loose-objects",
+    "incremental-repack",
+    "geometric-repack",
+    "gc",
+    "commit-graph",
+    "pack-refs",
+    "reflog-expire",
+    "worktree-prune",
+    "rerere-gc",
+];
+
 fn cmd_maintenance_run(args: &[String]) -> Result<()> {
     let mut quiet = false;
-    let mut tasks = Vec::new();
+    let mut auto = false;
+    let mut schedule: Option<String> = None;
+    // `--task=` selections in command-line order, validated as we parse so the
+    // "not a valid task" / "cannot be selected multiple times" diagnostics fire
+    // in git's order (task_option_parse, builtin/gc.c).
+    let mut tasks: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => {}
-            "--auto" | "--no-auto" | "--detach" | "--no-detach" => {}
+            "--no-quiet" => quiet = false,
+            "--auto" => auto = true,
+            "--no-auto" => auto = false,
+            "--detach" | "--no-detach" => {}
             "--schedule" => {
                 index += 1;
-                if args.get(index).is_none() {
+                let Some(value) = args.get(index) else {
                     eprintln!("error: option `schedule' requires a value");
                     return Err(GitError::Exit(129));
-                }
+                };
+                schedule = Some(validate_maintenance_schedule(value)?);
             }
-            value if value.starts_with("--schedule=") => {}
+            value if let Some(freq) = value.strip_prefix("--schedule=") => {
+                schedule = Some(validate_maintenance_schedule(freq)?);
+            }
             "--task" => {
                 index += 1;
                 let Some(task) = args.get(index) else {
                     eprintln!("error: option `task' requires a value");
                     return Err(GitError::Exit(129));
                 };
-                tasks.push(task.clone());
+                push_maintenance_task(&mut tasks, task)?;
             }
             value if let Some(task) = value.strip_prefix("--task=") => {
-                tasks.push(task.to_string());
+                push_maintenance_task(&mut tasks, task)?;
             }
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
@@ -599,22 +634,21 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
         index += 1;
     }
 
-    let run_gc = if tasks.is_empty() {
-        true
-    } else {
-        let mut saw_gc = false;
-        for task in &tasks {
-            match task.as_str() {
-                "gc" | "all" => saw_gc = true,
-                other => {
-                    eprintln!("error: '{other}' is not a valid task");
-                    return Err(GitError::Exit(129));
-                }
-            }
-        }
-        saw_gc
-    };
+    // `--auto`/`--task=` are each incompatible with `--schedule=` (git's
+    // die_for_incompatible_opt2 pair, builtin/gc.c maintenance_run).
+    if auto && schedule.is_some() {
+        eprintln!("fatal: options '--auto' and '--schedule=' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if !tasks.is_empty() && schedule.is_some() {
+        eprintln!("fatal: options '--task=' and '--schedule=' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
 
+    // Of the recognised tasks, only `gc` has a sley implementation today; the
+    // others are accepted (so validation parity holds) but are inert. With no
+    // explicit `--task=`, the default maintenance run includes gc.
+    let run_gc = tasks.is_empty() || tasks.iter().any(|task| task.eq_ignore_ascii_case("gc"));
     if run_gc {
         let mut gc_args = Vec::new();
         if quiet {
@@ -622,6 +656,39 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
         }
         cmd_gc(&gc_args)?;
     }
+    Ok(())
+}
+
+/// Validate a `--schedule=<frequency>` value against git's `parse_schedule`
+/// (hourly/daily/weekly, case-insensitive). Returns the value on success; emits
+/// git's `unrecognized --schedule argument` diagnostic (rc 128) otherwise.
+fn validate_maintenance_schedule(value: &str) -> Result<String> {
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "hourly" | "daily" | "weekly"
+    ) {
+        Ok(value.to_string())
+    } else {
+        eprintln!("fatal: unrecognized --schedule argument '{value}'");
+        Err(GitError::Exit(128))
+    }
+}
+
+/// Append a `--task=<name>` selection, mirroring git's `task_option_parse`:
+/// reject an unknown task name, and reject a task already selected (both rc 129).
+fn push_maintenance_task(tasks: &mut Vec<String>, task: &str) -> Result<()> {
+    if !MAINTENANCE_TASKS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(task))
+    {
+        eprintln!("error: '{task}' is not a valid task");
+        return Err(GitError::Exit(129));
+    }
+    if tasks.iter().any(|seen| seen.eq_ignore_ascii_case(task)) {
+        eprintln!("error: task '{task}' cannot be selected multiple times");
+        return Err(GitError::Exit(129));
+    }
+    tasks.push(task.to_string());
     Ok(())
 }
 
