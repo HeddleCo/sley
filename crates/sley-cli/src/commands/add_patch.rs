@@ -737,6 +737,32 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
                                 Some("No hunk matches the given pattern\n".to_string());
                         }
                     },
+                    'e' => {
+                        // Edit is disallowed on the mode-change pseudo-hunk and on
+                        // deletions (matches build_suffix's `,e` gating).
+                        let mode_change_count = if fd.mode_change.is_some() { 1 } else { 0 };
+                        if fd.deleted || hunk_index + 1 <= mode_change_count {
+                            pending_err = Some(format!(
+                                "Unknown command '{answer}' (use '?' for help)\n"
+                            ));
+                        } else {
+                            match edit_hunk_loop(fd, hunk_index, stdin) {
+                                EditResult::Applied => {
+                                    fd.hunks[hunk_index].use_hunk = HunkUse::Use;
+                                    hunk_index = undecided_next.unwrap_or(nr);
+                                    rendered = None;
+                                }
+                                EditResult::Abandoned => {
+                                    // Keep the original hunk; re-render it.
+                                    rendered = None;
+                                }
+                                EditResult::Eof => {
+                                    println!();
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
                     'P' => {
                         rendered = None;
                     }
@@ -984,6 +1010,187 @@ fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
     for line in &h.body {
         println!("{line}");
     }
+}
+
+/// Outcome of the manual-edit (`e`) loop.
+enum EditResult {
+    /// The edited hunk applied cleanly and replaced the original — mark it Use.
+    Applied,
+    /// The user abandoned editing (deleted everything, or said "no" to retry).
+    Abandoned,
+    /// EOF on the retry prompt.
+    Eof,
+}
+
+/// The `e` command: edit the current hunk in `$GIT_EDITOR`, recount its header,
+/// and validate it applies (re-prompting on failure). Mirrors add-patch.c's
+/// `edit_hunk_loop` + `edit_hunk_manually` + `run_apply_check`.
+fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead) -> EditResult {
+    let git_dir = match env::current_dir().ok().and_then(|cwd| {
+        crate::discover_git_dir(cwd).ok()
+    }) {
+        Some(dir) => dir,
+        None => return EditResult::Abandoned,
+    };
+    let comment = super::replay::comment_char(&git_dir);
+    let cc = comment as char;
+
+    loop {
+        // Build the editor buffer: commented preamble + the hunk + commented hints.
+        let mut buf = String::new();
+        buf.push_str(&format!(
+            "{cc} Manual hunk edit mode -- see bottom for a quick guide.\n"
+        ));
+        // The hunk header + body verbatim.
+        buf.push_str(&format_hunk_header(&fd.hunks[hunk_index], 0));
+        buf.push('\n');
+        for line in &fd.hunks[hunk_index].body {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        buf.push_str(&format!(
+            "{cc} ---\n\
+             {cc} To remove '-' lines, make them ' ' lines (context).\n\
+             {cc} To remove '+' lines, delete them.\n\
+             {cc} Lines starting with {cc} will be removed.\n\
+             {cc} If the patch applies cleanly, the edited hunk will immediately be\n\
+             {cc} marked for staging.\n\
+             {cc} If it does not apply cleanly, you will be given an opportunity to\n\
+             {cc} edit again.  If all lines of the hunk are removed, then the edit is\n\
+             {cc} aborted and the hunk is left unchanged.\n"
+        ));
+
+        // Write to the standard add-patch edit file under the git dir and launch.
+        let edit_path = git_dir.join("addp-hunk-edit.diff");
+        if std::fs::write(&edit_path, buf.as_bytes()).is_err() {
+            return EditResult::Abandoned;
+        }
+        if super::replay::launch_editor(&git_dir, &edit_path).is_err() {
+            let _ = std::fs::remove_file(&edit_path);
+            return EditResult::Abandoned;
+        }
+        let edited = std::fs::read(&edit_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&edit_path);
+
+        // Strip comment lines; collect the remaining body (drop the `@@` header if
+        // present — the prototype keeps the header separate).
+        let stripped = super::replay::strip_comment_lines(&edited, comment);
+        let text = String::from_utf8_lossy(&stripped);
+        let mut new_body: Vec<String> = Vec::new();
+        let mut saw_content = false;
+        for line in text.split('\n') {
+            if line.starts_with("@@ ") {
+                // Header line in the edited buffer: ignore (we recount ourselves).
+                continue;
+            }
+            let first = line.as_bytes().first().copied();
+            if matches!(first, Some(b' ') | Some(b'+') | Some(b'-') | Some(b'\\')) {
+                new_body.push(line.to_string());
+                saw_content = true;
+            } else if line.is_empty() {
+                // trailing blank from the split — skip.
+            }
+        }
+        if !saw_content {
+            // The user deleted everything → abort, keep original.
+            return EditResult::Abandoned;
+        }
+
+        // Recount the header from the edited body.
+        let (old_count, new_count) = recount_body(&new_body);
+        let mut candidate = Hunk {
+            old_offset: fd.hunks[hunk_index].old_offset,
+            old_count,
+            new_offset: fd.hunks[hunk_index].new_offset,
+            new_count,
+            heading: fd.hunks[hunk_index].heading.clone(),
+            body: new_body,
+            use_hunk: HunkUse::Use,
+            splittable_into: 1,
+            is_mode_change: false,
+        };
+
+        // Validate: reassemble a patch (file header + just this candidate hunk) and
+        // run `sley apply --cached --check`. On success, commit the edit.
+        if edited_hunk_applies(fd, &candidate) {
+            std::mem::swap(&mut fd.hunks[hunk_index], &mut candidate);
+            return EditResult::Applied;
+        }
+
+        // Failed to apply: prompt to edit again (saying "no" discards).
+        print!("Your edited hunk does not apply. Edit again (saying \"no\" discards!) [y/n]? ");
+        let _ = io::stdout().flush();
+        match read_line(stdin) {
+            Some(ans) => {
+                let yes = ans
+                    .chars()
+                    .next()
+                    .map(|c| c.to_ascii_lowercase() == 'y')
+                    .unwrap_or(false);
+                if !yes {
+                    return EditResult::Abandoned;
+                }
+                // loop: edit again
+            }
+            None => return EditResult::Eof,
+        }
+    }
+}
+
+/// Recount the `old`/`new` line counts of an edited hunk body.
+fn recount_body(body: &[String]) -> (i64, i64) {
+    let mut old_count = 0i64;
+    let mut new_count = 0i64;
+    for line in body {
+        match line.as_bytes().first().copied().unwrap_or(b' ') {
+            b' ' => {
+                old_count += 1;
+                new_count += 1;
+            }
+            b'-' => old_count += 1,
+            b'+' => new_count += 1,
+            _ => {}
+        }
+    }
+    (old_count, new_count)
+}
+
+/// Check that an edited hunk applies to the index blob: its old-side lines
+/// (context ` ` + deletions `-`) must match the index content at `old_offset`.
+/// Mirrors the effect of git's `git apply --check` for the single edited hunk
+/// (sley has no `apply --cached` yet, so we validate against the index blob the
+/// way the prototype's own apply pass reconstructs it).
+fn edited_hunk_applies(fd: &FileDiff, candidate: &Hunk) -> bool {
+    // Read the index version of the file (stage 0). For an addition the base is
+    // empty. A failed read means an empty base.
+    let spec = format!(":{}", fd.path);
+    let base = run_capture(&["cat-file", "blob", &spec], None).unwrap_or_default();
+    let base_text = String::from_utf8_lossy(&base).into_owned();
+    let had_final_nl = base_text.ends_with('\n');
+    let mut base_lines: Vec<&str> = base_text.split('\n').collect();
+    if had_final_nl {
+        base_lines.pop();
+    }
+    // The hunk's old side begins at 1-based old_offset.
+    let start = (candidate.old_offset - 1).max(0) as usize;
+    let mut cursor = start;
+    for line in &candidate.body {
+        let marker = line.as_bytes().first().copied().unwrap_or(b' ');
+        let rest = &line[1.min(line.len())..];
+        match marker {
+            b' ' | b'-' => {
+                // Old-side line: must match the base content exactly.
+                match base_lines.get(cursor) {
+                    Some(&base_line) if base_line == rest => cursor += 1,
+                    _ => return false,
+                }
+            }
+            b'+' => { /* new-side only; nothing to check against the base */ }
+            b'\\' => { /* "\ No newline" marker */ }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Print the file's diff header (the `diff --git ...` block up to the first
