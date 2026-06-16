@@ -1106,7 +1106,11 @@ struct UpdateRefStdinContext<'a> {
 }
 
 struct UpdateRefStdinWriteRequest<'a> {
+    /// The ref the write lands on (after dereferencing under `deref`).
     name: String,
+    /// The ref the user typed; used in `cannot lock ref '<requested>'` so an
+    /// indirect (symref) update reports the symref, not its dangling target.
+    requested: String,
     new_oid: ObjectId,
     expected_oid: Option<&'a ObjectId>,
 }
@@ -1370,12 +1374,14 @@ fn dispatch_ref_stdin_command(
                     &v,
                 )?),
             };
-            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
+            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let name = effective.effective.clone();
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
                     context,
                     UpdateRefStdinWriteRequest {
                         name,
+                        requested: effective.requested,
                         new_oid,
                         expected_oid: expected.as_ref(),
                     },
@@ -1389,6 +1395,7 @@ fn dispatch_ref_stdin_command(
                 context,
                 UpdateRefStdinWriteRequest {
                     name,
+                    requested: effective.requested,
                     new_oid,
                     expected_oid: expected.as_ref(),
                 },
@@ -1428,13 +1435,15 @@ fn dispatch_ref_stdin_command(
             if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(&raw_name);
             }
-            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
+            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let name = effective.effective.clone();
             let zero = zero_oid(context.format)?;
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
                     context,
                     UpdateRefStdinWriteRequest {
                         name,
+                        requested: effective.requested,
                         new_oid,
                         expected_oid: Some(&zero),
                     },
@@ -1448,6 +1457,7 @@ fn dispatch_ref_stdin_command(
                 context,
                 UpdateRefStdinWriteRequest {
                     name,
+                    requested: effective.requested,
                     new_oid,
                     expected_oid: Some(&zero),
                 },
@@ -1489,7 +1499,8 @@ fn dispatch_ref_stdin_command(
                     Some(oid)
                 }
             };
-            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
+            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let name = effective.effective.clone();
             if context.batch_updates {
                 return update_ref_delete_stdin_batch(
                     context.store,
@@ -1502,7 +1513,13 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_delete_stdin(context.store, context.format, &name, expected.as_ref())
+            update_ref_delete_stdin_named(
+                context.store,
+                context.format,
+                &effective.requested,
+                &name,
+                expected.as_ref(),
+            )
         }
         "verify" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1531,7 +1548,8 @@ fn dispatch_ref_stdin_command(
                 )?,
                 None => zero_oid(context.format)?,
             };
-            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
+            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let name = effective.effective.clone();
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
                 return verify_update_ref_stdin_batch(
@@ -1542,7 +1560,13 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
+            check_update_ref_stdin_expected_named(
+                context.format,
+                &effective.requested,
+                &name,
+                current.as_ref(),
+                &expected,
+            )
         }
         "symref-create" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -2247,15 +2271,22 @@ fn update_ref_stdin_write(
 ) -> Result<()> {
     let current = context.store.read_ref(&request.name)?;
     if let Some(expected_oid) = request.expected_oid {
-        check_update_ref_stdin_expected(
+        check_update_ref_stdin_expected_named(
             context.format,
+            &request.requested,
             &request.name,
             current.as_ref(),
             expected_oid,
         )?;
     }
     if request.new_oid == zero_oid(context.format)? {
-        return update_ref_delete_stdin(context.store, context.format, &request.name, None);
+        return update_ref_delete_stdin_named(
+            context.store,
+            context.format,
+            &request.requested,
+            &request.name,
+            None,
+        );
     }
     check_update_ref_new_value(
         context.git_dir,
@@ -2294,17 +2325,44 @@ fn update_ref_stdin_write(
 }
 
 fn update_ref_effective_name(store: &FileRefStore, name: &str, deref: bool) -> Result<String> {
+    Ok(update_ref_effective_ref(store, name, deref)?.effective)
+}
+
+/// The result of dereferencing a (possibly symbolic) ref for an update: the
+/// `requested` name the user typed and the `effective` name the write lands on.
+/// git reports the *requested* name in the `cannot lock ref '<requested>'`
+/// prefix but the *effective* (final, possibly dangling) name in the
+/// `unable to resolve reference '<effective>'` reason — so a `symref -> foo`
+/// with a missing `foo` yields
+/// `cannot lock ref 'symref': unable to resolve reference 'foo'`.
+struct EffectiveRefName {
+    requested: String,
+    effective: String,
+}
+
+fn update_ref_effective_ref(
+    store: &FileRefStore,
+    name: &str,
+    deref: bool,
+) -> Result<EffectiveRefName> {
+    let requested = name.to_string();
     if !deref {
-        return Ok(name.to_string());
+        return Ok(EffectiveRefName {
+            effective: requested.clone(),
+            requested,
+        });
     }
-    let mut current = name.to_string();
+    let mut current = requested.clone();
     for _ in 0..16 {
         match store.read_ref(&current)? {
             Some(RefTarget::Symbolic(target)) => current = target,
-            _ => return Ok(current),
+            _ => break,
         }
     }
-    Ok(current)
+    Ok(EffectiveRefName {
+        requested,
+        effective: current,
+    })
 }
 
 fn update_ref_delete(
@@ -2353,7 +2411,20 @@ fn update_ref_delete_stdin(
     name: &str,
     expected: Option<&ObjectId>,
 ) -> Result<()> {
-    let current = store.read_ref(name)?;
+    update_ref_delete_stdin_named(store, format, name, name, expected)
+}
+
+/// Delete `effective` (the dereferenced ref) while reporting `requested` (the
+/// ref the user typed) in `cannot lock ref '<requested>'` — see
+/// [`EffectiveRefName`].
+fn update_ref_delete_stdin_named(
+    store: &FileRefStore,
+    format: ObjectFormat,
+    requested: &str,
+    effective: &str,
+    expected: Option<&ObjectId>,
+) -> Result<()> {
+    let current = store.read_ref(effective)?;
     if let Some(expected) = expected {
         let zero = zero_oid(format)?;
         if expected != &zero {
@@ -2361,14 +2432,14 @@ fn update_ref_delete_stdin(
                 Some(RefTarget::Direct(actual)) if actual == expected => {}
                 Some(RefTarget::Direct(actual)) => {
                     return update_ref_stdin_lock_failure(
-                        name,
+                        requested,
                         &format!("is at {actual} but expected {expected}"),
                     );
                 }
                 Some(RefTarget::Symbolic(_)) | None => {
                     return update_ref_stdin_lock_failure(
-                        name,
-                        &format!("unable to resolve reference '{name}'"),
+                        requested,
+                        &format!("unable to resolve reference '{effective}'"),
                     );
                 }
             }
@@ -2377,10 +2448,10 @@ fn update_ref_delete_stdin(
     if current.is_some() {
         match current {
             Some(RefTarget::Symbolic(_)) => {
-                store.delete_symbolic_ref(name)?;
+                store.delete_symbolic_ref(effective)?;
             }
             _ => {
-                store.delete_ref(name)?;
+                store.delete_ref(effective)?;
             }
         }
     }
@@ -2528,22 +2599,39 @@ fn check_update_ref_stdin_expected(
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
+    check_update_ref_stdin_expected_named(format, name, name, current, expected)
+}
+
+/// As [`check_update_ref_stdin_expected`] but with the requested name
+/// (`cannot lock ref '<requested>'`) distinguished from the effective,
+/// dereferenced name (`unable to resolve reference '<effective>'`). git uses the
+/// requested ref in the lock-failure prefix and the final dangling target in the
+/// resolve-failure reason; a non-symbolic update has them equal.
+fn check_update_ref_stdin_expected_named(
+    format: ObjectFormat,
+    requested: &str,
+    effective: &str,
+    current: Option<&RefTarget>,
+    expected: &ObjectId,
+) -> Result<()> {
     let zero = zero_oid(format)?;
     if expected == &zero {
         if current.is_some() {
-            return update_ref_stdin_lock_failure(name, "reference already exists");
+            return update_ref_stdin_lock_failure(requested, "reference already exists");
         }
         return Ok(());
     }
 
     match current {
         Some(RefTarget::Direct(actual)) if actual == expected => Ok(()),
-        Some(RefTarget::Direct(actual)) => {
-            update_ref_stdin_lock_failure(name, &format!("is at {actual} but expected {expected}"))
-        }
-        Some(RefTarget::Symbolic(_)) | None => {
-            update_ref_stdin_lock_failure(name, &format!("unable to resolve reference '{name}'"))
-        }
+        Some(RefTarget::Direct(actual)) => update_ref_stdin_lock_failure(
+            requested,
+            &format!("is at {actual} but expected {expected}"),
+        ),
+        Some(RefTarget::Symbolic(_)) | None => update_ref_stdin_lock_failure(
+            requested,
+            &format!("unable to resolve reference '{effective}'"),
+        ),
     }
 }
 
