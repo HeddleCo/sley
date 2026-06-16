@@ -4,6 +4,128 @@
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{ErrorKind, Read, Write};
+use std::sync::RwLock;
+
+// ---------------------------------------------------------------------------
+// GIT_TRACE_PACKET: emit a human-readable trace of pkt-line traffic, matching
+// git's `pkt-line.c::packet_trace`. The format is
+// `packet: %12s%c <escaped-data>` where `%12s` is the program identity
+// (right-aligned in 12 columns), `%c` is `>` for writes and `<` for reads, and
+// non-printable bytes are octal-escaped (`\0` for NUL) with newlines suppressed.
+// Tracing is gated by the `GIT_TRACE_PACKET` env var so the (hot) pkt-line
+// paths early-out to a single env probe when tracing is off.
+// ---------------------------------------------------------------------------
+
+/// The program identity shown in `packet: %12s` (e.g. `git`, `ls-remote`,
+/// `clone`, `fetch`). Mirrors git's `packet_trace_identity`. Defaults to `git`.
+static PACKET_TRACE_IDENTITY: RwLock<Option<String>> = RwLock::new(None);
+
+/// Set the program identity used in subsequent packet traces (the CLI sets this
+/// from the running subcommand). Mirrors `packet_trace_identity(prog)`.
+pub fn set_packet_trace_identity(prog: &str) {
+    if let Ok(mut guard) = PACKET_TRACE_IDENTITY.write() {
+        *guard = Some(prog.to_string());
+    }
+}
+
+fn packet_trace_prefix() -> String {
+    PACKET_TRACE_IDENTITY
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| "git".to_string())
+}
+
+/// The destination for `GIT_TRACE_PACKET`: `1`/`2`/`true` → stderr, an absolute
+/// path is opened append+create, `0`/`false`/empty/unset disables. Mirrors
+/// git's `get_trace_fd` for the values the tests use.
+fn packet_trace_sink() -> Option<Box<dyn Write>> {
+    let value = std::env::var("GIT_TRACE_PACKET").ok()?;
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "0" | "false" => None,
+        "1" | "2" | "true" => Some(Box::new(std::io::stderr())),
+        _ => {
+            if std::path::Path::new(&value).is_absolute() {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&value)
+                    .ok()
+                    .map(|f| Box::new(f) as Box<dyn Write>)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Whether packet tracing is enabled (cheap env probe for the hot-path guard).
+fn packet_trace_enabled() -> bool {
+    match std::env::var("GIT_TRACE_PACKET") {
+        Ok(value) => {
+            let lower = value.to_ascii_lowercase();
+            !matches!(lower.as_str(), "" | "0" | "false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Emit one packet-trace line for `data` (one pkt-line's framing token or
+/// payload). `is_write` selects the `>`/`<` direction. Octal-escapes
+/// non-printable bytes and suppresses newlines, exactly like git's
+/// `packet_trace`. The pack-data stream is collapsed to `PACK ...` on its first
+/// chunk (git does the same so the trace stays human-readable).
+fn packet_trace(data: &[u8], is_write: bool) {
+    if !packet_trace_enabled() {
+        return;
+    }
+    let Some(mut sink) = packet_trace_sink() else {
+        return;
+    };
+    // Collapse pack data: once a payload starts with "PACK" (raw) or "\1PACK"
+    // (sideband channel 1), git emits a single `PACK ...` marker for the human
+    // trace rather than the binary stream. We approximate per-call (stateless):
+    // any payload beginning with those magic bytes is rendered as `PACK ...`.
+    let rendered: Vec<u8> = if data.starts_with(b"PACK") || data.starts_with(b"\x01PACK") {
+        b"PACK ...".to_vec()
+    } else {
+        data.to_vec()
+    };
+
+    let mut out = format!("packet: {:>12}{} ", packet_trace_prefix(), if is_write {
+        '>'
+    } else {
+        '<'
+    });
+    for &byte in &rendered {
+        if byte == b'\n' {
+            continue;
+        }
+        if (0x20..=0x7e).contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("\\{byte:o}"));
+        }
+    }
+    out.push('\n');
+    let _ = sink.write_all(out.as_bytes());
+    let _ = sink.flush();
+}
+
+/// Trace a frame on the wire. Flush/delim/response-end map to their 4-byte
+/// tokens (`0000`/`0001`/`0002`) like git, data frames to their payload.
+fn packet_trace_frame(frame: &PktLineFrame, is_write: bool) {
+    if !packet_trace_enabled() {
+        return;
+    }
+    match frame {
+        PktLineFrame::Data(payload) => packet_trace(payload, is_write),
+        PktLineFrame::Flush => packet_trace(b"0000", is_write),
+        PktLineFrame::Delimiter => packet_trace(b"0001", is_write),
+        PktLineFrame::ResponseEnd => packet_trace(b"0002", is_write),
+    }
+}
 
 pub const PKT_LINE_MAX_LEN: usize = 65_520;
 
@@ -250,22 +372,28 @@ pub fn read_pkt_line_frame(reader: &mut impl Read) -> Result<Option<PktLineFrame
     }
 
     let len = parse_pkt_len(&header)?;
-    match len {
-        0 => Ok(Some(PktLineFrame::Flush)),
-        1 => Ok(Some(PktLineFrame::Delimiter)),
-        2 => Ok(Some(PktLineFrame::ResponseEnd)),
-        3 => Err(GitError::InvalidFormat(
-            "reserved pkt-line length 0003".into(),
-        )),
+    let frame = match len {
+        0 => PktLineFrame::Flush,
+        1 => PktLineFrame::Delimiter,
+        2 => PktLineFrame::ResponseEnd,
+        3 => {
+            return Err(GitError::InvalidFormat(
+                "reserved pkt-line length 0003".into(),
+            ));
+        }
         4..=PKT_LINE_MAX_LEN => {
             let mut payload = vec![0; len - 4];
             reader.read_exact(&mut payload)?;
-            Ok(Some(PktLineFrame::Data(payload)))
+            PktLineFrame::Data(payload)
         }
-        _ => Err(GitError::InvalidFormat(format!(
-            "pkt-line length exceeds {PKT_LINE_MAX_LEN}: {len}"
-        ))),
-    }
+        _ => {
+            return Err(GitError::InvalidFormat(format!(
+                "pkt-line length exceeds {PKT_LINE_MAX_LEN}: {len}"
+            )));
+        }
+    };
+    packet_trace_frame(&frame, false);
+    Ok(Some(frame))
 }
 
 pub fn read_pkt_line_frames(reader: &mut impl Read) -> Result<Vec<PktLineFrame>> {
@@ -307,16 +435,27 @@ fn read_pkt_line_frames_until_control(
 
 pub fn write_pkt_line_frame(writer: &mut impl Write, frame: &PktLineFrame) -> Result<()> {
     match frame {
+        // `write_pkt_line_payload` already traces the data line.
         PktLineFrame::Data(payload) => write_pkt_line_payload(writer, payload)?,
-        PktLineFrame::Flush => writer.write_all(b"0000")?,
-        PktLineFrame::Delimiter => writer.write_all(b"0001")?,
-        PktLineFrame::ResponseEnd => writer.write_all(b"0002")?,
+        PktLineFrame::Flush => {
+            packet_trace(b"0000", true);
+            writer.write_all(b"0000")?;
+        }
+        PktLineFrame::Delimiter => {
+            packet_trace(b"0001", true);
+            writer.write_all(b"0001")?;
+        }
+        PktLineFrame::ResponseEnd => {
+            packet_trace(b"0002", true);
+            writer.write_all(b"0002")?;
+        }
     }
     Ok(())
 }
 
 pub fn write_pkt_line_payload(writer: &mut impl Write, payload: &[u8]) -> Result<()> {
     validate_pkt_line_payload(payload)?;
+    packet_trace(payload, true);
     let len = payload.len() + 4;
     writer.write_all(&pkt_line_header(len))?;
     writer.write_all(payload)?;
