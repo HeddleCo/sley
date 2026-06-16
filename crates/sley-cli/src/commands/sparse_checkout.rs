@@ -46,6 +46,15 @@ enum ConeFlag {
     NoCone,
 }
 
+/// Tri-state for `--sparse-index` / `--no-sparse-index`: leave the recorded
+/// `index.sparse` setting alone, enable it, or disable it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SparseIndexFlag {
+    Unset,
+    Enable,
+    Disable,
+}
+
 /// Where the per-worktree sparse settings (and the pattern file) live for the
 /// current repository.
 struct SparseContext {
@@ -85,14 +94,13 @@ pub(crate) fn cmd_sparse_checkout(args: &[String]) -> Result<()> {
 
 fn cmd_sparse_init(args: &[String]) -> Result<()> {
     let mut cone = ConeFlag::Unset;
+    let mut sparse_index = SparseIndexFlag::Unset;
     for arg in args {
         match arg.as_str() {
             "--cone" => cone = ConeFlag::Cone,
             "--no-cone" => cone = ConeFlag::NoCone,
-            // The sparse-index optimization is accepted for CLI compatibility but
-            // not materialized; the worktree result is identical, just not stored
-            // as a collapsed index.
-            "--sparse-index" | "--no-sparse-index" => {}
+            "--sparse-index" => sparse_index = SparseIndexFlag::Enable,
+            "--no-sparse-index" => sparse_index = SparseIndexFlag::Disable,
             other => return unknown_option(other, INIT_HELP),
         }
     }
@@ -100,6 +108,7 @@ fn cmd_sparse_init(args: &[String]) -> Result<()> {
     // Cone is the default at init time unless explicitly disabled.
     let cone_mode = !matches!(cone, ConeFlag::NoCone);
     enable_sparse_checkout(&ctx, cone_mode)?;
+    apply_sparse_index_flag(&ctx, sparse_index)?;
     // Preserve any existing patterns; otherwise seed the cone-style root file so
     // a fresh init leaves only top-level files in the worktree.
     if read_sparse_patterns(&ctx)?.is_none() {
@@ -107,6 +116,18 @@ fn cmd_sparse_init(args: &[String]) -> Result<()> {
     }
     apply_current_sparse(&ctx)?;
     Ok(())
+}
+
+/// Applies the `--[no-]sparse-index` toggle: record `index.sparse` in the
+/// worktree config (the persistent decision) so subsequent index writes either
+/// collapse out-of-cone directories or stay full. A no-op when the flag was not
+/// given.
+fn apply_sparse_index_flag(ctx: &SparseContext, flag: SparseIndexFlag) -> Result<()> {
+    match flag {
+        SparseIndexFlag::Unset => Ok(()),
+        SparseIndexFlag::Enable => set_index_sparse(ctx, true),
+        SparseIndexFlag::Disable => set_index_sparse(ctx, false),
+    }
 }
 
 fn cmd_sparse_list(args: &[String]) -> Result<()> {
@@ -168,6 +189,7 @@ fn cmd_sparse_set(args: &[String]) -> Result<()> {
     // pattern file untouched.
     let content = build_pattern_content(cone_mode, &parsed.patterns, parsed.skip_checks)?;
     enable_sparse_checkout(&ctx, cone_mode)?;
+    apply_sparse_index_flag(&ctx, parsed.sparse_index)?;
     write_sparse_file(&ctx, &content)?;
     apply_current_sparse(&ctx)?;
     Ok(())
@@ -213,12 +235,13 @@ fn cmd_sparse_reapply(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let mut cone = ConeFlag::Unset;
+    let mut sparse_index = SparseIndexFlag::Unset;
     for arg in args {
         match arg.as_str() {
             "--cone" => cone = ConeFlag::Cone,
             "--no-cone" => cone = ConeFlag::NoCone,
-            // Accepted for compatibility; the sparse-index is not materialized.
-            "--sparse-index" | "--no-sparse-index" => {}
+            "--sparse-index" => sparse_index = SparseIndexFlag::Enable,
+            "--no-sparse-index" => sparse_index = SparseIndexFlag::Disable,
             other => return unknown_option(other, REAPPLY_HELP),
         }
     }
@@ -230,6 +253,7 @@ fn cmd_sparse_reapply(args: &[String]) -> Result<()> {
         ConeFlag::Unset => sparse_cone_enabled(&ctx)?,
     };
     enable_sparse_checkout(&ctx, cone_mode)?;
+    apply_sparse_index_flag(&ctx, sparse_index)?;
     apply_current_sparse(&ctx)?;
     Ok(())
 }
@@ -589,6 +613,7 @@ fn list_files_recursive(root: &Path) -> Result<Vec<Vec<u8>>> {
 
 struct SetLikeArgs {
     cone: ConeFlag,
+    sparse_index: SparseIndexFlag,
     skip_checks: bool,
     patterns: Vec<Vec<u8>>,
 }
@@ -598,6 +623,7 @@ struct SetLikeArgs {
 /// not).
 fn parse_set_like(args: &[String], help: &str, allow_cone: bool) -> Result<SetLikeArgs> {
     let mut cone = ConeFlag::Unset;
+    let mut sparse_index = SparseIndexFlag::Unset;
     let mut skip_checks = false;
     let mut read_stdin = false;
     let mut positionals: Vec<Vec<u8>> = Vec::new();
@@ -614,8 +640,8 @@ fn parse_set_like(args: &[String], help: &str, allow_cone: bool) -> Result<SetLi
             "--skip-checks" => skip_checks = true,
             "--stdin" => read_stdin = true,
             "--no-stdin" => read_stdin = false,
-            // Accepted for compatibility; the sparse-index is not materialized.
-            "--sparse-index" | "--no-sparse-index" => {}
+            "--sparse-index" if allow_cone => sparse_index = SparseIndexFlag::Enable,
+            "--no-sparse-index" if allow_cone => sparse_index = SparseIndexFlag::Disable,
             other if other.starts_with('-') => return unknown_option(other, help),
             other => positionals.push(other.as_bytes().to_vec()),
         }
@@ -636,6 +662,7 @@ fn parse_set_like(args: &[String], help: &str, allow_cone: bool) -> Result<SetLi
     };
     Ok(SetLikeArgs {
         cone,
+        sparse_index,
         skip_checks,
         patterns,
     })
@@ -947,6 +974,28 @@ fn ensure_worktree_config_extension(ctx: &SparseContext) -> Result<()> {
     Ok(())
 }
 
+/// Records `index.sparse` in the per-worktree config, the toggle that decides
+/// whether the index is collapsed into sparse-directory entries on write. This
+/// mirrors upstream `set_sparse_index_config`.
+fn set_index_sparse(ctx: &SparseContext, enable: bool) -> Result<()> {
+    ensure_worktree_config_extension(ctx)?;
+    let mut config = read_worktree_config(&ctx.git_dir)?;
+    set_config_value(
+        &mut config,
+        "index",
+        None,
+        "sparse",
+        if enable { "true" } else { "false" },
+    );
+    write_worktree_config(&ctx.git_dir, &config)
+}
+
+/// Reads `index.sparse` from the per-worktree config (default `false`).
+fn index_sparse_enabled(ctx: &SparseContext) -> Result<bool> {
+    let config = read_worktree_config(&ctx.git_dir)?;
+    Ok(config.get_bool("index", None, "sparse").unwrap_or(false))
+}
+
 /// Reads `core.sparseCheckout` from the per-worktree config.
 fn sparse_checkout_enabled(ctx: &SparseContext) -> Result<bool> {
     let config = read_worktree_config(&ctx.git_dir)?;
@@ -1027,9 +1076,11 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
     } else {
         SparseCheckoutMode::Full
     };
+    // A sparse index is only valid in cone mode; outside cone mode the worktree
+    // stays full even if `index.sparse` is recorded.
     let sparse = SparseCheckout {
         patterns,
-        sparse_index: false,
+        sparse_index: cone && index_sparse_enabled(ctx)?,
     };
     let result = apply_sparse_checkout_with_mode(
         &ctx.worktree_root,
