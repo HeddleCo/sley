@@ -1845,4 +1845,60 @@ mod tests {
             "expected funcname heading: {text}",
         );
     }
+
+    fn render_cc(result: &[u8], parents: &[&[u8]], dense: bool) -> String {
+        let mut out = Vec::new();
+        let opts = CombinedRenderOptions {
+            dense,
+            ..Default::default()
+        };
+        render_combined_with(&mut out, result, parents, &opts);
+        String::from_utf8(out).expect("combined output is valid UTF-8")
+    }
+
+    #[test]
+    fn combined_two_parent_dense_header_and_columns() {
+        // A merge result that adds lines on top of two parents, the t4013
+        // dir/sub shape: parent0 = "A\nB\nC\nD\nE\nF\n", parent1 = "A\nB\n1\n2\n",
+        // result = "A\nB\nC\nD\nE\nF\n1\n2\n". git emits one combined hunk with
+        // the `@@@ -1,6 -1,4 +1,8 @@@` header and two prefix columns.
+        let p0 = b"A\nB\nC\nD\nE\nF\n";
+        let p1 = b"A\nB\n1\n2\n";
+        let result = b"A\nB\nC\nD\nE\nF\n1\n2\n";
+        let text = render_cc(result, &[p0, p1], true);
+        assert_eq!(
+            text,
+            "@@@ -1,6 -1,4 +1,8 @@@\n  A\n  B\n +C\n +D\n +E\n +F\n+ 1\n+ 2\n",
+            "combined dense output:\n{text}",
+        );
+    }
+
+    #[test]
+    fn combined_identical_to_one_parent_dense_drops_hunk() {
+        // When the result is identical to one parent, the dense (`--cc`) filter
+        // drops the hunk (the change is "interesting" only against the other
+        // parent), so nothing is emitted; the non-dense (`-c`) form still shows
+        // every parent.
+        let p0 = b"x\ny\n";
+        let p1 = b"x\nCHANGED\n";
+        let result = b"x\ny\n"; // identical to p0
+        assert_eq!(render_cc(result, &[p0, p1], true), "");
+        // Non-dense still shows the hunk (differs from p1).
+        assert!(render_cc(result, &[p0, p1], false).starts_with("@@@"));
+    }
+
+    #[test]
+    fn combined_reuse_identical_parents() {
+        // Two parents with the identical blob must produce identical columns
+        // (git's reuse_combine_diff path); the result adds a line relative to
+        // both, so both columns carry `+`.
+        let parent = b"a\nb\n";
+        let result = b"a\nb\nc\n";
+        let text = render_cc(result, &[parent, parent], true);
+        assert_eq!(
+            text,
+            "@@@ -1,2 -1,2 +1,3 @@@\n  a\n  b\n++c\n",
+            "reuse output:\n{text}",
+        );
+    }
 }
