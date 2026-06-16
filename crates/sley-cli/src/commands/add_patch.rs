@@ -1126,6 +1126,20 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
     n
 }
 
+/// The current stage-0 index object id for `path` (the blob recorded in the
+/// index), via `ls-files --stage`. Used to re-stage a mode change without
+/// touching the blob content.
+fn current_index_oid(path: &str) -> Option<String> {
+    let out = run_capture(&["ls-files", "--stage", "--", path], None).ok()?;
+    let text = String::from_utf8_lossy(&out);
+    // Format: `<mode> <oid> <stage>\t<path>`.
+    let line = text.lines().next()?;
+    let mut fields = line.split_whitespace();
+    let _mode = fields.next()?;
+    let oid = fields.next()?;
+    Some(oid.to_string())
+}
+
 /// Whether any content (non-mode-change) hunk in this file was selected.
 fn any_content_hunk_used(fd: &FileDiff) -> bool {
     fd.hunks
@@ -1159,22 +1173,26 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
     let content_used = any_content_hunk_used(fd);
     let mode_used = mode_change_used(fd);
 
-    // A mode change with no content change: stage just the new mode via
-    // `update-index --chmod`, leaving the blob as-is. (git stages the mode bit
-    // independently of the file content.)
-    if fd.mode_change.is_some() && mode_used && !content_used {
-        let chmod = if fd.mode_change == Some(0o100755) {
-            "+x"
-        } else {
-            "-x"
-        };
-        let status = Command::new(self_bin())
-            .args(["update-index", "--chmod", chmod, "--", &fd.path])
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|e| GitError::Io(e.to_string()))?;
-        if !status.success() {
-            return Err(GitError::Exit(1));
+    // A mode change with no content change: stage just the new mode, keeping the
+    // *index* blob (not the worktree content). git applies the mode change to the
+    // index by re-staging the existing index oid at the new mode — NOT via
+    // `update-index --chmod`, which re-hashes the (possibly dirty) worktree file.
+    // So read the current index oid and re-stage it via `--cacheinfo <newmode>`.
+    if let Some(new_mode) = fd.mode_change
+        && mode_used
+        && !content_used
+    {
+        let index_oid = current_index_oid(&fd.path);
+        if let Some(oid) = index_oid {
+            let mode = format!("{new_mode:o}");
+            let status = Command::new(self_bin())
+                .args(["update-index", "--cacheinfo", &mode, &oid, &fd.path])
+                .stdin(Stdio::null())
+                .status()
+                .map_err(|e| GitError::Io(e.to_string()))?;
+            if !status.success() {
+                return Err(GitError::Exit(1));
+            }
         }
         return Ok(());
     }
@@ -1193,14 +1211,14 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
     let oid = run_capture(&["hash-object", "-w", "--stdin"], Some(new_content.as_bytes()))
         .map_err(|e| GitError::Io(e.to_string()))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
-    // Stage mode: the new mode when the mode change was taken, otherwise the
-    // existing (old) index mode. `fd.mode` is the new-side mode from the diff's
-    // `index` line; when the mode change is NOT staged we keep the executable bit
-    // off (the pre-change 100644). For non-mode-change files `fd.mode` is correct.
-    let staged_mode = if fd.mode_change.is_some() && !mode_used {
-        0o100644
-    } else {
-        fd.mode
+    // Stage mode. For a mode-change file the diff's `index` line carries no mode,
+    // so `fd.mode` is the default 100644: use the explicit `mode_change` new mode
+    // when the change was taken, and keep 100644 (old mode) otherwise. For a plain
+    // content change `fd.mode` is the correct new-side mode.
+    let staged_mode = match (fd.mode_change, mode_used) {
+        (Some(new_mode), true) => new_mode,
+        (Some(_), false) => 0o100644,
+        (None, _) => fd.mode,
     };
     let mode = format!("{:o}", staged_mode);
     let status = Command::new(self_bin())
