@@ -198,14 +198,51 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     } else {
         Vec::new()
     };
-    let default_head_fetch = request.refspecs.is_empty() && configured_refspecs.is_empty();
-    let configured_remote_fetch = request.refspecs.is_empty() && !configured_refspecs.is_empty();
+    let configured_refspecs_empty = configured_refspecs.is_empty();
+    // git's `get_ref_map`: a default fetch (no command-line refspecs) of the
+    // current branch's tracking remote also fetches the branch's
+    // `branch.<x>.merge` refs (`add_merge_config`) as source-only refs recorded
+    // for-merge in FETCH_HEAD. When the remote has no configured fetch refspec
+    // either, those merge refs replace the bare-`HEAD` default fetch entirely.
+    let has_merge_config = request.refspecs.is_empty() && !options.merge_srcs.is_empty();
+    let default_head_fetch =
+        request.refspecs.is_empty() && configured_refspecs_empty && !has_merge_config;
+    let configured_remote_fetch = request.refspecs.is_empty() && !configured_refspecs_empty;
     let fetch_head_source = fetch_head_source_description(request.config, request.remote_name);
-    let effective_refspecs = fetch_refspecs_for_source(
+    let mut effective_refspecs = fetch_refspecs_for_source(
         configured_refspecs,
         request.refspecs,
         options.fetch_all_tags,
     );
+    if has_merge_config {
+        // Drop the synthetic bare-`HEAD` refspec the helper inserts when nothing
+        // is configured; the merge refs are fetched for-merge instead.
+        if configured_refspecs_empty && request.refspecs.is_empty() {
+            effective_refspecs.retain(|spec| spec != "HEAD");
+        }
+        // Parse the configured refspecs so coverage (pattern-aware) can be tested
+        // against their sources, mirroring `add_merge_config`'s ref-map lookup.
+        let configured_parsed = effective_refspecs
+            .iter()
+            .map(|refspec| parse_refspec(refspec))
+            .collect::<Result<Vec<_>>>()?;
+        for merge_src in &options.merge_srcs {
+            // git fetches a merge ref only when it is not already reachable
+            // through a configured fetch refspec (`add_merge_config`). A glob
+            // refspec like `refs/heads/*` already covers `refs/heads/three`.
+            let covered = configured_parsed.iter().any(|refspec| {
+                refspec
+                    .src
+                    .as_deref()
+                    .is_some_and(|src| refspec_source_covers(refspec, src, merge_src))
+            });
+            if !covered {
+                // Source-only refspec (no `:dst`): fetched and written to
+                // FETCH_HEAD but creating no local ref.
+                effective_refspecs.push(merge_src.clone());
+            }
+        }
+    }
     let parsed_refspecs = effective_refspecs
         .iter()
         .map(|refspec| parse_refspec(refspec))
@@ -253,6 +290,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
+                has_merge_config,
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             // Shallow fetch: replay the current boundary as `shallow` lines and ask
@@ -294,6 +332,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
+                    format: request.format,
                     store: &store,
                     options: &options,
                     fetch_head_source: &fetch_head_source,
@@ -321,6 +360,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
+                has_merge_config,
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
@@ -345,6 +385,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
+                    format: request.format,
                     store: &store,
                     options: &options,
                     fetch_head_source: &fetch_head_source,
@@ -369,6 +410,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
+                has_merge_config,
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             let existing_shallow =
@@ -391,6 +433,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
+                    format: request.format,
                     store: &store,
                     options: &options,
                     fetch_head_source: &fetch_head_source,
@@ -513,6 +556,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_excluded: deepen_plan.as_ref().map(|plan| &plan.excluded),
                 format: request.format,
                 configured_remote_fetch,
+                has_merge_config,
             })?;
             // A shallow server's new boundary points are only written on a
             // clone, an explicit deepen, or `--update-shallow`; otherwise the
@@ -595,6 +639,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
+                    format: request.format,
                     store: &store,
                     options: &options,
                     fetch_head_source: &fetch_head_source,
@@ -689,6 +734,10 @@ struct FetchPlanInput<'a> {
     deepen_excluded: Option<&'a HashSet<ObjectId>>,
     format: ObjectFormat,
     configured_remote_fetch: bool,
+    /// Default fetch (no command-line refspecs) of the current branch's tracking
+    /// remote with `branch.<x>.merge` configured. The merge refs drive which
+    /// FETCH_HEAD entries are for-merge (`add_merge_config`).
+    has_merge_config: bool,
 }
 
 fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpdate>> {
@@ -702,6 +751,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         deepen_excluded,
         format,
         configured_remote_fetch,
+        has_merge_config,
     } = input;
     let mut updates = plan_fetch_ref_updates(advertisements, refspecs, options.auto_follow_tags)?;
     if options.fetch_all_tags {
@@ -722,7 +772,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         }
         retain_missing_auto_follow_tags(store, &mut updates)?;
     }
-    if configured_remote_fetch {
+    if configured_remote_fetch || has_merge_config {
         for update in &mut updates {
             update.not_for_merge = true;
         }
@@ -764,10 +814,32 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
 /// installed; refs and `FETCH_HEAD` are left untouched), matching the CLI.
 struct FetchFinalize<'a> {
     git_dir: &'a Path,
+    format: ObjectFormat,
     store: &'a FileRefStore,
     options: &'a FetchOptions,
     fetch_head_source: &'a str,
     default_head_fetch: bool,
+}
+
+/// git's `store_updated_refs` (builtin/fetch.c) downgrades any for-merge
+/// FETCH_HEAD entry whose object does not peel to a commit to not-for-merge: an
+/// explicit `tag <name>` whose tag points at a tree or blob (e.g. `tag-one-tree`)
+/// is recorded but never eligible for merge. Runs after the pack is installed so
+/// the objects are present locally.
+fn downgrade_non_commit_for_merge(
+    git_dir: &Path,
+    format: ObjectFormat,
+    updates: &mut [FetchRefUpdate],
+) {
+    if updates.iter().all(|update| update.not_for_merge) {
+        return;
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    for update in updates.iter_mut() {
+        if !update.not_for_merge && sley_rev::peel_to_commit(&db, format, &update.oid).is_err() {
+            update.not_for_merge = true;
+        }
+    }
 }
 
 fn finalize_fetch(
@@ -777,6 +849,7 @@ fn finalize_fetch(
 ) -> Result<()> {
     let FetchFinalize {
         git_dir,
+        format,
         store,
         options,
         fetch_head_source,
@@ -786,6 +859,7 @@ fn finalize_fetch(
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());
     }
+    downgrade_non_commit_for_merge(git_dir, format, updates);
     if options.write_fetch_head {
         if default_head_fetch
             && updates.len() == 1
@@ -882,6 +956,30 @@ pub fn fetch_refspecs_for_source(
         effective.push("refs/tags/*:refs/tags/*".to_string());
     }
     effective
+}
+
+/// Whether a refspec (with source `src`) already covers `merge_src` — the test
+/// `add_merge_config` makes before fetching a `branch.<x>.merge` ref separately.
+/// A pattern source (`refs/heads/*`) covers any ref whose name fits the
+/// prefix/suffix; a literal source matches by git's abbreviated `refname_match`.
+fn refspec_source_covers(refspec: &RefSpec, src: &str, merge_src: &str) -> bool {
+    if refspec.pattern {
+        let Some((prefix, suffix)) = src.split_once('*') else {
+            return false;
+        };
+        // A `branch.<x>.merge` value may be abbreviated (`two` for
+        // `refs/heads/two`); git's `refname_match` resolves it against the
+        // ref-map entry the glob produced. Test the merge ref both verbatim and
+        // qualified under `refs/heads/`, the namespace branch merges live in.
+        let fits = |name: &str| {
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        };
+        fits(merge_src) || fits(&format!("refs/heads/{merge_src}"))
+    } else {
+        refname_matches(merge_src, src) || refname_matches(src, merge_src)
+    }
 }
 
 /// Mark tag refspec updates (`refs/tags/X:refs/tags/X`) as not-for-merge.
