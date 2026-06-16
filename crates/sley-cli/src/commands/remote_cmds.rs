@@ -3444,36 +3444,26 @@ fn configured_refspec_valid(refspec: &str, fetch: bool) -> bool {
             return false;
         }
         // RHS: missing/empty ok; else must be a valid ref.
-        match dst {
-            None => {}
-            Some(d) if d.is_empty() => {}
-            Some(d) => {
-                if !refspec_refname_ok(d, true, is_glob) {
-                    return false;
-                }
-            }
+        if let Some(d) = dst
+            && !d.is_empty()
+            && !refspec_refname_ok(d, true, is_glob)
+        {
+            return false;
         }
     } else {
         // Push LHS: empty ok (delete); globbed must be a valid ref; else anything.
-        if src.is_empty() {
-            // ok
-        } else if is_glob && !refspec_refname_ok(src, true, is_glob) {
+        if !src.is_empty() && is_glob && !refspec_refname_ok(src, true, is_glob) {
             return false;
         }
         // Push RHS: missing ok only if LHS is a valid ref; empty not allowed;
         // else must be a valid ref.
         match dst {
-            None => {
-                if !refspec_refname_ok(src, true, is_glob) {
-                    return false;
-                }
-            }
+            // No RHS: the LHS must be a valid-looking ref.
+            None => return refspec_refname_ok(src, true, is_glob),
+            // Empty RHS (`src:`) is never allowed for push.
             Some(d) if d.is_empty() => return false,
-            Some(d) => {
-                if !refspec_refname_ok(d, true, is_glob) {
-                    return false;
-                }
-            }
+            Some(d) if !refspec_refname_ok(d, true, is_glob) => return false,
+            Some(_) => {}
         }
     }
     true
