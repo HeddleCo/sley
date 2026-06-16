@@ -459,8 +459,10 @@ fn collect_traversal_objects(
                 break;
             }
             let rev = line.trim_end_matches(['\n', '\r']);
+            // An empty line terminates --revs stdin (revision.c
+            // read_revisions_from_stdin: `if (!sb.len) break;`).
             if rev.is_empty() {
-                continue;
+                break;
             }
             let (negative, rev) = match rev.strip_prefix('^') {
                 Some(rest) => (true, rest),
