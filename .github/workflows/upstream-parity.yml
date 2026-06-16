@@ -179,6 +179,26 @@ jobs:
             t8001-annotate.sh
             t8002-blame.sh
             t8012-blame-colors.sh
+            t4209-log-pickaxe.sh
+            t4211-line-log.sh
+            t5300-pack-object.sh
+            t5302-pack-index.sh
+            t5303-pack-corruption-resilience.sh
+            t5304-prune.sh
+            t5319-multi-pack-index.sh
+            t5324-split-commit-graph.sh
+            t5329-pack-objects-cruft.sh
+            t5504-fetch-receive-strict.sh
+            t5505-remote.sh
+            t5511-refspec.sh
+            t5515-fetch-merge-logic.sh
+            t5516-fetch-push.sh
+            t5520-pull.sh
+            t5601-clone.sh
+            t5603-clone-dirname.sh
+            t7502-commit-porcelain.sh
+            t7600-merge.sh
+            t7900-maintenance.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.
