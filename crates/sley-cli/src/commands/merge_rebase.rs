@@ -625,7 +625,7 @@ fn merge_octopus(
                 old_oid: head_oid,
                 new_oid,
                 committer: commit_identity_from_env("COMMITTER")?,
-                message: format!("merge {}: Fast-forward", reduced[0].0).into_bytes(),
+                message: merge_reflog_message(&reduced[0].0, "Fast-forward"),
             }),
         });
         tx.commit()?;
@@ -1025,6 +1025,38 @@ fn split_cmdline(cmdline: &str) -> std::result::Result<Vec<String>, SplitCmdline
     Ok(argv)
 }
 
+/// Process-global stand-in for git's `setenv("GIT_REFLOG_ACTION", …)` —
+/// the workspace forbids `std::env::set_var`, so `git pull` records its
+/// invocation here and `merge`/`rebase` read it back via
+/// [`reflog_action_override`].
+static REFLOG_ACTION_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record the reflog action git would have put in `GIT_REFLOG_ACTION` (e.g. the
+/// `pull …` argv) for `merge`/`rebase` invoked in-process to pick up.
+pub(crate) fn set_reflog_action_override(action: String) {
+    if let Ok(mut slot) = REFLOG_ACTION_OVERRIDE.lock() {
+        *slot = Some(action);
+    }
+}
+
+/// The effective `GIT_REFLOG_ACTION`: the real env var (highest precedence),
+/// then any in-process override stashed by `git pull`, else `None`.
+pub(crate) fn reflog_action_override() -> Option<String> {
+    if let Ok(value) = env::var("GIT_REFLOG_ACTION") {
+        return Some(value);
+    }
+    REFLOG_ACTION_OVERRIDE.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The reflog message git's merge writes: `<GIT_REFLOG_ACTION>: <suffix>`, with
+/// the action defaulting to `merge <target>` when unset. `git pull` records its
+/// own argv so a pull fast-forward writes `pull …: Fast-forward` rather than
+/// `merge …: Fast-forward`.
+fn merge_reflog_message(target: &str, suffix: &str) -> Vec<u8> {
+    let action = reflog_action_override().unwrap_or_else(|| format!("merge {target}"));
+    format!("{action}: {suffix}").into_bytes()
+}
+
 pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut options = MergeOptions::default();
     let cwd = env::current_dir()?;
@@ -1120,7 +1152,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 old_oid: zero_oid(format)?,
                 new_oid: other_oid,
                 committer: commit_identity_from_env("COMMITTER")?,
-                message: format!("merge {target}: Fast-forward").into_bytes(),
+                message: merge_reflog_message(&target, "Fast-forward"),
             }),
         });
         tx.commit()?;
@@ -1164,7 +1196,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 old_oid: head_oid,
                 new_oid: other_oid,
                 committer: commit_identity_from_env("COMMITTER")?,
-                message: format!("merge {target}: Fast-forward").into_bytes(),
+                message: merge_reflog_message(&target, "Fast-forward"),
             }),
         });
         tx.commit()?;
@@ -2510,6 +2542,20 @@ fn run_fetch_with_outcome(
 }
 
 pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
+    // git's `set_reflog_message`: record the pull invocation (`pull …`) as the
+    // reflog action so a fast-forward merge writes `pull …: Fast-forward`. The
+    // workspace forbids `std::env::set_var`, so the action is stashed in a
+    // process-global store (mirroring the `GIT_CONFIG_PARAMETERS` pattern) and
+    // read back by `merge_reflog_message`. Only set when neither the env var nor
+    // an earlier override is present, matching git's `setenv(…, 0)`.
+    if env::var_os("GIT_REFLOG_ACTION").is_none() {
+        let mut action = String::from("pull");
+        for arg in args {
+            action.push(' ');
+            action.push_str(arg);
+        }
+        set_reflog_action_override(action);
+    }
     let mut no_ff = false;
     let mut ff_only = false;
     let mut quiet = false;
