@@ -762,6 +762,7 @@ impl FileRefStore {
         FileRefTransaction {
             store: self,
             changes: Vec::new(),
+            hook: None,
         }
     }
 
@@ -1597,9 +1598,70 @@ fn repository_common_dir(git_dir: &Path) -> PathBuf {
     git_dir.to_path_buf()
 }
 
+/// The phase a [`ReferenceTransactionHook`] is invoked for, mirroring the
+/// `state` argument git passes to the `reference-transaction` hook
+/// (`refs.c:run_transaction_hook`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefTransactionPhase {
+    /// Before references are locked. A nonzero hook exit aborts the
+    /// transaction with `in 'preparing' phase, update aborted ...`.
+    Preparing,
+    /// After references are locked but before they are written. A nonzero
+    /// hook exit aborts with `in 'prepared' phase, update aborted ...`.
+    Prepared,
+    /// After every ref change has landed. The hook's exit status is ignored.
+    Committed,
+    /// When a prepared transaction is rolled back. The exit status is ignored.
+    Aborted,
+}
+
+impl RefTransactionPhase {
+    /// The literal `state` string git feeds as `argv[1]` to the hook.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefTransactionPhase::Preparing => "preparing",
+            RefTransactionPhase::Prepared => "prepared",
+            RefTransactionPhase::Committed => "committed",
+            RefTransactionPhase::Aborted => "aborted",
+        }
+    }
+}
+
+/// One queued ref change as the `reference-transaction` hook sees it: the
+/// `<old-value> SP <new-value> SP <refname>` triple git writes to the hook's
+/// stdin (`refs.c:transaction_hook_feed_stdin`). `old_value`/`new_value` are
+/// already rendered the way git renders them — a 40/64-hex OID, the string
+/// `ref:<target>` for a symref, or the all-zeros OID when the side is absent.
+#[derive(Clone, Debug)]
+pub struct RefTransactionHookUpdate {
+    pub old_value: String,
+    pub new_value: String,
+    pub refname: String,
+}
+
+/// A handler the file backend invokes at each phase of a ref transaction so the
+/// CLI layer can run the project's `reference-transaction` hook. Implemented in
+/// `sley-cli`; the backend stays oblivious to how (or whether) a hook script is
+/// found and executed.
+///
+/// `run` returns `Ok(true)` to mean "the hook ran and requested an abort"
+/// (nonzero exit in a `preparing`/`prepared` phase), `Ok(false)` to mean
+/// "proceed" (hook absent, succeeded, or a non-abortable phase), and `Err` only
+/// for an I/O failure spawning the hook. The backend turns an abort request in
+/// the prepare phases into the git-shaped `in '<phase>' phase, update aborted by
+/// the reference-transaction hook` failure.
+pub trait ReferenceTransactionHook {
+    fn run(
+        &self,
+        phase: RefTransactionPhase,
+        updates: &[RefTransactionHookUpdate],
+    ) -> Result<bool>;
+}
+
 pub struct FileRefTransaction<'a> {
     store: &'a FileRefStore,
     changes: Vec<QueuedRefChange>,
+    hook: Option<&'a dyn ReferenceTransactionHook>,
 }
 
 /// One queued update inside a [`FileRefTransaction`], carrying the
@@ -1635,6 +1697,16 @@ pub enum RefDeletePrecondition {
 }
 
 impl<'a> FileRefTransaction<'a> {
+    /// Attach the `reference-transaction` hook handler this transaction fires at
+    /// each phase. Without one the transaction behaves exactly as before (no
+    /// hook is run). This is the single point through which every ref-write path
+    /// — `update-ref`, `symbolic-ref`, `update-ref --stdin`, push — gets hook
+    /// coverage, so a new write site cannot silently skip the hook.
+    pub fn with_hook(mut self, hook: &'a dyn ReferenceTransactionHook) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
     /// Queue a ref update whose precondition comes from [`RefUpdate::expected`]
     /// (`None` = no check; `Some(target)` = the ref must currently match
     /// `target`). For create-only or match-or-create semantics use
@@ -1718,12 +1790,99 @@ impl<'a> FileRefTransaction<'a> {
     /// and all outstanding lock files are deleted. Reflog entries are appended
     /// only after every ref change has landed.
     pub fn commit(self) -> Result<()> {
-        let FileRefTransaction { store, changes } = self;
+        let FileRefTransaction {
+            store,
+            changes,
+            hook,
+        } = self;
         let changes = coalesce_ref_changes(changes)?;
-        if store.uses_reftable()? {
-            return store.commit_reftable(changes);
+        // Derive the `<old> <new> <refname>` lines the reference-transaction
+        // hook sees, in the same coalesced order the writes apply. This is the
+        // single place the hook is fed, so loose, packed, and symref updates all
+        // flow through one firing path (git's run_transaction_hook).
+        let hook_updates = hook.map(|_| hook_updates_for_changes(store.format, &changes));
+        if let (Some(hook), Some(updates)) = (hook, hook_updates.as_ref())
+            && hook.run(RefTransactionPhase::Preparing, updates)?
+        {
+            return Err(ref_transaction_hook_abort(RefTransactionPhase::Preparing));
         }
-        store.commit_loose(changes)
+        let result = if store.uses_reftable()? {
+            store.commit_reftable(changes)
+        } else {
+            store.commit_loose_hooked(changes, hook, hook_updates.as_deref())
+        };
+        result
+    }
+}
+
+/// The git-shaped fatal raised when the `reference-transaction` hook requests an
+/// abort in the `preparing`/`prepared` phase (`refs.c:abort_by_ref_transaction_hook`).
+fn ref_transaction_hook_abort(phase: RefTransactionPhase) -> GitError {
+    GitError::Transaction(format!(
+        "in '{}' phase, update aborted by the reference-transaction hook",
+        phase.as_str()
+    ))
+}
+
+/// Render the per-update hook lines for a coalesced change set, matching git's
+/// `transaction_hook_feed_stdin`: the old side is `null_oid` when no old value
+/// was required, `ref:<target>` for a symref precondition, else the expected
+/// OID; the new side is `null_oid` for a delete, `ref:<target>` for a new
+/// symref, else the new OID.
+fn hook_updates_for_changes(
+    format: ObjectFormat,
+    changes: &[CoalescedRefChange],
+) -> Vec<RefTransactionHookUpdate> {
+    let zero = ObjectId::null(format).to_string();
+    changes
+        .iter()
+        .map(|change| match change {
+            CoalescedRefChange::Update(update) => RefTransactionHookUpdate {
+                old_value: hook_old_value(&zero, &update.precondition),
+                new_value: hook_target_value(&zero, Some(&update.new)),
+                refname: update.name.clone(),
+            },
+            CoalescedRefChange::Delete(delete) => RefTransactionHookUpdate {
+                old_value: hook_delete_old_value(&zero, &delete.precondition),
+                new_value: zero.clone(),
+                refname: delete.name.clone(),
+            },
+        })
+        .collect()
+}
+
+/// The hook's `<old-value>` for an update: git prints `null_oid` unless the
+/// caller supplied an old value (`REF_HAVE_OLD`), in which case it is the
+/// expected target (a `ref:` for a symref expectation, else the OID).
+fn hook_old_value(zero: &str, precondition: &RefPrecondition) -> String {
+    match precondition {
+        RefPrecondition::Any | RefPrecondition::MustExist => zero.to_string(),
+        RefPrecondition::MustNotExist => zero.to_string(),
+        RefPrecondition::MustExistAndMatch(target)
+        | RefPrecondition::ExistingMustMatch(target) => hook_target_value(zero, Some(target)),
+    }
+}
+
+/// The hook's `<old-value>` for a delete: git renders the supplied old OID, or
+/// `null_oid` when none was required.
+fn hook_delete_old_value(zero: &str, precondition: &RefDeletePrecondition) -> String {
+    match precondition {
+        RefDeletePrecondition::Any => zero.to_string(),
+        RefDeletePrecondition::Immediate(target) => hook_target_value(zero, Some(target)),
+        RefDeletePrecondition::Direct(Some(oid)) | RefDeletePrecondition::Peeled(oid) => {
+            oid.to_string()
+        }
+        RefDeletePrecondition::Direct(None) => zero.to_string(),
+    }
+}
+
+/// Render a [`RefTarget`] the way git renders a hook value: `ref:<target>` for a
+/// symref, the bare OID for a direct ref, or `null_oid` when absent.
+fn hook_target_value(zero: &str, target: Option<&RefTarget>) -> String {
+    match target {
+        None => zero.to_string(),
+        Some(RefTarget::Direct(oid)) => oid.to_string(),
+        Some(RefTarget::Symbolic(name)) => format!("ref:{name}"),
     }
 }
 
@@ -1793,6 +1952,20 @@ impl FileRefStore {
     /// Atomic, all-or-nothing commit for the loose-ref backend. See
     /// [`FileRefTransaction::commit`] for the full ordering and rollback rules.
     fn commit_loose(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
+        self.commit_loose_hooked(changes, None, None)
+    }
+
+    /// As [`commit_loose`](Self::commit_loose) but firing the
+    /// `reference-transaction` hook at `prepared` (after every ref is locked and
+    /// staged, before any rename) and `committed` (after every change lands).
+    /// A nonzero hook exit in the `prepared` phase rolls the staged changes back
+    /// and surfaces the git-shaped abort error.
+    fn commit_loose_hooked(
+        &self,
+        changes: Vec<CoalescedRefChange>,
+        hook: Option<&dyn ReferenceTransactionHook>,
+        hook_updates: Option<&[RefTransactionHookUpdate]>,
+    ) -> Result<()> {
         // Capture HEAD's symref target before any ref is mutated so the
         // HEAD-reflog mirror reflects the pre-transaction checked-out branch.
         let head_branch = self.head_symref_target();
@@ -2011,6 +2184,16 @@ impl FileRefStore {
             }
         }
 
+        // git fires the `prepared` hook once every ref is locked, before any
+        // value is renamed into place. A nonzero exit drops the staged lock
+        // files (no on-disk change happened yet) and aborts.
+        if let (Some(hook), Some(updates)) = (hook, hook_updates)
+            && hook.run(RefTransactionPhase::Prepared, updates)?
+        {
+            release_pending_locks(&pending);
+            return Err(ref_transaction_hook_abort(RefTransactionPhase::Prepared));
+        }
+
         // Apply each staged path change; on failure restore paths already
         // changed and drop the remaining lock files.
         for index in 0..pending.len() {
@@ -2042,6 +2225,11 @@ impl FileRefStore {
         // All refs are durable; append reflogs last, matching git's ordering.
         for (name, entry) in reflogs {
             self.append_reflog(&name, &entry)?;
+        }
+        // git fires the `committed` hook once every ref change has landed. Its
+        // exit status is ignored — the transaction has already succeeded.
+        if let (Some(hook), Some(updates)) = (hook, hook_updates) {
+            hook.run(RefTransactionPhase::Committed, updates)?;
         }
         Ok(())
     }

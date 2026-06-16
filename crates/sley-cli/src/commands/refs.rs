@@ -1022,9 +1022,14 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             message,
         });
     let tx_name = name.clone();
-    let mut tx = store.transaction();
+    let hook = ReferenceTransactionHookRunner::new(&git_dir);
+    let mut tx = store.transaction().with_hook(&hook);
     tx.update(RefUpdate {
         name,
+        // The old value was already checked above (and its rejection messages
+        // are shaped there); keep the transaction precondition `None` so this
+        // path's error surface is unchanged. The hook old-value is reported via
+        // `hook_old` below.
         expected: None,
         new: RefTarget::Direct(new_oid),
         reflog,
@@ -1046,6 +1051,49 @@ fn update_ref_usage() -> Result<()> {
         "usage: git update-ref [<options>] -d <refname> [<old-oid>]\n   or: git update-ref [<options>]    <refname> <new-oid> [<old-oid>]\n   or: git update-ref [<options>] --stdin [-z] [--batch-updates]\n\n    -m <reason>           reason of the update\n    -d                    delete the reference\n    --no-deref            update <refname> not the one it points to\n    --deref               opposite of --no-deref\n    -z                    stdin has NUL-terminated arguments\n    --[no-]stdin          read updates from stdin\n    --[no-]create-reflog  create a reflog\n    -0, --[no-]batch-updates\n                          batch reference updates"
     );
     Err(GitError::Exit(129))
+}
+
+/// The `reference-transaction` hook runner the file backend fires at each
+/// transaction phase. Holds the repo's git dir so it can locate
+/// `$GIT_DIR/hooks/reference-transaction`. One instance is created per write and
+/// handed to [`FileRefTransaction::with_hook`], so every ref-write path —
+/// `update-ref`, `symbolic-ref`, `update-ref --stdin`, push — shares the same
+/// firing logic.
+pub(crate) struct ReferenceTransactionHookRunner {
+    git_dir: PathBuf,
+}
+
+impl ReferenceTransactionHookRunner {
+    pub(crate) fn new(git_dir: &Path) -> Self {
+        Self {
+            git_dir: git_dir.to_path_buf(),
+        }
+    }
+}
+
+impl ReferenceTransactionHook for ReferenceTransactionHookRunner {
+    fn run(
+        &self,
+        phase: RefTransactionPhase,
+        updates: &[RefTransactionHookUpdate],
+    ) -> Result<bool> {
+        // Feed one `<old> SP <new> SP <refname> LF` line per update, exactly as
+        // git's transaction_hook_feed_stdin builds them.
+        let mut stdin = Vec::new();
+        for update in updates {
+            stdin.extend_from_slice(update.old_value.as_bytes());
+            stdin.push(b' ');
+            stdin.extend_from_slice(update.new_value.as_bytes());
+            stdin.push(b' ');
+            stdin.extend_from_slice(update.refname.as_bytes());
+            stdin.push(b'\n');
+        }
+        crate::commands::hooks::run_reference_transaction_hook_at(
+            &self.git_dir,
+            phase.as_str(),
+            stdin,
+        )
+    }
 }
 
 struct UpdateRefStdinContext<'a> {
@@ -2231,7 +2279,11 @@ fn update_ref_stdin_write(
                 committer: default_committer(),
                 message: context.message.clone(),
             });
-    let mut tx = context.store.transaction();
+    let hook = ReferenceTransactionHookRunner::new(context.git_dir);
+    // Keep the transaction precondition `None`: the old-value was already
+    // checked above with the stdin-shaped rejection messages, and re-checking
+    // here would change that error surface.
+    let mut tx = context.store.transaction().with_hook(&hook);
     tx.update(RefUpdate {
         name: request.name,
         expected: None,
@@ -2878,7 +2930,8 @@ fn update_symbolic_ref(
         committer: default_committer(),
         message,
     });
-    let mut tx = store.transaction();
+    let hook = ReferenceTransactionHookRunner::new(git_dir);
+    let mut tx = store.transaction().with_hook(&hook);
     tx.update(RefUpdate {
         name: name.into(),
         expected: None,

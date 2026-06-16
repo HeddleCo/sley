@@ -114,6 +114,36 @@ pub(crate) fn hook_exists(hook_name: &str) -> Result<bool> {
         .any(|hook| !matches!(hook, HookCommand::Configured { disabled: true, .. })))
 }
 
+/// Run the traditional `$GIT_DIR/hooks/reference-transaction` hook for one
+/// phase, feeding the queued `<old> <new> <refname>` lines on stdin. Returns
+/// `Ok(true)` when the hook ran and exited nonzero (the caller decides whether
+/// that aborts the transaction — only the `preparing`/`prepared` phases do),
+/// `Ok(false)` when the hook is absent or exited zero, and `Err` only on a spawn
+/// I/O failure. Unlike [`run_traditional_hook_at`], a nonzero exit is reported
+/// rather than turned into a fatal, because git ignores it in the
+/// `committed`/`aborted` phases.
+pub(crate) fn run_reference_transaction_hook_at(
+    git_dir: &Path,
+    phase: &str,
+    stdin: Vec<u8>,
+) -> Result<bool> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let path = common_git_dir.join("hooks").join("reference-transaction");
+    if !is_executable_file(&path) {
+        return Ok(false);
+    }
+    let options = HookRun {
+        args: vec![phase.to_string()],
+        stdin: Some(stdin),
+        stdout_to_stderr: false,
+        error_if_missing: false,
+        cwd: Some(hook_cwd_for_git_dir(git_dir)?),
+        normalize_failure: false,
+    };
+    let status = spawn_hook(&HookCommand::Traditional(path), &options)?;
+    Ok(!status.success())
+}
+
 pub(crate) fn run_traditional_hook_at(
     git_dir: &Path,
     hook_name: &str,
