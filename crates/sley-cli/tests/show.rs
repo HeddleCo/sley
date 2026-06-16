@@ -255,10 +255,11 @@ fn show_merge_commit_matches_git() {
     }
     let repo = build_repo("show-merge");
 
-    // The tip is a merge commit. Under git's default --diff-merges=off the
-    // patch/raw/name listings are suppressed (header + trailing gap only), while
-    // the --stat family still renders the first-parent diff. The exact trailing
-    // gap differs per pretty format, so cover the spread.
+    // The tip is a merge commit. `git show` defaults a merge to the dense-combined
+    // diff (`diff --cc`), so the patch/raw/name listings render the combined diff
+    // against all parents, while the --stat family renders the first-parent diff
+    // and `-s`/`--no-patch` suppresses the body. The exact trailing gap differs
+    // per pretty format, so cover the spread.
     for args in [
         vec!["show", "HEAD"],
         vec!["show", "-s", "HEAD"],
