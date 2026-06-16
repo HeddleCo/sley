@@ -539,6 +539,11 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
     let mut rendered: Option<usize> = None;
     let mut pending_err: Option<String> = None;
     let mut quit = false;
+    // In `--no-auto-advance` mode the loop does NOT exit when every hunk is
+    // decided — it keeps prompting (so the user can revisit decisions), and the
+    // `?` help then shows a HUNKS SUMMARY. In the default auto-advance mode the
+    // loop breaks as soon as everything is decided.
+    let mut all_decided = false;
 
     // The file's diff header (`diff --git ...`) is printed exactly once on entry.
     render_file_header(fd);
@@ -555,7 +560,15 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
                     hunk_index = i;
                     rendered = None;
                 }
-                None => break,
+                None => {
+                    if cfg.auto_advance {
+                        break;
+                    }
+                    // --no-auto-advance: wrap to the first hunk and keep prompting
+                    // (git resets hunk_index to 0 rather than exiting).
+                    hunk_index = 0;
+                    rendered = None;
+                }
             }
         }
         // Find undecided next/prev.
@@ -567,8 +580,15 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
             && undecided_prev.is_none()
             && fd.hunks[hunk_index].use_hunk != HunkUse::Undecided
         {
-            // No undecided hunks anywhere → done with this file.
-            break;
+            if cfg.auto_advance {
+                // Default mode: done with this file.
+                break;
+            }
+            // `--no-auto-advance`: stay on the prompt; the `?` help shows the
+            // HUNKS SUMMARY while all_decided.
+            all_decided = true;
+        } else {
+            all_decided = false;
         }
 
         // Render the hunk if newly arrived at.
@@ -788,6 +808,24 @@ fn patch_update_file(fd: &mut FileDiff, stdin: &mut impl BufRead, cfg: &PatchCon
                                  p - print the current hunk\n\
                                  P - print the current hunk using the pager\n\
                                  ? - print help\n"
+                            );
+                        }
+                        // In --no-auto-advance mode, once every hunk is decided the
+                        // help appends a HUNKS SUMMARY (git's help_patch_remainder).
+                        if all_decided {
+                            let used = fd
+                                .hunks
+                                .iter()
+                                .filter(|h| h.use_hunk == HunkUse::Use)
+                                .count();
+                            let skipped = fd
+                                .hunks
+                                .iter()
+                                .filter(|h| h.use_hunk == HunkUse::Skip)
+                                .count();
+                            println!(
+                                "HUNKS SUMMARY - Hunks: {}, USE: {used}, SKIP: {skipped}",
+                                fd.hunks.len()
                             );
                         }
                     }

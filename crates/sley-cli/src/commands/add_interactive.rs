@@ -698,10 +698,11 @@ pub(crate) fn cmd_add_patch(
     paths: &[String],
     context: Option<i64>,
     interhunk: Option<i64>,
+    auto_advance: bool,
 ) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let _ = worktree_root_for_git_dir(&git_dir)?;
-    let cfg = resolve_patch_config(&git_dir, context, interhunk, true)?;
+    let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     super::add_patch::run_add_patch(super::add_patch::PatchMode::Add, paths, &mut handle, cfg)

@@ -1226,7 +1226,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
         }
         if patch {
-            return super::add_interactive::cmd_add_patch(&spec, context, interhunk);
+            return super::add_interactive::cmd_add_patch(
+                &spec,
+                context,
+                interhunk,
+                auto_advance.unwrap_or(true),
+            );
         }
         if interactive {
             return super::add_interactive::cmd_add_interactive(&spec);
