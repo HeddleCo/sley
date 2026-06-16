@@ -497,8 +497,10 @@ fn verify_pack_one(
             return Err(GitError::Exit(1));
         }
     };
-    let pack = match sley_pack::PackFile::parse(&pack_bytes, format) {
-        Ok(pack) => pack,
+    // `verify_pack_stats` parses + resolves the pack (validating checksum,
+    // inflate, and delta chains) and returns the per-object report git prints.
+    let stats = match sley_pack::PackFile::verify_pack_stats(&pack_bytes, format) {
+        Ok(stats) => stats,
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("fatal: packfile {} cannot be verified", pack_path.display());
@@ -507,7 +509,7 @@ fn verify_pack_one(
     };
 
     // The pack's trailing checksum must equal the one the `.idx` records.
-    if pack.checksum != index.pack_checksum {
+    if stats.checksum != index.pack_checksum {
         eprintln!(
             "fatal: {}: pack checksum mismatch with index",
             pack_path.display()
@@ -517,12 +519,12 @@ fn verify_pack_one(
 
     // Every object the index advertises must exist in the pack at the same
     // offset with the same id, and the pack must hold exactly that object set.
-    let mut pack_by_offset: HashMap<u64, &sley_pack::PackObject> =
-        HashMap::with_capacity(pack.entries.len());
-    for object in &pack.entries {
-        pack_by_offset.insert(object.entry.offset, object);
+    let mut stat_by_offset: HashMap<u64, &sley_pack::PackVerifyStat> =
+        HashMap::with_capacity(stats.objects.len());
+    for object in &stats.objects {
+        stat_by_offset.insert(object.offset, object);
     }
-    if pack.entries.len() != index.entries.len() {
+    if stats.objects.len() != index.entries.len() {
         eprintln!(
             "fatal: {}: object count mismatch between pack and index",
             pack_path.display()
@@ -530,8 +532,8 @@ fn verify_pack_one(
         return Err(GitError::Exit(1));
     }
     for entry in &index.entries {
-        match pack_by_offset.get(&entry.offset) {
-            Some(object) if object.entry.oid == entry.oid => {}
+        match stat_by_offset.get(&entry.offset) {
+            Some(object) if object.oid == entry.oid => {}
             _ => {
                 eprintln!(
                     "fatal: {}: object {} at offset {} does not match the pack",
@@ -544,37 +546,68 @@ fn verify_pack_one(
         }
     }
 
-    let mut entries = index.entries;
-    entries.sort_by_key(|entry| entry.offset);
-    let mut non_delta = 0usize;
-    for entry in &entries {
-        let Some(object) = pack_by_offset.get(&entry.offset) else {
-            eprintln!("fatal: cannot read object {}", entry.oid);
-            return Err(GitError::Exit(1));
-        };
-        // PackFile::parse fully resolves deltas, so every entry exposes a real
-        // type and size. The stat counts undeltified entries; with fully
-        // resolved objects every object reports as non-delta, which is the
-        // common-case stat the suite's exit-code checks do not constrain.
-        non_delta += 1;
+    // Reproduce builtin/index-pack.c::show_pack_info exactly. Objects print in
+    // pack offset order (verify_pack_stats already sorts them that way). The
+    // per-object line is `<oid> <type-6> <size> <size-in-pack> <offset>` with an
+    // optional ` <depth> <base-oid>` suffix for delta entries. The histogram is
+    // `non delta: N objects` followed by `chain length = K: M objects` per depth.
+    let non_delta = stats
+        .objects
+        .iter()
+        .filter(|object| object.delta_depth == 0)
+        .count();
+    let deepest = stats
+        .objects
+        .iter()
+        .map(|object| object.delta_depth)
+        .max()
+        .unwrap_or(0);
+    let mut chain_histogram = vec![0usize; deepest as usize];
+    for object in &stats.objects {
+        if object.delta_depth > 0 {
+            chain_histogram[(object.delta_depth - 1) as usize] += 1;
+        }
         if verbose && !stat_only {
-            println!(
+            print!(
                 "{} {:<6} {} {} {}",
-                entry.oid,
-                object.object.object_type.as_str(),
-                object.entry.uncompressed_size,
-                object.entry.compressed_size,
-                entry.offset
+                object.oid,
+                object.object_type.as_str(),
+                object.size,
+                object.size_in_pack,
+                object.offset
             );
+            if let Some(base_oid) = &object.base_oid {
+                print!(" {} {base_oid}", object.delta_depth);
+            }
+            println!();
         }
     }
     if verbose || stat_only {
-        println!("non delta: {non_delta} objects");
+        // git only emits the "non delta" line when there is at least one, and
+        // uses the singular noun for a count of one (printf_ln + Q_()).
+        if non_delta > 0 {
+            println!("non delta: {non_delta} {}", plural_objects(non_delta));
+        }
+        for (depth, &count) in chain_histogram.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            println!(
+                "chain length = {}: {count} {}",
+                depth + 1,
+                plural_objects(count)
+            );
+        }
         if verbose && !stat_only {
             println!("{}: ok", pack_path.display());
         }
     }
     Ok(())
+}
+
+/// git's `Q_("... object", "... objects", n)` noun selection: singular for 1.
+fn plural_objects(count: usize) -> &'static str {
+    if count == 1 { "object" } else { "objects" }
 }
 
 fn parse_verify_pack_object_format(value: &str) -> Result<ObjectFormat> {

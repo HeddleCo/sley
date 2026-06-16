@@ -147,6 +147,36 @@ pub struct PackObject {
     pub object: EncodedObject,
 }
 
+/// Per-object statistics for one entry of a verified pack, in the shape
+/// `git verify-pack -v` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackVerifyStat {
+    /// Resolved object id.
+    pub oid: ObjectId,
+    /// Resolved object type (the delta's *result* type, not `ofs-delta`).
+    pub object_type: ObjectType,
+    /// Resolved (inflated) object size in bytes.
+    pub size: u64,
+    /// Bytes this object occupies in the pack: the offset delta to the next
+    /// object, or to the trailing checksum for the last object.
+    pub size_in_pack: u64,
+    /// In-pack byte offset where this object's entry begins.
+    pub offset: u64,
+    /// Delta chain depth: `0` for undeltified objects, base-depth + 1 otherwise.
+    pub delta_depth: u32,
+    /// For delta objects, the id of the *immediate* base object (which may
+    /// itself be a delta). `None` for undeltified objects.
+    pub base_oid: Option<ObjectId>,
+}
+
+/// Result of [`PackFile::verify_pack_stats`]: per-object stats in pack offset
+/// order plus the pack's trailing checksum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackVerifyStats {
+    pub objects: Vec<PackVerifyStat>,
+    pub checksum: ObjectId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackWrite {
     pub pack: Vec<u8>,
@@ -385,6 +415,15 @@ enum DeltaBase {
     Ref(ObjectId),
 }
 
+/// One pack entry as stored on disk, used by [`PackFile::verify_pack_stats`] to
+/// recover the delta structure and on-disk stream size that resolved
+/// [`PackObject`]s no longer carry.
+struct OnDiskEntry {
+    offset: u64,
+    base: Option<DeltaBase>,
+    stream_size: u64,
+}
+
 impl PackFile {
     pub fn parse_sha1(bytes: &[u8]) -> Result<Self> {
         Self::parse(bytes, ObjectFormat::Sha1)
@@ -532,6 +571,192 @@ impl PackFile {
             version,
             entries: resolve_pack_entries(entries, format, &mut external_base)?,
             checksum,
+        })
+    }
+
+    /// Walk the pack and produce per-object statistics matching the output of
+    /// `git verify-pack -v` / `git index-pack --verify-stat`.
+    ///
+    /// Objects are returned in pack offset order (the order `git verify-pack -v`
+    /// prints them). Each entry carries the *resolved* object id, type and size,
+    /// the in-pack byte span (`size_in_pack` = the offset delta to the next
+    /// object, or to the trailing checksum for the last object), the in-pack
+    /// offset, the delta chain depth (`0` for undeltified objects), and — for
+    /// deltas — the object id of the *immediate* base (which may itself be a
+    /// delta). This mirrors `builtin/index-pack.c`'s `show_pack_info`.
+    pub fn verify_pack_stats(bytes: &[u8], format: ObjectFormat) -> Result<PackVerifyStats> {
+        // Resolve the whole pack first: this validates the trailing checksum,
+        // every object's inflate, and yields the resolved oid/type/size keyed by
+        // offset. `verify-pack` is exactly this validation plus the stat report.
+        let pack = Self::parse(bytes, format)?;
+
+        // Independently walk the on-disk entries to recover each object's stored
+        // kind and (for deltas) its base reference — information `PackFile`
+        // discards once deltas are resolved.
+        let trailer_len = format.raw_len();
+        let trailer_offset = bytes.len() - trailer_len;
+        let count = u32_be(&bytes[8..12]) as usize;
+        let mut offset = 12usize;
+        // Per entry in read (offset) order: (offset, base, on-disk stream size).
+        // The stream size is what git prints in the size column: it is the
+        // resolved object size for an undeltified entry, but the *delta
+        // instruction stream* length for a delta entry (builtin/index-pack.c sets
+        // `obj->size` from the entry header, before any delta is applied).
+        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry_offset = offset as u64;
+            let header = parse_entry_header(bytes, &mut offset)?;
+            let stream_size = header.size;
+            let base = match header.kind {
+                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(
+                    parse_ofs_delta_base_offset(bytes, &mut offset, entry_offset)?,
+                )),
+                PackObjectKind::RefDelta => {
+                    let hash_len = format.raw_len();
+                    if offset + hash_len > trailer_offset {
+                        return Err(GitError::InvalidFormat(
+                            "truncated ref-delta base object id".into(),
+                        ));
+                    }
+                    let oid = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
+                    offset += hash_len;
+                    Some(DeltaBase::Ref(oid))
+                }
+                _ => None,
+            };
+            // Skip the compressed body to reach the next entry header.
+            let mut body = Vec::new();
+            let consumed = inflate_into(
+                &bytes[offset..trailer_offset],
+                &mut body,
+                header.size.min(usize::MAX as u64) as usize,
+            )?;
+            offset = offset
+                .checked_add(consumed)
+                .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+            on_disk.push(OnDiskEntry {
+                offset: entry_offset,
+                base,
+                stream_size,
+            });
+        }
+
+        // Map offset -> resolved object so the on-disk walk can join in oid/type.
+        let mut resolved_by_offset: HashMap<u64, &PackObject> =
+            HashMap::with_capacity(pack.entries.len());
+        for object in &pack.entries {
+            resolved_by_offset.insert(object.entry.offset, object);
+        }
+        // Map offset -> resolved oid, for ofs-delta base lookups.
+        let mut oid_by_offset: HashMap<u64, ObjectId> = HashMap::with_capacity(on_disk.len());
+        for entry in &on_disk {
+            if let Some(object) = resolved_by_offset.get(&entry.offset) {
+                oid_by_offset.insert(entry.offset, object.entry.oid);
+            }
+        }
+        // Map base offset -> index in `on_disk`, for delta-depth propagation.
+        let mut index_by_offset: HashMap<u64, usize> = HashMap::with_capacity(on_disk.len());
+        for (idx, entry) in on_disk.iter().enumerate() {
+            index_by_offset.insert(entry.offset, idx);
+        }
+
+        // Sorted offsets give the size-in-pack span (next offset - this offset),
+        // with the trailing checksum offset as the final sentinel.
+        let mut sorted_offsets: Vec<u64> = on_disk.iter().map(|entry| entry.offset).collect();
+        sorted_offsets.sort_unstable();
+        let mut next_offset: HashMap<u64, u64> = HashMap::with_capacity(sorted_offsets.len());
+        for window in sorted_offsets.windows(2) {
+            next_offset.insert(window[0], window[1]);
+        }
+        if let Some(last) = sorted_offsets.last() {
+            next_offset.insert(*last, trailer_offset as u64);
+        }
+
+        // Compute delta depth by following base offsets. Depth of a non-delta is
+        // 0; a delta's depth is its base's depth + 1. `index_by_offset` lets an
+        // ofs-delta find its base's index; a ref-delta resolves its base oid to
+        // an in-pack offset when present (thin-pack external bases are not stored
+        // in this pack, but verify-pack only ever runs on self-contained packs).
+        let mut depth = vec![None; on_disk.len()];
+        fn resolve_depth(
+            idx: usize,
+            on_disk: &[OnDiskEntry],
+            index_by_offset: &HashMap<u64, usize>,
+            offset_of_oid: &HashMap<ObjectId, u64>,
+            depth: &mut [Option<u32>],
+        ) -> u32 {
+            if let Some(d) = depth[idx] {
+                return d;
+            }
+            let computed = match &on_disk[idx].base {
+                None => 0,
+                Some(base) => {
+                    let base_idx = match base {
+                        DeltaBase::Offset(off) => index_by_offset.get(off).copied(),
+                        DeltaBase::Ref(oid) => offset_of_oid
+                            .get(oid)
+                            .and_then(|off| index_by_offset.get(off).copied()),
+                    };
+                    match base_idx {
+                        Some(bi) => {
+                            resolve_depth(bi, on_disk, index_by_offset, offset_of_oid, depth) + 1
+                        }
+                        // Base not in this pack (thin pack); treat as depth 1.
+                        None => 1,
+                    }
+                }
+            };
+            depth[idx] = Some(computed);
+            computed
+        }
+        let mut offset_of_oid: HashMap<ObjectId, u64> = HashMap::with_capacity(oid_by_offset.len());
+        for (off, oid) in &oid_by_offset {
+            offset_of_oid.insert(*oid, *off);
+        }
+        for idx in 0..on_disk.len() {
+            resolve_depth(
+                idx,
+                &on_disk,
+                &index_by_offset,
+                &offset_of_oid,
+                &mut depth,
+            );
+        }
+
+        let mut stats = Vec::with_capacity(on_disk.len());
+        for (idx, entry) in on_disk.iter().enumerate() {
+            let off = entry.offset;
+            let object = resolved_by_offset.get(&off).ok_or_else(|| {
+                GitError::InvalidFormat("pack offset missing from resolved set".into())
+            })?;
+            let size_in_pack = next_offset
+                .get(&off)
+                .copied()
+                .unwrap_or(trailer_offset as u64)
+                .saturating_sub(off);
+            let base_oid = match &entry.base {
+                None => None,
+                Some(DeltaBase::Offset(base_off)) => oid_by_offset.get(base_off).copied(),
+                Some(DeltaBase::Ref(oid)) => Some(*oid),
+            };
+            stats.push(PackVerifyStat {
+                oid: object.entry.oid,
+                object_type: object.object.object_type,
+                // git prints the on-disk stream size: object body size for an
+                // undeltified entry, delta-instruction stream size for a delta.
+                size: entry.stream_size,
+                size_in_pack,
+                offset: off,
+                delta_depth: depth[idx].unwrap_or(0),
+                base_oid,
+            });
+        }
+        // Emit in pack offset order, matching git's read order.
+        stats.sort_by_key(|stat| stat.offset);
+
+        Ok(PackVerifyStats {
+            objects: stats,
+            checksum: pack.checksum,
         })
     }
 
