@@ -2513,7 +2513,173 @@ fn commented_lines(text: &[u8], comment: u8) -> Vec<u8> {
     out
 }
 
-/// `update_squash_messages` for plain fixup/squash (no `-c`/`-C` flags).
+/// `commit_subject_length`: bytes of the subject paragraph (up to and including
+/// the blank line that ends it), so `amend!`/`fixup!`/`squash!` subjects can be
+/// commented out while the body stays verbatim.
+fn commit_subject_length(body: &[u8]) -> usize {
+    let mut p = 0usize;
+    while p < body.len() {
+        // skip_blank_lines: if the current line is blank, the subject ends here.
+        let next = skip_blank_lines(&body[p..]) + p;
+        if next != p {
+            break;
+        }
+        // advance past this (non-blank) line.
+        match body[p..].iter().position(|&b| b == b'\n') {
+            Some(off) => p += off + 1,
+            None => return body.len(),
+        }
+    }
+    p
+}
+
+/// `skip_blank_lines`: return the offset past any leading all-whitespace lines.
+fn skip_blank_lines(buf: &[u8]) -> usize {
+    let mut p = 0usize;
+    loop {
+        let eol = buf[p..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|off| p + off)
+            .unwrap_or(buf.len());
+        if buf[p..eol].iter().any(|&b| !b.is_ascii_whitespace()) {
+            return p;
+        }
+        if eol >= buf.len() {
+            return buf.len();
+        }
+        p = eol + 1;
+    }
+}
+
+/// `seen_squash`: the current fixup chain contains a `squash` command.
+fn seen_squash(ctx: &Ctx) -> bool {
+    fs::read_to_string(ctx.state_path("current-fixups"))
+        .map(|text| {
+            text.starts_with("squash") || text.contains("\nsquash")
+        })
+        .unwrap_or(false)
+}
+
+/// `is_fixup_flag`: a `fixup -C` / `fixup -c` (replaces the prior message).
+fn is_fixup_flag(command: TodoCommand, flags: u8) -> bool {
+    command == TodoCommand::Fixup
+        && (flags & seq::FLAG_REPLACE_FIXUP_MSG != 0 || flags & seq::FLAG_EDIT_FIXUP_MSG != 0)
+}
+
+/// `update_squash_message_for_fixup`: when a `fixup -C/-c` follows earlier
+/// messages, re-comment any still-uncommented prior commit message so only the
+/// replacing message survives. Mirrors sequencer.c by rewriting the
+/// "This is the …th commit message:" headers to their "will be skipped" form
+/// and commenting the bodies they introduce.
+fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
+    let comment_str = (comment as char).to_string();
+    // The header markers (kept) and their skipped variants, both already
+    // carrying the comment prefix.
+    let kept_first = format!("{comment_str} This is the 1st commit message:");
+    let skip_first = format!("{comment_str} The 1st commit message will be skipped:");
+    let mut out = Vec::with_capacity(msg.len());
+    let mut commenting = false;
+    let mut idx = 1usize;
+    // Build the "This is the commit message #N:" / "...#N will be skipped:"
+    // markers lazily as we walk.
+    let kept_nth =
+        |n: usize| format!("{comment_str} This is the commit message #{n}:");
+    let skip_nth =
+        |n: usize| format!("{comment_str} The commit message #{n} will be skipped:");
+    for line in msg.split_inclusive(|&b| b == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let text = String::from_utf8_lossy(body);
+        if text == kept_first {
+            out.extend_from_slice(skip_first.as_bytes());
+            out.push(b'\n');
+            commenting = true;
+            continue;
+        }
+        if text == kept_nth(idx + 1) {
+            out.extend_from_slice(skip_nth(idx + 1).as_bytes());
+            out.push(b'\n');
+            idx += 1;
+            commenting = true;
+            continue;
+        }
+        if text == skip_first || text == skip_nth(idx + 1) {
+            if text == skip_nth(idx + 1) {
+                idx += 1;
+            }
+            out.extend_from_slice(line);
+            commenting = false;
+            continue;
+        }
+        if commenting {
+            // Comment out the message body, but leave blank lines untouched.
+            if body.is_empty() {
+                out.push(b'\n');
+            } else if body.first() == Some(&comment) {
+                out.extend_from_slice(line);
+            } else {
+                out.push(comment);
+                out.push(b' ');
+                out.extend_from_slice(line);
+            }
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+/// Append the replacing/squashed message body (`append_squash_message`):
+/// the "commit message #N" header plus the fixup commit's body. For
+/// `fixup -C/-c` the body replaces the message, so it is added verbatim
+/// (uncommented) and may be persisted to `message-fixup`.
+fn append_squash_message(
+    ctx: &Ctx,
+    buf: &mut Vec<u8>,
+    body: &[u8],
+    command: TodoCommand,
+    flags: u8,
+    comment: u8,
+    count: usize,
+) -> Result<()> {
+    let comment_str = (comment as char).to_string();
+    // `amend!` subjects (and fixup!/squash! when squashing) get their subject
+    // commented out.
+    let commented_len = if body.starts_with(b"amend!")
+        || ((command == TodoCommand::Squash || seen_squash(ctx))
+            && (body.starts_with(b"squash!") || body.starts_with(b"fixup!")))
+    {
+        commit_subject_length(body)
+    } else {
+        0
+    };
+    buf.push(b'\n');
+    buf.extend_from_slice(
+        format!("{comment_str} This is the commit message #{}:\n\n", count + 2).as_bytes(),
+    );
+    buf.extend_from_slice(&commented_lines(&body[..commented_len], comment));
+    let fixup_off = buf.len();
+    buf.extend_from_slice(&body[commented_len..]);
+
+    if is_fixup_flag(command, flags) && !seen_squash(ctx) {
+        if (flags & seq::FLAG_REPLACE_FIXUP_MSG != 0)
+            && (ctx.state_path("message-fixup").exists()
+                || !ctx.state_path("message-squash").exists())
+        {
+            let fixup_msg = &buf[fixup_off + skip_blank_lines(&buf[fixup_off..])..];
+            fs::write(ctx.state_path("message-fixup"), fixup_msg)?;
+        } else {
+            let _ = fs::remove_file(ctx.state_path("message-fixup"));
+        }
+    } else {
+        let _ = fs::remove_file(ctx.state_path("message-fixup"));
+    }
+    Ok(())
+}
+
+/// `update_squash_messages`: build the combined `message-squash` (and, for plain
+/// fixup chains, `message-fixup`). Handles `squash`, plain `fixup`, and
+/// `fixup -C`/`-c` (`FLAG_REPLACE_FIXUP_MSG` / `FLAG_EDIT_FIXUP_MSG`).
 fn update_squash_messages(
     ctx: &Ctx,
     db: &FileObjectDatabase,
@@ -2523,6 +2689,7 @@ fn update_squash_messages(
     let comment = comment_char(&ctx.git_dir);
     let comment_str = (comment as char).to_string();
     let count = current_fixup_count(ctx);
+    let flagged = is_fixup_flag(item.command, item.flags);
     let mut buf: Vec<u8>;
     if count > 0 {
         let existing = fs::read(ctx.state_path("message-squash"))?;
@@ -2541,35 +2708,38 @@ fn update_squash_messages(
         )
         .into_bytes();
         buf.extend_from_slice(&existing[eol..]);
+        if flagged && !seen_squash(ctx) {
+            buf = update_squash_message_for_fixup(&buf, comment);
+        }
     } else {
         let refs = ctx.refs();
         let head = head_commit_oid(&refs)?
             .ok_or_else(|| GitError::Command("need a HEAD to fixup".into()))?;
         let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
         let head_body = &head_record.commit.message;
+        // Plain fixup (no flag) seeds message-fixup with HEAD's body.
         if item.command == TodoCommand::Fixup && item.flags == 0 {
             fs::write(ctx.state_path("message-fixup"), head_body)?;
         }
         buf = format!("{comment_str} This is a combination of 2 commits.\n").into_bytes();
-        buf.extend_from_slice(
-            format!("{comment_str} This is the 1st commit message:\n\n").as_bytes(),
-        );
-        buf.extend_from_slice(head_body);
+        if flagged {
+            buf.extend_from_slice(
+                format!("{comment_str} The 1st commit message will be skipped:\n\n").as_bytes(),
+            );
+            buf.extend_from_slice(&commented_lines(head_body, comment));
+        } else {
+            buf.extend_from_slice(
+                format!("{comment_str} This is the 1st commit message:\n\n").as_bytes(),
+            );
+            buf.extend_from_slice(head_body);
+        }
     }
 
     let body = &record.commit.message;
-    if item.command == TodoCommand::Squash {
-        buf.push(b'\n');
-        buf.extend_from_slice(
-            format!(
-                "{comment_str} This is the commit message #{}:\n\n",
-                count + 2
-            )
-            .as_bytes(),
-        );
-        buf.extend_from_slice(body);
-        let _ = fs::remove_file(ctx.state_path("message-fixup"));
+    if item.command == TodoCommand::Squash || flagged {
+        append_squash_message(ctx, &mut buf, body, item.command, item.flags, comment, count)?;
     } else {
+        // Plain fixup: the message is skipped.
         buf.push(b'\n');
         buf.extend_from_slice(
             format!(
