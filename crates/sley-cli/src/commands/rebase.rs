@@ -1298,83 +1298,128 @@ fn make_script_commits(
     Ok(out)
 }
 
+/// `skip_fixupish`: strip one `fixup! `/`amend! `/`squash! ` prefix, returning
+/// the remainder.
+fn skip_fixupish(subject: &str) -> Option<&str> {
+    subject
+        .strip_prefix("fixup! ")
+        .or_else(|| subject.strip_prefix("amend! "))
+        .or_else(|| subject.strip_prefix("squash! "))
+}
+
+/// `todo_list_rearrange_squash`: move `fixup!`/`squash!`/`amend!` commits
+/// directly after their targets and rewrite their command. Faithful port of
+/// sequencer.c: targets are matched first by exact title, then by commit
+/// name (sha/ref) when the remainder has no space, and finally as a prefix of
+/// an earlier subject. `amend!` becomes `fixup -C` (replace message).
 fn rearrange_squash(
     ctx: &Ctx,
     db: &FileObjectDatabase,
     items: Vec<RebaseTodoItem>,
 ) -> Result<Vec<RebaseTodoItem>> {
-    let _ = (ctx, db);
-    // `--autosquash`: move fixup!/squash! commits behind their targets.
-    let mut subjects: Vec<(usize, String)> = Vec::new();
-    let mut moved: Vec<Option<Vec<usize>>> = vec![None; items.len()];
-    let mut used = vec![false; items.len()];
-    let mut rewritten: Vec<Option<TodoCommand>> = vec![None; items.len()];
-    for (idx, item) in items.iter().enumerate() {
-        if item.command != TodoCommand::Pick {
+    let n = items.len();
+    // Per-item subject (from the commit), or None for drop/comment/no-commit.
+    let mut subjects: Vec<Option<String>> = vec![None; n];
+    // Title -> first item index with that exact subject.
+    let mut subject2item: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Resolved commit oid -> item index (for the commit-name match tier).
+    let mut commit2item: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
+    let mut next = vec![-1i64; n];
+    let mut tail = vec![-1i64; n];
+    let mut rewritten: Vec<Option<(TodoCommand, u8)>> = vec![None; n];
+    let mut rearranged = false;
+
+    for i in 0..n {
+        let item = &items[i];
+        if item.oid.is_none() || item.command == TodoCommand::Drop {
             continue;
         }
-        let subject = item.arg.strip_prefix("# ").unwrap_or(&item.arg).to_string();
-        let mut rest = subject.as_str();
-        let mut command = None;
-        loop {
-            if let Some(stripped) = rest.strip_prefix("fixup! ") {
-                rest = stripped;
-                command.get_or_insert(TodoCommand::Fixup);
-            } else if let Some(stripped) = rest.strip_prefix("squash! ") {
-                rest = stripped;
-                command.get_or_insert(TodoCommand::Squash);
-            } else if let Some(stripped) = rest.strip_prefix("amend! ") {
-                rest = stripped;
-                command.get_or_insert(TodoCommand::Fixup);
+        // The subject is read off the commit, not the (potentially custom)
+        // instruction-format arg.
+        let record = read_rev_list_commit_record(db, ctx.format, item.oid.expect("checked"))?;
+        let subject = commit_subject(&record.commit.message);
+        subjects[i] = Some(subject.clone());
+
+        let mut i2: i64 = -1;
+        if let Some(mut p) = skip_fixupish(&subject) {
+            // Skip any nested fixup!/squash!/amend! prefixes (with whitespace).
+            loop {
+                p = p.trim_start();
+                match skip_fixupish(p) {
+                    Some(rest) => p = rest,
+                    None => break,
+                }
+            }
+            if let Some(&found) = subject2item.get(p) {
+                // found by title
+                i2 = found as i64;
+            } else if !p.contains(' ')
+                && let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, p)
+                && let Ok(peeled) = sley_rev::peel_to_commit(db, ctx.format, &oid)
+                && let Some(&found) = commit2item.get(&peeled)
+            {
+                // found by commit name (sha/ref)
+                i2 = found as i64;
             } else {
-                break;
+                // copy can be a prefix of the commit subject
+                for (j, subj) in subjects.iter().enumerate().take(i) {
+                    if let Some(subj) = subj
+                        && subj.starts_with(p)
+                    {
+                        i2 = j as i64;
+                        break;
+                    }
+                }
             }
         }
-        if let Some(command) = command {
-            // Find the target: latest earlier item whose subject matches
-            // `rest` (exact or prefix).
-            let target = subjects
-                .iter()
-                .rev()
-                .find(|(_, s)| s == rest || s.starts_with(rest))
-                .map(|(i, _)| *i);
-            if let Some(target) = target {
-                moved[target].get_or_insert_with(Vec::new).push(idx);
-                used[idx] = true;
-                rewritten[idx] = Some(command);
-                continue;
+
+        if i2 >= 0 {
+            rearranged = true;
+            let rewrite = if subject.starts_with("fixup!") {
+                (TodoCommand::Fixup, 0u8)
+            } else if subject.starts_with("amend!") {
+                (TodoCommand::Fixup, seq::FLAG_REPLACE_FIXUP_MSG)
+            } else {
+                (TodoCommand::Squash, 0u8)
+            };
+            rewritten[i] = Some(rewrite);
+            let i2u = i2 as usize;
+            if tail[i2u] < 0 {
+                next[i] = next[i2u];
+                next[i2u] = i as i64;
+            } else {
+                let t = tail[i2u] as usize;
+                next[i] = next[t];
+                next[t] = i as i64;
             }
+            tail[i2u] = i as i64;
+        } else {
+            subject2item.entry(subject).or_insert(i);
         }
-        subjects.push((idx, subject));
+        commit2item.insert(item.oid.expect("checked"), i);
     }
-    if used.iter().all(|&u| !u) {
+
+    if !rearranged {
         return Ok(items);
     }
-    let mut out = Vec::with_capacity(items.len());
-    fn push_chain(
-        idx: usize,
-        items: &[RebaseTodoItem],
-        moved: &[Option<Vec<usize>>],
-        rewritten: &[Option<TodoCommand>],
-        out: &mut Vec<RebaseTodoItem>,
-    ) {
-        let mut item = items[idx].clone();
-        if let Some(command) = rewritten[idx] {
-            item.command = command;
-        }
-        out.push(item);
-        if let Some(fixups) = &moved[idx] {
-            for &fixup in fixups {
-                push_chain(fixup, items, moved, rewritten, out);
-            }
-        }
-    }
-    for (idx, item) in items.iter().enumerate() {
-        if used[idx] {
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // Items already rearranged into a chain are emitted from their target.
+        if rewritten[i].is_some() {
             continue;
         }
-        let _ = item;
-        push_chain(idx, &items, &moved, &rewritten, &mut out);
+        let mut cur = i as i64;
+        while cur >= 0 {
+            let idx = cur as usize;
+            let mut item = items[idx].clone();
+            if let Some((command, flags)) = rewritten[idx] {
+                item.command = command;
+                item.flags = flags;
+            }
+            out.push(item);
+            cur = next[idx];
+        }
     }
     Ok(out)
 }
