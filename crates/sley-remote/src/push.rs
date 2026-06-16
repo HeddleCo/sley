@@ -882,7 +882,11 @@ fn plan_push_command_forces(
 ) -> Result<Vec<(ReceivePackCommand, bool)>> {
     let parsed_refspecs = refspecs
         .iter()
-        .map(|refspec| parse_refspec(&normalize_push_refspec_for_sources(refspec, local_refs)))
+        .map(|refspec| {
+            let normalized =
+                normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
+            parse_refspec(&normalized)
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut command_forces = Vec::new();
     for refspec in &parsed_refspecs {
@@ -928,22 +932,110 @@ fn add_revision_push_sources(
     }
 }
 
-fn normalize_push_refspec_for_sources(refspec: &str, local_refs: &[PushSourceRef]) -> String {
+fn normalize_push_refspec_for_sources(
+    refspec: &str,
+    local_refs: &[PushSourceRef],
+    remote_refs: &[RefAdvertisement],
+) -> Result<String> {
     let (force, refspec) = refspec
         .strip_prefix('+')
         .map_or((false, refspec), |refspec| (true, refspec));
     let normalized = if let Some((src, dst)) = refspec.split_once(':') {
         let (src, src_kind) = normalize_push_source_refname(src, local_refs);
-        let dst = normalize_push_destination_refname(dst, src_kind);
+        let dst = normalize_push_destination_refname(dst, src_kind, remote_refs)?;
         format!("{src}:{dst}")
     } else {
         let (name, _) = normalize_push_source_refname(refspec, local_refs);
-        format!("{name}:{name}")
+        // A colon-less refspec re-uses the source's *resolved* full name as the
+        // implicit destination (git's `match_explicit`: a NULL dst resolves to
+        // the matched source ref). That full name is then disambiguated against
+        // the remote's existing refs, so `git push <remote> frotz` (a tag)
+        // lands on `refs/tags/frotz` even when the remote also has a same-named
+        // branch.
+        let dst = match count_refspec_match_dst(&name, remote_refs) {
+            DstMatch::Unique(matched) => matched.to_string(),
+            DstMatch::None => name.clone(),
+            DstMatch::Ambiguous => {
+                return Err(GitError::Command(format!(
+                    "dst refspec {name} matches more than one"
+                )));
+            }
+        };
+        format!("{name}:{dst}")
     };
-    if force {
+    Ok(if force {
         format!("+{normalized}")
     } else {
         normalized
+    })
+}
+
+/// git's `refname_match`: true when `full_name` equals `abbrev` expanded by one
+/// of the `ref_rev_parse_rules`. Returns the matched rule's rank (higher = more
+/// specific) so the caller can replicate git's strong/weak distinction.
+fn refname_match_rank(abbrev: &str, full_name: &str) -> Option<usize> {
+    const RULES: [&str; 6] = [
+        "{}",
+        "refs/{}",
+        "refs/tags/{}",
+        "refs/heads/{}",
+        "refs/remotes/{}",
+        "refs/remotes/{}/HEAD",
+    ];
+    for (idx, rule) in RULES.iter().enumerate() {
+        let (prefix, suffix) = rule.split_once("{}").unwrap_or((rule, ""));
+        if full_name == format!("{prefix}{abbrev}{suffix}") {
+            return Some(RULES.len() - idx);
+        }
+    }
+    None
+}
+
+/// The outcome of git's `count_refspec_match` for a push destination.
+enum DstMatch<'a> {
+    /// Exactly one acceptable match (one strong, or zero strong + one weak).
+    Unique(&'a str),
+    /// No remote ref matched — the caller should `guess_ref` or use the literal.
+    None,
+    /// More than one match — git dies with "dst refspec … matches more than one".
+    Ambiguous,
+}
+
+/// git's `count_refspec_match` for a push destination: find the unique existing
+/// remote ref that `pattern` resolves to, distinguishing strong matches (full
+/// name, top-level, or a head/tag) from weak ones (a partial match outside
+/// heads/tags, e.g. `origin/main` → `refs/remotes/origin/main`). One strong
+/// match wins outright; with no strong match a single weak match is used; more
+/// than one acceptable match is ambiguous.
+fn count_refspec_match_dst<'a>(pattern: &str, remote_refs: &'a [RefAdvertisement]) -> DstMatch<'a> {
+    let patlen = pattern.len();
+    let mut strong: Option<&str> = None;
+    let mut strong_count = 0usize;
+    let mut weak: Option<&str> = None;
+    let mut weak_count = 0usize;
+    for advert in remote_refs {
+        let name = advert.name.as_str();
+        if refname_match_rank(pattern, name).is_none() {
+            continue;
+        }
+        let namelen = name.len();
+        let is_weak = namelen != patlen
+            && patlen + 5 != namelen
+            && !name.starts_with("refs/heads/")
+            && !name.starts_with("refs/tags/");
+        if is_weak {
+            weak = Some(name);
+            weak_count += 1;
+        } else {
+            strong = Some(name);
+            strong_count += 1;
+        }
+    }
+    match (strong_count, weak_count, strong, weak) {
+        (1, _, Some(matched), _) => DstMatch::Unique(matched),
+        (0, 1, _, Some(matched)) => DstMatch::Unique(matched),
+        (0, 0, _, _) => DstMatch::None,
+        _ => DstMatch::Ambiguous,
     }
 }
 
@@ -976,13 +1068,28 @@ fn normalize_push_source_refname(
     }
 }
 
-fn normalize_push_destination_refname(name: &str, src_kind: PushSourceKind) -> String {
+fn normalize_push_destination_refname(
+    name: &str,
+    src_kind: PushSourceKind,
+    remote_refs: &[RefAdvertisement],
+) -> Result<String> {
     if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
-        return name.to_string();
+        return Ok(name.to_string());
     }
-    match src_kind {
-        PushSourceKind::Tag => format!("refs/tags/{name}"),
-        PushSourceKind::Branch | PushSourceKind::Other => format!("refs/heads/{name}"),
+    // git's `match_explicit`: a partial destination first resolves against the
+    // remote's existing refs (so `main:origin/main` lands on the existing
+    // `refs/remotes/origin/main`); an ambiguous match is fatal; only when
+    // nothing matches does it fall back to `guess_ref`'s heads/tags choice
+    // driven by the source ref's kind.
+    match count_refspec_match_dst(name, remote_refs) {
+        DstMatch::Unique(matched) => Ok(matched.to_string()),
+        DstMatch::Ambiguous => Err(GitError::Command(format!(
+            "dst refspec {name} matches more than one"
+        ))),
+        DstMatch::None => Ok(match src_kind {
+            PushSourceKind::Tag => format!("refs/tags/{name}"),
+            PushSourceKind::Branch | PushSourceKind::Other => format!("refs/heads/{name}"),
+        }),
     }
 }
 
