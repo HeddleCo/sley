@@ -1175,7 +1175,7 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
                 let yes = ans
                     .chars()
                     .next()
-                    .map(|c| c.to_ascii_lowercase() == 'y')
+                    .map(|c| c.eq_ignore_ascii_case(&'y'))
                     .unwrap_or(false);
                 if !yes {
                     return EditResult::Abandoned;
