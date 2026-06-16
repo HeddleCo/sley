@@ -170,6 +170,18 @@ fn dispatch_with_aliases(
 }
 
 fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
+    // git emits `trace: built-in: git <argv>` immediately before running a
+    // builtin (git.c:502). Mirror it for the general GIT_TRACE key so harnesses
+    // that read the trace (t3701 "add -p does not expand argument lists") find a
+    // populated trace file and the run_command/built-in argv lines.
+    if setup::git_trace_enabled() {
+        let mut msg = String::from("trace: built-in: git");
+        for arg in args {
+            msg.push(' ');
+            msg.push_str(&setup::trace_quote_sq(arg));
+        }
+        setup::git_trace_line("git.c:502", &msg);
+    }
     let Some(command) = args.first().map(String::as_str) else {
         print_usage();
         return Err(GitError::Command("missing command".into()));

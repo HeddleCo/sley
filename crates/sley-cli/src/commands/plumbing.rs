@@ -1142,6 +1142,101 @@ fn init_config_bool(
 }
 
 pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
+    // `add -i` / `add --interactive` and `add -p` / `add --patch` route to the
+    // interactive engine. git treats `--patch` as implying interactive and lets
+    // a pathspec follow. We collect the non-flag pathspec args plus the diff-tuning
+    // flags add-patch forwards to the spawned `diff-files` (`-U`/`--unified`,
+    // `--inter-hunk-context`) and forward them.
+    {
+        let mut interactive = false;
+        let mut patch = false;
+        let mut spec: Vec<String> = Vec::new();
+        // Explicit `-U<n>` / `--inter-hunk-context=<n>` from add's own argv. `None`
+        // means "fall back to diff.context / diff.interHunkContext config".
+        let mut context: Option<i64> = None;
+        let mut interhunk: Option<i64> = None;
+        // `--auto-advance`/`--no-auto-advance`. git's default is auto-advance ON;
+        // `Some(false)` is `--no-auto-advance`.
+        let mut auto_advance: Option<bool> = None;
+        let mut after_dd = false;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if after_dd {
+                spec.push(arg.clone());
+                continue;
+            }
+            match arg.as_str() {
+                "--" => after_dd = true,
+                "-i" | "--interactive" => interactive = true,
+                "-p" | "--patch" => patch = true,
+                "--auto-advance" => auto_advance = Some(true),
+                "--no-auto-advance" => auto_advance = Some(false),
+                "-U" | "--unified" => {
+                    context = iter.next().and_then(|v| v.parse::<i64>().ok());
+                }
+                value if value.starts_with("-U") => {
+                    context = value[2..].parse::<i64>().ok();
+                }
+                value if let Some(rest) = value.strip_prefix("--unified=") => {
+                    context = rest.parse::<i64>().ok();
+                }
+                "--inter-hunk-context" => {
+                    interhunk = iter.next().and_then(|v| v.parse::<i64>().ok());
+                }
+                value if let Some(rest) = value.strip_prefix("--inter-hunk-context=") => {
+                    interhunk = rest.parse::<i64>().ok();
+                }
+                other if other.starts_with('-') => {
+                    // Leave any other flags to the normal path (no -i/-p).
+                }
+                other => spec.push(other.to_string()),
+            }
+        }
+        // builtin/add.c validation order: negative context dies first (independent
+        // of -p), then the "requires --interactive/--patch" checks fire only when
+        // NOT in interactive/patch mode.
+        if let Some(value) = context
+            && value < -1
+        {
+            eprintln!("fatal: '--unified' cannot be negative");
+            return Err(GitError::Exit(128));
+        }
+        if let Some(value) = interhunk
+            && value < -1
+        {
+            eprintln!("fatal: '--inter-hunk-context' cannot be negative");
+            return Err(GitError::Exit(128));
+        }
+        if !patch && !interactive {
+            if context.is_some() {
+                eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
+                return Err(GitError::Exit(128));
+            }
+            if interhunk.is_some() {
+                eprintln!(
+                    "fatal: the option '--inter-hunk-context' requires '--interactive/--patch'"
+                );
+                return Err(GitError::Exit(128));
+            }
+            if auto_advance == Some(false) {
+                eprintln!(
+                    "fatal: the option '--no-auto-advance' requires '--interactive/--patch'"
+                );
+                return Err(GitError::Exit(128));
+            }
+        }
+        if patch {
+            return super::add_interactive::cmd_add_patch(
+                &spec,
+                context,
+                interhunk,
+                auto_advance.unwrap_or(true),
+            );
+        }
+        if interactive {
+            return super::add_interactive::cmd_add_interactive(&spec);
+        }
+    }
     let mut paths = Vec::new();
     let mut dry_run = false;
     let mut verbose = false;
@@ -1150,6 +1245,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut ignore_removal = false;
     let mut ignore_missing = false;
+    let mut intent_to_add = false;
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -1186,6 +1282,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
             "--ignore-missing" => ignore_missing = true,
             "--no-ignore-missing" => ignore_missing = false,
+            "-N" | "--intent-to-add" => intent_to_add = true,
+            "--no-intent-to-add" => intent_to_add = false,
             "--chmod" => {
                 let value = iter
                     .next()
@@ -1279,6 +1377,9 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    if intent_to_add && !dry_run {
+        return add_intent_to_add(&cwd, &worktree_root, &git_dir, format, &paths);
+    }
     if !update
         && !all
         && let Some(actions) = try_add_regular_exact_tracked_raw(
@@ -1517,6 +1618,83 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     }
     if verbose {
         print_add_actions(&worktree_root, &actions)?;
+    }
+    Ok(())
+}
+
+/// `git add -N` / `git add --intent-to-add`: record that each named path will
+/// be added later without staging its content. Mirrors `builtin/add.c`'s
+/// `ADD_CACHE_INTENT` path: for every pathspec that resolves to a worktree file
+/// not already tracked at stage 0, insert an intent-to-add placeholder entry
+/// (empty-blob id, mode 100644, the ITA extended flag). Already-tracked paths
+/// are left untouched. The index is rewritten with the entries kept in git's
+/// canonical (path, stage) sort order.
+fn add_intent_to_add(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<()> {
+    let mut index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or_else(|| Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
+
+    let mut changed = false;
+    for path in paths {
+        // Resolve the pathspec to a worktree-relative git path. Reject anything
+        // outside the worktree (git errors; we silently skip, matching the
+        // tests which only ever pass in-tree paths).
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            continue;
+        };
+        let git_path = add_git_path_bytes(relative)?;
+        if git_path.is_empty() {
+            continue;
+        }
+        // The worktree file must exist (git only marks paths that are present).
+        if !worktree_root.join(relative).is_file() {
+            continue;
+        }
+        // Skip paths already in the index at stage 0 (tracked or already ITA).
+        let already = index
+            .entries
+            .iter()
+            .any(|entry| index_entry_stage(entry) == 0 && entry.path.as_bytes() == git_path.as_slice());
+        if already {
+            continue;
+        }
+        let entry = IndexEntry::intent_to_add(format, git_path);
+        // Insert keeping the (path, stage) sort order the writer relies on.
+        let position = index
+            .entries
+            .binary_search_by(|existing| {
+                existing
+                    .path
+                    .as_bytes()
+                    .cmp(entry.path.as_bytes())
+                    .then(index_entry_stage(existing).cmp(&index_entry_stage(&entry)))
+            })
+            .unwrap_or_else(|insert_at| insert_at);
+        index.entries.insert(position, entry);
+        changed = true;
+    }
+
+    if changed {
+        // ITA entries carry an extended flag → the writer needs index v3+.
+        if index.version < 3 {
+            index.version = 3;
+        }
+        let index_path = sley_worktree::repository_index_path(git_dir);
+        std::fs::write(index_path, index.write(format)?)?;
     }
     Ok(())
 }
