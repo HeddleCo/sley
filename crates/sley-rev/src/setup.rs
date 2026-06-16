@@ -50,6 +50,7 @@ pub struct RevisionOptions {
     pub remove_empty: bool,
     pub simplify_merges: bool,
     pub show_pulls: bool,
+    pub ancestry_path: bool,
     pub ignore_missing: bool,
     pub had_ref_selector: bool,
     pub author_patterns: Vec<String>,
@@ -216,8 +217,13 @@ where
                 "--sparse" => self.setup.options.sparse = true,
                 "--dense" => self.setup.options.sparse = false,
                 "--remove-empty" => self.setup.options.remove_empty = true,
-                "--simplify-merges" => self.setup.options.simplify_merges = true,
+                "--simplify-merges" => {
+                    self.setup.options.simplify_merges = true;
+                    // git: --simplify-merges implies topo-order + parent rewriting.
+                    self.setup.options.order = RevisionOrder::Topo;
+                }
                 "--show-pulls" => self.setup.options.show_pulls = true,
+                "--ancestry-path" => self.setup.options.ancestry_path = true,
                 "--reverse" => self.setup.options.reverse = true,
                 "--first-parent" => self.setup.options.first_parent = true,
                 "--no-first-parent" => self.setup.options.first_parent = false,

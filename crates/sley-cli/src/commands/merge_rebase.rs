@@ -739,6 +739,9 @@ struct MergeOptions {
     quiet: bool,
     /// `-X ours` / `-X theirs` conflict favouring for textual conflicts.
     favor: sley_diff_merge::MergeFavor,
+    /// `--allow-unrelated-histories`: merge two branches with no common ancestor
+    /// using the empty tree as the virtual base (git refuses by default).
+    allow_unrelated_histories: bool,
 }
 
 impl Default for MergeOptions {
@@ -750,6 +753,7 @@ impl Default for MergeOptions {
             no_commit: false,
             quiet: false,
             favor: sley_diff_merge::MergeFavor::None,
+            allow_unrelated_histories: false,
         }
     }
 }
@@ -895,6 +899,8 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--ff-only" => set_merge_fast_forward(options, false, true),
             "--no-commit" => options.no_commit = true,
             "--commit" => options.no_commit = false,
+            "--allow-unrelated-histories" => options.allow_unrelated_histories = true,
+            "--no-allow-unrelated-histories" => options.allow_unrelated_histories = false,
             "-q" | "--quiet" => options.quiet = true,
             "--no-quiet" => options.quiet = false,
             "-m" | "--message" => {
@@ -1191,7 +1197,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     }
 
     // True 3-way merge.
-    if bases.is_empty() {
+    if bases.is_empty() && !options.allow_unrelated_histories {
         eprintln!("fatal: refusing to merge unrelated histories");
         return Err(GitError::Exit(128));
     }
@@ -1208,7 +1214,13 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // (the merge-recursive "virtual ancestor" — git's behaviour for a
     // criss-cross history with >1 merge base). With a single base this is just
     // that base's tree, so the common case is unchanged.
-    let base_map = virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir)?;
+    let base_map = if bases.is_empty() {
+        // `--allow-unrelated-histories`: the two branches share no common
+        // ancestor, so the merge base is the empty tree.
+        MergeTreeMap::new()
+    } else {
+        virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir)?
+    };
 
     let (results, conflicts) = three_way_merge_trees_with_favor(
         &write_db,

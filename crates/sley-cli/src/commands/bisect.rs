@@ -1673,6 +1673,7 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
             sley_rev::SimplifyOptions {
                 full_history: false,
                 first_parent,
+                ..Default::default()
             },
         )?,
         None => candidates.clone(),

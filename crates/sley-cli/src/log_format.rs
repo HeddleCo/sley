@@ -110,7 +110,9 @@ pub(crate) enum FormatToken {
     Encoding,
     NoteName,
     RevisionSource,
-    ColorParen,
+    /// `%C(...)` colour directive carrying the parenthesised spec (e.g.
+    /// `"bold red"`, `"green"`). Rendered to ANSI when colour is enabled.
+    ColorParen(String),
     ColorName(&'static str),
     Body,
     FullMessage,
@@ -245,7 +247,7 @@ impl FormatToken {
                 | FormatToken::Marker
                 | FormatToken::NoteName
                 | FormatToken::RevisionSource
-                | FormatToken::ColorParen
+                | FormatToken::ColorParen(_)
                 | FormatToken::ColorName(_)
                 | FormatToken::Newline
                 | FormatToken::HexByte(_)
@@ -587,11 +589,12 @@ fn parse_color_atom(value: &str) -> Result<(FormatToken, usize)> {
             ));
         };
         // Ported from sley#75: `%C(auto)` resolves to ColorAuto so padding is
-        // still flushed; every other `%C(...)` stays ColorParen.
+        // still flushed; every other `%C(...)` carries its spec for ANSI
+        // rendering when colour is enabled.
         if &value[2..end] == "auto" {
             return Ok((FormatToken::ColorAuto, end + 1));
         }
-        return Ok((FormatToken::ColorParen, end + 1));
+        return Ok((FormatToken::ColorParen(value[2..end].to_string()), end + 1));
     }
     for name in [
         "reset", "normal", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",

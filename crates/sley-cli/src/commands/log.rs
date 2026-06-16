@@ -263,7 +263,7 @@ fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
                     | FormatToken::Subject
                     | FormatToken::SanitizedSubject
                     | FormatToken::NoteName
-                    | FormatToken::ColorParen
+                    | FormatToken::ColorParen(_)
                     | FormatToken::ColorName(_)
                     | FormatToken::Newline
                     | FormatToken::HexByte(_)
@@ -426,9 +426,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 );
             }
             "--full-history" | "--sparse" | "--dense" | "--remove-empty"
-            | "--simplify-merges" | "--show-pulls" | "--reverse" | "--topo-order"
-            | "--date-order" | "--author-date-order" | "--first-parent" | "--no-walk"
-            | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" | "--all"
+            | "--simplify-merges" | "--show-pulls" | "--ancestry-path" | "--reverse"
+            | "--topo-order" | "--date-order" | "--author-date-order" | "--first-parent"
+            | "--no-walk" | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" | "--all"
             | "--branches" | "--tags" | "--remotes" => setup_args.push(arg.clone()),
             "--parents" => show_parents = true,
             "--children" => show_children = true,
@@ -1888,10 +1888,20 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         RevListOrdering::Date => rev_list_date_order(selected)?,
         RevListOrdering::AuthorDate => rev_list_author_date_order(selected)?,
     };
+    // `--ancestry-path`: keep only commits on a path from a `^`-excluded boundary
+    // (bottom) commit up to the tips (git's `limit_to_ancestry`). Runs before
+    // simplification.
+    if revision_options.ancestry_path && !revision_options.negatives.is_empty() {
+        let on_path = sley_rev::ancestry_path_on_set(
+            selected.iter().map(|r| (r.oid, r.parents.clone())),
+            &revision_options.negatives,
+        );
+        selected.retain(|r| on_path.contains(&r.oid));
+    }
     // Pathspec-limited / --full-history simplification (TREESAME prune + parent
     // rewriting). Owned binding outlives `selected` (a Vec of references).
     let simplified_storage;
-    if !pathspecs.is_empty() || full_history {
+    if !pathspecs.is_empty() || full_history || revision_options.simplify_merges {
         let pathspec = sley_rev::Pathspec::parse(
             pathspecs.iter().map(|p| p.as_bytes()),
             sley_rev::PathspecMatchMagic::default(),
@@ -1899,7 +1909,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
-        simplified_storage = sley_rev::simplify_history(
+        // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for
+        // topology-keep decisions even though they aren't shown.
+        let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
+        simplified_storage = sley_rev::simplify_history_with_bottoms(
             &db,
             format,
             ordered_owned,
@@ -1907,7 +1920,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             sley_rev::SimplifyOptions {
                 full_history,
                 first_parent,
+                simplify_merges: revision_options.simplify_merges,
+                show_pulls: revision_options.show_pulls,
+                ancestry_path: revision_options.ancestry_path,
+                // git's `want_ancestry` = `rewrite_parents || children`.
+                // `--ancestry-path` alone does NOT set rewrite_parents, so a bare
+                // `--ancestry-path` still drops TREESAME merges.
+                want_ancestry: show_parents
+                    || show_children
+                    || graph
+                    || revision_options.simplify_merges,
             },
+            &bottoms,
         )?;
         selected = simplified_storage.iter().collect();
     }

@@ -27,6 +27,14 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut object_names = true;
     let mut read_stdin = false;
     let mut header = false;
+    // `--no-commit-header` / `--commit-header`: override whether `--format=` /
+    // `--pretty=format:` prints the `commit <oid>` header line. Applied after the
+    // format is parsed (order-independent).
+    let mut commit_header_override: Option<bool> = None;
+    // `--color` / `--color=always|auto|never`: enable ANSI color atoms (`%Cred`,
+    // `%C(...)`). We are never a tty, so `auto` resolves to off (matching git's
+    // `want_color`).
+    let mut want_color = false;
     let mut pretty = RevListPretty::Default;
     let mut preset_oneline = false;
     let mut author_patterns = Vec::new();
@@ -118,12 +126,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--children" => children = true,
             "--count" => count = true,
             "--no-count" => count = false,
-            "--sparse"
-            | "--dense"
-            | "--remove-empty"
-            | "--simplify-merges"
-            | "--show-pulls"
-            | "--exclude-promisor-objects" => {}
+            // History-simplification flags handled by the sley-rev setup +
+            // `simplify_history`; forward them so they take effect.
+            "--simplify-merges" | "--show-pulls" | "--ancestry-path" => {
+                setup_args.push(arg.clone())
+            }
+            "--sparse" | "--dense" | "--remove-empty" | "--exclude-promisor-objects" => {}
             // No effect on the regular walk yet (pre-existing behaviour); the
             // bitmap path filters packed objects out of its result.
             "--unpacked" => unpacked = true,
@@ -231,6 +239,14 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--no-object-names" => object_names = false,
             "--stdin" => read_stdin = true,
             "--header" => header = true,
+            "--no-commit-header" => commit_header_override = Some(false),
+            "--commit-header" => commit_header_override = Some(true),
+            "--color" => want_color = true,
+            "--no-color" => want_color = false,
+            value if value.starts_with("--color=") => {
+                // `always` forces color; `auto`/`never` are off when not a tty.
+                want_color = value["--color=".len()..].eq_ignore_ascii_case("always");
+            }
             "--oneline" => {
                 preset_oneline = true;
                 abbrev_commit = true;
@@ -581,20 +597,34 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
 
     let mut excluded = HashSet::new();
-    for oid in exclude_tip_oids {
-        for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
+    for oid in &exclude_tip_oids {
+        for record in rev_list_walk_commits(&db, format, [*oid], first_parent)? {
             excluded.insert(record.oid);
         }
+    }
+    // Apply `--no-commit-header` / `--commit-header` to the compiled format
+    // (order-independent override of the per-format default).
+    if let (Some(want_header), RevListPretty::Compiled { commit_header, .. }) =
+        (commit_header_override, &mut pretty)
+    {
+        *commit_header = want_header;
     }
     // Commit-graph fast path: a plain commit listing (no flag that needs the parsed
     // commit object) walks via the commit-graph and reads zero commit objects. Any
     // commit-body-dependent mode falls through to the full walk below. The guard is
     // a strict allowlist — only flags whose handling needs solely oid+parents+time.
     let metadata_format = match &pretty {
-        RevListPretty::Compiled { compiled, .. }
-            if compiled.is_metadata_emitable()
-                && compiled.uses_oid()
-                && !compiled.uses_decorations() =>
+        // The metadata fast-path does not emit the `commit <oid>` header that
+        // `--format=` / `--pretty=format:` require (commit_header: true), so it
+        // only handles header-less formats (`--no-commit-header`). Header formats
+        // fall through to the full Compiled path below, which prints the header
+        // and abbreviates `%h` correctly.
+        RevListPretty::Compiled {
+            compiled,
+            commit_header: false,
+        } if compiled.is_metadata_emitable()
+            && compiled.uses_oid()
+            && !compiled.uses_decorations() =>
         {
             Some(compiled)
         }
@@ -690,7 +720,11 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             return Ok(());
         }
         let mut stdout = io::stdout();
-        let effective_abbrev_len = abbrev_commit.then_some(abbrev_len).flatten();
+        // `%h`/`%t`/`%p` in a format always abbreviate to `abbrev_len` (default
+        // 7), independent of `--abbrev-commit` (which only abbreviates the
+        // `commit <oid>` header). The plain-oid fast path below still gates on
+        // `abbrev_commit`.
+        let effective_abbrev_len = abbrev_len;
         let mut line = metadata_format
             .map(|compiled| Vec::with_capacity(compiled.estimated_line_capacity()));
         for record in &selected {
@@ -711,7 +745,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
-                        color: false,
+                        color: want_color,
                         output_encoding: "UTF-8",
                     },
                     line,
@@ -799,11 +833,21 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             first_parent,
         );
     }
+    // `--ancestry-path`: keep only commits on a path from a `^`-excluded
+    // boundary (bottom) commit up to the tips. Applied before simplification,
+    // matching git's `limit_to_ancestry` (which runs in `limit_list`).
+    if revision_options.ancestry_path && !exclude_tip_oids.is_empty() {
+        let on_path = sley_rev::ancestry_path_on_set(
+            selected.iter().map(|r| (r.oid, r.parents.clone())),
+            &exclude_tip_oids,
+        );
+        selected.retain(|r| on_path.contains(&r.oid));
+    }
     // Pathspec-limited / --full-history simplification: TREESAME-prune the
     // ordered set and rewrite parents past the dropped commits. Held in an
     // owned binding so `selected` (a Vec of references) can borrow from it.
     let simplified_storage;
-    if !pathspecs.is_empty() || full_history {
+    if !pathspecs.is_empty() || full_history || revision_options.simplify_merges {
         let pathspec = sley_rev::Pathspec::parse(
             pathspecs.iter().map(|p| p.as_bytes()),
             sley_rev::PathspecMatchMagic::default(),
@@ -811,7 +855,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
-        simplified_storage = sley_rev::simplify_history(
+        // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for
+        // topology-keep decisions even though they aren't shown.
+        let bottoms: HashSet<ObjectId> = exclude_tip_oids.iter().copied().collect();
+        simplified_storage = sley_rev::simplify_history_with_bottoms(
             &db,
             format,
             ordered_owned,
@@ -819,7 +866,15 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             sley_rev::SimplifyOptions {
                 full_history,
                 first_parent,
+                simplify_merges: revision_options.simplify_merges,
+                show_pulls: revision_options.show_pulls,
+                ancestry_path: revision_options.ancestry_path,
+                // git's `want_ancestry` = `rewrite_parents || children`.
+                // `--ancestry-path` alone does NOT set rewrite_parents, so a bare
+                // `--ancestry-path` still drops TREESAME merges.
+                want_ancestry: parents || children || revision_options.simplify_merges,
             },
+            &bottoms,
         )?;
         selected = simplified_storage.iter().collect();
     }
@@ -980,7 +1035,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
-                        color: false,
+                        color: want_color,
                         output_encoding: "UTF-8",
                     };
                     if children {
@@ -1059,7 +1114,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
-                        color: false,
+                        color: want_color,
                         output_encoding: "UTF-8",
                     },
                 )?;

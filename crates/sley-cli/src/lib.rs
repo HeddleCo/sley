@@ -8131,6 +8131,136 @@ fn format_log_oid(oid: &ObjectId, abbrev_len: Option<usize>) -> String {
     }
 }
 
+/// Resolve a git color name / attribute (as used by `%Cred`, `%C(red)`,
+/// `%C(bold red)`, etc.) to its ANSI escape sequence. Mirrors git's
+/// `color_parse_mem` for the subset of single-word colours and attributes:
+/// `reset`, `normal`, the eight ANSI colours, and the attribute words. Returns
+/// `None` for an unknown name.
+fn git_color_name_to_ansi(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "reset" => "\x1b[m",
+        "normal" => "", // GIT_COLOR_NORMAL is the empty string.
+        "black" => "\x1b[30m",
+        "red" => "\x1b[31m",
+        "green" => "\x1b[32m",
+        "yellow" => "\x1b[33m",
+        "blue" => "\x1b[34m",
+        "magenta" => "\x1b[35m",
+        "cyan" => "\x1b[36m",
+        "white" => "\x1b[37m",
+        "bold" => "\x1b[1m",
+        "dim" => "\x1b[2m",
+        "italic" => "\x1b[3m",
+        "ul" => "\x1b[4m",
+        "blink" => "\x1b[5m",
+        "reverse" => "\x1b[7m",
+        "strike" => "\x1b[9m",
+        _ => return None,
+    })
+}
+
+/// Resolve a multi-word `%C(...)` colour spec (e.g. `bold red`, `auto,green`,
+/// `red yellow bold`) to an ANSI escape, mirroring git's `color_parse_mem`. The
+/// grammar is `[reset] [fg [bg]] [attr]...` and the emitted SGR sequence is
+/// ordered **attributes (numeric order), then foreground, then background** —
+/// matching git's `color_parse_mem_1`. A leading `auto` qualifier only emits
+/// when `color` is on; `always` forces it; `never` suppresses it. Returns an
+/// empty string when nothing applies.
+fn git_color_spec_to_ansi(spec: &str, color: bool) -> String {
+    let normalized = spec.replace(',', " ");
+    let mut words: Vec<&str> = normalized.split_whitespace().collect();
+    let mut effective_color = color;
+    if let Some(first) = words.first() {
+        match *first {
+            "auto" => {
+                words.remove(0);
+            }
+            "always" => {
+                effective_color = true;
+                words.remove(0);
+            }
+            "never" => return String::new(),
+            _ => {}
+        }
+    }
+    if !effective_color {
+        return String::new();
+    }
+
+    let mut has_reset = false;
+    let mut attr_bits: u32 = 0;
+    let mut fg: Option<u8> = None;
+    let mut bg: Option<u8> = None;
+    for word in words {
+        if word == "reset" {
+            has_reset = true;
+            continue;
+        }
+        if let Some(ansi) = git_ansi_color_value(word) {
+            // `[fg [bg]]`: first colour is fg, second is bg.
+            if fg.is_none() {
+                fg = Some(ansi);
+            } else if bg.is_none() {
+                bg = Some(ansi);
+            }
+            continue;
+        }
+        if let Some(bit) = git_attr_bit(word) {
+            attr_bits |= 1 << bit;
+        }
+    }
+
+    if !has_reset && attr_bits == 0 && fg.is_none() && bg.is_none() {
+        return String::new();
+    }
+    let mut codes: Vec<String> = Vec::new();
+    // Attributes in ascending numeric (bit) order.
+    for bit in 0..32u32 {
+        if attr_bits & (1 << bit) != 0 {
+            codes.push(bit.to_string());
+        }
+    }
+    if let Some(v) = fg {
+        codes.push((30 + v).to_string());
+    }
+    if let Some(v) = bg {
+        codes.push((40 + v).to_string());
+    }
+    format!("\x1b[{}m", codes.join(";"))
+}
+
+/// The ANSI offset (0-7, or 9 for `default`) of a basic colour word, or `None`
+/// if the word is not a colour.
+fn git_ansi_color_value(word: &str) -> Option<u8> {
+    Some(match word {
+        "black" => 0,
+        "red" => 1,
+        "green" => 2,
+        "yellow" => 3,
+        "blue" => 4,
+        "magenta" => 5,
+        "cyan" => 6,
+        "white" => 7,
+        "default" => 9,
+        _ => return None,
+    })
+}
+
+/// The SGR code (bit position) of an attribute word, mirroring git's
+/// `parse_attr`, or `None` if the word is not an attribute.
+fn git_attr_bit(word: &str) -> Option<u32> {
+    Some(match word {
+        "bold" => 1,
+        "dim" => 2,
+        "italic" => 3,
+        "ul" => 4,
+        "blink" => 5,
+        "reverse" => 7,
+        "strike" => 9,
+        _ => return None,
+    })
+}
+
 fn append_log_oid(out: &mut Vec<u8>, oid: &ObjectId, abbrev_len: Option<usize>) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let width = abbrev_len
@@ -8380,7 +8510,7 @@ impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_,
     fn is_modifier_atom(&self, atom: &FormatToken) -> bool {
         matches!(
             atom,
-            FormatToken::ColorParen | FormatToken::ColorName(_) | FormatToken::ColorAuto
+            FormatToken::ColorParen(_) | FormatToken::ColorName(_) | FormatToken::ColorAuto
         )
     }
 }
@@ -8466,7 +8596,17 @@ fn emit_log_one_token(
                 }
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
-            FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::ColorName(name) => {
+                if color
+                    && let Some(ansi) = git_color_name_to_ansi(name)
+                {
+                    out.extend_from_slice(ansi.as_bytes());
+                }
+            }
+            FormatToken::ColorParen(spec) => {
+                let ansi = git_color_spec_to_ansi(spec, color);
+                out.extend_from_slice(ansi.as_bytes());
+            }
             FormatToken::Body => out.extend_from_slice(commit_body(message)),
             FormatToken::FullMessage => out.extend_from_slice(message),
             FormatToken::DecorationsParen => {
@@ -9007,6 +9147,7 @@ fn emit_compiled_log_format_metadata_inner(
         marker,
         dialect,
         source,
+        color,
         ..
     } = *context;
 
@@ -9029,7 +9170,16 @@ fn emit_compiled_log_format_metadata_inner(
                 }
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
-            FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::ColorName(name) => {
+                if color
+                    && let Some(ansi) = git_color_name_to_ansi(name)
+                {
+                    out.extend_from_slice(ansi.as_bytes());
+                }
+            }
+            FormatToken::ColorParen(spec) => {
+                out.extend_from_slice(git_color_spec_to_ansi(spec, color).as_bytes());
+            }
             FormatToken::Subject if let Some(message) = message => {
                 out.extend_from_slice(commit_subject_bytes(message));
             }
@@ -9167,7 +9317,7 @@ pub(crate) fn emit_compiled_stash_format(
             }
             FormatToken::NoteName => {}
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
-            FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::ColorParen(_) | FormatToken::ColorName(_) => {}
             FormatToken::Body => out.extend_from_slice(commit_body(&commit.message)),
             FormatToken::FullMessage => out.extend_from_slice(&commit.message),
             FormatToken::StashDecoParen if index == 0 => {

@@ -2612,6 +2612,7 @@ fn select_commits(
             sley_rev::SimplifyOptions {
                 full_history: false,
                 first_parent: false,
+                ..Default::default()
             },
         )?;
     }
