@@ -2292,6 +2292,18 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("you need to specify a tag name".into()))?;
                 refspecs.push(format!("refs/tags/{name}:refs/tags/{name}"));
             }
+            // `OPT_IPVERSION` in builtin/fetch.c: accepted but a no-op for the
+            // file:// transport; the `--no-` forms are undefined in git and so
+            // fall through to the unknown-option path below.
+            "-4" | "--ipv4" | "-6" | "--ipv6" => {}
+            // An unrecognized dash-option is a usage error (git's parse-options
+            // emits `error: unknown option …` and exits 129), not a remote name.
+            // `-` alone is git's stdin marker and is left to the positional path.
+            value if value.starts_with('-') && value != "-" => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                eprintln!("usage: git fetch [<options>] [<repository> [<refspec>...]]");
+                return Err(GitError::Exit(129));
+            }
             _ if source.is_none() => source = Some(arg.clone()),
             _ => refspecs.push(arg.clone()),
         }
@@ -2534,14 +2546,18 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                     || value.starts_with("--receive-pack=")
                     || value.starts_with("--exec=") => {}
             "--porcelain" | "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
+            // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
+            // file:// transport (the `--no-` forms are not defined and fall
+            // through to the unknown-option path, matching git).
+            "-4" | "--ipv4" | "-6" | "--ipv6" => {}
             "--" => {
                 positional.extend(iter.map(|value| value.to_string()));
                 break;
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported push option {value}"
-                )));
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                eprintln!("usage: git push [<options>] [<repository> [<refspec>...]]");
+                return Err(GitError::Exit(129));
             }
             value => positional.push(value.to_string()),
         }
