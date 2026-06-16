@@ -155,6 +155,13 @@ pub(crate) enum MergePathResult {
         ours: Option<(u32, ObjectId)>,
         theirs: Option<(u32, ObjectId)>,
         worktree: Option<(u32, Vec<u8>)>,
+        /// The conflict classification, so the porcelain renders the correct
+        /// `CONFLICT (…)` message line (content / modify-delete / rename-delete /
+        /// file-directory) instead of always claiming a content conflict.
+        kind: Option<sley_diff_merge::MergeConflictKind>,
+        /// True when a textual 3-way content merge ran for this path; drives the
+        /// `Auto-merging <path>` info line (git emits it only for content merges).
+        auto_merged: bool,
     },
 }
 
@@ -384,6 +391,8 @@ fn three_way_merge_trees_inner(
                     ours: entry.stages.ours,
                     theirs: entry.stages.theirs,
                     worktree: entry.worktree,
+                    kind: entry.conflict,
+                    auto_merged: entry.auto_merged,
                 },
             );
         } else {
@@ -1788,15 +1797,66 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
-    for path in &conflicts {
-        println!("Auto-merging {}", String::from_utf8_lossy(path));
-        println!(
-            "CONFLICT (content): Merge conflict in {}",
-            String::from_utf8_lossy(path)
-        );
-    }
+    print_merge_conflict_messages(&results);
     eprintln!("Automatic merge failed; fix conflicts and then commit the result.");
     Err(GitError::Exit(1))
+}
+
+/// Emit git's per-path merge conflict notices, in path order, from the reshaped
+/// merge results. Mirrors merge-ort's `path_msg` set: an `Auto-merging <path>`
+/// info line precedes the `CONFLICT (…)` line for any path that went through a
+/// textual 3-way merge, and each conflict kind renders its own message. The
+/// `results` map is keyed by path so iteration is already sorted like git's
+/// message ordering.
+fn print_merge_conflict_messages(results: &MergePathResults) {
+    for (path, result) in results {
+        let MergePathResult::Conflict { kind, auto_merged, .. } = result else {
+            continue;
+        };
+        let path_str = String::from_utf8_lossy(path);
+        if *auto_merged {
+            println!("Auto-merging {path_str}");
+        }
+        match kind {
+            Some(sley_diff_merge::MergeConflictKind::Content { add_add }) => {
+                let reason = if *add_add { "add/add" } else { "content" };
+                println!("CONFLICT ({reason}): Merge conflict in {path_str}");
+            }
+            Some(sley_diff_merge::MergeConflictKind::RenameContent { .. }) => {
+                println!("CONFLICT (content): Merge conflict in {path_str}");
+            }
+            Some(sley_diff_merge::MergeConflictKind::ModifyDelete {
+                deleted_in,
+                modified_in,
+            }) => {
+                println!(
+                    "CONFLICT (modify/delete): {path_str} deleted in {deleted_in} and modified in {modified_in}.  Version {modified_in} of {path_str} left in tree."
+                );
+            }
+            Some(sley_diff_merge::MergeConflictKind::RenameDelete {
+                old_path,
+                renamed_in,
+                deleted_in,
+            }) => {
+                println!(
+                    "CONFLICT (rename/delete): {} renamed to {path_str} in {renamed_in}, but deleted in {deleted_in}.",
+                    String::from_utf8_lossy(old_path)
+                );
+            }
+            Some(sley_diff_merge::MergeConflictKind::FileDirectory {
+                original_path,
+                moved_from,
+            }) => {
+                println!(
+                    "CONFLICT (file/directory): directory in the way of {} from {moved_from}; moving it to {path_str} instead.",
+                    String::from_utf8_lossy(original_path)
+                );
+            }
+            None => {
+                println!("CONFLICT (content): Merge conflict in {path_str}");
+            }
+        }
+    }
 }
 
 // ===== pull / rebase / merge-continue =====

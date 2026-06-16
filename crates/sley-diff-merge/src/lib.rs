@@ -4841,6 +4841,17 @@ pub enum MergeConflictKind {
         /// The side label that deleted the source.
         deleted_in: String,
     },
+    /// A file collides with a directory at the same path in the merged result:
+    /// the directory wins at the original path and the file is moved aside to
+    /// `path~<branch>` (merge-ort's D/F conflict, `unique_path`). git emits
+    /// `CONFLICT (file/directory): directory in the way of <old> from <branch>;
+    /// moving it to <new> instead.`
+    FileDirectory {
+        /// The original (pre-move) path now occupied by the directory.
+        original_path: Vec<u8>,
+        /// The side label whose file was moved aside.
+        moved_from: String,
+    },
 }
 
 /// One resolved/conflicted path in the merged tree.
@@ -5270,9 +5281,160 @@ pub fn merge_entry_maps(
         }
     }
 
+    // Directory/file (D/F) conflict resolution (merge-ort `process_entry`): a
+    // path that ends up as a *file* in the merged result while another result
+    // path lives *under* it (so the path is simultaneously a directory) cannot
+    // coexist. git keeps the directory at the original path and moves the file
+    // aside to `path~<branch>` via `unique_path`, where `<branch>` is the side
+    // that contributed the file. We resolve this on the flattened `leaves` after
+    // every per-path decision is made, so renames/dir-renames have settled first.
+    resolve_directory_file_conflicts(
+        &mut paths,
+        &mut leaves,
+        &mut clean,
+        &eff_ours,
+        &eff_theirs,
+        options,
+    );
+
     let tree = write_merged_tree(db, &leaves)?;
 
     Ok(MergeTreesResult { tree, paths, clean })
+}
+
+/// Flatten a branch label the way git's `add_flattened_path` does for
+/// `unique_path`: any `/` in the branch name becomes `_` so the synthesized
+/// `path~branch` stays a single path component family.
+fn flatten_branch_label(branch: &str) -> String {
+    branch.replace('/', "_")
+}
+
+/// Pick a `path~<branch>` name not already present in `leaves` (or claimed by an
+/// existing `paths` entry), mirroring merge-ort's `unique_path`: start from
+/// `path~branch`, then append `_0`, `_1`, … on collision.
+fn unique_df_path(
+    path: &[u8],
+    branch: &str,
+    leaves: &MergeEntryMap,
+    paths: &[MergedPath],
+) -> Vec<u8> {
+    let mut base = path.to_vec();
+    base.push(b'~');
+    base.extend_from_slice(flatten_branch_label(branch).as_bytes());
+    let taken = |candidate: &[u8]| {
+        leaves.contains_key(candidate) || paths.iter().any(|p| p.path == candidate)
+    };
+    if !taken(&base) {
+        return base;
+    }
+    let mut suffix = 0usize;
+    loop {
+        let mut candidate = base.clone();
+        candidate.push(b'_');
+        candidate.extend_from_slice(suffix.to_string().as_bytes());
+        if !taken(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// Resolve directory/file collisions in the merged leaf set. For every file leaf
+/// whose path is also a directory (some other leaf lives under `path/`), move the
+/// file to `path~<branch>` and record a [`MergeConflictKind::FileDirectory`].
+fn resolve_directory_file_conflicts(
+    paths: &mut Vec<MergedPath>,
+    leaves: &mut MergeEntryMap,
+    clean: &mut bool,
+    eff_ours: &MergeEntryMap,
+    eff_theirs: &MergeEntryMap,
+    options: &MergeTreesOptions<'_>,
+) {
+    // A path is a "directory" in the result iff some leaf key has it as a strict
+    // `path/` prefix. Collect every such directory prefix once.
+    let mut directory_prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for key in leaves.keys() {
+        let mut idx = 0;
+        while let Some(pos) = key[idx..].iter().position(|b| *b == b'/') {
+            let end = idx + pos;
+            directory_prefixes.insert(key[..end].to_vec());
+            idx = end + 1;
+        }
+    }
+    if directory_prefixes.is_empty() {
+        return;
+    }
+
+    // File leaves that collide with a directory of the same name.
+    let colliding: Vec<Vec<u8>> = leaves
+        .keys()
+        .filter(|key| directory_prefixes.contains(*key))
+        .cloned()
+        .collect();
+
+    for original in colliding {
+        let Some(entry) = leaves.remove(&original) else {
+            continue;
+        };
+        // Which side contributed the file? git keys off `dirmask`: the file lives
+        // on the side that is NOT the directory. We read it off the effective side
+        // maps — whichever side has this path as a plain file. When only theirs has
+        // it, use the theirs label; otherwise (ours has it, or both do) ours wins,
+        // matching git's index-1 bias for the moved-aside name.
+        let ours_has_file = eff_ours.contains_key(&original);
+        let theirs_has_file = eff_theirs.contains_key(&original);
+        let from_ours = ours_has_file || !theirs_has_file;
+        let branch = if from_ours {
+            options.ours_label
+        } else {
+            options.theirs_label
+        };
+        let new_path = unique_df_path(&original, branch, leaves, paths);
+        leaves.insert(new_path.clone(), entry);
+        *clean = false;
+
+        // Relocate the path's MergedPath: update its destination and stamp the D/F
+        // conflict. If the path had no MergedPath (defensive), synthesize one.
+        if let Some(slot) = paths.iter_mut().find(|p| p.path == original) {
+            slot.path = new_path.clone();
+            slot.result = Some(entry);
+            // Preserve any pre-existing higher-order stages; a clean file leaf has
+            // none, so seed ours/theirs from the effective maps for `ls-files -u`.
+            if slot.conflict.is_none() {
+                slot.stages = MergeStages {
+                    base: None,
+                    ours: if from_ours { Some(entry) } else { None },
+                    theirs: if from_ours { None } else { Some(entry) },
+                };
+            }
+            // git runs the moved-aside file through handle_content_merge, so it
+            // emits `Auto-merging <new_path>` even for a one-sided clean file.
+            slot.auto_merged = true;
+            slot.conflict = Some(MergeConflictKind::FileDirectory {
+                original_path: original.clone(),
+                moved_from: branch.to_string(),
+            });
+        } else {
+            paths.push(MergedPath {
+                path: new_path.clone(),
+                stages: MergeStages {
+                    base: None,
+                    ours: if from_ours { Some(entry) } else { None },
+                    theirs: if from_ours { None } else { Some(entry) },
+                },
+                result: Some(entry),
+                worktree: None,
+                conflict: Some(MergeConflictKind::FileDirectory {
+                    original_path: original.clone(),
+                    moved_from: branch.to_string(),
+                }),
+                auto_merged: true,
+            });
+        }
+    }
+
+    // Keep `paths` sorted by destination path (callers and tests assume order).
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
 }
 
 /// Construct a clean (non-conflicted) [`MergedPath`].

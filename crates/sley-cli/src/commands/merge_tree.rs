@@ -514,6 +514,20 @@ fn render_merge_outcome(
                     ),
                 });
             }
+            sley_diff_merge::MergeConflictKind::FileDirectory {
+                original_path,
+                moved_from,
+            } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![original_path.clone(), path.clone()],
+                    stable_type: "CONFLICT (file/directory)".to_string(),
+                    message: format!(
+                        "CONFLICT (file/directory): directory in the way of {old} from {moved_from}; moving it to {new} instead.",
+                        old = String::from_utf8_lossy(original_path),
+                        new = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
         }
         push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }
