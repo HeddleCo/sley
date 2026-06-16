@@ -91,6 +91,14 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     // `--strict` / `--fsck-objects`: fsck every object the pack carries and
     // report content findings, mirroring index-pack.c's fsck_finish pass.
     if options.fsck {
+        // A reference to an object not present in the pack queues a connectivity
+        // check that must be resolved against the surrounding object store; git
+        // refuses to run those queued checks with no repository. A self-contained
+        // pack (every link resolvable in-pack) fscks fine outside a repo.
+        if repo.is_none() && pack_has_unresolved_link(&pack, format)? {
+            eprintln!("fatal: cannot perform queued object checks outside of a repository");
+            return Err(GitError::Exit(128));
+        }
         let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
         if exit != 0 {
             return Err(GitError::Exit(exit));
@@ -219,6 +227,51 @@ fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Resu
     }
     options.pack_file = Some(PathBuf::from(value));
     Ok(())
+}
+
+/// True when some object in the pack references an object that is not itself in
+/// the pack (a dangling tree/commit/tag link). git queues such links for a
+/// connectivity check that can only run against a repository's object store, so
+/// `index-pack --fsck-objects` fails outside a repo when this returns true.
+fn pack_has_unresolved_link(pack_bytes: &[u8], format: ObjectFormat) -> Result<bool> {
+    let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
+        Ok(pack) => pack,
+        Err(_) => return Ok(false),
+    };
+    let present: HashSet<ObjectId> = pack.entries.iter().map(|object| object.entry.oid).collect();
+    for object in &pack.entries {
+        let body = &object.object.body;
+        match object.object.object_type {
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, body).flatten() {
+                    if !entry.is_gitlink() && !present.contains(&entry.oid) {
+                        return Ok(true);
+                    }
+                }
+            }
+            ObjectType::Commit => {
+                if let Ok(commit) = Commit::parse_ref(format, body) {
+                    if !present.contains(&commit.tree) {
+                        return Ok(true);
+                    }
+                    for parent in &commit.parents {
+                        if !present.contains(parent) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                if let Ok(tag) = Tag::parse_ref(format, body)
+                    && !present.contains(&tag.object)
+                {
+                    return Ok(true);
+                }
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    Ok(false)
 }
 
 /// fsck every object carried by `pack_bytes`, printing content findings in
