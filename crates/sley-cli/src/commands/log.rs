@@ -1261,15 +1261,25 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_format_explicit = true;
             }
             "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
-            // `-c`/`--cc` select combined merge output and imply a patch
-            // (git's `merges_imply_patch`).
+            // `-c`/`--cc` select combined merge output and imply a *global*
+            // patch (git's `merges_imply_patch` sets `output_format=PATCH`, so
+            // non-merge commits get an ordinary patch too).
             "-c" => {
                 diff_opts.merges = Some(LogDiffMerges::Combined { dense: false });
                 diff_opts.merges_imply_patch = true;
+                diff_opts.patch = true;
             }
             "--cc" => {
                 diff_opts.merges = Some(LogDiffMerges::Combined { dense: true });
                 diff_opts.merges_imply_patch = true;
+                diff_opts.patch = true;
+            }
+            // `--dd` is first-parent merges that also imply a global patch
+            // (git's `set_first_parent` + `merges_imply_patch`).
+            "--dd" => {
+                diff_opts.merges = Some(LogDiffMerges::FirstParent);
+                diff_opts.merges_imply_patch = true;
+                diff_opts.patch = true;
             }
             "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
@@ -1331,6 +1341,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    // `log.diffMerges` provides the default merge-diff mode and is validated
+    // unconditionally at startup (git rejects a wrong value with exit 128 even
+    // for a plain `git log` with no diff output).
+    let config_diff_merges = match config.get("log", None, "diffMerges") {
+        Some(value) => Some(log_parse_diff_merges_config(&value)?),
+        None => None,
+    };
+    if diff_opts.merges.is_none() {
+        diff_opts.merges = config_diff_merges;
+    }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let output_encoding = log_output_encoding(&config);
     let cwd = env::current_dir()?;
@@ -3194,6 +3214,22 @@ fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
         ))),
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// Parse a `log.diffMerges` config value into a [`LogDiffMerges`] default.
+/// git's `diff_merges_config` rejects an unknown value, which `git log`
+/// surfaces as a fatal config error (exit 128).
+fn log_parse_diff_merges_config(value: &str) -> Result<LogDiffMerges> {
+    match value {
+        "off" | "none" => Ok(LogDiffMerges::Off),
+        "first-parent" | "1" | "on" | "separate" | "m" => Ok(LogDiffMerges::FirstParent),
+        "combined" | "c" => Ok(LogDiffMerges::Combined { dense: false }),
+        "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
+        _ => {
+            eprintln!("fatal: bad config variable 'log.diffMerges'");
             Err(GitError::Exit(128))
         }
     }
