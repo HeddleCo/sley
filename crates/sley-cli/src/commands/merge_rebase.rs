@@ -829,6 +829,69 @@ fn merge_octopus(
     Ok(())
 }
 
+/// Build and write `.git/SQUASH_MSG` for a `--squash` merge of `other` onto
+/// `head`, mirroring git's `squash_message` (builtin/merge.c): the literal
+/// header `Squashed commit of the following:` then, for each commit reachable
+/// from `other` but not `head` (newest first by commit date), a blank line,
+/// `commit <full-oid>`, and the commit rendered in `git log` MEDIUM format.
+fn write_squash_message(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    head: &ObjectId,
+    other: &ObjectId,
+) -> Result<()> {
+    // Mark HEAD's ancestors uninteresting, then collect `other`'s ancestors that
+    // are not among them (the `^HEAD other` range).
+    let uninteresting = ancestor_depths(db, format, head)?;
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending = VecDeque::from([other.clone()]);
+    while let Some(oid) = pending.pop_front() {
+        if uninteresting.contains_key(&oid) || !seen.insert(oid.clone()) {
+            continue;
+        }
+        let record = read_rev_list_commit_record(db, format, oid.clone())?;
+        for parent in &record.parents {
+            if !uninteresting.contains_key(parent) {
+                pending.push_back(parent.clone());
+            }
+        }
+        records.push(record);
+    }
+    // `git log` default order is reverse-chronological by commit date; ties keep
+    // a stable order (children before parents, which the collection preserves).
+    records.sort_by(|left, right| {
+        let left_time = commit_identity_timestamp_i64(&left.commit.committer).unwrap_or(0);
+        let right_time = commit_identity_timestamp_i64(&right.commit.committer).unwrap_or(0);
+        right_time.cmp(&left_time)
+    });
+
+    let mut out = String::from("Squashed commit of the following:\n");
+    for record in &records {
+        out.push('\n');
+        out.push_str(&format!("commit {}\n", record.oid));
+        out.push_str(&format!(
+            "Author: {}\n",
+            commit_author_identity(&record.commit.author)
+        ));
+        out.push_str(&format!(
+            "Date:   {}\n",
+            commit_identity_date(&record.commit.author, &DateMode::Default)
+        ));
+        out.push('\n');
+        for line in String::from_utf8_lossy(&record.commit.message).lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
+    fs::write(git_dir.join("SQUASH_MSG"), out)?;
+    Ok(())
+}
+
 /// The default merge commit subject for a single-parent merge of `target`,
 /// mirroring git's `merge_name` + `fmt_merge_msg`: dwim the target to a ref and
 /// pick `Merge tag '<n>'` / `Merge branch '<n>'` / `Merge remote-tracking branch
@@ -880,6 +943,10 @@ struct MergeOptions {
     /// `NO_FAST_FORWARD | NO_TRIVIAL`). Other strategies (`recursive`/`ort`)
     /// use the 3-way engine and leave this `false`.
     ours_strategy: bool,
+    /// `--squash`: stage the merged result and write `.git/SQUASH_MSG`, but do
+    /// NOT create a merge commit or advance HEAD (git's `squash`). Implies
+    /// `--no-commit`-like behaviour and is incompatible with `--commit`.
+    squash: bool,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -904,6 +971,7 @@ impl Default for MergeOptions {
             allow_unrelated_histories: false,
             diffstat: None,
             ours_strategy: false,
+            squash: false,
         }
     }
 }
@@ -1048,6 +1116,9 @@ fn set_merge_fast_forward(options: &mut MergeOptions, no_ff: bool, ff_only: bool
 
 fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<ParsedMergeArgs> {
     let mut parsed = ParsedMergeArgs::default();
+    // Track an explicit `--commit` so `--squash --commit` can be rejected (git
+    // dies only when option_commit was positively set, builtin/merge.c).
+    let mut explicit_commit = false;
     let mut iter = args.iter();
     while let Some(token) = iter.next() {
         match token.as_str() {
@@ -1057,7 +1128,14 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--ff" => set_merge_fast_forward(options, false, false),
             "--ff-only" => set_merge_fast_forward(options, false, true),
             "--no-commit" => options.no_commit = true,
-            "--commit" => options.no_commit = false,
+            "--commit" => {
+                options.no_commit = false;
+                explicit_commit = true;
+            }
+            // `--squash` records the merge result without creating a commit and
+            // writes SQUASH_MSG; it silently implies no-commit (builtin/merge.c).
+            "--squash" => options.squash = true,
+            "--no-squash" => options.squash = false,
             // git merge's `show_diffstat` flags (builtin/merge.c): `-n`/
             // `--no-stat` suppress it, `--stat`/`--summary` force the full
             // diffstat + summary block, `--compact-summary` folds the summary
@@ -1124,6 +1202,15 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
                 parsed.positional.push(value.to_string());
             }
         }
+    }
+    // `--squash` silently disables committing, but conflicts with an explicit
+    // `--commit` (git emits the literal `--commit.` token, trailing dot included).
+    if options.squash {
+        if explicit_commit {
+            eprintln!("fatal: options '--squash' and '--commit.' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
+        options.no_commit = true;
     }
     Ok(parsed)
 }
@@ -1306,7 +1393,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // Already up to date: other is reachable from HEAD.
     if other_oid == head_oid || bases.iter().any(|base| base == &other_oid) {
         if !options.quiet {
-            println!("Already up to date.");
+            // git appends "(nothing to squash)" under --squash.
+            if options.squash {
+                println!("Already up to date. (nothing to squash)");
+            } else {
+                println!("Already up to date.");
+            }
         }
         return Ok(());
     }
@@ -1365,6 +1457,44 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
 
     // Fast-forward: HEAD is an ancestor of other.
     let can_fast_forward = bases.iter().any(|base| base == &head_oid);
+
+    // `--squash` over a fast-forwardable history: bring the index/worktree up to
+    // `other` and write SQUASH_MSG, but DO NOT move HEAD. git still prints the
+    // `Updating <a>..<b>` / `Fast-forward` lines before the squash notice.
+    if can_fast_forward && options.squash {
+        let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+        let other_tree = commit_tree_oid(&db, format, &other_oid)?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &worktree_root,
+            &git_dir,
+            format,
+            &other_oid,
+        )?;
+        write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
+        if !options.quiet {
+            let mut stdout = io::stdout();
+            writeln!(
+                stdout,
+                "Updating {}..{}",
+                format_log_abbrev_oid(&head_oid),
+                format_log_abbrev_oid(&other_oid)
+            )?;
+            writeln!(stdout, "Fast-forward")?;
+            writeln!(stdout, "Squash commit -- not updating HEAD")?;
+            write_merge_result_diffstat(
+                &mut stdout,
+                &db,
+                format,
+                &head_tree,
+                &other_tree,
+                merge_diffstat_mode(&options),
+            )?;
+            stdout.flush()?;
+        }
+        commands::hooks::run_hook_l("post-merge", &["1"])?;
+        return Ok(());
+    }
+
     if can_fast_forward && !options.no_ff {
         // Record the pre-merge HEAD in ORIG_HEAD before moving HEAD, exactly as
         // git does for every merge/pull including fast-forwards — so that
@@ -1476,9 +1606,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         )?;
         let merged_tree = sley_worktree::write_tree_from_index(&git_dir, format)?;
 
-        if options.no_commit {
-            fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-            fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+        // Materialize the merged result into the worktree (shared by the
+        // --squash and --no-commit early-exit paths below).
+        let write_merged_worktree = || -> Result<()> {
             for (path, result) in &results {
                 if let MergePathResult::Resolved(value) = result {
                     match value {
@@ -1490,6 +1620,27 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        };
+
+        // `--squash`: leave the merged result staged + in the worktree and write
+        // SQUASH_MSG, but record NO in-progress merge (no MERGE_HEAD) and do not
+        // move HEAD. git prints the clean-merge notice then the squash line.
+        if options.squash {
+            write_merged_worktree()?;
+            write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
+            if !options.quiet {
+                println!("Automatic merge went well; stopped before committing as requested");
+                println!("Squash commit -- not updating HEAD");
+            }
+            commands::hooks::run_hook_l("post-merge", &["1"])?;
+            return Ok(());
+        }
+
+        if options.no_commit {
+            fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
+            fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            write_merged_worktree()?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
