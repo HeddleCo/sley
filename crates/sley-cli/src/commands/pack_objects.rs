@@ -155,15 +155,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             "--no-all-progress" | "--no-all-progress-implied" if !saw_dashdash => {}
             value if !saw_dashdash && value.starts_with("--index-version=") => {
                 let spec = &value["--index-version=".len()..];
-                // Format is "<version>" or "<version>,<offset-threshold>".
-                let version_part = spec.split(',').next().unwrap_or(spec);
-                let version: u32 = version_part.parse().map_err(|_| {
-                    GitError::Command(format!("bad index version '{spec}'"))
-                })?;
-                if version != 1 && version != 2 {
-                    return Err(GitError::Command(format!("bad index version '{spec}'")));
-                }
-                options.index_version = Some(version);
+                options.index_version = Some(parse_index_version_spec(spec)?);
             }
             value if !saw_dashdash && value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
@@ -1059,6 +1051,54 @@ fn pack_objects_usage<T>() -> Result<T> {
     eprintln!("usage: git pack-objects --stdout [<options>] [< <ref-list> | < <object-list>]");
     eprintln!("   or: git pack-objects [<options>] <base-name> [< <ref-list> | < <object-list>]");
     Err(GitError::Exit(129))
+}
+
+/// Parse a `--index-version=<version>[,<offset>]` spec the way
+/// builtin/pack-objects.c `option_parse_index_version` does with `strtoul`: the
+/// leading digits are the version, an optional `,<offset>` follows, and any
+/// leftover characters (including a bare trailing `,` with nothing after it)
+/// are rejected with git's `bad index version` message.
+fn parse_index_version_spec(spec: &str) -> Result<u32> {
+    let bytes = spec.as_bytes();
+    let digits_end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
+    let version: u32 = spec[..digits_end].parse().map_err(|_| {
+        eprintln!("fatal: bad index version '{spec}'");
+        GitError::Exit(128)
+    })?;
+    if version > 2 {
+        eprintln!("fatal: unsupported index version {spec}");
+        return Err(GitError::Exit(128));
+    }
+    let mut rest = &spec[digits_end..];
+    // `if (*c == ',' && c[1])` — only consume the offset when the comma is
+    // followed by at least one character. A bare trailing `,` is NOT consumed,
+    // so it survives into the leftover check below and is rejected.
+    if let Some(after_comma) = rest.strip_prefix(',')
+        && !after_comma.is_empty()
+    {
+        // strtoul base 0: consume an optional 0x/0X prefix then alphanumeric
+        // digits. The offset value itself is derived from the offsets by sley's
+        // writer, so we only need to consume the token and reject trailing junk.
+        let offset_token = after_comma.strip_prefix("0x").or_else(|| after_comma.strip_prefix("0X"));
+        let body = offset_token.unwrap_or(after_comma);
+        let off_end = body
+            .bytes()
+            .position(|byte| !byte.is_ascii_hexdigit())
+            .unwrap_or(body.len());
+        rest = &body[off_end..];
+    }
+    if !rest.is_empty() {
+        eprintln!("fatal: bad index version '{spec}'");
+        return Err(GitError::Exit(128));
+    }
+    if version != 1 && version != 2 {
+        eprintln!("fatal: bad index version '{spec}'");
+        return Err(GitError::Exit(128));
+    }
+    Ok(version)
 }
 
 /// `git pack-objects --cruft [--cruft-expiration=<time>]`.
