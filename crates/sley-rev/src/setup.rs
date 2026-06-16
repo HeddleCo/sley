@@ -756,6 +756,17 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
             GitError::Exit(128)
         });
     }
+    // A bare all-digit number with at least 9 digits is seconds-since-epoch
+    // (date.c match_digit: `num >= 100000000 && nodate(tm)` → gmtime). Fewer
+    // digits stay ambiguous with YYYYMMDD/HHMMSS and fall through to the
+    // date+time parse below.
+    if value.split_whitespace().nth(1).is_none()
+        && first.len() >= 9
+        && first.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(timestamp) = first.parse::<i64>()
+    {
+        return Ok(timestamp);
+    }
     let (date, time, embedded_tz) = if let Some((date, rest)) = first.split_once('T') {
         let (time, tz) = split_embedded_timezone(rest);
         (date, time, tz)

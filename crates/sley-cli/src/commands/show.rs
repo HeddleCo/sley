@@ -810,6 +810,7 @@ fn write_commit_diff_patch(
                 diff_algorithm: options.diff_algorithm,
                 ignore_blank_lines: options.ignore_blank_lines,
                 ignore_regexes: &options.ignore_regexes,
+                line_ranges: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

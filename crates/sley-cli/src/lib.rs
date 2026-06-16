@@ -2135,45 +2135,48 @@ fn diff_raw_oid(
 
 #[derive(Clone, Copy)]
 pub(crate) struct DiffPatchOptions<'a> {
-    db: &'a FileObjectDatabase,
-    worktree_root: Option<&'a Path>,
-    use_worktree_new: bool,
-    format: ObjectFormat,
-    abbrev: usize,
-    src_prefix: &'a str,
-    dst_prefix: &'a str,
+    pub(crate) db: &'a FileObjectDatabase,
+    pub(crate) worktree_root: Option<&'a Path>,
+    pub(crate) use_worktree_new: bool,
+    pub(crate) format: ObjectFormat,
+    pub(crate) abbrev: usize,
+    pub(crate) src_prefix: &'a str,
+    pub(crate) dst_prefix: &'a str,
     /// Lines of hunk context (`-U<n>`); the porcelain default is 3.
-    context: usize,
+    pub(crate) context: usize,
     /// Userdiff driver resolution (`diff=<driver>` attributes + config);
     /// `None` keeps the default funcname heuristic.
-    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
+    pub(crate) userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
     /// ANSI palette when color output is enabled.
-    colors: Option<&'a commands::diff_words::DiffColors>,
+    pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
     /// Word-diff rendering request (mode + the command-line regex override).
-    word_diff: Option<&'a WordDiffRequest<'a>>,
+    pub(crate) word_diff: Option<&'a WordDiffRequest<'a>>,
     /// Preloaded file contents for `diff --no-index` (old, new), bypassing
     /// the object database / worktree reads.
-    no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
+    pub(crate) no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
     /// Gitlink paths whose worktree-side synthesized content carries the
     /// `-dirty` suffix (the submodule's own tree has modified/untracked
     /// content the effective ignore mode does not suppress).
-    dirty_submodules: Option<&'a HashSet<Vec<u8>>>,
+    pub(crate) dirty_submodules: Option<&'a HashSet<Vec<u8>>>,
     /// The whitespace rule used to highlight whitespace errors on new lines
     /// (`--ws-error-highlight`, default new-only) when color is enabled.
     /// `None` disables whitespace-error highlighting.
-    ws_error_rule: Option<sley_diff_merge::ws::WsRule>,
+    pub(crate) ws_error_rule: Option<sley_diff_merge::ws::WsRule>,
     /// Extra inter-hunk merge distance (`--inter-hunk-context`).
-    interhunk: usize,
+    pub(crate) interhunk: usize,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`) applied to the line comparison.
-    ws_ignore: sley_diff_merge::WsIgnore,
+    pub(crate) ws_ignore: sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / default Myers).
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    pub(crate) diff_algorithm: sley_diff_merge::DiffAlgorithm,
     /// `--ignore-blank-lines`: drop change groups whose lines are all blank.
-    ignore_blank_lines: bool,
+    pub(crate) ignore_blank_lines: bool,
     /// `-I<regex>` / `--ignore-matching-lines`: drop change groups all of whose
     /// lines match one of these (compiled ERE) regexes.
-    ignore_regexes: &'a [grep_source::Regex],
+    pub(crate) ignore_regexes: &'a [grep_source::Regex],
+    /// `log -L`: restrict the emitted hunks to these post-image line ranges.
+    /// `None` (every non-line-log caller) renders the full patch.
+    pub(crate) line_ranges: Option<&'a [sley_diff_merge::render::LineRange]>,
 }
 
 /// A `--word-diff` request before per-file word-regex resolution.
@@ -2429,6 +2432,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
+                line_ranges: None,
             },
         )?;
     }
@@ -2454,7 +2458,7 @@ pub(crate) fn compile_ignore_matching_regexes(
     Ok(compiled)
 }
 
-fn write_diff_patch_entry(
+pub(crate) fn write_diff_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
@@ -2756,6 +2760,7 @@ fn write_diff_patch_entry(
         ws_ignore: options.ws_ignore,
         algorithm: options.diff_algorithm,
         change_ignore: change_ignore.as_ref(),
+        line_ranges: options.line_ranges,
         ..Default::default()
     };
     let mut hunks = Vec::new();

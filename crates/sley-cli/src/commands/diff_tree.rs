@@ -964,6 +964,7 @@ fn run_diff_request(
                 diff_algorithm: context.options.diff_algorithm,
                 ignore_blank_lines: context.options.ignore_blank_lines,
                 ignore_regexes: &context.options.ignore_regexes,
+                line_ranges: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

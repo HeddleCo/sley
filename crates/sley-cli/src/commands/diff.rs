@@ -1038,6 +1038,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     diff_algorithm,
                     ignore_blank_lines,
                     ignore_regexes: &ignore_regexes,
+                    line_ranges: None,
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1444,6 +1445,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             diff_algorithm: params.diff_algorithm,
             ignore_blank_lines: params.ignore_blank_lines,
             ignore_regexes: params.ignore_regexes,
+            line_ranges: None,
         };
         write_diff_patch_entry(&mut stdout, &entry, options)?;
     }
