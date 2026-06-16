@@ -393,13 +393,29 @@ fn three_way_merge_trees_inner(
     Ok((results, conflicts))
 }
 
+/// Render git merge's post-merge `--stat`/`--compact-summary` block.
+///
+/// git (`builtin/merge.c`) drives this from `show_diffstat`:
+///   * `MERGE_SHOW_DIFFSTAT` → `DIFF_FORMAT_DIFFSTAT | DIFF_FORMAT_SUMMARY`,
+///     i.e. the diffstat followed by the `create/delete mode`/`rename` summary
+///     block;
+///   * `MERGE_SHOW_COMPACTSUMMARY` → `DIFF_FORMAT_DIFFSTAT` with
+///     `stat_with_summary`, folding the summary into the stat rows (no separate
+///     block);
+///   * off → nothing.
+///
+/// Rename detection is always on (git sets `DIFF_DETECT_RENAME`).
 fn write_merge_result_diffstat(
     stdout: &mut io::Stdout,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old_tree: &ObjectId,
     new_tree: &ObjectId,
+    mode: MergeDiffstat,
 ) -> Result<()> {
+    if mode == MergeDiffstat::Off {
+        return Ok(());
+    }
     let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
@@ -407,6 +423,7 @@ fn write_merge_result_diffstat(
         new_tree,
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
+    let compact = mode == MergeDiffstat::Compact;
     write_diff_stat(
         stdout,
         &entries,
@@ -414,11 +431,40 @@ fn write_merge_result_diffstat(
         None,
         false,
         DiffStatOptions {
-            compact_summary: false,
+            compact_summary: compact,
             stat_count: None,
             color: false,
         },
-    )
+    )?;
+    // The default `--stat` mode appends a `DIFF_FORMAT_SUMMARY` block (the
+    // ` create mode`/` delete mode`/` rename`/` mode change` lines). The
+    // compact mode inlines that information into the stat rows instead, so it
+    // emits no separate block.
+    if !compact {
+        for entry in &entries {
+            write_diff_summary_entry(stdout, entry)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve git merge's effective `show_diffstat` value: an explicit CLI flag
+/// wins, otherwise `merge.stat` config decides (`false`/`no`/`off` → off,
+/// `compact` → compact, anything else / unset → the default full diffstat).
+fn merge_diffstat_mode(options: &MergeOptions) -> MergeDiffstat {
+    if let Some(mode) = options.diffstat {
+        return mode;
+    }
+    let value = effective_config_with_overrides()
+        .and_then(|config| config.get("merge", None, "stat").map(str::to_string));
+    match value.as_deref() {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "false" | "no" | "off" | "0" => MergeDiffstat::Off,
+            "compact" => MergeDiffstat::Compact,
+            _ => MergeDiffstat::Stat,
+        },
+        None => MergeDiffstat::Stat,
+    }
 }
 
 /// Create a merge commit with two parents and advance the current branch (or
@@ -645,7 +691,7 @@ fn merge_octopus(
             )?;
             writeln!(stdout, "Fast-forward")?;
             let new_tree = commit_tree_oid(&db, format, &new_oid)?;
-            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &new_tree)?;
+            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &new_tree, merge_diffstat_mode(options))?;
             stdout.flush()?;
         }
         return Ok(());
@@ -685,7 +731,7 @@ fn merge_octopus(
     if !options.quiet {
         let mut stdout = io::stdout();
         writeln!(stdout, "Merge made by the 'octopus' strategy.")?;
-        write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree)?;
+        write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree, merge_diffstat_mode(options))?;
         stdout.flush()?;
     }
 
@@ -742,6 +788,22 @@ struct MergeOptions {
     /// `--allow-unrelated-histories`: merge two branches with no common ancestor
     /// using the empty tree as the virtual base (git refuses by default).
     allow_unrelated_histories: bool,
+    /// Diffstat display mode after a completed merge. Mirrors git's
+    /// `show_diffstat` int driven by `-n`/`--stat`/`--summary`/
+    /// `--compact-summary` and the `merge.stat` config. `None` means the field
+    /// has not been set from the command line, so the `merge.stat` config still
+    /// gets to decide; `Some(_)` is an explicit CLI choice that wins.
+    diffstat: Option<MergeDiffstat>,
+}
+
+/// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
+/// the default `--stat` (diffstat + `create/delete mode` summary block), or
+/// `--compact-summary` (diffstat with the summary folded into the rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeDiffstat {
+    Off,
+    Stat,
+    Compact,
 }
 
 impl Default for MergeOptions {
@@ -754,6 +816,7 @@ impl Default for MergeOptions {
             quiet: false,
             favor: sley_diff_merge::MergeFavor::None,
             allow_unrelated_histories: false,
+            diffstat: None,
         }
     }
 }
@@ -899,6 +962,14 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--ff-only" => set_merge_fast_forward(options, false, true),
             "--no-commit" => options.no_commit = true,
             "--commit" => options.no_commit = false,
+            // git merge's `show_diffstat` flags (builtin/merge.c): `-n`/
+            // `--no-stat` suppress it, `--stat`/`--summary` force the full
+            // diffstat + summary block, `--compact-summary` folds the summary
+            // into the stat rows. An explicit CLI choice overrides `merge.stat`.
+            "-n" | "--no-stat" | "--no-summary" => options.diffstat = Some(MergeDiffstat::Off),
+            "--stat" | "--summary" => options.diffstat = Some(MergeDiffstat::Stat),
+            "--compact-summary" => options.diffstat = Some(MergeDiffstat::Compact),
+            "--no-compact-summary" => options.diffstat = Some(MergeDiffstat::Stat),
             "--allow-unrelated-histories" => options.allow_unrelated_histories = true,
             "--no-allow-unrelated-histories" => options.allow_unrelated_histories = false,
             "-q" | "--quiet" => options.quiet = true,
@@ -1185,7 +1256,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             writeln!(stdout, "Fast-forward")?;
             let head_tree = commit_tree_oid(&db, format, &head_oid)?;
             let other_tree = commit_tree_oid(&db, format, &other_oid)?;
-            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &other_tree)?;
+            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &other_tree, merge_diffstat_mode(&options))?;
             stdout.flush()?;
         }
         return Ok(());
@@ -1292,7 +1363,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if !options.quiet {
             let mut stdout = io::stdout();
             writeln!(stdout, "Merge made by the 'ort' strategy.")?;
-            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree)?;
+            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree, merge_diffstat_mode(&options))?;
             stdout.flush()?;
         }
         let merged_oid = merge_commit_and_advance(
