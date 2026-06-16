@@ -18,6 +18,7 @@ pub(crate) mod branch;
 pub(crate) mod cat_file;
 pub(crate) mod checkout_index;
 pub(crate) mod config_cmd;
+pub(crate) mod daemon;
 pub(crate) mod describe;
 pub(crate) mod diff;
 pub(crate) mod diff_files;

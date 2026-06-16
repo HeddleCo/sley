@@ -248,6 +248,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "unpack-objects" => commands::pack::cmd_unpack_objects(&args[1..]),
         "receive-pack" => commands::remote_cmds::cmd_receive_pack(&args[1..]),
         "upload-pack" => commands::remote_cmds::cmd_upload_pack(&args[1..]),
+        "daemon" => commands::daemon::cmd_daemon(&args[1..]),
         "write-tree" => commands::trees::cmd_write_tree(&args[1..]),
         "worktree" => commands::worktree::cmd_worktree(&args[1..]),
         "update-index" => commands::index::cmd_update_index(&args[1..]),
