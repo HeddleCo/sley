@@ -347,7 +347,7 @@ fn die(message: String) -> GitError {
 /// Returns the number of input bytes consumed (up to and including the closing
 /// quote) on success, or `None` if the quoting is malformed. A NUL byte
 /// terminates the input just as it does in git's C-string view.
-fn unquote_c_style(input: &[u8], out: &mut Vec<u8>) -> Option<usize> {
+pub(crate) fn unquote_c_style(input: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     let mut i = 0usize;
     if input.get(i).copied()? != b'"' {
         return None;

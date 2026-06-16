@@ -11041,6 +11041,16 @@ pub fn index_from_tree(
 /// * **Out of cone**: the skip-worktree bit is set and any existing worktree
 ///   file is removed (empty parent directories are pruned).
 ///
+/// Returns `true` when `path` is inside the sparse-checkout described by
+/// `sparse` under the given matching `mode`. This is the engine behind
+/// `git sparse-checkout check-rules`: a path is "in" the sparse-checkout when
+/// the compiled matcher would keep its worktree file. Cone and full (gitignore)
+/// grammars are both handled, exactly as the apply engine interprets them, so
+/// `check-rules` and `set`/`reapply` agree by construction.
+pub fn path_in_sparse_checkout(path: &[u8], sparse: &SparseCheckout, mode: SparseCheckoutMode) -> bool {
+    SparseMatcher::new(sparse, mode).includes_file(path)
+}
+
 /// Conflicted entries (stage != 0) are never given the skip-worktree bit and
 /// are left alone, matching upstream Git. The index is rewritten in place.
 pub fn apply_sparse_checkout(

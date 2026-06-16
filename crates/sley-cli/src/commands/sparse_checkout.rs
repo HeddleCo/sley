@@ -20,7 +20,10 @@
 // is in scope here without re-listing it.
 use crate::*;
 
-use sley_worktree::{SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode};
+use crate::commands::ref_command_stream::unquote_c_style;
+use sley_worktree::{
+    SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
+};
 
 const SPARSE_USAGE: &str = "usage: git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]";
 
@@ -65,6 +68,8 @@ pub(crate) fn cmd_sparse_checkout(args: &[String]) -> Result<()> {
         "add" => cmd_sparse_add(&args[1..]),
         "reapply" => cmd_sparse_reapply(&args[1..]),
         "disable" => cmd_sparse_disable(&args[1..]),
+        "check-rules" => cmd_sparse_check_rules(&args[1..]),
+        "clean" => cmd_sparse_clean(&args[1..]),
         other => {
             eprintln!("error: unknown subcommand: `{other}'");
             eprintln!("{SPARSE_USAGE}");
@@ -117,12 +122,19 @@ fn cmd_sparse_list(args: &[String]) -> Result<()> {
     if let Some(arg) = args.iter().find(|arg| arg.starts_with('-')) {
         return unknown_option(arg.as_str(), LIST_HELP);
     }
-    let patterns = read_sparse_patterns(&ctx)?.unwrap_or_default();
+    // A sparse worktree whose pattern file is missing is not an error: upstream
+    // warns and exits 0 (the `res < 0` path of `add_patterns_from_file_to_list`).
+    let Some(patterns) = read_sparse_patterns(&ctx)? else {
+        eprintln!("warning: this worktree is not sparse (sparse-checkout file may not exist)");
+        return Ok(());
+    };
     let cone = sparse_cone_enabled(&ctx)?;
     let mut out = io::stdout();
     if cone {
+        // Cone entries are emitted through git's `quote_c_style`, so a directory
+        // with unusual bytes is C-quoted exactly as `ls-files` would render it.
         for dir in cone_list_entries(&patterns) {
-            out.write_all(&dir)?;
+            write_status_quoted_path(&mut out, &dir, false)?;
             out.write_all(b"\n")?;
         }
     } else {
@@ -253,6 +265,322 @@ fn cmd_sparse_disable(args: &[String]) -> Result<()> {
     set_config_value(&mut config, "index", None, "sparse", "false");
     write_worktree_config(&ctx.git_dir, &config)?;
     Ok(())
+}
+
+const CHECK_RULES_HELP: &str = "usage: git sparse-checkout check-rules [-z] [--skip-checks][--[no-]cone] [--rules-file <file>]\n\n    -z                    terminate input and output files by a NUL character\n    --[no-]cone           when used with --rules-file interpret patterns as cone mode patterns\n    --rules-file <file>   use patterns in <file> instead of the current ones.\n";
+
+/// `git sparse-checkout check-rules`: read paths from stdin and echo back the
+/// subset that *would be* present under the active (or supplied) sparse rules.
+///
+/// This is the read-only counterpart of the apply engine. It does not require a
+/// worktree (it runs in bare repos), and it never mutates state. Under `-z`,
+/// input and output are NUL-delimited and input paths are taken verbatim;
+/// otherwise a leading-`"` line is C-unquoted on input and any matching path is
+/// re-quoted with git's `quote_c_style` on output.
+fn cmd_sparse_check_rules(args: &[String]) -> Result<()> {
+    let mut cone = ConeFlag::Unset;
+    let mut null_terminated = false;
+    let mut rules_file: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-z" => null_terminated = true,
+            "--cone" => cone = ConeFlag::Cone,
+            "--no-cone" => cone = ConeFlag::NoCone,
+            // Accepted for option-grammar compatibility; check-rules performs no
+            // path sanity checks of its own.
+            "--skip-checks" => {}
+            "--rules-file" => {
+                let Some(path) = iter.next() else {
+                    return unknown_option("--rules-file", CHECK_RULES_HELP);
+                };
+                rules_file = Some(path.clone());
+            }
+            other if other.starts_with("--rules-file=") => {
+                rules_file = Some(other["--rules-file=".len()..].to_string());
+            }
+            other => return unknown_option(other, CHECK_RULES_HELP),
+        }
+    }
+
+    let ctx = sparse_context_no_worktree()?;
+
+    // Resolve the matching mode. With --rules-file and no explicit cone flag,
+    // upstream defaults to cone. Otherwise an explicit flag wins, then the
+    // worktree's recorded `core.sparseCheckoutCone`.
+    let cone_mode = match cone {
+        ConeFlag::Cone => true,
+        ConeFlag::NoCone => false,
+        ConeFlag::Unset => {
+            if rules_file.is_some() {
+                true
+            } else {
+                sparse_cone_enabled(&ctx).unwrap_or(false)
+            }
+        }
+    };
+
+    // Load the patterns. With --rules-file each line is an *input* directory (in
+    // cone mode) or gitignore pattern (non-cone), exactly like `set`/`add`
+    // arguments — so cone input is converted to the cone-grammar pattern file
+    // form before matching. Without --rules-file we read the already-serialized
+    // worktree pattern file, which is consumed as-is.
+    let patterns: Vec<Vec<u8>> = match &rules_file {
+        Some(path) => {
+            let mut lines: Vec<Vec<u8>> = fs::read(path)?
+                .split(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect();
+            if lines.last().map(Vec::is_empty) == Some(true) {
+                lines.pop();
+            }
+            // A line beginning with `"` is a C-quoted path that must be decoded.
+            let decoded: Vec<Vec<u8>> = lines
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    if line.first() == Some(&b'"') {
+                        let mut buf = Vec::new();
+                        if unquote_c_style(&line, &mut buf).is_some() {
+                            return buf;
+                        }
+                    }
+                    line
+                })
+                .collect();
+            if cone_mode {
+                let dirs: Vec<Vec<u8>> =
+                    decoded.iter().map(|line| normalize_cone_dir(line)).collect();
+                build_cone_file(&dirs)
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            } else {
+                decoded
+            }
+        }
+        None => read_sparse_patterns(&ctx)?.unwrap_or_default(),
+    };
+
+    let sparse = SparseCheckout {
+        patterns,
+        sparse_index: false,
+    };
+    let mode = if cone_mode {
+        SparseCheckoutMode::Cone
+    } else {
+        SparseCheckoutMode::Full
+    };
+
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    let delimiter = if null_terminated { 0u8 } else { b'\n' };
+    let mut out = io::stdout();
+    for raw in input.split(|byte| *byte == delimiter) {
+        // The trailing element after the final delimiter is empty; skip it.
+        if raw.is_empty() {
+            continue;
+        }
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        // Outside -z, a line beginning with `"` is a C-quoted path that must be
+        // decoded before matching.
+        let decoded: Vec<u8> = if !null_terminated && line.first() == Some(&b'"') {
+            let mut buf = Vec::new();
+            if unquote_c_style(line, &mut buf).is_none() {
+                eprintln!(
+                    "fatal: unable to unquote C-style string '{}'",
+                    String::from_utf8_lossy(line)
+                );
+                return Err(GitError::Exit(128));
+            }
+            buf
+        } else {
+            line.to_vec()
+        };
+        if path_in_sparse_checkout(&decoded, &sparse, mode) {
+            if null_terminated {
+                // Under -z paths are emitted verbatim, NUL-terminated.
+                out.write_all(&decoded)?;
+                out.write_all(&[0])?;
+            } else {
+                write_status_quoted_path(&mut out, &decoded, false)?;
+                out.write_all(b"\n")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+const CLEAN_HELP: &str = "usage: git sparse-checkout clean [-n|--dry-run]\n\n    -n, --dry-run         dry run\n    -f, --force           force\n    -v, --verbose         report each affected file, not just directories\n";
+
+/// `git sparse-checkout clean`: remove worktree directories that have fully
+/// fallen out of the cone (the directories git would collapse into sparse
+/// directory entries). It is the worktree-cleanup counterpart of the sparse
+/// index: an out-of-cone directory that still has stray files on disk is
+/// removed wholesale.
+fn cmd_sparse_clean(args: &[String]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let ctx = sparse_context()?;
+    if !sparse_checkout_enabled(&ctx)? {
+        eprintln!("fatal: must be in a sparse-checkout to clean directories");
+        return Err(GitError::Exit(128));
+    }
+    if !sparse_cone_enabled(&ctx)? {
+        eprintln!("fatal: must be in a cone-mode sparse-checkout to clean directories");
+        return Err(GitError::Exit(128));
+    }
+
+    let mut dry_run = false;
+    let mut force = false;
+    let mut verbose = false;
+    for arg in args {
+        match arg.as_str() {
+            "-n" | "--dry-run" => dry_run = true,
+            "-f" | "--force" => force = true,
+            "-v" | "--verbose" => verbose = true,
+            other => return unknown_option(other, CLEAN_HELP),
+        }
+    }
+
+    // `clean.requireForce` defaults to true: without --force or --dry-run, refuse.
+    let require_force = clean_require_force(&ctx)?;
+    if require_force && !force && !dry_run {
+        eprintln!("fatal: for safety, refusing to clean without one of --force or --dry-run");
+        return Err(GitError::Exit(128));
+    }
+
+    let patterns = read_sparse_patterns(&ctx)?.unwrap_or_default();
+    let sparse_dirs = sparse_directories(&ctx, &patterns)?;
+
+    let msg_prefix = if dry_run { "Would remove" } else { "Removing" };
+    let mut out = io::stdout();
+    for dir in &sparse_dirs {
+        let abs = ctx
+            .worktree_root
+            .join(std::ffi::OsStr::from_bytes(dir));
+        if !abs.is_dir() {
+            continue;
+        }
+        if verbose {
+            // Report every file inside the directory rather than the directory.
+            for file in list_files_recursive(&abs)? {
+                let mut rel = dir.clone();
+                rel.extend_from_slice(&file);
+                writeln!(out, "{msg_prefix} {}", String::from_utf8_lossy(&rel))?;
+            }
+        } else {
+            writeln!(out, "{msg_prefix} {}/", String::from_utf8_lossy(dir))?;
+        }
+        if !dry_run {
+            fs::remove_dir_all(&abs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads `clean.requireForce` from the repository config, defaulting to `true`.
+fn clean_require_force(ctx: &SparseContext) -> Result<bool> {
+    let common = common_git_dir_for_git_dir(&ctx.git_dir)?;
+    let config_path = common.join("config");
+    if config_path.exists() {
+        let config = GitConfig::read(&config_path)?;
+        if let Some(value) = config.get_bool("clean", None, "requireForce") {
+            return Ok(value);
+        }
+    }
+    Ok(true)
+}
+
+/// Computes the set of worktree-relative directory paths (without a trailing
+/// slash) that have *entirely* fallen out of the cone: every tracked path under
+/// the directory is skip-worktree and the directory itself is out-of-cone. These
+/// are exactly the directories git collapses into sparse-directory entries, and
+/// hence the directories `clean` removes.
+fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    use std::collections::BTreeMap;
+    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(&index_path)?;
+    let sparse = SparseCheckout {
+        patterns: patterns.to_vec(),
+        sparse_index: false,
+    };
+
+    // For every tracked path, find the shallowest ancestor directory that is
+    // wholly out of cone. A directory is collapsible when the cone does not keep
+    // any path inside it, i.e. it has no in-cone descendant and no parent guard.
+    // We approximate git's cache-tree collapse by grouping paths by their
+    // top-most out-of-cone directory prefix.
+    let mut dir_state: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
+    Index::for_each_path(&bytes, ctx.format, |path| {
+        let in_cone = path_in_sparse_checkout(path, &sparse, SparseCheckoutMode::Cone);
+        // Record, for each ancestor directory of this path, whether any in-cone
+        // file lives beneath it.
+        let mut start = 0usize;
+        while let Some(rel) = path.get(start..).and_then(|s| s.iter().position(|b| *b == b'/')) {
+            let end = start + rel;
+            let dir = path[..end].to_vec();
+            let entry = dir_state.entry(dir).or_insert(false);
+            *entry = *entry || in_cone;
+            start = end + 1;
+        }
+        Ok(())
+    })?;
+
+    // A directory is a sparse (collapsible) directory when it has no in-cone
+    // descendant. The shallowest such directory subsumes deeper ones, so keep
+    // only top-level collapsed directories.
+    let all_collapsed: Vec<Vec<u8>> = dir_state
+        .iter()
+        .filter(|(_, has_in_cone)| !**has_in_cone)
+        .map(|(dir, _)| dir.clone())
+        .collect();
+    // Keep only the shallowest collapsed directories: a directory whose strict
+    // ancestor is also collapsed is subsumed by it.
+    let mut collapsed: Vec<Vec<u8>> = all_collapsed
+        .iter()
+        .filter(|dir| {
+            !all_collapsed.iter().any(|other| {
+                other != *dir
+                    && dir
+                        .strip_prefix(other.as_slice())
+                        .is_some_and(|rest| rest.first() == Some(&b'/'))
+            })
+        })
+        .cloned()
+        .collect();
+    collapsed.sort();
+    Ok(collapsed)
+}
+
+/// Lists every file beneath `root`, returned as paths relative to `root` (with a
+/// leading component, no leading slash). Used for `clean --verbose`.
+fn list_files_recursive(root: &Path) -> Result<Vec<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut files = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), Vec::<u8>::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry.file_name();
+            let mut rel = prefix.clone();
+            rel.extend_from_slice(name.as_bytes());
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                let mut child_prefix = rel.clone();
+                child_prefix.push(b'/');
+                stack.push((entry.path(), child_prefix));
+            } else {
+                files.push(rel);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 // --------------------------------------------------------------------------
@@ -547,11 +875,32 @@ fn clean_pattern_line(raw: &[u8]) -> &[u8] {
 // Config + pattern-file I/O
 // --------------------------------------------------------------------------
 
+/// Resolves the sparse context for a worktree-requiring subcommand (every one
+/// but `check-rules`). Mirrors upstream's `setup_work_tree()` at the head of
+/// each handler: a bare repository fails with "this operation must be run in a
+/// work tree".
 fn sparse_context() -> Result<SparseContext> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = require_work_tree(&git_dir)?;
+    Ok(SparseContext {
+        git_dir,
+        worktree_root,
+        format,
+    })
+}
+
+/// Resolves a context for `check-rules`, which upstream does *not* gate behind
+/// `setup_work_tree()` and so runs in a bare repository. The worktree root is
+/// only used to anchor relative paths, so a bare repo falls back to the git
+/// directory's parent (it is never read for `check-rules`).
+fn sparse_context_no_worktree() -> Result<SparseContext> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+        .unwrap_or_else(|| git_dir.parent().unwrap_or(&git_dir).to_path_buf());
     Ok(SparseContext {
         git_dir,
         worktree_root,
