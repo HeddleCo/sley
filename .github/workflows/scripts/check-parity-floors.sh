@@ -435,7 +435,7 @@ declare -A FLOOR=(
     [t4019-diff-wserror.sh]=19
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=10
-    [t5500-fetch-pack.sh]=356
+    [t5500-fetch-pack.sh]=359
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=306
@@ -482,6 +482,7 @@ declare -A FLOOR=(
     [t5543-atomic-push.sh]=7
     [t5548-push-porcelain.sh]=11
     [t6430-merge-recursive.sh]=23
+    [t5702-protocol-v2.sh]=5
 )
 
 fail=0
