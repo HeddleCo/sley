@@ -2508,6 +2508,167 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const SEND_PACK_USAGE: &str = "usage: git send-pack [--mirror] [--dry-run] [--force]\n              [--receive-pack=<git-receive-pack>]\n              [--verbose] [--thin] [--atomic]\n              [--[no-]signed | --signed=(true|false|if-asked)]\n              [<host>:]<directory> (--all | <ref>...)";
+
+/// `git send-pack [<options>] <directory> (--all | <ref>...)`: the plumbing push
+/// to a local repository. Unlike `git push`, it takes a literal destination
+/// directory (no remote-name resolution) and pushes bare refs as `<ref>:<ref>`
+/// (a leading `:` deletes). It renders the same status report as push but does
+/// not touch remote-tracking refs (it is a low-level transport, not porcelain).
+pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
+    // `-h` is handled by git's option parser before any repository is opened, so
+    // it works outside a git repo too (the `nongit` case in t5400).
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+
+    let mut force = false;
+    let mut dry_run = false;
+    let mut atomic = false;
+    let mut mirror = false;
+    let mut all_refs = false;
+    let mut quiet = false;
+    let mut force_with_lease_specs: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{SEND_PACK_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            "-f" | "--force" => force = true,
+            "-n" | "--dry-run" => dry_run = true,
+            "--atomic" => atomic = true,
+            "--mirror" => mirror = true,
+            "--all" => all_refs = true,
+            "-q" | "--quiet" => quiet = true,
+            "-v" | "--verbose" | "--progress" | "--no-progress" | "--thin" | "--no-thin"
+            | "--stateless-rpc" | "--helper-status" => {}
+            "--signed" | "--no-signed" => {}
+            value if value.starts_with("--signed=") => {}
+            "--force-if-includes" => {}
+            value if value.starts_with("--force-with-lease=") => {
+                force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
+            }
+            "--receive-pack" | "--exec" | "--remote" | "--push-option" => {
+                iter.next().ok_or_else(|| {
+                    GitError::Command(format!("send-pack {} requires a value", arg.as_str()))
+                })?;
+            }
+            value
+                if value.starts_with("--receive-pack=")
+                    || value.starts_with("--exec=")
+                    || value.starts_with("--remote=")
+                    || value.starts_with("--push-option=") => {}
+            "--" => {
+                positional.extend(iter.map(|value| value.to_string()));
+                break;
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                eprintln!("{SEND_PACK_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+
+    if mirror {
+        force = true;
+    }
+
+    let Some((dest, refs)) = positional.split_first() else {
+        eprintln!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    };
+    if refs.is_empty() && !all_refs && !mirror {
+        eprintln!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+
+    let remote_git_dir = ls_remote_git_dir(dest)?;
+    let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+
+    let mut refspecs: Vec<String> = if mirror {
+        vec!["refs/*:refs/*".to_string()]
+    } else if all_refs {
+        vec!["refs/heads/*:refs/heads/*".to_string()]
+    } else {
+        // send-pack pushes each bare ref as `<ref>:<ref>` (a leading `:` is a
+        // delete; a leading `+` forces); no porcelain-style short-name guessing.
+        refs.iter()
+            .map(|spec| {
+                let (force_marker, body) = match spec.strip_prefix('+') {
+                    Some(rest) => ("+", rest),
+                    None => ("", spec.as_str()),
+                };
+                let normalized = if let Some(rest) = body.strip_prefix(':') {
+                    format!(":{}", sley_remote::normalize_push_refname(rest))
+                } else if let Some((src, dstn)) = body.split_once(':') {
+                    format!(
+                        "{}:{}",
+                        sley_remote::normalize_push_refname(src),
+                        sley_remote::normalize_push_refname(dstn)
+                    )
+                } else {
+                    let name = sley_remote::normalize_push_refname(body);
+                    format!("{name}:{name}")
+                };
+                format!("{force_marker}{normalized}")
+            })
+            .collect()
+    };
+
+    // `--mirror` deletes remote refs the local repo no longer has.
+    if mirror {
+        let remote_advertisements =
+            sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+        let local_names: std::collections::HashSet<String> = store
+            .list_refs()?
+            .into_iter()
+            .map(|reference| reference.name)
+            .collect();
+        for advertisement in &remote_advertisements {
+            if advertisement.name.starts_with("refs/") && !local_names.contains(&advertisement.name)
+            {
+                refspecs.push(format!(":{}", advertisement.name));
+            }
+        }
+    }
+
+    let force_with_lease =
+        resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+    let options = PushOptions {
+        quiet,
+        set_upstream: false,
+        force,
+        no_verify: true,
+        dry_run,
+    };
+    run_push_local_report(RunPushLocalReport {
+        git_dir: &git_dir,
+        common_git_dir: &common_git_dir,
+        format,
+        remote: dest,
+        remote_git_dir: &remote_git_dir,
+        remote_common_git_dir: &remote_common_git_dir,
+        refspecs: &refspecs,
+        options,
+        porcelain: false,
+        atomic,
+        force_with_lease: &force_with_lease,
+        force_with_lease_default: false,
+    })
+}
+
 pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
