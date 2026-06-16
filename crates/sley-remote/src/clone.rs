@@ -107,6 +107,10 @@ pub struct CloneOptions<'a> {
     /// Partial-clone object filter (`--filter=blob:none`) to apply to the
     /// clone fetch. Only honored by the in-process local server.
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// Whether `checkout_branch` came from an explicit `--branch`. When set, a
+    /// missing remote tip for that branch is a hard error ("Remote branch … not
+    /// found"); when unset, a missing tip is an empty/unborn-repository clone.
+    pub branch_explicit: bool,
 }
 
 /// The structured result of a [`clone`].
@@ -115,8 +119,15 @@ pub struct CloneOutcome {
     /// The destination repository's `$GIT_DIR` (the `.git` directory created by
     /// the init step). The caller uses it for its post-checkout steps.
     pub git_dir: PathBuf,
-    /// The object id the local branch was created at (the fetched remote tip).
-    pub branch_oid: ObjectId,
+    /// The object id the local branch was created at (the fetched remote tip),
+    /// or `None` when the remote was empty/unborn (no branch was created and
+    /// `HEAD` was left as an unborn symref to `checkout_branch`).
+    pub branch_oid: Option<ObjectId>,
+    /// True when the remote advertised no refs for `checkout_branch` and no
+    /// `--branch`/`--revision` was requested: an empty/unborn-repository clone.
+    /// The caller prints git's "You appear to have cloned an empty repository."
+    /// warning and skips the worktree checkout.
+    pub empty: bool,
 }
 
 /// Fully resolved inputs for a [`clone`] run.
@@ -233,7 +244,8 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         )?;
         return Ok(CloneOutcome {
             git_dir,
-            branch_oid: *detached,
+            branch_oid: Some(*detached),
+            empty: false,
         });
     }
     let remote_branch_ref = format!(
@@ -248,9 +260,37 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             ));
         }
         None => {
-            return Err(GitError::reference_not_found(format!(
-                "remote ref {remote_branch_ref}"
-            )));
+            // The remote advertised no tip for the branch we are tracking. When
+            // the caller did not request an explicit branch this is an
+            // empty/unborn-repository clone: upstream `builtin/clone.c` warns,
+            // skips the checkout, and leaves `HEAD` as an unborn symref pointing
+            // at the remote's (or local default) branch — `update_head`'s
+            // `unborn` arm. We mirror that by setting `HEAD` and returning a
+            // marker for the CLI to print the warning. An explicit-branch miss
+            // is still a hard error (the CLI maps it to git's "Remote branch …
+            // not found" message).
+            if request.options.branch_explicit {
+                return Err(GitError::reference_not_found(format!(
+                    "remote ref {remote_branch_ref}"
+                )));
+            }
+            let unborn = format!("refs/heads/{}", request.options.checkout_branch);
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: "HEAD".to_string(),
+                expected: None,
+                new: RefTarget::Symbolic(unborn),
+                reflog: None,
+            });
+            tx.commit()?;
+            // Install branch upstream config for the unborn branch, matching
+            // git's `install_branch_config` in the unborn path.
+            (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
+            return Ok(CloneOutcome {
+                git_dir,
+                branch_oid: None,
+                empty: true,
+            });
         }
     };
     store.create_branch(
@@ -296,7 +336,8 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 
     Ok(CloneOutcome {
         git_dir,
-        branch_oid,
+        branch_oid: Some(branch_oid),
+        empty: false,
     })
 }
 

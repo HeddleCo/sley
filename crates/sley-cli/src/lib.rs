@@ -847,6 +847,14 @@ fn init_config_value(
     Ok(config.get(section, None, entry_key).map(str::to_owned))
 }
 
+/// `init.defaultBranch` from the global/injected config, used by `git clone`
+/// when an empty/unborn remote leaves it to name the local default branch.
+/// Looked up with no repository context (clone runs before the new repo's config
+/// is relevant), so it consults injected `-c` overrides and the global config.
+pub(crate) fn clone_init_default_branch_config() -> Result<Option<String>> {
+    init_config_value("init.defaultBranch", &[], None)
+}
+
 pub(crate) fn report_config_setup_error(err: GitError) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {

@@ -590,10 +590,22 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let remote_git_dir = ls_remote_git_dir(&repository)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
-    let detached_remote_head = remote_head_detached(&remote_common_git_dir, format);
+    // `--branch=<name>` may name a tag rather than a branch; git then checks the
+    // tag's commit out with a detached HEAD (`our_head_points_at` is a tag ⇒
+    // detach in builtin/clone.c). Detect that here so the clone routes through
+    // the detached-head path instead of looking for a non-existent
+    // `refs/remotes/<origin>/<tag>`.
+    let branch_tag_oid = branch
+        .as_deref()
+        .and_then(|name| clone_source_tag_commit(&remote_common_git_dir, format, name));
+    let detached_remote_head = match &branch_tag_oid {
+        Some(oid) => Some(oid.clone()),
+        None => remote_head_detached(&remote_common_git_dir, format),
+    };
     let remote_head_branch = match (&detached_remote_head, &branch) {
-        // A detached source HEAD has no default branch; the clone checks the
-        // commit out detached (unless --branch named one).
+        // A detached source HEAD (or a `--branch=<tag>`) has no default branch;
+        // the clone checks the commit out detached.
+        (Some(_), _) if branch_tag_oid.is_some() => String::new(),
         (Some(_), None) => String::new(),
         _ => remote_head_branch(&remote_common_git_dir, format)?,
     };
@@ -694,6 +706,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 fetch_filter,
                 head_branch: &checkout_branch,
                 branch_explicit,
+                // A detached source HEAD (and no explicit --branch) makes the
+                // bare/mirror clone detach the destination HEAD at that commit.
+                detached_head: if branch_explicit {
+                    None
+                } else {
+                    detached_remote_head.as_ref()
+                },
                 revision_oid: revision_oid.as_ref(),
                 mirror,
                 single_branch,
@@ -797,12 +816,21 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         deepen_since,
         deepen_not,
         committer: commit_identity_from_env("COMMITTER")?,
-        detached_head: if branch_explicit {
+        // `--branch=<tag>` checks the tag's commit out detached; otherwise a
+        // detached source HEAD is honored only for the default (no `--branch`)
+        // case.
+        detached_head: if branch_tag_oid.is_some() {
+            branch_tag_oid.clone()
+        } else if branch_explicit {
             None
         } else {
             detached_remote_head
         },
         filter: fetch_filter,
+        // A `--branch=<tag>` is satisfied by the detached checkout, so the
+        // remote-tracking-branch lookup (and its "Remote branch not found"
+        // mapping) must be bypassed.
+        branch_explicit: branch_explicit && branch_tag_oid.is_none(),
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -843,7 +871,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         },
     )?;
     let git_dir = outcome.git_dir;
-    if !checkout {
+    if outcome.empty {
+        warn_cloned_empty_repository();
+    } else if !checkout {
         remove_clone_worktree_files(&destination, &git_dir, format)?;
     } else if sparse {
         apply_clone_sparse_checkout(&destination, &git_dir, format)?;
@@ -886,17 +916,19 @@ struct CloneHttpOptions<'a> {
 
 /// Derive the remote default branch name from the upload-pack advertisement:
 /// prefer the advertised `HEAD` symref, otherwise match the `HEAD` object id to a
-/// branch tip.
+/// branch tip. Returns `None` when the remote advertised no usable HEAD (an
+/// empty/unborn repository); the caller then falls back to the local default
+/// branch name (git's `repo_default_branch_name`).
 fn http_remote_head_branch(
     features: &UploadPackFeatures,
     advertisements: &[RefAdvertisement],
-) -> Result<String> {
+) -> Option<String> {
     for symref in &features.symrefs {
         if let Some((name, target)) = symref.split_once(':')
             && name == "HEAD"
             && let Some(branch) = target.strip_prefix("refs/heads/")
         {
-            return Ok(branch.to_string());
+            return Some(branch.to_string());
         }
     }
     if let Some(head) = advertisements
@@ -907,13 +939,28 @@ fn http_remote_head_branch(
             if advertisement.oid == head.oid
                 && let Some(branch) = advertisement.name.strip_prefix("refs/heads/")
             {
-                return Ok(branch.to_string());
+                return Some(branch.to_string());
             }
         }
     }
-    Err(GitError::Unsupported(
-        "could not determine the remote default branch".into(),
-    ))
+    None
+}
+
+/// git's `repo_default_branch_name`: `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`
+/// (when non-empty), then `init.defaultBranch`, then `master`. Used to name the
+/// unborn local branch when cloning an empty/unborn remote.
+fn clone_default_branch_name() -> String {
+    if let Ok(name) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+        && !name.is_empty()
+    {
+        return name;
+    }
+    if let Ok(Some(name)) = crate::clone_init_default_branch_config()
+        && !name.is_empty()
+    {
+        return name;
+    }
+    "master".to_string()
 }
 
 /// Clone a repository over smart HTTP(S). Covers the common non-bare case;
@@ -960,7 +1007,8 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
             format.name()
         )));
     }
-    let remote_head_branch = http_remote_head_branch(&features, &advertisements)?;
+    let remote_head_branch = http_remote_head_branch(&features, &advertisements)
+        .unwrap_or_else(clone_default_branch_name);
     let branch_explicit = options.branch.is_some();
     let checkout_branch = options
         .branch
@@ -994,6 +1042,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
         filter: None,
+        branch_explicit,
     };
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
@@ -1035,9 +1084,12 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         },
     );
     let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
+    let empty = outcome.empty;
     let git_dir = outcome.git_dir;
 
-    if !options.checkout {
+    if empty {
+        warn_cloned_empty_repository();
+    } else if !options.checkout {
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse {
         apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
@@ -1045,7 +1097,9 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
     }
-    if !options.quiet {
+    // An empty-repository clone stops before the checkout that would print
+    // "done."; git emits only the warning in that case.
+    if !options.quiet && !empty {
         eprintln!("done.");
     }
     Ok(())
@@ -1122,7 +1176,10 @@ fn clone_network_repository(
         }
     };
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
-    let remote_head_branch = http_remote_head_branch(&features, &advertisements)?;
+    // An empty/unborn remote advertises no usable HEAD; fall back to the local
+    // default branch name so the unborn-clone path can name `HEAD`.
+    let remote_head_branch = http_remote_head_branch(&features, &advertisements)
+        .unwrap_or_else(clone_default_branch_name);
     let branch_explicit = options.branch.is_some();
     let checkout_branch = options
         .branch
@@ -1159,6 +1216,7 @@ fn clone_network_repository(
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
         filter: None,
+        branch_explicit,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -1201,9 +1259,12 @@ fn clone_network_repository(
         },
     );
     let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
+    let empty = outcome.empty;
     let git_dir = outcome.git_dir;
 
-    if !options.checkout {
+    if empty {
+        warn_cloned_empty_repository();
+    } else if !options.checkout {
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse {
         apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
@@ -1211,7 +1272,9 @@ fn clone_network_repository(
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
     }
-    if !options.quiet {
+    // An empty-repository clone stops before the checkout that would print
+    // "done."; git emits only the warning in that case.
+    if !options.quiet && !empty {
         eprintln!("done.");
     }
     Ok(())
@@ -1352,6 +1415,12 @@ struct CloneLocalOptions<'a> {
     fetch_filter: Option<sley_odb::PackObjectFilter>,
     head_branch: &'a str,
     branch_explicit: bool,
+    /// The source HEAD is detached at this commit (no default branch). The bare
+    /// clone copies every ref (mirror) or the branch refs, then points the
+    /// destination `HEAD` directly at this commit instead of a `refs/heads/<x>`
+    /// symref — mirrors git's `update_head` detached arm for a bare clone of a
+    /// detached-HEAD source.
+    detached_head: Option<&'a ObjectId>,
     revision_oid: Option<&'a ObjectId>,
     mirror: bool,
     single_branch: bool,
@@ -1368,11 +1437,19 @@ fn clone_bare_or_mirror_local_repository(
     destination: &Path,
     options: CloneLocalOptions<'_>,
 ) -> Result<()> {
+    // A detached-HEAD source has no default branch; init on a placeholder so the
+    // empty `head_branch` does not form an invalid `refs/heads/` symref. The
+    // destination HEAD is repointed at the detached commit after the fetch.
+    let initial_branch = if options.detached_head.is_some() {
+        "__git_rs_clone_unborn__"
+    } else {
+        options.head_branch
+    };
     let layout = RepositoryLayout::init_at_with_initial_branch(
         destination,
         options.format,
         true,
-        options.head_branch,
+        initial_branch,
     )?;
     let git_dir = layout.git_dir;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
@@ -1460,7 +1537,14 @@ fn clone_bare_or_mirror_local_repository(
         },
     );
     env::set_current_dir(previous_cwd)?;
-    fetch_result
+    fetch_result?;
+    // For a detached-HEAD source, point the destination HEAD directly at the
+    // source's detached commit (it was just copied by the mirror/branch fetch),
+    // matching git's `update_head` detached arm.
+    if let Some(detached) = options.detached_head {
+        fs::write(git_dir.join("HEAD"), format!("{detached}\n"))?;
+    }
+    Ok(())
 }
 
 /// Parse a `git clone --config <key>=<value>` (a.k.a. clone's own `-c`) entry
@@ -1821,26 +1905,166 @@ fn prune_empty_clone_dirs(root: &Path, mut dir: Option<&Path>) -> Result<()> {
 }
 
 fn default_clone_directory(repository: &str, bare: bool) -> PathBuf {
-    let path = parse_remote_url(repository)
-        .ok()
-        .map(|url| PathBuf::from(url.path))
-        .unwrap_or_else(|| PathBuf::from(repository));
-    let leaf = path.file_name().and_then(|name| {
-        if name == ".git" {
-            path.parent().and_then(Path::file_name)
-        } else {
-            Some(name)
-        }
-    });
-    let name = leaf
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repository".to_string());
-    let name = name.strip_suffix(".git").unwrap_or(&name);
-    if bare {
-        PathBuf::from(format!("{name}.git"))
-    } else {
-        PathBuf::from(name)
+    // Port of upstream `git_url_basename` (dir.c). Operates on raw bytes because
+    // the URL/host:path syntax must be parsed exactly as git does, including
+    // auth-stripping, trailing-`/.git` handling, port stripping, and treating
+    // `:` as a path separator for backwards-compatible `host:path` URLs.
+    PathBuf::from(git_url_basename(repository, false, bare))
+}
+
+/// `is_dir_sep` on Linux: only `/`.
+fn is_dir_sep(c: u8) -> bool {
+    c == b'/'
+}
+
+/// Faithful port of `git_url_basename` from upstream `dir.c`: guess the
+/// destination directory name for `git clone <repo>` when no explicit directory
+/// is given.
+fn git_url_basename(repo: &str, is_bundle: bool, is_bare: bool) -> String {
+    let bytes = repo.as_bytes();
+    let mut start = 0usize;
+    let mut end = bytes.len();
+
+    // Skip scheme ("://").
+    if let Some(pos) = repo.find("://") {
+        start = pos + 3;
     }
+
+    // Skip authentication data, greedily up to the last '@' inside the host
+    // part (before the first dir separator).
+    {
+        let mut ptr = start;
+        while ptr < end && !is_dir_sep(bytes[ptr]) {
+            if bytes[ptr] == b'@' {
+                start = ptr + 1;
+            }
+            ptr += 1;
+        }
+    }
+
+    // Strip trailing spaces, slashes and a trailing "/.git".
+    while start < end && (is_dir_sep(bytes[end - 1]) || bytes[end - 1].is_ascii_whitespace()) {
+        end -= 1;
+    }
+    if end >= start
+        && end - start > 5
+        && is_dir_sep(bytes[end - 5])
+        && &bytes[end - 4..end] == b".git"
+    {
+        end -= 5;
+        while start < end && is_dir_sep(bytes[end - 1]) {
+            end -= 1;
+        }
+    }
+
+    if end < start {
+        return die_no_directory_name();
+    }
+
+    // Strip a trailing port number, but only for a bare hostname (no '/' but a
+    // ':' present), so URLs like '/foo/bar:2222.git' keep '2222'.
+    let span = &bytes[start..end];
+    if !span.contains(&b'/') && span.contains(&b':') {
+        let mut ptr = end;
+        while start < ptr && bytes[ptr - 1].is_ascii_digit() && bytes[ptr - 1] != b':' {
+            ptr -= 1;
+        }
+        if start < ptr && bytes[ptr - 1] == b':' {
+            end = ptr - 1;
+        }
+    }
+
+    // Find the last component. Colons count as separators too, so cloning
+    // 'foo:bar.git' yields directory 'bar'.
+    {
+        let mut ptr = end;
+        while start < ptr && !is_dir_sep(bytes[ptr - 1]) && bytes[ptr - 1] != b':' {
+            ptr -= 1;
+        }
+        start = ptr;
+    }
+
+    // Strip a trailing ".bundle" or ".git" suffix.
+    let mut len = end - start;
+    let suffix: &[u8] = if is_bundle { b".bundle" } else { b".git" };
+    if len >= suffix.len() && &bytes[start + len - suffix.len()..start + len] == suffix {
+        len -= suffix.len();
+    }
+
+    if len == 0 || (len == 1 && bytes[start] == b'/') {
+        return die_no_directory_name();
+    }
+
+    let base = &bytes[start..start + len];
+    let mut dir: Vec<u8> = if is_bare {
+        let mut v = base.to_vec();
+        v.extend_from_slice(b".git");
+        v
+    } else {
+        base.to_vec()
+    };
+
+    // Replace runs of control/whitespace chars with a single ASCII space, and
+    // strip leading/trailing spaces.
+    if !dir.is_empty() {
+        let mut out = 0usize;
+        let mut prev_space = true; // strip leading whitespace
+        for i in 0..dir.len() {
+            let mut ch = dir[i];
+            if ch < 0x20 {
+                ch = b' ';
+            }
+            if ch.is_ascii_whitespace() {
+                if prev_space {
+                    continue;
+                }
+                prev_space = true;
+            } else {
+                prev_space = false;
+            }
+            dir[out] = ch;
+            out += 1;
+        }
+        dir.truncate(out);
+        if out > 0 && prev_space {
+            dir.truncate(out - 1);
+        }
+    }
+
+    String::from_utf8_lossy(&dir).into_owned()
+}
+
+/// git's empty-repository clone warning. Printed (to stderr) after the "Cloning
+/// into …" banner when the remote advertised no tip for the tracked branch.
+fn warn_cloned_empty_repository() {
+    eprintln!("warning: You appear to have cloned an empty repository.");
+}
+
+fn die_no_directory_name() -> String {
+    // Upstream `die()`s here; sley callers only reach this with degenerate URLs
+    // that the CLI already rejects. Fall back to a stable placeholder so the
+    // path type stays infallible.
+    "repository".to_string()
+}
+
+/// If `--branch=<name>` names a tag (and not a branch) in the local clone
+/// source, return the commit it resolves to so the clone checks it out
+/// detached. A branch of the same name takes precedence (git's
+/// `find_remote_branch` searches `refs/heads/` first), so this returns `None`
+/// when `refs/heads/<name>` exists.
+fn clone_source_tag_commit(
+    remote_common_git_dir: &Path,
+    format: ObjectFormat,
+    name: &str,
+) -> Option<ObjectId> {
+    let store = FileRefStore::new(remote_common_git_dir, format);
+    if store.read_ref(&format!("refs/heads/{name}")).ok()?.is_some() {
+        return None;
+    }
+    let tag_ref = format!("refs/tags/{name}");
+    store.read_ref(&tag_ref).ok()??;
+    // Resolve (peeling annotated tags) to the underlying commit.
+    sley_rev::resolve_revision(remote_common_git_dir, format, &tag_ref).ok()
 }
 
 fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<String> {
@@ -2795,7 +3019,7 @@ fn run_fetch(
 ) -> Result<()> {
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
-    sley_remote::fetch(
+    let outcome = sley_remote::fetch(
         sley_remote::FetchRequest {
             git_dir,
             format,
@@ -2810,6 +3034,64 @@ fn run_fetch(
             progress: &mut progress,
         },
     )?;
+    maybe_set_remote_head_on_fetch(git_dir, format, config, source, refspecs, &outcome)?;
+    Ok(())
+}
+
+/// git's `do_set_head` behavior in `builtin/fetch.c`: a plain `git fetch
+/// <remote>` (no explicit refspecs) creates `refs/remotes/<remote>/HEAD` from
+/// the remote's advertised default branch, but only when the remote has
+/// configured fetch refspecs and `remote.<name>.followRemoteHEAD` is not
+/// `never`. The default mode is `create` — set only if `<remote>/HEAD` does not
+/// already exist.
+fn maybe_set_remote_head_on_fetch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    source: &str,
+    refspecs: &[String],
+    outcome: &sley_remote::FetchOutcome,
+) -> Result<()> {
+    // Only for a default fetch (no command-line refspecs) of a configured remote
+    // that has fetch refspecs.
+    if !refspecs.is_empty() {
+        return Ok(());
+    }
+    if config.get("remote", Some(source), "fetch").is_none() {
+        return Ok(());
+    }
+    let follow = config
+        .get("remote", Some(source), "followremotehead")
+        .unwrap_or("create");
+    if follow.eq_ignore_ascii_case("never") {
+        return Ok(());
+    }
+    // The remote's advertised HEAD target (e.g. `refs/heads/main`).
+    let Some(head_symref) = outcome.head_symref.as_deref() else {
+        return Ok(());
+    };
+    let Some(head_name) = head_symref.strip_prefix("refs/heads/") else {
+        return Ok(());
+    };
+    let store = FileRefStore::new(git_dir, format);
+    let head_ref = format!("refs/remotes/{source}/HEAD");
+    let target = format!("refs/remotes/{source}/{head_name}");
+    // The matched branch must actually exist as a remote-tracking ref.
+    if store.read_ref(&target)?.is_none() {
+        return Ok(());
+    }
+    let create_only = !follow.eq_ignore_ascii_case("always");
+    if create_only && store.read_ref(&head_ref)?.is_some() {
+        return Ok(());
+    }
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: head_ref,
+        expected: None,
+        new: RefTarget::Symbolic(target),
+        reflog: None,
+    });
+    tx.commit()?;
     Ok(())
 }
 
@@ -3616,11 +3898,76 @@ pub(crate) fn cmd_remote(args: &[String]) -> Result<()> {
         "set-head" => cmd_remote_set_head(&args[idx + 1..]),
         "set-url" => cmd_remote_set_url(&args[idx + 1..]),
         "show" => cmd_remote_show(&args[idx + 1..]),
+        "update" => cmd_remote_update(&args[idx + 1..], verbose),
         other => Err(GitError::Command(format!(
             "unsupported remote subcommand {other}"
         ))),
     }
 }
+/// Emit a `git remote <sub>` usage block to stderr and return git's usage exit
+/// code (129). `synopsis` is the one-line usage (without the leading `usage: `);
+/// `options` are the option-help lines git appends after a blank line. The
+/// `^usage:` first line is what the upstream `test_extra_arg`/invalid-arg tests
+/// grep for.
+fn remote_usage_error(synopsis: &str, options: &str) -> GitError {
+    eprintln!("usage: {synopsis}");
+    if !options.is_empty() {
+        eprintln!();
+        eprint!("{options}");
+    }
+    GitError::Exit(129)
+}
+
+fn remote_add_usage_error() -> GitError {
+    remote_usage_error(
+        "git remote add [<options>] <name> <url>",
+        "    -f, --[no-]fetch      fetch the remote branches\n\
+         \x20   --[no-]tags           import all tags and associated objects when fetching\n\
+         \x20                         or do not fetch any tag at all (--no-tags)\n\
+         \x20   -t, --track <branch>  branch(es) to track\n\
+         \x20   -m, --master <branch>\n\
+         \x20                         master branch\n\
+         \x20   --mirror[=(push|fetch)]\n\
+         \x20                         set up remote as a mirror to push to or fetch from\n",
+    )
+}
+
+fn remote_rename_usage_error() -> GitError {
+    remote_usage_error(
+        "git remote rename [--[no-]progress] <old> <new>",
+        "    --[no-]progress       force progress reporting\n",
+    )
+}
+
+fn remote_remove_usage_error() -> GitError {
+    remote_usage_error("git remote remove <name>", "")
+}
+
+fn remote_sethead_usage_error() -> GitError {
+    remote_usage_error(
+        "git remote set-head <name> (-a | --auto | -d | --delete | <branch>)",
+        "    -a, --auto            set refs/remotes/<name>/HEAD according to remote\n\
+         \x20   -d, --delete          delete refs/remotes/<name>/HEAD\n",
+    )
+}
+
+fn remote_geturl_usage_error() -> GitError {
+    remote_usage_error(
+        "git remote get-url [--push] [--all] <name>",
+        "    --push                query push URLs rather than fetch URLs\n\
+         \x20   --all                 return all URLs\n",
+    )
+}
+
+fn remote_seturl_usage_error() -> GitError {
+    remote_usage_error(
+        "git remote set-url [--push] <name> <newurl> [<oldurl>]",
+        "    --push                manipulate push URLs\n\
+         \x20   --add                 add URL\n\
+         \x20   --delete              delete URLs\n",
+    )
+}
+
 fn remote_list(verbose: bool) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let config = read_repo_config(&git_dir)?;
@@ -3646,10 +3993,13 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     let mut master = None;
     let mut tag_opt = None;
     let mut mirror = RemoteAddMirror::None;
+    let mut fetch = false;
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "-f" | "--fetch" => fetch = true,
+            "--no-fetch" => fetch = false,
             "-t" | "--track" => {
                 let branch = iter
                     .next()
@@ -3696,9 +4046,7 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
         }
     }
     if positional.len() != 2 {
-        return Err(GitError::Command(
-            "remote add requires [-t <branch>] <name> <url>".into(),
-        ));
+        return Err(remote_add_usage_error());
     }
     let name = positional[0];
     let url = positional[1];
@@ -3747,6 +4095,12 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
         }
     }
     write_repo_config(&git_dir, &config)?;
+    // `-f`/`--fetch`: git runs `git fetch <name>` immediately after configuring
+    // the remote (builtin/remote.c `add()`), so the tracking refs exist before
+    // `-m`'s master HEAD is set.
+    if fetch {
+        cmd_fetch(&[name.to_string()])?;
+    }
     if let Some(master) = master {
         let format = repository_object_format(&git_dir)?;
         let store = FileRefStore::new(&git_dir, format);
@@ -3794,9 +4148,7 @@ pub(crate) fn cmd_remote_get_url(args: &[String]) -> Result<()> {
         }
     }
     if positional.len() != 1 {
-        return Err(GitError::Command(
-            "remote get-url requires [--push] [--all] <name>".into(),
-        ));
+        return Err(remote_geturl_usage_error());
     }
     let name = positional[0];
     validate_remote_name(name)?;
@@ -3830,7 +4182,7 @@ pub(crate) fn cmd_remote_get_url(args: &[String]) -> Result<()> {
 
 pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     if args.len() != 1 {
-        return Err(GitError::Command("remote remove requires <name>".into()));
+        return Err(remote_remove_usage_error());
     }
     let name = &args[0];
     validate_remote_name(name)?;
@@ -3848,6 +4200,88 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     write_repo_config(&git_dir, &config)?;
     let format = repository_object_format(&git_dir)?;
     remove_remote_tracking_refs(&git_dir, format, name)
+}
+
+/// `git remote update [-p|--prune] [(<group> | <remote>)...]`.
+///
+/// Upstream `builtin/remote.c::update` shells out to `git fetch --multiple
+/// [--prune] [-v] <names...>` where an empty arg list means the `default`
+/// group (every remote that does not set `remote.<name>.skipDefaultUpdate`,
+/// or — when no remote is in the default set — `--all`). A named argument is
+/// expanded through `remotes.<group>` when that config exists, otherwise taken
+/// as a bare remote name. We resolve the remote set here and fetch each one in
+/// turn (sley's `fetch` is single-remote), matching that behavior without the
+/// process fan-out.
+pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
+    let mut prune: Option<bool> = None;
+    let mut groups: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-p" | "--prune" => prune = Some(true),
+            "--no-prune" => prune = Some(false),
+            "-v" | "--verbose" => { /* verbose already captured by cmd_remote */ }
+            _ => {
+                groups.push(arg.clone());
+                groups.extend(iter.by_ref().cloned());
+            }
+        }
+    }
+
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let config = read_repo_config(&git_dir)?;
+
+    // Resolve the requested groups/remotes into a de-duplicated, order-preserving
+    // list of concrete remote names.
+    let mut remotes: Vec<String> = Vec::new();
+    let mut push_unique = |name: String, into: &mut Vec<String>| {
+        if !into.contains(&name) {
+            into.push(name);
+        }
+    };
+    if groups.is_empty() {
+        // The implicit `default` group: a `remotes.default` list if configured,
+        // else every remote without `remote.<name>.skipDefaultUpdate`.
+        if let Some(list) = config.get("remotes", None, "default") {
+            for name in list.split_whitespace() {
+                push_unique(name.to_string(), &mut remotes);
+            }
+        } else {
+            for name in remote_names(&config) {
+                let skip = config
+                    .get_bool("remote", Some(&name), "skipdefaultupdate")
+                    .unwrap_or(false);
+                if !skip {
+                    push_unique(name, &mut remotes);
+                }
+            }
+        }
+    } else {
+        for group in &groups {
+            if let Some(list) = config.get("remotes", None, group) {
+                for name in list.split_whitespace() {
+                    push_unique(name.to_string(), &mut remotes);
+                }
+            } else {
+                push_unique(group.clone(), &mut remotes);
+            }
+        }
+    }
+
+    for remote in remotes {
+        let mut fetch_args = Vec::new();
+        match prune {
+            Some(true) => fetch_args.push("--prune".to_string()),
+            Some(false) => fetch_args.push("--no-prune".to_string()),
+            None => {}
+        }
+        if verbose {
+            fetch_args.push("-v".to_string());
+        }
+        fetch_args.push(remote);
+        cmd_fetch(&fetch_args)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
@@ -3887,13 +4321,17 @@ pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
-    if args.len() != 2 {
-        return Err(GitError::Command(
-            "remote rename requires <old> <new>".into(),
-        ));
+    // `--[no-]progress` is accepted (and ignored — sley does not render rename
+    // progress) before the two positional names, matching git's option parsing.
+    let positional: Vec<&String> = args
+        .iter()
+        .filter(|arg| !matches!(arg.as_str(), "--progress" | "--no-progress"))
+        .collect();
+    if positional.len() != 2 {
+        return Err(remote_rename_usage_error());
     }
-    let old = &args[0];
-    let new = &args[1];
+    let old = positional[0];
+    let new = positional[1];
     validate_remote_name(old)?;
     validate_remote_name(new)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
@@ -4183,9 +4621,7 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
             (positional[0], Some(positional[1]))
         }
         _ => {
-            return Err(GitError::Command(
-                "remote set-head requires <name> (-d|--delete|<branch>)".into(),
-            ));
+            return Err(remote_sethead_usage_error());
         }
     };
     validate_remote_name(name)?;
@@ -4342,9 +4778,7 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     if (add || delete) && positional.len() != 2
         || (!add && !delete && !(2..=3).contains(&positional.len()))
     {
-        return Err(GitError::Command(
-            "remote set-url requires [--push] [--add|--delete] <name> <url> [<oldurl>]".into(),
-        ));
+        return Err(remote_seturl_usage_error());
     }
     let name = positional[0];
     let url = positional[1];
@@ -4769,6 +5203,16 @@ pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
         return Err(GitError::InvalidFormat(
             "remote name contains a delimiter byte".into(),
         ));
+    }
+    // git's `valid_remote_name` (remote.c) builds the fetch refspec
+    // `refs/heads/test:refs/remotes/<name>/test` and rejects the name if that is
+    // not a valid fetch refspec — this catches names with a colon, control
+    // chars, or other refname-invalid spellings (e.g. `some:url`).
+    let probe = format!("refs/heads/test:refs/remotes/{name}/test");
+    if sley_protocol::parse_refspec(&probe).is_err() {
+        return Err(GitError::InvalidFormat(format!(
+            "'{name}' is not a valid remote name"
+        )));
     }
     Ok(())
 }

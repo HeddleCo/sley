@@ -628,6 +628,34 @@ fn resolve_previous_checkout(
 
 /// Extract the source branch `X` from a HEAD reflog message of the form
 /// "checkout: moving from X to Y", or `None` for any other reflog message.
+/// The name of the N-th previously checked-out branch (the `X` in the N-th
+/// newest "checkout: moving from X to Y" HEAD reflog entry), as used by
+/// `git checkout -`/`@{-N}` to switch *back to that branch by name* rather than
+/// to a detached commit. Returns `None` when there are fewer than `n` such
+/// reflog entries.
+pub fn nth_prior_checkout_branch_name(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    n: usize,
+) -> Result<Option<String>> {
+    if n == 0 {
+        return Ok(None);
+    }
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let entries = refs.read_reflog("HEAD")?;
+    let mut seen = 0usize;
+    for entry in entries.iter().rev() {
+        let Some(from) = checkout_move_source(&entry.message) else {
+            continue;
+        };
+        seen += 1;
+        if seen == n {
+            return Ok(Some(from.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 fn checkout_move_source(message: &[u8]) -> Option<&str> {
     let message = std::str::from_utf8(message).ok()?;
     let rest = message.strip_prefix("checkout: moving from ")?;

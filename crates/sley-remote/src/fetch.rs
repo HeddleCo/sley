@@ -415,6 +415,14 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             }
             let advertisements =
                 crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
+            // The remote's advertised HEAD symref target (e.g. `refs/heads/main`),
+            // used by the CLI to create `refs/remotes/<remote>/HEAD` on a default
+            // fetch — parity with the network transports' `head_symref`.
+            if let Some(RefTarget::Symbolic(target)) =
+                FileRefStore::new(remote_git_dir, request.format).read_ref("HEAD")?
+            {
+                outcome.head_symref = Some(target);
+            }
             let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
             // Shallow fetch: the in-process upload-pack needs its deepen plan up
             // front. The boundary walk starts from the primary planned tips

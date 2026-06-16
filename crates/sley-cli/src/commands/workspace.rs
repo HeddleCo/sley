@@ -635,6 +635,20 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    // `git checkout -` is shorthand for `git checkout @{-1}`: switch back to the
+    // branch we most recently left (by name, so HEAD re-attaches). Expand it to
+    // that branch name before branch/revision resolution; if the prior checkout
+    // was detached (no branch name) leave it so the normal `@{-1}` revision path
+    // handles the detached case.
+    if matches!(branch_mode, CheckoutBranchMode::Existing)
+        && dashdash_index.is_none()
+        && positional.len() == 1
+        && positional[0] == "-"
+    {
+        if let Some(name) = sley_rev::nth_prior_checkout_branch_name(&git_dir, format, 1)? {
+            positional[0] = name;
+        }
+    }
     let checkout_old_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or_else(|| ObjectId::null(format));
 
