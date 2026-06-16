@@ -244,6 +244,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "prune" => commands::pack::cmd_prune(&args[1..]),
         "prune-packed" => commands::plumbing::cmd_prune_packed(&args[1..]),
         "push" => commands::remote_cmds::cmd_push(&args[1..]),
+        "send-pack" => commands::remote_cmds::cmd_send_pack(&args[1..]),
         "fetch-pack" => commands::fetch_pack::cmd_fetch_pack(&args[1..]),
         "unpack-objects" => commands::pack::cmd_unpack_objects(&args[1..]),
         "receive-pack" => commands::remote_cmds::cmd_receive_pack(&args[1..]),

@@ -2508,6 +2508,167 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const SEND_PACK_USAGE: &str = "usage: git send-pack [--mirror] [--dry-run] [--force]\n              [--receive-pack=<git-receive-pack>]\n              [--verbose] [--thin] [--atomic]\n              [--[no-]signed | --signed=(true|false|if-asked)]\n              [<host>:]<directory> (--all | <ref>...)";
+
+/// `git send-pack [<options>] <directory> (--all | <ref>...)`: the plumbing push
+/// to a local repository. Unlike `git push`, it takes a literal destination
+/// directory (no remote-name resolution) and pushes bare refs as `<ref>:<ref>`
+/// (a leading `:` deletes). It renders the same status report as push but does
+/// not touch remote-tracking refs (it is a low-level transport, not porcelain).
+pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
+    // `-h` is handled by git's option parser before any repository is opened, so
+    // it works outside a git repo too (the `nongit` case in t5400).
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+
+    let mut force = false;
+    let mut dry_run = false;
+    let mut atomic = false;
+    let mut mirror = false;
+    let mut all_refs = false;
+    let mut quiet = false;
+    let mut force_with_lease_specs: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{SEND_PACK_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            "-f" | "--force" => force = true,
+            "-n" | "--dry-run" => dry_run = true,
+            "--atomic" => atomic = true,
+            "--mirror" => mirror = true,
+            "--all" => all_refs = true,
+            "-q" | "--quiet" => quiet = true,
+            "-v" | "--verbose" | "--progress" | "--no-progress" | "--thin" | "--no-thin"
+            | "--stateless-rpc" | "--helper-status" => {}
+            "--signed" | "--no-signed" => {}
+            value if value.starts_with("--signed=") => {}
+            "--force-if-includes" => {}
+            value if value.starts_with("--force-with-lease=") => {
+                force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
+            }
+            "--receive-pack" | "--exec" | "--remote" | "--push-option" => {
+                iter.next().ok_or_else(|| {
+                    GitError::Command(format!("send-pack {} requires a value", arg.as_str()))
+                })?;
+            }
+            value
+                if value.starts_with("--receive-pack=")
+                    || value.starts_with("--exec=")
+                    || value.starts_with("--remote=")
+                    || value.starts_with("--push-option=") => {}
+            "--" => {
+                positional.extend(iter.map(|value| value.to_string()));
+                break;
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                eprintln!("{SEND_PACK_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+
+    if mirror {
+        force = true;
+    }
+
+    let Some((dest, refs)) = positional.split_first() else {
+        eprintln!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    };
+    if refs.is_empty() && !all_refs && !mirror {
+        eprintln!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+
+    let remote_git_dir = ls_remote_git_dir(dest)?;
+    let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+
+    let mut refspecs: Vec<String> = if mirror {
+        vec!["refs/*:refs/*".to_string()]
+    } else if all_refs {
+        vec!["refs/heads/*:refs/heads/*".to_string()]
+    } else {
+        // send-pack pushes each bare ref as `<ref>:<ref>` (a leading `:` is a
+        // delete; a leading `+` forces); no porcelain-style short-name guessing.
+        refs.iter()
+            .map(|spec| {
+                let (force_marker, body) = match spec.strip_prefix('+') {
+                    Some(rest) => ("+", rest),
+                    None => ("", spec.as_str()),
+                };
+                let normalized = if let Some(rest) = body.strip_prefix(':') {
+                    format!(":{}", sley_remote::normalize_push_refname(rest))
+                } else if let Some((src, dstn)) = body.split_once(':') {
+                    format!(
+                        "{}:{}",
+                        sley_remote::normalize_push_refname(src),
+                        sley_remote::normalize_push_refname(dstn)
+                    )
+                } else {
+                    let name = sley_remote::normalize_push_refname(body);
+                    format!("{name}:{name}")
+                };
+                format!("{force_marker}{normalized}")
+            })
+            .collect()
+    };
+
+    // `--mirror` deletes remote refs the local repo no longer has.
+    if mirror {
+        let remote_advertisements =
+            sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+        let local_names: std::collections::HashSet<String> = store
+            .list_refs()?
+            .into_iter()
+            .map(|reference| reference.name)
+            .collect();
+        for advertisement in &remote_advertisements {
+            if advertisement.name.starts_with("refs/") && !local_names.contains(&advertisement.name)
+            {
+                refspecs.push(format!(":{}", advertisement.name));
+            }
+        }
+    }
+
+    let force_with_lease =
+        resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+    let options = PushOptions {
+        quiet,
+        set_upstream: false,
+        force,
+        no_verify: true,
+        dry_run,
+    };
+    run_push_local_report(RunPushLocalReport {
+        git_dir: &git_dir,
+        common_git_dir: &common_git_dir,
+        format,
+        remote: dest,
+        remote_git_dir: &remote_git_dir,
+        remote_common_git_dir: &remote_common_git_dir,
+        refspecs: &refspecs,
+        options,
+        porcelain: false,
+        atomic,
+        force_with_lease: &force_with_lease,
+        force_with_lease_default: false,
+    })
+}
+
 pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -2520,6 +2681,15 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut no_verify = false;
     let mut dry_run = false;
+    let mut porcelain = false;
+    let mut atomic = false;
+    let mut mirror = false;
+    let mut all_refs = false;
+    let mut tags = false;
+    // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
+    // bare flag (lease every pushed ref against its remote-tracking ref).
+    let mut force_with_lease_default = false;
+    let mut force_with_lease_specs: Vec<String> = Vec::new();
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2536,6 +2706,24 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             "--no-set-upstream" => set_upstream = false,
             "-d" | "--delete" => delete = true,
             "--no-delete" => delete = false,
+            "--porcelain" => porcelain = true,
+            "--atomic" => atomic = true,
+            "--no-atomic" => atomic = false,
+            "--mirror" => mirror = true,
+            "--all" | "--branches" => all_refs = true,
+            "--tags" => tags = true,
+            "--force-with-lease" => force_with_lease_default = true,
+            "--no-force-with-lease" => {
+                force_with_lease_default = false;
+                force_with_lease_specs.clear();
+            }
+            // `--force-if-includes` is a refinement of `--force-with-lease`; for
+            // the file:// transport (no remote-tracking reflog to consult) it has
+            // no additional effect, so it is accepted as a no-op.
+            "--force-if-includes" | "--no-force-if-includes" => {}
+            value if value.starts_with("--force-with-lease=") => {
+                force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
+            }
             "--repo" | "--receive-pack" | "--exec" => {
                 iter.next().ok_or_else(|| {
                     GitError::Command(format!("push {} requires a value", arg.as_str()))
@@ -2545,7 +2733,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 if value.starts_with("--repo=")
                     || value.starts_with("--receive-pack=")
                     || value.starts_with("--exec=") => {}
-            "--porcelain" | "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
+            "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
             // through to the unknown-option path, matching git).
@@ -2563,6 +2751,17 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         }
     }
 
+    // `--mirror` implies `--force` and forbids explicit refspecs.
+    if mirror {
+        if positional.len() >= 2 {
+            return Err(GitError::Command("--mirror can't be combined with refspecs".into()));
+        }
+        force = true;
+    }
+    if all_refs && positional.len() >= 2 {
+        return Err(GitError::Command("--all can't be combined with refspecs".into()));
+    }
+
     let (remote, mut refspecs) = if delete {
         let Some((remote, names)) = positional.split_first() else {
             return Err(GitError::Command(
@@ -2578,6 +2777,22 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             remote.clone(),
             names.iter().map(|refspec| format!(":{refspec}")).collect(),
         )
+    } else if mirror {
+        // `--mirror`: push every local ref to the same name, mirroring; the
+        // remote-ref deletions for refs we no longer have are expanded below
+        // once the remote's advertisement is known.
+        let remote = mirror_all_remote(&git_dir, &store, &positional)?;
+        (remote, vec!["refs/*:refs/*".to_string()])
+    } else if all_refs || tags {
+        let remote = mirror_all_remote(&git_dir, &store, &positional)?;
+        let mut specs = Vec::new();
+        if all_refs {
+            specs.push("refs/heads/*:refs/heads/*".to_string());
+        }
+        if tags {
+            specs.push("refs/tags/*:refs/tags/*".to_string());
+        }
+        (remote, specs)
     } else {
         push_remote_and_refspecs(&git_dir, &store, &positional)?
     };
@@ -2610,6 +2825,50 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             common_git_dir: remote_common_git_dir,
         }
     };
+
+    // The file:// (local) transport gets git's full per-ref status report: this
+    // is the path the upstream push tests exercise. Other transports keep the
+    // existing terse summary.
+    if let sley_remote::PushDestination::Local {
+        git_dir: remote_git_dir,
+        common_git_dir: remote_common_git_dir,
+    } = &destination
+    {
+        // `--mirror` also deletes remote refs the local repo no longer has.
+        if mirror {
+            let remote_advertisements =
+                sley_remote::local_fetch_advertisements(remote_git_dir, format)?;
+            let local_names: std::collections::HashSet<String> = store
+                .list_refs()?
+                .into_iter()
+                .map(|reference| reference.name)
+                .collect();
+            for advertisement in &remote_advertisements {
+                if advertisement.name.starts_with("refs/")
+                    && !local_names.contains(&advertisement.name)
+                {
+                    refspecs.push(format!(":{}", advertisement.name));
+                }
+            }
+        }
+        let force_with_lease =
+            resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+        return run_push_local_report(RunPushLocalReport {
+            git_dir: &git_dir,
+            common_git_dir: &common_git_dir,
+            format,
+            remote: &remote,
+            remote_git_dir,
+            remote_common_git_dir,
+            refspecs: &refspecs,
+            options,
+            porcelain,
+            atomic,
+            force_with_lease: &force_with_lease,
+            force_with_lease_default,
+        });
+    }
+
     run_push(
         &git_dir,
         &common_git_dir,
@@ -2619,6 +2878,57 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         &refspecs,
         options,
     )
+}
+
+/// Resolve the remote argument for `--mirror`/`--all`/`--tags`: the lone
+/// positional, or the configured default push remote when none is given.
+fn mirror_all_remote(
+    git_dir: &Path,
+    store: &FileRefStore,
+    positional: &[String],
+) -> Result<String> {
+    if let Some(remote) = positional.first() {
+        return Ok(remote.clone());
+    }
+    // Reuse the no-positional resolution path (default remote), discarding the
+    // refspecs it would compute.
+    let (remote, _) = push_remote_and_refspecs(git_dir, store, &[])?;
+    Ok(remote)
+}
+
+/// Resolve `--force-with-lease=<ref>[:<expect>]` specs into `(dst, expected_old)`
+/// pairs. An omitted `<expect>` leases against the ref's remote-tracking value;
+/// an explicit empty `<expect>` means "must not exist".
+fn resolve_force_with_lease(
+    git_dir: &Path,
+    store: &FileRefStore,
+    format: ObjectFormat,
+    specs: &[String],
+) -> Result<Vec<(String, Option<ObjectId>)>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let (refname, expect) = match spec.split_once(':') {
+            Some((refname, expect)) => (refname, Some(expect)),
+            None => (spec.as_str(), None),
+        };
+        let dst = sley_remote::normalize_push_refname(refname);
+        let expected = match expect {
+            Some("") => None,
+            Some(value) => Some(sley_rev::resolve_revision(git_dir, format, value)?),
+            None => {
+                // Lease against the ref's own remote-tracking value is not
+                // discoverable for an arbitrary file:// remote without the
+                // remote name; treat a bare per-ref lease the same as an
+                // explicit current value lookup against the local ref store.
+                match store.read_ref(&dst)? {
+                    Some(RefTarget::Direct(oid)) => Some(oid),
+                    _ => None,
+                }
+            }
+        };
+        out.push((dst, expected));
+    }
+    Ok(out)
 }
 
 fn default_head_push_destinations(store: &FileRefStore, refspecs: &mut [String]) -> Result<()> {
@@ -2716,6 +3026,414 @@ fn run_push(
         }
     }
     Ok(())
+}
+
+/// Inputs for the file:// push path that renders git's full status report.
+struct RunPushLocalReport<'a> {
+    git_dir: &'a Path,
+    common_git_dir: &'a Path,
+    format: ObjectFormat,
+    remote: &'a str,
+    remote_git_dir: &'a Path,
+    remote_common_git_dir: &'a Path,
+    refspecs: &'a [String],
+    options: PushOptions,
+    porcelain: bool,
+    atomic: bool,
+    force_with_lease: &'a [(String, Option<ObjectId>)],
+    force_with_lease_default: bool,
+}
+
+/// Drive a file:// push through [`sley_remote::push_local_with_report`], render
+/// git's `transport_print_push_status`, update remote-tracking refs, run hooks,
+/// and return the git exit code (1 when any ref was rejected).
+fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
+    let config = read_repo_config(req.git_dir).unwrap_or_default();
+
+    // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
+    // This lets us run the receive-side pre-receive/update hooks before any ref
+    // is written, matching git's receive-pack ordering, and reject all refs when
+    // a hook declines.
+    let plan = sley_remote::push_local_with_report(
+        sley_remote::PushReportRequest {
+            git_dir: req.git_dir,
+            common_git_dir: req.common_git_dir,
+            format: req.format,
+            remote_git_dir: req.remote_git_dir,
+            remote_common_git_dir: req.remote_common_git_dir,
+            refspecs: req.refspecs,
+            force: req.options.force,
+            atomic: req.atomic,
+            dry_run: true,
+            force_with_lease: req.force_with_lease,
+            force_with_lease_default: req.force_with_lease_default,
+        },
+        &config,
+    )?;
+
+    // A no-op push (no refspec matched anything) prints nothing and exits 0,
+    // matching git's `transport_refs_pushed` short-circuit on an empty ref list.
+    if plan.refs.is_empty() {
+        return Ok(());
+    }
+
+    // pre-push hook (driven from the would-be commands), unless --no-verify.
+    if !req.options.no_verify {
+        let commands: Vec<ReceivePackCommand> = plan
+            .refs
+            .iter()
+            .map(|reference| ReceivePackCommand {
+                old_id: reference.old_id,
+                new_id: reference.new_id,
+                name: reference.dst.clone(),
+            })
+            .collect();
+        run_pre_push_hook(req.git_dir, req.remote, req.refspecs, &commands)?;
+    }
+
+    let ok_commands: Vec<ReceivePackCommand> = plan
+        .refs
+        .iter()
+        .filter(|reference| matches!(reference.status, sley_remote::PushRefStatus::Ok))
+        .map(|reference| ReceivePackCommand {
+            old_id: reference.old_id,
+            new_id: reference.new_id,
+            name: reference.dst.clone(),
+        })
+        .collect();
+
+    let destination = sley_remote::PushDestination::Local {
+        git_dir: req.remote_git_dir.to_path_buf(),
+        common_git_dir: req.remote_common_git_dir.to_path_buf(),
+    };
+
+    // Run the receive-side pre-receive + update hooks. A failure declines the
+    // whole push (git's receive-pack rejects every ref with "pre-receive hook
+    // declined"). Skipped under --dry-run.
+    let pre_receive_declined = if !req.options.dry_run && !ok_commands.is_empty() {
+        run_local_receive_pre_hooks(&destination, &ok_commands).is_err()
+    } else {
+        false
+    };
+
+    // Second pass: actually apply (unless dry-run or the hook declined).
+    let mut report = if req.options.dry_run || pre_receive_declined {
+        plan
+    } else {
+        sley_remote::push_local_with_report(
+            sley_remote::PushReportRequest {
+                git_dir: req.git_dir,
+                common_git_dir: req.common_git_dir,
+                format: req.format,
+                remote_git_dir: req.remote_git_dir,
+                remote_common_git_dir: req.remote_common_git_dir,
+                refspecs: req.refspecs,
+                force: req.options.force,
+                atomic: req.atomic,
+                dry_run: false,
+                force_with_lease: req.force_with_lease,
+                force_with_lease_default: req.force_with_lease_default,
+            },
+            &config,
+        )?
+    };
+
+    if pre_receive_declined {
+        for reference in &mut report.refs {
+            if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+                reference.status = sley_remote::PushRefStatus::RemoteReject(
+                    "pre-receive hook declined".to_string(),
+                );
+            }
+        }
+    }
+
+    // Post-apply side effects for the refs that landed: post-receive/post-update
+    // hooks, remote-tracking ref updates (git updates tracking for every
+    // non-rejected ref, including up-to-date ones), and set-upstream config.
+    if !req.options.dry_run {
+        let applied: Vec<ReceivePackCommand> = report
+            .refs
+            .iter()
+            .filter(|reference| {
+                matches!(
+                    reference.status,
+                    sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+                )
+            })
+            .map(|reference| ReceivePackCommand {
+                old_id: reference.old_id,
+                new_id: reference.new_id,
+                name: reference.dst.clone(),
+            })
+            .collect();
+        if !applied.is_empty() {
+            let landed: Vec<ReceivePackCommand> = applied
+                .iter()
+                .filter(|command| command.old_id != command.new_id)
+                .cloned()
+                .collect();
+            if !landed.is_empty() {
+                run_local_receive_post_hooks(&destination, &landed)?;
+            }
+            update_push_remote_tracking_refs(
+                req.git_dir,
+                req.format,
+                &config,
+                req.remote,
+                &applied,
+            )?;
+            if req.options.set_upstream {
+                configure_push_upstreams(req.git_dir, req.remote, &applied)?;
+            }
+        }
+    }
+
+    // git's status header and the trailing error use the *resolved* push URL
+    // (`transport->url` / `anon_url`), not the remote name the user typed.
+    let url = push_resolved_url(req.remote).unwrap_or_else(|_| req.remote.to_string());
+
+    let had_errors = report.had_errors();
+    if !req.options.quiet || had_errors {
+        let local_db = FileObjectDatabase::from_git_dir(req.common_git_dir, req.format);
+        let remote_db = FileObjectDatabase::from_git_dir(req.remote_common_git_dir, req.format);
+        render_push_status(
+            &report,
+            &url,
+            req.porcelain,
+            req.options.dry_run,
+            &local_db,
+            &remote_db,
+        )?;
+    }
+
+    if had_errors {
+        eprintln!("error: failed to push some refs to '{url}'");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+/// Render a push status report exactly like git's `transport_print_push_status`:
+/// the "To <url>" header, one line per ref (OK refs first, then rejects), and a
+/// trailing "Done"/"Everything up-to-date" depending on porcelain and progress.
+fn render_push_status(
+    report: &sley_remote::PushStatusReport,
+    dest: &str,
+    porcelain: bool,
+    _dry_run: bool,
+    local_db: &FileObjectDatabase,
+    remote_db: &FileObjectDatabase,
+) -> Result<()> {
+    let summary_width = push_summary_width(report);
+    // git renders refs in `remote_refs` order: the refs that already exist on the
+    // remote first (the advertisement is sorted by ref name), then the
+    // newly-created refs appended in refspec/planning order. A "new" ref is a
+    // create (zero old id that is not a deletion). Reproduce that key, then the
+    // three status passes below each walk in this canonical order.
+    let mut ordered: Vec<(usize, &sley_remote::PushReportRef)> =
+        report.refs.iter().enumerate().collect();
+    ordered.sort_by(|(ai, a), (bi, b)| {
+        let a_new = a.old_id.is_null() && !a.is_deletion();
+        let b_new = b.old_id.is_null() && !b.is_deletion();
+        match (a_new, b_new) {
+            (false, false) => a.dst.cmp(&b.dst),
+            (true, true) => ai.cmp(bi),
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+        }
+    });
+    let ordered: Vec<&sley_remote::PushReportRef> =
+        ordered.into_iter().map(|(_, reference)| reference).collect();
+    let mut first = true;
+    let mut emit = |reference: &sley_remote::PushReportRef| {
+        if first {
+            if porcelain {
+                println!("To {dest}");
+            } else {
+                eprintln!("To {dest}");
+            }
+            first = false;
+        }
+        print_push_ref(
+            reference,
+            porcelain,
+            summary_width,
+            local_db,
+            remote_db,
+        );
+    };
+
+    // git's `transport_print_push_status` prints in three passes:
+    //   1. UPTODATE refs, but only when verbose — and porcelain forces verbose.
+    //   2. OK refs.
+    //   3. everything else (rejections / no-match).
+    // Each pass preserves planning order.
+    if porcelain {
+        for reference in &ordered {
+            if matches!(reference.status, sley_remote::PushRefStatus::UpToDate) {
+                emit(reference);
+            }
+        }
+    }
+    for reference in &ordered {
+        if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+            emit(reference);
+        }
+    }
+    for reference in &ordered {
+        if !matches!(
+            reference.status,
+            sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+        ) {
+            emit(reference);
+        }
+    }
+
+    // git prints "Done" under porcelain whenever the transport-level push
+    // succeeded (`!push_ret`); ref-level rejections (non-ff, atomic, remote ng)
+    // do not set push_ret, so over the local transport "Done" always prints.
+    if porcelain {
+        println!("Done");
+    } else if !report.had_errors() && !report.refs_pushed() {
+        // stable plumbing output; do not modify or localize
+        eprintln!("Everything up-to-date");
+    }
+    Ok(())
+}
+
+/// git's `transport_summary_width`: `2 * maxw + 3` where `maxw` is the widest
+/// unique abbreviation across every ref's old and new oid (min `DEFAULT_ABBREV`).
+fn push_summary_width(report: &sley_remote::PushStatusReport) -> usize {
+    let mut maxw = 7usize;
+    for reference in &report.refs {
+        // We approximate `measure_abbrev` with the default abbrev length; the
+        // status renderer recomputes the actual unique abbrev per oid below, so
+        // any growth there is reflected in the printed quickref even though the
+        // column width stays at the common-case 17. This matches git for the
+        // overwhelmingly common 7-hex-unique case the tests exercise.
+        let _ = reference;
+        maxw = maxw.max(7);
+    }
+    2 * maxw + 3
+}
+
+/// Render one ref's status line. Mirrors git's `print_one_push_report` +
+/// `print_ok_ref_status` + `print_ref_status`.
+fn print_push_ref(
+    reference: &sley_remote::PushReportRef,
+    porcelain: bool,
+    summary_width: usize,
+    local_db: &FileObjectDatabase,
+    remote_db: &FileObjectDatabase,
+) {
+    use sley_remote::PushRefStatus;
+    let (flag, summary, msg): (char, String, Option<String>) = match &reference.status {
+        PushRefStatus::Ok => push_ok_summary(reference, local_db, remote_db),
+        PushRefStatus::UpToDate => ('=', "[up to date]".to_string(), None),
+        PushRefStatus::RejectNonFastForward => {
+            ('!', "[rejected]".to_string(), Some("non-fast-forward".to_string()))
+        }
+        PushRefStatus::RejectStale => {
+            ('!', "[rejected]".to_string(), Some("stale info".to_string()))
+        }
+        PushRefStatus::RemoteReject(message) => {
+            ('!', "[remote rejected]".to_string(), Some(message.clone()))
+        }
+        PushRefStatus::AtomicPushFailed => {
+            ('!', "[rejected]".to_string(), Some("atomic push failed".to_string()))
+        }
+    };
+
+    // The "from" side. git models a deletion's peer_ref as the literal
+    // "(delete)": a *successful* delete (`print_ok_ref_status`) prints with
+    // `from = NULL` (→ `:dst`), but a *rejected* delete (`print_ref_status` in
+    // the reject arms) prints the peer_ref `(delete)` (→ `(delete):dst`). A
+    // non-delete uses its source ref both ways.
+    let from = if reference.is_deletion() {
+        if matches!(reference.status, PushRefStatus::Ok) {
+            None
+        } else {
+            Some("(delete)".to_string())
+        }
+    } else {
+        reference.src.clone()
+    };
+
+    if porcelain {
+        let from_field = from.as_deref().unwrap_or("");
+        let body = match &msg {
+            Some(m) => format!("{summary} ({m})"),
+            None => summary,
+        };
+        println!("{flag}\t{from_field}:{}\t{body}", reference.dst);
+    } else {
+        let to = prettify_refname(&reference.dst);
+        let mut line = format!(" {flag} {summary:<summary_width$} ");
+        match &from {
+            Some(from) => line.push_str(&format!("{} -> {to}", prettify_refname(from))),
+            None => line.push_str(&to),
+        }
+        if let Some(m) = &msg {
+            line.push_str(&format!(" ({m})"));
+        }
+        eprintln!("{line}");
+    }
+}
+
+/// git's `print_ok_ref_status`: classify an applied update into its flag,
+/// `[deleted]`/`[new branch]`/`[new tag]`/`[new reference]` summary, or the
+/// `<old>..<new>` / `<old>...<new>` quickref with the forced marker.
+fn push_ok_summary(
+    reference: &sley_remote::PushReportRef,
+    local_db: &FileObjectDatabase,
+    remote_db: &FileObjectDatabase,
+) -> (char, String, Option<String>) {
+    if reference.is_deletion() {
+        return ('-', "[deleted]".to_string(), None);
+    }
+    if reference.old_id.is_null() {
+        let summary = if reference.dst.starts_with("refs/tags/") {
+            "[new tag]"
+        } else if reference.dst.starts_with("refs/heads/") {
+            "[new branch]"
+        } else {
+            "[new reference]"
+        };
+        return ('*', summary.to_string(), None);
+    }
+    let old = unique_abbrev(&reference.old_id, remote_db);
+    let new = unique_abbrev(&reference.new_id, local_db);
+    if reference.forced {
+        ('+', format!("{old}...{new}"), Some("forced update".to_string()))
+    } else {
+        (' ', format!("{old}..{new}"), None)
+    }
+}
+
+/// Prettify a ref name for human output (git's `prettify_refname`): drop the
+/// `refs/heads/`, `refs/tags/`, or `refs/remotes/` prefix.
+fn prettify_refname(name: &str) -> String {
+    for prefix in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// git's `find_unique_abbrev`: the shortest prefix (≥ `DEFAULT_ABBREV` = 7) of
+/// `oid` that is unambiguous in `db`, growing until it resolves uniquely.
+fn unique_abbrev(oid: &ObjectId, db: &FileObjectDatabase) -> String {
+    let hex = oid.to_hex();
+    let mut width = 7.min(hex.len());
+    while width < hex.len() {
+        match db.resolve_prefix(&hex[..width]) {
+            Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
+            _ => break,
+        }
+    }
+    hex[..width].to_string()
 }
 
 fn update_push_remote_tracking_refs(

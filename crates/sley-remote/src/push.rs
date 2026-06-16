@@ -35,7 +35,7 @@ use sley_protocol::{
 };
 use sley_protocol::{
     PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackPushRequest,
-    ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
+    ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement, RefSpec,
     parse_refspec, plan_push_commands,
 };
 
@@ -211,6 +211,85 @@ pub struct PushOutcome {
     /// negotiated. Already validated: a failed unpack or a rejected ref is
     /// surfaced as an `Err` from [`push`], not returned here.
     pub report: Option<ReceivePackReportStatus>,
+}
+
+/// Per-ref outcome of a push, mirroring git's `enum ref_status` so the CLI can
+/// reproduce `transport_print_push_status` byte-for-byte. `Ok` covers create,
+/// update, forced update, and delete (disambiguated by the old/new ids on the
+/// owning [`PushReportRef`]); the remaining variants are the rejection reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushRefStatus {
+    /// The update was (or would be, under `--dry-run`) applied.
+    Ok,
+    /// The ref was already at the requested value; nothing to do.
+    UpToDate,
+    /// Local-side rejection: a non-forced non-fast-forward branch update.
+    RejectNonFastForward,
+    /// `--force-with-lease`/`--force-if-includes` expectation was not met.
+    RejectStale,
+    /// The receive-pack side reported `ng <ref> <message>`.
+    RemoteReject(String),
+    /// Part of an `--atomic` push that failed because a sibling ref was rejected.
+    AtomicPushFailed,
+}
+
+/// One ref's line in git's push status report. Carries everything
+/// `print_one_push_report` needs: the source ("from") ref, the destination
+/// ("to") ref, the old/new object ids, whether the update was forced, whether it
+/// is a deletion, and the classified [`PushRefStatus`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushReportRef {
+    /// The local source ref name (git's `ref->peer_ref->name`), e.g.
+    /// `refs/heads/main`. `None` for a deletion (git prints `:dst`).
+    pub src: Option<String>,
+    /// The destination ref name (git's `ref->name`), e.g. `refs/heads/main`.
+    pub dst: String,
+    /// The remote's old object id for `dst` (zero for a create).
+    pub old_id: ObjectId,
+    /// The object id installed at `dst` (zero for a delete).
+    pub new_id: ObjectId,
+    /// True when the update overwrote a non-fast-forward (git's `forced_update`).
+    pub forced: bool,
+    /// The classified outcome.
+    pub status: PushRefStatus,
+}
+
+impl PushReportRef {
+    /// Whether this ref is a deletion (new id is the zero oid).
+    pub fn is_deletion(&self) -> bool {
+        self.new_id.is_null()
+    }
+
+    /// Whether this ref's status counts as a push error (git's `push_had_errors`:
+    /// anything that is not `Ok`/`UpToDate`/none).
+    pub fn had_error(&self) -> bool {
+        !matches!(self.status, PushRefStatus::Ok | PushRefStatus::UpToDate)
+    }
+}
+
+/// The full result of a push as git's transport layer models it: every ref's
+/// classified status, ready to be rendered into the "To <url>" report and used
+/// to decide the process exit code and the `pull-before-push` advice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushStatusReport {
+    /// Every requested ref, in planning order.
+    pub refs: Vec<PushReportRef>,
+}
+
+impl PushStatusReport {
+    /// True when any ref was rejected (git's overall push error flag).
+    pub fn had_errors(&self) -> bool {
+        self.refs.iter().any(PushReportRef::had_error)
+    }
+
+    /// True when at least one ref was actually updated (git's
+    /// `transport_refs_pushed`): used to print "Everything up-to-date".
+    pub fn refs_pushed(&self) -> bool {
+        self.refs.iter().any(|reference| {
+            reference.old_id != reference.new_id
+                && matches!(reference.status, PushRefStatus::Ok)
+        })
+    }
 }
 
 /// Fully resolved inputs for a [`push`] run.
@@ -814,6 +893,250 @@ fn execute_push_local(
     })
 }
 
+/// Fully resolved inputs for a status-reporting push to a local repository.
+pub struct PushReportRequest<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository common `$GIT_DIR`, used for object access.
+    pub common_git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// The remote repository's `$GIT_DIR`.
+    pub remote_git_dir: &'a Path,
+    /// The remote repository's common `$GIT_DIR`.
+    pub remote_common_git_dir: &'a Path,
+    /// Refspecs requested by the caller (already URL/repo resolved).
+    pub refspecs: &'a [String],
+    /// Force every update (the `--force` flag).
+    pub force: bool,
+    /// `--atomic`: send nothing if any ref would be rejected.
+    pub atomic: bool,
+    /// `--dry-run`: classify and report, but do not send or update.
+    pub dry_run: bool,
+    /// Per-ref `--force-with-lease` expectations: `(dst, expected_old)`. An
+    /// `expected_old` of `None` means "the remote ref must not exist".
+    pub force_with_lease: &'a [(String, Option<ObjectId>)],
+    /// `--force-with-lease` with no per-ref value: lease every pushed ref against
+    /// its remote-tracking ref (git's implicit cas). The expected value per dst
+    /// is supplied via [`Self::force_with_lease`]; this flag only governs whether
+    /// a lease was requested at all (used for the "no actual ref" diagnostics).
+    pub force_with_lease_default: bool,
+}
+
+/// Push to a local repository, returning git's per-ref status report instead of
+/// failing on the first rejection. Performs the client-side checks git's
+/// send-pack does — non-fast-forward and `--force-with-lease` (stale info) — then
+/// (unless `--dry-run`) sends the surviving commands and folds the receive-pack
+/// report-status back into each ref. With `--atomic`, a single client-side
+/// rejection turns every other ref into [`PushRefStatus::AtomicPushFailed`] and
+/// nothing is sent. The caller renders the report and derives the exit code.
+pub fn push_local_with_report(
+    request: PushReportRequest<'_>,
+    config: &GitConfig,
+) -> Result<PushStatusReport> {
+    let format = request.format;
+    let remote_format = crate::object_format_for_git_dir(request.remote_common_git_dir)?;
+    if remote_format != format {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository uses {}, local repository uses {}",
+            remote_format.name(),
+            format.name()
+        )));
+    }
+    let local_store = FileRefStore::new(request.git_dir, format);
+    let mut local_refs = local_push_source_refs(&local_store, format)?;
+    add_revision_push_sources(request.git_dir, format, request.refspecs, &mut local_refs);
+    let remote_refs = crate::local::local_fetch_advertisements(request.remote_git_dir, format)?;
+    let planned = plan_push_command_sources(
+        format,
+        &local_refs,
+        &remote_refs,
+        request.refspecs,
+        request.force,
+    )?;
+    let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, format);
+
+    // Classify each planned command the way git's send-pack does, collecting
+    // rejections rather than bailing on the first one.
+    let mut refs: Vec<PushReportRef> = Vec::new();
+    for plan in &planned {
+        let status = classify_push_command(
+            &local_db,
+            format,
+            plan,
+            &request,
+            config,
+            request.remote_git_dir,
+        )?;
+        // git's `forced_update` reflects whether the update is *actually* a
+        // non-fast-forward (a rewind), independent of the `--force` flag — the
+        // flag only permits it. A create/delete is never "forced".
+        let forced = matches!(status, PushRefStatus::Ok)
+            && !plan.command.old_id.is_null()
+            && !plan.command.new_id.is_null()
+            && !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?;
+        refs.push(PushReportRef {
+            src: plan.source.clone(),
+            dst: plan.command.name.clone(),
+            old_id: plan.command.old_id,
+            new_id: plan.command.new_id,
+            forced,
+            status,
+        });
+    }
+
+    let any_local_reject = refs.iter().any(|reference| {
+        matches!(
+            reference.status,
+            PushRefStatus::RejectNonFastForward | PushRefStatus::RejectStale
+        )
+    });
+
+    // `--atomic`: if any ref was rejected client-side, send nothing and mark all
+    // would-be-OK refs as atomic-push-failed (git's REF_STATUS_ATOMIC_PUSH_FAILED).
+    // UpToDate refs are *not* converted — git leaves them reported as up to date.
+    if request.atomic && any_local_reject {
+        for reference in &mut refs {
+            if matches!(reference.status, PushRefStatus::Ok) {
+                reference.status = PushRefStatus::AtomicPushFailed;
+            }
+        }
+        return Ok(PushStatusReport { refs });
+    }
+
+    if request.dry_run {
+        return Ok(PushStatusReport { refs });
+    }
+
+    // Send only the commands that survived client-side checks.
+    let send: Vec<ReceivePackCommand> = refs
+        .iter()
+        .filter(|reference| matches!(reference.status, PushRefStatus::Ok))
+        .map(|reference| ReceivePackCommand {
+            old_id: reference.old_id,
+            new_id: reference.new_id,
+            name: reference.dst.clone(),
+        })
+        .collect();
+
+    if !send.is_empty() {
+        let remote_excluded_tips: Vec<ObjectId> =
+            remote_refs.iter().map(|reference| reference.oid).collect();
+        let pack_objects: Vec<ObjectId> = Vec::new();
+        let starts = push_pack_roots(&send, &pack_objects);
+        let remote_db =
+            FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
+        let remote_excluded =
+            collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+        let packfile = if starts.is_empty() {
+            Vec::new()
+        } else {
+            b"PACK".to_vec()
+        };
+        let receive_request = ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                shallow: Vec::new(),
+                commands: send.clone(),
+                capabilities: Vec::new(),
+            },
+            push_options: None,
+            packfile,
+        };
+        let report = crate::local::receive_pack_reachable_pack_into_local_repository(
+            request.remote_git_dir,
+            format,
+            &receive_request,
+            &local_db,
+            starts,
+            remote_excluded,
+        )?;
+        // Fold the receive-pack ng reports back onto the matching refs.
+        if let ReceivePackUnpackStatus::Error(message) = &report.unpack {
+            for reference in &mut refs {
+                if matches!(reference.status, PushRefStatus::Ok) {
+                    reference.status = PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
+                }
+            }
+        }
+        for command_status in &report.commands {
+            if let ReceivePackCommandStatus::Ng { name, message } = command_status {
+                for reference in &mut refs {
+                    if reference.dst == *name && matches!(reference.status, PushRefStatus::Ok) {
+                        reference.status = PushRefStatus::RemoteReject(message.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(PushStatusReport { refs })
+}
+
+/// Classify one planned command into git's send-pack pre-flight status: an
+/// up-to-date no-op, a non-fast-forward rejection, a `--force-with-lease` stale
+/// rejection, or `Ok` (the command will be sent).
+fn classify_push_command(
+    local_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    plan: &PlannedPushCommand,
+    request: &PushReportRequest<'_>,
+    _config: &GitConfig,
+    _remote_git_dir: &Path,
+) -> Result<PushRefStatus> {
+    let command = &plan.command;
+
+    // No change: the remote already has exactly this value (and it is not a
+    // create-from-nothing of a non-existent ref). git reports UPTODATE.
+    if command.old_id == command.new_id {
+        return Ok(PushRefStatus::UpToDate);
+    }
+
+    // `--force-with-lease`: the remote's current value must match the lease, or
+    // the push is rejected as stale info — checked before the non-ff gate and
+    // independent of `--force`.
+    if let Some((_, expected)) = request
+        .force_with_lease
+        .iter()
+        .find(|(dst, _)| *dst == command.name)
+    {
+        let actual = if command.old_id.is_null() {
+            None
+        } else {
+            Some(command.old_id)
+        };
+        if *expected != actual {
+            return Ok(PushRefStatus::RejectStale);
+        }
+        // A satisfied lease forces the update.
+        return Ok(PushRefStatus::Ok);
+    }
+
+    // Non-fast-forward branch update: rejected unless forced. Creations,
+    // deletions, and non-branch refs skip this gate (matching git's send-pack).
+    if !plan.force
+        && command.name.starts_with("refs/heads/")
+        && !command.old_id.is_null()
+        && !command.new_id.is_null()
+        && !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?
+    {
+        return Ok(PushRefStatus::RejectNonFastForward);
+    }
+
+    Ok(PushRefStatus::Ok)
+}
+
+/// Whether `old` is an ancestor of `new` (a fast-forward). A walk from `new`;
+/// `old` reachable ⇒ fast-forward.
+fn is_fast_forward(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old: &ObjectId,
+    new: &ObjectId,
+) -> Result<bool> {
+    let ancestors = ancestor_depths(db, format, new)?;
+    Ok(ancestors.contains_key(old))
+}
+
 /// Parse the receive-pack features from the leading ref advertisement (the empty
 /// default when the remote advertised no refs).
 #[cfg(feature = "http")]
@@ -900,6 +1223,63 @@ fn plan_push_command_forces(
         }
     }
     Ok(command_forces)
+}
+
+/// One planned push command paired with its forcing flag and the local source
+/// ref it came from (git's `ref->peer_ref`). A delete carries `source: None`.
+struct PlannedPushCommand {
+    command: ReceivePackCommand,
+    force: bool,
+    source: Option<String>,
+}
+
+/// Like [`plan_push_command_forces`], but also records the local source ref each
+/// command resolved from so the status report can print the `from -> to` line.
+/// The source is the normalized refspec source name; a delete (`:dst`) has no
+/// source. A pattern refspec re-derives each expanded command's source from its
+/// destination by reversing the wildcard substitution.
+fn plan_push_command_sources(
+    format: ObjectFormat,
+    local_refs: &[PushSourceRef],
+    remote_refs: &[RefAdvertisement],
+    refspecs: &[String],
+    force: bool,
+) -> Result<Vec<PlannedPushCommand>> {
+    let mut planned = Vec::new();
+    for refspec in refspecs {
+        let normalized = normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
+        let parsed = parse_refspec(&normalized)?;
+        let commands =
+            plan_push_commands(format, local_refs, remote_refs, std::slice::from_ref(&parsed))?;
+        for command in commands {
+            let source = push_command_source_name(&parsed, &command);
+            planned.push(PlannedPushCommand {
+                command,
+                force: force || parsed.force,
+                source,
+            });
+        }
+    }
+    Ok(planned)
+}
+
+/// Recover the local source ref name for one planned `command` from its owning
+/// `refspec`. Deletes (no `src`) return `None`. A wildcard pattern reverses the
+/// substitution: the command's destination minus the pattern's destination
+/// affix yields the matched stem, which slots into the pattern's source affix.
+fn push_command_source_name(refspec: &RefSpec, command: &ReceivePackCommand) -> Option<String> {
+    let src = refspec.src.as_deref()?;
+    if !refspec.pattern {
+        return Some(src.to_string());
+    }
+    let (src_prefix, src_suffix) = src.split_once('*')?;
+    let dst = refspec.dst.as_deref()?;
+    let (dst_prefix, dst_suffix) = dst.split_once('*')?;
+    let stem = command
+        .name
+        .strip_prefix(dst_prefix)
+        .and_then(|rest| rest.strip_suffix(dst_suffix))?;
+    Some(format!("{src_prefix}{stem}{src_suffix}"))
 }
 
 fn add_revision_push_sources(
@@ -1043,14 +1423,23 @@ fn count_refspec_match_dst<'a>(pattern: &str, remote_refs: &'a [RefAdvertisement
 enum PushSourceKind {
     Branch,
     Tag,
+    /// A source ref that resolves but is neither under `refs/heads/` nor
+    /// `refs/tags/` (e.g. `HEAD`, a fully-qualified `refs/...` name). git's
+    /// `guess_ref` still guesses `refs/heads/<dst>` for these.
     Other,
+    /// A source that is NOT a ref at all (a raw object id or a rev-expression
+    /// like `main^`). git's `guess_ref` resolves nothing for these, so an
+    /// unqualified destination cannot be guessed and the push is rejected.
+    Unqualifiable,
 }
 
 fn normalize_push_source_refname(
     name: &str,
     local_refs: &[PushSourceRef],
 ) -> (String, PushSourceKind) {
-    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
+    // `@` is git's documented alias for `HEAD`; like `HEAD` it resolves to a
+    // branch, so `guess_ref` can still qualify an unqualified destination.
+    if name.is_empty() || name == "HEAD" || name == "@" || name.starts_with("refs/") {
         return (name.to_string(), PushSourceKind::Other);
     }
     let branch = format!("refs/heads/{name}");
@@ -1062,7 +1451,10 @@ fn normalize_push_source_refname(
     } else if has_branch {
         (branch, PushSourceKind::Branch)
     } else if local_refs.iter().any(|reference| reference.name == name) {
-        (name.to_string(), PushSourceKind::Other)
+        // A literal match outside heads/tags/HEAD/refs is a revision source
+        // injected by `add_revision_push_sources` (an oid or `main^`-style
+        // expression) — not a ref, so a partial dst cannot be guessed.
+        (name.to_string(), PushSourceKind::Unqualifiable)
     } else {
         (branch, PushSourceKind::Branch)
     }
@@ -1086,10 +1478,16 @@ fn normalize_push_destination_refname(
         DstMatch::Ambiguous => Err(GitError::Command(format!(
             "dst refspec {name} matches more than one"
         ))),
-        DstMatch::None => Ok(match src_kind {
-            PushSourceKind::Tag => format!("refs/tags/{name}"),
-            PushSourceKind::Branch | PushSourceKind::Other => format!("refs/heads/{name}"),
-        }),
+        DstMatch::None => match src_kind {
+            PushSourceKind::Tag => Ok(format!("refs/tags/{name}")),
+            PushSourceKind::Branch | PushSourceKind::Other => Ok(format!("refs/heads/{name}")),
+            // git's `guess_ref` returns NULL for a non-ref source, so the
+            // unqualified destination is unresolvable (the "destination is not a
+            // full refname … you must fully qualify the ref" error).
+            PushSourceKind::Unqualifiable => Err(GitError::Command(format!(
+                "the destination you provided is not a full refname (i.e., starting with \"refs/\"); unable to guess the destination for {name}"
+            ))),
+        },
     }
 }
 
