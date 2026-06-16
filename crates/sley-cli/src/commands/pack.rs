@@ -15,6 +15,9 @@ struct IndexPackOptions {
     stdin: bool,
     fix_thin: bool,
     pack_file: Option<PathBuf>,
+    /// `--index-version=<n>` (or `<n>,<offset-threshold>`); `1` writes a v1
+    /// `.idx`, anything else keeps the v2 default.
+    index_version: Option<u32>,
 }
 
 pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
@@ -50,7 +53,14 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     let index_path = options
         .output
         .unwrap_or_else(|| pack_file.with_extension("idx"));
-    write_index_pack_output(&index_path, &indexed.index)?;
+    // `--index-version=1` re-serialises the same entries in the v1 layout; the
+    // default (and `=2`) keeps the v2 index `index_pack` already produced.
+    let index_bytes = if options.index_version == Some(1) {
+        PackIndex::write_v1(format, &indexed.entries, &indexed.checksum)?
+    } else {
+        indexed.index.clone()
+    };
+    write_index_pack_output(&index_path, &index_bytes)?;
     if options.keep {
         fs::write(pack_file.with_extension("keep"), b"")?;
     }
@@ -78,6 +88,7 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         stdin: false,
         fix_thin: false,
         pack_file: None,
+        index_version: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -102,7 +113,26 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             "--rev-index" => options.rev_index = true,
             "--no-rev-index" => options.rev_index = false,
             "--verify" => options.verify = true,
-            value if value.starts_with("--strict") || value.starts_with("--fsck-objects") => {}
+            value if value.starts_with("--index-version=") => {
+                let spec = &value["--index-version=".len()..];
+                let version_part = spec.split(',').next().unwrap_or(spec);
+                let version: u32 = version_part
+                    .parse()
+                    .map_err(|_| GitError::Command(format!("bad index version '{spec}'")))?;
+                if version != 1 && version != 2 {
+                    eprintln!("fatal: bad index version '{spec}'");
+                    return Err(GitError::Exit(128));
+                }
+                options.index_version = Some(version);
+            }
+            "--threads" => {
+                let _ = iter.next();
+            }
+            value
+                if value.starts_with("--strict")
+                    || value.starts_with("--fsck-objects")
+                    || value.starts_with("--threads=")
+                    || value.starts_with("--pack_header=") => {}
             value if value.starts_with('-') => return index_pack_usage(),
             value => index_pack_add_pack_file(&mut options, value)?,
         }
