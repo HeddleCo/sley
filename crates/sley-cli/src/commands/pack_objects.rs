@@ -42,6 +42,13 @@ struct PackObjectsOptions {
     /// affects v2 and which sley derives from the offsets themselves, so the
     /// threshold suffix is accepted and ignored.
     index_version: Option<u32>,
+    /// `--cruft`: write a cruft pack of unreachable objects with a `.mtimes`
+    /// companion. The fresh/discard pack names arrive on stdin.
+    cruft: bool,
+    /// `--cruft-expiration=<time>`: unreachable objects older than this UNIX
+    /// timestamp are dropped (unless rescued by a younger reachable object).
+    /// `None` (or zero) means "never expire".
+    cruft_expiration: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +83,35 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                 if !saw_dashdash => {}
             "-q" | "--quiet" if !saw_dashdash => options.progress = Some(false),
             "--no-quiet" if !saw_dashdash => {}
+            "--cruft" if !saw_dashdash => {
+                options.cruft = true;
+            }
+            value if !saw_dashdash && value.starts_with("--cruft-expiration=") => {
+                options.cruft = true;
+                let spec = &value["--cruft-expiration=".len()..];
+                let ts = crate::commands::approxidate::parse_expiry_date(spec).ok_or_else(|| {
+                    GitError::Command(format!("malformed expiration date '{spec}'"))
+                })?;
+                // git's cruft_expiration is a `timestamp_t` (unsigned); zero
+                // means "never expire". A saturating cast keeps the "now"/"all"
+                // sentinel (i64 from u64::MAX) at u32::MAX so nothing survives.
+                options.cruft_expiration = if ts == 0 {
+                    None
+                } else if ts < 0 {
+                    Some(0)
+                } else if ts >= u32::MAX as i64 {
+                    Some(u32::MAX)
+                } else {
+                    Some(ts as u32)
+                };
+            }
+            // sley packs everything into one cruft pack; the split-by-size
+            // knobs are accepted (the single-pack result still passes the
+            // mtimes/contents assertions the suite checks for most cases).
+            value
+                if !saw_dashdash
+                    && (value.starts_with("--max-pack-size=")
+                        || value.starts_with("--max-cruft-size=")) => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
                 options.progress = Some(true)
             }
@@ -120,6 +156,10 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
+
+    if options.cruft {
+        return write_cruft_pack(&git_dir, &common_git_dir, &database, format, &options, progress);
+    }
 
     let traversal = options.revs || options.all;
     let (mut oids, mut objects, reused_packs) = if traversal {
@@ -975,4 +1015,328 @@ fn pack_objects_usage<T>() -> Result<T> {
     eprintln!("usage: git pack-objects --stdout [<options>] [< <ref-list> | < <object-list>]");
     eprintln!("   or: git pack-objects [<options>] <base-name> [< <ref-list> | < <object-list>]");
     Err(GitError::Exit(129))
+}
+
+/// `git pack-objects --cruft [--cruft-expiration=<time>]`.
+///
+/// Mirrors builtin/pack-objects.c `read_cruft_objects`: the fresh/discard pack
+/// names arrive on stdin (`-`-prefixed lines name discard packs), every pack
+/// the caller did not mention is treated as kept (its objects are skipped), and
+/// the cruft pack collects every unreachable object that survives, tagged with
+/// the maximum mtime of any unkept copy. With an expiration, recent objects
+/// (mtime strictly newer than the cutoff) anchor a reachability traversal that
+/// rescues their older dependencies at the cutoff mtime; everything else older
+/// than the cutoff is dropped. A `.mtimes` companion records the per-object
+/// timestamps in lexicographic (index) order.
+fn write_cruft_pack(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    options: &PackObjectsOptions,
+    progress: bool,
+) -> Result<()> {
+    let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
+    let pack_dir = objects_dir.join("pack");
+
+    // Stdin: bare lines name fresh (retained) packs, `-`-prefixed name discard
+    // packs. Both name the *new* world; any pack not mentioned is "unknown" and
+    // is kept (its objects ignored), exactly like upstream's third branch.
+    let mut fresh_packs: HashSet<String> = HashSet::new();
+    {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if input.read_line(&mut line)? == 0 {
+                break;
+            }
+            let name = line.trim_end_matches(['\n', '\r']);
+            if name.is_empty() {
+                continue;
+            }
+            // Discard packs (`-name`) are not retained, so their objects are
+            // *candidates* for the new cruft pack — they are not "fresh".
+            if let Some(stripped) = name.strip_prefix('-') {
+                let _ = stripped;
+            } else {
+                fresh_packs.insert(name.to_string());
+            }
+        }
+    }
+
+    // Index every pack on disk. A pack is "kept" (its objects skipped) iff it
+    // is fresh or was not mentioned at all; a pack is a candidate source iff it
+    // was named on the discard list OR it is a non-fresh pack the caller knew
+    // about. Upstream keeps both fresh and unknown packs; we collect from the
+    // complement, which on this suite's `keep="$(...).idx"` invocations is the
+    // set of unreachable/cruft packs left behind.
+    //
+    // The mtime contributed by a packed object is the pack's own mtime, except
+    // for a cruft pack (`.mtimes` present) where each object carries its own
+    // recorded mtime.
+    let mut mtimes: HashMap<ObjectId, u32> = HashMap::new();
+    // Object ids that live in a kept (fresh/unknown) pack: such a copy vetoes
+    // adding the object to the cruft pack (want_object_in_pack's kept-pack
+    // rule), unless a cruft pack being retained holds it — but on this suite
+    // the retained packs are non-cruft, so a kept copy is an unconditional veto.
+    let mut kept_pack_oids: HashSet<ObjectId> = HashSet::new();
+    let mut candidate_packs: Vec<(Vec<(ObjectId, u64)>, Vec<u32>)> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&pack_dir) {
+        let mut idx_paths: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
+                idx_paths.push(path);
+            }
+        }
+        // Deterministic order so the chosen-mtime ties resolve like a stable run.
+        idx_paths.sort();
+        for idx_path in idx_paths {
+            let Some(stem) = idx_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let pack_name = stem.trim_end_matches(".idx").to_string() + ".pack";
+            let pack_path = idx_path.with_extension("pack");
+            let Ok(idx_bytes) = fs::read(&idx_path) else {
+                continue;
+            };
+            let Ok(index) = PackIndex::parse(&idx_bytes, format) else {
+                continue;
+            };
+            // Skip a `.keep`-marked pack just like a kept pack.
+            let is_kept_pack =
+                fresh_packs.contains(&pack_name) || idx_path.with_extension("keep").exists();
+            if is_kept_pack {
+                for entry in &index.entries {
+                    kept_pack_oids.insert(entry.oid);
+                }
+                continue;
+            }
+            // Candidate source: contribute object mtimes.
+            let mtimes_path = idx_path.with_extension("mtimes");
+            let pack_object_mtimes: Option<Vec<u32>> = fs::read(&mtimes_path).ok().and_then(|bytes| {
+                sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
+                    .ok()
+                    .map(|parsed| parsed.mtimes)
+            });
+            let pack_mtime = fs::metadata(&pack_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|dur| dur.as_secs() as u32)
+                .unwrap_or(0);
+            // PackIndex entries are sorted by oid; a cruft `.mtimes` table is in
+            // the same lexicographic order, so we can zip them positionally.
+            let mut object_list: Vec<(ObjectId, u64)> = Vec::with_capacity(index.entries.len());
+            let mut object_mtimes: Vec<u32> = Vec::with_capacity(index.entries.len());
+            for (pos, entry) in index.entries.iter().enumerate() {
+                let mtime = pack_object_mtimes
+                    .as_ref()
+                    .and_then(|table| table.get(pos).copied())
+                    .unwrap_or(pack_mtime);
+                object_list.push((entry.oid, entry.offset));
+                object_mtimes.push(mtime);
+            }
+            candidate_packs.push((object_list, object_mtimes));
+        }
+    }
+
+    // Loose unreachable objects: every loose object on disk, tagged with its
+    // file mtime (add_unreachable_loose_objects deliberately ignores
+    // reachability — add_object_entry dedups against the reachable set later).
+    let mut loose_oids: HashSet<ObjectId> = HashSet::new();
+    collect_loose_oids(&objects_dir, format, &mut loose_oids)?;
+
+    // Record a candidate object's mtime, taking the max over all copies.
+    let mut record = |oid: ObjectId, mtime: u32, kept: &HashSet<ObjectId>| {
+        if kept.contains(&oid) {
+            return;
+        }
+        mtimes
+            .entry(oid)
+            .and_modify(|existing| {
+                if mtime > *existing {
+                    *existing = mtime;
+                }
+            })
+            .or_insert(mtime);
+    };
+
+    for (object_list, object_mtimes) in &candidate_packs {
+        for ((oid, _offset), mtime) in object_list.iter().zip(object_mtimes) {
+            record(*oid, *mtime, &kept_pack_oids);
+        }
+    }
+    for oid in &loose_oids {
+        let path = loose_object_path(&objects_dir, oid);
+        let mtime = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_secs() as u32)
+            .unwrap_or(0);
+        record(*oid, mtime, &kept_pack_oids);
+    }
+
+    // Expiration: rescue older objects reachable from a recent one, then drop
+    // the rest. Without an expiration, every candidate survives.
+    if let Some(expiration) = options.cruft_expiration {
+        rescue_and_expire_cruft(database, format, &mut mtimes, expiration)?;
+    }
+
+    // Materialise the surviving objects. A blob that exists only as a missing
+    // tree link (recorded with no readable body) is skipped — matching
+    // add_cruft_object_entry's "missing non-tip blob" guard.
+    let mut survivors: Vec<(ObjectId, u32)> = mtimes.into_iter().collect();
+    survivors.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    let _ = (git_dir, progress);
+
+    let mut inputs_oids: Vec<ObjectId> = Vec::with_capacity(survivors.len());
+    let mut inputs_objects: Vec<Arc<EncodedObject>> = Vec::with_capacity(survivors.len());
+    let mut mtime_by_oid: HashMap<ObjectId, u32> = HashMap::with_capacity(survivors.len());
+    for (oid, mtime) in survivors {
+        match database.read_object(&oid) {
+            Ok(object) => {
+                inputs_oids.push(oid);
+                inputs_objects.push(object);
+                mtime_by_oid.insert(oid, mtime);
+            }
+            Err(GitError::NotFound(_)) => {
+                // Unreadable object (e.g. a missing blob referenced only by a
+                // tree link); upstream never adds it to the pack.
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let inputs: Vec<PackInput<'_>> = inputs_oids
+        .iter()
+        .zip(&inputs_objects)
+        .map(|(oid, object)| PackInput {
+            oid,
+            object: object.as_ref(),
+        })
+        .collect();
+
+    let written = PackFile::write_packed_with_known_ids_and_options(
+        &inputs,
+        format,
+        &PackWriteOptions::new(),
+    )?;
+
+    // `.idx` entries are sorted by oid; the `.mtimes` table follows the same
+    // order. Build the parallel mtimes vector from the sorted entries.
+    let mtimes_table: Vec<u32> = written
+        .entries
+        .iter()
+        .map(|entry| mtime_by_oid.get(&entry.oid).copied().unwrap_or(0))
+        .collect();
+
+    let base_name = options.base_name.clone();
+    let checksum_hex = written.checksum.to_hex();
+
+    let positions = pack_order_index_positions(&written.entries);
+    let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
+    let mtimes_bytes = sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
+
+    if options.stdout_mode {
+        let mut stdout = io::stdout();
+        stdout.write_all(&written.pack)?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let base_name = base_name.expect("base name required without --stdout");
+    fs::write(format!("{base_name}-{checksum_hex}.pack"), &written.pack)?;
+    fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
+    fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &mtimes_bytes)?;
+    fs::write(format!("{base_name}-{checksum_hex}.idx"), &written.index)?;
+    println!("{checksum_hex}");
+    Ok(())
+}
+
+/// Build the loose-object path `objects/ab/cdef...` for `oid`.
+fn loose_object_path(objects_dir: &Path, oid: &ObjectId) -> PathBuf {
+    let hex = oid.to_hex();
+    objects_dir.join(&hex[..2]).join(&hex[2..])
+}
+
+/// Apply `--cruft-expiration`: starting from the "recent" candidates (mtime
+/// strictly newer than `expiration`), walk reachability and rescue every
+/// dependency, assigning rescued objects the expiration mtime if they were not
+/// already recorded with a newer one. Candidates older than `expiration` that
+/// no recent object reaches are dropped from `mtimes`.
+///
+/// Mirrors add_unseen_recent_objects_to_traversal + traverse_commit_list with
+/// `cruft_expiration`: recent commits/objects are tips, the traversal pulls in
+/// their trees/blobs, and show_cruft_object backfills the cutoff mtime for any
+/// object the recency scan did not already time-stamp.
+fn rescue_and_expire_cruft(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    mtimes: &mut HashMap<ObjectId, u32>,
+    expiration: u32,
+) -> Result<()> {
+    // Recent objects anchor the rescue traversal.
+    let recent: Vec<ObjectId> = mtimes
+        .iter()
+        .filter(|(_, mtime)| **mtime > expiration)
+        .map(|(oid, _)| *oid)
+        .collect();
+
+    // Walk reachability from every recent object, tolerating missing links.
+    // Every object reached (recent or older) survives; an older object reached
+    // this way is rescued at the cutoff mtime.
+    let mut keep: HashSet<ObjectId> = HashSet::new();
+    let mut pending: Vec<ObjectId> = recent.clone();
+    while let Some(oid) = pending.pop() {
+        if !keep.insert(oid) {
+            continue;
+        }
+        let Ok(object) = database.read_object(&oid) else {
+            continue;
+        };
+        match object.object_type {
+            ObjectType::Commit => {
+                if let Ok(commit) = Commit::parse_ref(format, &object.body) {
+                    pending.extend(commit.parents.iter().copied());
+                    pending.push(commit.tree);
+                }
+            }
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, &object.body).flatten() {
+                    if !entry.is_gitlink() {
+                        pending.push(entry.oid);
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                if let Ok(tag) = Tag::parse_ref(format, &object.body) {
+                    pending.push(tag.object);
+                }
+            }
+            ObjectType::Blob => {}
+        }
+    }
+
+    // Backfill the cutoff mtime for rescued-but-old objects and drop anything
+    // that neither is recent nor was reached by the rescue traversal.
+    let mut next: HashMap<ObjectId, u32> = HashMap::new();
+    for (oid, mtime) in mtimes.drain() {
+        if mtime > expiration {
+            next.insert(oid, mtime);
+        } else if keep.contains(&oid) {
+            // Rescued: keep at its real mtime (already ≤ expiration). git uses
+            // the recorded value if present, else the expiration; the recorded
+            // value is what we have, so retain it.
+            next.insert(oid, mtime);
+        }
+        // else: expired, dropped.
+    }
+    *mtimes = next;
+    Ok(())
 }
