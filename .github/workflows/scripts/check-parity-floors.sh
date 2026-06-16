@@ -465,7 +465,7 @@ declare -A FLOOR=(
     [t5505-remote.sh]=81
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
-    [t5516-fetch-push.sh]=54
+    [t5516-fetch-push.sh]=57
     [t5520-pull.sh]=23
     [t5601-clone.sh]=60
     [t5603-clone-dirname.sh]=39
@@ -477,6 +477,11 @@ declare -A FLOOR=(
     [t3701-add-interactive.sh]=85
     [t4011-diff-symlink.sh]=1
     [t6402-merge-rename.sh]=30
+    [t5400-send-pack.sh]=12
+    [t5404-tracking-branches.sh]=6
+    [t5543-atomic-push.sh]=7
+    [t5548-push-porcelain.sh]=11
+    [t6430-merge-recursive.sh]=23
 )
 
 fail=0
