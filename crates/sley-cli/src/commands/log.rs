@@ -1261,6 +1261,26 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_format_explicit = true;
             }
             "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
+            // `-c`/`--cc` select combined merge output and imply a *global*
+            // patch (git's `merges_imply_patch` sets `output_format=PATCH`, so
+            // non-merge commits get an ordinary patch too).
+            "-c" => {
+                diff_opts.merges = Some(LogDiffMerges::Combined { dense: false });
+                diff_opts.merges_imply_patch = true;
+                diff_opts.patch = true;
+            }
+            "--cc" => {
+                diff_opts.merges = Some(LogDiffMerges::Combined { dense: true });
+                diff_opts.merges_imply_patch = true;
+                diff_opts.patch = true;
+            }
+            // `--dd` is first-parent merges that also imply a global patch
+            // (git's `set_first_parent` + `merges_imply_patch`).
+            "--dd" => {
+                diff_opts.merges = Some(LogDiffMerges::FirstParent);
+                diff_opts.merges_imply_patch = true;
+                diff_opts.patch = true;
+            }
             "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
             "--follow" => saw_follow = true,
@@ -1321,6 +1341,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    // `log.diffMerges` provides the default merge-diff mode and is validated
+    // unconditionally at startup (git rejects a wrong value with exit 128 even
+    // for a plain `git log` with no diff output).
+    let config_diff_merges = match config.get("log", None, "diffMerges") {
+        Some(value) => Some(log_parse_diff_merges_config(&value)?),
+        None => None,
+    };
+    if diff_opts.merges.is_none() {
+        diff_opts.merges = config_diff_merges;
+    }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let output_encoding = log_output_encoding(&config);
     let cwd = env::current_dir()?;
@@ -2326,7 +2356,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
                         let block = log_diff.render(record, prefix_width)?;
                         if !block.is_empty() {
-                            msg.extend_from_slice(diff_opts.block_separator());
+                            msg.extend_from_slice(diff_opts.block_separator_for(record));
                             msg.extend_from_slice(&block);
                         }
                     }
@@ -2400,7 +2430,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 }
                 if !diff_block.is_empty() {
                     let mut stdout = io::stdout();
-                    stdout.write_all(diff_opts.block_separator())?;
+                    stdout.write_all(diff_opts.block_separator_for(record))?;
                     stdout.write_all(&diff_block)?;
                 }
             }
@@ -3162,6 +3192,8 @@ enum LogDiffMerges {
     /// Merges diff against their first parent (`--diff-merges=first-parent`,
     /// and the default under `--first-parent`).
     FirstParent,
+    /// Combined merge diff: `-c` (`dense=false`) / `--cc` (`dense=true`).
+    Combined { dense: bool },
 }
 
 /// Parse a `--diff-merges=<value>` into the supported modes.
@@ -3169,17 +3201,35 @@ fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
     match value {
         "off" | "none" => Ok(LogDiffMerges::Off),
         // "on"/"m" follow the diff-merges default (separate); sley renders the
-        // first-parent diff for these until separate/combined modes land.
+        // first-parent diff for these until the separate mode lands.
         "first-parent" | "1" | "on" | "separate" | "m" => Ok(LogDiffMerges::FirstParent),
+        "combined" | "c" => Ok(LogDiffMerges::Combined { dense: false }),
+        "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
         "" => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
             Err(GitError::Exit(128))
         }
-        "combined" | "c" | "dense-combined" | "cc" | "remerge" | "r" => Err(GitError::Command(
-            format!("unsupported log option --diff-merges={value}"),
-        )),
+        "remerge" | "r" => Err(GitError::Command(format!(
+            "unsupported log option --diff-merges={value}"
+        ))),
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// Parse a `log.diffMerges` config value into a [`LogDiffMerges`] default.
+/// git's `diff_merges_config` rejects an unknown value, which `git log`
+/// surfaces as a fatal config error (exit 128).
+fn log_parse_diff_merges_config(value: &str) -> Result<LogDiffMerges> {
+    match value {
+        "off" | "none" => Ok(LogDiffMerges::Off),
+        "first-parent" | "1" | "on" | "separate" | "m" => Ok(LogDiffMerges::FirstParent),
+        "combined" | "c" => Ok(LogDiffMerges::Combined { dense: false }),
+        "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
+        _ => {
+            eprintln!("fatal: bad config variable 'log.diffMerges'");
             Err(GitError::Exit(128))
         }
     }
@@ -3247,6 +3297,18 @@ impl LogDiffOptions {
         } else {
             b"\n"
         }
+    }
+
+    /// Per-record variant of [`block_separator`](Self::block_separator). A
+    /// combined merge always uses a blank-line separator before its block (git
+    /// never prefixes a combined stat-then-patch block with `---`).
+    fn block_separator_for(&self, record: &sley_rev::CommitRecord) -> &'static [u8] {
+        if record.commit.parents.len() > 1
+            && matches!(self.merges, Some(LogDiffMerges::Combined { .. }))
+        {
+            return b"\n";
+        }
+        self.block_separator()
     }
 
     /// Whether any diff output was requested at all.
@@ -3690,6 +3752,13 @@ impl LogDiffContext<'_> {
             return Ok(Vec::new());
         }
         let parents = &record.commit.parents;
+        // A combined merge takes a separate render path (the result diffed
+        // against every parent at once). Detect it before the two-tree setup.
+        if parents.len() > 1
+            && let LogDiffMerges::Combined { dense } = self.merges
+        {
+            return self.render_combined_merge(record, dense, line_prefix_width);
+        }
         let parent_tree = match parents.len() {
             0 => {
                 if !self.show_root {
@@ -3701,6 +3770,8 @@ impl LogDiffContext<'_> {
             _ => match self.merges {
                 LogDiffMerges::Off => return Ok(Vec::new()),
                 LogDiffMerges::FirstParent => Some(self.parent_tree(&parents[0])?),
+                // Handled above.
+                LogDiffMerges::Combined { .. } => unreachable!(),
             },
         };
         let base = sley_diff_merge::DiffNameStatusOptions {
@@ -3824,6 +3895,122 @@ impl LogDiffContext<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// Render the combined merge diff (`log -c`/`--cc`) for one merge commit:
+    /// the first-parent stat family (when requested) followed by the combined
+    /// patch. Returns the block bytes WITHOUT a leading blank line (the caller
+    /// owns separators).
+    fn render_combined_merge(
+        &self,
+        record: &sley_rev::CommitRecord,
+        dense: bool,
+        line_prefix_width: i64,
+    ) -> Result<Vec<u8>> {
+        let opts = self.opts;
+        let merges_only = !opts.any();
+        let patch = opts.patch || merges_only;
+        let result_tree = &record.commit.tree;
+        let parent_trees = record
+            .commit
+            .parents
+            .iter()
+            .map(|parent| self.parent_tree(parent))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Stat family is computed against the first parent (STAT_FORMAT_MASK).
+        let stat_active =
+            opts.raw || opts.numstat || opts.stat || opts.compact_summary || opts.shortstat || opts.summary;
+        let first_parent_entries = if stat_active {
+            let base = sley_diff_merge::DiffNameStatusOptions {
+                detect_renames: self.detect_renames,
+                detect_copies: self.detect_copies,
+                find_copies_harder: false,
+                rename_empty: true,
+            };
+            sley_diff_merge::diff_name_status_trees_with_options(
+                self.db,
+                self.format,
+                &parent_trees[0],
+                result_tree,
+                base,
+            )?
+        } else {
+            Vec::new()
+        };
+
+        let paths =
+            commands::combined::combined_paths(self.db, self.format, result_tree, &parent_trees)?;
+        if paths.is_empty() && first_parent_entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out: Vec<u8> = Vec::new();
+        if opts.raw {
+            // git shows combined raw (`::`) for log --raw on a combined merge.
+            let render_ctx = self.combined_ctx(dense);
+            for path in &paths {
+                commands::combined::write_combined_raw(&mut out, &render_ctx, path, false)?;
+            }
+        }
+        if opts.numstat {
+            for entry in &first_parent_entries {
+                write_diff_numstat_entry(&mut out, entry, false, self.db, None, false)?;
+            }
+        }
+        if opts.stat || opts.compact_summary {
+            let mut widths = opts.stat_widths;
+            widths.resolve_config(self.config);
+            widths.line_prefix_width = line_prefix_width;
+            write_diff_stat_with_widths(
+                &mut out,
+                &first_parent_entries,
+                self.db,
+                None,
+                false,
+                DiffStatOptions {
+                    compact_summary: opts.compact_summary,
+                    stat_count: opts.stat_count,
+                    color: false,
+                },
+                widths,
+            )?;
+        }
+        if opts.shortstat {
+            write_diff_shortstat(&mut out, &first_parent_entries, self.db, None, false)?;
+        }
+        if opts.summary {
+            for entry in &first_parent_entries {
+                write_diff_summary_entry(&mut out, entry)?;
+            }
+        }
+        if patch && !paths.is_empty() {
+            if stat_active {
+                out.push(b'\n');
+            }
+            let render_ctx = self.combined_ctx(dense);
+            for path in &paths {
+                commands::combined::write_combined_patch(&mut out, &render_ctx, path)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Build the shared combined-render context for this log invocation.
+    fn combined_ctx(&self, dense: bool) -> commands::combined::CombinedRenderCtx<'_> {
+        commands::combined::CombinedRenderCtx {
+            db: self.db,
+            format: self.format,
+            dense,
+            all_paths: false,
+            context: 3,
+            ws_ignore: self.opts.ws_ignore,
+            diff_algorithm: self.opts.diff_algorithm,
+            src_prefix: "a/",
+            dst_prefix: "b/",
+            patch_abbrev: self.patch_abbrev,
+            raw_abbrev: self.raw_abbrev,
+        }
     }
 
     /// Tree oid of `parent`.

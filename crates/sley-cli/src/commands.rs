@@ -17,6 +17,7 @@ pub(crate) mod blame;
 pub(crate) mod branch;
 pub(crate) mod cat_file;
 pub(crate) mod checkout_index;
+pub(crate) mod combined;
 pub(crate) mod config_cmd;
 pub(crate) mod daemon;
 pub(crate) mod describe;

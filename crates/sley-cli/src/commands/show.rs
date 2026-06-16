@@ -49,10 +49,33 @@ enum ShowCommitFormat {
     },
 }
 
+/// How merge commits are diffed (`git show`'s `--diff-merges` resolution).
+/// `git show` defaults a merge to [`ShowMergeMode::Combined`] (dense) when no
+/// override is given; `--first-parent` flips the default to first-parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShowMergeMode {
+    /// `--diff-merges=off`/`none`: no diff for merge commits.
+    Off,
+    /// `--first-parent` / `--diff-merges=first-parent`: diff against parent 1.
+    FirstParent,
+    /// `-m` / `--diff-merges=separate`: one diff per parent.
+    Separate,
+    /// `-c` (`dense=false`) / `--cc` (`dense=true`) / the default: combined.
+    Combined { dense: bool },
+}
+
 /// Parsed `git show` invocation state.
 struct ShowOptions {
     commit_format: ShowCommitFormat,
     diff_mode: ShowDiffMode,
+    /// Explicit merge-diff mode, or `None` to use the default (dense combined,
+    /// or first-parent under `--first-parent`).
+    merge_mode: Option<ShowMergeMode>,
+    /// `--first-parent`: flips the merge default to first-parent and restricts
+    /// history (history restriction is a no-op for single-commit `show`).
+    first_parent: bool,
+    /// `--combined-all-paths` (only meaningful with `-c`/`--cc`).
+    combined_all_paths: bool,
     /// Whether the `commit <oid>` line (medium/full-oneline) uses an abbreviated
     /// oid. `--oneline` always abbreviates regardless of this flag.
     abbrev_commit: bool,
@@ -128,6 +151,21 @@ struct CommitTrailerLayout {
     blank_before_diff: bool,
     separator_mode: bool,
     is_merge: bool,
+    /// The resolved merge-diff mode for this commit (only meaningful when
+    /// `is_merge`).
+    merge_mode: ShowMergeMode,
+}
+
+/// Resolve the effective merge-diff mode for `git show`: the explicit
+/// `--diff-merges`/`-c`/`--cc`/`-m` if given, otherwise dense-combined (or
+/// first-parent under `--first-parent`). Mirrors git's
+/// `diff_merges_default_to_*` in `cmd_show`'s setup tweak.
+fn resolve_show_merge_mode(options: &ShowOptions) -> ShowMergeMode {
+    match options.merge_mode {
+        Some(mode) => mode,
+        None if options.first_parent => ShowMergeMode::FirstParent,
+        None => ShowMergeMode::Combined { dense: true },
+    }
 }
 
 impl Default for ShowOptions {
@@ -135,6 +173,9 @@ impl Default for ShowOptions {
         Self {
             commit_format: ShowCommitFormat::Medium,
             diff_mode: ShowDiffMode::Patch,
+            merge_mode: None,
+            first_parent: false,
+            combined_all_paths: false,
             abbrev_commit: false,
             abbrev_len: Some(7),
             stat: false,
@@ -485,7 +526,9 @@ fn show_commit(
             blank_before_diff,
             separator_mode,
             is_merge,
+            merge_mode: resolve_show_merge_mode(options),
         },
+        commit,
         &entries,
     )
 }
@@ -501,13 +544,28 @@ fn write_commit_trailer(
     stdout: &mut io::Stdout,
     context: &ShowContext<'_>,
     layout: CommitTrailerLayout,
+    commit: &Commit,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let options = context.options;
     let diff_active = options.diff_mode != ShowDiffMode::None;
-    // For a merge, only the stat family renders; for an ordinary commit every
-    // mode renders when there are changes.
-    let body_renders = if layout.is_merge {
+    // A merge in combined mode renders the combined patch (plus the stat family,
+    // which is always first-parent). In any other merge mode (off / first-parent
+    // default) only the stat family renders.
+    let combined_merge = layout.is_merge
+        && matches!(layout.merge_mode, ShowMergeMode::Combined { .. });
+    // `--first-parent` (and `--diff-merges=first-parent`) renders the full
+    // first-parent diff for a merge — the same body an ordinary commit gets.
+    let first_parent_merge =
+        layout.is_merge && layout.merge_mode == ShowMergeMode::FirstParent;
+    // For an off-mode merge only the stat family renders; for a combined merge,
+    // a first-parent merge, and an ordinary commit the body renders fully.
+    let body_renders = if combined_merge {
+        // A combined merge renders a body for every active diff mode (the
+        // combined patch, the first-parent stat family, or the combined
+        // name/name-status listing).
+        diff_active && !entries.is_empty()
+    } else if layout.is_merge && !first_parent_merge {
         diff_active && merge_renders_stat(options) && !entries.is_empty()
     } else {
         diff_active && !entries.is_empty()
@@ -522,10 +580,17 @@ fn write_commit_trailer(
         if !layout.text_self_terminated {
             writeln!(stdout)?;
         }
-        if layout.blank_before_diff {
+        // A combined merge separates the commit header from its diff with a
+        // blank line (git's diff_tree_combined `line_termination` separator),
+        // even for `--oneline` which abuts the diff for ordinary commits. The
+        // exception is `--pretty=format:` (text not self-terminated): there the
+        // text line's own newline above is the only separator, matching git.
+        if layout.blank_before_diff || (combined_merge && layout.text_self_terminated) {
             writeln!(stdout)?;
         }
-        return if layout.is_merge {
+        return if combined_merge {
+            write_show_combined(stdout, context, &layout, commit, entries)
+        } else if layout.is_merge && !first_parent_merge {
             write_merge_stat(stdout, context.db, context.config, options, entries)
         } else {
             write_commit_diff(
@@ -614,6 +679,86 @@ fn write_merge_stat(
         for entry in entries {
             write_diff_summary_entry(stdout, entry)?;
         }
+    }
+    Ok(())
+}
+
+/// Render a merge commit's combined diff for `git show` (`-c`/`--cc`/default):
+/// the first-parent stat family (when requested) followed by the combined patch
+/// (when patch output is active). `entries` is the first-parent name-status
+/// list reused for the stat family.
+fn write_show_combined(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    layout: &CommitTrailerLayout,
+    commit: &Commit,
+    entries: &[sley_diff_merge::NameStatusEntry],
+) -> Result<()> {
+    let options = context.options;
+    let db = context.db;
+    let format = context.format;
+    let dense = matches!(layout.merge_mode, ShowMergeMode::Combined { dense: true });
+
+    let parent_trees = commit
+        .parents
+        .iter()
+        .map(|parent| {
+            let object = db.read_object(parent)?;
+            let parent_commit = Commit::parse_ref(format, &object.body)?;
+            Ok(parent_commit.tree)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let paths = commands::combined::combined_paths(db, format, &commit.tree, &parent_trees)?;
+    let render_ctx = commands::combined::CombinedRenderCtx {
+        db,
+        format,
+        dense,
+        all_paths: options.combined_all_paths,
+        context: 3,
+        ws_ignore: options.ws_ignore,
+        diff_algorithm: options.diff_algorithm,
+        src_prefix: "a/",
+        dst_prefix: "b/",
+        patch_abbrev: options.patch_abbrev.unwrap_or(7).min(format.hex_len()),
+        raw_abbrev: None,
+    };
+
+    // `--name-only`/`--name-status` print the combined name (status) listing.
+    match options.diff_mode {
+        ShowDiffMode::NameOnly => {
+            for path in &paths {
+                writeln!(stdout, "{}", status_quote_path(&path.path, false))?;
+            }
+            return Ok(());
+        }
+        ShowDiffMode::NameStatus => {
+            for path in &paths {
+                commands::combined::write_combined_name_status(stdout, path, false)?;
+            }
+            return Ok(());
+        }
+        ShowDiffMode::None => return Ok(()),
+        ShowDiffMode::Patch => {}
+    }
+
+    // Patch mode: the stat family (first-parent) renders first; the combined
+    // patch renders only when no stat/raw extra replaced it (git's `show_patch
+    // = !has_diff_extras()`).
+    let stat_active = merge_renders_stat(options);
+    if stat_active {
+        write_merge_stat(stdout, db, context.config, options, entries)?;
+    }
+    if options.has_diff_extras() {
+        return Ok(());
+    }
+
+    // git separates a preceding stat block from the combined patch with a blank
+    // line (the `--patch-with-stat` separator).
+    if stat_active && !paths.is_empty() {
+        writeln!(stdout)?;
+    }
+    for path in &paths {
+        commands::combined::write_combined_patch(stdout, &render_ctx, path)?;
     }
     Ok(())
 }
@@ -920,6 +1065,32 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--name-status" => {
                 options.diff_mode = ShowDiffMode::NameStatus;
             }
+            // --- merge diff selection (git's diff-merges parsing) --------------
+            "-c" => {
+                options.merge_mode = Some(ShowMergeMode::Combined { dense: false });
+                options.restore_patch();
+            }
+            "--cc" => {
+                options.merge_mode = Some(ShowMergeMode::Combined { dense: true });
+                options.restore_patch();
+            }
+            "-m" => options.merge_mode = Some(ShowMergeMode::Separate),
+            "--first-parent" => {
+                options.first_parent = true;
+            }
+            "--combined-all-paths" => options.combined_all_paths = true,
+            "--no-diff-merges" => options.merge_mode = Some(ShowMergeMode::Off),
+            "--diff-merges" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--diff-merges requires a value".into()))?;
+                options.merge_mode = Some(show_parse_diff_merges(value)?);
+                options.restore_patch();
+            }
+            value if let Some(rest) = value.strip_prefix("--diff-merges=") => {
+                options.merge_mode = Some(show_parse_diff_merges(rest)?);
+                options.restore_patch();
+            }
             "--stat" => {
                 options.stat = true;
                 options.restore_patch();
@@ -1098,7 +1269,30 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
         }
     }
     options.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
+    if options.combined_all_paths
+        && !matches!(options.merge_mode, Some(ShowMergeMode::Combined { .. }))
+    {
+        return Err(GitError::Command(
+            "--combined-all-paths makes no sense without -c or --cc".into(),
+        ));
+    }
     Ok(options)
+}
+
+/// Resolve a `--diff-merges=<value>` argument into a [`ShowMergeMode`]
+/// (git's `func_by_opt`).
+fn show_parse_diff_merges(value: &str) -> Result<ShowMergeMode> {
+    match value {
+        "off" | "none" => Ok(ShowMergeMode::Off),
+        "1" | "first-parent" => Ok(ShowMergeMode::FirstParent),
+        "separate" | "m" | "on" => Ok(ShowMergeMode::Separate),
+        "c" | "combined" => Ok(ShowMergeMode::Combined { dense: false }),
+        "cc" | "dense-combined" => Ok(ShowMergeMode::Combined { dense: true }),
+        _ => {
+            eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
+            Err(GitError::Exit(128))
+        }
+    }
 }
 
 /// Resolve a `--pretty=<value>` / `--format=<value>` argument into a
