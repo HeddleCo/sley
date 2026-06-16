@@ -1,0 +1,8 @@
+#!/bin/sh
+SLEY_BIN='/home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-rebase-i/release/sley'
+SHIM_DIR='/home/heddleco/dev/HeddleCo/workspace/parity-rebase-i/.sley-shim-bin'
+case "${1:-}" in
+    --exec-path) printf '%s\n' "$SHIM_DIR"; exit 0 ;;
+    --man-path|--html-path|--info-path) printf '%s\n' "$SHIM_DIR"; exit 0 ;;
+esac
+exec "$SLEY_BIN" "$@"

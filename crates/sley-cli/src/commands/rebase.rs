@@ -58,6 +58,9 @@ struct RebaseArgs {
     signoff: bool,
     no_verify: bool,
     reschedule_failed_exec: Option<bool>,
+    committer_date_is_author_date: bool,
+    ignore_date: bool,
+    ignore_whitespace: bool,
     root: bool,
     fork_point: Option<bool>,
     reapply_cherry_picks: Option<bool>,
@@ -93,6 +96,9 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         signoff: false,
         no_verify: false,
         reschedule_failed_exec: None,
+        committer_date_is_author_date: false,
+        ignore_date: false,
+        ignore_whitespace: false,
         root: false,
         fork_point: None,
         reapply_cherry_picks: None,
@@ -204,12 +210,21 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--verify" => out.no_verify = false,
             "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
             "--allow-empty-message" => {}
-            "--committer-date-is-author-date" | "--reset-author-date" | "--ignore-date" => {
+            "--committer-date-is-author-date" => {
+                out.committer_date_is_author_date = true;
                 out.force = true;
             }
+            "--no-committer-date-is-author-date" => out.committer_date_is_author_date = false,
+            "--reset-author-date" | "--ignore-date" => {
+                out.ignore_date = true;
+                out.force = true;
+            }
+            "--no-reset-author-date" | "--no-ignore-date" => out.ignore_date = false,
             "--ignore-whitespace" => {
+                out.ignore_whitespace = true;
                 out.strategy_opts.push("ignore-space-change".to_string());
             }
+            "--no-ignore-whitespace" => out.ignore_whitespace = false,
             _ if arg.starts_with("-C") => {
                 let value = &arg[2..];
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -332,6 +347,8 @@ struct MachineOpts {
     drop_redundant_commits: bool,
     keep_redundant_commits: bool,
     reschedule_failed_exec: bool,
+    committer_date_is_author_date: bool,
+    ignore_date: bool,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
@@ -368,6 +385,12 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     } else {
         fs::write(dir.join("no-reschedule-failed-exec"), b"")?;
     }
+    if opts.committer_date_is_author_date {
+        fs::write(dir.join("cdate_is_adate"), b"")?;
+    }
+    if opts.ignore_date {
+        fs::write(dir.join("ignore_date"), b"")?;
+    }
     Ok(())
 }
 
@@ -392,6 +415,8 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         drop_redundant_commits: exists("drop_redundant_commits"),
         keep_redundant_commits: exists("keep_redundant_commits"),
         reschedule_failed_exec: exists("reschedule-failed-exec"),
+        committer_date_is_author_date: exists("cdate_is_adate"),
+        ignore_date: exists("ignore_date"),
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -923,6 +948,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         drop_redundant_commits: empty == EmptyMode::Drop,
         keep_redundant_commits: empty == EmptyMode::Keep,
         reschedule_failed_exec,
+        committer_date_is_author_date: args.committer_date_is_author_date,
+        ignore_date: args.ignore_date,
         head_name: head_name.clone(),
         onto,
         orig_head,
@@ -2657,7 +2684,29 @@ fn machine_commit(
         }
     }
 
-    let committer = commit_identity_from_env("COMMITTER")?;
+    // Apply `--reset-author-date`/`--ignore-date` and
+    // `--committer-date-is-author-date`, mirroring sequencer.c's
+    // try_to_commit. `ignore_date` rewrites the author date to "now"; the
+    // committer date is then either "now" (`ignore_date`), the author's date
+    // (`committer_date_is_author_date` without `ignore_date`), or the
+    // environment's committer date.
+    let author = if opts.ignore_date {
+        reset_identity_date(&author, &rebase_now_date())
+    } else {
+        author
+    };
+    let committer = if opts.committer_date_is_author_date {
+        if opts.ignore_date {
+            reset_identity_date(&commit_identity_from_env("COMMITTER")?, &rebase_now_date())
+        } else {
+            let author_date = identity_date(&author).unwrap_or_else(rebase_now_date);
+            commit_identity_from_env_with_date("COMMITTER", &author_date)?
+        }
+    } else if opts.ignore_date {
+        reset_identity_date(&commit_identity_from_env("COMMITTER")?, &rebase_now_date())
+    } else {
+        commit_identity_from_env("COMMITTER")?
+    };
     let mut writer = ctx.db();
     let new_oid = sley_sequencer::create_commit(
         &mut writer,
@@ -2691,6 +2740,45 @@ fn machine_commit(
 
     let _ = opts;
     Ok(CommitOutcome::Committed)
+}
+
+/// The current wall-clock time as git's raw `@<seconds> +0000`. Mirrors git's
+/// `reset_ident_date()` + `datestamp()` path used by `--ignore-date` /
+/// `--committer-date-is-author-date`: the upstream tests run under `TZ=UTC`, so
+/// the synthesized "now" carries a `+0000` offset.
+fn rebase_now_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("@{secs} +0000")
+}
+
+/// Extract the `@<seconds> <tz>` date portion from a raw identity line
+/// (`Name <email> <seconds> <tz>`), suitable for `commit_identity_from_env_with_date`.
+fn identity_date(identity: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(identity).ok()?;
+    let close = text.rfind('>')?;
+    let rest = text[close + 1..].trim();
+    let mut parts = rest.split_whitespace();
+    let seconds = parts.next()?;
+    let tz = parts.next()?;
+    Some(format!("@{seconds} {tz}"))
+}
+
+/// Replace the date portion of a raw identity line (`Name <email> <seconds> <tz>`)
+/// with `new_date` (any form `canonicalize_commit_date` accepts), keeping the
+/// name+email. Used to reset author/committer dates to "now".
+fn reset_identity_date(identity: &[u8], new_date: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(identity);
+    let Some(close) = text.rfind('>') else {
+        return identity.to_vec();
+    };
+    let canonical = canonicalize_commit_date(new_date);
+    let mut out = text[..=close].as_bytes().to_vec();
+    out.push(b' ');
+    out.extend_from_slice(canonical.as_bytes());
+    out
 }
 
 fn read_author_script_identity(ctx: &Ctx) -> Result<Option<Vec<u8>>> {
