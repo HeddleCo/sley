@@ -1665,6 +1665,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             abbrev_len_explicit,
             max_age,
             min_age,
+            pickaxe: compiled_pickaxe.as_ref(),
+            pickaxe_ignore_case,
+            pickaxe_text,
+            pickaxe_detect_renames,
         });
     }
     if plain_oneline
@@ -2532,6 +2536,14 @@ struct LineLogOutputCtx<'a> {
     /// `--until`/`--before` upper time bound (commits newer than this are
     /// pruned). `None` == no upper bound.
     min_age: Option<i64>,
+    /// `-S`/`-G`/`--find-object` pickaxe: like upstream's `-L` + pickaxe, this
+    /// suppresses the *diff pairs* of a commit whose whole-file diff does not
+    /// match (the commit header still prints, matching git's pipeline where
+    /// show_log runs before diffcore_std's pickaxe). `None` == no pickaxe.
+    pickaxe: Option<&'a CompiledPickaxe>,
+    pickaxe_ignore_case: bool,
+    pickaxe_text: bool,
+    pickaxe_detect_renames: bool,
 }
 
 /// `git log -L`: walk history with the line-log engine and emit each commit that
@@ -2564,6 +2576,10 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         abbrev_len_explicit,
         max_age,
         min_age,
+        pickaxe,
+        pickaxe_ignore_case,
+        pickaxe_text,
+        pickaxe_detect_renames,
     } = ctx;
 
     // Reachable commits from the tip, in topological order (child before
@@ -2689,7 +2705,28 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     let mut stdout = io::stdout();
     let mut printed_entries = 0usize;
     for record in &selected {
-        let files = result.printed.get(&record.oid);
+        // `-S`/`-G`/`--find-object`: suppress this commit's diff pairs when its
+        // whole-file diff does not match the pickaxe (the header still prints,
+        // matching git's show_log-before-diffcore_std pipeline). Computed on the
+        // ORIGINAL record so the real parent edge drives the diff.
+        let pickaxe_suppresses = match pickaxe {
+            Some(pickaxe) => !pickaxe_commit_matches(
+                db,
+                format,
+                record,
+                pickaxe,
+                pickaxe_ignore_case,
+                pickaxe_text,
+                pickaxe_detect_renames,
+                None,
+            )?,
+            None => false,
+        };
+        let files = if pickaxe_suppresses {
+            None
+        } else {
+            result.printed.get(&record.oid)
+        };
         // Under `--parents`, render the rewritten parent set (collapsing
         // commits that did not touch the tracked range) for both the inline
         // parent list and any `%p`/`%P` format placeholders.
