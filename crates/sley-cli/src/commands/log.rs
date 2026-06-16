@@ -378,6 +378,22 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut line_log_args: Vec<crate::commands::line_log::LineLogArg> = Vec::new();
     // `--follow` (incompatible with `-L`).
     let mut saw_follow = false;
+    // Whether a diff *output format* was explicitly requested (`-p`/`-s`/
+    // `--stat`/`--raw`/...). Mirrors git's `revs->diffopt.output_format`: `-L`
+    // forces `DIFF_FORMAT_PATCH` only when this is still unset at setup time, so
+    // an explicit `-s`/`--no-patch` wins regardless of where it sits relative to
+    // `-L` on the command line (revision.c: `if (!revs->diffopt.output_format)`).
+    // Note `--format`/`--pretty` set the *commit* format, NOT a diff output
+    // format, so they do not count here (`-L --format=%s` still defaults to a
+    // patch).
+    let mut diff_format_explicit = false;
+    // Diff-format presentation options forwarded to the `-L` patch renderer.
+    // The ordinary log path threads these through `setup_args` to the diff
+    // machinery; the line-log path renders its restricted patch directly, so it
+    // captures the same options here. `None`/default == git's defaults.
+    let mut line_log_src_prefix: Option<String> = None;
+    let mut line_log_dst_prefix: Option<String> = None;
+    let mut line_log_full_index = false;
     // Raw `-I<regex>` (`--ignore-matching-lines`) patterns, compiled after the
     // option scan so a malformed regex fails like git's diff_opt_ignore_regex.
     let mut ignore_regex_patterns: Vec<String> = Vec::new();
@@ -628,9 +644,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--indent-heuristic"
             | "--no-indent-heuristic"
             | "--function-context"
-            | "--no-prefix"
             | "--default-prefix"
-            | "--full-index"
             | "--break-rewrites"
             | "--irreversible-delete"
             | "--textconv"
@@ -866,16 +880,29 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--inter-hunk-context=") => {
                 log_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
             }
+            "--no-prefix" => {
+                line_log_src_prefix = Some(String::new());
+                line_log_dst_prefix = Some(String::new());
+            }
+            "--full-index" => line_log_full_index = true,
             "--src-prefix" => {
-                iter.next()
+                let value = iter
+                    .next()
                     .ok_or_else(|| log_option_requires_value_error("src-prefix"))?;
+                line_log_src_prefix = Some(value.clone());
             }
             "--dst-prefix" => {
-                iter.next()
+                let value = iter
+                    .next()
                     .ok_or_else(|| log_option_requires_value_error("dst-prefix"))?;
+                line_log_dst_prefix = Some(value.clone());
             }
-            value if value.starts_with("--src-prefix=") => {}
-            value if value.starts_with("--dst-prefix=") => {}
+            value if let Some(p) = value.strip_prefix("--src-prefix=") => {
+                line_log_src_prefix = Some(p.to_string());
+            }
+            value if let Some(p) = value.strip_prefix("--dst-prefix=") => {
+                line_log_dst_prefix = Some(p.to_string());
+            }
             value if value.starts_with("--break-rewrites=") => {
                 log_validate_break_rewrites_option(&value["--break-rewrites=".len()..])?;
             }
@@ -1177,9 +1204,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             {
                 setup_args.push(arg.clone());
             }
-            "-p" | "-u" | "--patch" => diff_opts.patch = true,
-            "-s" | "--no-patch" => diff_opts = LogDiffOptions::default(),
-            "--stat" => diff_opts.stat = true,
+            "-p" | "-u" | "--patch" => {
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            "-s" | "--no-patch" => {
+                diff_opts = LogDiffOptions::default();
+                diff_format_explicit = true;
+            }
+            "--stat" => {
+                diff_opts.stat = true;
+                diff_format_explicit = true;
+            }
             value
                 if value.starts_with("--stat=")
                     || value.starts_with("--stat-width=")
@@ -1188,24 +1224,42 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     || value.starts_with("--stat-count=") =>
             {
                 diff_opts.stat = true;
+                diff_format_explicit = true;
                 diff_stat_parse_width_option(value, &mut diff_opts.stat_widths)?;
                 if let Some(count) = diff_stat_count_option(value)? {
                     diff_opts.stat_count = count;
                 }
             }
-            "--compact-summary" => diff_opts.compact_summary = true,
-            "--numstat" => diff_opts.numstat = true,
-            "--shortstat" => diff_opts.shortstat = true,
-            "--summary" => diff_opts.summary = true,
+            "--compact-summary" => {
+                diff_opts.compact_summary = true;
+                diff_format_explicit = true;
+            }
+            "--numstat" => {
+                diff_opts.numstat = true;
+                diff_format_explicit = true;
+            }
+            "--shortstat" => {
+                diff_opts.shortstat = true;
+                diff_format_explicit = true;
+            }
+            "--summary" => {
+                diff_opts.summary = true;
+                diff_format_explicit = true;
+            }
             "--patch-with-stat" => {
                 diff_opts.patch = true;
                 diff_opts.stat = true;
+                diff_format_explicit = true;
             }
             "--patch-with-raw" => {
                 diff_opts.patch = true;
                 diff_opts.raw = true;
+                diff_format_explicit = true;
             }
-            "--raw" => diff_opts.raw = true,
+            "--raw" => {
+                diff_opts.raw = true;
+                diff_format_explicit = true;
+            }
             "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
             "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
@@ -1219,20 +1273,27 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 line_log_args.push(crate::commands::line_log::LineLogArg {
                     raw: value.clone(),
                 });
-                // `-L` implies a patch unless `-s`/format suppresses output.
-                diff_opts.patch = true;
+                // `-L` does NOT eagerly force a patch here; the default is
+                // applied after the option scan only when no explicit diff
+                // output format was requested (see `diff_format_explicit`).
             }
             value if let Some(arg) = value.strip_prefix("-L") => {
                 line_log_args.push(crate::commands::line_log::LineLogArg {
                     raw: arg.to_string(),
                 });
-                diff_opts.patch = true;
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported log option {value}")));
             }
             value => setup_args.push(value.to_string()),
         }
+    }
+    // `-L` defaults to a patch only when no explicit diff output format was
+    // requested (revision.c: `if (!revs->diffopt.output_format) output_format =
+    // DIFF_FORMAT_PATCH`). This runs after the full option scan so `-s`/`-p`
+    // win regardless of their position relative to `-L`.
+    if !line_log_args.is_empty() && !diff_format_explicit {
+        diff_opts.patch = true;
     }
     if read_stdin {
         let mut input = String::new();
@@ -1598,6 +1659,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             show_parents,
             decoration,
             output_encoding: &output_encoding,
+            src_prefix: line_log_src_prefix.as_deref(),
+            dst_prefix: line_log_dst_prefix.as_deref(),
+            full_index: line_log_full_index,
+            abbrev_len_explicit,
         });
     }
     if plain_oneline
@@ -2449,6 +2514,16 @@ struct LineLogOutputCtx<'a> {
     show_parents: bool,
     decoration: LogDecorationMode,
     output_encoding: &'a str,
+    /// `--src-prefix`/`--no-prefix` override for the `-L` patch (`None` keeps
+    /// the `a/` default).
+    src_prefix: Option<&'a str>,
+    /// `--dst-prefix`/`--no-prefix` override (`None` keeps `b/`).
+    dst_prefix: Option<&'a str>,
+    /// `--full-index`: emit the full object names on the `index` line.
+    full_index: bool,
+    /// Whether `--abbrev=<n>` was given explicitly (so the diff `index` line
+    /// honors it instead of the config-derived diff abbreviation).
+    abbrev_len_explicit: bool,
 }
 
 /// `git log -L`: walk history with the line-log engine and emit each commit that
@@ -2475,6 +2550,10 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         show_parents,
         decoration,
         output_encoding,
+        src_prefix,
+        dst_prefix,
+        full_index,
+        abbrev_len_explicit,
     } = ctx;
 
     // Reachable commits from the tip, in topological order (child before
@@ -2528,9 +2607,22 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         db,
         format,
     };
-    let patch_abbrev = repository_abbrev_from_config(git_dir, format, config)?
-        .unwrap_or(7)
-        .min(format.hex_len());
+    let patch_abbrev = if full_index {
+        // `--full-index`: the `index` line carries the full object names.
+        format.hex_len()
+    } else if abbrev_len_explicit {
+        // `--abbrev=<n>` overrides the diff abbreviation directly.
+        abbrev_len.unwrap_or(7).min(format.hex_len())
+    } else {
+        repository_abbrev_from_config(git_dir, format, config)?
+            .unwrap_or(7)
+            .min(format.hex_len())
+    };
+
+    // Effective diff path prefixes: `--src-prefix`/`--dst-prefix`/`--no-prefix`
+    // override the `a/`/`b/` defaults.
+    let eff_src_prefix = src_prefix.unwrap_or("a/");
+    let eff_dst_prefix = dst_prefix.unwrap_or("b/");
 
     let mut stdout = io::stdout();
     let mut printed_entries = 0usize;
@@ -2589,6 +2681,8 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         files,
                         diff_opts,
                         patch_abbrev,
+                        eff_src_prefix,
+                        eff_dst_prefix,
                     )?;
                     if !block.is_empty() {
                         stdout.write_all(diff_opts.block_separator())?;
@@ -2639,6 +2733,8 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         files,
                         diff_opts,
                         patch_abbrev,
+                        eff_src_prefix,
+                        eff_dst_prefix,
                     )?;
                     if !block.is_empty() {
                         if !*final_newline {
@@ -2665,6 +2761,8 @@ fn render_line_log_patch(
     files: Option<&Vec<crate::commands::line_log::PrintedFile>>,
     diff_opts: &LogDiffOptions,
     patch_abbrev: usize,
+    src_prefix: &str,
+    dst_prefix: &str,
 ) -> Result<()> {
     let files = match files {
         Some(f) if !f.is_empty() => f,
@@ -2693,8 +2791,8 @@ fn render_line_log_patch(
                 use_worktree_new: false,
                 format,
                 abbrev: patch_abbrev,
-                src_prefix: "a/",
-                dst_prefix: "b/",
+                src_prefix,
+                dst_prefix,
                 context: 3,
                 userdiff: None,
                 colors: None,
