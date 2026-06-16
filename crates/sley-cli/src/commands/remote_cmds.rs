@@ -2448,18 +2448,62 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Whether the connecting client requested protocol v2 via the `GIT_PROTOCOL`
+/// environment variable (`version=2`, possibly among colon-separated tokens).
+/// Mirrors `git_protocol_version_from_environment` in protocol.c.
+fn upload_pack_requested_protocol_v2() -> bool {
+    let Ok(value) = std::env::var("GIT_PROTOCOL") else {
+        return false;
+    };
+    value.split(':').any(|token| token == "version=2")
+}
+
 pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
-    let repository = match args {
-        [repository] => repository,
-        _ => {
-            return Err(GitError::Command(
-                "upload-pack currently supports: upload-pack <repository>".into(),
-            ));
+    // Accept (and ignore) the upload-pack flags the transports pass through:
+    // `git daemon` runs `upload-pack --strict <dir>`, the smart transports add
+    // `--stateless-rpc`/`--advertise-refs`/`--timeout=<n>`. The repository is
+    // the lone positional argument. Mirrors builtin/upload-pack.c's options.
+    let mut repository: Option<&String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--strict" | "--stateless-rpc" | "--advertise-refs" | "--http-backend-info-refs" => {}
+            value if value.starts_with("--timeout=") => {}
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!(
+                    "upload-pack: unknown option {value}"
+                )));
+            }
+            value => {
+                if repository.is_some() {
+                    return Err(GitError::Command(
+                        "upload-pack currently supports: upload-pack <repository>".into(),
+                    ));
+                }
+                repository = Some(arg);
+                let _ = value;
+            }
         }
+    }
+    let Some(repository) = repository else {
+        return Err(GitError::Command(
+            "upload-pack currently supports: upload-pack <repository>".into(),
+        ));
     };
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+
+    // Protocol v2: the client requests version 2 via the `GIT_PROTOCOL`
+    // environment variable (the daemon/file:// transport propagates it from the
+    // connection's `version=2` extra-arg). Run the v2 server loop instead of the
+    // v0 ref advertisement. Mirrors upload-pack.c's `determine_protocol_version`.
+    if upload_pack_requested_protocol_v2() {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        return sley_remote::serve_upload_pack_v2(&git_dir, format, &mut stdin, &mut stdout);
+    }
     let features = sley_remote::upload_pack_features(&git_dir, format)?;
     let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
     sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
