@@ -968,11 +968,13 @@ pub fn push_local_with_report(
             config,
             request.remote_git_dir,
         )?;
+        // git's `forced_update` reflects whether the update is *actually* a
+        // non-fast-forward (a rewind), independent of the `--force` flag — the
+        // flag only permits it. A create/delete is never "forced".
         let forced = matches!(status, PushRefStatus::Ok)
             && !plan.command.old_id.is_null()
             && !plan.command.new_id.is_null()
-            && (plan.force
-                || !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?);
+            && !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?;
         refs.push(PushReportRef {
             src: plan.source.clone(),
             dst: plan.command.name.clone(),
@@ -992,9 +994,10 @@ pub fn push_local_with_report(
 
     // `--atomic`: if any ref was rejected client-side, send nothing and mark all
     // would-be-OK refs as atomic-push-failed (git's REF_STATUS_ATOMIC_PUSH_FAILED).
+    // UpToDate refs are *not* converted — git leaves them reported as up to date.
     if request.atomic && any_local_reject {
         for reference in &mut refs {
-            if matches!(reference.status, PushRefStatus::Ok | PushRefStatus::UpToDate) {
+            if matches!(reference.status, PushRefStatus::Ok) {
                 reference.status = PushRefStatus::AtomicPushFailed;
             }
         }

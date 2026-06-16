@@ -2957,13 +2957,17 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         }
     }
 
+    // git's status header and the trailing error use the *resolved* push URL
+    // (`transport->url` / `anon_url`), not the remote name the user typed.
+    let url = push_resolved_url(req.remote).unwrap_or_else(|_| req.remote.to_string());
+
     let had_errors = report.had_errors();
     if !req.options.quiet || had_errors {
         let local_db = FileObjectDatabase::from_git_dir(req.common_git_dir, req.format);
         let remote_db = FileObjectDatabase::from_git_dir(req.remote_common_git_dir, req.format);
         render_push_status(
             &report,
-            req.remote,
+            &url,
             req.porcelain,
             req.options.dry_run,
             &local_db,
@@ -2972,7 +2976,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     }
 
     if had_errors {
-        eprintln!("error: failed to push some refs to '{}'", req.remote);
+        eprintln!("error: failed to push some refs to '{url}'");
         return Err(GitError::Exit(1));
     }
     Ok(())
@@ -2990,6 +2994,11 @@ fn render_push_status(
     remote_db: &FileObjectDatabase,
 ) -> Result<()> {
     let summary_width = push_summary_width(report);
+    // git renders refs in the remote-ref list order, which `match_push_refs`
+    // builds sorted by destination ref name. Sort a view so the three status
+    // passes below each walk in that canonical order.
+    let mut ordered: Vec<&sley_remote::PushReportRef> = report.refs.iter().collect();
+    ordered.sort_by(|a, b| a.dst.cmp(&b.dst));
     let mut first = true;
     let mut emit = |reference: &sley_remote::PushReportRef| {
         if first {
@@ -3009,14 +3018,24 @@ fn render_push_status(
         );
     };
 
-    // OK refs first (git prints UPTODATE only with --verbose, which we do not
-    // pass), then rejected refs, preserving each group's planning order.
-    for reference in &report.refs {
+    // git's `transport_print_push_status` prints in three passes:
+    //   1. UPTODATE refs, but only when verbose — and porcelain forces verbose.
+    //   2. OK refs.
+    //   3. everything else (rejections / no-match).
+    // Each pass preserves planning order.
+    if porcelain {
+        for reference in &ordered {
+            if matches!(reference.status, sley_remote::PushRefStatus::UpToDate) {
+                emit(reference);
+            }
+        }
+    }
+    for reference in &ordered {
         if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
             emit(reference);
         }
     }
-    for reference in &report.refs {
+    for reference in &ordered {
         if !matches!(
             reference.status,
             sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
@@ -3025,7 +3044,10 @@ fn render_push_status(
         }
     }
 
-    if porcelain && !report.had_errors() {
+    // git prints "Done" under porcelain whenever the transport-level push
+    // succeeded (`!push_ret`); ref-level rejections (non-ff, atomic, remote ng)
+    // do not set push_ret, so over the local transport "Done" always prints.
+    if porcelain {
         println!("Done");
     } else if !report.had_errors() && !report.refs_pushed() {
         // stable plumbing output; do not modify or localize
@@ -3077,10 +3099,17 @@ fn print_push_ref(
         }
     };
 
-    // The "from" side: a deletion has none; a remote-reject of a deletion also
-    // prints `:dst` (git passes NULL peer_ref when ref->deletion).
+    // The "from" side. git models a deletion's peer_ref as the literal
+    // "(delete)": a *successful* delete (`print_ok_ref_status`) prints with
+    // `from = NULL` (→ `:dst`), but a *rejected* delete (`print_ref_status` in
+    // the reject arms) prints the peer_ref `(delete)` (→ `(delete):dst`). A
+    // non-delete uses its source ref both ways.
     let from = if reference.is_deletion() {
-        None
+        if matches!(reference.status, PushRefStatus::Ok) {
+            None
+        } else {
+            Some("(delete)".to_string())
+        }
     } else {
         reference.src.clone()
     };
