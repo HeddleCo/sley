@@ -514,6 +514,58 @@ fn merge_commit_and_advance(
     Ok(oid)
 }
 
+/// Commit + advance HEAD for `-s ours`. Identical to [`merge_commit_and_advance`]
+/// except the reflog message names the `ours` strategy and uses the merge target
+/// label (e.g. `merge main: Merge made by the 'ours' strategy.`), matching git's
+/// `merge-ours` reflog exactly.
+#[allow(clippy::too_many_arguments)]
+fn merge_ours_commit_and_advance(
+    git_dir: &Path,
+    refs: &FileRefStore,
+    format: ObjectFormat,
+    head_oid: &ObjectId,
+    other_oid: &ObjectId,
+    tree: ObjectId,
+    target_label: &str,
+    message: Vec<u8>,
+) -> Result<ObjectId> {
+    commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
+    let author = commit_identity_from_env("AUTHOR")?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let oid = sley_sequencer::create_commit(
+        &mut db,
+        sley_sequencer::CommitCreate {
+            tree,
+            parents: vec![*head_oid, *other_oid],
+            author,
+            committer: committer.clone(),
+            message,
+            encoding: None,
+        },
+    )?;
+    let target_ref = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => branch,
+        _ => "HEAD".to_string(),
+    };
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: target_ref,
+        expected: Some(RefTarget::Direct(*head_oid)),
+        new: RefTarget::Direct(oid),
+        reflog: Some(ReflogEntry {
+            old_oid: *head_oid,
+            new_oid: oid,
+            committer,
+            message: format!("merge {target_label}: Merge made by the 'ours' strategy.")
+                .into_bytes(),
+        }),
+    });
+    tx.commit()?;
+    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
+    Ok(oid)
+}
+
 /// `git merge <a> <b> [...]` — the octopus strategy. Mirrors upstream's
 /// `git-merge-octopus`: iteratively three-way-merge each head onto the running
 /// merged tree (MRT), fast-forwarding where possible, and refuse (exit 2) the
@@ -794,6 +846,11 @@ struct MergeOptions {
     /// has not been set from the command line, so the `merge.stat` config still
     /// gets to decide; `Some(_)` is an explicit CLI choice that wins.
     diffstat: Option<MergeDiffstat>,
+    /// `-s ours`: the merge keeps HEAD's tree verbatim and records the other
+    /// commit only as a second parent (git's `merge-ours` strategy, which has
+    /// `NO_FAST_FORWARD | NO_TRIVIAL`). Other strategies (`recursive`/`ort`)
+    /// use the 3-way engine and leave this `false`.
+    ours_strategy: bool,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -817,17 +874,27 @@ impl Default for MergeOptions {
             favor: sley_diff_merge::MergeFavor::None,
             allow_unrelated_histories: false,
             diffstat: None,
+            ours_strategy: false,
         }
     }
 }
 
 /// Accept a `-s <strategy>` value. sley implements a single 3-way merge engine
 /// equivalent to git's `ort` (the modern default, byte-compatible with the older
-/// `recursive` on the cases we model), so both names are accepted; any other
-/// named strategy is rejected.
-fn accept_merge_strategy(value: &str) -> Result<()> {
+/// `recursive` on the cases we model), so both names are accepted. `ours` selects
+/// the trivial strategy that keeps HEAD's tree (recorded in `ours_strategy`); any
+/// other named strategy is rejected. The last `-s` wins (git replaces the
+/// strategy list), so re-selecting `recursive`/`ort` clears a prior `ours`.
+fn accept_merge_strategy(value: &str, options: &mut MergeOptions) -> Result<()> {
     match value {
-        "recursive" | "ort" => Ok(()),
+        "recursive" | "ort" => {
+            options.ours_strategy = false;
+            Ok(())
+        }
+        "ours" => {
+            options.ours_strategy = true;
+            Ok(())
+        }
         other => Err(GitError::Command(format!(
             "merge strategy '{other}' is not supported"
         ))),
@@ -990,13 +1057,13 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("merge -s requires a value".into()))?;
-                accept_merge_strategy(value)?;
+                accept_merge_strategy(value, options)?;
             }
             value if value.starts_with("--strategy=") => {
-                accept_merge_strategy(value.strip_prefix("--strategy=").unwrap_or(""))?;
+                accept_merge_strategy(value.strip_prefix("--strategy=").unwrap_or(""), options)?;
             }
             value if value.starts_with("-s") && value.len() > 2 => {
-                accept_merge_strategy(&value[2..])?;
+                accept_merge_strategy(&value[2..], options)?;
             }
             "-X" | "--strategy-option" => {
                 let value = iter
@@ -1212,6 +1279,70 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if !options.quiet {
             println!("Already up to date.");
         }
+        return Ok(());
+    }
+
+    // `-s ours`: keep HEAD's tree verbatim, recording `other` only as a second
+    // parent (git's `merge-ours` strategy). It has `NO_FAST_FORWARD`, so it skips
+    // the fast-forward and 3-way paths entirely and always creates a merge commit
+    // (the "Already up to date." short-circuit above still applies). The worktree
+    // and index are unchanged because the tree equals HEAD's.
+    if options.ours_strategy {
+        if options.ff_only {
+            eprintln!("fatal: Not possible to fast-forward, aborting.");
+            return Err(GitError::Exit(128));
+        }
+        fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
+        let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+        let target_is_branch = match branch_ref_name(&target) {
+            Ok(name) => refs.read_ref(&name)?.is_some(),
+            Err(_) => false,
+        };
+        let default_message = if target == "FETCH_HEAD" {
+            fetch_head_merge_record(&git_dir, format)
+                .map(|record| format!("Merge {}", record.description))
+                .unwrap_or_else(|_| format!("Merge commit '{target}'"))
+        } else if target_is_branch {
+            format!("Merge branch '{target}'")
+        } else {
+            format!("Merge commit '{target}'")
+        };
+        let message = options.message.clone().unwrap_or(default_message);
+        if options.no_commit {
+            fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
+            fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            if !options.quiet {
+                println!("Automatic merge went well; stopped before committing as requested");
+            }
+            return Ok(());
+        }
+        if !options.quiet {
+            let mut stdout = io::stdout();
+            writeln!(stdout, "Merge made by the 'ours' strategy.")?;
+            stdout.flush()?;
+        }
+        let merged_oid = merge_ours_commit_and_advance(
+            &git_dir,
+            &refs,
+            format,
+            &head_oid,
+            &other_oid,
+            head_tree,
+            &target,
+            commit_cleanup_message(
+                message.clone().into_bytes(),
+                CommitCleanupMode::Whitespace,
+                "#",
+                false,
+            ),
+        )?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &worktree_root,
+            &git_dir,
+            format,
+            &merged_oid,
+        )?;
+        commands::hooks::run_hook_l("post-merge", &["0"])?;
         return Ok(());
     }
 

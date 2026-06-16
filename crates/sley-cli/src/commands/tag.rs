@@ -190,6 +190,27 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                     .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
                 merged = Some((value, false));
             }
+            // `--with`/`--without` are hidden aliases for `--contains`/
+            // `--no-contains` (parse-options.h OPT_WITH/OPT_WITHOUT). Like their
+            // canonical forms they take an optional commit-ish defaulting to HEAD.
+            "--with" => {
+                let value = iter
+                    .next()
+                    .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
+                contains = Some((value, true));
+            }
+            "--without" => {
+                let value = iter
+                    .next()
+                    .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
+                contains = Some((value, false));
+            }
+            value if let Some(rev) = value.strip_prefix("--with=") => {
+                contains = Some((rev.to_string(), true));
+            }
+            value if let Some(rev) = value.strip_prefix("--without=") => {
+                contains = Some((rev.to_string(), false));
+            }
             "-m" => {
                 let Some(message) = iter.next() else {
                     return tag_message_requires_value_error();
@@ -433,6 +454,32 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         && !create_reflog
     {
         return print_default_tag_list(&git_dir, format, &store);
+    }
+    // A ref-filter (`--contains`/`--no-contains`/`--points-at`/`--merged`/
+    // `--no-merged`) or `-n` is "only allowed in list mode": when an explicit
+    // non-list cmdmode (`-d`/`-v`) is also given git dies naming the offending
+    // option (builtin/tag.c `only_in_list`). Precedence mirrors git's chain:
+    // `-n` first, then contains, no-contains, points-at, merged, no-merged.
+    if delete || verify {
+        let only_in_list = if annotation_lines.is_some() {
+            Some("-n")
+        } else if matches!(contains, Some((_, true))) {
+            Some("--contains")
+        } else if matches!(contains, Some((_, false))) {
+            Some("--no-contains")
+        } else if points_at.is_some() {
+            Some("--points-at")
+        } else if matches!(merged, Some((_, true))) {
+            Some("--merged")
+        } else if matches!(merged, Some((_, false))) {
+            Some("--no-merged")
+        } else {
+            None
+        };
+        if let Some(option) = only_in_list {
+            eprintln!("fatal: the '{option}' option is only allowed in list mode");
+            return Err(GitError::Exit(128));
+        }
     }
     if verify {
         if explicit_list {

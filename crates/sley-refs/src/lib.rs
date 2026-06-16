@@ -1465,6 +1465,46 @@ impl FileRefStore {
         }
     }
 
+    /// Mirror git's `files_log_ref_write`: when a transaction updates a branch
+    /// that `HEAD` symbolically points at, the same reflog entry is also written
+    /// to `logs/HEAD`. Without this, `git reflog` (which reads the HEAD reflog)
+    /// misses commits/merges/resets done on the checked-out branch.
+    ///
+    /// `head_branch` is HEAD's symref target captured **before** the transaction
+    /// mutated any refs — using the post-apply value would mis-mirror a
+    /// transaction that re-points HEAD onto the branch it just updated (e.g.
+    /// rebase's finish step, which manages `logs/HEAD` itself). When the
+    /// transaction explicitly updates `HEAD` it owns the HEAD reflog and nothing
+    /// is mirrored.
+    fn head_reflog_mirror(
+        head_branch: Option<&str>,
+        reflogs: &[(String, ReflogEntry)],
+    ) -> Vec<(String, ReflogEntry)> {
+        let Some(head_branch) = head_branch else {
+            return Vec::new();
+        };
+        // A transaction that touches HEAD directly is managing the HEAD reflog
+        // on its own terms (detach, rebase finish, checkout); don't double-write.
+        if reflogs.iter().any(|(name, _)| name == "HEAD") {
+            return Vec::new();
+        }
+        reflogs
+            .iter()
+            .filter(|(name, _)| name == head_branch)
+            .map(|(_, entry)| ("HEAD".to_string(), entry.clone()))
+            .collect()
+    }
+
+    /// HEAD's symref target (`refs/heads/<branch>`) if HEAD is symbolic, else
+    /// `None`. Read once at the start of a transaction commit so the HEAD-reflog
+    /// mirror reflects the pre-transaction state.
+    fn head_symref_target(&self) -> Option<String> {
+        match self.read_ref("HEAD") {
+            Ok(Some(RefTarget::Symbolic(branch))) => Some(branch),
+            _ => None,
+        }
+    }
+
     pub fn append_reflog(&self, name: &str, entry: &ReflogEntry) -> Result<()> {
         validate_ref_name_for_read(name)?;
         let path = self.reflog_path(name);
@@ -1689,6 +1729,9 @@ impl<'a> FileRefTransaction<'a> {
 
 impl FileRefStore {
     fn commit_reftable(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
+        // Capture HEAD's symref target before any ref is mutated so the
+        // HEAD-reflog mirror reflects the pre-transaction checked-out branch.
+        let head_branch = self.head_symref_target();
         let mut records = Vec::with_capacity(changes.len());
         let mut reflogs = Vec::new();
         let mut delete_names = Vec::new();
@@ -1739,6 +1782,8 @@ impl FileRefStore {
         for name in &delete_names {
             self.remove_reflog_file(name);
         }
+        let head_mirror = Self::head_reflog_mirror(head_branch.as_deref(), &reflogs);
+        reflogs.extend(head_mirror);
         for (name, entry) in reflogs {
             self.append_reflog(&name, &entry)?;
         }
@@ -1748,6 +1793,9 @@ impl FileRefStore {
     /// Atomic, all-or-nothing commit for the loose-ref backend. See
     /// [`FileRefTransaction::commit`] for the full ordering and rollback rules.
     fn commit_loose(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
+        // Capture HEAD's symref target before any ref is mutated so the
+        // HEAD-reflog mirror reflects the pre-transaction checked-out branch.
+        let head_branch = self.head_symref_target();
         let has_delete = changes
             .iter()
             .any(|change| matches!(change, CoalescedRefChange::Delete(_)));
@@ -1987,6 +2035,10 @@ impl FileRefStore {
         for name in &delete_names {
             self.remove_reflog_file(name);
         }
+        // git's `files_log_ref_write` mirrors a checked-out branch's reflog
+        // entry into logs/HEAD; `head_branch` was captured before any mutation.
+        let head_mirror = Self::head_reflog_mirror(head_branch.as_deref(), &reflogs);
+        reflogs.extend(head_mirror);
         // All refs are durable; append reflogs last, matching git's ordering.
         for (name, entry) in reflogs {
             self.append_reflog(&name, &entry)?;
