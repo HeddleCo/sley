@@ -1212,9 +1212,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--follow" => saw_follow = true,
             // `-L<range>:<file>` (attached) or `-L <range>:<file>` (separate).
             "-L" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| log_option_requires_value_error("L"))?;
+                let value = iter.next().ok_or_else(|| {
+                    eprintln!("error: switch `L' requires a value");
+                    GitError::Exit(129)
+                })?;
                 line_log_args.push(crate::commands::line_log::LineLogArg {
                     raw: value.clone(),
                 });

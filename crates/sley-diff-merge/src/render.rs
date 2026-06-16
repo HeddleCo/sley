@@ -378,11 +378,19 @@ impl RangeFilter<'_> {
             self.rhunk.clear();
             return;
         }
-        out.extend_from_slice(b"@@ -");
-        out.extend_from_slice(format_hunk_range(usize_or_zero(self.rhunk_old_begin), usize_or_zero(self.rhunk_old_count)).as_bytes());
-        out.extend_from_slice(b" +");
-        out.extend_from_slice(format_hunk_range(usize_or_zero(self.rhunk_new_begin), usize_or_zero(self.rhunk_new_count)).as_bytes());
-        out.extend_from_slice(b" @@");
+        // git's flush_rhunk uses `@@ -%ld,%ld +%ld,%ld @@` unconditionally —
+        // the count is ALWAYS shown (unlike the normal emitter, which omits a
+        // count of 1).
+        out.extend_from_slice(
+            format!(
+                "@@ -{},{} +{},{} @@",
+                self.rhunk_old_begin,
+                self.rhunk_old_count,
+                self.rhunk_new_begin,
+                self.rhunk_new_count
+            )
+            .as_bytes(),
+        );
         if !self.func.is_empty() {
             out.push(b' ');
             out.extend_from_slice(&self.func);
@@ -464,10 +472,6 @@ impl RangeFilter<'_> {
             self.rhunk_old_count += 1;
         }
     }
-}
-
-fn usize_or_zero(v: i64) -> usize {
-    if v < 0 { 0 } else { v as usize }
 }
 
 /// Clip a fully-rendered unified-diff hunk body (`full`, produced with

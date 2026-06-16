@@ -508,7 +508,6 @@ fn parse_loc(
     let pattern = &spec[1..j];
     // begin-- (human terms → 0-based), search from that line.
     let search_from = anchor - 1;
-    let from_off = ends.get(search_from.max(0) as usize).copied().unwrap_or(0);
     let regex = grep_source::Regex::compile_bytes(
         pattern.as_bytes(),
         grep_source::RegexMode::Bre,
@@ -516,41 +515,48 @@ fn parse_loc(
         false,
     )
     .map_err(|_| line_log_fatal(format!("-L parameter '{pattern}': invalid regex")))?;
-    let hay = &data[from_off.min(data.len())..];
-    match regex.find_from(hay, 0) {
-        Some((mstart, _)) => {
-            let abs = from_off + mstart;
-            // Find the line containing abs: advance begin until nth_line passes it.
-            let mut b = search_from;
-            while b < lines {
-                let nline_off = ends.get((b + 1) as usize).copied().unwrap_or(data.len());
-                if from_off + (abs - from_off) < nline_off
-                    && ends.get(b as usize).copied().unwrap_or(0) <= abs
-                {
-                    break;
-                }
-                b += 1;
-            }
-            // git's loop: while begin++ < lines, finds the line whose [start,next)
-            // contains cp; *ret = begin (1-based after the ++). Reproduce by
-            // scanning offsets directly.
-            let mut idx = search_from.max(0);
-            while idx < lines {
-                let lo = ends.get(idx as usize).copied().unwrap_or(data.len());
-                let hi = ends.get((idx + 1) as usize).copied().unwrap_or(data.len());
-                if lo <= abs && abs < hi {
-                    return Ok(idx + 1);
-                }
-                idx += 1;
-            }
-            Ok(lines)
-        }
+    // git runs the regex with REG_NEWLINE (multiline `^`/`$`) over the buffer
+    // from `search_from`, then maps the first match offset to a line. sley's
+    // regex engine lacks multiline anchors, so scan line-by-line: the first
+    // line (>= search_from) the pattern matches is git's result.
+    match find_regex_line(&regex, data, ends, lines, search_from) {
+        Some(line0) => Ok(line0 + 1),
         None => Err(line_log_fatal(format!(
             "-L parameter '{}' starting at line {}: no match",
             pattern,
             search_from + 1
         ))),
     }
+}
+
+/// Find the first line index (0-based, `>= from0`) whose bytes the `regex`
+/// matches anywhere — git's REG_NEWLINE multiline search reduced to a per-line
+/// scan (the engine here has no multiline `^`/`$`, so we feed each line slice
+/// individually, which makes `^`/`$` anchor at the line boundaries). Returns
+/// `None` when no line in `[from0, lines)` matches.
+fn find_regex_line(
+    regex: &grep_source::Regex,
+    data: &[u8],
+    ends: &[usize],
+    lines: i64,
+    from0: i64,
+) -> Option<i64> {
+    let mut idx = from0.max(0);
+    while idx < lines {
+        let lo = ends.get(idx as usize).copied().unwrap_or(data.len());
+        let hi = ends.get((idx + 1) as usize).copied().unwrap_or(data.len());
+        // Match against the line WITHOUT the trailing '\n' so `$` anchors at the
+        // line's logical end (git's REG_NEWLINE treats '\n' as the boundary).
+        let mut slice = &data[lo.min(data.len())..hi.min(data.len())];
+        if slice.last() == Some(&b'\n') {
+            slice = &slice[..slice.len() - 1];
+        }
+        if regex.find_from(slice, 0).is_some() {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
 }
 
 /// Parse a `:funcname:` (or `^:funcname:`) spec into (begin, end), 1-based.
@@ -579,35 +585,26 @@ fn parse_range_funcname(
         false,
     )
     .map_err(|_| line_log_fatal(format!("-L parameter '{pattern}': invalid regex")))?;
-    // find_funcname_matching_regexp: scan forward from start_off for a match
-    // whose containing line is a funcname line.
-    let mut search = start_off.min(data.len());
+    // find_funcname_matching_regexp: scan forward from the anchor line for the
+    // first line that (a) the regex matches and (b) is a funcname line (git's
+    // `match_funcname` over the matched line). Per-line scan gives the correct
+    // multiline-anchor semantics that the engine lacks. `p` is the byte offset
+    // of that line's start.
+    let _ = start_off;
     let mut found: Option<usize> = None;
-    while search < data.len() {
-        let hay = &data[search..];
-        let (mstart, _) = match regex.find_from(hay, 0) {
-            Some(m) => m,
-            None => break,
-        };
-        let mabs = search + mstart;
-        // bol = start of the line containing mabs
-        let mut bol = mabs;
-        while bol > 0 && data[bol - 1] != b'\n' {
-            bol -= 1;
+    let mut idx = anchor0.max(0);
+    while idx < lines {
+        let lo = ends.get(idx as usize).copied().unwrap_or(data.len());
+        let hi = ends.get((idx + 1) as usize).copied().unwrap_or(data.len());
+        let mut slice = &data[lo.min(data.len())..hi.min(data.len())];
+        if slice.last() == Some(&b'\n') {
+            slice = &slice[..slice.len() - 1];
         }
-        // eol = end of line (past '\n')
-        let mut eol = mabs;
-        while eol < data.len() && data[eol] != b'\n' {
-            eol += 1;
-        }
-        if eol < data.len() {
-            eol += 1;
-        }
-        if is_funcname_line(&data[bol..eol]) {
-            found = Some(bol);
+        if regex.find_from(slice, 0).is_some() && is_funcname_line(line_at(data, lo)) {
+            found = Some(lo);
             break;
         }
-        search = eol.max(mabs + 1);
+        idx += 1;
     }
     let p = found.ok_or_else(|| {
         line_log_fatal(format!(
