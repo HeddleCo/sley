@@ -4072,6 +4072,10 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
     let mut show_stash = false;
     let mut ahead_behind = true;
+    // `git status -v` verbosity: 0 (none), 1 (append the staged HEAD-vs-index
+    // diff), 2+ (also append the index-vs-worktree diff). `-vv` and repeated
+    // `-v` accumulate; `--no-verbose` resets to 0 (wt-status verbose level).
+    let mut verbose: u8 = 0;
     // `--ignore-submodules[=<when>]` from the command line, the highest-priority
     // source for the per-submodule ignore resolution (above `.git/config`,
     // `.gitmodules`, and `diff.ignoreSubmodules`). `None` means the flag was not
@@ -4188,12 +4192,11 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 porcelain_v2 = false;
                 explicit_long = false;
             }
+            "-v" | "--verbose" => verbose = verbose.saturating_add(1),
+            "--no-verbose" => verbose = 0,
             "--no-renames"
             | "--renames"
             | "--find-renames"
-            | "-v"
-            | "--verbose"
-            | "--no-verbose"
             | "--column"
             | "--no-column"
             | "--column="
@@ -4297,6 +4300,16 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-ignore-submodules=") => {
                 return status_option_takes_no_value_error("no-ignore-submodules");
+            }
+            // `-vv`/`-vvv`: a run of `v` short flags raises the verbose level by
+            // its length (parse-options collapses adjacent shorts).
+            value
+                if value.len() > 1
+                    && value.starts_with('-')
+                    && !value.starts_with("--")
+                    && value[1..].bytes().all(|byte| byte == b'v') =>
+            {
+                verbose = verbose.saturating_add((value.len() - 1) as u8);
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(
@@ -4447,6 +4460,32 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             submodule_summary,
         };
         print_status_long(&git_dir, format, entries, &display)?;
+        // `git status -v` appends the staged diff (HEAD vs index). `-vv` instead
+        // frames both diffs with section headers and a 50-dash separator and
+        // renders them with diff.mnemonicprefix=true (commit/index `c/`,`i/` for
+        // the cached half; index/worktree `i/`,`w/` for the unstaged half) —
+        // exactly wt-status's verbose>1 layout. Reuse the diff command so the
+        // hunk bytes match `git diff` verbatim.
+        if verbose == 1 {
+            io::stdout().flush()?;
+            commands::diff::cmd_diff(&["--cached".to_string()])?;
+        } else if verbose >= 2 {
+            io::stdout().flush()?;
+            println!("Changes to be committed:");
+            io::stdout().flush()?;
+            commands::diff::cmd_diff(&[
+                "--cached".to_string(),
+                "--src-prefix=c/".to_string(),
+                "--dst-prefix=i/".to_string(),
+            ])?;
+            println!("--------------------------------------------------");
+            println!("Changes not staged for commit:");
+            io::stdout().flush()?;
+            commands::diff::cmd_diff(&[
+                "--src-prefix=i/".to_string(),
+                "--dst-prefix=w/".to_string(),
+            ])?;
+        }
     }
     Ok(())
 }
