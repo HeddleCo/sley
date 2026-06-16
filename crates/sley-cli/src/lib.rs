@@ -1328,6 +1328,7 @@ fn print_reset_hard_head(
 
 fn checkout_create_or_reset_branch(
     git_dir: &Path,
+    start_git_dir: &Path,
     format: ObjectFormat,
     branch: &str,
     start: &str,
@@ -1341,7 +1342,10 @@ fn checkout_create_or_reset_branch(
         eprintln!("fatal: a branch named '{branch}' already exists");
         return Err(GitError::Exit(128));
     }
-    let start_oid = match resolve_checkout_start_oid(git_dir, format, start) {
+    // The start point (often the implicit "HEAD") is resolved against the
+    // worktree the command runs from — `git worktree add` from a linked
+    // worktree branches off *that* worktree's HEAD.
+    let start_oid = match resolve_checkout_start_oid(start_git_dir, format, start) {
         Ok(Some(start_oid)) => start_oid,
         Ok(None) => {
             let mut tx = store.transaction();

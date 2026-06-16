@@ -630,6 +630,43 @@ fn reinstate_stash_index(
 /// (the index) cannot be safely overwritten, and an untracked file may not be
 /// clobbered by a newly-introduced path. Matches git's refusal to lose local
 /// changes during `stash apply`.
+/// The (mode, blob-oid) the worktree path would hash to, lstat-aware: a regular
+/// file hashes its content (mode 100644/100755); a symlink hashes its link target
+/// string (mode 120000), never the file it points at. `None` when the path is
+/// absent or a directory. Mirrors git's `index_path` for the on-disk comparison.
+fn worktree_blob_oid(format: ObjectFormat, full: &Path) -> Result<Option<(u32, ObjectId)>> {
+    let metadata = match fs::symlink_metadata(full) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let target = fs::read_link(full)?;
+        let body = target.as_os_str().as_bytes().to_vec();
+        let oid = sley_core::object_id_for_bytes(format, "blob", &body)?;
+        return Ok(Some((0o120000, oid)));
+    }
+    if metadata.is_dir() {
+        return Ok(None);
+    }
+    let bytes = fs::read(full)?;
+    let oid = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            0o100755
+        } else {
+            0o100644
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = 0o100644;
+    Ok(Some((mode, oid)))
+}
+
 fn verify_stash_apply_safe(
     worktree_root: &Path,
     format: ObjectFormat,
@@ -651,19 +688,22 @@ fn verify_stash_apply_safe(
         };
         let full = worktree_root.join(rel);
         match ours_map.get(path) {
-            Some((_, ours_oid)) => {
-                let Ok(bytes) = fs::read(&full) else {
+            Some((ours_mode, ours_oid)) => {
+                // Compute the on-disk blob the way git does: lstat, and for a
+                // symlink hash the *link target* (mode 120000), not the file it
+                // points at (`fs::read` would follow it and read the target's
+                // content). Without this a symlink-vs-file path looks "dirty".
+                let Some((on_disk_mode, on_disk)) = worktree_blob_oid(format, &full)? else {
                     continue;
                 };
-                let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
-                if &on_disk != ours_oid {
+                if &on_disk != ours_oid || on_disk_mode != *ours_mode {
                     local_changes.push(path.clone());
                 }
             }
             None => {
                 let would_write =
                     target.is_some() || matches!(result, MergePathResult::Conflict { .. });
-                if would_write && full.exists() {
+                if would_write && fs::symlink_metadata(&full).is_ok() {
                     untracked.push(path.clone());
                 }
             }
@@ -1842,22 +1882,49 @@ fn stash_worktree_entries(
         }
         let path = stash_repo_path_to_os_path(&entry.path)?;
         let absolute = worktree_root.join(path);
-        let Ok(metadata) = fs::metadata(&absolute) else {
+        // lstat: a tracked path that became a symlink must be captured as the link
+        // (mode 120000, blob = target), not followed (which `fs::metadata` does,
+        // dropping a dangling symlink entirely).
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
             continue;
         };
-        if !metadata.is_file() {
+        if let Some(stashed) =
+            stash_capture_worktree_entry(db, &absolute, &metadata, entry.path.clone())?
+        {
+            entries.push(stashed);
+        } else {
             entries.push(entry.clone());
-            continue;
         }
-        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(&absolute)?))?;
-        entries.push(stash_index_entry_from_metadata(
-            entry.path.clone(),
-            oid,
-            &metadata,
-        ));
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
+}
+
+/// Capture one worktree path as a stash index entry. Regular files record their
+/// content blob; symlinks record the link target as a mode-120000 blob (matching
+/// git's index_path). Anything else (a directory / gitlink) returns `None` so the
+/// caller keeps the original index entry.
+fn stash_capture_worktree_entry(
+    db: &mut FileObjectDatabase,
+    absolute: &Path,
+    metadata: &fs::Metadata,
+    path: BString,
+) -> Result<Option<IndexEntry>> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = fs::read_link(absolute)?;
+        use std::os::unix::ffi::OsStrExt;
+        let body = target.as_os_str().as_bytes().to_vec();
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
+        let mut index_entry = stash_index_entry_from_metadata(path, oid, metadata);
+        index_entry.mode = 0o120000;
+        return Ok(Some(index_entry));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(absolute)?))?;
+    Ok(Some(stash_index_entry_from_metadata(path, oid, metadata)))
 }
 
 fn stash_untracked_entries(
@@ -1868,16 +1935,13 @@ fn stash_untracked_entries(
     let mut entries = Vec::new();
     for path in paths {
         let absolute = worktree_root.join(stash_repo_path_to_os_path(path)?);
-        let metadata = fs::metadata(&absolute)?;
-        if !metadata.is_file() {
-            continue;
+        // lstat so an untracked symlink is stashed as a link, not followed.
+        let metadata = fs::symlink_metadata(&absolute)?;
+        if let Some(stashed) =
+            stash_capture_worktree_entry(db, &absolute, &metadata, BString::from(path.as_slice()))?
+        {
+            entries.push(stashed);
         }
-        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(&absolute)?))?;
-        entries.push(stash_index_entry_from_metadata(
-            path.clone(),
-            oid,
-            &metadata,
-        ));
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
@@ -2034,6 +2098,49 @@ fn cmd_stash_store(args: &[String]) -> Result<()> {
         }),
     });
     tx.commit()
+}
+
+/// Resolve a `git stash <subcmd> [<stash>]` argument to its stash commit oid,
+/// mirroring git's `parse_stash_revision` + `repo_get_oid` + `assert_stash_like`:
+///   * no arg → `stash@{0}` (errors "No stash entries found." if `refs/stash` is
+///     absent);
+///   * a bare number `n` → `stash@{n}`;
+///   * anything else → resolved as a general revision (a raw oid, `stash@{n}`,
+///     any commit-ish), then validated to be stash-like (a merge commit).
+/// This is what lets `stash show <oid>` / `stash branch <name> <oid>` accept a
+/// "stash-like argument" produced by `git stash create`.
+fn resolve_stash_argument(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    spec: Option<&str>,
+) -> Result<ObjectId> {
+    // git's `parse_stash_revision` expands to the FULL ref `refs/stash@{n}`
+    // (`ref_stash`), so the reflog lookup resolves without depending on a `stash`
+    // → `refs/stash` dwim that the rev parser may not apply to the short form.
+    let revision = match spec {
+        None => {
+            if store.read_ref("refs/stash")?.is_none() {
+                eprintln!("No stash entries found.");
+                return Err(GitError::Exit(1));
+            }
+            "refs/stash@{0}".to_string()
+        }
+        Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("refs/stash@{{{value}}}")
+        }
+        Some(value) => value.to_string(),
+    };
+    let oid = match resolve_revision(common_git_dir, format, &revision) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("error: {revision} is not a valid reference");
+            return Err(GitError::Exit(1));
+        }
+    };
+    validate_stash_like_commit(db, format, &oid)?;
+    Ok(oid)
 }
 
 fn validate_stash_like_commit(
@@ -2462,28 +2569,17 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     {
         show_patch = true;
     }
-    let selector = match specs.first() {
-        Some(spec) => parse_stash_drop_selector(spec)?,
-        None => 0,
-    };
-
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
-    let entries = store.read_reflog("refs/stash")?;
-    if entries.is_empty() {
-        eprintln!("No stash entries found.");
-        return Err(GitError::Exit(1));
-    }
-    if selector >= entries.len() {
-        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
-        return Err(GitError::Exit(128));
-    }
-    let entry_index = entries.len() - 1 - selector;
-    let stash_oid = entries[entry_index].new_oid;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    // git's `stash show` accepts any stash-like argument (a `stash@{n}` ref, a
+    // bare index, or a raw commit-ish such as `git stash create`'s output), not
+    // just a reflog selector.
+    let stash_oid =
+        resolve_stash_argument(&common_git_dir, format, &store, &db, specs.first().map(String::as_str))?;
     let object = db.read_object(&stash_oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(

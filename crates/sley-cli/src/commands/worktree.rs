@@ -93,7 +93,10 @@ struct WorktreeAddOptions {
     /// Explicit `--orphan` flag (NOT the DWIM-inferred orphan, which is tracked
     /// separately on the resolved head).
     orphan: bool,
-    guess_remote: bool,
+    /// `--[no-]guess-remote` as a tri-state: `None` when no flag was given (so
+    /// `worktree.guessRemote` config supplies the default). Resolved to a bool by
+    /// [`WorktreeAddOptions::guess_remote`] once the git dir is known.
+    guess_remote_flag: Option<bool>,
     /// `--track`/`--no-track` as a tri-state mirror of git's `OPT_PASSTHRU`
     /// `opt_track`: `None` when neither flag given, `Some(true)` for `--track`,
     /// `Some(false)` for `--no-track`. Git only treats a *present* `opt_track`
@@ -151,6 +154,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     }
     let add_head = worktree_add_resolve_head(
         &common_git_dir,
+        &git_dir,
         format,
         &store,
         &path,
@@ -159,8 +163,14 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     )?;
     if let Some(branch) = add_head.branch_name.as_ref() {
         let refname = branch_ref_name(branch)?;
-        if let Some(existing_path) =
-            branch_checked_out_worktree(&common_git_dir, &refname, Some(&path))?
+        // git only runs die_if_checked_out when the branch ref actually EXISTS
+        // (`refs_ref_exists(symref.buf)`). An UNBORN target branch — e.g.
+        // `worktree add --orphan -b main` when the main repo's HEAD points at an
+        // as-yet-uncommitted `main` — is not "checked out" anywhere, so the
+        // collision check must be skipped.
+        if store.read_ref(&refname)?.is_some()
+            && let Some(existing_path) =
+                branch_checked_out_worktree(&common_git_dir, &refname, Some(&path))?
             && options.force == 0
         {
             if !options.quiet {
@@ -665,7 +675,9 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
     let mut new_branch: Option<String> = None;
     let mut new_branch_force: Option<String> = None;
     let mut orphan = false;
-    let mut guess_remote = false;
+    // `None` = no `--[no-]guess-remote` flag, so `worktree.guessRemote` config
+    // (resolved later, once the git dir is known) supplies the default.
+    let mut guess_remote: Option<bool> = None;
     let mut track: Option<bool> = None;
     let mut relative_paths: Option<bool> = None;
     let mut paths = Vec::new();
@@ -721,8 +733,8 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
             value if value.starts_with("-B") && value.len() > 2 => {
                 new_branch_force = Some(value[2..].to_string());
             }
-            "--guess-remote" => guess_remote = true,
-            "--no-guess-remote" => guess_remote = false,
+            "--guess-remote" => guess_remote = Some(true),
+            "--no-guess-remote" => guess_remote = Some(false),
             "--track" => track = Some(true),
             value if value.starts_with("--track=") => track = Some(true),
             "--no-track" => track = Some(false),
@@ -782,7 +794,7 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
         branch,
         force_branch,
         orphan,
-        guess_remote,
+        guess_remote_flag: guess_remote,
         track,
         relative_paths,
         path: paths.remove(0),
@@ -1061,12 +1073,15 @@ struct WorktreeAddHead {
 /// HEAD), git additionally warns "HEAD points to an invalid (or orphaned)
 /// reference." unless `--quiet`. Returns whether a local ref is usable.
 fn can_use_local_refs(
-    common_git_dir: &Path,
+    worktree_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     quiet: bool,
 ) -> Result<bool> {
-    if resolve_revision(common_git_dir, format, "HEAD").is_ok() {
+    // HEAD is per-worktree: when `git worktree add` runs from inside a linked
+    // worktree, its HEAD (and thus the implicit source commit) is that
+    // worktree's, NOT the common dir's. Resolve against `worktree_git_dir`.
+    if resolve_revision(worktree_git_dir, format, "HEAD").is_ok() {
         return Ok(true);
     }
     for reference in store.list_refs()? {
@@ -1085,12 +1100,23 @@ fn can_use_local_refs(
 /// no remote ref exists yet a remote IS configured (and no `-f`), git dies
 /// asking the user to fetch first — sley cannot fetch, so this is the terminal
 /// outcome for those cells.
+/// Resolve `--guess-remote`: the explicit flag if present, else
+/// `worktree.guessRemote` config (git's `git_worktree_config`), default false.
+fn worktree_guess_remote(common_git_dir: &Path, options: &WorktreeAddOptions) -> bool {
+    options.guess_remote_flag.unwrap_or_else(|| {
+        read_repo_config(common_git_dir)
+            .ok()
+            .and_then(|config| config.get_bool("worktree", None, "guessRemote"))
+            .unwrap_or(false)
+    })
+}
+
 fn can_use_remote_refs(
     common_git_dir: &Path,
     store: &FileRefStore,
     options: &WorktreeAddOptions,
 ) -> Result<bool> {
-    if !options.guess_remote {
+    if !worktree_guess_remote(common_git_dir, options) {
         return Ok(false);
     }
     for reference in store.list_refs()? {
@@ -1110,6 +1136,82 @@ fn can_use_remote_refs(
     Ok(false)
 }
 
+/// git's `unique_tracking_name` (checkout.c): map `<name>` through every
+/// remote's fetch refspec to the remote-tracking ref `refs/remotes/<remote>/…`,
+/// keeping it only when that ref actually exists. Returns the unique match's
+/// shortname (e.g. `repo_upstream/foo`) when exactly one remote provides it; if
+/// several match, `checkout.defaultRemote` breaks the tie. `None` otherwise.
+fn worktree_unique_tracking_name(
+    common_git_dir: &Path,
+    store: &FileRefStore,
+    name: &str,
+) -> Result<Option<String>> {
+    let config = read_repo_config(common_git_dir).unwrap_or_default();
+    let default_remote = config.get("checkout", None, "defaultRemote").map(str::to_string);
+    let src_ref = format!("refs/heads/{name}");
+    let mut unique: Option<String> = None;
+    let mut num_matches = 0usize;
+    let mut default_match: Option<String> = None;
+    for remote in sley_config::remotes::remote_names(&config) {
+        let Some(fetch) = config.get("remote", Some(&remote), "fetch") else {
+            continue;
+        };
+        let Ok(refspec) = parse_refspec(fetch) else {
+            continue;
+        };
+        if refspec.negative {
+            continue;
+        }
+        let (Some(spec_src), Some(spec_dst)) = (refspec.src.as_deref(), refspec.dst.as_deref())
+        else {
+            continue;
+        };
+        // Map src_ref -> dst via the refspec (pattern or exact).
+        let dst_ref = if refspec.pattern {
+            let (src_prefix, src_suffix) = match spec_src.split_once('*') {
+                Some(parts) => parts,
+                None => continue,
+            };
+            let Some(middle) = src_ref
+                .strip_prefix(src_prefix)
+                .and_then(|rest| rest.strip_suffix(src_suffix))
+            else {
+                continue;
+            };
+            let (dst_prefix, dst_suffix) = match spec_dst.split_once('*') {
+                Some(parts) => parts,
+                None => continue,
+            };
+            format!("{dst_prefix}{middle}{dst_suffix}")
+        } else if spec_src == src_ref {
+            spec_dst.to_string()
+        } else {
+            continue;
+        };
+        if store.read_ref(&dst_ref)?.is_none() {
+            continue;
+        }
+        let short = dst_ref
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(&dst_ref)
+            .to_string();
+        num_matches += 1;
+        if default_remote.as_deref() == Some(remote.as_str()) {
+            default_match = Some(short.clone());
+        }
+        if unique.is_none() {
+            unique = Some(short);
+        }
+    }
+    if num_matches == 1 {
+        return Ok(unique);
+    }
+    if let Some(default_match) = default_match {
+        return Ok(Some(default_match));
+    }
+    Ok(None)
+}
+
 /// Mirrors git's `dwim_orphan` (builtin/worktree.c): decides whether
 /// `worktree add` should infer `--orphan`. Returns `true` when neither a local
 /// nor (when `remote`) a remote ref can supply a source. When inferring, git
@@ -1118,12 +1220,13 @@ fn can_use_remote_refs(
 /// orphan an illegal combination.
 fn dwim_orphan(
     common_git_dir: &Path,
+    worktree_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     options: &WorktreeAddOptions,
     remote: bool,
 ) -> Result<bool> {
-    if can_use_local_refs(common_git_dir, format, store, options.quiet)? {
+    if can_use_local_refs(worktree_git_dir, format, store, options.quiet)? {
         return Ok(false);
     }
     if remote && can_use_remote_refs(common_git_dir, store, options)? {
@@ -1213,6 +1316,7 @@ fn previous_checkout_branch(store: &FileRefStore, n: usize) -> Result<Option<Str
 
 fn worktree_add_resolve_head(
     common_git_dir: &Path,
+    worktree_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     path: &Path,
@@ -1245,7 +1349,7 @@ fn worktree_add_resolve_head(
         // builtin/worktree.c `add`: the `ac < 2 && new_branch` arm).
         if options.start.is_none()
             && !options.force_branch
-            && dwim_orphan(common_git_dir, format, store, options, false)?
+            && dwim_orphan(common_git_dir, worktree_git_dir, format, store, options, false)?
         {
             return worktree_add_inferred_orphan_head(branch.clone(), format);
         }
@@ -1253,15 +1357,33 @@ fn worktree_add_resolve_head(
         // git: `if (!opts.orphan && !lookup_commit_reference_by_name(branch))`
         // — when the start point is unresolvable (e.g. a dangling HEAD), emit
         // the invalid-reference error (with the `-b`-aware orphan hint) instead
-        // of a lower-level failure from branch creation.
-        worktree_add_resolve_commitish(common_git_dir, format, options, start)?;
+        // of a lower-level failure from branch creation. The implicit "HEAD"
+        // start resolves against the current worktree's HEAD.
+        worktree_add_resolve_commitish(worktree_git_dir, format, options, start)?;
         let was_reset = checkout_create_or_reset_branch(
             common_git_dir,
+            worktree_git_dir,
             format,
             branch,
             start,
             options.force_branch,
             committer,
+        )?;
+        // git delegates branch creation to `git branch <new> <start> [<track>]`,
+        // which sets up `branch.<new>.remote`/`.merge` per `--track`/`--no-track`
+        // (or branch.autoSetupMerge when neither is given).
+        let track_mode = match options.track {
+            Some(true) => Some(commands::branch::BranchTrackMode::Direct),
+            Some(false) => Some(commands::branch::BranchTrackMode::Never),
+            None => None,
+        };
+        commands::branch::branch_create_set_tracking(
+            common_git_dir,
+            store,
+            branch,
+            Some(&start.to_string()),
+            track_mode,
+            options.quiet,
         )?;
         let oid = resolve_revision(common_git_dir, format, branch)?;
         let prepare_message = if was_reset {
@@ -1283,9 +1405,9 @@ fn worktree_add_resolve_head(
         // Detaching at HEAD in a repo whose HEAD is dangling warns + dies via
         // can_use_local_refs (git: the `detach && branch == "HEAD"` arm).
         if commitish == "HEAD" {
-            can_use_local_refs(common_git_dir, format, store, options.quiet)?;
+            can_use_local_refs(worktree_git_dir, format, store, options.quiet)?;
         }
-        let oid = worktree_add_resolve_commitish(common_git_dir, format, options, &commitish)?;
+        let oid = worktree_add_resolve_commitish(worktree_git_dir, format, options, &commitish)?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1299,9 +1421,10 @@ fn worktree_add_resolve_head(
 
     if options.start.is_some() {
         // `ac == 2`: an explicit commit-ish. If it names a branch, check it out
-        // (HEAD becomes a symref); otherwise detach.
+        // (HEAD becomes a symref); otherwise detach. Resolve against the current
+        // worktree so per-worktree revs (HEAD, @{-1}) are correct.
         if let Some(branch) = worktree_add_branch_for_commitish(store, &commitish)? {
-            let oid = resolve_revision(common_git_dir, format, &commitish)?;
+            let oid = resolve_revision(worktree_git_dir, format, &commitish)?;
             return Ok(WorktreeAddHead {
                 branch_name: Some(branch),
                 oid,
@@ -1309,7 +1432,45 @@ fn worktree_add_resolve_head(
                 orphan: false,
             });
         }
-        let oid = worktree_add_resolve_commitish(common_git_dir, format, options, &commitish)?;
+        // DWIM remote: an explicit `<branch>` that is neither a local branch nor
+        // directly resolvable, but uniquely names a remote-tracking branch, gets
+        // a new local branch checked out + tracking set up (git's `ac == 2`
+        // `unique_tracking_name` arm → `git branch <name> <remote-ref>`).
+        if resolve_revision(worktree_git_dir, format, &commitish).is_err()
+            && let Some(remote_ref) =
+                worktree_unique_tracking_name(common_git_dir, store, &commitish)?
+        {
+            let new_branch = commitish.clone();
+            let start_short = remote_ref.clone();
+            let start_oid = resolve_revision(common_git_dir, format, &start_short)?;
+            store.create_branch(
+                &new_branch,
+                start_oid,
+                committer,
+                format!("branch: Created from {start_short}").into_bytes(),
+            )?;
+            let track_mode = match options.track {
+                Some(true) => Some(commands::branch::BranchTrackMode::Direct),
+                Some(false) => Some(commands::branch::BranchTrackMode::Never),
+                None => None,
+            };
+            commands::branch::branch_create_set_tracking(
+                common_git_dir,
+                store,
+                &new_branch,
+                Some(&start_short),
+                track_mode,
+                options.quiet,
+            )?;
+            let oid = resolve_revision(common_git_dir, format, &new_branch)?;
+            return Ok(WorktreeAddHead {
+                branch_name: Some(new_branch.clone()),
+                oid,
+                prepare_message: format!("Preparing worktree (new branch '{new_branch}')"),
+                orphan: false,
+            });
+        }
+        let oid = worktree_add_resolve_commitish(worktree_git_dir, format, options, &commitish)?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1336,14 +1497,56 @@ fn worktree_add_resolve_head(
             orphan: false,
         });
     }
-    if dwim_orphan(common_git_dir, format, store, options, true)? {
+    // git's `dwim_branch`: with `--guess-remote`, a remote-tracking branch
+    // matching the worktree basename creates a new local branch off it (with
+    // tracking) instead of branching off HEAD.
+    if worktree_guess_remote(common_git_dir, options)
+        && let Some(remote_ref) = worktree_unique_tracking_name(common_git_dir, store, &branch)?
+    {
+        let start_oid = resolve_revision(common_git_dir, format, &remote_ref)?;
+        store.create_branch(
+            &branch,
+            start_oid,
+            committer,
+            format!("branch: Created from {remote_ref}").into_bytes(),
+        )?;
+        let track_mode = match options.track {
+            Some(true) => Some(commands::branch::BranchTrackMode::Direct),
+            Some(false) => Some(commands::branch::BranchTrackMode::Never),
+            None => None,
+        };
+        commands::branch::branch_create_set_tracking(
+            common_git_dir,
+            store,
+            &branch,
+            Some(&remote_ref),
+            track_mode,
+            options.quiet,
+        )?;
+        let oid = resolve_revision(common_git_dir, format, &branch)?;
+        return Ok(WorktreeAddHead {
+            branch_name: Some(branch.clone()),
+            oid,
+            prepare_message: format!("Preparing worktree (new branch '{branch}')"),
+            orphan: false,
+        });
+    }
+    if dwim_orphan(common_git_dir, worktree_git_dir, format, store, options, true)? {
         return worktree_add_inferred_orphan_head(branch, format);
     }
     // The new branch is created from HEAD. git's `!opts.orphan &&
     // !lookup_commit_reference_by_name("HEAD")` arm emits the invalid-reference
     // error (with the no-`-b` orphan hint) when HEAD is a dangling reference.
-    worktree_add_resolve_commitish(common_git_dir, format, options, "HEAD")?;
-    commands::branch::create_branch_from_start(common_git_dir, format, store, &branch, None)?;
+    // HEAD is per-worktree, so resolve + branch off the current worktree's HEAD,
+    // but write the new branch into the common store.
+    worktree_add_resolve_commitish(worktree_git_dir, format, options, "HEAD")?;
+    let head_oid = resolve_revision(worktree_git_dir, format, "HEAD")?;
+    store.create_branch(
+        &branch,
+        head_oid,
+        commit_identity_from_env("COMMITTER")?,
+        b"branch: Created from HEAD".to_vec(),
+    )?;
     let oid = resolve_revision(common_git_dir, format, &branch)?;
     Ok(WorktreeAddHead {
         branch_name: Some(branch.clone()),

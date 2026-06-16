@@ -2202,9 +2202,13 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_not: Vec::new(),
     };
     let mut unshallow = false;
+    // `git fetch --all`: fetch from every configured remote in turn.
+    let mut fetch_all_remotes = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--all" if source.is_none() => fetch_all_remotes = true,
+            "--no-all" if source.is_none() => fetch_all_remotes = false,
             "-q" | "--quiet" if source.is_none() => options.quiet = true,
             "--no-quiet" if source.is_none() => options.quiet = false,
             "--write-fetch-head" => options.write_fetch_head = true,
@@ -2295,6 +2299,24 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    // `git fetch --all`: iterate every configured remote, fetching each with its
+    // own configured refspecs. An explicit `<remote>` is incompatible.
+    if fetch_all_remotes {
+        if source.is_some() {
+            eprintln!("fatal: fetch --all does not take a repository argument");
+            return Err(GitError::Exit(128));
+        }
+        let config = read_repo_config(&git_dir)?;
+        for remote in remote_names(&config) {
+            let mut remote_options = options.clone();
+            if refspecs.is_empty() {
+                remote_options.merge_srcs =
+                    current_branch_merge_for_remote(&git_dir, format, &remote);
+            }
+            fetch_one_source(&git_dir, format, &remote, &refspecs, remote_options)?;
+        }
+        return Ok(());
+    }
     // With no remote argument, resolve the default the way git's
     // `remote_for_branch` does: the current branch's `branch.<name>.remote`,
     // else the sole configured remote, else `origin`.
@@ -2321,7 +2343,19 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         }
         options.depth = Some(sley_remote::INFINITE_DEPTH);
     }
-    if let Ok(input) = fs::read(&source)
+    fetch_one_source(&git_dir, format, &source, &refspecs, options)
+}
+
+/// Dispatch a single fetch source (bundle / http / ssh / git / local) — shared
+/// by the plain `git fetch <remote>` path and the `--all` per-remote loop.
+fn fetch_one_source(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<()> {
+    if let Ok(input) = fs::read(source)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
         // Bundle fetches have no shallow support, so a `--depth` is warned-and-
@@ -2329,18 +2363,18 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         if options.depth.is_some() {
             eprintln!("warning: --depth is ignored in bundle fetches; use file:// instead.");
         }
-        return fetch_bundle(&git_dir, format, &source, &refspecs, &bundle, options);
+        return fetch_bundle(git_dir, format, source, refspecs, &bundle, options);
     }
-    if fetch_source_is_http(&source)? {
-        return fetch_http_repository(&git_dir, format, &source, &refspecs, options);
+    if fetch_source_is_http(source)? {
+        return fetch_http_repository(git_dir, format, source, refspecs, options);
     }
-    if fetch_source_is_ssh(&source)? {
-        return fetch_ssh_repository(&git_dir, format, &source, &refspecs, options);
+    if fetch_source_is_ssh(source)? {
+        return fetch_ssh_repository(git_dir, format, source, refspecs, options);
     }
-    if fetch_source_is_git(&source)? {
-        return fetch_git_repository(&git_dir, format, &source, &refspecs, options);
+    if fetch_source_is_git(source)? {
+        return fetch_git_repository(git_dir, format, source, refspecs, options);
     }
-    fetch_local_repository(&git_dir, format, &source, &refspecs, options)
+    fetch_local_repository(git_dir, format, source, refspecs, options)
 }
 
 /// Parse a `--shallow-since` date through the approxidate layer, mirroring

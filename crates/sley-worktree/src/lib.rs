@@ -8774,17 +8774,75 @@ fn materialize_tree_entry(
             path: BString::from(path),
         });
     }
+    let file_path = write_worktree_blob_entry(db, worktree_root, path, entry)?;
+    let metadata = fs::symlink_metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
+}
+
+/// Materialize a blob (or symlink) tree entry into the worktree at `path`,
+/// returning the absolute path written. Shared by every checkout/reset worktree
+/// rebuild so the type-change handling is identical everywhere.
+///
+/// Mirrors git's entry.c `write_entry`: it unlinks whatever currently occupies
+/// the path before creating the new object, so a type transition (regular file ⇄
+/// symlink, or a stale symlink/directory in the way) is overwritten rather than
+/// left in place or failing with EEXIST. A plain `fs::write` follows an existing
+/// symlink and would write *through* it (leaving the link), so the unlink is
+/// load-bearing for the symlink-stash / reset-hard type-change cases.
+fn write_worktree_blob_entry(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+) -> Result<PathBuf> {
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&file_path, &object.body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
-    let metadata = fs::metadata(&file_path)?;
-    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
-    index_entry.mode = entry.mode;
-    Ok(index_entry)
+    remove_existing_worktree_path(&file_path)?;
+    if (entry.mode & 0o170000) == 0o120000 {
+        // Symlink entry (mode 120000): the blob body is the link target.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let target =
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(object.body.clone()));
+            std::os::unix::fs::symlink(&target, &file_path)?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&file_path, &object.body)?;
+    } else {
+        fs::write(&file_path, &object.body)?;
+        set_worktree_file_mode(&file_path, entry.mode)?;
+    }
+    Ok(file_path)
+}
+
+/// Remove whatever currently occupies a worktree path before writing a new
+/// object there — a symlink (even a dangling one, which `Path::exists` misses),
+/// a regular file, or a directory subtree. Uses `symlink_metadata` (lstat) so a
+/// symlink is removed as the link, never followed.
+fn remove_existing_worktree_path(file_path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(file_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() {
+        // A directory in the way of a file (D/F transition) or a populated
+        // gitlink: remove the subtree so the file can be created.
+        match fs::remove_dir_all(file_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    } else {
+        fs::remove_file(file_path)?;
+    }
+    Ok(())
 }
 
 /// chmod a freshly-materialized worktree blob to match its tree/index entry mode.
@@ -10077,13 +10135,7 @@ fn restore_head_entry_to_worktree(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<()> {
-    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    let file_path = worktree_path(worktree_root, path)?;
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&file_path, &object.body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
+    write_worktree_blob_entry(db, worktree_root, path, entry)?;
     Ok(())
 }
 
@@ -10093,14 +10145,8 @@ fn restore_head_entry_to_worktree_and_index(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
-    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    let file_path = worktree_path(worktree_root, path)?;
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&file_path, &object.body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
-    let metadata = fs::metadata(&file_path)?;
+    let file_path = write_worktree_blob_entry(db, worktree_root, path, entry)?;
+    let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
     Ok(index_entry)

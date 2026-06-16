@@ -53,14 +53,52 @@ pub(crate) fn merge_write_worktree_file(
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&full, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
-        fs::set_permissions(&full, perms)?;
+    // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
+    // change (regular file ⇄ symlink) is overwritten rather than written *through*
+    // an existing symlink or left stale — the symlink-stash-apply / merge cases.
+    merge_unlink_path_in_the_way(&full)?;
+    if (mode & 0o170000) == 0o120000 {
+        // Symlink entry (mode 120000): the blob bytes are the link target.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let target =
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(content.to_vec()));
+            std::os::unix::fs::symlink(&target, &full)?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&full, content)?;
+    } else {
+        fs::write(&full, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
+            fs::set_permissions(&full, perms)?;
+        }
     }
-    let _ = mode;
+    Ok(())
+}
+
+/// Remove whatever currently occupies `full` (lstat-based, so a dangling symlink
+/// is removed as the link, not followed) before a merge materializes a new object
+/// there. A directory in the way is removed recursively (D/F transition).
+fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
+    match fs::symlink_metadata(full) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                match fs::remove_dir_all(full) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
+            } else {
+                fs::remove_file(full)?;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
     Ok(())
 }
 
@@ -96,8 +134,12 @@ pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> R
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
     let full = worktree_root.join(rel);
-    if full.exists() {
-        fs::remove_file(&full)?;
+    // lstat (symlink_metadata): `Path::exists` follows symlinks and misses a
+    // dangling one, leaving it behind on removal.
+    match fs::symlink_metadata(&full) {
+        Ok(_) => fs::remove_file(&full)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
     Ok(())
 }

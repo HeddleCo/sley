@@ -951,6 +951,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let store = FileRefStore::new(&git_dir, format);
             let was_reset = checkout_create_or_reset_branch(
                 &git_dir,
+                &git_dir,
                 format,
                 &branch,
                 start,
@@ -1719,6 +1720,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut reset_author = false;
     let mut amend = false;
     let mut verbose = false;
+    // `--status` / `--no-status` (and `commit.status` config) control whether the
+    // working-tree status block is appended to the editor template (COMMIT_EDITMSG).
+    // `None` = unset on the command line, so `commit.status` config (default true)
+    // decides. Mirrors builtin/commit.c `include_status`.
+    let mut include_status: Option<bool> = None;
     // The raw `--cleanup=<mode>` argument, if any. Resolution to a concrete mode
     // is deferred until `use_editor` is known (git: `default`/`scissors` depend
     // on whether an editor runs). `None` means "no --cleanup given" — fall back
@@ -1746,6 +1752,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut pathspec_file_nul = false;
     let mut pathspec_args = Vec::new();
     let mut edit_flag: Option<bool> = None;
+    // `-t <file>` / `--template <file>`: the lowest-priority message body source.
+    // Unlike `-m`/`-F`/`-C`, it does NOT suppress the editor (git keeps
+    // `use_editor = 1`), so the user always edits the template.
+    let mut template_file: Option<String> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -2003,7 +2013,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             value if value.starts_with("--no-post-rewrite=") => {
                 return commit_option_takes_no_value_error("no-post-rewrite");
             }
-            "--status" | "--no-status" => {}
+            "--status" => include_status = Some(true),
+            "--no-status" => include_status = Some(false),
             value if value.starts_with("--status=") => {
                 return commit_option_takes_no_value_error("status");
             }
@@ -2234,18 +2245,24 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 return commit_option_takes_no_value_error("no-branch");
             }
             "-t" => {
-                let Some(_template) = iter.next() else {
+                let Some(template) = iter.next() else {
                     return commit_template_short_requires_value_error();
                 };
+                template_file = Some(template.clone());
             }
-            value if value.starts_with("-t") && value.len() > 2 => {}
+            value if value.starts_with("-t") && value.len() > 2 => {
+                template_file = Some(value[2..].to_string());
+            }
             "--template" => {
-                let Some(_template) = iter.next() else {
+                let Some(template) = iter.next() else {
                     return commit_template_requires_value_error();
                 };
+                template_file = Some(template.clone());
             }
-            value if value.starts_with("--template=") => {}
-            "--no-template" => {}
+            value if let Some(path) = value.strip_prefix("--template=") => {
+                template_file = Some(path.to_string());
+            }
+            "--no-template" => template_file = None,
             value if value.starts_with("--no-template=") => {
                 return commit_option_takes_no_value_error("no-template");
             }
@@ -2521,6 +2538,27 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 None
             }
         })
+        .or_else(|| {
+            // `-t <file>`: the template body, used only when no `-m`/`-F`/`-C`
+            // and not concluding a merge/cherry-pick. Read verbatim (git sets
+            // `clean_message_contents = 0`).
+            if file_message.is_none()
+                && message_chunks.is_empty()
+                && reuse_message.is_none()
+                && fixup_commit.is_none()
+                && squash_commit.is_none()
+                && !amend
+            {
+                template_file
+                    .as_deref()
+                    .map(|path| read_commit_template_file(path))
+                    .transpose()
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| {
             file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks))
         });
@@ -2552,8 +2590,48 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if !no_verify {
         commands::hooks::run_hook("pre-commit", commands::hooks::HookRun::default())?;
     }
+    // Resolve the cleanup mode now that `use_editor` is known. An explicit
+    // `--cleanup`/`--no-cleanup` wins; otherwise `commit.cleanup` config; absent
+    // both, git's editor-dependent default (ALL with an editor, SPACE without).
+    let cleanup_config = cleanup_arg.clone().or_else(|| {
+        read_repo_config(&git_dir)
+            .ok()
+            .and_then(|c| c.get("commit", None, "cleanup").map(str::to_string))
+    });
+    let cleanup_mode = resolve_commit_cleanup_mode(cleanup_config.as_deref(), use_editor);
+    let comment_char = commit_comment_string(&git_dir);
     let editmsg = git_dir.join("COMMIT_EDITMSG");
-    fs::write(&editmsg, &message)?;
+    // When an editor will run, git appends a commented status block (the
+    // template) to COMMIT_EDITMSG unless `--no-status`/`commit.status=false`.
+    // `include_status` (cmdline) wins over `commit.status` config (default true).
+    let include_status_resolved = include_status.unwrap_or_else(|| {
+        read_repo_config(&git_dir)
+            .ok()
+            .and_then(|c| c.get_bool("commit", None, "status"))
+            .unwrap_or(true)
+    });
+    let mut template = message.clone();
+    if use_editor && include_status_resolved {
+        // `author_date_is_interesting()` = `--date` given or author reused from
+        // another commit (`-C`/`-c`/amend); env GIT_AUTHOR_DATE alone does not
+        // trigger the template Date line.
+        let author_date_interesting =
+            author_date.is_some() || reuse_message.is_some() || amend;
+        let block = build_commit_editor_template_block(&CommitTemplateBlock {
+            git_dir: &git_dir,
+            format,
+            comment_char: &comment_char,
+            cleanup_mode,
+            allow_empty_message,
+            author: &author,
+            committer: &committer,
+            author_date_interesting,
+            amend,
+            untracked_override: commit_untracked,
+        })?;
+        template.extend_from_slice(&block);
+    }
+    fs::write(&editmsg, &template)?;
     let editmsg_arg = editmsg.to_string_lossy().into_owned();
     let mut prepare_args = vec![editmsg_arg.as_str()];
     if amend {
@@ -2579,16 +2657,6 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
     }
     message = fs::read(&editmsg)?;
-    // Resolve the cleanup mode now that `use_editor` is known. An explicit
-    // `--cleanup`/`--no-cleanup` wins; otherwise `commit.cleanup` config; absent
-    // both, git's editor-dependent default (ALL with an editor, SPACE without).
-    let cleanup_config = cleanup_arg.clone().or_else(|| {
-        read_repo_config(&git_dir)
-            .ok()
-            .and_then(|c| c.get("commit", None, "cleanup").map(str::to_string))
-    });
-    let cleanup_mode = resolve_commit_cleanup_mode(cleanup_config.as_deref(), use_editor);
-    let comment_char = commit_comment_string(&git_dir);
     message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose);
     if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
@@ -3722,6 +3790,252 @@ fn commit_index_tree_if_changed(
     }
     let commit = Commit::parse_ref(format, &object.body)?;
     Ok((commit.tree != tree).then_some(tree))
+}
+
+/// Read a `-t <file>` / `--template <file>` template body. The path is relative
+/// to the current working directory (git resolves it via the prefix). git reads
+/// it verbatim (no whitespace cleanup).
+fn read_commit_template_file(path: &str) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|err| {
+        eprintln!("fatal: could not read '{path}': {err}");
+        GitError::Exit(128)
+    })
+}
+
+/// Inputs for [`build_commit_editor_template_block`].
+struct CommitTemplateBlock<'a> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    comment_char: &'a str,
+    cleanup_mode: CommitCleanupMode,
+    allow_empty_message: bool,
+    author: &'a [u8],
+    committer: &'a [u8],
+    /// `commit --date=...` / reused author ⇒ git's `author_date_is_interesting()`
+    /// shows the `Date:` line in the template.
+    author_date_interesting: bool,
+    /// `--amend` ⇒ the staged summary compares against `HEAD^`.
+    amend: bool,
+    untracked_override: Option<sley_worktree::StatusUntrackedMode>,
+}
+
+/// Build the comment-prefixed block git appends to COMMIT_EDITMSG when an editor
+/// is launched with `include_status` (commit.status / --status). Mirrors the
+/// `use_editor && include_status` branch of builtin/commit.c `prepare_to_commit`:
+/// a blank line, the cleanup hint (or a scissors cut line), the Author/Date/
+/// Committer ident lines (each shown only when it differs from the committer
+/// default), a blank line, then the long working-tree status — all commented.
+fn build_commit_editor_template_block(input: &CommitTemplateBlock) -> Result<Vec<u8>> {
+    let CommitTemplateBlock {
+        git_dir,
+        format,
+        comment_char,
+        cleanup_mode,
+        allow_empty_message,
+        author,
+        committer,
+        author_date_interesting,
+        amend,
+        untracked_override,
+    } = *input;
+
+    let mut out: Vec<u8> = Vec::new();
+    // builtin/commit.c emits `fprintf(s->fp, "\n")` before the hint.
+    out.push(b'\n');
+
+    // The cleanup hint, or — for scissors — the cut line. SPACE/VERBATIM keep
+    // their own hint text.
+    match cleanup_mode {
+        CommitCleanupMode::Scissors => {
+            append_scissors_cut_line(&mut out, comment_char);
+        }
+        CommitCleanupMode::Whitespace => {
+            let hint = "Please enter the commit message for your changes. Lines starting\nwith '%s' will be kept; you may remove them yourself if you want to.";
+            append_commented_hint(
+                &mut out,
+                comment_char,
+                hint,
+                allow_empty_message,
+                "An empty message aborts the commit.",
+            );
+        }
+        _ => {
+            // ALL (default with editor): empty lines are ignored.
+            let hint = "Please enter the commit message for your changes. Lines starting\nwith '%s' will be ignored";
+            if allow_empty_message {
+                append_commented_hint(&mut out, comment_char, &format!("{hint}."), false, "");
+            } else {
+                append_commented_hint(
+                    &mut out,
+                    comment_char,
+                    &format!("{hint}, and an empty message aborts the commit."),
+                    false,
+                    "",
+                );
+            }
+        }
+    }
+
+    // Ident block: Author / Date / Committer, each gated on differing from the
+    // committer default. The first shown line gets a leading blank comment line
+    // (git's `ident_shown++ ? "" : "\n"`).
+    let author_id = identity_name_email(author);
+    let committer_id = identity_name_email(committer);
+    let mut ident_shown = false;
+    let mut commented_line = |out: &mut Vec<u8>, text: &str| {
+        if !ident_shown {
+            out.extend_from_slice(comment_char.as_bytes());
+            out.push(b'\n');
+            ident_shown = true;
+        }
+        out.extend_from_slice(comment_char.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(text.as_bytes());
+        out.push(b'\n');
+    };
+    if author_id != committer_id {
+        commented_line(&mut out, &format!("Author:    {author_id}"));
+    }
+    if author_date_interesting {
+        let date = commit_identity_date(author, &DateMode::Default);
+        commented_line(&mut out, &format!("Date:      {date}"));
+    }
+    if !committer_ident_sufficiently_given() {
+        commented_line(&mut out, &format!("Committer: {committer_id}"));
+    }
+    // "Add new line for clarity" (status_printf_ln(s, ..., "%s", "")).
+    out.extend_from_slice(comment_char.as_bytes());
+    out.push(b'\n');
+
+    // The long working-tree status, every line commented.
+    let status = render_commit_template_status(
+        git_dir,
+        format,
+        comment_char,
+        amend,
+        untracked_override,
+    )?;
+    out.extend_from_slice(&status);
+    Ok(out)
+}
+
+/// Append git's commented cleanup hint. `hint` carries a single `%s` placeholder
+/// for the comment char (matching the gettext templates); when `with_abort` is
+/// set, `abort_line` is appended as a final commented sentence.
+fn append_commented_hint(
+    out: &mut Vec<u8>,
+    comment_char: &str,
+    hint: &str,
+    with_abort: bool,
+    abort_line: &str,
+) {
+    let text = hint.replace("%s", comment_char);
+    let mut full = text;
+    if with_abort && !abort_line.is_empty() {
+        full.push('\n');
+        full.push_str(abort_line);
+    }
+    append_commented_lines(out, comment_char, &full);
+}
+
+/// Comment every line of `text` with `comment_char` (git's
+/// `strbuf_add_commented_lines`): non-empty lines get `<char> `, empty lines just
+/// `<char>`.
+fn append_commented_lines(out: &mut Vec<u8>, comment_char: &str, text: &str) {
+    for line in text.split('\n') {
+        if line.is_empty() {
+            out.extend_from_slice(comment_char.as_bytes());
+        } else {
+            out.extend_from_slice(comment_char.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(line.as_bytes());
+        }
+        out.push(b'\n');
+    }
+}
+
+/// git's `wt_status_append_cut_line`: the commented `>8` scissors line followed
+/// by the "Do not modify..." explanation.
+fn append_scissors_cut_line(out: &mut Vec<u8>, comment_char: &str) {
+    let cut = "------------------------ >8 ------------------------";
+    out.extend_from_slice(comment_char.as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(cut.as_bytes());
+    out.push(b'\n');
+    append_commented_lines(
+        out,
+        comment_char,
+        "Do not modify or remove the line above.\nEverything below it will be ignored.",
+    );
+}
+
+/// Whether the committer identity was explicitly supplied (vs guessed from the
+/// system). Mirrors git's `committer_ident_sufficiently_given()`: true when both
+/// GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL are set in the environment.
+fn committer_ident_sufficiently_given() -> bool {
+    env::var_os("GIT_COMMITTER_NAME").is_some() && env::var_os("GIT_COMMITTER_EMAIL").is_some()
+}
+
+/// Render the long working-tree status block (every line commented with
+/// `comment_char`) for the COMMIT_EDITMSG template.
+fn render_commit_template_status(
+    git_dir: &Path,
+    format: ObjectFormat,
+    comment_char: &str,
+    amend: bool,
+    untracked_override: Option<sley_worktree::StatusUntrackedMode>,
+) -> Result<Vec<u8>> {
+    let config = read_repo_config(git_dir).map_err(report_config_setup_error)?;
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let untracked_mode = untracked_override.unwrap_or_else(|| {
+        match config.get("status", None, "showUntrackedFiles") {
+            Some("no") | Some("false") | Some("0") | Some("off") => {
+                sley_worktree::StatusUntrackedMode::None
+            }
+            Some("all") => sley_worktree::StatusUntrackedMode::All,
+            _ => sley_worktree::StatusUntrackedMode::Normal,
+        }
+    });
+    let mut entries = sley_worktree::short_status_with_options(
+        &worktree_root,
+        git_dir,
+        format,
+        sley_worktree::ShortStatusOptions {
+            include_ignored: false,
+            ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
+            untracked_mode,
+        },
+    )?;
+    let ignore_resolver = SubmoduleIgnoreResolver::load(git_dir, &config, None)?;
+    apply_submodule_ignore(&mut entries, &ignore_resolver);
+    let base_ref = if amend { "HEAD^" } else { "HEAD" };
+    let submodule_summary = status_submodule_summary(
+        git_dir,
+        &worktree_root,
+        format,
+        &config,
+        base_ref,
+        &ignore_resolver,
+    )?;
+    let display = StatusLongDisplay {
+        commit_preview: true,
+        show_stash: false,
+        ahead_behind: true,
+        // builtin/commit.c sets `s->hints = 0` for the template ("Most hints are
+        // counter-productive when the commit has already started") — the
+        // parenthetical `(use "git ...")` guidance is suppressed regardless of
+        // advice.statusHints.
+        hints: false,
+        untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
+        // The template ALWAYS comments the status, regardless of
+        // status.displayCommentPrefix.
+        comment_prefix: Some(comment_char.to_string()),
+        submodule_summary,
+    };
+    let sink = build_status_long_sink(git_dir, format, entries, &display)?;
+    let mut buf: Vec<u8> = Vec::new();
+    sink.write_to(&mut buf);
+    Ok(buf)
 }
 
 fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {
@@ -5073,6 +5387,14 @@ impl StatusLineSink {
 
     fn flush(self) {
         let mut out = io::stdout().lock();
+        self.write_to(&mut out);
+        let _ = out.flush();
+    }
+
+    /// Render the buffered lines (with the comment prefix applied) into an
+    /// arbitrary writer. Used both for stdout (status preview) and for building
+    /// the COMMIT_EDITMSG template block.
+    fn write_to(&self, out: &mut impl Write) {
         for line in &self.lines {
             if let Some(prefix) = &self.comment_prefix {
                 if line.is_empty() {
@@ -5088,7 +5410,6 @@ impl StatusLineSink {
                 let _ = writeln!(out, "{line}");
             }
         }
-        let _ = out.flush();
     }
 }
 
@@ -5098,6 +5419,19 @@ fn print_status_long(
     entries: Vec<sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
 ) -> Result<()> {
+    let sink = build_status_long_sink(git_dir, format, entries, display)?;
+    sink.flush();
+    Ok(())
+}
+
+/// Build (but do not emit) the buffered long-status output. Shared by the
+/// `git status` stdout path and the COMMIT_EDITMSG template builder.
+fn build_status_long_sink(
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<sley_worktree::ShortStatusEntry>,
+    display: &StatusLongDisplay,
+) -> Result<StatusLineSink> {
     let StatusLongDisplay {
         commit_preview,
         show_stash,
@@ -5311,8 +5645,7 @@ fn print_status_long(
             sink.line(format!("Your stash currently has {stash_count} entries"));
         }
     }
-    sink.flush();
-    Ok(())
+    Ok(sink)
 }
 
 fn status_stash_count(git_dir: &Path, format: ObjectFormat) -> Result<usize> {

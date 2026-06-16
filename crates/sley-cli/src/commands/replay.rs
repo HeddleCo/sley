@@ -1275,11 +1275,23 @@ pub(crate) fn append_signoff_before_comments(message: Vec<u8>, signoff: &[u8]) -
         return message;
     }
     let mut out = body.to_vec();
-    if !out.ends_with(b"\n") && !out.is_empty() {
+    // git's `append_signoff` newline handling (sequencer.c): complete the line,
+    // then pad so the sign-off sits below a blank line. The empty-buffer case
+    // gets two newlines so the editor template leaves room for a title + body —
+    // this is what makes `commit -s --allow-empty-message` produce "\n\nS-o-b\n".
+    if !out.is_empty() && !out.ends_with(b"\n") {
         out.push(b'\n');
     }
-    if !has_conforming_footer(body) && !out.is_empty() {
-        out.push(b'\n');
+    if !has_conforming_footer(body) {
+        let len = out.len();
+        if len == 0 {
+            out.extend_from_slice(b"\n\n");
+        } else if len == 1 {
+            out.push(b'\n');
+        } else if out[len - 2] != b'\n' {
+            out.push(b'\n');
+        }
+        // else: already ends with two newlines — nothing to add.
     }
     out.extend_from_slice(&signoff_line);
     out.extend_from_slice(tail);
