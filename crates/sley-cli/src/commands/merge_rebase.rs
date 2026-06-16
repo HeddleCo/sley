@@ -51,6 +51,12 @@ pub(crate) fn merge_write_worktree_file(
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
     let full = worktree_root.join(rel);
     if let Some(parent) = full.parent() {
+        // A regular file may occupy one of the ancestor path components (the D/F
+        // case: HEAD had `dir` as a file, the merge now needs `dir/<child>`). git
+        // removes the blocking file before materializing the directory subtree, so
+        // clear any non-directory ancestor before `create_dir_all`, which would
+        // otherwise fail with EEXIST/ENOTDIR.
+        remove_blocking_file_ancestors(worktree_root, rel)?;
         fs::create_dir_all(parent)?;
     }
     // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
@@ -98,6 +104,51 @@ fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+/// Clear worktree files that block any directory path in the merged result.
+/// Used on the clean-merge checkout path before
+/// [`sley_worktree::reset_index_and_worktree_to_commit`], which would otherwise
+/// fail when a HEAD file occupies a path the merged tree now needs as a
+/// directory (directory-rename D/F). Best-effort: errors are swallowed so a
+/// genuine I/O problem surfaces from the subsequent checkout instead.
+fn clear_merge_df_blockers(worktree_root: &Path, results: &MergePathResults) {
+    for path in results.keys() {
+        if !path.contains(&b'/') {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(path) {
+            let _ = remove_blocking_file_ancestors(worktree_root, rel);
+        }
+    }
+}
+
+/// Remove any regular file occupying an ancestor directory component of `rel`
+/// (relative worktree path). This clears the D/F case where a file (e.g. `dir`)
+/// blocks the creation of a directory subtree (`dir/child`). Only plain files
+/// are removed — an existing directory ancestor is left intact, and a symlink
+/// ancestor is unlinked (git would not write through it).
+fn remove_blocking_file_ancestors(worktree_root: &Path, rel: &str) -> Result<()> {
+    let mut prefix = String::new();
+    let mut components = rel.split('/').peekable();
+    while let Some(component) = components.next() {
+        // Stop before the leaf — only ancestors (directory components) matter.
+        if components.peek().is_none() {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        let candidate = worktree_root.join(&prefix);
+        match fs::symlink_metadata(&candidate) {
+            Ok(meta) if !meta.is_dir() => fs::remove_file(&candidate)?,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }
@@ -1708,6 +1759,11 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 false,
             ),
         )?;
+        // A directory in the merged result may now occupy a path that HEAD held
+        // as a plain file (e.g. `before/`→`after/` directory-rename while HEAD had
+        // a file `after`). Clear those file-in-the-way ancestors before the
+        // checkout materializes the subtree, else `create_dir_all` fails EEXIST.
+        clear_merge_df_blockers(&worktree_root, &results);
         sley_worktree::reset_index_and_worktree_to_commit(
             &worktree_root,
             &git_dir,

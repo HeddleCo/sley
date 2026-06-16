@@ -5289,13 +5289,14 @@ pub fn merge_entry_maps(
     // that contributed the file. We resolve this on the flattened `leaves` after
     // every per-path decision is made, so renames/dir-renames have settled first.
     resolve_directory_file_conflicts(
+        db,
         &mut paths,
         &mut leaves,
         &mut clean,
         &eff_ours,
         &eff_theirs,
         options,
-    );
+    )?;
 
     let tree = write_merged_tree(db, &leaves)?;
 
@@ -5343,13 +5344,14 @@ fn unique_df_path(
 /// whose path is also a directory (some other leaf lives under `path/`), move the
 /// file to `path~<branch>` and record a [`MergeConflictKind::FileDirectory`].
 fn resolve_directory_file_conflicts(
+    db: &FileObjectDatabase,
     paths: &mut Vec<MergedPath>,
     leaves: &mut MergeEntryMap,
     clean: &mut bool,
     eff_ours: &MergeEntryMap,
     eff_theirs: &MergeEntryMap,
     options: &MergeTreesOptions<'_>,
-) {
+) -> Result<()> {
     // A path is a "directory" in the result iff some leaf key has it as a strict
     // `path/` prefix. Collect every such directory prefix once.
     let mut directory_prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -5362,7 +5364,7 @@ fn resolve_directory_file_conflicts(
         }
     }
     if directory_prefixes.is_empty() {
-        return;
+        return Ok(());
     }
 
     // File leaves that collide with a directory of the same name.
@@ -5376,6 +5378,9 @@ fn resolve_directory_file_conflicts(
         let Some(entry) = leaves.remove(&original) else {
             continue;
         };
+        // The moved-aside file must be materialized in the worktree at its new
+        // path; read its blob bytes once so the porcelain has worktree content.
+        let moved_bytes = merge_blob_bytes(db, &entry.1)?;
         // Which side contributed the file? git keys off `dirmask`: the file lives
         // on the side that is NOT the directory. We read it off the effective side
         // maps — whichever side has this path as a plain file. When only theirs has
@@ -5407,9 +5412,12 @@ fn resolve_directory_file_conflicts(
                     theirs: if from_ours { None } else { Some(entry) },
                 };
             }
-            // git runs the moved-aside file through handle_content_merge, so it
-            // emits `Auto-merging <new_path>` even for a one-sided clean file.
-            slot.auto_merged = true;
+            // Keep the slot's existing `auto_merged`: git only emits
+            // `Auto-merging <new_path>` for the moved file when a real content
+            // merge ran (a rename or both-sides change drives filemask>=6 through
+            // handle_content_merge). A plain one-sided add (filemask 2/4) is moved
+            // aside silently, so we must NOT force the flag on here.
+            slot.worktree = Some((entry.0, moved_bytes));
             slot.conflict = Some(MergeConflictKind::FileDirectory {
                 original_path: original.clone(),
                 moved_from: branch.to_string(),
@@ -5423,18 +5431,19 @@ fn resolve_directory_file_conflicts(
                     theirs: if from_ours { None } else { Some(entry) },
                 },
                 result: Some(entry),
-                worktree: None,
+                worktree: Some((entry.0, moved_bytes)),
                 conflict: Some(MergeConflictKind::FileDirectory {
                     original_path: original.clone(),
                     moved_from: branch.to_string(),
                 }),
-                auto_merged: true,
+                auto_merged: false,
             });
         }
     }
 
     // Keep `paths` sorted by destination path (callers and tests assume order).
     paths.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(())
 }
 
 /// Construct a clean (non-conflicted) [`MergedPath`].
