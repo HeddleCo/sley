@@ -51,6 +51,11 @@ fn self_bin() -> PathBuf {
 }
 
 fn run_capture(args: &[&str], stdin_bytes: Option<&[u8]>) -> io::Result<Vec<u8>> {
+    Ok(run_capture_status(args, stdin_bytes)?.0)
+}
+
+/// Like [`run_capture`] but also returns whether the child exited successfully.
+fn run_capture_status(args: &[&str], stdin_bytes: Option<&[u8]>) -> io::Result<(Vec<u8>, bool)> {
     let mut child = Command::new(self_bin())
         .args(args)
         .stdin(if stdin_bytes.is_some() {
@@ -67,7 +72,7 @@ fn run_capture(args: &[&str], stdin_bytes: Option<&[u8]>) -> io::Result<Vec<u8>>
         let _ = stdin.write_all(bytes);
     }
     let out = child.wait_with_output()?;
-    Ok(out.stdout)
+    Ok((out.stdout, out.status.success()))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +435,14 @@ pub(crate) fn run_add_patch(
         owned.push(p.clone());
     }
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let diff = run_capture(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+    // git's `parse_diff` errors with "could not parse diff" (exit 1) when the
+    // spawned `diff-files` fails — e.g. an invalid `--diff-algorithm` (t3701 #69).
+    let (diff, diff_ok) =
+        run_capture_status(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+    if !diff_ok {
+        eprintln!("error: could not parse diff");
+        return Err(GitError::Exit(1));
+    }
     let diff_text = String::from_utf8_lossy(&diff).into_owned();
     let mut files = parse_diff(&diff_text);
 
