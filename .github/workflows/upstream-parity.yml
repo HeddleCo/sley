@@ -124,6 +124,8 @@ jobs:
             t3103-ls-tree-misc.sh
             t3200-branch.sh
             t3301-notes.sh
+            t3309-notes-merge-auto-resolve.sh
+            t3311-notes-merge-fanout.sh
             t4301-merge-tree-write-tree.sh
             t3403-rebase-skip.sh
             t3404-rebase-interactive.sh
@@ -170,6 +172,7 @@ jobs:
             t6003-rev-list-topo-order.sh
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh
+            t6112-rev-list-filters-objects.sh
             t6113-rev-list-bitmap-filters.sh
             t6120-describe.sh
             t6300-for-each-ref.sh
