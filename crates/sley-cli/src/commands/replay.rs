@@ -89,6 +89,613 @@ pub(crate) fn cmd_revert(args: &[String]) -> Result<()> {
     run_replay(ReplayAction::Revert, args)
 }
 
+pub(crate) fn cmd_replay(args: &[String]) -> Result<()> {
+    run_git_replay(args)
+}
+
+const REPLAY_USAGE: &str = "\
+usage: (EXPERIMENTAL!) git replay ([--contained] --onto=<newbase> | --advance=<branch> | --revert=<branch>)
+       [--ref=<ref>] [--ref-action=<mode>] <revision-range>
+
+    --[no-]contained      update all branches that point at commits in <revision-range>
+    --onto <revision>     replay onto given commit
+    --advance <branch>    make replay advance given branch
+    --revert <branch>     revert commits onto given branch
+    --ref <branch>        reference to update with result
+    --ref-action <mode>   control ref update behavior (update|print)
+";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayRefAction {
+    Update,
+    Print,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayModeKind {
+    Onto,
+    Advance,
+    Revert,
+}
+
+struct GitReplayArgs {
+    onto: Option<String>,
+    advance: Option<String>,
+    revert: Option<String>,
+    contained: bool,
+    ref_name: Option<String>,
+    ref_action: Option<ReplayRefAction>,
+    rev_args: Vec<String>,
+}
+
+struct GitReplayPlan {
+    action: ReplayAction,
+    base: ObjectId,
+    target_ref: String,
+    old_oid: Option<ObjectId>,
+    commits: Vec<ObjectId>,
+    ref_action: ReplayRefAction,
+    reflog_message: Vec<u8>,
+}
+
+fn run_git_replay(args: &[String]) -> Result<()> {
+    let parsed = parse_git_replay_args(args)?;
+    if parsed.onto.is_some() && parsed.advance.is_some() {
+        eprintln!("fatal: options '--onto' and '--advance' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if parsed.revert.is_some() && parsed.onto.is_some() {
+        eprintln!("fatal: options '--revert' and '--onto' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if parsed.revert.is_some() && parsed.advance.is_some() {
+        eprintln!("fatal: options '--revert' and '--advance' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    let modes = usize::from(parsed.onto.is_some())
+        + usize::from(parsed.advance.is_some())
+        + usize::from(parsed.revert.is_some());
+    if modes != 1 {
+        eprintln!("error: exactly one of --onto, --advance, or --revert is required");
+        eprint!("{REPLAY_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+    if parsed.advance.is_some() && parsed.contained {
+        eprintln!("fatal: options '--advance' and '--contained' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if parsed.revert.is_some() && parsed.contained {
+        eprintln!("fatal: options '--revert' and '--contained' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if parsed.ref_name.is_some() && parsed.contained {
+        eprintln!("fatal: options '--ref' and '--contained' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if parsed.rev_args.is_empty() {
+        eprintln!("error: empty commit set passed");
+        return Err(GitError::Exit(128));
+    }
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+        .unwrap_or_else(|| cwd.clone());
+    let ctx = ReplayCtx {
+        action: if parsed.revert.is_some() {
+            ReplayAction::Revert
+        } else {
+            ReplayAction::Pick
+        },
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+    };
+    let plan = build_git_replay_plan(&ctx, parsed)?;
+    let new_oid = replay_commits_to_base(&ctx, &plan)?;
+    emit_or_update_replay_ref(&ctx, &plan, &new_oid)
+}
+
+fn parse_git_replay_args(args: &[String]) -> Result<GitReplayArgs> {
+    let mut parsed = GitReplayArgs {
+        onto: None,
+        advance: None,
+        revert: None,
+        contained: false,
+        ref_name: None,
+        ref_action: None,
+        rev_args: Vec::new(),
+    };
+    let mut iter = args.iter();
+    let mut positional_only = false;
+    while let Some(arg) = iter.next() {
+        if positional_only {
+            parsed.rev_args.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "-h" | "--help" => {
+                print!("{REPLAY_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            "--contained" => parsed.contained = true,
+            "--no-contained" => parsed.contained = false,
+            "--onto" => {
+                parsed.onto = Some(
+                    iter.next()
+                        .ok_or_else(|| option_error("switch `onto' requires a value"))?
+                        .clone(),
+                );
+            }
+            value if value.starts_with("--onto=") => {
+                parsed.onto = Some(value["--onto=".len()..].to_string());
+            }
+            "--advance" => {
+                parsed.advance = Some(
+                    iter.next()
+                        .ok_or_else(|| option_error("switch `advance' requires a value"))?
+                        .clone(),
+                );
+            }
+            value if value.starts_with("--advance=") => {
+                parsed.advance = Some(value["--advance=".len()..].to_string());
+            }
+            "--revert" => {
+                parsed.revert = Some(
+                    iter.next()
+                        .ok_or_else(|| option_error("switch `revert' requires a value"))?
+                        .clone(),
+                );
+            }
+            value if value.starts_with("--revert=") => {
+                parsed.revert = Some(value["--revert=".len()..].to_string());
+            }
+            "--ref" => {
+                parsed.ref_name = Some(
+                    iter.next()
+                        .ok_or_else(|| option_error("switch `ref' requires a value"))?
+                        .clone(),
+                );
+            }
+            value if value.starts_with("--ref=") => {
+                parsed.ref_name = Some(value["--ref=".len()..].to_string());
+            }
+            "--ref-action" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| option_error("switch `ref-action' requires a value"))?;
+                parsed.ref_action = Some(parse_replay_ref_action(value)?);
+            }
+            value if value.starts_with("--ref-action=") => {
+                parsed.ref_action = Some(parse_replay_ref_action(&value["--ref-action=".len()..])?);
+            }
+            value => parsed.rev_args.push(value.to_string()),
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_replay_ref_action(value: &str) -> Result<ReplayRefAction> {
+    match value {
+        "update" => Ok(ReplayRefAction::Update),
+        "print" => Ok(ReplayRefAction::Print),
+        _ => {
+            eprintln!("fatal: invalid value for --ref-action: {value}");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitReplayPlan> {
+    let refs = ctx.refs();
+    let mode = if parsed.onto.is_some() {
+        ReplayModeKind::Onto
+    } else if parsed.advance.is_some() {
+        ReplayModeKind::Advance
+    } else {
+        ReplayModeKind::Revert
+    };
+    if matches!(mode, ReplayModeKind::Advance | ReplayModeKind::Revert)
+        && parsed.rev_args.len() != 1
+    {
+        let option = if mode == ReplayModeKind::Advance {
+            "--advance"
+        } else {
+            "--revert"
+        };
+        eprintln!(
+            "fatal: '{option}' cannot be used with multiple revision ranges because the ordering would be ill-defined"
+        );
+        return Err(GitError::Exit(128));
+    }
+    if parsed.ref_name.is_some() && parsed.rev_args.len() != 1 {
+        eprintln!("fatal: --ref cannot be used with multiple revision ranges");
+        return Err(GitError::Exit(128));
+    }
+    let ref_action = match parsed.ref_action {
+        Some(action) => action,
+        None => match config_value(&ctx.git_dir, "replay", "refAction").as_deref() {
+            Some("print") => ReplayRefAction::Print,
+            Some("update") | None => ReplayRefAction::Update,
+            Some(value) => {
+                eprintln!("fatal: invalid replay.refAction value: {value}");
+                return Err(GitError::Exit(128));
+            }
+        },
+    };
+    let (action, base, default_target, old_oid, reflog_message) = match mode {
+        ReplayModeKind::Onto => {
+            let onto = parsed.onto.as_ref().expect("--onto mode has value");
+            let base = resolve_revision(&ctx.git_dir, ctx.format, onto).map_err(|_| {
+                eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
+                GitError::Exit(128)
+            })?;
+            let target = replay_target_from_revision(&refs, &parsed.rev_args)?;
+            let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
+            (
+                ReplayAction::Pick,
+                base,
+                target,
+                old_oid,
+                format!("replay --onto {base}").into_bytes(),
+            )
+        }
+        ReplayModeKind::Advance => {
+            let advance = parsed.advance.as_ref().expect("--advance mode has value");
+            let target = replay_existing_ref(&refs, advance, "--advance")?;
+            let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
+            let Some(base) = old_oid else {
+                eprintln!("fatal: argument to --advance must be a reference");
+                return Err(GitError::Exit(128));
+            };
+            (
+                ReplayAction::Pick,
+                base,
+                target,
+                old_oid,
+                format!("replay --advance {advance}").into_bytes(),
+            )
+        }
+        ReplayModeKind::Revert => {
+            let revert = parsed.revert.as_ref().expect("--revert mode has value");
+            let target = replay_existing_ref(&refs, revert, "--revert")?;
+            let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
+            let Some(base) = old_oid else {
+                eprintln!("fatal: argument to --revert must be a reference");
+                return Err(GitError::Exit(128));
+            };
+            (
+                ReplayAction::Revert,
+                base,
+                target,
+                old_oid,
+                format!("replay --revert {revert}").into_bytes(),
+            )
+        }
+    };
+    let explicit_ref = parsed.ref_name.is_some();
+    let target_ref = match parsed.ref_name {
+        Some(name) => validate_replay_ref(&name)?,
+        None => default_target,
+    };
+    let old_oid = if explicit_ref {
+        read_direct_ref(&refs, ctx.format, &target_ref)?
+    } else {
+        old_oid
+    };
+    let commits = select_git_replay_commits(ctx, action, &parsed.rev_args, &base)?;
+    Ok(GitReplayPlan {
+        action,
+        base,
+        target_ref,
+        old_oid,
+        commits,
+        ref_action,
+        reflog_message,
+    })
+}
+
+fn replay_existing_ref(store: &FileRefStore, name: &str, option: &str) -> Result<String> {
+    let candidates = if name == "HEAD" || name.starts_with("refs/") {
+        vec![name.to_string()]
+    } else {
+        vec![branch_ref_name(name)?, name.to_string()]
+    };
+    for candidate in candidates {
+        if store.read_ref(&candidate).ok().flatten().is_some() {
+            return Ok(candidate);
+        }
+    }
+    eprintln!("fatal: argument to {option} must be a reference");
+    Err(GitError::Exit(128))
+}
+
+fn replay_target_from_revision(store: &FileRefStore, rev_args: &[String]) -> Result<String> {
+    if rev_args.len() == 1 {
+        let arg = &rev_args[0];
+        let candidate = arg
+            .rsplit_once("..")
+            .map(|(_, right)| right)
+            .filter(|right| !right.is_empty())
+            .unwrap_or(arg);
+        if let Ok(name) = replay_existing_ref(store, candidate, "--onto") {
+            return Ok(name);
+        }
+    }
+    eprintln!("fatal: could not determine ref to update");
+    Err(GitError::Exit(128))
+}
+
+fn validate_replay_ref(name: &str) -> Result<String> {
+    if !(name == "HEAD" || name.starts_with("refs/")) || validate_ref_name(name).is_err() {
+        eprintln!("fatal: '{name}' is not a valid refname");
+        return Err(GitError::Exit(128));
+    }
+    Ok(name.to_string())
+}
+
+fn read_direct_ref(
+    store: &FileRefStore,
+    format: ObjectFormat,
+    name: &str,
+) -> Result<Option<ObjectId>> {
+    Ok(match store.read_ref(name)? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        Some(RefTarget::Symbolic(target)) => match store.read_ref(&target)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+        None => {
+            let _ = format;
+            None
+        }
+    })
+}
+
+fn select_git_replay_commits(
+    ctx: &ReplayCtx,
+    action: ReplayAction,
+    rev_args: &[String],
+    base: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    if action == ReplayAction::Pick
+        && rev_args.len() == 1
+        && !rev_args[0].contains("..")
+        && !rev_args[0].starts_with('^')
+    {
+        let tip = resolve_revision(&ctx.git_dir, ctx.format, &rev_args[0])?;
+        let db = ctx.db();
+        let excluded = rev_list_walk_commits(&db, ctx.format, [*base], false)?
+            .into_iter()
+            .map(|record| record.oid)
+            .collect::<HashSet<_>>();
+        let mut commits = rev_list_walk_commits(&db, ctx.format, [tip], false)?
+            .into_iter()
+            .filter_map(|record| (!excluded.contains(&record.oid)).then_some(record.oid))
+            .collect::<Vec<_>>();
+        commits.reverse();
+        return Ok(commits);
+    }
+    let selection = select_revisions(ctx, action, rev_args)?;
+    Ok(selection.commits)
+}
+
+fn replay_commits_to_base(ctx: &ReplayCtx, plan: &GitReplayPlan) -> Result<ObjectId> {
+    if plan.commits.is_empty() {
+        return Ok(plan.base);
+    }
+    let mut head = plan.base;
+    for oid in &plan.commits {
+        head = replay_one_commit_to(ctx, plan.action, &head, oid)?;
+    }
+    Ok(head)
+}
+
+fn replay_one_commit_to(
+    ctx: &ReplayCtx,
+    action: ReplayAction,
+    head: &ObjectId,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
+    let db = ctx.db();
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let commit = Commit::parse(ctx.format, &object.body)?;
+    if commit.parents.len() > 1 {
+        eprintln!("fatal: replaying merge commits is not supported yet!");
+        return Err(GitError::Exit(128));
+    }
+    let parent = commit.parents.first().copied();
+    let (base_map, theirs_map) = match action {
+        ReplayAction::Pick => {
+            let base = match parent {
+                Some(parent) => tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?,
+                None => MergeTreeMap::new(),
+            };
+            let theirs = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
+            (base, theirs)
+        }
+        ReplayAction::Revert => {
+            let base = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
+            let theirs = match parent {
+                Some(parent) => tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?,
+                None => MergeTreeMap::new(),
+            };
+            (base, theirs)
+        }
+    };
+    let head_tree = commit_tree_oid(&db, ctx.format, head)?;
+    let ours_map = stash_tree_entry_map(&db, ctx.format, &head_tree)?;
+    let (results, conflicts) = three_way_merge_trees_styled(
+        &db,
+        ctx.format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        "HEAD",
+        &format_log_abbrev_oid(oid),
+        "parent",
+        sley_diff_merge::ConflictStyle::Merge,
+    )
+    .map_err(|err| {
+        eprintln!("error: {err}");
+        GitError::Exit(128)
+    })?;
+    if !conflicts.is_empty() {
+        return Err(GitError::Exit(1));
+    }
+    let tree_map = merge_results_to_tree_map(&results);
+    let new_tree = write_tree_map_object(&db, ctx.format, &tree_map)?;
+    if new_tree == head_tree {
+        return Ok(*head);
+    }
+    let author = match action {
+        ReplayAction::Pick => commit.author.clone(),
+        ReplayAction::Revert => commit_identity_from_env("AUTHOR")?,
+    };
+    let message = match action {
+        ReplayAction::Pick => commit.message.clone(),
+        ReplayAction::Revert => format_revert_message(
+            ctx,
+            &db,
+            &make_todo_item(ctx, ReplayAction::Revert, oid)?,
+            &commit,
+            &commit_subject(&commit.message),
+            parent.as_ref(),
+            &ReplayOpts::default(),
+        )?,
+    };
+    let mut writer = ctx.db();
+    sley_sequencer::create_commit(
+        &mut writer,
+        sley_sequencer::CommitCreate {
+            tree: new_tree,
+            parents: vec![*head],
+            author,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message,
+            encoding: commit.encoding.clone(),
+        },
+    )
+}
+
+fn finish_replay_halt(halt: ReplayHalt) -> GitError {
+    match halt {
+        ReplayHalt::Fatal => GitError::Exit(128),
+        ReplayHalt::Code(code) => GitError::Exit(code),
+    }
+}
+
+fn merge_results_to_tree_map(results: &BTreeMap<Vec<u8>, MergePathResult>) -> MergeTreeMap {
+    let mut out = MergeTreeMap::new();
+    for (path, result) in results {
+        if let MergePathResult::Resolved(Some((mode, oid))) = result {
+            out.insert(path.clone(), (*mode, *oid));
+        }
+    }
+    out
+}
+
+fn write_tree_map_object(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entries: &MergeTreeMap,
+) -> Result<ObjectId> {
+    let _ = format;
+    write_tree_map_level(db, entries, &[])
+}
+
+fn write_tree_map_level(
+    db: &FileObjectDatabase,
+    entries: &MergeTreeMap,
+    prefix: &[u8],
+) -> Result<ObjectId> {
+    let mut tree_entries: Vec<TreeEntry> = Vec::new();
+    let mut subdirs: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let prefix_len = if prefix.is_empty() {
+        0
+    } else {
+        prefix.len() + 1
+    };
+    for (path, (mode, oid)) in entries {
+        if !prefix.is_empty()
+            && (!path.starts_with(prefix) || path.get(prefix.len()) != Some(&b'/'))
+        {
+            continue;
+        }
+        let rel = &path[prefix_len..];
+        if let Some(slash) = rel.iter().position(|byte| *byte == b'/') {
+            subdirs.insert(rel[..slash].to_vec());
+        } else {
+            tree_entries.push(TreeEntry {
+                mode: *mode,
+                name: BString::from(rel.to_vec()),
+                oid: *oid,
+            });
+        }
+    }
+    for dir in subdirs {
+        let mut sub_prefix = prefix.to_vec();
+        if !sub_prefix.is_empty() {
+            sub_prefix.push(b'/');
+        }
+        sub_prefix.extend_from_slice(&dir);
+        let oid = write_tree_map_level(db, entries, &sub_prefix)?;
+        tree_entries.push(TreeEntry {
+            mode: 0o040000,
+            name: BString::from(dir),
+            oid,
+        });
+    }
+    tree_entries.sort_by_key(|entry| {
+        let mut key = entry.name.clone().into_bytes();
+        if entry.mode == 0o040000 {
+            key.push(b'/');
+        }
+        key
+    });
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree {
+            entries: tree_entries,
+        }
+        .write(),
+    ))
+}
+
+fn emit_or_update_replay_ref(ctx: &ReplayCtx, plan: &GitReplayPlan, new_oid: &ObjectId) -> Result<()> {
+    let old_oid = plan
+        .old_oid
+        .unwrap_or_else(|| ObjectId::null(ctx.format));
+    if plan.ref_action == ReplayRefAction::Print {
+        println!("update {} {} {}", plan.target_ref, new_oid, old_oid);
+        return Ok(());
+    }
+    let refs = ctx.refs();
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: plan.target_ref.clone(),
+        expected: plan.old_oid.map(RefTarget::Direct),
+        new: RefTarget::Direct(*new_oid),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: *new_oid,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message: plan.reflog_message.clone(),
+        }),
+    });
+    tx.commit()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CmdMode {
     Quit,
