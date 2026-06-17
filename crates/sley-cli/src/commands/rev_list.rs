@@ -987,7 +987,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    if quiet && !(objects && filter_print_omitted) {
+    if quiet && !(objects && (filter_print_omitted || missing_action == RevListMissingAction::Print)) {
         return Ok(());
     }
     let mut child_oids = HashMap::<ObjectId, Vec<ObjectId>>::new();
@@ -1646,7 +1646,7 @@ impl RevListObjectFilter {
             Self::Combine(filters) => filters
                 .iter()
                 .filter_map(Self::tree_depth_limit)
-                .min(),
+                .max(),
             _ => None,
         }
     }
@@ -1827,7 +1827,7 @@ fn rev_list_mark_tree_objects(
     tree_oid: &ObjectId,
     seen: &mut HashSet<ObjectId>,
 ) -> Result<()> {
-    if !seen.insert(*tree_oid) {
+    if seen.contains(tree_oid) {
         return Ok(());
     }
     let object = db.read_object(tree_oid)?;
