@@ -11561,6 +11561,16 @@ fn materialize_index_entry_file(
     file_path: &Path,
     entry: &IndexEntry,
 ) -> Result<()> {
+    // A gitlink (mode 160000) has no blob in this object store and materializes
+    // as a directory (git's `write_entry` S_IFGITLINK arm: mkdir, never read an
+    // object). Single gitlink rule via `sley_index::is_gitlink`; without it a
+    // sparse re-materialization of a submodule path would fail with "not found:
+    // blob object <commit-oid>".
+    if sley_index::is_gitlink(entry.mode) {
+        prepare_blob_parent_dirs(worktree_root, file_path)?;
+        fs::create_dir_all(file_path)?;
+        return Ok(());
+    }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     prepare_blob_parent_dirs(worktree_root, file_path)?;
     remove_existing_worktree_path(file_path)?;
@@ -12423,7 +12433,12 @@ fn restore_head_entry_to_worktree(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<()> {
-    write_worktree_blob_entry(db, worktree_root, path, entry)?;
+    // Route through the single gitlink-aware materializer: a gitlink has no blob
+    // here, so `write_worktree_blob_entry` would fail reading the commit-oid as
+    // a blob. `materialize_tree_entry` owns the gitlink-vs-blob decision (mkdir
+    // the submodule dir) in ONE place. The returned index entry is unused on
+    // this worktree-only restore path.
+    materialize_tree_entry(db, worktree_root, path, entry)?;
     Ok(())
 }
 

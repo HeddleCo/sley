@@ -1705,6 +1705,92 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn is_gitlink_matches_git_s_isgitlink() {
+        // Only the gitlink file-type bits classify as a gitlink; blobs,
+        // executables, symlinks, and trees do not.
+        assert!(is_gitlink(GITLINK_MODE));
+        assert!(is_gitlink(0o160000));
+        // Permission bits ORed onto the gitlink type still classify (mask).
+        assert!(is_gitlink(0o160000 | 0o755));
+        assert!(!is_gitlink(0o100644));
+        assert!(!is_gitlink(0o100755));
+        assert!(!is_gitlink(0o120000)); // symlink
+        assert!(!is_gitlink(0o040000)); // tree / on-disk directory mode
+        assert!(!is_gitlink(0));
+    }
+
+    #[test]
+    fn gitlink_stat_verdict_directory_is_populated_else_typechanged() {
+        let dir = unique_temp_dir("gitlink-verdict");
+        fs::create_dir_all(&dir).expect("test operation should succeed");
+        // A directory on disk → Populated (clean unless HEAD differs, the
+        // caller's job). The 040000-vs-160000 mode mismatch must NOT make it
+        // dirty — the whole point of the primitive.
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).expect("test operation should succeed");
+        assert_eq!(
+            gitlink_stat_verdict(&fs::symlink_metadata(&sub).expect("test operation should succeed")),
+            GitlinkStatVerdict::Populated
+        );
+        // A regular file where the submodule should be → TypeChanged (dirty).
+        let file = dir.join("file");
+        fs::write(&file, b"x").expect("test operation should succeed");
+        assert_eq!(
+            gitlink_stat_verdict(&fs::symlink_metadata(&file).expect("test operation should succeed")),
+            GitlinkStatVerdict::TypeChanged
+        );
+    }
+
+    #[test]
+    fn stat_verdict_treats_populated_gitlink_as_clean_not_dirty() {
+        // Regression for the consolidation: a gitlink entry (mode 160000) whose
+        // worktree path is a directory (mode 040000) must be Clean, NOT Dirty.
+        // Before the primitive, `entry.mode != worktree_metadata_mode` reported
+        // every populated submodule dirty (`update-index --refresh: needs
+        // update`).
+        let dir = unique_temp_dir("gitlink-stat-clean");
+        fs::create_dir_all(&dir).expect("test operation should succeed");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).expect("test operation should succeed");
+        let entry = IndexEntry {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode: GITLINK_MODE,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "ce013625030ba8dba906f756967f9e9ca394464a",
+            )
+            .expect("test operation should succeed"),
+            flags: 3,
+            flags_extended: 0,
+            path: BString::from(b"sub"),
+        };
+        let cache = IndexStatCache::default();
+        let md = fs::symlink_metadata(&sub).expect("test operation should succeed");
+        assert_eq!(
+            cache.index_entry_worktree_stat_verdict(&entry, &md),
+            StatVerdict::Clean,
+            "populated gitlink directory must be clean, not dirty"
+        );
+        // Replace the directory with a file → TypeChanged → Dirty.
+        fs::remove_dir(&sub).expect("test operation should succeed");
+        fs::write(&sub, b"x").expect("test operation should succeed");
+        let md = fs::symlink_metadata(&sub).expect("test operation should succeed");
+        assert_eq!(
+            cache.index_entry_worktree_stat_verdict(&entry, &md),
+            StatVerdict::Dirty,
+            "a file where the gitlink dir should be is a type change (dirty)"
+        );
+    }
+
+    #[test]
     fn index_v2_round_trips_entry() {
         let index = Index {
             version: 2,

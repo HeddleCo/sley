@@ -4793,7 +4793,7 @@ fn print_status_porcelain_v2(
                     '.'
                 },
             ),
-            None if entry.index_mode == Some(0o160000) || entry.worktree_mode == Some(0o160000) => {
+            None if entry.index_mode.is_some_and(sley_index::is_gitlink) || entry.worktree_mode.is_some_and(sley_index::is_gitlink) => {
                 "S...".to_string()
             }
             None => "N...".to_string(),
@@ -4961,9 +4961,9 @@ fn apply_submodule_ignore_entry(
     // only touches the worktree-side detail and the summary (cells #93/#94 keep
     // the staged line).
     let cli_all = resolver.cli == Some(IgnoreSubmodules::All);
-    let is_gitlink = entry.head_mode == Some(0o160000)
-        || entry.index_mode == Some(0o160000)
-        || entry.worktree_mode == Some(0o160000);
+    let is_gitlink = entry.head_mode.is_some_and(sley_index::is_gitlink)
+        || entry.index_mode.is_some_and(sley_index::is_gitlink)
+        || entry.worktree_mode.is_some_and(sley_index::is_gitlink);
     if cli_all && is_gitlink {
         return false;
     }
@@ -5101,7 +5101,7 @@ fn tree_gitlinks(
     let flat = sley_diff_merge::flatten_tree(db, format, tree_oid)?;
     Ok(flat
         .into_iter()
-        .filter(|(_, (mode, _))| *mode == 0o160000)
+        .filter(|(_, (mode, _))| sley_index::is_gitlink(*mode))
         .map(|(path, (_, oid))| (path, oid))
         .collect())
 }
@@ -5116,7 +5116,7 @@ fn index_gitlinks(git_dir: &Path, format: ObjectFormat) -> Result<BTreeMap<Vec<u
     Ok(index
         .entries
         .iter()
-        .filter(|entry| entry.stage() == sley_index::Stage::Normal && entry.mode == 0o160000)
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode))
         .map(|entry| (entry.path.to_vec(), entry.oid))
         .collect())
 }
