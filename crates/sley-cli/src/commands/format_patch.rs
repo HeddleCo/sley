@@ -23,6 +23,7 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
+use sley_notes::{NotesRef, read_note_bytes};
 
 /// The `--rfc[=<token>]` / `--no-rfc` state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,8 @@ struct FormatPatchOptions {
     stdout: bool,
     /// Output directory for the `.patch` files (`-o`/`--output-directory`).
     output_directory: Option<String>,
+    /// Write the concatenated mbox stream to a single file (`--output=<file>`).
+    output: Option<String>,
     /// `[PATCH ...]` numbering policy.
     number_mode: NumberMode,
     /// First patch number (`--start-number`); defaults to 1.
@@ -213,6 +216,9 @@ struct FormatPatchOptions {
     /// `--in-reply-to=<msgid>`: seed the In-Reply-To/References chain with this
     /// message id (cleaned of surrounding `<>`/whitespace).
     in_reply_to: Option<String>,
+    /// Notes display state for `--notes[=<ref>]`, `--no-notes`, and
+    /// `format.notes`.
+    notes: FormatPatchNotes,
     /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
     setup_args: Vec<String>,
 }
@@ -222,11 +228,46 @@ struct FormatPatchSelection {
     pathspecs: Vec<String>,
 }
 
+/// Tracks `format-patch` notes display state. This is deliberately local rather
+/// than reusing `log.rs`'s private display helper so the parity fix stays in this
+/// command file.
+#[derive(Default, Clone)]
+struct FormatPatchNotes {
+    given: bool,
+    enabled: bool,
+    use_default: bool,
+    suppress_config: bool,
+    refs: Vec<String>,
+}
+
+impl FormatPatchNotes {
+    fn add_default(&mut self) {
+        self.given = true;
+        self.enabled = true;
+        self.use_default = true;
+    }
+
+    fn add_ref(&mut self, reff: &str) {
+        self.given = true;
+        self.enabled = true;
+        self.refs.push(NotesRef::expand(reff).as_str().to_string());
+    }
+
+    fn disable(&mut self) {
+        self.given = true;
+        self.enabled = false;
+        self.use_default = false;
+        self.suppress_config = true;
+        self.refs.clear();
+    }
+}
+
 impl Default for FormatPatchOptions {
     fn default() -> Self {
         Self {
             stdout: false,
             output_directory: None,
+            output: None,
             number_mode: NumberMode::Auto,
             start_number: None,
             signoff: false,
@@ -268,6 +309,7 @@ impl Default for FormatPatchOptions {
             encode_email_headers: None,
             thread: None,
             in_reply_to: None,
+            notes: FormatPatchNotes::default(),
             setup_args: Vec::new(),
         }
     }
@@ -312,6 +354,13 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
+
+    if (options.stdout && (options.output_directory.is_some() || options.output.is_some()))
+        || (options.output.is_some() && options.output_directory.is_some())
+    {
+        eprintln!("fatal: multiple output options?");
+        return Err(GitError::Exit(128));
+    }
 
     // Resolve diff path prefixes: `--no-prefix`/`--default-prefix` win over the
     // `format.noprefix` config. A non-boolean `format.noprefix` is fatal (git
@@ -369,6 +418,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         None
     };
     let abbrev = patch_index_abbrev(git_dir, format, &options)?;
+    let notes_refs = resolve_format_patch_notes(git_dir, format, &options, config)?;
 
     // Resolve message threading: the `--thread`/`format.thread` level plus any
     // `--in-reply-to` seed determine the Message-ID / In-Reply-To / References on
@@ -456,6 +506,8 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 thread: patch_thread(idx),
                 encode_headers,
                 config,
+                git_dir,
+                notes_refs: &notes_refs,
             })?;
             stdout.write_all(&buffer)?;
         }
@@ -463,7 +515,46 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let out_dir = options.output_directory.as_deref().unwrap_or(".");
+    if let Some(output) = options.output.as_deref() {
+        let output_path = resolve_cli_path(cwd, output);
+        let mut stream = Vec::new();
+        if let Some(cover) = &cover {
+            stream.extend_from_slice(cover);
+        }
+        for (idx, record) in commits.iter().enumerate() {
+            if idx > 0 {
+                stream.push(b'\n');
+            }
+            let buffer = render_patch(RenderContext {
+                db,
+                format,
+                options: &options,
+                resolved: &resolved,
+                record,
+                diff_pathspec: diff_pathspec.as_ref(),
+                seq: start_number + idx,
+                last_number,
+                numbered,
+                signoff_line: signoff_line.as_deref(),
+                abbrev,
+                thread: patch_thread(idx),
+                encode_headers,
+                config,
+                git_dir,
+                notes_refs: &notes_refs,
+            })?;
+            stream.extend_from_slice(&buffer);
+        }
+        fs::write(output_path, stream)?;
+        return Ok(());
+    }
+
+    let configured_out_dir = config.get("format", None, "outputDirectory");
+    let out_dir = options
+        .output_directory
+        .as_deref()
+        .or(configured_out_dir)
+        .unwrap_or(".");
     let out_dir_path = resolve_cli_path(cwd, out_dir);
     fs::create_dir_all(&out_dir_path)?;
     // Resolve the filename length cap: CLI `--filename-max-length`, else
@@ -509,6 +600,8 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             thread: patch_thread(idx),
             encode_headers,
             config,
+            git_dir,
+            notes_refs: &notes_refs,
         })?;
         let file_name = if options.numbered_files {
             seq.to_string()
@@ -1418,6 +1511,147 @@ fn cover_diff_entries(
     })
 }
 
+/// Resolve the notes refs that `format-patch` appends after the `---` separator.
+/// `format.notes` is opt-in, unlike `git log`, and command-line `--no-notes`
+/// suppresses configured refs until a later `--notes` flag re-enables explicit
+/// display.
+fn resolve_format_patch_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> Result<Vec<String>> {
+    let mut refs = Vec::new();
+    let mut active = false;
+    if !options.notes.suppress_config {
+        for entry in config.get_all("format", None, "notes") {
+            match entry {
+                None => {
+                    push_note_ref(git_dir, &mut refs, None);
+                    active = true;
+                }
+                Some(value) => match git_config_bool_str(value) {
+                    Some(true) => {
+                        push_note_ref(git_dir, &mut refs, None);
+                        active = true;
+                    }
+                    Some(false) => {
+                        refs.clear();
+                        active = false;
+                    }
+                    None => {
+                        push_note_ref(git_dir, &mut refs, Some(value));
+                        active = true;
+                    }
+                },
+            }
+        }
+    }
+
+    if options.notes.given {
+        if !options.notes.enabled {
+            return Ok(Vec::new());
+        }
+        active = true;
+        if options.notes.use_default {
+            push_note_ref(git_dir, &mut refs, None);
+        }
+        for reff in &options.notes.refs {
+            push_note_ref(git_dir, &mut refs, Some(reff));
+        }
+    }
+
+    if !active {
+        return Ok(Vec::new());
+    }
+    expand_format_patch_notes(git_dir, format, refs)
+}
+
+fn push_note_ref(git_dir: &Path, refs: &mut Vec<String>, reff: Option<&str>) {
+    let value = match reff {
+        Some(reff) => NotesRef::expand(reff).as_str().to_string(),
+        None => crate::commands::notes::raw_notes_ref(git_dir, None),
+    };
+    if !value.is_empty() && !refs.contains(&value) {
+        refs.push(value);
+    }
+}
+
+fn expand_format_patch_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refs: Vec<String>,
+) -> Result<Vec<String>> {
+    if refs.iter().all(|reff| !reff.contains('*')) {
+        return Ok(refs);
+    }
+    let store = FileRefStore::new(git_dir, format);
+    let mut expanded = Vec::new();
+    for reff in refs {
+        if !reff.contains('*') {
+            if !expanded.contains(&reff) {
+                expanded.push(reff);
+            }
+            continue;
+        }
+        let prefix = reff.trim_end_matches('*');
+        let mut matched: Vec<String> = store
+            .list_refs()?
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        matched.sort();
+        for name in matched {
+            if !expanded.contains(&name) {
+                expanded.push(name);
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+fn render_format_patch_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refs: &[String],
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if refs.is_empty() {
+        return Ok(out);
+    }
+    let store = FileRefStore::new(git_dir, format);
+    for reff in refs {
+        let handle = NotesRef::expand(reff);
+        let Some(mut body) = read_note_bytes(git_dir, format, &store, &handle, oid)? else {
+            continue;
+        };
+        if body.last() == Some(&b'\n') {
+            body.pop();
+        }
+        if handle.as_str() == sley_notes::DEFAULT_NOTES_REF {
+            out.extend_from_slice(b"\nNotes:\n");
+        } else {
+            let name = handle
+                .as_str()
+                .strip_prefix("refs/")
+                .and_then(|s| s.strip_prefix("notes/"))
+                .unwrap_or(handle.as_str());
+            out.extend_from_slice(format!("\nNotes ({name}):\n").as_bytes());
+        }
+        for line in body.split(|b| *b == b'\n') {
+            out.extend_from_slice(b"    ");
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    if !out.is_empty() {
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
 /// Fold the parsed options together with repository config into the run-wide
 /// [`ResolvedFormat`]: the subject prefix, the To/Cc/extra-header block, the
 /// `--from` rewrite identity, and the signature trailer text. This mirrors
@@ -1711,6 +1945,10 @@ struct RenderContext<'a> {
     encode_headers: bool,
     /// Repo config (for the `--signoff` committer-ident 8-bit CTE check).
     config: &'a GitConfig,
+    /// Repository gitdir, used to resolve notes.
+    git_dir: &'a Path,
+    /// Ordered notes refs to append after the `---` separator.
+    notes_refs: &'a [String],
 }
 
 /// Render one commit into a complete mbox patch byte buffer.
@@ -1730,6 +1968,8 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         thread,
         encode_headers,
         config,
+        git_dir,
+        notes_refs,
     } = ctx;
 
     let commit = &record.commit;
@@ -1835,6 +2075,8 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     if !entries.is_empty() {
         if options.stat {
             out.extend_from_slice(b"---\n");
+            let notes = render_format_patch_notes(git_dir, format, notes_refs, &record.oid)?;
+            out.extend_from_slice(&notes);
             write_patch_diffstat(&mut out, &entries, db, options)?;
             for entry in &entries {
                 write_patch_summary_entry(&mut out, entry)?;
@@ -3300,6 +3542,15 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value if let Some(dir) = value.strip_prefix("-o") => {
                 options.output_directory = Some(dir.to_string());
             }
+            "--output" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--output requires a value".into()))?;
+                options.output = Some(value.clone());
+            }
+            value if let Some(path) = value.strip_prefix("--output=") => {
+                options.output = Some(path.to_string());
+            }
             "-n" | "--numbered" => options.number_mode = NumberMode::Numbered,
             "-N" | "--no-numbered" => options.number_mode = NumberMode::Unnumbered,
             "--start-number" => {
@@ -3332,7 +3583,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // `--no-stat`). The long `--patch` is the diff-machinery flag and,
             // quirkily, does *not* disable the stat — so it is a no-op here.
             "-p" => options.stat = false,
-            "--patch" | "--no-patch-with-stat" => {}
+            "--patch" | "--no-patch-with-stat" | "--numstat" => {}
             "--full-index" => options.full_index = true,
             "--no-renames" => options.detect_renames = false,
             "-M" | "--find-renames" => options.detect_renames = true,
@@ -3525,6 +3776,14 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value if let Some(msgid) = value.strip_prefix("--in-reply-to=") => {
                 options.in_reply_to = Some(msgid.to_string());
             }
+            "--notes" | "--show-notes" => options.notes.add_default(),
+            value if let Some(reff) = value.strip_prefix("--notes=") => {
+                options.notes.add_ref(reff);
+            }
+            value if let Some(reff) = value.strip_prefix("--show-notes=") => {
+                options.notes.add_ref(reff);
+            }
+            "--no-notes" => options.notes.disable(),
             // Cover-letter family.
             "--cover-letter" => options.cover_letter = Some(true),
             "--no-cover-letter" => options.cover_letter = Some(false),
