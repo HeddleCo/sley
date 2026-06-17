@@ -646,8 +646,31 @@ fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
     let (paths, quiet) = parse_submodule_init_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let submodules = read_submodule_configs(&worktree_root)?;
+
+    // git's `module_list_compute` lists the INDEX gitlinks, then `init_submodule`
+    // dies "No url found for submodule path '<p>' in .gitmodules" for any listed
+    // gitlink with no `.gitmodules` url. Cross-reference the index gitlinks
+    // (restricted to the requested pathspecs) against the parsed `.gitmodules`
+    // so an index gitlink with no mapping aborts init, matching git.
+    let index = read_repository_index(&git_dir, format)?;
+    let index_gitlinks = index_relevant_paths(&index, &BTreeMap::new());
+    let known_paths: BTreeSet<String> = submodules.iter().map(|s| s.path.clone()).collect();
+    for (path, (mode, _)) in &index_gitlinks {
+        if *mode != 0o160000 {
+            continue;
+        }
+        if !path_selected_by_specs(&cwd, &worktree_root, path, &paths) {
+            continue;
+        }
+        if !known_paths.contains(path) {
+            eprintln!("fatal: No url found for submodule path '{path}' in .gitmodules");
+            return Err(GitError::Exit(128));
+        }
+    }
+
     let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &paths)?;
     let mut config = read_repo_config(&git_dir)?;
     let mut changed = false;
@@ -679,6 +702,18 @@ fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
         write_repo_config(&git_dir, &config)?;
     }
     Ok(())
+}
+
+/// True when `path` is selected by `specs` (all paths when `specs` is empty),
+/// using the same normalization as the submodule pathspec matcher.
+fn path_selected_by_specs(cwd: &Path, worktree_root: &Path, path: &str, specs: &[&str]) -> bool {
+    if specs.is_empty() {
+        return true;
+    }
+    specs.iter().any(|spec| {
+        let normalized = normalize_submodule_pathspec(cwd, worktree_root, spec);
+        submodule_path_matches_pathspec(path, &normalized)
+    })
 }
 
 fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
