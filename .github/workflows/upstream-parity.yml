@@ -219,6 +219,14 @@ jobs:
             t1416-ref-transaction-hooks.sh
             t1091-sparse-checkout-builtin.sh
             t1092-sparse-checkout-compatibility.sh
+            t7602-merge-octopus-many.sh
+            t7604-merge-custom-message.sh
+            t7607-merge-state.sh
+            t7611-merge-abort.sh
+            t7401-submodule-summary.sh
+            t7407-submodule-foreach.sh
+            t7406-submodule-update.sh
+            t4203-mailmap.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.

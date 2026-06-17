@@ -376,13 +376,13 @@ declare -A FLOOR=(
     [t1401-symbolic-ref.sh]=25
     [t1450-fsck.sh]=82
     [t1500-rev-parse.sh]=81
-    [t2400-worktree-add.sh]=213
+    [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=378
     [t7004-tag.sh]=176
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
-    [t0020-crlf.sh]=27
+    [t0020-crlf.sh]=28
     [t0021-conversion.sh]=21
     [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10
@@ -391,7 +391,7 @@ declare -A FLOOR=(
     [t1461-refs-list.sh]=378
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
-    [t6423-merge-rename-directories.sh]=14
+    [t6423-merge-rename-directories.sh]=17
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
@@ -410,10 +410,10 @@ declare -A FLOOR=(
     [t6012-rev-list-simplify.sh]=36
     [t4205-log-pretty-formats.sh]=108
     [t4216-log-bloom.sh]=142
-    [t5318-commit-graph.sh]=92
+    [t5318-commit-graph.sh]=93
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=53
-    [t4202-log.sh]=72
+    [t4202-log.sh]=80
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
@@ -439,7 +439,7 @@ declare -A FLOOR=(
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=307
-    [t7400-submodule-basic.sh]=70
+    [t7400-submodule-basic.sh]=85
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=114
     [t4027-diff-submodule.sh]=18
@@ -469,8 +469,8 @@ declare -A FLOOR=(
     [t5520-pull.sh]=23
     [t5601-clone.sh]=60
     [t5603-clone-dirname.sh]=39
-    [t7502-commit-porcelain.sh]=74
-    [t7600-merge.sh]=38
+    [t7502-commit-porcelain.sh]=75
+    [t7600-merge.sh]=44
     [t7900-maintenance.sh]=12
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
@@ -496,6 +496,19 @@ declare -A FLOOR=(
     [t1416-ref-transaction-hooks.sh]=7
     [t1091-sparse-checkout-builtin.sh]=40
     [t1092-sparse-checkout-compatibility.sh]=3
+    # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
+    # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
+    # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
+    # t7400 70->85, t6423 14->17, t4202 72->80, t2400 213->214, t5318 92->93, t7502 74->75,
+    # t0020 27->28. NEW floors locking the gains:
+    [t7602-merge-octopus-many.sh]=5
+    [t7604-merge-custom-message.sh]=8
+    [t7607-merge-state.sh]=1
+    [t7611-merge-abort.sh]=19
+    [t7401-submodule-summary.sh]=22
+    [t7407-submodule-foreach.sh]=20
+    [t7406-submodule-update.sh]=19
+    [t4203-mailmap.sh]=69
 )
 
 fail=0
