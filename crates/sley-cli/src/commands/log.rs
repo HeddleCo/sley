@@ -1481,6 +1481,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     {
         abbrev_commit = true;
     }
+    if abbrev_commit
+        && !abbrev_len_explicit
+        && matches!(
+            config
+                .get("core", None, "abbrev")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("false") | Some("no") | Some("off") | Some("0")
+        )
+    {
+        abbrev_len = None;
+        abbrev_len_explicit = true;
+    }
     // Mailmap: git's `log.mailmap` defaults to true (`use_mailmap_config = 1`);
     // `--use-mailmap`/`--no-use-mailmap` (and `--mailmap`/`--no-mailmap` aliases)
     // override. When enabled, the *whole* identity is mapped (default formats and
