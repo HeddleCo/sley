@@ -1125,7 +1125,11 @@ struct SubmoduleDeinitOptions<'a> {
 }
 
 struct SubmoduleForeachOptions {
-    command: String,
+    /// The raw command argv after option parsing. git keeps the args un-joined
+    /// so it can reproduce `run-command`'s two modes: a single arg runs through
+    /// the shell (with the per-submodule env vars), multiple args run directly
+    /// (no re-evaluation) unless argv[0] itself needs a shell.
+    args: Vec<String>,
     quiet: bool,
     recursive: bool,
 }
@@ -1320,16 +1324,15 @@ fn parse_submodule_foreach_options(
                 recursive = true;
                 index += 1;
             }
-            "--" => {
-                index += 1;
-                break;
-            }
+            // git's `cmd_foreach` has no `--` end-of-options arm: `--` matches
+            // the `-*) usage` case, so `foreach -- <anything>` is a usage error
+            // (exit 1). The command is the first non-option token onward.
             value if value.starts_with('-') => return submodule_usage(),
             _ => break,
         }
     }
     Ok(SubmoduleForeachOptions {
-        command: args[index..].join(" "),
+        args: args[index..].to_vec(),
         quiet,
         recursive,
     })
@@ -1629,25 +1632,81 @@ fn run_submodule_foreach_command(
     if !options.quiet {
         println!("Entering '{display_path}'");
     }
-    let output = ProcessCommand::new("sh")
-        .arg("-c")
-        .arg(&options.command)
+    // Bare `foreach` (no command): git's argv[0] is null, so it runs nothing.
+    if options.args.is_empty() {
+        return Ok(());
+    }
+    // git's `runcommand_in_submodule_cb` + `run-command`'s `use_shell`:
+    //  - argc == 1: a single command string is run through the shell, with the
+    //    per-submodule env vars ($name/$sm_path/$displaypath/$sha1/$toplevel)
+    //    exported and `path=<sq-quoted>;` prefixed. The shell interprets quotes.
+    //  - argc > 1: the args run AS-IS (no re-evaluation). `prepare_shell_cmd`
+    //    only wraps them in `sh -c '<argv0> "$@"' ...` when argv0 contains a
+    //    shell metacharacter; a plain argv0 (e.g. `echo`) execs directly, so
+    //    quotes inside later args stay literal.
+    let mut command = ProcessCommand::new("sh");
+    if options.args.len() == 1 {
+        let toplevel = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+        command
+            .arg("-c")
+            .arg(format!(
+                "path={}; {}",
+                shell_single_quote(&submodule.path),
+                options.args[0]
+            ))
+            .env("name", &submodule.name)
+            .env("sm_path", &submodule.path)
+            .env("displaypath", &display_path)
+            .env("sha1", &sha1)
+            .env("toplevel", &toplevel);
+    } else if shell_needs_quoting(&options.args[0]) {
+        command
+            .arg("-c")
+            .arg(format!("{} \"$@\"", options.args[0]))
+            .arg(&options.args[0]);
+        command.args(&options.args[1..]);
+    } else {
+        // Plain argv0: exec it directly, args verbatim (no shell).
+        command = ProcessCommand::new(&options.args[0]);
+        command.args(&options.args[1..]);
+    }
+    // Inherit stdin/stdout/stderr so the child sees the parent's stdin (git's
+    // `read y` test pipes `yes` into foreach) and its stdout/stderr go straight
+    // to the parent's (already-redirected) descriptors. Flush our own buffered
+    // "Entering" line first so ordering is preserved.
+    io::stdout().flush()?;
+    let status = command
         .current_dir(&submodule_root)
-        .env("name", &submodule.name)
-        .env("sm_path", &submodule.path)
-        .env("displaypath", &display_path)
-        .env("sha1", &sha1)
-        .env("toplevel", worktree_root)
-        .output()
+        .status()
         .map_err(|err| GitError::Io(err.to_string()))?;
-    io::stdout().write_all(&output.stdout)?;
-    io::stderr().write_all(&output.stderr)?;
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
     eprintln!("fatal: run_command returned non-zero status for {display_path}");
     eprintln!(".");
     Err(GitError::Exit(128))
+}
+
+/// `run-command.c prepare_shell_cmd`'s metacharacter test: argv[0] needs a shell
+/// only when it contains one of the shell-special bytes.
+fn shell_needs_quoting(arg0: &str) -> bool {
+    arg0.bytes()
+        .any(|b| b"|&;<>()$`\\\"' \t\n*?[#~=%".contains(&b))
+}
+
+/// `sq_quote_buf`: single-quote a string for safe inclusion in a shell command.
+fn shell_single_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Port of `generate_submodule_summary` (git `builtin/submodule--helper.c`).
