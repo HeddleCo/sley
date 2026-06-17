@@ -372,7 +372,7 @@ declare -A FLOOR=(
     [t1006-cat-file.sh]=290
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=497
-    [t1400-update-ref.sh]=232
+    [t1400-update-ref.sh]=238
     [t1401-symbolic-ref.sh]=25
     [t1450-fsck.sh]=82
     [t1500-rev-parse.sh]=81
@@ -386,7 +386,7 @@ declare -A FLOOR=(
     [t0021-conversion.sh]=21
     [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10
-    [t7810-grep.sh]=228
+    [t7810-grep.sh]=230
     [t3301-notes.sh]=144
     [t1461-refs-list.sh]=378
     [t1462-refs-exists.sh]=12
@@ -412,7 +412,7 @@ declare -A FLOOR=(
     [t4216-log-bloom.sh]=142
     [t5318-commit-graph.sh]=92
     [t3432-rebase-fast-forward.sh]=219
-    [t3600-rm.sh]=52
+    [t3600-rm.sh]=53
     [t4202-log.sh]=72
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
@@ -451,7 +451,7 @@ declare -A FLOOR=(
     [t8002-blame.sh]=117
     [t8001-annotate.sh]=99
     [t8012-blame-colors.sh]=98
-    [t3903-stash.sh]=60
+    [t3903-stash.sh]=82
     [t4209-log-pickaxe.sh]=45
     [t4211-line-log.sh]=69
     [t5300-pack-object.sh]=46
@@ -486,6 +486,16 @@ declare -A FLOOR=(
     [t7103-reset-bare.sh]=12
     [t7110-reset-merge.sh]=21
     [t7201-co.sh]=19
+    # wave-8 engine-completion (2026-06-17): rebase-i sequencer (autosquash + fixup
+    # -C/-c message machinery), update-ref --stdin ref-transaction hook + git-faithful
+    # error surface, sparse-checkout builtin + the sparse-index collapse/expand format.
+    # NEW floors locking the gains (t1400 also bumped 232->238 above):
+    [t3415-rebase-autosquash.sh]=22
+    [t3437-rebase-fixup-options.sh]=7
+    [t1404-update-ref-errors.sh]=38
+    [t1416-ref-transaction-hooks.sh]=7
+    [t1091-sparse-checkout-builtin.sh]=40
+    [t1092-sparse-checkout-compatibility.sh]=3
 )
 
 fail=0
