@@ -1986,7 +1986,7 @@ fn index_worktree_metadata_for_entries(
         if entry.is_intent_to_add() {
             needs_snapshot = true;
         }
-        if entry.mode() == 0o160000 {
+        if sley_index::is_gitlink(entry.mode()) {
             staged_gitlinks.push(IndexGitlinkEntry {
                 path: BString::from_bytes(entry.git_path()),
                 oid: entry.oid(),
@@ -2246,7 +2246,7 @@ fn augment_with_stat_dirty_entries(
         };
         // Gitlinks (submodules) have their own dirtiness model and are not stat-
         // compared here; the content diff already handles changed gitlink oids.
-        if tracked.mode == 0o160000 {
+        if sley_index::is_gitlink(tracked.mode) {
             continue;
         }
         let path = worktree_path_for_repo_path(worktree_root, git_path);
@@ -3577,7 +3577,7 @@ fn merge_tree_entry(
 fn index_gitlinks(index: &BTreeMap<Vec<u8>, TrackedEntry>) -> BTreeMap<Vec<u8>, ObjectId> {
     index
         .iter()
-        .filter(|(_, entry)| entry.mode == 0o160000)
+        .filter(|(_, entry)| sley_index::is_gitlink(entry.mode))
         .map(|(path, entry)| (path.clone(), entry.oid))
         .collect()
 }
@@ -3639,14 +3639,14 @@ fn worktree_entry_for_path(
     {
         let oid = gitlink_head_oid(&path, format).unwrap_or(*staged_oid);
         return Ok(Some(TrackedEntry {
-            mode: 0o160000,
+            mode: sley_index::GITLINK_MODE,
             oid,
         }));
     }
     if metadata.is_dir() {
         if let Some(oid) = gitlink_head_oid(&path, format) {
             return Ok(Some(TrackedEntry {
-                mode: 0o160000,
+                mode: sley_index::GITLINK_MODE,
                 oid,
             }));
         }
@@ -3688,15 +3688,15 @@ fn index_worktree_change_for_entry(
     };
     let file_type = metadata.file_type();
     let right = if metadata.is_dir() {
-        if index_entry.mode() == 0o160000 {
+        if sley_index::is_gitlink(index_entry.mode()) {
             let oid = gitlink_head_oid(path, format).unwrap_or(index_entry.oid());
             Some(TrackedEntry {
-                mode: 0o160000,
+                mode: sley_index::GITLINK_MODE,
                 oid,
             })
         } else if let Some(oid) = gitlink_head_oid(path, format) {
             Some(TrackedEntry {
-                mode: 0o160000,
+                mode: sley_index::GITLINK_MODE,
                 oid,
             })
         } else {
@@ -3819,7 +3819,7 @@ fn worktree_blob_cache_for_unique_paths<'a>(
     }
     let mut cache = HashMap::new();
     for (git_path, entry) in right_entries {
-        if entry.mode == 0o160000 || !candidate_oids.contains(&entry.oid) {
+        if sley_index::is_gitlink(entry.mode) || !candidate_oids.contains(&entry.oid) {
             continue;
         }
         let path = worktree_path_for_repo_path(worktree_root, git_path);
@@ -6594,7 +6594,7 @@ mod tests {
                 mtime_nanoseconds: 0,
                 dev: 0,
                 ino: 0,
-                mode: 0o160000,
+                mode: sley_index::GITLINK_MODE,
                 uid: 0,
                 gid: 0,
                 size: 0,

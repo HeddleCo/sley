@@ -1092,7 +1092,7 @@ pub fn add_exact_tracked_path_from_disk(
     }
 
     let entry = raw.entry.clone();
-    if entry.stage() != Stage::Normal || index_entry_skip_worktree(&entry) || entry.mode == 0o160000
+    if entry.stage() != Stage::Normal || index_entry_skip_worktree(&entry) || sley_index::is_gitlink(entry.mode)
     {
         return Ok(AddExactTrackedPathResult::Unsupported);
     }
@@ -1486,12 +1486,12 @@ fn add_update_tracked_path(
         Err(err) => return Err(err.into()),
     };
     if metadata.is_dir() {
-        if entry.mode != 0o160000 {
+        if !sley_index::is_gitlink(entry.mode) {
             return Ok((None, false));
         }
         let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(entry.oid);
         let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
-        updated_entry.mode = 0o160000;
+        updated_entry.mode = sley_index::GITLINK_MODE;
         let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
         if updated_entry != entry {
             replace_index_entries_with_entry(&mut index.entries, updated_entry);
@@ -1817,7 +1817,7 @@ fn update_index_paths_impl(
                 return Err(GitError::Exit(128));
             }
             let mut entry = index_entry_from_metadata(git_path.clone(), head_oid, &metadata);
-            entry.mode = 0o160000;
+            entry.mode = sley_index::GITLINK_MODE;
             reports.push(format!("add '{display}'"));
             replace_index_entries_with_entry(&mut index.entries, entry);
             updated.push(head_oid);
@@ -2001,6 +2001,27 @@ pub fn refresh_index_paths(
             needs_update = true;
             continue;
         };
+        // git's `refresh_cache_ent` runs `ie_match_stat`, whose `S_IFGITLINK`
+        // arm never re-reads content: a gitlink whose worktree path is a
+        // directory is up to date (an unpopulated/HEAD-matching submodule), so
+        // `--refresh` leaves it untouched and silent. Only a gitlink that is no
+        // longer a directory (replaced by a file, or removed) is `TYPE_CHANGED`.
+        // This is the single `sley_index::gitlink_stat_verdict` rule; without it
+        // the `!is_file()` guard below mis-flagged every populated submodule as
+        // "needs update". The populated-HEAD comparison is deliberately left to
+        // status/diff (the unpopulated default is clean).
+        if sley_index::is_gitlink(entry.mode) {
+            match sley_index::gitlink_stat_verdict(&metadata) {
+                sley_index::GitlinkStatVerdict::Populated => continue,
+                sley_index::GitlinkStatVerdict::TypeChanged => {
+                    if !quiet {
+                        print_update_index_needs_update(entry.path.as_bytes());
+                    }
+                    needs_update = true;
+                    continue;
+                }
+            }
+        }
         if !metadata.is_file() {
             if !quiet {
                 print_update_index_needs_update(entry.path.as_bytes());
@@ -2089,6 +2110,21 @@ fn refresh_all_index_paths_parallel(
                     needs_update = true;
                     continue;
                 };
+                // Gitlink: never re-read; a directory on disk is up to date (the
+                // single `sley_index::gitlink_stat_verdict` rule, matching the
+                // serial path above). Only a type-changed gitlink needs update.
+                if sley_index::is_gitlink(entry.mode) {
+                    match sley_index::gitlink_stat_verdict(&metadata) {
+                        sley_index::GitlinkStatVerdict::Populated => continue,
+                        sley_index::GitlinkStatVerdict::TypeChanged => {
+                            if !quiet {
+                                print_update_index_needs_update(&path);
+                            }
+                            needs_update = true;
+                            continue;
+                        }
+                    }
+                }
                 if !metadata.is_file() {
                     if !quiet {
                         print_update_index_needs_update(&path);
@@ -3021,7 +3057,7 @@ where
 
         let mode = entry.write_tree_mode();
         let oid = entry.write_tree_oid();
-        if !missing_ok && mode != 0o160000 && !checker.contains(&oid)? {
+        if !missing_ok && !sley_index::is_gitlink(mode) && !checker.contains(&oid)? {
             eprintln!(
                 "error: invalid object {:o} {} for '{}'",
                 mode,
@@ -3645,7 +3681,7 @@ fn status_submodule_from_entries(
     untracked_mode: StatusUntrackedMode,
 ) -> Option<SubmoduleStatus> {
     let worktree_entry = worktree_entry?;
-    if index_entry.mode != 0o160000 || worktree_entry.mode != 0o160000 {
+    if !sley_index::is_gitlink(index_entry.mode) || !sley_index::is_gitlink(worktree_entry.mode) {
         return None;
     }
     let dirt = submodule_dirt_map.get(path).copied().unwrap_or(0);
@@ -4982,7 +5018,7 @@ fn tracked_only_stat_precheck(
     stat_cache: &IndexStatCache,
     absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
-    if index_entry.mode == 0o160000 {
+    if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     let git_path = index_entry.path.as_bytes();
@@ -5019,7 +5055,7 @@ fn tracked_only_borrowed_stat_precheck(
     stat_cache: &IndexStatCache,
     absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
-    if index_entry.mode == 0o160000 {
+    if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     set_worktree_path_from_repo_path(worktree_root, index_entry.path, absolute)?;
@@ -5087,7 +5123,7 @@ fn tracked_only_submodule_status(
     let Some(worktree_entry) = worktree_entry else {
         return Ok(None);
     };
-    if index_entry.mode != 0o160000 || worktree_entry.mode != 0o160000 {
+    if !sley_index::is_gitlink(index_entry.mode) || !sley_index::is_gitlink(worktree_entry.mode) {
         return Ok(None);
     }
     let absolute = worktree_root.join(repo_path_to_os_path(path)?);
@@ -5771,7 +5807,7 @@ enum StatusTrackedKind {
 
 impl StatusTrackedKind {
     fn from_mode_and_skip(mode: u32, skip_worktree: bool) -> Self {
-        if mode == 0o160000 {
+        if sley_index::is_gitlink(mode) {
             Self::Gitlink
         } else if skip_worktree {
             Self::SkipWorktree
@@ -10068,7 +10104,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
     for (path, entry) in &target_entries {
         // Gitlinks go through the shared materialization step (mkdir + zeroed
         // stat); smudge filters never apply to a submodule directory.
-        if entry.mode == 0o160000 {
+        if sley_index::is_gitlink(entry.mode) {
             index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
             continue;
         }
@@ -10161,7 +10197,9 @@ fn checkout_commit_to_index_and_worktree_sparse(
         // treats gitlinks as always up-to-date (ie_match_stat refuses to pay
         // for a submodule dirtiness probe), so new commits / dirty content in
         // a submodule must not fail the branch switch.
-        if entry.index_mode == Some(0o160000) || entry.worktree_mode == Some(0o160000) {
+        if entry.index_mode.is_some_and(sley_index::is_gitlink)
+            || entry.worktree_mode.is_some_and(sley_index::is_gitlink)
+        {
             return Ok(StreamControl::Continue);
         }
         // An untracked embedded repository where the target tree records a
@@ -10174,7 +10212,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
                 .unwrap_or(entry.path);
             if target_entries
                 .get(path)
-                .is_some_and(|target| target.mode == 0o160000)
+                .is_some_and(|target| sley_index::is_gitlink(target.mode))
             {
                 return Ok(StreamControl::Continue);
             }
@@ -10709,7 +10747,7 @@ fn materialize_tree_entry(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
-    if entry.mode == 0o160000 {
+    if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, path)?;
         fs::create_dir_all(&dir_path)?;
         return Ok(IndexEntry {
@@ -12338,7 +12376,7 @@ fn restored_head_index_entry(
     // invariant that the status stat-cache relies on. Leave the stat zeroed so
     // status always re-hashes this path and detects any modification -- exactly
     // git's behavior for tree-sourced entries until a later refresh validates them.
-    let size = if entry.mode == 0o160000 {
+    let size = if sley_index::is_gitlink(entry.mode) {
         // A gitlink's oid names a commit in the submodule's repository — it is
         // not readable here, and a tree-sourced gitlink entry carries size 0.
         0
@@ -12615,6 +12653,19 @@ impl IndexStatCache {
         entry: &IndexEntry,
         worktree_metadata: &fs::Metadata,
     ) -> Option<TrackedEntry> {
+        // Gitlink: reusable as-is whenever the worktree path is a directory (a
+        // submodule is never re-hashed; its cached stat is ignored). Routes
+        // through the single `sley_index::gitlink_stat_verdict` rule so the
+        // gitlink-vs-040000 mode mismatch never spuriously rejects it.
+        if sley_index::is_gitlink(entry.mode) {
+            return match sley_index::gitlink_stat_verdict(worktree_metadata) {
+                sley_index::GitlinkStatVerdict::Populated => Some(TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                }),
+                sley_index::GitlinkStatVerdict::TypeChanged => None,
+            };
+        }
         if entry.mode != worktree_entry_mode(worktree_metadata) {
             return None;
         }
@@ -12635,6 +12686,15 @@ impl IndexStatCache {
         entry: &IndexEntryRef<'_>,
         worktree_metadata: &fs::Metadata,
     ) -> Option<TrackedEntry> {
+        if sley_index::is_gitlink(entry.mode) {
+            return match sley_index::gitlink_stat_verdict(worktree_metadata) {
+                sley_index::GitlinkStatVerdict::Populated => Some(TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                }),
+                sley_index::GitlinkStatVerdict::TypeChanged => None,
+            };
+        }
         if entry.mode != worktree_entry_mode(worktree_metadata) {
             return None;
         }
@@ -12654,7 +12714,7 @@ impl IndexStatCache {
     fn gitlink_entry(&self, git_path: &[u8]) -> Option<&IndexEntry> {
         self.entries
             .get(git_path)
-            .filter(|entry| entry.mode == 0o160000)
+            .filter(|entry| sley_index::is_gitlink(entry.mode))
     }
 }
 
@@ -13053,7 +13113,7 @@ fn worktree_entry_for_git_path(
         Err(err) => return Err(err.into()),
     };
 
-    if expected_mode == 0o160000 {
+    if sley_index::is_gitlink(expected_mode) {
         if !metadata.is_dir() {
             return Ok(Some(TrackedEntry {
                 mode: worktree_entry_mode(&metadata),
@@ -13062,7 +13122,7 @@ fn worktree_entry_for_git_path(
         }
         let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(*expected_oid);
         return Ok(Some(TrackedEntry {
-            mode: 0o160000,
+            mode: sley_index::GITLINK_MODE,
             oid,
         }));
     }
@@ -13124,7 +13184,7 @@ fn worktree_entry_for_index_entry_with_attributes(
     };
     let file_type = metadata.file_type();
 
-    if expected_mode == 0o160000 {
+    if sley_index::is_gitlink(expected_mode) {
         if !file_type.is_dir() {
             return Ok(Some(TrackedEntry {
                 mode: worktree_entry_mode(&metadata),
@@ -13133,7 +13193,7 @@ fn worktree_entry_for_index_entry_with_attributes(
         }
         let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(index_entry.oid);
         return Ok(Some(TrackedEntry {
-            mode: 0o160000,
+            mode: sley_index::GITLINK_MODE,
             oid,
         }));
     }
@@ -13201,7 +13261,7 @@ fn worktree_entry_for_index_entry_ref_with_attributes(
     };
     let file_type = metadata.file_type();
 
-    if expected_mode == 0o160000 {
+    if sley_index::is_gitlink(expected_mode) {
         if !file_type.is_dir() {
             return Ok(Some(TrackedEntry {
                 mode: worktree_entry_mode(&metadata),
@@ -13210,7 +13270,7 @@ fn worktree_entry_for_index_entry_ref_with_attributes(
         }
         let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(index_entry.oid);
         return Ok(Some(TrackedEntry {
-            mode: 0o160000,
+            mode: sley_index::GITLINK_MODE,
             oid,
         }));
     }
@@ -13456,7 +13516,7 @@ fn collect_worktree_entries(
                     context.submodule_dirt.insert(git_path.clone(), dirt);
                 }
                 let tracked = TrackedEntry {
-                    mode: 0o160000,
+                    mode: sley_index::GITLINK_MODE,
                     oid,
                 };
                 if dirt != 0 || context.should_record_tracked_entry(&git_path, &tracked) {
@@ -15846,7 +15906,7 @@ mod tests {
             ObjectFormat::Sha1,
             Path::new("submodule"),
             &oid,
-            0o160000,
+            sley_index::GITLINK_MODE,
             None,
         )
         .expect("test operation should succeed");

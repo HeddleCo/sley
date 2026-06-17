@@ -1395,6 +1395,7 @@ name = "sley-unpack-trees"
 version = "0.1.0"
 dependencies = [
  "sley-core",
+ "sley-index",
 ]
 
 [[package]]

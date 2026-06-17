@@ -15,6 +15,88 @@ use std::{env, fs};
 
 pub use sley_core::BString;
 
+// ===========================================================================
+// Gitlink (submodule) primitive — the SINGLE source of truth for "is this
+// entry a gitlink, and what does it mean for a gitlink to be up to date?".
+//
+// A gitlink is git's `S_IFGITLINK` (raw file mode `0o160000`): the index/tree
+// entry for an embedded submodule. Its oid names a *commit in the submodule's
+// own repository* (never a blob in this repository's object store), and its
+// working-tree representation is a *directory* (the submodule checkout), not a
+// file. This crate is the leaf that every index/diff/status/refresh consumer
+// already depends on, so the gitlink predicate and stat semantics live here so
+// no consumer re-derives `mode == 0o160000` or open-codes git's
+// `ce_match_stat`/`ce_match_stat_basic` gitlink arm. The *HEAD resolution* of a
+// populated submodule (`resolve_gitlink_ref`) needs the ref store and so lives
+// one layer up in `sley-diff-merge`; this crate models everything that does not
+// require reading the embedded repository.
+// ===========================================================================
+
+/// The raw git file mode of a gitlink (submodule) entry: git's `S_IFGITLINK`.
+/// An index or tree entry with this mode records the commit oid an embedded
+/// repository has checked out; the entry has no blob in this object store and
+/// its worktree representation is a directory.
+pub const GITLINK_MODE: u32 = 0o160000;
+
+/// The git file-type mask (`S_IFMT`): isolates the file-type bits of a raw git
+/// mode so a mode with extra permission bits (e.g. `0o100755`) still classifies
+/// by type. Gitlinks carry no permission bits, but masking keeps the predicate
+/// honest against any caller that ORs bits in.
+pub const GIT_MODE_TYPE_MASK: u32 = 0o170000;
+
+/// git's `S_ISGITLINK(mode)`: whether a raw git file mode names a gitlink
+/// (submodule) entry. This is the ONE definition every consumer must call
+/// rather than testing `mode == 0o160000` inline, so the gitlink concept has a
+/// single, greppable owner.
+#[inline]
+pub fn is_gitlink(mode: u32) -> bool {
+    (mode & GIT_MODE_TYPE_MASK) == GITLINK_MODE
+}
+
+/// git's `ce_match_stat_basic` `S_IFGITLINK` arm, factored out so every
+/// stat-verdict consumer (`update-index --refresh`, `diff-files`, `status`)
+/// shares one gitlink rule instead of re-deriving it.
+///
+/// For a gitlink entry git **ignores almost all of `st_xxx`**: it only checks
+/// the on-disk type and, when that is a directory, the embedded HEAD.
+///
+/// * On-disk is **not a directory** (the submodule checkout is missing, or a
+///   file/symlink sits where the submodule should be) → git's `TYPE_CHANGED`,
+///   reported here as [`StatVerdict::Dirty`].
+/// * On-disk **is a directory** → git compares the submodule's resolved HEAD
+///   against the entry oid (`ce_compare_gitlink`). An *unpopulated* submodule
+///   (HEAD unresolvable — no `.git`, unborn branch) **always matches** (git
+///   "consider it always to match"); a populated submodule whose HEAD differs
+///   from the recorded oid is dirty. Because resolving the HEAD needs the ref
+///   store (a higher layer), this returns [`GitlinkStatVerdict::Populated`] so
+///   the caller can run the cheap HEAD comparison and finish the verdict; an
+///   index-only / HEAD-blind caller treats `Populated` as clean, exactly git's
+///   unpopulated default.
+///
+/// Racy-clean never applies to a gitlink (git's `is_racy_timestamp` returns 0
+/// for gitlinks), so this never yields a content-recheck verdict.
+pub fn gitlink_stat_verdict(worktree_metadata: &fs::Metadata) -> GitlinkStatVerdict {
+    if worktree_metadata.is_dir() {
+        GitlinkStatVerdict::Populated
+    } else {
+        GitlinkStatVerdict::TypeChanged
+    }
+}
+
+/// The outcome of [`gitlink_stat_verdict`]: the part of git's gitlink
+/// `ce_match_stat` decision this crate can make without the ref store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitlinkStatVerdict {
+    /// The worktree path is not a directory (missing / replaced by a file):
+    /// git's `TYPE_CHANGED`. Always dirty.
+    TypeChanged,
+    /// The worktree path is a directory. The entry is clean unless the embedded
+    /// submodule's resolved HEAD differs from the entry oid — a comparison the
+    /// caller completes (it owns the ref store). An unpopulated submodule has no
+    /// resolvable HEAD and so always matches (clean).
+    Populated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     pub version: u32,
@@ -932,6 +1014,18 @@ impl IndexStatCache {
         entry: &'a IndexEntry,
         worktree_metadata: &fs::Metadata,
     ) -> Option<&'a IndexEntry> {
+        // A gitlink is reusable as-is whenever its worktree path is a directory
+        // (git never re-hashes a submodule; the cached stat is ignored). The
+        // populated-HEAD comparison is the caller's, but a reusable-entry probe
+        // is for the "skip the content re-read" shortcut, and a gitlink has no
+        // content to read — so a directory on disk reuses the entry. A
+        // non-directory (`TYPE_CHANGED`) is not reusable.
+        if is_gitlink(entry.mode) {
+            return match gitlink_stat_verdict(worktree_metadata) {
+                GitlinkStatVerdict::Populated => Some(entry),
+                GitlinkStatVerdict::TypeChanged => None,
+            };
+        }
         if entry.mode != worktree_metadata_mode(worktree_metadata) {
             return None;
         }
@@ -951,6 +1045,14 @@ impl IndexStatCache {
         entry: &IndexEntryRef<'_>,
         worktree_metadata: &fs::Metadata,
     ) -> bool {
+        // Gitlink: reusable whenever the worktree path is a directory (no
+        // content to re-hash); see [`Self::reusable_index_entry`].
+        if is_gitlink(entry.mode) {
+            return matches!(
+                gitlink_stat_verdict(worktree_metadata),
+                GitlinkStatVerdict::Populated
+            );
+        }
         if entry.mode != worktree_metadata_mode(worktree_metadata) {
             return false;
         }
@@ -989,6 +1091,20 @@ impl IndexStatCache {
     ) -> StatVerdict {
         if entry.flags & INDEX_FLAG_VALID != 0 {
             return StatVerdict::Clean;
+        }
+        // git's `ce_match_stat_basic` `S_IFGITLINK` arm: a gitlink ignores the
+        // cached stat entirely. A non-directory on disk is `TYPE_CHANGED`
+        // (dirty); a directory is clean unless the embedded HEAD differs, which
+        // the caller resolves (`Populated` → treat as clean here, the
+        // unpopulated-submodule default). Crucially a gitlink is NEVER reported
+        // dirty merely because a directory's `worktree_metadata_mode` (040000)
+        // does not equal the gitlink mode (160000) — that mode mismatch is the
+        // bug the single primitive exists to prevent.
+        if is_gitlink(entry.mode) {
+            return match gitlink_stat_verdict(worktree_metadata) {
+                GitlinkStatVerdict::TypeChanged => StatVerdict::Dirty,
+                GitlinkStatVerdict::Populated => StatVerdict::Clean,
+            };
         }
         if entry.mode != worktree_metadata_mode(worktree_metadata) {
             return StatVerdict::Dirty;
