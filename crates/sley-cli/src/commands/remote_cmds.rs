@@ -1776,6 +1776,43 @@ fn recurse_clone_submodules(
     if active.is_empty() || bare || !checkout {
         return Ok(());
     }
+    // git's `clone.c` treats `--recurse-submodules[=<pathspec>]` as the
+    // `submodule.active` filter, NOT as explicit named pathspecs: it runs the
+    // recursive update with no positional pathspec and lets the active filter
+    // select which submodules populate. A pathspec that matches no submodule
+    // therefore yields an empty active set — a no-op (exit 0) — rather than the
+    // "pathspec did not match" error a bare `submodule update <pathspec>` raises.
+    // We mirror this by restricting the forwarded pathspecs to those that match a
+    // real submodule path in the cloned superproject, and skipping the update
+    // entirely when none match (the all-case `.` forwards no pathspec, so it
+    // always runs).
+    let recurse_all = active.iter().any(|value| value == ".");
+    let pathspecs: Vec<&String> = if recurse_all {
+        Vec::new()
+    } else {
+        let submodules = crate::commands::submodule::read_submodule_configs(destination)?;
+        active
+            .iter()
+            .filter(|value| {
+                let normalized = crate::commands::submodule::normalize_submodule_pathspec(
+                    destination,
+                    destination,
+                    value,
+                );
+                submodules.iter().any(|submodule| {
+                    crate::commands::submodule::submodule_path_matches_pathspec(
+                        &submodule.path,
+                        &normalized,
+                    )
+                })
+            })
+            .collect()
+    };
+    // No pathspec matched any submodule (and `.` was not requested): nothing to
+    // recurse into — exit cleanly, matching git's empty-active-set no-op.
+    if !recurse_all && pathspecs.is_empty() {
+        return Ok(());
+    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
     let mut command = ProcessCommand::new(exe);
     command.arg("submodule");
@@ -1789,11 +1826,9 @@ fn recurse_clone_submodules(
     if let Some(depth) = depth {
         command.arg(format!("--depth={depth}"));
     }
-    // Restrict to the requested pathspecs unless `.` (all) was given.
-    for value in active {
-        if value != "." {
-            command.arg(value);
-        }
+    // Restrict to the matched pathspecs (the all-case `.` forwards none).
+    for value in pathspecs {
+        command.arg(value);
     }
     let status = command
         .current_dir(destination)

@@ -93,9 +93,9 @@ struct SubmoduleStatusOptions<'a> {
 }
 
 #[derive(Debug)]
-struct SubmoduleConfigEntry {
+pub(crate) struct SubmoduleConfigEntry {
     name: String,
-    path: String,
+    pub(crate) path: String,
     url: Option<String>,
     update: Option<String>,
 }
@@ -2654,7 +2654,7 @@ fn clear_submodule_worktree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<SubmoduleConfigEntry>> {
+pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<SubmoduleConfigEntry>> {
     // PILOT (sley-submodule): the hand-rolled section walk that used to live
     // here is now the typed `submodule-config.c` port. We map the typed
     // `Submodule` back onto the CLI's `SubmoduleConfigEntry` so the dozen-odd
@@ -2763,7 +2763,7 @@ fn filter_submodules(
     Ok(selected)
 }
 
-fn submodule_path_matches_pathspec(path: &str, pathspec: &str) -> bool {
+pub(crate) fn submodule_path_matches_pathspec(path: &str, pathspec: &str) -> bool {
     pathspec.is_empty()
         || path == pathspec
         || path
@@ -2771,7 +2771,7 @@ fn submodule_path_matches_pathspec(path: &str, pathspec: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn normalize_submodule_pathspec(cwd: &Path, worktree_root: &Path, path: &str) -> String {
+pub(crate) fn normalize_submodule_pathspec(cwd: &Path, worktree_root: &Path, path: &str) -> String {
     let path = path.trim_end_matches('/');
     let path = Path::new(path);
     let absolute = if path.is_absolute() {
