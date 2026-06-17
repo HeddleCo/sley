@@ -292,6 +292,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         diff_hunk_control,
         interhunk,
         diff_whitespace_control,
+        indent_heuristic,
         ws_ignore,
         ignore_blank_lines,
         ignore_regexes,
@@ -429,6 +430,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 diff_algorithm,
                 ignore_blank_lines,
                 ignore_regexes: &ignore_regexes,
+                // `--no-index` honors the CLI flag; config (when inside a repo)
+                // is resolved below for the in-repo path, so here we fall back
+                // to git's enabled-by-default behavior absent an explicit flag.
+                indent_heuristic: indent_heuristic.unwrap_or(true),
             },
         );
     }
@@ -487,6 +492,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     {
         diff_relative = commands::diff_options::DiffRelativeMode::Cwd;
     }
+    // `--indent-heuristic` / `--no-indent-heuristic` (CLI) win over
+    // `diff.indentHeuristic` config, which itself defaults to git's
+    // enabled-by-default behavior.
+    let indent_heuristic = indent_heuristic.unwrap_or_else(|| {
+        read_repo_config(&git_dir)
+            .ok()
+            .and_then(|config| config.get_bool("diff", None, "indentheuristic"))
+            .unwrap_or(true)
+    });
     if !renames_explicit
         && let Ok(config) = read_repo_config(&git_dir)
         && let Some(value) = config.get("diff", None, "renames")
@@ -1039,6 +1053,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     ignore_blank_lines,
                     ignore_regexes: &ignore_regexes,
                     line_ranges: None,
+                    indent_heuristic,
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1340,6 +1355,7 @@ struct DiffNoIndexParams<'a> {
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     ignore_blank_lines: bool,
     ignore_regexes: &'a [crate::grep_source::Regex],
+    indent_heuristic: bool,
 }
 
 /// `git diff --no-index <path> <path>`: compare two files outside (or beside)
@@ -1446,6 +1462,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             ignore_blank_lines: params.ignore_blank_lines,
             ignore_regexes: params.ignore_regexes,
             line_ranges: None,
+            indent_heuristic: params.indent_heuristic,
         };
         write_diff_patch_entry(&mut stdout, &entry, options)?;
     }

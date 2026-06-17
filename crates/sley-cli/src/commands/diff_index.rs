@@ -62,6 +62,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut patch_full_index = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
+    let mut indent_heuristic: Option<bool> = None;
     let mut setup_args: Vec<String> = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
@@ -138,6 +139,8 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             }
             "--rename-empty" => rename_empty = true,
             "--no-rename-empty" => rename_empty = false,
+            "--indent-heuristic" => indent_heuristic = Some(true),
+            "--no-indent-heuristic" => indent_heuristic = Some(false),
             "-B" | "--break-rewrites" => {}
             "--full-index" => patch_full_index = true,
             "--abbrev" => abbrev = AbbrevRequest::Auto,
@@ -366,6 +369,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if !quiet {
+        // `--indent-heuristic` / `--no-indent-heuristic` win over
+        // `diff.indentHeuristic`, which defaults to git's enabled behavior.
+        let indent_heuristic = indent_heuristic
+            .unwrap_or_else(|| repo.config().get_bool("diff", None, "indentheuristic").unwrap_or(true));
         render(
             &entries,
             &output,
@@ -379,6 +386,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
                 patch_abbrev,
                 src_prefix: &src_prefix,
                 dst_prefix: &dst_prefix,
+                indent_heuristic,
             },
         )?;
     }
@@ -430,6 +438,7 @@ struct RenderContext<'a> {
     patch_abbrev: usize,
     src_prefix: &'a str,
     dst_prefix: &'a str,
+    indent_heuristic: bool,
 }
 
 fn render(
@@ -540,6 +549,7 @@ fn render(
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
+                indent_heuristic: ctx.indent_heuristic,
             };
             write_diff_patch_entry(&mut stdout, entry, options)?;
         }

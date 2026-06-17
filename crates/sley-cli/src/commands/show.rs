@@ -131,6 +131,9 @@ struct ShowOptions {
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<crate::grep_source::Regex>,
+    /// `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
+    /// `diff.indentHeuristic` config (default git-enabled).
+    indent_heuristic: Option<bool>,
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
 }
@@ -201,6 +204,7 @@ impl Default for ShowOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            indent_heuristic: None,
             setup_args: Vec::new(),
         }
     }
@@ -970,6 +974,11 @@ fn write_commit_diff_patch(
                 ignore_blank_lines: options.ignore_blank_lines,
                 ignore_regexes: &options.ignore_regexes,
                 line_ranges: None,
+                indent_heuristic: options.indent_heuristic.unwrap_or_else(|| {
+                    config
+                        .get_bool("diff", None, "indentheuristic")
+                        .unwrap_or(true)
+                }),
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }
@@ -1260,10 +1269,10 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             value if value.starts_with("-I") && value.len() > 2 => {
                 ignore_regex_patterns.push(value[2..].to_string());
             }
+            "--indent-heuristic" => options.indent_heuristic = Some(true),
+            "--no-indent-heuristic" => options.indent_heuristic = Some(false),
             "--no-color"
             | "--color"
-            | "--indent-heuristic"
-            | "--no-indent-heuristic"
             | "--no-prefix"
             | "--text"
             | "-a"

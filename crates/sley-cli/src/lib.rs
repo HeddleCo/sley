@@ -2230,6 +2230,9 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// `log -L`: restrict the emitted hunks to these post-image line ranges.
     /// `None` (every non-line-log caller) renders the full patch.
     pub(crate) line_ranges: Option<&'a [sley_diff_merge::render::LineRange]>,
+    /// `--indent-heuristic` / `diff.indentHeuristic`: shift slidable change
+    /// groups to the most readable boundary. Enabled by default, matching git.
+    pub(crate) indent_heuristic: bool,
 }
 
 /// A `--word-diff` request before per-file word-regex resolution.
@@ -2486,6 +2489,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
+                indent_heuristic: true,
             },
         )?;
     }
@@ -2812,6 +2816,7 @@ pub(crate) fn write_diff_patch_entry(
         ws_error,
         ws_ignore: options.ws_ignore,
         algorithm: options.diff_algorithm,
+        indent_heuristic: options.indent_heuristic,
         change_ignore: change_ignore.as_ref(),
         line_ranges: options.line_ranges,
         ..Default::default()

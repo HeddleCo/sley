@@ -396,6 +396,14 @@ fn xdl_isspace(c: u8) -> bool {
 ///   trailing whitespace is dropped entirely).
 /// * `space_at_eol`: strip trailing whitespace only.
 /// * `cr_at_eol`: drop a single `\r` immediately before a terminating `\n`.
+///
+/// Exposed crate-internally so the change-compaction pass in [`crate::render`]
+/// can compare lines for sliding under the exact same equality the line-level
+/// diff uses (git's `recs_match` on the whitespace-canonicalized record).
+pub(crate) fn canonicalize_line_for_match(line: &[u8], ignore: WsIgnore) -> Vec<u8> {
+    canonicalize_line(line, ignore)
+}
+
 fn canonicalize_line(line: &[u8], ignore: WsIgnore) -> Vec<u8> {
     if ignore.all_space {
         return line.iter().copied().filter(|&c| !xdl_isspace(c)).collect();

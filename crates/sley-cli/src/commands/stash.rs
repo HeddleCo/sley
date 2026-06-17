@@ -2751,6 +2751,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         ignore_blank_lines: false,
                         ignore_regexes: &[],
                         line_ranges: None,
+                        indent_heuristic: true,
                     };
                     write_diff_patch_entry(&mut stdout, entry, options)?;
                 }

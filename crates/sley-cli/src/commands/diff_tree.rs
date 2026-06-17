@@ -129,6 +129,9 @@ struct DiffTreeOptions {
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<crate::grep_source::Regex>,
+    /// `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
+    /// `diff.indentHeuristic` config (default git-enabled).
+    indent_heuristic: Option<bool>,
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
 }
@@ -163,6 +166,7 @@ impl Default for DiffTreeOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            indent_heuristic: None,
             setup_args: Vec::new(),
         }
     }
@@ -359,7 +363,8 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
             "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
             "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
-            "--indent-heuristic" | "--no-indent-heuristic" => {}
+            "--indent-heuristic" => options.indent_heuristic = Some(true),
+            "--no-indent-heuristic" => options.indent_heuristic = Some(false),
             "--diff-algorithm" => {
                 idx += 1;
                 let value = args
@@ -489,12 +494,20 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     } else {
         None
     };
+    // `--indent-heuristic` / `--no-indent-heuristic` win over the
+    // `diff.indentHeuristic` config (which defaults to git's enabled behavior).
+    let indent_heuristic = options.indent_heuristic.unwrap_or_else(|| {
+        repo.config()
+            .get_bool("diff", None, "indentheuristic")
+            .unwrap_or(true)
+    });
     let request_context = DiffRequestContext {
         format,
         db,
         options: &options,
         raw_abbrev,
         patch_abbrev,
+        indent_heuristic,
         ws_resolver,
         check_failed: std::cell::Cell::new(false),
     };
@@ -863,6 +876,8 @@ struct DiffRequestContext<'a> {
     options: &'a DiffTreeOptions,
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
+    /// Resolved `--indent-heuristic` / `diff.indentHeuristic`.
+    indent_heuristic: bool,
     /// `--check` whitespace-rule resolver (only built in check mode).
     ws_resolver: Option<commands::diff::WhitespaceRuleResolver>,
     /// Accumulated `--check` failure status across all requests.
@@ -1031,6 +1046,7 @@ fn run_diff_request(
                 ignore_blank_lines: context.options.ignore_blank_lines,
                 ignore_regexes: &context.options.ignore_regexes,
                 line_ranges: None,
+                indent_heuristic: context.indent_heuristic,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }
