@@ -454,7 +454,11 @@ declare -A FLOOR=(
     [t8002-blame.sh]=117
     [t8001-annotate.sh]=99
     [t8012-blame-colors.sh]=98
-    [t3903-stash.sh]=83
+    # t3903-stash FLAKY: cell #46 "stash symlink to file (stage rm)" oscillates 82/83
+    # (symlink<->file type-change race, independent of any wave — flips on a pristine
+    # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
+    # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
+    [t3903-stash.sh]=82
     [t4209-log-pickaxe.sh]=45
     [t4211-line-log.sh]=69
     [t5300-pack-object.sh]=46
@@ -477,7 +481,10 @@ declare -A FLOOR=(
     [t5611-clone-config.sh]=13
     [t5603-clone-dirname.sh]=39
     [t7502-commit-porcelain.sh]=75
-    [t7600-merge.sh]=44
+    # codex-wave-1 (2026-06-17): config stop-at-non-option (+3) + commit SQUASH_MSG (+2),
+    # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
+    [t7600-merge.sh]=49
+    [t6120-describe.sh]=84
     [t7900-maintenance.sh]=12
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11

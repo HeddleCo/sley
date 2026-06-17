@@ -168,6 +168,7 @@ jobs:
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh
             t6113-rev-list-bitmap-filters.sh
+            t6120-describe.sh
             t6300-for-each-ref.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
