@@ -287,6 +287,7 @@ impl CatFileOptions {
                 buffer: self.buffer.unwrap_or(batch_all_objects),
                 follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
+                use_mailmap: self.use_mailmap,
             }));
         }
 
@@ -673,6 +674,9 @@ struct CatFileBatchRequest {
     buffer: bool,
     follow_symlinks: bool,
     filter: CatFileObjectsFilter,
+    /// `--use-mailmap`: emitted commit/tag bodies and their `%(objectsize)` are
+    /// computed from the mailmapped identity headers.
+    use_mailmap: bool,
 }
 
 /// The `--filter=<spec>` object filter for batch mode. Only the kinds upstream `cat-file`
@@ -746,6 +750,17 @@ impl CatFileObjectsFilter {
 /// `git_parse_ulong`: a base-0 integer with an optional case-insensitive `k`/`m`/`g` suffix
 /// (1024-scaled). Returns `None` on overflow or a malformed value, exactly like the C helper
 /// that backs `blob:limit=<n>`.
+/// Load the mailmap for the batch path when `--use-mailmap` is set (else empty).
+fn batch_record_mailmap(use_mailmap: bool) -> Result<commands::utility::Mailmap> {
+    if use_mailmap {
+        let git_dir = discover_git_dir(env::current_dir()?)?;
+        let format = repository_object_format(&git_dir)?;
+        commands::utility::Mailmap::load_default(&git_dir, format)
+    } else {
+        Ok(commands::utility::Mailmap::default())
+    }
+}
+
 /// git's `apply_mailmap_to_header` for cat-file: rewrite the `author`/
 /// `committer`/`tagger` identity headers (only those, only in the leading header
 /// block before the blank line) of a commit/tag object body through the mailmap.
@@ -883,6 +898,7 @@ impl CatFileBatchRequest {
                     follow_symlinks: self.follow_symlinks,
                     filter: self.filter,
                     all_objects: self.batch_all_objects,
+                    use_mailmap: self.use_mailmap,
                 },
             )?;
             // Upstream's `batch_write` goes straight to the fd (unbuffered) unless `--buffer`
@@ -1020,6 +1036,7 @@ impl CatFileBatchRequest {
                 follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
                 all_objects: false,
+                use_mailmap: self.use_mailmap,
             },
         )
     }
@@ -1154,6 +1171,9 @@ struct CatFileBatchRecord<'a> {
     /// True when the record comes from `--batch-all-objects`; upstream silently skips
     /// filter-excluded objects in that mode instead of emitting `<name> excluded`.
     all_objects: bool,
+    /// `--use-mailmap`: the emitted body and `%(objectsize)` reflect the
+    /// mailmapped commit/tag identity headers.
+    use_mailmap: bool,
 }
 
 fn print_cat_file_batch_record(
@@ -1237,7 +1257,7 @@ fn print_cat_file_batch_record(
         None
     };
     if record.check_only {
-        let Some((object_type, size)) = batch_object_header(
+        let Some((object_type, mut size)) = batch_object_header(
             stdout,
             &record,
             &query,
@@ -1246,6 +1266,16 @@ fn print_cat_file_batch_record(
         else {
             return Ok(());
         };
+        // `--use-mailmap`: `%(objectsize)` reflects the mailmapped commit/tag body.
+        if record.use_mailmap && matches!(object_type, ObjectType::Commit | ObjectType::Tag) {
+            let mailmap = batch_record_mailmap(record.use_mailmap)?;
+            if !mailmap.is_empty() {
+                let object = record.view.db().read_object(&read_oid)?;
+                size =
+                    cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap).len()
+                        as u64;
+            }
+        }
         if record.filter.excludes(object_type, size) {
             return print_cat_file_excluded(stdout, &record);
         }
@@ -1293,15 +1323,27 @@ fn print_cat_file_batch_record(
         }
         Err(_) => return report_object_missing(stdout, &record, &query),
     };
+    // `--use-mailmap`: emit (and size) the mailmapped commit/tag body. Borrow the
+    // raw body unless a rewrite is actually needed (avoids cloning every object).
+    let mailmapped_body = if record.use_mailmap
+        && matches!(object.object_type, ObjectType::Commit | ObjectType::Tag)
+    {
+        let mailmap = batch_record_mailmap(record.use_mailmap)?;
+        (!mailmap.is_empty())
+            .then(|| cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap))
+    } else {
+        None
+    };
+    let body: &[u8] = mailmapped_body.as_deref().unwrap_or(&object.body);
     print_cat_file_batch_header(
         stdout,
         &record,
         &oid,
         object.object_type,
-        object.body.len() as u64,
+        body.len() as u64,
         object_mode.as_deref(),
     )?;
-    stdout.write_all(&object.body)?;
+    stdout.write_all(body)?;
     stdout.write_all(&[record.terminator])?;
     Ok(())
 }
