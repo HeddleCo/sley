@@ -2496,6 +2496,20 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             }
         })
         .or_else(|| {
+            if file_message.is_none()
+                && message_chunks.is_empty()
+                && reuse_message.is_none()
+                && fixup_commit.is_none()
+                && squash_commit.is_none()
+                && !amend
+                && git_dir.join("SQUASH_MSG").is_file()
+            {
+                read_squash_merge_message_from_file(&git_dir).ok()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
             if (in_merge || in_cherry_pick || in_revert)
                 && file_message.is_none()
                 && message_chunks.is_empty()
@@ -2614,7 +2628,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if amend {
         prepare_args.push("commit");
         prepare_args.push("HEAD");
-    } else if in_merge || ((in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file()) {
+    } else if in_merge
+        || ((in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file())
+        || (git_dir.join("SQUASH_MSG").is_file() && git_dir.join("MERGE_MSG").is_file())
+    {
         prepare_args.push("merge");
     } else if let Some(rev) = reuse_message.as_deref() {
         prepare_args.push("commit");
@@ -3560,6 +3577,63 @@ fn read_fixup_commit_message(
 fn read_squash_commit_message(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<u8>> {
     let commit = read_reused_commit(git_dir, format, rev)?;
     Ok(format!("squash! {}\n", commit_subject(&commit.message)).into_bytes())
+}
+
+fn read_squash_merge_message_from_file(git_dir: &Path) -> Result<Vec<u8>> {
+    let mut message = fs::read(git_dir.join("SQUASH_MSG"))?;
+    if let Ok(merge_msg) = fs::read(git_dir.join("MERGE_MSG"))
+        && let Some(conflicts) = merge_msg_conflicts_block(&merge_msg)
+    {
+        if !merge_msg_block_has_scissors(conflicts) && commit_cleanup_config_is_scissors(git_dir) {
+            let comment_char = commit_comment_string(git_dir);
+            message.push(b'\n');
+            append_scissors_cut_line(&mut message, &comment_char);
+            message.extend_from_slice(comment_char.as_bytes());
+            message.push(b'\n');
+            message.extend_from_slice(conflicts.strip_prefix(b"\n").unwrap_or(conflicts));
+        } else {
+            message.extend_from_slice(conflicts);
+        }
+    }
+    Ok(message)
+}
+
+fn merge_msg_conflicts_block(message: &[u8]) -> Option<&[u8]> {
+    let conflicts = message_line_start(message, b"# Conflicts:\n")?;
+    let cut = message_line_start(message, b"# ------------------------ >8 ------------------------\n")
+        .filter(|cut| *cut < conflicts)
+        .unwrap_or(conflicts);
+    let start = if cut > 0 && message[cut - 1] == b'\n' {
+        cut - 1
+    } else {
+        cut
+    };
+    Some(&message[start..])
+}
+
+fn message_line_start(message: &[u8], marker: &[u8]) -> Option<usize> {
+    if message.starts_with(marker) {
+        return Some(0);
+    }
+    message
+        .windows(marker.len() + 1)
+        .position(|window| window[0] == b'\n' && &window[1..] == marker)
+        .map(|index| index + 1)
+}
+
+fn merge_msg_block_has_scissors(message: &[u8]) -> bool {
+    message_line_start(message, b"# ------------------------ >8 ------------------------\n").is_some()
+}
+
+fn commit_cleanup_config_is_scissors(git_dir: &Path) -> bool {
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("commit", None, "cleanup")
+                .map(|value| value == "scissors")
+        })
+        .unwrap_or(false)
 }
 
 fn commit_fixup_message(
