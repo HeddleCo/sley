@@ -89,6 +89,11 @@ struct AmCommitOpts {
     ignore_date: bool,
     /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
     no_verify: bool,
+    /// When set, the per-commit reflog uses the rebase apply-backend format
+    /// `<action> (pick): <subject>` (git runs am under the rebase backend with
+    /// `GIT_REFLOG_ACTION="<action> (pick)"`, builtin/rebase.c run_am), instead
+    /// of the bare `am: <subject>` a standalone `git am` writes.
+    rebase_pick_reflog: bool,
 }
 
 /// A single message extracted from an mbox: identity, message, and raw diff.
@@ -1357,6 +1362,10 @@ fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
         ),
         ignore_date: read_state_bool(state_dir, "ignore-date"),
         no_verify: read_state_bool(state_dir, "no-verify"),
+        // The `head-name` marker is written only by the rebase apply backend
+        // (start_rebase_apply); a bare `git am` never writes it. Its presence
+        // selects the rebase per-pick reflog format.
+        rebase_pick_reflog: state_dir.join("head-name").exists(),
     }
 }
 
@@ -1926,6 +1935,15 @@ fn create_am_commit(
         Some(RefTarget::Symbolic(branch)) => branch,
         _ => "HEAD".to_string(),
     };
+    // Standalone `git am` writes `am: <subject>`; the rebase apply backend runs
+    // am with GIT_REFLOG_ACTION="<action> (pick)" so each commit lands a
+    // `<action> (pick): <subject>` entry (builtin/rebase.c run_am + am.c).
+    let reflog_message = if commit_opts.rebase_pick_reflog {
+        let action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
+        format!("{action} (pick): {}", patch.subject)
+    } else {
+        format!("am: {}", patch.subject)
+    };
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: target_ref,
@@ -1935,7 +1953,7 @@ fn create_am_commit(
             old_oid: head_oid,
             new_oid,
             committer,
-            message: format!("am: {}", patch.subject).into_bytes(),
+            message: reflog_message.into_bytes(),
         }),
     });
     tx.commit()?;
@@ -2525,16 +2543,45 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
             }),
         });
         tx.commit()?;
-        head_name
-            .strip_prefix("refs/heads/")
-            .unwrap_or(&head_name)
-            .to_string()
+        // git's apply backend reports the FULL ref name here
+        // (`refs/heads/<branch>`), not the short branch.
+        head_name.clone()
     } else {
         "detached HEAD".to_string()
     };
 
+    // Restore any autostash before the "Successfully rebased" line — git applies
+    // it then prints "Applied autostash." ahead of the success message. The
+    // apply backend records its autostash in `rebase-apply/autostash`; the state
+    // dir is removed by the caller's finish, so consume the file before then.
+    apply_rebase_autostash(&common_git_dir, state_dir)?;
+
     if !quiet {
         eprintln!("Successfully rebased and updated {head_display}.");
+    }
+    Ok(())
+}
+
+/// Apply (or store) the autostash recorded in the apply backend's
+/// `rebase-apply/autostash`. Mirrors `apply_autostash` in the merge backend
+/// (rebase.rs) but reachable from the am finish path. Prints "Applied
+/// autostash." on a clean apply, or stores the stash on conflict.
+fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path) -> Result<()> {
+    let autostash_path = state_dir.join("autostash");
+    if let Ok(text) = fs::read_to_string(&autostash_path) {
+        let _ = fs::remove_file(&autostash_path);
+        let format = repository_object_format(common_git_dir)?;
+        if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
+            let applied =
+                commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
+            if applied {
+                eprintln!("Applied autostash.");
+            } else if commands::stash::store_stash_commit(&oid, "autostash").is_ok() {
+                eprintln!(
+                    "Applying autostash resulted in conflicts.\nYour changes are safe in the stash.\nYou can run \"git stash pop\" or \"git stash drop\" at any time."
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2560,14 +2607,22 @@ fn am_abort(
     state_dir: &Path,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
-    // The rebase apply backend records the branch to return to in `head-name`;
-    // `git rebase --apply --abort` restores the *original branch* (symbolic HEAD)
-    // at `orig-head`, not just a detached HEAD. A bare `git am --abort` keeps the
-    // existing HEAD shape and restores `abort-safety`.
-    let rebase_head_name = fs::read_to_string(state_dir.join("head-name"))
+    // The rebase apply backend records the branch to return to in `head-name`
+    // (a `refs/heads/...` ref when attached, the literal "detached HEAD"
+    // otherwise) plus the starting commit in `orig-head`. `git rebase --apply
+    // --abort` returns HEAD to where the rebase started; a bare `git am --abort`
+    // keeps the existing HEAD shape and restores `abort-safety`.
+    let head_name_raw = fs::read_to_string(state_dir.join("head-name"))
         .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|name| name.starts_with("refs/heads/"));
+        .map(|raw| raw.trim().to_string());
+    let is_rebase = head_name_raw.is_some();
+    let rebase_branch = head_name_raw
+        .as_deref()
+        .filter(|name| name.starts_with("refs/heads/"))
+        .map(str::to_string);
+    let orig_head = fs::read_to_string(state_dir.join("orig-head"))
+        .ok()
+        .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok());
     let safety = fs::read_to_string(state_dir.join("abort-safety")).unwrap_or_default();
     let safety = safety.trim();
     if !safety.is_empty()
@@ -2577,44 +2632,61 @@ fn am_abort(
         let current = head_commit_oid(&refs)?;
         let committer = commit_identity_from_env("COMMITTER")?;
         let mut tx = refs.transaction();
-        match &rebase_head_name {
-            Some(branch) => {
-                let reflog = ReflogEntry {
+        if is_rebase {
+            // git builtin/rebase.c abort: `<action> (abort): returning to
+            // <head_name OR orig_head_sha>` — the branch ref when attached, the
+            // starting commit's hex when the rebase was on a detached HEAD.
+            let action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
+            let returning_to = match &rebase_branch {
+                Some(branch) => branch.clone(),
+                None => orig_head.unwrap_or(oid).to_hex().to_string(),
+            };
+            let reflog = ReflogEntry {
+                old_oid: current.unwrap_or(zero_oid(format)?),
+                new_oid: oid,
+                committer: committer.clone(),
+                message: format!("{action} (abort): returning to {returning_to}").into_bytes(),
+            };
+            match &rebase_branch {
+                Some(branch) => {
+                    // The apply backend ran on a DETACHED HEAD (checkout_onto_for_apply
+                    // detaches), so the branch ref never moved off orig_head — abort
+                    // only re-attaches HEAD to it. Writing the branch ref here would
+                    // add a spurious branch-reflog entry; git leaves the branch
+                    // reflog untouched (t3406 #25).
+                    tx.update(RefUpdate {
+                        name: "HEAD".into(),
+                        expected: None,
+                        new: RefTarget::Symbolic(branch.clone()),
+                        reflog: Some(reflog),
+                    });
+                }
+                None => {
+                    // Detached rebase: HEAD itself moves back to orig_head.
+                    tx.update(RefUpdate {
+                        name: "HEAD".into(),
+                        expected: None,
+                        new: RefTarget::Direct(oid),
+                        reflog: Some(reflog),
+                    });
+                }
+            }
+        } else {
+            let target_ref = match refs.read_ref("HEAD")? {
+                Some(RefTarget::Symbolic(branch)) => branch,
+                _ => "HEAD".to_string(),
+            };
+            tx.update(RefUpdate {
+                name: target_ref,
+                expected: None,
+                new: RefTarget::Direct(oid),
+                reflog: Some(ReflogEntry {
                     old_oid: current.unwrap_or(zero_oid(format)?),
                     new_oid: oid,
-                    committer: committer.clone(),
-                    message: b"rebase (abort)".to_vec(),
-                };
-                tx.update(RefUpdate {
-                    name: branch.clone(),
-                    expected: None,
-                    new: RefTarget::Direct(oid),
-                    reflog: Some(reflog.clone()),
-                });
-                tx.update(RefUpdate {
-                    name: "HEAD".into(),
-                    expected: None,
-                    new: RefTarget::Symbolic(branch.clone()),
-                    reflog: Some(reflog),
-                });
-            }
-            None => {
-                let target_ref = match refs.read_ref("HEAD")? {
-                    Some(RefTarget::Symbolic(branch)) => branch,
-                    _ => "HEAD".to_string(),
-                };
-                tx.update(RefUpdate {
-                    name: target_ref,
-                    expected: None,
-                    new: RefTarget::Direct(oid),
-                    reflog: Some(ReflogEntry {
-                        old_oid: current.unwrap_or(zero_oid(format)?),
-                        new_oid: oid,
-                        committer,
-                        message: b"am --abort".to_vec(),
-                    }),
-                });
-            }
+                    committer,
+                    message: b"am --abort".to_vec(),
+                }),
+            });
         }
         tx.commit()?;
         sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;

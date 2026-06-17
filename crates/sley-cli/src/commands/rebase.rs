@@ -653,27 +653,41 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
     if apply_in_progress {
         match parsed.action {
             RebaseAction::Continue => {
-                return commands::am::rebase_apply_continue(
+                let result = commands::am::rebase_apply_continue(
                     &ctx.git_dir,
                     &ctx.common_git_dir,
                     &ctx.worktree_root,
                     ctx.format,
                 );
+                // Ok iff the whole series completed; restore the autostash then
+                // (a fresh conflict returns Err and keeps it for the next step).
+                if result.is_ok() {
+                    finish_apply_autostash(&ctx);
+                }
+                return result;
             }
             RebaseAction::Skip => {
-                return commands::am::rebase_apply_skip(
+                let result = commands::am::rebase_apply_skip(
                     &ctx.git_dir,
                     &ctx.common_git_dir,
                     &ctx.worktree_root,
                     ctx.format,
                 );
+                if result.is_ok() {
+                    finish_apply_autostash(&ctx);
+                }
+                return result;
             }
             RebaseAction::Abort => {
-                return commands::am::rebase_apply_abort(
+                let result = commands::am::rebase_apply_abort(
                     &ctx.git_dir,
                     &ctx.worktree_root,
                     ctx.format,
                 );
+                // Abort always ends the rebase; restore the autostash on top of
+                // the restored orig_head (git applies it after reset).
+                finish_apply_autostash(&ctx);
+                return result;
             }
             RebaseAction::Quit => {
                 let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
@@ -837,12 +851,29 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         }
     };
 
+    // git creates the autostash BEFORE running the pre-rebase hook, and a hook
+    // refusal restores it (builtin/rebase.c: create_autostash → pre-rebase →
+    // cleanup_autostash on failure). Resolve the config flag here so the order
+    // matches; the value is reused below in place of the later re-read.
+    let autostash = args
+        .autostash
+        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "autostash").unwrap_or(false));
+    if autostash {
+        create_autostash(ctx, use_apply_backend)?;
+    }
+
     if !args.no_verify {
         let mut hook_args = vec![upstream_name.as_str()];
         if args.positional.get(1).is_some() {
             hook_args.push(branch_name.as_str());
         }
-        commands::hooks::run_hook_l("pre-rebase", &hook_args)?;
+        if let Err(err) = commands::hooks::run_hook_l("pre-rebase", &hook_args) {
+            // The hook refused the rebase: restore the autostash and drop any
+            // state so no rebase is left in progress (t3420 #18).
+            apply_autostash(ctx);
+            seq::remove_merge_state(&ctx.git_dir);
+            return Err(err);
+        }
     }
 
     // Onto.
@@ -893,9 +924,6 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         }
     };
 
-    let autostash = args
-        .autostash
-        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "autostash").unwrap_or(false));
     let autosquash = args.autosquash.unwrap_or_else(|| {
         interactive_explicit && rebase_config_bool(ctx, "rebase", "autosquash").unwrap_or(false)
     });
@@ -919,10 +947,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     });
     let force = args.force || args.signoff;
 
-    // Autostash before the clean-tree check.
-    if autostash {
-        create_autostash(ctx)?;
-    }
+    // Autostash was already created above (before the pre-rebase hook, matching
+    // git's order), so the clean-tree gate below sees the stashed-clean tree.
 
     // Clean-tree gate.
     if let Err(err) = require_clean_work_tree(ctx, "rebase", true) {
@@ -1156,6 +1182,8 @@ fn run_apply_backend(
             let committer = commit_identity_from_env("COMMITTER")?;
             move_to_original_branch(ctx, head_name, *orig_head, *onto, committer)?;
         }
+        // A noop rebase still finishes, so restore any autostash now.
+        finish_apply_autostash(ctx);
         if !args.quiet {
             eprintln!(
                 "Successfully rebased and updated {}.",
@@ -1189,10 +1217,23 @@ fn run_apply_backend(
         });
     }
 
-    // Detach HEAD onto the new base (the am series commits onto it).
-    checkout_onto_for_apply(ctx, db, onto, onto_name, orig_head)?;
+    // The apply backend (git-rebase--am) announces the rewind before replaying.
+    if !args.quiet {
+        eprintln!("First, rewinding head to replay your work on top of it...");
+    }
 
-    commands::am::start_rebase_apply(
+    // Detach HEAD onto the new base (the am series commits onto it). If the
+    // checkout is refused (untracked-file clobber), the rebase never starts:
+    // restore the autostash and drop all state so no rebase is left in progress
+    // (t3420 #5 — `rebase --quit` must then report "no rebase in progress").
+    if let Err(err) = checkout_onto_for_apply(ctx, db, onto, onto_name, orig_head) {
+        apply_autostash(ctx);
+        seq::remove_merge_state(&ctx.git_dir);
+        let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
+        return Err(err);
+    }
+
+    let result = commands::am::start_rebase_apply(
         &ctx.git_dir,
         &ctx.common_git_dir,
         &ctx.worktree_root,
@@ -1208,7 +1249,23 @@ fn run_apply_backend(
             orig_head: *orig_head,
             onto: *onto,
         },
-    )
+    );
+    // The series finished cleanly (Ok) iff the whole rebase completed; restore
+    // the autostash then. A conflict returns Err and leaves the stash in place
+    // for the eventual `--continue`/`--abort` to handle.
+    if result.is_ok() {
+        finish_apply_autostash(ctx);
+    }
+    result
+}
+
+/// Restore an autostash for a completed apply-backend rebase and clean up the
+/// stray `rebase-merge/` directory `create_autostash` writes the autostash into
+/// (the apply backend otherwise only removes `rebase-apply/`, leaving an empty
+/// `rebase-merge/` that the next rebase mistakes for an interrupted one).
+fn finish_apply_autostash(ctx: &Ctx) {
+    apply_autostash(ctx);
+    seq::remove_merge_state(&ctx.git_dir);
 }
 
 /// Detach HEAD onto `base` for the apply backend, refusing if the checkout would
@@ -3715,17 +3772,11 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
     let mut tx = refs.transaction();
     match &opts.head_name {
         Some(head_name) => {
-            tx.update(RefUpdate {
-                name: head_name.clone(),
-                expected: None,
-                new: RefTarget::Direct(target),
-                reflog: Some(ReflogEntry {
-                    old_oid: old_head,
-                    new_oid: target,
-                    committer: committer.clone(),
-                    message: reflog_message.clone(),
-                }),
-            });
+            // The merge backend ran on a DETACHED HEAD (the pick loop detaches
+            // onto `onto`), so the branch ref never moved off orig_head — abort
+            // only re-attaches HEAD to it. Updating the branch ref here would
+            // add a spurious branch-reflog entry; git leaves it untouched
+            // (t3406 #15).
             tx.update(RefUpdate {
                 name: "HEAD".into(),
                 expected: None,
@@ -3806,7 +3857,7 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
 // Autostash
 // ---------------------------------------------------------------------------
 
-fn create_autostash(ctx: &Ctx) -> Result<()> {
+fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
     let dirty = status
         .iter()
@@ -3819,7 +3870,16 @@ fn create_autostash(ctx: &Ctx) -> Result<()> {
         eprintln!("fatal: Cannot autostash");
         return Err(GitError::Exit(128));
     };
-    let dir = seq::merge_dir(&ctx.git_dir);
+    // git records the autostash inside the active backend's state dir
+    // (`rebase-apply/` for the apply backend, `rebase-merge/` for the merge
+    // sequencer). The t-suite asserts on `$dotest/autostash` per backend, and
+    // routing it to the wrong dir both fails those asserts and leaves the other
+    // dir behind for the next rebase to trip over.
+    let dir = if use_apply_backend {
+        ctx.git_dir.join("rebase-apply")
+    } else {
+        seq::merge_dir(&ctx.git_dir)
+    };
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("autostash"), oid.to_hex())?;
     let db = ctx.db();
@@ -3845,7 +3905,16 @@ fn save_autostash(ctx: &Ctx) {
 }
 
 fn apply_save_autostash(ctx: &Ctx, attempt_apply: bool) {
-    let path = ctx.state_path("autostash");
+    // The autostash lives in whichever backend's state dir created it:
+    // `rebase-merge/autostash` (merge sequencer) or `rebase-apply/autostash`
+    // (apply backend). Check both so the restore path is backend-agnostic.
+    let merge_path = ctx.state_path("autostash");
+    let apply_path = ctx.git_dir.join("rebase-apply").join("autostash");
+    let path = if merge_path.exists() {
+        merge_path
+    } else {
+        apply_path
+    };
     let Ok(text) = fs::read_to_string(&path) else {
         return;
     };
