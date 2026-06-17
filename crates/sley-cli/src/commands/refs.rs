@@ -1391,6 +1391,9 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
+            if let Some(err) = transaction.check_batch_df_against_queued(&name) {
+                return Err(err);
+            }
             update_ref_stdin_write(
                 context,
                 UpdateRefStdinWriteRequest {
@@ -1453,6 +1456,9 @@ fn dispatch_ref_stdin_command(
             }
             if transaction.capture(context.store, &name)? {
                 return Ok(());
+            }
+            if let Some(err) = transaction.check_batch_df_against_queued(&name) {
+                return Err(err);
             }
             update_ref_stdin_write(
                 context,
@@ -1679,6 +1685,19 @@ fn dispatch_ref_stdin_command(
     }
 }
 
+/// True when two ref names directory/file-conflict: one is a strict
+/// path-component prefix of the other (e.g. `a/b` and `a/b/c`). Equal names and
+/// names that merely share a textual prefix without a `/` boundary
+/// (`a/bc` vs `a/b`) do not conflict.
+fn ref_names_df_conflict(a: &str, b: &str) -> bool {
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    if short.len() == long.len() {
+        return false;
+    }
+    long.strip_prefix(short)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Pull `(new_ref, existing_ref)` out of the backend's D/F-conflict message
 /// `cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'`.
 fn parse_df_conflict_message(message: &str) -> Option<(String, String)> {
@@ -1722,6 +1741,41 @@ impl UpdateRefStdinTransaction {
     /// the `extras` set).
     fn is_batch_create(&self, name: &str) -> bool {
         matches!(self.originals.get(name), Some(None))
+    }
+
+    /// Detect a D/F conflict between `name` (a ref about to be created/updated)
+    /// and a ref *already touched in this batch* whose on-disk path no longer
+    /// collides — e.g. `delete foo/bar` then `create foo`, where the delete has
+    /// already pruned `foo/`. git verifies all batch refnames against each other
+    /// up front (`extras`), so it rejects this even though the loose write would
+    /// now succeed. Reports git's message: the same-batch name yields
+    /// `cannot process`, a pre-existing-then-deleted name yields
+    /// `'<other>' exists; cannot create '<name>'` (the delete's old value still
+    /// existed at batch start). Returns the failure if a conflict exists.
+    fn check_batch_df_against_queued(&self, name: &str) -> Option<GitError> {
+        for other in self.originals.keys() {
+            if other == name {
+                continue;
+            }
+            if !ref_names_df_conflict(name, other) {
+                continue;
+            }
+            // Order parent (shorter) before child to match git's sorted output.
+            let (parent, child) = if other.len() <= name.len() {
+                (other.as_str(), name)
+            } else {
+                (name, other.as_str())
+            };
+            if self.is_batch_create(other) {
+                eprintln!("fatal: cannot process '{parent}' and '{child}' at the same time");
+            } else {
+                // `other` existed at batch start (a delete of a real ref): git
+                // reports it as an existing-ref conflict against the new name.
+                eprintln!("fatal: cannot lock ref '{name}': '{other}' exists; cannot create '{name}'");
+            }
+            return Some(GitError::Exit(128));
+        }
+        None
     }
 
     /// Reshape a backend D/F-conflict error into the git-shaped `fatal:` exit-128
