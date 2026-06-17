@@ -1,0 +1,2 @@
+script,command,result,ok,notok,total,plan_total
+t3418-rebase-continue.sh,t3418-rebase-continue.sh,FAIL,10,20,30,30

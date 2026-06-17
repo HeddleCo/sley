@@ -1,0 +1,159 @@
+sley upstream test report
+run label: 2026-06-17T04:54:09Z
+sley binary: /home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-rebase-i-cont/release/sley
+upstream t/: /tmp/git-pcre-src/t
+default hash: sha1
+per-script timeout: 300s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3418-rebase-continue.sh     FAIL        10    20  rc=1 (1..30) #		|# failed 20 among 30 test(s)|1..30
+
+----- t3418-rebase-continue.sh (FAIL): failing assertions -----
+  [#4] apply based rebase --continue works with touched file
+  [#6] rebase --continue remembers merge strategy and options
+  [#7] rebase -r passes merge strategy options correctly
+  [#8] --skip after failed fixup cleans commit message
+  [#10] rebase --apply --continue remembers --rerere-autoupdate
+  [#11] rebase --apply --continue honors rerere.autoUpdate
+  [#12] rebase --apply --continue remembers --no-rerere-autoupdate
+  [#13] rebase -m --continue remembers --rerere-autoupdate
+  [#14] rebase -m --continue honors rerere.autoUpdate
+  [#15] rebase -m --continue remembers --no-rerere-autoupdate
+  [#16] rebase -i --continue remembers --rerere-autoupdate
+  [#17] rebase -i --continue honors rerere.autoUpdate
+  [#18] rebase -i --continue remembers --no-rerere-autoupdate
+  [#19] the todo command "break" works
+  [#20] patch file is removed before break command
+  [#26] no change in comment character due to conflicts markers with core.commentChar=auto
+  [#27] rebase --apply sets ORIG_HEAD correctly
+  [#28] rebase --apply <upstream> <branch> sets ORIG_HEAD correctly
+  [#29] rebase --merge sets ORIG_HEAD correctly
+  [#30] rebase --merge <upstream> <branch> sets ORIG_HEAD correctly
+----- t3418-rebase-continue.sh (FAIL) last 25 lines -----
+#	
+not ok 27 - rebase --apply sets ORIG_HEAD correctly
+#	
+#			git checkout topic &&
+#			git reset --hard commit-new-file-F2-on-topic-branch &&
+#			test_orig_head_helper $type main
+#		
+not ok 28 - rebase --apply <upstream> <branch> sets ORIG_HEAD correctly
+#	
+#			git checkout main &&
+#			test_orig_head_helper $type main topic
+#		
+not ok 29 - rebase --merge sets ORIG_HEAD correctly
+#	
+#			git checkout topic &&
+#			git reset --hard commit-new-file-F2-on-topic-branch &&
+#			test_orig_head_helper $type main
+#		
+not ok 30 - rebase --merge <upstream> <branch> sets ORIG_HEAD correctly
+#	
+#			git checkout main &&
+#			test_orig_head_helper $type main topic
+#		
+# failed 20 among 30 test(s)
+1..30
+----- end t3418-rebase-continue.sh -----
+
+t3406-rebase-message.sh      FAIL        22    10  rc=1 (1..32) ok 32 - rebase -i onto unrelated history|# failed 10 among 32 test(s)|1..32
+
+----- t3406-rebase-message.sh (FAIL): failing assertions -----
+  [#15] rebase --merge --abort reflog
+  [#20] rebase --merge --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#22] rebase --apply reflog
+  [#24] rebase --apply --skip reflog
+  [#25] rebase --apply --abort reflog
+  [#26] rebase --apply --abort detached HEAD reflog
+  [#27] rebase --apply reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#29] rebase --apply --skip reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#30] rebase --apply --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#31] rebase --apply --abort detached HEAD reflog GIT_REFLOG_ACTION=my-reflog-action
+----- t3406-rebase-message.sh (FAIL) last 25 lines -----
+#	
+#		git checkout Q &&
+#		test_when_finished "git reset --hard Q" &&
+#	
+#		(
+#			if test -n "$reflog_action"
+#			then
+#				GIT_REFLOG_ACTION="$reflog_action" &&
+#				export GIT_REFLOG_ACTION
+#			fi &&
+#			test_must_fail git rebase $mode main &&
+#			git rebase --abort
+#		) &&
+#	
+#		git log -g --format=%gs -3 >actual &&
+#		write_reflog_expect <<-EOF &&
+#		${reflog_action:-rebase} (abort): returning to $(git rev-parse Q)
+#		${reflog_action:-rebase} (pick): P
+#		${reflog_action:-rebase} (start): checkout main
+#		EOF
+#		test_cmp expect actual
+#		
+ok 32 - rebase -i onto unrelated history
+# failed 10 among 32 test(s)
+1..32
+----- end t3406-rebase-message.sh -----
+
+t3420-rebase-autostash.sh    FAIL        33    19  rc=1 (1..52) #	|# failed 19 among 52 test(s)|1..52
+
+----- t3420-rebase-autostash.sh (FAIL): failing assertions -----
+  [#5] rebase --apply: restore autostash when checkout onto fails
+  [#6] rebase --apply: restore autostash when branch checkout fails
+  [#8] rebase --apply: dirty worktree, non-conflicting rebase
+  [#9] rebase --apply --autostash: check output
+  [#10] rebase --apply: dirty index, non-conflicting rebase
+  [#11] rebase --apply: conflicting rebase
+  [#12] rebase --apply: --continue
+  [#13] rebase --apply: --skip
+  [#14] rebase --apply: --abort
+  [#15] rebase --apply: --quit
+  [#16] rebase --apply: non-conflicting rebase, conflicting stash
+  [#17] rebase --apply: check output with conflicting stash
+  [#18] rebase --merge: restore autostash when pre-rebase hook fails
+  [#20] rebase --merge: restore autostash when branch checkout fails
+  [#21] rebase --merge: dirty worktree, --no-autostash
+  [#22] rebase --merge: dirty worktree, non-conflicting rebase
+  [#23] rebase --merge --autostash: check output
+  [#49] autostash with dirty submodules
+  [#52] autostash commit is marked as reachable
+----- t3420-rebase-autostash.sh (FAIL) last 25 lines -----
+ok 48 - autostash is saved on editor failure with conflict
+not ok 49 - autostash with dirty submodules
+#	
+#		test_when_finished "git reset --hard && git checkout main" &&
+#		git checkout -b with-submodule &&
+#		git -c protocol.file.allow=always submodule add ./ sub &&
+#		test_tick &&
+#		git commit -m add-submodule &&
+#		echo changed >sub/file0 &&
+#		git rebase -i --autostash HEAD
+#	
+ok 50 - branch is left alone when possible
+ok 51 - never change active branch
+not ok 52 - autostash commit is marked as reachable
+#	
+#		echo changed >file0 &&
+#		git rebase --autostash --exec "git prune --expire=now" \
+#			feature-branch^ feature-branch &&
+#		# git rebase succeeds if the stash cannot be applied so we need to check
+#		# the contents of file0
+#		echo changed >expect &&
+#		test_cmp expect file0
+#	
+# failed 19 among 52 test(s)
+1..52
+----- end t3420-rebase-autostash.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t3418-rebase-continue.sh FAIL             10     20     30  33%
+t3406-rebase-message.sh FAIL             22     10     32  68%
+t3420-rebase-autostash.sh FAIL             33     19     52  63%
+
+SUMMARY: 3 script(s): 0 passed, 3 failed, 0 timed out.

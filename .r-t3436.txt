@@ -1,0 +1,63 @@
+sley upstream test report
+run label: 2026-06-17T04:35:58Z
+sley binary: /home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-rebase-i-cont/release/sley
+upstream t/: /tmp/git-pcre-src/t
+default hash: sha1
+per-script timeout: 300s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3436-rebase-more-options.sh FAIL         2    17  rc=1 (1..19) ok 19 - $EDITOR and friends are unchanged|# failed 17 among 19 test(s)|1..19
+
+----- t3436-rebase-more-options.sh (FAIL): failing assertions -----
+  [#2] --ignore-whitespace works with apply backend
+  [#3] --ignore-whitespace works with merge backend
+  [#4] --ignore-whitespace is remembered when continuing
+  [#5] --committer-date-is-author-date works with apply backend
+  [#6] --committer-date-is-author-date works with merge backend
+  [#7] --committer-date-is-author-date works when rewording
+  [#8] --committer-date-is-author-date works with rebase -r
+  [#9] --committer-date-is-author-date works when forking merge
+  [#10] --committer-date-is-author-date works when committing conflict resolution
+  [#11] --reset-author-date works with apply backend
+  [#12] --reset-author-date works with merge backend
+  [#13] --reset-author-date works after conflict resolution
+  [#14] --reset-author-date works with rebase -r
+  [#15] --reset-author-date with --committer-date-is-author-date works
+  [#16] reset-author-date with --committer-date-is-author-date works when rewording
+  [#17] --reset-author-date --committer-date-is-author-date works when forking merge
+  [#18] --ignore-date is an alias for --reset-author-date
+----- t3436-rebase-more-options.sh (FAIL) last 25 lines -----
+#		test_write_lines edited "" >expect &&
+#		git log --format="%B" -1 >actual &&
+#		test_cmp expect actual &&
+#		test_atime_is_ignored -1
+#	
+not ok 17 - --reset-author-date --committer-date-is-author-date works when forking merge
+#	
+#		GIT_SEQUENCE_EDITOR="echo \"merge -C $(git rev-parse HEAD) commit3\">" \
+#			PATH="./test-bin:$PATH" git rebase -i --strategy=test \
+#					--reset-author-date \
+#					--committer-date-is-author-date side side &&
+#		test_ctime_is_atime -1 &&
+#		test_atime_is_ignored -1
+#	 
+not ok 18 - --ignore-date is an alias for --reset-author-date
+#	
+#		git commit --amend --date="$GIT_AUTHOR_DATE" &&
+#		git rebase --apply --ignore-date HEAD^ &&
+#		git commit --allow-empty -m empty --date="$GIT_AUTHOR_DATE" &&
+#		git rebase -m --ignore-date HEAD^ &&
+#		test_atime_is_ignored -2
+#	
+ok 19 - $EDITOR and friends are unchanged
+# failed 17 among 19 test(s)
+1..19
+----- end t3436-rebase-more-options.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t3436-rebase-more-options.sh FAIL              2     17     19  10%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.

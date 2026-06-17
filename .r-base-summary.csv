@@ -1,0 +1,6 @@
+script,command,result,ok,notok,total,plan_total
+t3418-rebase-continue.sh,t3418-rebase-continue.sh,FAIL,11,19,30,30
+t3406-rebase-message.sh,t3406-rebase-message.sh,FAIL,26,6,32,32
+t3420-rebase-autostash.sh,t3420-rebase-autostash.sh,FAIL,37,15,52,52
+t3404-rebase-interactive.sh,t3404-rebase-interactive.sh,FAIL,47,85,132,132
+t4150-am.sh,t4150-am.sh,FAIL,54,33,87,87

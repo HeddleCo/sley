@@ -1,0 +1,56 @@
+sley upstream test report
+run label: 2026-06-17T04:58:00Z
+sley binary: /home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-rebase-i-cont/release/sley
+upstream t/: /tmp/git-pcre-src/t
+default hash: sha1
+per-script timeout: 300s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3406-rebase-message.sh      FAIL        22    10  rc=1 (1..32) ok 32 - rebase -i onto unrelated history|# failed 10 among 32 test(s)|1..32
+
+----- t3406-rebase-message.sh (FAIL): failing assertions -----
+  [#15] rebase --merge --abort reflog
+  [#20] rebase --merge --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#22] rebase --apply reflog
+  [#24] rebase --apply --skip reflog
+  [#25] rebase --apply --abort reflog
+  [#26] rebase --apply --abort detached HEAD reflog
+  [#27] rebase --apply reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#29] rebase --apply --skip reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#30] rebase --apply --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#31] rebase --apply --abort detached HEAD reflog GIT_REFLOG_ACTION=my-reflog-action
+----- t3406-rebase-message.sh (FAIL) last 25 lines -----
+#	
+#		git checkout Q &&
+#		test_when_finished "git reset --hard Q" &&
+#	
+#		(
+#			if test -n "$reflog_action"
+#			then
+#				GIT_REFLOG_ACTION="$reflog_action" &&
+#				export GIT_REFLOG_ACTION
+#			fi &&
+#			test_must_fail git rebase $mode main &&
+#			git rebase --abort
+#		) &&
+#	
+#		git log -g --format=%gs -3 >actual &&
+#		write_reflog_expect <<-EOF &&
+#		${reflog_action:-rebase} (abort): returning to $(git rev-parse Q)
+#		${reflog_action:-rebase} (pick): P
+#		${reflog_action:-rebase} (start): checkout main
+#		EOF
+#		test_cmp expect actual
+#		
+ok 32 - rebase -i onto unrelated history
+# failed 10 among 32 test(s)
+1..32
+----- end t3406-rebase-message.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t3406-rebase-message.sh FAIL             22     10     32  68%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
