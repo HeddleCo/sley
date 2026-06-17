@@ -36,6 +36,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut local = None::<bool>;
     let mut deepen_since = None::<i64>;
     let mut deepen_not = Vec::<String>::new();
+    // `--reject-shallow` / `--no-reject-shallow` are a tri-state (upstream
+    // `option_reject_shallow = -1` when unspecified); the CLI flag overrides the
+    // `clone.rejectshallow` config when present.
+    let mut option_reject_shallow = None::<bool>;
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -55,7 +59,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             "--no-single-branch" => explicit_single_branch = Some(false),
             "--tags" => tag_opt = None,
             "--no-tags" => tag_opt = Some("--no-tags".to_string()),
-            "--reject-shallow" | "--no-reject-shallow" => {}
+            "--reject-shallow" => option_reject_shallow = Some(true),
+            "--no-reject-shallow" => option_reject_shallow = Some(false),
             "--depth" => {
                 let value = iter
                     .next()
@@ -628,6 +633,19 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         && !parse_remote_url(&repository)
             .map(|url| url.transport == RemoteTransport::File)
             .unwrap_or(false);
+    // Upstream `builtin/clone.c`: `clone.rejectshallow` (config) is overridden by
+    // `--[no-]reject-shallow` (CLI). When the resolved value is true and the
+    // source repository is shallow (a `shallow` file in its git dir), the clone
+    // is refused. For a true local-mechanism clone git only `warning`s and falls
+    // back to the transport, but sley always serves locally through the
+    // in-process upload-pack, so the rejection applies whenever the source is
+    // shallow — matching `--no-local` (the only way to reject-shallow a path).
+    let reject_shallow =
+        option_reject_shallow.or(clone_reject_shallow_config(&config_overrides)?);
+    if reject_shallow == Some(true) && remote_common_git_dir.join("shallow").exists() {
+        eprintln!("fatal: source repository is shallow, reject to clone.");
+        return Err(GitError::Exit(128));
+    }
     if !quiet {
         if bare {
             eprintln!(
@@ -1568,14 +1586,43 @@ fn parse_clone_config_override(value: &str) -> Result<GlobalConfigOverride> {
     })
 }
 
+/// Resolve `clone.rejectshallow` for the reject-shallow gate, reading the same
+/// config git's second `git_config` pass sees: the global `-c` / `GIT_CONFIG_*`
+/// injection plus any `clone -c clone.rejectshallow=<bool>`. Returns the last
+/// (highest-precedence) value, or `None` when unset. The CLI `--reject-shallow`
+/// flag overrides this at the call site (upstream `option_reject_shallow`).
+fn clone_reject_shallow_config(config_overrides: &[GlobalConfigOverride]) -> Result<Option<bool>> {
+    let mut resolved = None;
+    for parameter in crate::injected_config_parameters()? {
+        let (section, subsection, key) = parameter.split_key();
+        if section == "clone" && subsection.is_none() && key == "rejectshallow" {
+            let value = parameter.value.as_deref().unwrap_or("true");
+            resolved = sley_config::parse_config_bool(value);
+        }
+    }
+    for override_entry in config_overrides {
+        let key = override_entry.key.to_ascii_lowercase();
+        if key == "clone.rejectshallow" {
+            resolved = sley_config::parse_config_bool(&override_entry.value);
+        }
+    }
+    Ok(resolved)
+}
+
 fn apply_clone_config_overrides(git_dir: &Path, overrides: &[GlobalConfigOverride]) -> Result<()> {
     if overrides.is_empty() {
         return Ok(());
     }
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     for override_entry in overrides {
         let key = parse_config_key(&override_entry.key)?;
-        config_set_value(&mut config, &key, &override_entry.value, false);
+        // Each `clone -c key=value` is an independent multivar addition, matching
+        // upstream `write_one_config`'s `repo_config_set_multivar_gently(...,
+        // CONFIG_REGEX_NONE, 0)` (CONFIG_REGEX_NONE => always append). Repeating
+        // `-c` on the same key accumulates (`core.foo=bar -c core.foo=baz`), an
+        // empty value persists a blank entry, and a `-c remote.<o>.fetch=<spec>`
+        // adds a second fetch refspec alongside clone's default one.
+        config_set_value(&mut config, &key, &override_entry.value, true);
     }
     write_repo_config(git_dir, &config)
 }
@@ -1592,7 +1639,7 @@ fn apply_clone_template(git_dir: &Path, template: Option<&Path>, copy_config: bo
     let template_config_path = template.join("config");
     if copy_config && template_config_path.is_file() {
         let mut template_config = GitConfig::read(template_config_path)?;
-        let current_config = read_repo_config(git_dir)?;
+        let current_config = read_repo_config_on_disk(git_dir)?;
         template_config.sections.extend(current_config.sections);
         write_repo_config(git_dir, &template_config)?;
     }
@@ -1727,7 +1774,7 @@ fn apply_clone_submodule_active(git_dir: &Path, active: &[String]) -> Result<()>
     if active.is_empty() {
         return Ok(());
     }
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let key = parse_config_key("submodule.active")?;
     for value in active {
         config_set_value(&mut config, &key, value, true);
@@ -1772,7 +1819,7 @@ fn apply_clone_sparse_checkout(
     fs::create_dir_all(git_dir.join("info"))?;
     fs::write(git_dir.join("info/sparse-checkout"), b"/*\n!/*/\n")?;
 
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let key = parse_config_key("extensions.worktreeConfig")?;
     config_set_value(&mut config, &key, "true", false);
     write_repo_config(git_dir, &config)?;
@@ -2098,7 +2145,7 @@ fn configure_clone_remote(
     tag_opt: Option<&str>,
     partial_clone_filter: Option<&str>,
 ) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     if let Some(fetch_refspec) = fetch_refspec {
         entries.push(ConfigEntry::new("fetch", Some(fetch_refspec)));
@@ -2125,7 +2172,7 @@ fn configure_clone_remote(
 }
 
 fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     config.sections.push(ConfigSection::new(
         "branch",
         Some(branch.to_string()),
@@ -6157,6 +6204,18 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // cannot push into the process env, so it reconstructs the effective
     // `GIT_CONFIG_PARAMETERS` and passes it through.
     sley_config::read_repo_config(git_dir, crate::effective_config_parameters_env().as_deref())
+}
+
+/// The repository's on-disk `config` file alone, with NO command-line `-c` /
+/// `GIT_CONFIG_*` injection layered on. Use this for the read side of any
+/// read-modify-write that persists the result back to the config file:
+/// [`read_repo_config`] folds the process-level injection into the returned
+/// config, so writing it back would persist `git -c key=value` into the file
+/// (upstream keeps `-c` injections process-local and never writes them out).
+/// This is the bug class behind clone wrongly baking `git -c …` into the cloned
+/// repo's config. Includes (`include.path` / `includeIf`) are still resolved.
+pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
+    sley_config::read_repo_config(git_dir, None)
 }
 
 /// Short branch name from `HEAD` (e.g. "main"), or None when detached/unborn.
