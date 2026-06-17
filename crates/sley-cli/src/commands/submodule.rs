@@ -850,9 +850,24 @@ fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
     }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
+    // module_summary: the leading operand is the `<commit>` ONLY if it resolves
+    // to an object (git's `repo_get_oid`); otherwise it's a pathspec and the
+    // source side is HEAD. A leading "HEAD" before the first commit resolves to
+    // the empty tree.
+    let mut commit: Option<String> = None;
+    let mut positionals = options.positionals.clone();
+    if let Some(candidate) = &options.commit {
+        if candidate == "HEAD" || resolve_revision(&git_dir, format, candidate).is_ok() {
+            commit = Some(candidate.clone());
+        } else {
+            // Not a revision: it is the first pathspec.
+            positionals.insert(0, candidate.clone());
+        }
+    }
+
     // module_summary: resolve the source-side commit. With a commit arg, use it;
     // otherwise HEAD, falling back to the empty tree before the first commit.
-    let head_tree = summary_source_tree(&db, &git_dir, format, options.commit.as_deref())?;
+    let head_tree = summary_source_tree(&db, &git_dir, format, commit.as_deref())?;
 
     let index = read_repository_index(&git_dir, format)?;
     let mut entries = if options.files {
@@ -864,9 +879,8 @@ fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
     };
 
     // Restrict to the requested pathspecs (git passes them through to diff).
-    if !options.positionals.is_empty() {
-        let specs: Vec<String> = options
-            .positionals
+    if !positionals.is_empty() {
+        let specs: Vec<String> = positionals
             .iter()
             .map(|path| normalize_submodule_pathspec(&cwd, &worktree_root, path))
             .collect();
