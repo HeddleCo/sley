@@ -1,2 +1,0 @@
-script,command,result,ok,notok,total,plan_total
-t6423-merge-rename-directories.sh,t6423-merge-rename-directories.sh,FAIL,22,60,82,82
