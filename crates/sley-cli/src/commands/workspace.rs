@@ -2744,6 +2744,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
+    remove_commit_state_files(&git_dir);
     if !quiet {
         print_commit_summary(
             &git_dir,
@@ -3028,9 +3029,7 @@ fn conclude_replay_via_commit(
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
-        let _ = fs::remove_file(git_dir.join(name));
-    }
+    remove_commit_state_files(git_dir);
     if !quiet {
         println!("{new_oid}");
     }
@@ -3216,11 +3215,18 @@ fn commit_partial_paths(
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
+    remove_commit_state_files(git_dir);
     if !quiet {
         println!("{new_oid}");
     }
     commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
     Ok(())
+}
+
+fn remove_commit_state_files(git_dir: &Path) {
+    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
+        let _ = fs::remove_file(git_dir.join(name));
+    }
 }
 
 /// Write a tree object hierarchy from a flat `path -> (mode, oid)` map
