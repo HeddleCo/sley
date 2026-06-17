@@ -1214,6 +1214,7 @@ fn run_apply_backend(
             author_date: date,
             message,
             diff,
+            orig_commit: record.oid,
         });
     }
 

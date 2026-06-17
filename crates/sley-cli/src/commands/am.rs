@@ -281,6 +281,10 @@ pub(crate) struct RebaseApplyCommit {
     pub message: Vec<u8>,
     /// Unified diff of the commit against its first parent.
     pub diff: Vec<u8>,
+    /// The original commit being replayed. Recorded so the apply backend can feed
+    /// the `post-rewrite` hook the `<old> <new>` mapping (git's `state->orig_commit`,
+    /// from each patch's `From <sha>` line). Drives the per-commit `rewritten` file.
+    pub orig_commit: ObjectId,
 }
 
 /// Options for a fresh `git rebase --apply` run.
@@ -354,6 +358,21 @@ pub(crate) fn start_rebase_apply(
         .ok_or_else(|| GitError::Command("rebase --apply: cannot read HEAD".into()))?;
 
     write_am_state_dir(&state_dir, &patches, &options, &head_oid)?;
+    // git records each patch's original commit (`state->orig_commit`, parsed from
+    // the `From <sha>` line format-patch emits) and, in `do_commit`, appends
+    // `<orig> <new>` to `rebase-apply/rewritten`. We don't round-trip a `From <sha>`
+    // line through the RFC822 patch parser, so persist the per-patch original shas
+    // in a parallel `orig-commits` file (line N = patch N's original) that the
+    // series driver looks up by patch number when each commit lands.
+    let orig_commits: String = params
+        .commits
+        .iter()
+        .map(|commit| format!("{}\n", commit.orig_commit))
+        .collect();
+    fs::write(state_dir.join("orig-commits"), orig_commits)?;
+    // The `rebasing` marker selects git's post-rewrite firing path (am.c keys the
+    // whole `rewritten`/post-rewrite mechanism off `state->rebasing`).
+    fs::write(state_dir.join("rebasing"), b"")?;
     // Rebase markers: their presence makes `finish_am` / `am --abort` behave as a
     // rebase (return to the original branch) rather than a bare `git am`.
     let head_name = params
@@ -1423,6 +1442,8 @@ fn run_am_series(
             common_git_dir,
             worktree_root,
             format,
+            state_dir,
+            number,
             &patch,
             commit_opts,
             three_way,
@@ -1511,6 +1532,8 @@ fn apply_one_patch(
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    state_dir: &Path,
+    number: usize,
     patch: &AmPatch,
     commit_opts: AmCommitOpts,
     three_way: bool,
@@ -1521,7 +1544,7 @@ fn apply_one_patch(
     match try_straight_apply(worktree_root, &file_patches, ignore_whitespace)? {
         Some(actions) => {
             apply_actions(worktree_root, &actions)?;
-            stage_and_commit(
+            let new_oid = stage_and_commit(
                 git_dir,
                 common_git_dir,
                 worktree_root,
@@ -1530,6 +1553,7 @@ fn apply_one_patch(
                 &actions,
                 commit_opts,
             )?;
+            record_rebase_rewrite(state_dir, format, number, &new_oid)?;
             Ok(ApplyResult::Committed)
         }
         None => {
@@ -1540,6 +1564,8 @@ fn apply_one_patch(
                     common_git_dir,
                     worktree_root,
                     format,
+                    state_dir,
+                    number,
                     patch,
                     &file_patches,
                     commit_opts,
@@ -1823,7 +1849,7 @@ fn stage_and_commit(
     patch: &AmPatch,
     actions: &[ApplyFileAction],
     commit_opts: AmCommitOpts,
-) -> Result<()> {
+) -> Result<ObjectId> {
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut index = read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
@@ -1894,7 +1920,7 @@ fn create_am_commit(
     format: ObjectFormat,
     patch: &AmPatch,
     commit_opts: AmCommitOpts,
-) -> Result<()> {
+) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
@@ -1962,7 +1988,7 @@ fn create_am_commit(
     // informational, run after the commit has already landed (builtin/am.c
     // calls `run_hooks` without checking the result). Swallow any failure.
     let _ = commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default());
-    Ok(())
+    Ok(new_oid)
 }
 
 /// Build the author and committer identity bytes for an am commit, honouring
@@ -2131,11 +2157,14 @@ fn is_trailer_line(line: &str) -> bool {
 /// Best-effort 3-way application: reconstruct the pre-image from the index's
 /// blobs, apply the patch to that to form "theirs", and 3-way merge against the
 /// worktree state ("ours"). Reuses the shared tree-merge engine.
+#[allow(clippy::too_many_arguments)]
 fn apply_three_way(
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    state_dir: &Path,
+    number: usize,
     patch: &AmPatch,
     file_patches: &[sley_diff_merge::FilePatch],
     commit_opts: AmCommitOpts,
@@ -2236,7 +2265,7 @@ fn apply_three_way(
     write_merge_index_and_worktree(git_dir, worktree_root, format, &db, &ours_map, &results)?;
 
     if conflicts.is_empty() {
-        create_am_commit(
+        let new_oid = create_am_commit(
             git_dir,
             common_git_dir,
             worktree_root,
@@ -2244,6 +2273,7 @@ fn apply_three_way(
             patch,
             commit_opts,
         )?;
+        record_rebase_rewrite(state_dir, format, number, &new_oid)?;
         Ok(ApplyResult::Committed)
     } else {
         for path in &conflicts {
@@ -2491,10 +2521,66 @@ fn finish_am(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Append `<orig> <new>` to `rebase-apply/rewritten` for the patch at index
+/// `number`, mirroring `do_commit` in builtin/am.c (which writes the pair off
+/// `state->orig_commit` whenever `state->rebasing`). The original commit is read
+/// from the parallel `orig-commits` file written at `start_rebase_apply`; a bare
+/// `git am` has no such file (and no `rebasing` marker), so this is a no-op there.
+fn record_rebase_rewrite(
+    state_dir: &Path,
+    format: ObjectFormat,
+    number: usize,
+    new_oid: &ObjectId,
+) -> Result<()> {
+    if !state_dir.join("rebasing").exists() {
+        return Ok(());
+    }
+    let orig_commits = match fs::read_to_string(state_dir.join("orig-commits")) {
+        Ok(text) => text,
+        Err(_) => return Ok(()),
+    };
+    // `number` is 1-based (the patch file is `{number:04}`); the orig-commits file
+    // lists one original sha per line in the same order.
+    let Some(line) = orig_commits.lines().nth(number.saturating_sub(1)) else {
+        return Ok(());
+    };
+    let Ok(orig) = ObjectId::from_hex(format, line.trim()) else {
+        return Ok(());
+    };
+    let mut rewritten = fs::read_to_string(state_dir.join("rewritten")).unwrap_or_default();
+    rewritten.push_str(&format!("{orig} {new_oid}\n"));
+    fs::write(state_dir.join("rewritten"), rewritten)?;
+    Ok(())
+}
+
+/// Run the `post-rewrite` hook with arg `rebase`, feeding the accumulated
+/// `rebase-apply/rewritten` (`<old> <new>` per rewritten commit) on stdin —
+/// git's `run_post_rewrite_hook` in builtin/am.c, fired once the series finishes.
+/// A no-op when nothing was rewritten (an all-skipped or noop run).
+fn run_apply_post_rewrite_hook(state_dir: &Path) {
+    let input = fs::read(state_dir.join("rewritten")).unwrap_or_default();
+    if input.is_empty() {
+        return;
+    }
+    let _ = commands::hooks::run_hook(
+        "post-rewrite",
+        commands::hooks::HookRun {
+            args: vec!["rebase".to_string()],
+            stdin: Some(input),
+            ..commands::hooks::HookRun::default()
+        },
+    );
+}
+
 /// Move HEAD back to the original branch at the rebased tip and print the rebase
 /// success line, mirroring `git-rebase--am`'s `move_to_original_branch` + the
 /// "Successfully rebased and updated <branch>." message.
 fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
+    // git fires the post-rewrite hook at the end of the am loop (am.c:1928),
+    // BEFORE the rebase caller moves HEAD back to the original branch. Match that
+    // order: feed the accumulated `<old> <new>` map while the state dir still
+    // exists (the caller removes it after this returns).
+    run_apply_post_rewrite_hook(state_dir);
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -2718,6 +2804,10 @@ fn am_skip(
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head_oid)?;
     let next = read_state_usize(state_dir, "next")?;
+    // git's `am_skip` records the skipped commit in `rewritten` too: `<orig> <HEAD>`,
+    // where HEAD is the (cleaned) tip at skip time (am.c:2131). The post-rewrite
+    // hook then reports a skipped commit as rewritten to the commit it folded into.
+    record_rebase_rewrite(state_dir, format, next, &head_oid)?;
     run_am_series(
         git_dir,
         common_git_dir,
@@ -2790,7 +2880,7 @@ fn am_continue(
         return Err(GitError::Exit(128));
     }
 
-    create_am_commit(
+    let new_oid = create_am_commit(
         git_dir,
         common_git_dir,
         worktree_root,
@@ -2798,6 +2888,7 @@ fn am_continue(
         &patch,
         commit_opts,
     )?;
+    record_rebase_rewrite(state_dir, format, next, &new_oid)?;
     run_am_series(
         git_dir,
         common_git_dir,
