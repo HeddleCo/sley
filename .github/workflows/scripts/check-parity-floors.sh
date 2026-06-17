@@ -382,7 +382,10 @@ declare -A FLOOR=(
     [t7004-tag.sh]=176
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
-    [t0020-crlf.sh]=28
+    # t0020-crlf is FLAKY (oscillates 27/28 — a sley crlf-ordering non-determinism, tracked
+    # separately). Wave-9 bumped it 27->28 from a flaky read; that silently reddened the weekly
+    # floor gate ~1-in-3. Floor = the safe LOWER bound 27. (Lesson: re-measure small +1 bumps.)
+    [t0020-crlf.sh]=27
     [t0021-conversion.sh]=21
     [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10
@@ -391,7 +394,7 @@ declare -A FLOOR=(
     [t1461-refs-list.sh]=378
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
-    [t6423-merge-rename-directories.sh]=17
+    [t6423-merge-rename-directories.sh]=23
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
@@ -462,12 +465,16 @@ declare -A FLOOR=(
     [t5324-split-commit-graph.sh]=11
     [t5329-pack-objects-cruft.sh]=16
     [t5504-fetch-receive-strict.sh]=7
-    [t5505-remote.sh]=81
+    [t5505-remote.sh]=90
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
     [t5516-fetch-push.sh]=57
     [t5520-pull.sh]=23
     [t5601-clone.sh]=60
+    # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
+    # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
+    # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
+    [t5611-clone-config.sh]=13
     [t5603-clone-dirname.sh]=39
     [t7502-commit-porcelain.sh]=75
     [t7600-merge.sh]=44
