@@ -81,6 +81,10 @@ pub(crate) struct DiffOptions {
     pub(crate) diff_hunk_control: bool,
     pub(crate) interhunk: Option<usize>,
     pub(crate) diff_whitespace_control: bool,
+    /// CLI `--indent-heuristic` / `--no-indent-heuristic`: `Some(true)` /
+    /// `Some(false)` when given, `None` to fall back to `diff.indentHeuristic`
+    /// config (which itself defaults to git's enabled-by-default behavior).
+    pub(crate) indent_heuristic: Option<bool>,
     pub(crate) ws_ignore: sley_diff_merge::WsIgnore,
     pub(crate) ignore_blank_lines: bool,
     pub(crate) ignore_regexes: Vec<String>,
@@ -149,6 +153,7 @@ impl Default for DiffOptions {
             diff_hunk_control: false,
             interhunk: None,
             diff_whitespace_control: false,
+            indent_heuristic: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
@@ -1041,8 +1046,11 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             log_validate_output_indicator(long, str_value(option))?;
             options.diff_output_indicator_control = true;
         }
-        (Some('W'), Some("function-context")) | (_, Some("indent-heuristic")) => {
+        (Some('W'), Some("function-context")) => {
             options.diff_patch_context_control = true;
+        }
+        (_, Some("indent-heuristic")) => {
+            options.indent_heuristic = Some(bool_value(option));
         }
         (
             _,

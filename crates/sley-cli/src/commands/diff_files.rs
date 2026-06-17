@@ -107,6 +107,9 @@ struct DiffFilesOptions {
     // `--diff-algorithm=<algo>`: which LCS engine to use. add-patch passes this
     // from `diff.algorithm`; bare diff-files defaults to Myers.
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    // `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
+    // `diff.indentHeuristic` config (default git-enabled).
+    indent_heuristic: Option<bool>,
     path_args: Vec<String>,
 }
 
@@ -147,6 +150,7 @@ impl Default for DiffFilesOptions {
             context: None,
             interhunk: None,
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            indent_heuristic: None,
             path_args: Vec::new(),
         }
     }
@@ -348,6 +352,8 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
             }
             "--rename-empty" => o.rename_empty = true,
             "--no-rename-empty" => o.rename_empty = false,
+            "--indent-heuristic" => o.indent_heuristic = Some(true),
+            "--no-indent-heuristic" => o.indent_heuristic = Some(false),
             value if value.starts_with("-M") && value.len() > 2 => {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
                 o.detect_renames = true;
@@ -583,6 +589,13 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     let context = o.context.unwrap_or(3);
     let interhunk = o.interhunk.unwrap_or(0);
     let diff_algorithm = o.diff_algorithm;
+    // `--indent-heuristic` / `--no-indent-heuristic` win over the
+    // `diff.indentHeuristic` config (which defaults to git's enabled behavior).
+    let indent_heuristic = o.indent_heuristic.unwrap_or_else(|| {
+        repo.config()
+            .get_bool("diff", None, "indentheuristic")
+            .unwrap_or(true)
+    });
 
     let has_differences = !entries.is_empty();
     if !o.quiet && !o.no_patch {
@@ -597,6 +610,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             context,
             interhunk,
             diff_algorithm,
+            indent_heuristic,
         )?;
     }
     if (o.quiet || o.exit_code) && has_differences {
@@ -619,6 +633,7 @@ fn render_diff_files_entries(
     context: usize,
     interhunk: usize,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    indent_heuristic: bool,
 ) -> Result<()> {
     let mut stdout = io::stdout();
     // diff-files always compares the working tree, so the new-side object is the
@@ -723,6 +738,7 @@ fn render_diff_files_entries(
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
+                indent_heuristic,
             };
             write_diff_patch_entry(&mut stdout, entry, patch_options)?;
         }

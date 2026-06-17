@@ -139,6 +139,14 @@ pub struct HunkRenderOptions<'a, 'h> {
     pub ws_ignore: WsIgnore,
     /// The line-diff algorithm to use (Myers / patience / histogram).
     pub algorithm: DiffAlgorithm,
+    /// Indent heuristic (`--indent-heuristic` / `diff.indentHeuristic`): when
+    /// set, change groups that can slide within surrounding identical lines are
+    /// shifted to the most readable boundary (git's `XDF_INDENT_HEURISTIC`
+    /// scoring in `xdl_change_compact`). The base change compaction — sliding
+    /// groups as far down as possible and aligning add/delete pairs — always
+    /// runs; this flag only enables the indent-based slider scoring. Defaults to
+    /// `true` to match git's `diff.indentHeuristic` default.
+    pub indent_heuristic: bool,
     /// Change-group suppression (`--ignore-blank-lines`, `-I<regex>`): when
     /// set, change groups all of whose old and new lines are blank (and/or
     /// match a `-I` regex) are dropped from hunk emission, mirroring git's
@@ -204,6 +212,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             ws_error: None,
             ws_ignore: WsIgnore::default(),
             algorithm: DiffAlgorithm::Myers,
+            indent_heuristic: true,
             change_ignore: None,
             line_ranges: None,
         }
@@ -251,7 +260,13 @@ pub fn render_hunks(
     }
     let old = split_lines(old_content.unwrap_or_default());
     let new = split_lines(new_content.unwrap_or_default());
-    let ops = myers_diff_lines_ws(&old, &new, options.ws_ignore, options.algorithm);
+    let mut ops = myers_diff_lines_ws(&old, &new, options.ws_ignore, options.algorithm);
+
+    // git's `xdl_change_compact`: slide each change group as far down as
+    // possible, snap add/delete pairs back into alignment, and (under the
+    // indent heuristic) shift to the most readable split. Runs on the raw edit
+    // script before it is flattened into tagged lines.
+    change_compact(&mut ops, &old, &new, options.ws_ignore, options.indent_heuristic);
 
     // Flatten the edit script into a tagged line stream carrying old/new
     // positions.
@@ -323,6 +338,537 @@ pub fn render_hunks(
         let hunk_start = first_change.saturating_sub(options.context);
         let hunk_end = (last_change + options.context + 1).min(tagged.len());
         render_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
+    }
+}
+
+// ===========================================================================
+// Change compaction: a faithful port of git's `xdl_change_compact`
+// (xdiff/xdiffi.c), including the `XDF_INDENT_HEURISTIC` slider scoring.
+//
+// git represents a diff as two per-file boolean "changed" arrays (`xdf1.rchg`
+// for the old file, `xdf2.rchg` for the new). A *group* is a maximal run of
+// changed lines (a deletion run in the old file, an insertion run in the new
+// file), separated by runs of unchanged lines. `xdl_change_compact` walks the
+// groups of one file while keeping a synchronized cursor over the groups of the
+// other, sliding each group up/down within identical surrounding lines to a
+// canonical (and, under the indent heuristic, more readable) position.
+//
+// We reconstruct the two `changed[]` arrays from the [`DiffOp`] script, run the
+// algorithm on each file (old then new, exactly as git does), and rebuild the
+// script. Line equality for sliding (`recs_match`) uses the same
+// whitespace-canonicalized bytes the line-level diff used, so a group only
+// slides across lines the diff itself considered identical.
+// ===========================================================================
+
+/// If a line is indented more than this, [`get_indent`] returns this value
+/// (git's `MAX_INDENT`).
+const MAX_INDENT: i32 = 200;
+/// Cap on consecutive blank lines counted around a split (git's `MAX_BLANKS`).
+const MAX_BLANKS: i32 = 20;
+
+// Empirically-determined weight factors from git's xdiffi.c.
+const START_OF_FILE_PENALTY: i32 = 1;
+const END_OF_FILE_PENALTY: i32 = 21;
+const TOTAL_BLANK_WEIGHT: i32 = -30;
+const POST_BLANK_WEIGHT: i32 = 6;
+const RELATIVE_INDENT_PENALTY: i32 = -4;
+const RELATIVE_INDENT_WITH_BLANK_PENALTY: i32 = 10;
+const RELATIVE_OUTDENT_PENALTY: i32 = 24;
+const RELATIVE_OUTDENT_WITH_BLANK_PENALTY: i32 = 17;
+const RELATIVE_DEDENT_PENALTY: i32 = 23;
+const RELATIVE_DEDENT_WITH_BLANK_PENALTY: i32 = 17;
+const INDENT_WEIGHT: i32 = 60;
+const INDENT_HEURISTIC_MAX_SLIDING: i64 = 100;
+
+/// One file's record set for compaction: the whitespace-canonicalized line
+/// bytes (for `recs_match` and `get_indent`) and the per-line `changed` flags.
+/// `nrec` is the number of records; index `-1` and `nrec` are treated as
+/// "unchanged" sentinels, matching git's zero-padded `rchg`.
+struct CompactFile {
+    recs: Vec<Vec<u8>>,
+    changed: Vec<bool>,
+}
+
+impl CompactFile {
+    fn nrec(&self) -> i64 {
+        self.recs.len() as i64
+    }
+
+    /// `xdf->changed[i]` with git's out-of-range sentinels: positions `-1` and
+    /// `nrec` are unchanged (`false`).
+    fn changed(&self, i: i64) -> bool {
+        if i < 0 || i >= self.nrec() {
+            false
+        } else {
+            self.changed[i as usize]
+        }
+    }
+
+    fn set_changed(&mut self, i: i64, v: bool) {
+        self.changed[i as usize] = v;
+    }
+}
+
+/// git's `get_indent`: indentation columns of `rec` treating TAB as advancing
+/// to the next multiple of 8; `-1` for a blank (whitespace-only / empty) line;
+/// clamped at [`MAX_INDENT`].
+fn get_indent(rec: &[u8]) -> i32 {
+    let mut ret: i32 = 0;
+    for &c in rec {
+        if !xdl_isspace(c) {
+            return ret;
+        } else if c == b' ' {
+            ret += 1;
+        } else if c == b'\t' {
+            ret += 8 - ret % 8;
+        }
+        // other whitespace (e.g. CR) is ignored, matching git.
+        if ret >= MAX_INDENT {
+            return MAX_INDENT;
+        }
+    }
+    // The line contains only whitespace.
+    -1
+}
+
+/// git's `XDL_ISSPACE`: space, tab, newline, vertical tab, form feed, carriage
+/// return.
+fn xdl_isspace(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// git's `struct split_measurement`.
+#[derive(Default)]
+struct SplitMeasurement {
+    end_of_file: bool,
+    indent: i32,
+    pre_blank: i32,
+    pre_indent: i32,
+    post_blank: i32,
+    post_indent: i32,
+}
+
+/// git's `struct split_score`.
+#[derive(Default, Clone, Copy)]
+struct SplitScore {
+    effective_indent: i32,
+    penalty: i32,
+}
+
+/// git's `measure_split`: characteristics of a hypothetical split above line
+/// `split` in `xdf`.
+fn measure_split(xdf: &CompactFile, split: i64) -> SplitMeasurement {
+    let mut m = SplitMeasurement::default();
+    if split >= xdf.nrec() {
+        m.end_of_file = true;
+        m.indent = -1;
+    } else {
+        m.end_of_file = false;
+        m.indent = get_indent(&xdf.recs[split as usize]);
+    }
+
+    m.pre_blank = 0;
+    m.pre_indent = -1;
+    let mut i = split - 1;
+    while i >= 0 {
+        m.pre_indent = get_indent(&xdf.recs[i as usize]);
+        if m.pre_indent != -1 {
+            break;
+        }
+        m.pre_blank += 1;
+        if m.pre_blank == MAX_BLANKS {
+            m.pre_indent = 0;
+            break;
+        }
+        i -= 1;
+    }
+
+    m.post_blank = 0;
+    m.post_indent = -1;
+    let mut i = split + 1;
+    while i < xdf.nrec() {
+        m.post_indent = get_indent(&xdf.recs[i as usize]);
+        if m.post_indent != -1 {
+            break;
+        }
+        m.post_blank += 1;
+        if m.post_blank == MAX_BLANKS {
+            m.post_indent = 0;
+            break;
+        }
+        i += 1;
+    }
+
+    m
+}
+
+/// git's `score_add_split`: accumulate the badness of split `m` into `s`.
+fn score_add_split(m: &SplitMeasurement, s: &mut SplitScore) {
+    if m.pre_indent == -1 && m.pre_blank == 0 {
+        s.penalty += START_OF_FILE_PENALTY;
+    }
+    if m.end_of_file {
+        s.penalty += END_OF_FILE_PENALTY;
+    }
+
+    let post_blank = if m.indent == -1 { 1 + m.post_blank } else { 0 };
+    let total_blank = m.pre_blank + post_blank;
+
+    s.penalty += TOTAL_BLANK_WEIGHT * total_blank;
+    s.penalty += POST_BLANK_WEIGHT * post_blank;
+
+    let indent = if m.indent != -1 { m.indent } else { m.post_indent };
+    let any_blanks = total_blank != 0;
+
+    s.effective_indent += indent;
+
+    if indent == -1 || m.pre_indent == -1 {
+        // End of file, or no non-blank predecessor: no adjustment needed
+        // (git's two separate `indent == -1` / `pre_indent == -1` no-op arms).
+    } else if indent > m.pre_indent {
+        s.penalty += if any_blanks {
+            RELATIVE_INDENT_WITH_BLANK_PENALTY
+        } else {
+            RELATIVE_INDENT_PENALTY
+        };
+    } else if indent == m.pre_indent {
+        // Same indentation as predecessor; no adjustment.
+    } else if m.post_indent != -1 && m.post_indent > indent {
+        s.penalty += if any_blanks {
+            RELATIVE_OUTDENT_WITH_BLANK_PENALTY
+        } else {
+            RELATIVE_OUTDENT_PENALTY
+        };
+    } else {
+        s.penalty += if any_blanks {
+            RELATIVE_DEDENT_WITH_BLANK_PENALTY
+        } else {
+            RELATIVE_DEDENT_PENALTY
+        };
+    }
+}
+
+/// git's `score_cmp`: `<0` when `s1` is the better (lower-badness) split.
+fn score_cmp(s1: &SplitScore, s2: &SplitScore) -> i32 {
+    let cmp_indents = (s1.effective_indent > s2.effective_indent) as i32
+        - (s1.effective_indent < s2.effective_indent) as i32;
+    INDENT_WEIGHT * cmp_indents + (s1.penalty - s2.penalty)
+}
+
+/// git's `struct xdlgroup`: a (possibly empty) group spanning `[start, end)` of
+/// changed lines.
+struct XdlGroup {
+    start: i64,
+    end: i64,
+}
+
+/// git's `recs_match`: the two records hash-equal (here: canonicalized bytes
+/// equal).
+fn recs_match(xdf: &CompactFile, a: i64, b: i64) -> bool {
+    xdf.recs[a as usize] == xdf.recs[b as usize]
+}
+
+/// git's `group_init`: point `g` at the first group in `xdf`.
+fn group_init(xdf: &CompactFile) -> XdlGroup {
+    let mut end = 0i64;
+    while xdf.changed(end) {
+        end += 1;
+    }
+    XdlGroup { start: 0, end }
+}
+
+/// git's `group_next`: advance to the next group; `false` if already at EOF.
+fn group_next(xdf: &CompactFile, g: &mut XdlGroup) -> bool {
+    if g.end == xdf.nrec() {
+        return false;
+    }
+    g.start = g.end + 1;
+    g.end = g.start;
+    while xdf.changed(g.end) {
+        g.end += 1;
+    }
+    true
+}
+
+/// git's `group_previous`: step back to the previous group; `false` if at BOF.
+fn group_previous(xdf: &CompactFile, g: &mut XdlGroup) -> bool {
+    if g.start == 0 {
+        return false;
+    }
+    g.end = g.start - 1;
+    g.start = g.end;
+    while xdf.changed(g.start - 1) {
+        g.start -= 1;
+    }
+    true
+}
+
+/// git's `group_slide_down`: slide `g` toward EOF if the line below equals the
+/// group's first line, absorbing any group it bumps into. `false` if it cannot
+/// slide.
+fn group_slide_down(xdf: &mut CompactFile, g: &mut XdlGroup) -> bool {
+    if g.end < xdf.nrec() && recs_match(xdf, g.start, g.end) {
+        xdf.set_changed(g.start, false);
+        xdf.set_changed(g.end, true);
+        g.start += 1;
+        g.end += 1;
+        while xdf.changed(g.end) {
+            g.end += 1;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// git's `group_slide_up`: slide `g` toward BOF if the line above equals the
+/// group's last line, absorbing any group it bumps into. `false` if it cannot
+/// slide.
+fn group_slide_up(xdf: &mut CompactFile, g: &mut XdlGroup) -> bool {
+    if g.start > 0 && recs_match(xdf, g.start - 1, g.end - 1) {
+        g.start -= 1;
+        g.end -= 1;
+        xdf.set_changed(g.start, true);
+        xdf.set_changed(g.end, false);
+        while xdf.changed(g.start - 1) {
+            g.start -= 1;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Compact the change groups of `xdf`, keeping `xdfo` (the other file) in sync.
+/// A faithful port of the per-file body of git's `xdl_change_compact`. The
+/// `xdfo` re-diff tail (only reachable for histogram diff) is omitted: this
+/// compaction never merges groups in a way that creates new matching lines for
+/// the Myers/patience/histogram scripts produced here, so the re-diff is a
+/// no-op for our outputs.
+fn compact_one(xdf: &mut CompactFile, xdfo: &mut CompactFile, indent_heuristic: bool) {
+    let mut g = group_init(xdf);
+    let mut go = group_init(xdfo);
+
+    loop {
+        // Skip empty groups in the to-be-compacted file.
+        if g.end == g.start {
+            if !group_next(xdf, &mut g) {
+                break;
+            }
+            if !group_next(xdfo, &mut go) {
+                break;
+            }
+            continue;
+        }
+
+        let mut groupsize;
+        let mut earliest_end;
+        let mut end_matching_other;
+
+        loop {
+            groupsize = g.end - g.start;
+            end_matching_other = -1i64;
+
+            // Shift the group backward as far as possible.
+            while group_slide_up(xdf, &mut g) {
+                let ok = group_previous(xdfo, &mut go);
+                debug_assert!(ok, "group sync broken sliding up");
+            }
+            // Highest this group can be shifted; record its end.
+            earliest_end = g.end;
+            if go.end > go.start {
+                end_matching_other = g.end;
+            }
+            // Now shift the group forward as far as possible.
+            loop {
+                if !group_slide_down(xdf, &mut g) {
+                    break;
+                }
+                let ok = group_next(xdfo, &mut go);
+                debug_assert!(ok, "group sync broken sliding down");
+                if go.end > go.start {
+                    end_matching_other = g.end;
+                }
+            }
+            if groupsize == g.end - g.start {
+                break;
+            }
+        }
+
+        // The group is now shifted as far down as possible; only upward shifts
+        // remain to consider.
+        if g.end == earliest_end {
+            // No shifting was possible.
+        } else if end_matching_other != -1 {
+            // Move the (possibly merged) group back to line up with the last
+            // group of changes from the other file it can align with. Avoids
+            // splitting one change into a separate add/delete.
+            while go.end == go.start {
+                let ok = group_slide_up(xdf, &mut g);
+                debug_assert!(ok, "match disappeared");
+                let ok = group_previous(xdfo, &mut go);
+                debug_assert!(ok, "group sync broken sliding to match");
+            }
+        } else if indent_heuristic {
+            // Pick the shift with the lowest indent-heuristic score.
+            let mut best_shift = -1i64;
+            let mut best_score = SplitScore::default();
+
+            let mut shift = earliest_end;
+            if g.end - groupsize - 1 > shift {
+                shift = g.end - groupsize - 1;
+            }
+            if g.end - INDENT_HEURISTIC_MAX_SLIDING > shift {
+                shift = g.end - INDENT_HEURISTIC_MAX_SLIDING;
+            }
+            while shift <= g.end {
+                let mut score = SplitScore::default();
+                let m = measure_split(xdf, shift);
+                score_add_split(&m, &mut score);
+                let m = measure_split(xdf, shift - groupsize);
+                score_add_split(&m, &mut score);
+                if best_shift == -1 || score_cmp(&score, &best_score) <= 0 {
+                    best_score = score;
+                    best_shift = shift;
+                }
+                shift += 1;
+            }
+
+            while g.end > best_shift {
+                let ok = group_slide_up(xdf, &mut g);
+                debug_assert!(ok, "best shift unreached");
+                let ok = group_previous(xdfo, &mut go);
+                debug_assert!(ok, "group sync broken sliding to blank line");
+            }
+        }
+
+        // Advance to the next group pair.
+        if !group_next(xdf, &mut g) {
+            break;
+        }
+        if !group_next(xdfo, &mut go) {
+            break;
+        }
+    }
+}
+
+/// Run git's `xdl_change_compact` over the [`DiffOp`] script in place.
+///
+/// Reconstructs the per-file `changed[]` flags from `ops`, compacts the old
+/// file then the new file (each synchronized against the other, as git does),
+/// and rebuilds `ops` from the recompacted flags.
+fn change_compact(
+    ops: &mut Vec<DiffOp>,
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    ws_ignore: WsIgnore,
+    indent_heuristic: bool,
+) {
+    // Fast path: no changes (or a single trivial run) cannot be slid.
+    if ops.iter().all(|op| matches!(op, DiffOp::Equal(_))) {
+        return;
+    }
+
+    // Canonicalized record bytes — the same equality the line-level diff used.
+    let canon = |lines: &[DiffLine<'_>]| -> Vec<Vec<u8>> {
+        if ws_ignore.is_empty() {
+            lines.iter().map(|l| l.content.to_vec()).collect()
+        } else {
+            lines
+                .iter()
+                .map(|l| crate::canonicalize_line_for_match(l.content, ws_ignore))
+                .collect()
+        }
+    };
+
+    let mut xdf1 = CompactFile {
+        recs: canon(old),
+        changed: vec![false; old.len()],
+    };
+    let mut xdf2 = CompactFile {
+        recs: canon(new),
+        changed: vec![false; new.len()],
+    };
+
+    // Reconstruct git's two `changed[]` arrays from the run-length script.
+    let mut oi = 0usize;
+    let mut ni = 0usize;
+    for op in ops.iter() {
+        match *op {
+            DiffOp::Equal(n) => {
+                oi += n;
+                ni += n;
+            }
+            DiffOp::Delete(n) => {
+                for _ in 0..n {
+                    xdf1.changed[oi] = true;
+                    oi += 1;
+                }
+            }
+            DiffOp::Insert(n) => {
+                for _ in 0..n {
+                    xdf2.changed[ni] = true;
+                    ni += 1;
+                }
+            }
+        }
+    }
+
+    // git compacts xdf1 (synced against xdf2) then xdf2 (synced against xdf1).
+    compact_one(&mut xdf1, &mut xdf2, indent_heuristic);
+    compact_one(&mut xdf2, &mut xdf1, indent_heuristic);
+
+    // Rebuild the coalesced op script by walking both files' changed flags in
+    // lockstep, emitting deletes for the old side and inserts for the new side.
+    let n_old = xdf1.changed.len();
+    let n_new = xdf2.changed.len();
+    let mut rebuilt: Vec<DiffOp> = Vec::with_capacity(ops.len());
+    let mut i = 0usize; // old index
+    let mut j = 0usize; // new index
+    while i < n_old || j < n_new {
+        let del = i < n_old && xdf1.changed[i];
+        let ins = j < n_new && xdf2.changed[j];
+        if del {
+            let mut run = 0usize;
+            while i < n_old && xdf1.changed[i] {
+                run += 1;
+                i += 1;
+            }
+            push_op(&mut rebuilt, DiffOp::Delete(run));
+        } else if ins {
+            let mut run = 0usize;
+            while j < n_new && xdf2.changed[j] {
+                run += 1;
+                j += 1;
+            }
+            push_op(&mut rebuilt, DiffOp::Insert(run));
+        } else {
+            // Both sides are unchanged here: an equal run.
+            let mut run = 0usize;
+            while i < n_old
+                && j < n_new
+                && !xdf1.changed[i]
+                && !xdf2.changed[j]
+            {
+                run += 1;
+                i += 1;
+                j += 1;
+            }
+            debug_assert!(run > 0, "change_compact stalled rebuilding script");
+            push_op(&mut rebuilt, DiffOp::Equal(run));
+        }
+    }
+
+    *ops = rebuilt;
+}
+
+/// Append `op` to `out`, coalescing with a same-kind run at the tail.
+fn push_op(out: &mut Vec<DiffOp>, op: DiffOp) {
+    match (out.last_mut(), op) {
+        (Some(DiffOp::Equal(prev)), DiffOp::Equal(n)) => *prev += n,
+        (Some(DiffOp::Delete(prev)), DiffOp::Delete(n)) => *prev += n,
+        (Some(DiffOp::Insert(prev)), DiffOp::Insert(n)) => *prev += n,
+        _ => out.push(op),
     }
 }
 

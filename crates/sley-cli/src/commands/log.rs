@@ -375,6 +375,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Diff-output options (`-p`, `--stat`, ...): rendered per commit against
     // its first parent, mirroring git's log diff machinery.
     let mut diff_opts = LogDiffOptions::default();
+    // Tracks whether `--indent-heuristic` / `--no-indent-heuristic` was given on
+    // the command line, so a CLI flag wins over `diff.indentHeuristic` config.
+    let mut indent_heuristic_explicit = false;
     // `-L<start>,<end>:<file>` / `-L:<funcname>:<file>` line-log arguments (the
     // raw `<range>:<file>` strings). When non-empty, the log runs the line-log
     // engine instead of the ordinary walk.
@@ -642,8 +645,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--no-ext-diff"
             | "--find-copies-harder"
             | "--no-find-copies-harder"
-            | "--indent-heuristic"
-            | "--no-indent-heuristic"
             | "--function-context"
             | "--default-prefix"
             | "--break-rewrites"
@@ -667,6 +668,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--find-copies" | "-C" => {
                 renames_override = Some(true);
                 copies_override = Some(true);
+            }
+            "--indent-heuristic" => {
+                diff_opts.indent_heuristic = true;
+                indent_heuristic_explicit = true;
+            }
+            "--no-indent-heuristic" => {
+                diff_opts.indent_heuristic = false;
+                indent_heuristic_explicit = true;
             }
             "--minimal" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
             "--patience" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
@@ -1342,6 +1351,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    // `diff.indentHeuristic` sets the default; a CLI
+    // `--indent-heuristic`/`--no-indent-heuristic` (tracked above) overrides it.
+    if !indent_heuristic_explicit {
+        diff_opts.indent_heuristic = config
+            .get_bool("diff", None, "indentheuristic")
+            .unwrap_or(true);
+    }
     // `log.diffMerges` provides the default merge-diff mode and is validated
     // unconditionally at startup (git rejects a wrong value with exit 128 even
     // for a plain `git log` with no diff output).
@@ -2992,6 +3008,7 @@ fn render_line_log_patch(
                 ignore_blank_lines: diff_opts.ignore_blank_lines,
                 ignore_regexes: &diff_opts.ignore_regexes,
                 line_ranges: Some(&file.line_ranges),
+                indent_heuristic: diff_opts.indent_heuristic,
             },
         )?;
     }
@@ -3336,6 +3353,9 @@ struct LogDiffOptions {
     ignore_regexes: Vec<crate::grep_source::Regex>,
     /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
     text: bool,
+    /// Resolved `--indent-heuristic` / `diff.indentHeuristic` (default
+    /// git-enabled).
+    indent_heuristic: bool,
 }
 
 impl Default for LogDiffOptions {
@@ -3357,6 +3377,7 @@ impl Default for LogDiffOptions {
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             text: false,
+            indent_heuristic: true,
         }
     }
 }
@@ -3964,6 +3985,7 @@ impl LogDiffContext<'_> {
                         ignore_blank_lines: self.opts.ignore_blank_lines,
                         ignore_regexes: &self.opts.ignore_regexes,
                         line_ranges: None,
+                        indent_heuristic: self.opts.indent_heuristic,
                     },
                 )?;
             }
