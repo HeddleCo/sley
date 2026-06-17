@@ -119,6 +119,16 @@ struct SubmoduleUpdateOptions<'a> {
     init: bool,
     recursive: bool,
     quiet: bool,
+    force: bool,
+    remote: bool,
+    nofetch: bool,
+    /// The strategy forced by `--checkout`/`--merge`/`--rebase` on the command
+    /// line; `Unspecified` when none was given.
+    cli_default: sley_submodule::UpdateType,
+    /// `--depth <n>` for a shallow clone of a just-cloned submodule.
+    depth: Option<u32>,
+    /// `--filter <spec>` partial-clone filter (requires `--init`).
+    filter: Option<String>,
     paths: Vec<&'a str>,
 }
 
@@ -354,123 +364,519 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
     let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &options.paths)?;
     let index = read_repository_index(&git_dir, format)?;
     let config = read_repo_config(&git_dir)?;
+    // git iterates the whole selected list and only stops early on a *fatal*
+    // failure of the update itself (merge conflict, rebase error, command
+    // failure). A plain checkout error continues to the next submodule (so
+    // sibling submodules are still updated) but the command's final exit code is
+    // non-zero. We thread both behaviors: `first_error` records a non-fatal
+    // checkout failure, `?` propagates a fatal one immediately.
+    let mut first_error: Option<GitError> = None;
     for submodule in selected {
         let Some(target_oid) = submodule_index_oid(&index, &submodule.path) else {
+            // An unmerged (stage > 0) gitlink is skipped with a notice — git's
+            // `prepare_to_clone_next_submodule` "Skipping unmerged submodule".
+            if submodule_index_is_unmerged(&index, &submodule.path) {
+                let display = display_submodule_path(&cwd, &worktree_root, &submodule.path)?;
+                eprintln!("Skipping unmerged submodule {display}");
+            }
             continue;
         };
-        let path = worktree_root.join(&submodule.path);
-        // `update` (without --init) only touches *initialized* submodules:
-        // ones whose url was copied into .git/config. A .gitmodules-only
-        // entry gets upstream's two-line stderr nudge and is skipped.
-        let Some(url) = config
-            .get("submodule", Some(&submodule.name), "url")
-            .map(str::to_string)
-        else {
-            eprintln!("Submodule path '{}' not initialized", submodule.path);
-            eprintln!("Maybe you want to use 'update --init'?");
-            continue;
-        };
-        let just_populated = submodule_head(&path).is_err();
-        if just_populated {
-            // Populate the worktree: reconnect to a retained
-            // .git/modules/<path> git dir when one exists (upstream
-            // clone_submodule does the same after the worktree was removed),
-            // otherwise clone fresh. NOTE: `-N/--no-fetch` only skips the
-            // *fetch* step of an update; the native implementation has no
-            // separate fetch today, so the flag is accepted as a no-op.
-            let modules_git_dir = git_dir.join("modules").join(&submodule.path);
-            if modules_git_dir.join("HEAD").is_file() {
-                if path.exists() {
-                    if !path.is_dir() || fs::read_dir(&path)?.next().is_some() {
-                        eprintln!(
-                            "fatal: destination path '{}' already exists and is not an empty directory",
-                            submodule.path
-                        );
-                        return Err(GitError::Exit(128));
-                    }
-                } else {
-                    fs::create_dir_all(&path)?;
+        match update_one_submodule(
+            &cwd,
+            &git_dir,
+            &worktree_root,
+            &config,
+            submodule,
+            &target_oid,
+            &options,
+        )? {
+            UpdateOutcome::Done => {}
+            UpdateOutcome::NonFatalCheckoutError(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
                 }
-                rewrite_submodule_gitdir_file(&path, &modules_git_dir)?;
-                set_submodule_core_worktree(&path, &modules_git_dir)?;
-            } else {
-                let mut clone_args = Vec::new();
-                if options.quiet {
-                    clone_args.push("-q".to_string());
-                }
-                clone_args.push("--separate-git-dir".to_string());
-                clone_args.push(modules_git_dir.display().to_string());
-                clone_args.push(url);
-                clone_args.push(path.display().to_string());
-                super::remote_cmds::cmd_clone(&clone_args)?;
-                rewrite_submodule_gitdir_file(&path, &modules_git_dir)?;
-                set_submodule_core_worktree(&path, &modules_git_dir)?;
             }
         }
-        // Check out the gitlink oid recorded in the superproject index,
-        // detached — upstream `submodule update --checkout` runs
-        // `git checkout -q <oid>` inside the submodule and reports it. A
-        // submodule already at the recorded oid is left alone (and silent) —
-        // unless its worktree was just (re)populated: a reconnected git dir
-        // can already have HEAD at the target while the worktree is empty.
-        let (sub_git_dir, head_oid) = submodule_head(&path)?;
-        if just_populated || head_oid != target_oid {
-            let sub_format = repository_object_format(&sub_git_dir)?;
-            sley_worktree::reset_index_and_worktree_to_commit(
-                &path,
-                &sub_git_dir,
-                sub_format,
-                &target_oid,
-            )?;
-            fs::write(sub_git_dir.join("HEAD"), format!("{target_oid}\n"))?;
-            if !options.quiet {
-                println!(
-                    "Submodule path '{}': checked out '{target_oid}'",
-                    submodule.path
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The result of updating one submodule. A non-fatal checkout failure is carried
+/// up so the loop continues to the next submodule but the overall command still
+/// exits non-zero (git's `run_update_command` returns the `git checkout` exit
+/// code without `die()`ing the whole run).
+enum UpdateOutcome {
+    Done,
+    NonFatalCheckoutError(GitError),
+}
+
+/// The single `submodule update` primitive — git's `update_submodule` +
+/// `run_update_procedure` + `run_update_command`. Every update mode
+/// (checkout/merge/rebase/command) and every `none`-skip flows through here, so
+/// the whole class shares one strategy resolver + one dispatch.
+#[allow(clippy::too_many_arguments)]
+fn update_one_submodule(
+    cwd: &Path,
+    git_dir: &Path,
+    worktree_root: &Path,
+    config: &GitConfig,
+    submodule: &SubmoduleConfigEntry,
+    target_oid: &ObjectId,
+    options: &SubmoduleUpdateOptions<'_>,
+) -> Result<UpdateOutcome> {
+    let display = display_submodule_path(cwd, worktree_root, &submodule.path)?;
+    let path = worktree_root.join(&submodule.path);
+
+    // git's `prepare_to_clone_next_submodule`: an update=none submodule (from
+    // .git/config OR .gitmodules) is skipped BEFORE the initialized check, with
+    // a "Skipping submodule '<displaypath>'" notice — UNLESS the CLI forced a
+    // mode (`--checkout`/`--merge`/`--rebase`), which overrides update=none.
+    if options.cli_default == sley_submodule::UpdateType::Unspecified {
+        let config_none = config
+            .get("submodule", Some(&submodule.name), "update")
+            .map(|v| v == "none");
+        let effective_none = match config_none {
+            Some(is_none) => is_none,
+            None => submodule.update.as_deref() == Some("none"),
+        };
+        if effective_none {
+            eprintln!("Skipping submodule '{display}'");
+            return Ok(UpdateOutcome::Done);
+        }
+    }
+
+    // `update` (without --init) only touches *initialized* submodules: ones
+    // whose url was copied into .git/config. A .gitmodules-only entry gets
+    // upstream's two-line stderr nudge and is skipped.
+    let Some(url) = config
+        .get("submodule", Some(&submodule.name), "url")
+        .map(str::to_string)
+    else {
+        eprintln!("Submodule path '{}' not initialized", submodule.path);
+        eprintln!("Maybe you want to use 'update --init'?");
+        return Ok(UpdateOutcome::Done);
+    };
+
+    let just_populated = submodule_head(&path).is_err();
+    if just_populated {
+        populate_submodule_worktree(git_dir, &submodule.path, &path, &url, options)?;
+    }
+
+    // Resolve the effective update strategy via the single resolver. The typed
+    // `.gitmodules` strategy is reconstructed from the raw string the config
+    // reader carries.
+    let gitmodules_strategy = submodule
+        .update
+        .as_deref()
+        .and_then(sley_submodule::parse_update_strategy)
+        .unwrap_or_default();
+    let config_update = config.get("submodule", Some(&submodule.name), "update");
+    let strategy = match sley_submodule::determine_update_strategy(
+        options.cli_default,
+        config_update,
+        &gitmodules_strategy,
+        just_populated,
+    ) {
+        Ok(strategy) => strategy,
+        Err(value) => {
+            eprintln!(
+                "fatal: Invalid update mode '{value}' configured for submodule path '{}'",
+                submodule.path
+            );
+            return Err(GitError::Exit(128));
+        }
+    };
+
+    let (sub_git_dir, head_oid) = submodule_head(&path)?;
+    let sub_format = repository_object_format(&sub_git_dir)?;
+
+    // `--remote`: re-point the target oid at the upstream branch tip rather than
+    // the gitlink recorded in the superproject index. git fetches, then resolves
+    // `refs/remotes/<remote>/<branch>`.
+    let target_oid = if options.remote {
+        remote_target_oid(
+            &path,
+            &sub_git_dir,
+            sub_format,
+            config,
+            submodule,
+            options,
+            &display,
+        )?
+    } else {
+        *target_oid
+    };
+
+    // `subforce`: git forces the checkout when the submodule has no current HEAD
+    // (just cloned) or `--force` was given.
+    let subforce = just_populated || options.force;
+
+    // git: run the update only when the target differs from the current HEAD, OR
+    // --force was given. A just-populated worktree always needs the checkout.
+    if just_populated || head_oid != target_oid || options.force {
+        match run_submodule_update_command(
+            &path,
+            &sub_git_dir,
+            &strategy,
+            &target_oid,
+            subforce,
+            options.quiet,
+            &display,
+        )? {
+            UpdateOutcome::Done => {}
+            other => return Ok(other),
+        }
+    }
+
+    // `submodule update --recursive`: after this submodule is checked out,
+    // recurse into ITS submodules. Self-invoke `sley submodule update --init
+    // --recursive` inside the submodule worktree, which is where the nested
+    // `.gitmodules` + `.git/config` (and the nested `.git/modules/...`) live.
+    // Running it as a child process — exactly as git's `update_submodule` does —
+    // makes the nested git-dir land in `<this>/.git/modules/<sub>` (which, via
+    // the gitdir-file chain, is `super/.git/modules/<path>/modules/<sub>`).
+    if options.recursive {
+        recurse_submodule_update(&path, &display, options)?;
+    }
+
+    Ok(UpdateOutcome::Done)
+}
+
+/// Populate a just-initialized submodule's worktree: reconnect to a retained
+/// `.git/modules/<path>` git dir when one exists (upstream `clone_submodule`
+/// does the same after the worktree was removed), otherwise clone fresh.
+fn populate_submodule_worktree(
+    git_dir: &Path,
+    sub_path: &str,
+    path: &Path,
+    url: &str,
+    options: &SubmoduleUpdateOptions<'_>,
+) -> Result<()> {
+    let modules_git_dir = git_dir.join("modules").join(sub_path);
+    if modules_git_dir.join("HEAD").is_file() {
+        if path.exists() {
+            if !path.is_dir() || fs::read_dir(path)?.next().is_some() {
+                eprintln!(
+                    "fatal: destination path '{sub_path}' already exists and is not an empty directory"
                 );
+                return Err(GitError::Exit(128));
             }
+        } else {
+            fs::create_dir_all(path)?;
         }
-        // `submodule update --recursive`: after populating + checking out this
-        // submodule, recurse into ITS submodules with `update --init --recursive`
-        // (git's RECURSE_SUBMODULES_ON path). Done in the submodule's worktree,
-        // which is where its own `.gitmodules` + `.git/config` live.
-        if options.recursive {
-            run_submodule_update_recursive(&path, options.quiet)?;
+        rewrite_submodule_gitdir_file(path, &modules_git_dir)?;
+        set_submodule_core_worktree(path, &modules_git_dir)?;
+    } else {
+        let mut clone_args = Vec::new();
+        if options.quiet {
+            clone_args.push("-q".to_string());
         }
+        if let Some(depth) = options.depth {
+            clone_args.push(format!("--depth={depth}"));
+        }
+        if let Some(filter) = &options.filter {
+            clone_args.push(format!("--filter={filter}"));
+        }
+        clone_args.push("--separate-git-dir".to_string());
+        clone_args.push(modules_git_dir.display().to_string());
+        clone_args.push(url.to_string());
+        clone_args.push(path.display().to_string());
+        super::remote_cmds::cmd_clone(&clone_args)?;
+        rewrite_submodule_gitdir_file(path, &modules_git_dir)?;
+        set_submodule_core_worktree(path, &modules_git_dir)?;
     }
     Ok(())
 }
 
-/// Recurse `submodule update --init --recursive` into the submodule rooted at
-/// `submodule_root`. Mirrors git's `update --recursive` step that, after a
-/// submodule is checked out, runs the same update on the submodule's own
-/// submodules. Runs in `submodule_root` (where the nested `.gitmodules` lives).
-fn run_submodule_update_recursive(submodule_root: &Path, quiet: bool) -> Result<()> {
-    // The nested submodule may have no submodules of its own; that's a no-op.
-    let nested = read_submodule_configs(submodule_root)?;
-    if nested.is_empty() {
-        return Ok(());
+/// `--remote`: fetch the submodule's default remote, then resolve the configured
+/// (or `.gitmodules`, or `HEAD`) branch tip to the oid we should update to.
+/// Mirrors git's `update_submodule` remote branch: `remote_submodule_branch`
+/// (config override > `.gitmodules` branch > `HEAD`, with `.` = superproject's
+/// current branch) then `refs/remotes/<remote>/<branch>`.
+fn remote_target_oid(
+    path: &Path,
+    sub_git_dir: &Path,
+    sub_format: ObjectFormat,
+    config: &GitConfig,
+    submodule: &SubmoduleConfigEntry,
+    options: &SubmoduleUpdateOptions<'_>,
+    display: &str,
+) -> Result<ObjectId> {
+    let remote = submodule_default_remote(sub_git_dir, sub_format)?;
+    let branch = resolve_remote_branch(config, submodule)?;
+    let remote_ref = format!("refs/remotes/{remote}/{branch}");
+
+    if !options.nofetch {
+        let mut fetch_args = vec!["-C".to_string(), path.display().to_string()];
+        fetch_args.push(remote.clone());
+        // Run the fetch via self-invocation so the submodule's own config/remote
+        // is used (git spawns `git -C <sm_path> fetch`).
+        let status = self_sley(&fetch_args)?;
+        if !status.success() {
+            eprintln!("fatal: Unable to fetch in submodule path '{display}'");
+            return Err(GitError::Exit(128));
+        }
     }
-    let previous = env::current_dir()?;
-    env::set_current_dir(submodule_root)?;
-    let mut args = Vec::new();
-    if quiet {
-        args.push("-q".to_string());
+
+    let store = FileRefStore::new(sub_git_dir, sub_format);
+    if let Some(oid) = resolve_ref_to_oid(&store, &remote_ref)? {
+        return Ok(oid);
     }
-    args.push("--init".to_string());
-    args.push("--recursive".to_string());
-    let result = cmd_submodule_update(&args, quiet);
-    // Always restore the cwd, even on error, so the outer loop stays anchored.
-    env::set_current_dir(previous)?;
-    result
+    eprintln!("fatal: Unable to find {remote_ref} revision in submodule path '{}'", display);
+    Err(GitError::Exit(128))
+}
+
+/// Run a `sley fetch -C <sm_path> <remote>`-style self-invocation. The first
+/// argument must be the bare subcommand args (e.g. `["-C", path, remote]`);
+/// `fetch` is prepended here.
+fn self_sley(fetch_args: &[String]) -> Result<std::process::ExitStatus> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command = ProcessCommand::new(exe);
+    command.arg("fetch");
+    command.args(fetch_args);
+    command
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))
+}
+
+/// git's `remote_submodule_branch`: `submodule.<name>.branch` from
+/// `.git/config`, falling back to the `.gitmodules` branch, then `HEAD`. A `.`
+/// value means "inherit the superproject's current branch".
+fn resolve_remote_branch(
+    config: &GitConfig,
+    submodule: &SubmoduleConfigEntry,
+) -> Result<String> {
+    let branch = config
+        .get("submodule", Some(&submodule.name), "branch")
+        .map(str::to_string)
+        .or_else(|| submodule_gitmodules_branch(submodule));
+    let Some(branch) = branch else {
+        return Ok("HEAD".to_string());
+    };
+    if branch != "." {
+        return Ok(branch);
+    }
+    // `.` inherits the superproject's current branch.
+    let cwd = env::current_dir()?;
+    let super_git_dir = discover_git_dir(&cwd)?;
+    let super_format = repository_object_format(&super_git_dir)?;
+    let store = FileRefStore::new(&super_git_dir, super_format);
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+        if let Some(name) = target.strip_prefix("refs/heads/") {
+            return Ok(name.to_string());
+        }
+    }
+    eprintln!(
+        "fatal: Submodule ({}) branch configured to inherit branch from superproject, but the superproject is not on any branch",
+        submodule.name
+    );
+    Err(GitError::Exit(128))
+}
+
+/// Read the `.gitmodules` `branch` value for a submodule (the typed config
+/// reader does not surface it, so re-read it here).
+fn submodule_gitmodules_branch(submodule: &SubmoduleConfigEntry) -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    let git_dir = discover_git_dir(&cwd).ok()?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir).ok()?;
+    let gitmodules = GitConfig::read(worktree_root.join(".gitmodules")).ok()?;
+    gitmodules
+        .get("submodule", Some(&submodule.name), "branch")
+        .map(str::to_string)
+}
+
+/// git's `get_default_remote_submodule`: the remote of the submodule's current
+/// branch, falling back to `origin`.
+fn submodule_default_remote(sub_git_dir: &Path, sub_format: ObjectFormat) -> Result<String> {
+    let config = read_repo_config(sub_git_dir)?;
+    let store = FileRefStore::new(sub_git_dir, sub_format);
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+        if let Some(branch) = target.strip_prefix("refs/heads/") {
+            if let Some(remote) = config.get("branch", Some(branch), "remote") {
+                return Ok(remote.to_string());
+            }
+        }
+    }
+    Ok("origin".to_string())
+}
+
+/// True when the index carries an unmerged (stage > 0) gitlink at `path`.
+fn submodule_index_is_unmerged(index: &Option<Index>, path: &str) -> bool {
+    use sley_index::Stage;
+    let path = path.as_bytes();
+    index.as_ref().is_some_and(|index| {
+        index
+            .entries
+            .iter()
+            .any(|entry| entry.path == path && entry.stage() != Stage::Normal)
+    })
+}
+
+/// Run ONE update strategy against the submodule worktree — git's
+/// `run_update_command`. checkout/rebase/merge route through the matching `sley`
+/// subcommand (run as a child process inside the submodule, exactly like git
+/// spawns `git checkout`/`git rebase`/`git merge`), and a `!command` runs the
+/// shell command. The byte-for-byte error text comes from the underlying sley
+/// command; we add git's `Unable to … in submodule path` / `Execution of …
+/// failed` fatal line on failure and the success notice otherwise.
+#[allow(clippy::too_many_arguments)]
+fn run_submodule_update_command(
+    path: &Path,
+    sub_git_dir: &Path,
+    strategy: &sley_submodule::UpdateStrategy,
+    target_oid: &ObjectId,
+    subforce: bool,
+    quiet: bool,
+    display: &str,
+) -> Result<UpdateOutcome> {
+    use sley_submodule::UpdateType;
+    let oid = target_oid.to_string();
+
+    // Build the subcommand (sley) or shell command to run in the submodule.
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command;
+    match strategy.kind {
+        UpdateType::Checkout => {
+            command = ProcessCommand::new(&exe);
+            command.arg("checkout").arg("-q");
+            if subforce {
+                command.arg("-f");
+            }
+            command.arg(&oid);
+        }
+        UpdateType::Rebase => {
+            command = ProcessCommand::new(&exe);
+            command.arg("rebase");
+            if quiet {
+                command.arg("--quiet");
+            }
+            command.arg(&oid);
+        }
+        UpdateType::Merge => {
+            command = ProcessCommand::new(&exe);
+            command.arg("merge");
+            if quiet {
+                command.arg("--quiet");
+            }
+            command.arg(&oid);
+        }
+        UpdateType::Command => {
+            let cmd = strategy.command.clone().unwrap_or_default();
+            command = ProcessCommand::new("sh");
+            command.arg("-c").arg(format!("{cmd} \"$@\"")).arg(&cmd).arg(&oid);
+        }
+        UpdateType::None | UpdateType::Unspecified => {
+            // Resolved strategy never carries these (none is skipped earlier,
+            // unspecified defaults to checkout); be defensive and no-op.
+            return Ok(UpdateOutcome::Done);
+        }
+    }
+
+    io::stdout().flush()?;
+    let status = command
+        .current_dir(path)
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+
+    if !status.success() {
+        match strategy.kind {
+            UpdateType::Checkout => {
+                eprintln!("fatal: Unable to checkout '{oid}' in submodule path '{display}'");
+                // git returns the `git checkout` exit code WITHOUT die()ing the
+                // whole run, so sibling submodules still update.
+                return Ok(UpdateOutcome::NonFatalCheckoutError(GitError::Exit(1)));
+            }
+            UpdateType::Rebase => {
+                eprintln!("fatal: Unable to rebase '{oid}' in submodule path '{display}'");
+            }
+            UpdateType::Merge => {
+                eprintln!("fatal: Unable to merge '{oid}' in submodule path '{display}'");
+            }
+            UpdateType::Command => {
+                let cmd = strategy.command.clone().unwrap_or_default();
+                eprintln!(
+                    "fatal: Execution of '{cmd} {oid}' failed in submodule path '{display}'"
+                );
+            }
+            UpdateType::None | UpdateType::Unspecified => {}
+        }
+        return Err(GitError::Exit(1));
+    }
+
+    if !quiet {
+        match strategy.kind {
+            UpdateType::Checkout => {
+                println!("Submodule path '{display}': checked out '{oid}'");
+            }
+            UpdateType::Rebase => {
+                println!("Submodule path '{display}': rebased into '{oid}'");
+            }
+            UpdateType::Merge => {
+                println!("Submodule path '{display}': merged in '{oid}'");
+            }
+            UpdateType::Command => {
+                let cmd = strategy.command.clone().unwrap_or_default();
+                println!("Submodule path '{display}': '{cmd} {oid}'");
+            }
+            UpdateType::None | UpdateType::Unspecified => {}
+        }
+    }
+    let _ = sub_git_dir;
+    Ok(UpdateOutcome::Done)
+}
+
+/// Recurse `submodule update` into the submodule rooted at `submodule_root` by
+/// self-invoking `sley submodule update --init --recursive` as a child process
+/// in that worktree — git's `update_submodule` recursion. Running as a child
+/// (not an in-process `cwd` swap) is what makes the nested submodule git-dir
+/// land in `<submodule>/.git/modules/...` (i.e.
+/// `super/.git/modules/<path>/modules/<sub>` via the gitdir-file chain) and
+/// keeps the displaypaths anchored at the recursion root. On failure git prints
+/// `Failed to recurse into submodule path '<displaypath>'` and propagates the
+/// child's exit code.
+fn recurse_submodule_update(
+    submodule_root: &Path,
+    display: &str,
+    options: &SubmoduleUpdateOptions<'_>,
+) -> Result<()> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command = ProcessCommand::new(exe);
+    command.arg("submodule");
+    if options.quiet {
+        command.arg("--quiet");
+    }
+    command.arg("update").arg("--init").arg("--recursive");
+    if options.force {
+        command.arg("--force");
+    }
+    io::stdout().flush()?;
+    let status = command
+        .current_dir(submodule_root)
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if !status.success() {
+        eprintln!("fatal: Failed to recurse into submodule path '{display}'");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
 }
 
 fn parse_submodule_update_options(
     args: &[String],
     mut quiet: bool,
 ) -> Result<SubmoduleUpdateOptions<'_>> {
+    use sley_submodule::UpdateType;
     let mut init = false;
     let mut recursive = false;
+    let mut force = false;
+    let mut remote = false;
+    let mut nofetch = false;
+    let mut cli_default = UpdateType::Unspecified;
+    let mut depth = None;
+    let mut filter = None;
     let mut paths = Vec::new();
     let mut positional_only = false;
     let mut index = 0;
@@ -486,22 +892,52 @@ fn parse_submodule_update_options(
             "--quiet" | "-q" => quiet = true,
             "--init" => init = true,
             "--recursive" => recursive = true,
-            // `-N/--no-fetch` skips the fetch step of an update; the native
-            // implementation performs no separate fetch, so it is a no-op
-            // (NOT "skip checkout" — the checkout below still happens).
-            "--no-fetch" | "-N" => {}
-            "--checkout"
-            | "--merge"
-            | "--rebase"
-            | "--recommend-shallow"
+            "--force" | "-f" => force = true,
+            "--remote" => remote = true,
+            // `-N/--no-fetch` skips the fetch step of an update; only meaningful
+            // for `--remote` today (the non-remote path has no separate fetch).
+            "--no-fetch" | "-N" => nofetch = true,
+            // The three update-mode flags force the strategy (git's
+            // `update_default`). Last one wins, like git's option parsing.
+            "--checkout" => cli_default = UpdateType::Checkout,
+            "--merge" => cli_default = UpdateType::Merge,
+            "--rebase" => cli_default = UpdateType::Rebase,
+            "--recommend-shallow"
             | "--no-recommend-shallow"
             | "--single-branch"
-            | "--no-single-branch" => {}
-            "--filter" => {
+            | "--no-single-branch"
+            | "--progress"
+            | "--no-progress" => {}
+            "--depth" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                depth = Some(value.parse::<u32>().map_err(|_| {
+                    eprintln!("fatal: invalid depth '{value}'");
+                    GitError::Exit(128)
+                })?);
+            }
+            value if let Some(value) = value.strip_prefix("--depth=") => {
+                depth = Some(value.parse::<u32>().map_err(|_| {
+                    eprintln!("fatal: invalid depth '{value}'");
+                    GitError::Exit(128)
+                })?);
+            }
+            "--jobs" | "-j" => {
+                // Parallelism is accepted but ignored (sley updates serially).
                 index += 1;
                 if args.get(index).is_none() {
                     return submodule_usage();
                 }
+            }
+            value if value.strip_prefix("--jobs=").is_some() => {}
+            "--filter" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                filter = Some(value.clone());
             }
             // See parse_submodule_add_options: refuse --reference rather than
             // silently cloning without the requested object borrowing.
@@ -513,16 +949,29 @@ fn parse_submodule_update_options(
                 eprintln!("fatal: sley submodule update does not support --reference yet");
                 return Err(GitError::Exit(128));
             }
-            value if value.starts_with("--filter=") => {}
+            value if let Some(value) = value.strip_prefix("--filter=") => {
+                filter = Some(value.to_string());
+            }
             value if value.starts_with('-') => return submodule_usage(),
             value => paths.push(value),
         }
         index += 1;
     }
+    // git: `--filter` requires `--init` (exit code 129 — usage error).
+    if filter.is_some() && !init {
+        eprintln!("fatal: --filter can only be used with the --init option");
+        return Err(GitError::Exit(129));
+    }
     Ok(SubmoduleUpdateOptions {
         init,
         recursive,
         quiet,
+        force,
+        remote,
+        nofetch,
+        cli_default,
+        depth,
+        filter,
         paths,
     })
 }
@@ -2145,6 +2594,19 @@ fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<SubmoduleConfigEnt
         return Ok(Vec::new());
     };
     let set = sley_submodule::SubmoduleConfigSet::parse(&config);
+    // git die()s "invalid value for 'submodule.<name>.update'" the moment any
+    // command parses a `.gitmodules` with a bad update value (an unrecognized
+    // mode or a forbidden `!command`). The typed parser surfaces that as an
+    // `InvalidUpdate` warning; promote the FIRST one to git's fatal here so
+    // status / init / update all reject it identically.
+    if let Some(sley_submodule::ParseWarning::InvalidUpdate { name }) = set
+        .warnings
+        .iter()
+        .find(|w| matches!(w, sley_submodule::ParseWarning::InvalidUpdate { .. }))
+    {
+        eprintln!("fatal: invalid value for 'submodule.{name}.update'");
+        return Err(GitError::Exit(128));
+    }
     let mut submodules = Vec::new();
     for submodule in set.iter() {
         // A submodule with no `path` is not addressable; the old walk skipped

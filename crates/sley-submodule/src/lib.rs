@@ -14,6 +14,11 @@
 //!   `submodule init` / `sync` / `add` all route their relative-url math through
 //!   this one primitive so every git URL form (ssh, scp-style, file://, helper,
 //!   relative local path) resolves byte-for-byte the way upstream does.
+//! - [`update_strategy`] — the `submodule update` mode resolver
+//!   (`submodule--helper.c::determine_submodule_update_strategy`): picks ONE of
+//!   checkout/merge/rebase/command/none from the CLI-flag → `.git/config` →
+//!   `.gitmodules` → default-checkout precedence, with the `just_cloned`
+//!   downgrade. `submodule update` routes every mode through this one resolver.
 //! - [`move_head`] — the move-head / verify-clean primitives
 //!   (`submodule.c::submodule_move_head` dry-run path + the `unpack-trees.c`
 //!   wrappers `check_submodule_move_head` / `verify_clean_submodule`). These are
@@ -27,6 +32,7 @@
 pub mod config;
 pub mod move_head;
 pub mod relative_url;
+pub mod update_strategy;
 
 pub use config::{
     ParseWarning, RecurseMode, Submodule, SubmoduleConfigSet, UpdateStrategy, UpdateType,
@@ -34,6 +40,7 @@ pub use config::{
     parse_update_strategy, parse_update_type, update_type_to_string,
 };
 pub use relative_url::{relative_url, resolve_relative_url};
+pub use update_strategy::determine_update_strategy;
 pub use move_head::{
     MoveHeadContext, MoveHeadFlags, MoveHeadVerdict, check_move_head, check_submodule_move_head,
     verify_clean_submodule,

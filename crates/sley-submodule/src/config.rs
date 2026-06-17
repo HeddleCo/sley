@@ -159,6 +159,12 @@ pub enum ParseWarning {
     /// `warning("Invalid parameter '%s' for config option
     /// 'submodule.%s.ignore'")`.
     InvalidIgnore { name: String, value: String },
+    /// git `die(_("invalid value for '%s'"))` while parsing
+    /// `submodule.<name>.update` — either an unrecognized value or a `!command`
+    /// (which is forbidden from `.gitmodules` for security). This crate has no
+    /// fatal channel, so it surfaces here; the `submodule init`/`update` path
+    /// turns it into the fatal git behavior.
+    InvalidUpdate { name: String },
 }
 
 /// The parsed set of all submodules from one `.gitmodules`, the analogue of the
@@ -325,15 +331,22 @@ fn parse_config(set: &mut SubmoduleConfigSet, name: &str, item: &str, value: Opt
                     name: name.to_string(),
                     option: "update".to_string(),
                 });
-            } else if let Some(strategy) = parse_update_strategy(value)
-                && strategy.kind != UpdateType::Command
-            {
-                // git die()s on a bad value or a `!command` from .gitmodules;
-                // we keep the unspecified strategy (rejecting the value) rather
-                // than aborting the whole parse, since this crate has no fatal
-                // channel. The command-form `!cmd` is forbidden from
-                // .gitmodules for security and is silently dropped here.
-                set.submodules[index].update_strategy = strategy;
+            } else {
+                match parse_update_strategy(value) {
+                    Some(strategy) if strategy.kind != UpdateType::Command => {
+                        set.submodules[index].update_strategy = strategy;
+                    }
+                    // git die()s on a bad value or a `!command` from .gitmodules
+                    // (the command-form is forbidden there for security). This
+                    // crate has no fatal channel, so we record the invalid value
+                    // as a warning and leave the strategy unspecified; the
+                    // `init`/`update` path promotes it to the fatal git behavior.
+                    _ => {
+                        set.warnings.push(ParseWarning::InvalidUpdate {
+                            name: name.to_string(),
+                        });
+                    }
+                }
             }
         }
         "shallow" => {
