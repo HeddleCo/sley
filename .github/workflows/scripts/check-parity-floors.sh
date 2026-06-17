@@ -442,7 +442,7 @@ declare -A FLOOR=(
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=307
-    [t7400-submodule-basic.sh]=85
+    [t7400-submodule-basic.sh]=87
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=114
     [t4027-diff-submodule.sh]=18
@@ -470,7 +470,7 @@ declare -A FLOOR=(
     [t5515-fetch-merge-logic.sh]=65
     [t5516-fetch-push.sh]=57
     [t5520-pull.sh]=23
-    [t5601-clone.sh]=60
+    [t5601-clone.sh]=62
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
@@ -513,8 +513,8 @@ declare -A FLOOR=(
     [t7607-merge-state.sh]=1
     [t7611-merge-abort.sh]=19
     [t7401-submodule-summary.sh]=22
-    [t7407-submodule-foreach.sh]=20
-    [t7406-submodule-update.sh]=19
+    [t7407-submodule-foreach.sh]=21
+    [t7406-submodule-update.sh]=54
     [t4203-mailmap.sh]=69
 )
 
