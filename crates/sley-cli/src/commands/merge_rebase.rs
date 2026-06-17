@@ -780,6 +780,12 @@ fn merge_octopus(
             eprintln!("Unable to find common commit with {name}");
             return Err(GitError::Exit(2));
         }
+        // `--ff-only`: a real (non-fast-forward) octopus step is needed, which
+        // an ff-only merge cannot satisfy. git refuses before merging.
+        if options.ff_only() {
+            eprintln!("fatal: Not possible to fast-forward, aborting.");
+            return Err(GitError::Exit(128));
+        }
         non_ff = true;
         // git-merge-octopus's "Trying simple merge with <name>" line precedes
         // each non-fast-forward pairwise step.
