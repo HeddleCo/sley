@@ -2385,6 +2385,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             }
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let merged_paths: Vec<Vec<u8>> = entries.iter().map(|entry| entry.path.to_vec()).collect();
         let index = Index {
             version: 2,
             entries,
@@ -2419,6 +2420,11 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+            for path in ours_map.keys() {
+                if !merged_paths.iter().any(|merged| merged == path) {
+                    merge_remove_worktree_file(&worktree_root, path)?;
                 }
             }
             Ok(())
@@ -2464,6 +2470,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             merged_tree,
             prepare_merge_commit_message(&git_dir, &message, &options)?,
         )?;
+        write_merged_worktree()?;
         // A directory in the merged result may now occupy a path that HEAD held
         // as a plain file (e.g. `before/`→`after/` directory-rename while HEAD had
         // a file `after`). Clear those file-in-the-way ancestors before the
