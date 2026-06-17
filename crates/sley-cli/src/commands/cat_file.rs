@@ -54,6 +54,10 @@ struct CatFileOptions {
     cmd_mode: Option<CatFileCmdSelection>,
     path: Option<String>,
     positional: Vec<String>,
+    /// `--use-mailmap`/`--mailmap` (and their `--no-` forms): rewrite the
+    /// `author`/`committer`/`tagger` identity headers of emitted commit/tag
+    /// objects through the mailmap (git's `--use-mailmap`; off by default).
+    use_mailmap: bool,
 }
 
 /// A recorded `OPT_CMDMODE` selection plus the spelling the user typed for it, so a later
@@ -75,6 +79,7 @@ impl CatFileOptions {
             cmd_mode: None,
             path: None,
             positional: Vec::new(),
+            use_mailmap: false,
         };
         let mut args = GitArgCursor::new(args);
         while let Some(arg) = args.next() {
@@ -84,6 +89,8 @@ impl CatFileOptions {
                         if option.has_value() {
                             return option_takes_no_value(option.name());
                         }
+                        options.use_mailmap =
+                            matches!(option.name(), "use-mailmap" | "mailmap");
                     }
                     "batch" => options.set_batch_mode(
                         CatFileBatchMode::Batch,
@@ -280,6 +287,7 @@ impl CatFileOptions {
                 buffer: self.buffer.unwrap_or(batch_all_objects),
                 follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
+                use_mailmap: self.use_mailmap,
             }));
         }
 
@@ -303,6 +311,7 @@ impl CatFileOptions {
             return Ok(CatFileInvocation::Object(CatFileObjectRequest {
                 mode: CatFileObjectMode::Command(mode),
                 object_name: self.positional[0].clone(),
+                use_mailmap: self.use_mailmap,
             }));
         }
 
@@ -319,6 +328,7 @@ impl CatFileOptions {
         Ok(CatFileInvocation::Object(CatFileObjectRequest {
             mode: CatFileObjectMode::Typed(object_type),
             object_name: self.positional[1].clone(),
+            use_mailmap: self.use_mailmap,
         }))
     }
 }
@@ -326,6 +336,7 @@ impl CatFileOptions {
 struct CatFileObjectRequest {
     mode: CatFileObjectMode,
     object_name: String,
+    use_mailmap: bool,
 }
 
 impl CatFileObjectRequest {
@@ -334,6 +345,7 @@ impl CatFileObjectRequest {
         let query = ObjectQuery {
             view: &view,
             name: &self.object_name,
+            use_mailmap: self.use_mailmap,
         };
         match self.mode {
             CatFileObjectMode::Command(mode) => query.print_command_mode(mode),
@@ -451,6 +463,8 @@ impl RepositoryObjectView {
 struct ObjectQuery<'a> {
     view: &'a RepositoryObjectView,
     name: &'a str,
+    /// `--use-mailmap`: rewrite emitted commit/tag identity headers.
+    use_mailmap: bool,
 }
 
 impl ObjectQuery<'_> {
@@ -511,6 +525,16 @@ impl ObjectQuery<'_> {
             Ok(Some((object_type, size))) => {
                 if want_type {
                     println!("{}", object_type.as_str());
+                } else if self.use_mailmap
+                    && matches!(object_type, ObjectType::Commit | ObjectType::Tag)
+                {
+                    // git reports the size of the *mailmapped* object (the header
+                    // rewrite can change the byte count), so re-read the body.
+                    let mailmap = self.cat_file_mailmap()?;
+                    let object = self.view.db().read_object(&read_oid)?;
+                    let body =
+                        cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap);
+                    println!("{}", body.len());
                 } else {
                     println!("{size}");
                 }
@@ -571,10 +595,23 @@ impl ObjectQuery<'_> {
                 },
             )?;
         } else {
-            io::stdout().write_all(&object.body)?;
+            let mailmap = self.cat_file_mailmap()?;
+            let body = cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap);
+            io::stdout().write_all(&body)?;
             io::stdout().flush()?;
         }
         Ok(())
+    }
+
+    /// Load the mailmap when `--use-mailmap` is in effect (else an empty one).
+    fn cat_file_mailmap(&self) -> Result<commands::utility::Mailmap> {
+        if self.use_mailmap {
+            let git_dir = discover_git_dir(env::current_dir()?)?;
+            let format = repository_object_format(&git_dir)?;
+            commands::utility::Mailmap::load_default(&git_dir, format)
+        } else {
+            Ok(commands::utility::Mailmap::default())
+        }
     }
 
     fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
@@ -602,7 +639,9 @@ impl ObjectQuery<'_> {
             eprintln!("fatal: git cat-file {}: bad file", self.name);
             return Err(GitError::Exit(128));
         }
-        io::stdout().write_all(&object.body)?;
+        let mailmap = self.cat_file_mailmap()?;
+        let body = cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap);
+        io::stdout().write_all(&body)?;
         io::stdout().flush()?;
         Ok(())
     }
@@ -635,6 +674,9 @@ struct CatFileBatchRequest {
     buffer: bool,
     follow_symlinks: bool,
     filter: CatFileObjectsFilter,
+    /// `--use-mailmap`: emitted commit/tag bodies and their `%(objectsize)` are
+    /// computed from the mailmapped identity headers.
+    use_mailmap: bool,
 }
 
 /// The `--filter=<spec>` object filter for batch mode. Only the kinds upstream `cat-file`
@@ -708,6 +750,83 @@ impl CatFileObjectsFilter {
 /// `git_parse_ulong`: a base-0 integer with an optional case-insensitive `k`/`m`/`g` suffix
 /// (1024-scaled). Returns `None` on overflow or a malformed value, exactly like the C helper
 /// that backs `blob:limit=<n>`.
+/// Load the mailmap for the batch path when `--use-mailmap` is set (else empty).
+fn batch_record_mailmap(use_mailmap: bool) -> Result<commands::utility::Mailmap> {
+    if use_mailmap {
+        let git_dir = discover_git_dir(env::current_dir()?)?;
+        let format = repository_object_format(&git_dir)?;
+        commands::utility::Mailmap::load_default(&git_dir, format)
+    } else {
+        Ok(commands::utility::Mailmap::default())
+    }
+}
+
+/// git's `apply_mailmap_to_header` for cat-file: rewrite the `author`/
+/// `committer`/`tagger` identity headers (only those, only in the leading header
+/// block before the blank line) of a commit/tag object body through the mailmap.
+/// Returns the original body unchanged for non-commit/tag types, an empty
+/// mailmap, or when no header maps.
+fn cat_file_apply_mailmap_body(
+    body: &[u8],
+    object_type: ObjectType,
+    mailmap: &commands::utility::Mailmap,
+) -> Vec<u8> {
+    if mailmap.is_empty()
+        || !matches!(object_type, ObjectType::Commit | ObjectType::Tag)
+    {
+        return body.to_vec();
+    }
+    let mut out = Vec::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        // End of the header block: a blank line (or empty buffer) — copy the
+        // remainder (message + trailing data) verbatim.
+        if rest.is_empty() || rest[0] == b'\n' {
+            out.extend_from_slice(rest);
+            break;
+        }
+        let line_end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+        let line = &rest[..line_end];
+        match ["author ", "committer ", "tagger "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix.as_bytes()).map(|ident| (*prefix, ident)))
+        {
+            Some((prefix, ident)) => {
+                out.extend_from_slice(prefix.as_bytes());
+                out.extend_from_slice(&cat_file_rewrite_ident(ident, mailmap));
+            }
+            // Other header lines (`tree`, `parent`, `type`, `object`, …) are
+            // copied unchanged; git keeps scanning until the blank separator.
+            None => out.extend_from_slice(line),
+        }
+        if line_end < rest.len() {
+            out.push(b'\n');
+            rest = &rest[line_end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Rewrite a single identity payload (`Name <email> <ts> <tz>`) through the
+/// mailmap, preserving the trailing date.
+fn cat_file_rewrite_ident(ident: &[u8], mailmap: &commands::utility::Mailmap) -> Vec<u8> {
+    let (name, email) = mailmap.rewrite_identity(ident);
+    let tail = ident
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|idx| &ident[idx + 1..])
+        .unwrap_or(b"");
+    let mut out = Vec::with_capacity(name.len() + email.len() + tail.len() + 4);
+    out.extend_from_slice(&name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(&email);
+    out.push(b'>');
+    out.extend_from_slice(tail);
+    out
+}
+
 fn git_parse_ulong(value: &str) -> Option<u64> {
     if value.is_empty() || value.contains('-') {
         return None;
@@ -779,6 +898,7 @@ impl CatFileBatchRequest {
                     follow_symlinks: self.follow_symlinks,
                     filter: self.filter,
                     all_objects: self.batch_all_objects,
+                    use_mailmap: self.use_mailmap,
                 },
             )?;
             // Upstream's `batch_write` goes straight to the fd (unbuffered) unless `--buffer`
@@ -916,6 +1036,7 @@ impl CatFileBatchRequest {
                 follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
                 all_objects: false,
+                use_mailmap: self.use_mailmap,
             },
         )
     }
@@ -1050,6 +1171,9 @@ struct CatFileBatchRecord<'a> {
     /// True when the record comes from `--batch-all-objects`; upstream silently skips
     /// filter-excluded objects in that mode instead of emitting `<name> excluded`.
     all_objects: bool,
+    /// `--use-mailmap`: the emitted body and `%(objectsize)` reflect the
+    /// mailmapped commit/tag identity headers.
+    use_mailmap: bool,
 }
 
 fn print_cat_file_batch_record(
@@ -1059,6 +1183,9 @@ fn print_cat_file_batch_record(
     let query = ObjectQuery {
         view: record.view,
         name: record.object_name,
+        // Batch-mode mailmapping is handled by the batch record path itself;
+        // the per-object query here does not re-map.
+        use_mailmap: false,
     };
     // `--follow-symlinks` only alters `<rev>:<path>` resolution (upstream's
     // `GET_OID_FOLLOW_SYMLINKS` is consulted solely in the `<rev>:<path>`
@@ -1130,7 +1257,7 @@ fn print_cat_file_batch_record(
         None
     };
     if record.check_only {
-        let Some((object_type, size)) = batch_object_header(
+        let Some((object_type, mut size)) = batch_object_header(
             stdout,
             &record,
             &query,
@@ -1139,6 +1266,16 @@ fn print_cat_file_batch_record(
         else {
             return Ok(());
         };
+        // `--use-mailmap`: `%(objectsize)` reflects the mailmapped commit/tag body.
+        if record.use_mailmap && matches!(object_type, ObjectType::Commit | ObjectType::Tag) {
+            let mailmap = batch_record_mailmap(record.use_mailmap)?;
+            if !mailmap.is_empty() {
+                let object = record.view.db().read_object(&read_oid)?;
+                size =
+                    cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap).len()
+                        as u64;
+            }
+        }
         if record.filter.excludes(object_type, size) {
             return print_cat_file_excluded(stdout, &record);
         }
@@ -1186,15 +1323,27 @@ fn print_cat_file_batch_record(
         }
         Err(_) => return report_object_missing(stdout, &record, &query),
     };
+    // `--use-mailmap`: emit (and size) the mailmapped commit/tag body. Borrow the
+    // raw body unless a rewrite is actually needed (avoids cloning every object).
+    let mailmapped_body = if record.use_mailmap
+        && matches!(object.object_type, ObjectType::Commit | ObjectType::Tag)
+    {
+        let mailmap = batch_record_mailmap(record.use_mailmap)?;
+        (!mailmap.is_empty())
+            .then(|| cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap))
+    } else {
+        None
+    };
+    let body: &[u8] = mailmapped_body.as_deref().unwrap_or(&object.body);
     print_cat_file_batch_header(
         stdout,
         &record,
         &oid,
         object.object_type,
-        object.body.len() as u64,
+        body.len() as u64,
         object_mode.as_deref(),
     )?;
-    stdout.write_all(&object.body)?;
+    stdout.write_all(body)?;
     stdout.write_all(&[record.terminator])?;
     Ok(())
 }

@@ -288,6 +288,9 @@ fn read_shortlog_from_revisions(
         return Err(GitError::Exit(128));
     }
 
+    // git's shortlog *always* mailmaps the grouping identity (no flag needed).
+    let mailmap = commands::utility::Mailmap::load_default(repo.git_dir(), format)?;
+
     let author_filters = parse_log_filter_patterns(&options.author_patterns, options.regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&options.grep_patterns, options.regexp_mode)?;
 
@@ -338,7 +341,7 @@ fn read_shortlog_from_revisions(
             ShortlogGroup::Author => &record.commit.author,
             ShortlogGroup::Committer => &record.commit.committer,
         };
-        let key = shortlog_identity_key(identity, options.email);
+        let key = shortlog_identity_key(identity, options.email, &mailmap);
         let subject = shortlog_subject(&record.commit.message);
         push_shortlog_commit_front(groups, index, key, subject);
     }
@@ -361,6 +364,17 @@ fn read_shortlog_from_stdin(
 ) -> Result<()> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
+
+    // git's shortlog always mailmaps. The stdin path may run outside a repo
+    // (`git log ... | git shortlog`), so prefer the repo mailmap when one is
+    // discoverable and fall back to a cwd-relative `.mailmap` otherwise.
+    let mailmap = match RepositoryContext::discover_current() {
+        Ok(repo) => {
+            let format = repo.format();
+            commands::utility::Mailmap::load_default(repo.git_dir(), format)?
+        }
+        Err(_) => commands::utility::Mailmap::load_cwd()?,
+    };
 
     // git matches both the human `git log` headers and the raw commit-object
     // headers, so a `git cat-file commit` stream works too.
@@ -402,7 +416,7 @@ fn read_shortlog_from_stdin(
         // so the extra alignment spaces in `--format=fuller` (`Author:     X`)
         // become part of the grouping key, matching upstream byte-for-byte. The
         // summary, by contrast, has both ends trimmed.
-        if let Some(key) = shortlog_stdin_identity_key(identity, options.email) {
+        if let Some(key) = shortlog_stdin_identity_key(identity, options.email, &mailmap) {
             // stdin records arrive newest-first (matching `git log`); prepend so
             // each group lists oldest-first like the revision-walk path.
             push_shortlog_commit_front(groups, index, key, summary.trim().to_string());
@@ -536,8 +550,9 @@ fn wrap_shortlog_text(text: &str, width: usize, indent1: usize, indent2: usize) 
 /// (`Name <email> <ts> <tz>`); we keep `Name` and, with `--email`, append the
 /// address as ` <email>` — always including the angle brackets, even when the
 /// address is empty, exactly as git renders `Name <>`.
-fn shortlog_identity_key(raw: &[u8], email: bool) -> String {
+fn shortlog_identity_key(raw: &[u8], email: bool, mailmap: &commands::utility::Mailmap) -> String {
     let (name, addr) = commit_identity_name_email(raw);
+    let (name, addr) = mailmap.map_user(&name, &addr);
     if email {
         format!("{name} <{addr}>")
     } else {
@@ -548,11 +563,16 @@ fn shortlog_identity_key(raw: &[u8], email: bool) -> String {
 /// Build the display key from a `git log` `Author:`/`Commit:` value (already a
 /// `Name <email>` string). git only counts commits whose identity carries an
 /// email, so identities lacking `<...>` are dropped (returns `None`).
-fn shortlog_stdin_identity_key(identity: &str, email: bool) -> Option<String> {
+fn shortlog_stdin_identity_key(
+    identity: &str,
+    email: bool,
+    mailmap: &commands::utility::Mailmap,
+) -> Option<String> {
     let (name, addr) = match identity.rsplit_once(" <") {
         Some((name, rest)) => (name.to_string(), rest.trim_end_matches('>').to_string()),
         None => return None,
     };
+    let (name, addr) = mailmap.map_user(&name, &addr);
     if email {
         Some(format!("{name} <{addr}>"))
     } else {

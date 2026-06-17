@@ -121,6 +121,12 @@ pub(crate) enum FormatToken {
     AuthorName,
     AuthorEmail,
     AuthorEmailLocal,
+    /// `%aN`/`%aE`/`%aL`: name/email/local-part *always* run through the mailmap
+    /// (git's `format_person_part` upper-case branch), independent of
+    /// `--use-mailmap`.
+    AuthorNameMapped,
+    AuthorEmailMapped,
+    AuthorEmailLocalMapped,
     AuthorTimestamp,
     AuthorDate,
     AuthorDateIso,
@@ -130,6 +136,10 @@ pub(crate) enum FormatToken {
     CommitterName,
     CommitterEmail,
     CommitterEmailLocal,
+    /// `%cN`/`%cE`/`%cL`: committer counterparts of the always-mailmap atoms.
+    CommitterNameMapped,
+    CommitterEmailMapped,
+    CommitterEmailLocalMapped,
     CommitterTimestamp,
     CommitterDate,
     CommitterDateIso,
@@ -396,7 +406,11 @@ impl CompiledLogFormat {
                 FormatToken::AuthorName
                 | FormatToken::CommitterName
                 | FormatToken::AuthorEmail
-                | FormatToken::CommitterEmail => 48,
+                | FormatToken::CommitterEmail
+                | FormatToken::AuthorNameMapped
+                | FormatToken::CommitterNameMapped
+                | FormatToken::AuthorEmailMapped
+                | FormatToken::CommitterEmailMapped => 48,
                 _ => 8,
             }
         })
@@ -684,13 +698,21 @@ fn parse_identity_atom(
     } else {
         FormatFields::COMMITTER
     });
+    // Upper-case N/E/L always mailmap; lower-case n/e/l mailmap only under
+    // `--use-mailmap`/`log.mailmap` (decided at render time).
     let token = match value.chars().nth(1) {
-        Some('n') | Some('N') if author => FormatToken::AuthorName,
-        Some('n') | Some('N') => FormatToken::CommitterName,
-        Some('e') | Some('E') if author => FormatToken::AuthorEmail,
-        Some('e') | Some('E') => FormatToken::CommitterEmail,
-        Some('l') | Some('L') if author => FormatToken::AuthorEmailLocal,
-        Some('l') | Some('L') => FormatToken::CommitterEmailLocal,
+        Some('n') if author => FormatToken::AuthorName,
+        Some('N') if author => FormatToken::AuthorNameMapped,
+        Some('n') => FormatToken::CommitterName,
+        Some('N') => FormatToken::CommitterNameMapped,
+        Some('e') if author => FormatToken::AuthorEmail,
+        Some('E') if author => FormatToken::AuthorEmailMapped,
+        Some('e') => FormatToken::CommitterEmail,
+        Some('E') => FormatToken::CommitterEmailMapped,
+        Some('l') if author => FormatToken::AuthorEmailLocal,
+        Some('L') if author => FormatToken::AuthorEmailLocalMapped,
+        Some('l') => FormatToken::CommitterEmailLocal,
+        Some('L') => FormatToken::CommitterEmailLocalMapped,
         Some('t') if author => FormatToken::AuthorTimestamp,
         Some('t') => FormatToken::CommitterTimestamp,
         Some('d') if author => FormatToken::AuthorDate,

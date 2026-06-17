@@ -566,17 +566,38 @@ enum MailmapSourceSpec {
     Blob(String),
 }
 
+/// The shared mailmap canonicalization engine — git's `mailmap.c` model.
+///
+/// A mailmap file maps a *commit* identity (the name/email recorded in the
+/// object header) to a *canonical* one. git keys the whole structure by the
+/// commit email (case-insensitively): each `MailmapEntry` carries an optional
+/// top-level name/email replacement (the unqualified `<commit@email>` form) and
+/// a `namemap` of commit-name → replacement for the name-qualified forms. This
+/// is the ONE engine every consumer (log/blame/shortlog/for-each-ref/tag/
+/// branch/cat-file/check-mailmap) routes through — see [`Mailmap::map_user`].
 #[derive(Debug, Default)]
 pub(crate) struct Mailmap {
-    entries: Vec<MailmapEntry>,
+    /// Keyed by the lowercased commit email (git's `string_list` keyed by
+    /// `old_email`, compared case-insensitively via `lookup_prefix`).
+    entries: HashMap<String, MailmapEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct MailmapEntry {
-    old_name: Option<String>,
-    old_email: String,
-    new_name: Option<String>,
-    new_email: String,
+    /// Top-level replacement for the unqualified `<commit@email>` form
+    /// (git's `me->name` / `me->email`).
+    name: Option<String>,
+    email: Option<String>,
+    /// Name-qualified replacements: `(lowercased old_name, replacement)`, in
+    /// insertion order. git stores these in a `string_list` keyed by
+    /// `old_name`, compared case-insensitively.
+    namemap: Vec<(String, MailmapInfo)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MailmapInfo {
+    name: Option<String>,
+    email: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,6 +614,52 @@ impl Mailmap {
         Self::load(git_dir, format, &[])
     }
 
+    /// Load the mailmap when there may be no repository (git's `read_mailmap`
+    /// non-repo branch: `.mailmap` from the *current directory* — symlinks
+    /// followed — plus the `mailmap.file` config path). Used by the stdin path
+    /// of `shortlog`, which git lets run outside a repo. Falls back to
+    /// [`Self::load_default`] when a repo is present so blob sources still work.
+    pub(crate) fn load_cwd() -> Result<Self> {
+        let mut mailmap = Self::default();
+        mailmap.add_file(Path::new(".mailmap"))?;
+        if let Some(config) = identity_effective_config()
+            && let Some(path) = config.get("mailmap", None, "file")
+        {
+            mailmap.add_file(Path::new(&path))?;
+        }
+        Ok(mailmap)
+    }
+
+    /// True when no mapping entries were loaded — lets consumers short-circuit
+    /// the lookup entirely (git gates on `mail_map->nr`).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// git's `map_user`: resolve a commit (name, email) pair through the mailmap.
+    /// Returns the canonical `(name, email)`, leaving either component unchanged
+    /// when the mailmap has no replacement for it. This is the single
+    /// canonicalization primitive every consumer calls.
+    pub(crate) fn map_user(&self, name: &str, email: &str) -> (String, String) {
+        let mut out_name = name.to_string();
+        let mut out_email = email.to_string();
+        if let Some(entry) = self.entries.get(&email.to_ascii_lowercase()) {
+            // Prefer a name-qualified replacement; fall back to the top-level
+            // (unqualified) one. Matches git's namemap-then-simple precedence.
+            let info = entry
+                .lookup_name(name)
+                .map(|info| (info.name.as_deref(), info.email.as_deref()))
+                .unwrap_or((entry.name.as_deref(), entry.email.as_deref()));
+            if let Some(new_email) = info.1 {
+                out_email = new_email.to_string();
+            }
+            if let Some(new_name) = info.0 {
+                out_name = new_name.to_string();
+            }
+        }
+        (out_name, out_email)
+    }
+
     /// Resolve a raw identity (`Name <email> <timestamp> <tz>` bytes, as found in
     /// commit/tag headers) through the mailmap, returning rewritten name and email
     /// bytes. The trailing date is preserved untouched.
@@ -600,32 +667,11 @@ impl Mailmap {
         let name = for_each_ref_identity_name(identity).unwrap_or(b"");
         // The bracketed email, including angle brackets; strip them for lookup.
         let email = for_each_ref_identity_email(identity, ForEachRefEmailMode::Trim).unwrap_or(b"");
-        let contact = MailmapContact {
-            name: (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned()),
-            email: String::from_utf8_lossy(email).into_owned(),
-        };
-        let resolved = self.resolve_contact_struct(&contact);
-        let resolved_name = resolved
-            .name
-            .map(String::into_bytes)
-            .unwrap_or_else(|| name.to_vec());
-        (resolved_name, resolved.email.into_bytes())
-    }
-
-    fn resolve_contact_struct(&self, contact: &MailmapContact) -> MailmapContact {
-        let mut resolved = contact.clone();
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.matches(&resolved))
-        {
-            if let Some(name) = &entry.new_name {
-                resolved.name = Some(name.clone());
-            }
-            resolved.email.clone_from(&entry.new_email);
-        }
-        resolved
+        let (new_name, new_email) = self.map_user(
+            &String::from_utf8_lossy(name),
+            &String::from_utf8_lossy(email),
+        );
+        (new_name.into_bytes(), new_email.into_bytes())
     }
 
     fn load(
@@ -633,20 +679,38 @@ impl Mailmap {
         format: ObjectFormat,
         source_specs: &[MailmapSourceSpec],
     ) -> Result<Self> {
+        // git's `read_mailmap` order (mailmap.c): `.mailmap` (worktree only) →
+        // `mailmap.blob` → `mailmap.file` (last, so it overrides). A bare repo
+        // skips `.mailmap` and defaults the blob to `HEAD:.mailmap`.
         let mut mailmap = Self::default();
         let worktree_root = worktree_root_for_git_dir(git_dir).ok();
+        let is_bare = worktree_root.is_none();
+        let config = identity_effective_config();
+        let mailmap_file = config
+            .as_ref()
+            .and_then(|c| c.get("mailmap", None, "file").map(str::to_owned));
+        let mut mailmap_blob = config
+            .as_ref()
+            .and_then(|c| c.get("mailmap", None, "blob").map(str::to_owned));
+        if mailmap_blob.is_none() && is_bare {
+            mailmap_blob = Some("HEAD:.mailmap".to_string());
+        }
+
+        // `.mailmap` from the worktree (non-bare only).
         if let Some(root) = &worktree_root {
             mailmap.add_file(&root.join(".mailmap"))?;
         }
-        if let Some(config) = identity_effective_config() {
-            if let Some(path) = config.get("mailmap", None, "file") {
-                let path = mailmap_config_path(worktree_root.as_deref(), path);
-                mailmap.add_file(&path)?;
-            }
-            if let Some(blob) = config.get("mailmap", None, "blob") {
-                mailmap.add_blob(git_dir, format, blob)?;
-            }
+        // `mailmap.blob` (config value, or the bare-repo default).
+        if let Some(blob) = &mailmap_blob {
+            mailmap.add_blob(git_dir, format, blob)?;
         }
+        // `mailmap.file` last — overrides the blob/`.mailmap` for matching keys.
+        if let Some(path) = &mailmap_file {
+            let path = mailmap_config_path(worktree_root.as_deref(), path);
+            mailmap.add_file(&path)?;
+        }
+        // Explicit `--mailmap-file`/`--mailmap-blob` sources (check-mailmap) layer
+        // on top, in order.
         for source in source_specs {
             match source {
                 MailmapSourceSpec::File(path) => mailmap.add_file(path)?,
@@ -664,50 +728,126 @@ impl Mailmap {
         }
     }
 
+    /// git's `read_mailmap_blob`: a missing rev is silently skipped; an
+    /// unreadable object or a non-blob type prints an `error:` to stderr but does
+    /// NOT abort the command (git's `error()` returns nonzero, the caller
+    /// accumulates it and still runs).
     fn add_blob(&mut self, git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<()> {
-        let oid = resolve_revision(git_dir, format, rev)?;
+        // `repo_get_oid(...) < 0` → return 0 (silent skip of a missing blob/rev).
+        let Ok(oid) = resolve_revision(git_dir, format, rev) else {
+            return Ok(());
+        };
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        let object = db.read_object(&oid)?;
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => {
+                eprintln!("error: unable to read mailmap object at {rev}");
+                return Ok(());
+            }
+        };
         if object.object_type != ObjectType::Blob {
-            eprintln!("error: unable to read mailmap object at {rev}");
-            return Err(GitError::Exit(128));
+            eprintln!("error: mailmap is not a blob: {rev}");
+            return Ok(());
         }
         self.add_bytes(&object.body)
     }
 
     fn add_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let text = String::from_utf8_lossy(bytes);
-        self.entries
-            .extend(text.lines().filter_map(parse_mailmap_line));
+        for line in text.lines() {
+            self.read_mailmap_line(line);
+        }
         Ok(())
     }
 
-    fn resolve_contact(&self, contact: &str) -> MailmapContact {
-        let mut resolved = parse_mailmap_contact(contact);
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.matches(&resolved))
-        {
-            if let Some(name) = &entry.new_name {
-                resolved.name = Some(name.clone());
-            }
-            resolved.email.clone_from(&entry.new_email);
+    /// git's `read_mailmap_line` + `add_mapping`. A line is
+    /// `<proper>[ <commit>]`; the first `Name <email>` is the canonical
+    /// identity, the (optional) second is the commit identity to match. When the
+    /// commit form is absent the line keys on the proper email and only the name
+    /// is replaced.
+    fn read_mailmap_line(&mut self, line: &str) {
+        // git only special-cases a `#` in the *first* column as a whole-line
+        // comment; a `#` elsewhere is literal (unlike a stripspace comment).
+        if line.starts_with('#') {
+            return;
         }
-        resolved
+        let mut rest = line;
+        // First token is the *proper* (canonical) name+email. `email1` must be
+        // present (git's `if (email1)` guard) or the line is ignored.
+        let Some((new_name, new_email)) = parse_name_and_email(&mut rest, false) else {
+            return;
+        };
+        let Some(new_email) = new_email else {
+            return;
+        };
+        // Second token (commit-side name+email) is optional.
+        let (old_name, old_email) = parse_name_and_email(&mut rest, true).unwrap_or((None, None));
+        // add_mapping's reshuffle: with no commit-side email, the proper email
+        // is itself the lookup key and only the name is replaced.
+        let (new_email, old_email) = match old_email {
+            Some(old_email) => (Some(new_email), old_email),
+            None => (None, new_email),
+        };
+        self.add_mapping(new_name, new_email, old_name, old_email);
+    }
+
+    fn add_mapping(
+        &mut self,
+        new_name: Option<String>,
+        new_email: Option<String>,
+        old_name: Option<String>,
+        old_email: String,
+    ) {
+        let entry = self
+            .entries
+            .entry(old_email.to_ascii_lowercase())
+            .or_default();
+        match old_name {
+            None => {
+                // Replace the simple (unqualified) name/email for this email.
+                if new_name.is_some() {
+                    entry.name = new_name;
+                }
+                if new_email.is_some() {
+                    entry.email = new_email;
+                }
+            }
+            Some(old_name) => {
+                let info = MailmapInfo {
+                    name: new_name,
+                    email: new_email,
+                };
+                let key = old_name.to_ascii_lowercase();
+                if let Some(slot) = entry.namemap.iter_mut().find(|(k, _)| *k == key) {
+                    slot.1 = info;
+                } else {
+                    entry.namemap.push((key, info));
+                }
+            }
+        }
+    }
+
+    fn resolve_contact(&self, contact: &str) -> MailmapContact {
+        let parsed = parse_mailmap_contact(contact);
+        let name = parsed.name.as_deref().unwrap_or("");
+        let (new_name, new_email) = self.map_user(name, &parsed.email);
+        MailmapContact {
+            name: (!new_name.is_empty()).then_some(new_name),
+            email: new_email,
+        }
     }
 }
 
 impl MailmapEntry {
-    fn matches(&self, contact: &MailmapContact) -> bool {
-        self.old_email.eq_ignore_ascii_case(&contact.email)
-            && self.old_name.as_ref().is_none_or(|name| {
-                contact
-                    .name
-                    .as_deref()
-                    .is_some_and(|contact_name| contact_name == name)
-            })
+    fn lookup_name(&self, name: &str) -> Option<&MailmapInfo> {
+        if self.namemap.is_empty() {
+            return None;
+        }
+        let key = name.to_ascii_lowercase();
+        self.namemap
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, info)| info)
     }
 }
 
@@ -731,36 +871,28 @@ fn mailmap_config_path(worktree_root: Option<&Path>, value: &str) -> PathBuf {
     }
 }
 
-fn parse_mailmap_line(line: &str) -> Option<MailmapEntry> {
-    let line = strip_mailmap_comment(line).trim();
-    if line.is_empty() {
+/// git's `parse_name_and_email`: pull the leading `Name <email>` token off the
+/// front of `buffer`, advancing `buffer` past the closing `>`. Returns the
+/// `(name, email)` pair (each trimmed; `None` when empty) when a token is found.
+/// With `allow_empty_email == false` an empty `<>` is rejected (returns `None`).
+/// When no `<...>` is present at all the function returns `None` and leaves
+/// `buffer` pointing at the empty tail.
+fn parse_name_and_email(
+    buffer: &mut &str,
+    allow_empty_email: bool,
+) -> Option<(Option<String>, Option<String>)> {
+    let left = buffer.find('<')?;
+    let right_rel = buffer[left + 1..].find('>')?;
+    let right = left + 1 + right_rel;
+    if !allow_empty_email && right == left + 1 {
         return None;
     }
-    let (new_contact, rest) = parse_mailmap_contact_prefix(line)?;
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    let old_contact = parse_mailmap_contact(rest);
-    Some(MailmapEntry {
-        old_name: old_contact.name,
-        old_email: old_contact.email,
-        new_name: new_contact.name,
-        new_email: new_contact.email,
-    })
-}
-
-fn strip_mailmap_comment(line: &str) -> &str {
-    line.split_once('#')
-        .map(|(before, _)| before)
-        .unwrap_or(line)
-}
-
-fn parse_mailmap_contact_prefix(value: &str) -> Option<(MailmapContact, &str)> {
-    let end = value.find('>')?;
-    let head = &value[..=end];
-    let rest = &value[end + 1..];
-    Some((parse_mailmap_contact(head), rest))
+    let name = buffer[..left].trim();
+    let email = &buffer[left + 1..right];
+    let name = (!name.is_empty()).then(|| name.to_string());
+    let email = (!email.is_empty()).then(|| email.to_string());
+    *buffer = &buffer[right + 1..];
+    Some((name, email))
 }
 
 fn parse_mailmap_contact(value: &str) -> MailmapContact {

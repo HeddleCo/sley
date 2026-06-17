@@ -339,6 +339,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut abbrev_commit = false;
     let mut abbrev_len = Some(7usize);
     let mut abbrev_len_explicit = false;
+    // `--use-mailmap`/`--mailmap` (and their `--no-` forms). `None` means the CLI
+    // didn't decide, so `log.mailmap` config (default true) is consulted.
+    let mut use_mailmap_explicit: Option<bool> = None;
     let mut decoration = LogDecorationMode::Off;
     // Whether `--decorate`/`--no-decorate`/`--decorate=<mode>` was given on the
     // command line (a CLI flag overrides `log.decorate` config).
@@ -623,15 +626,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = None,
             "--no-max-parents" => max_parents = None,
+            "--use-mailmap" | "--mailmap" => use_mailmap_explicit = Some(true),
+            "--no-use-mailmap" | "--no-mailmap" => use_mailmap_explicit = Some(false),
             "-q"
             | "--quiet"
             | "--no-quiet"
             | "--unpacked"
             | "--no-source"
-            | "--use-mailmap"
-            | "--no-use-mailmap"
-            | "--mailmap"
-            | "--no-mailmap"
             | "--show-signature"
             | "--no-show-signature"
             | "--full-diff"
@@ -1353,6 +1354,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let output_encoding = log_output_encoding(&config);
+    // Mailmap: git's `log.mailmap` defaults to true (`use_mailmap_config = 1`);
+    // `--use-mailmap`/`--no-use-mailmap` (and `--mailmap`/`--no-mailmap` aliases)
+    // override. When enabled, the *whole* identity is mapped (default formats and
+    // the lower-case `%an`/… atoms); the upper-case `%aN`/… atoms always map.
+    let use_mailmap = use_mailmap_explicit
+        .unwrap_or_else(|| config.get_bool("log", None, "mailmap").unwrap_or(true));
+    let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
     let setup = sley_rev::setup_revisions(
@@ -1847,6 +1855,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     describe: None,
                     color: false,
                     output_encoding: &output_encoding,
+                    mailmap: &mailmap,
+                    use_mailmap,
                 },
                 &mut line,
             )?;
@@ -1904,6 +1914,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             describe: None,
             color: false,
             output_encoding: &output_encoding,
+            mailmap: &mailmap,
+            use_mailmap,
         };
         let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
             &git_dir,
@@ -1965,8 +1977,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             || min_parents.is_some_and(|min| record.parents.len() < min)
             || max_parents.is_some_and(|max| record.parents.len() > max)
             || !log_age_filters_match(record, max_age, min_age)?
-            || !log_author_matcher_matches(record, author_filters.as_ref())
-            || !log_committer_matcher_matches(record, committer_filters.as_ref())
+            || !log_author_matcher_matches(
+                record,
+                author_filters.as_ref(),
+                use_mailmap.then_some(&mailmap),
+            )
+            || !log_committer_matcher_matches(
+                record,
+                committer_filters.as_ref(),
+                use_mailmap.then_some(&mailmap),
+            )
             || !log_grep_matcher_matches(
                 record,
                 grep_filters.as_ref(),
@@ -2267,6 +2287,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         describe: Some(&describe_ctx),
                         color: color_always,
                         output_encoding: &output_encoding,
+                        mailmap: &mailmap,
+                        use_mailmap,
                     };
                     let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
                     emit_compiled_log_format(
@@ -2327,7 +2349,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     writeln!(
                         msg,
                         "Author: {}",
-                        commit_author_identity(&record.commit.author)
+                        commit_identity_mailmapped(
+                            &record.commit.author,
+                            use_mailmap.then_some(&mailmap)
+                        )
                     )
                     .map_err(io::Error::from)?;
                     if *kind == LogDefaultKind::Medium {
@@ -2407,7 +2432,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         record.parents.iter().map(format_log_abbrev_oid).collect();
                     println!("Merge: {}", merged.join(" "));
                 }
-                println!("Author: {}", commit_author_identity(&record.commit.author));
+                println!(
+                    "Author: {}",
+                    commit_identity_mailmapped(&record.commit.author, use_mailmap.then_some(&mailmap))
+                );
                 if kind == LogDefaultKind::Medium {
                     println!(
                         "Date:   {}",
@@ -2456,6 +2484,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     describe: Some(&describe_ctx),
                     color: false,
                     output_encoding: &output_encoding,
+                    mailmap: &mailmap,
+                    use_mailmap,
                 };
                 if compiled_children && inline_children {
                     print_log_format_with_children(
@@ -2611,6 +2641,11 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         pickaxe_text,
         pickaxe_detect_renames,
     } = ctx;
+
+    // `-L` line-log shares git's `log.mailmap` default (true) and the default
+    // pretty-format identity mapping.
+    let use_mailmap = config.get_bool("log", None, "mailmap").unwrap_or(true);
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
 
     // Reachable commits from the tip, in topological order (child before
     // parent) — git forces `topo_order` for `-L`. The line-log engine walks the
@@ -2801,7 +2836,11 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         record.parents.iter().map(format_log_abbrev_oid).collect();
                     writeln!(stdout, "Merge: {}", merged.join(" "))?;
                 }
-                writeln!(stdout, "Author: {}", commit_author_identity(&record.commit.author))?;
+                writeln!(
+                    stdout,
+                    "Author: {}",
+                    commit_identity_mailmapped(&record.commit.author, use_mailmap.then_some(&mailmap))
+                )?;
                 if *kind == LogDefaultKind::Medium {
                     writeln!(
                         stdout,
@@ -2855,6 +2894,8 @@ fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     describe: Some(&describe_ctx),
                     color: false,
                     output_encoding,
+                    mailmap: &mailmap,
+                    use_mailmap,
                 };
                 let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
                 emit_compiled_log_format(
@@ -3030,15 +3071,48 @@ fn compile_log_filter_matcher(
 fn log_author_matcher_matches(
     record: &sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
+    mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
-    filter.is_none_or(|filter| filter.matches_any(&record.commit.author))
+    filter.is_none_or(|filter| {
+        filter.matches_any(&log_mailmapped_identity_header(&record.commit.author, mailmap))
+    })
 }
 
 fn log_committer_matcher_matches(
     record: &sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
+    mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
-    filter.is_none_or(|filter| filter.matches_any(&record.commit.committer))
+    filter.is_none_or(|filter| {
+        filter.matches_any(&log_mailmapped_identity_header(&record.commit.committer, mailmap))
+    })
+}
+
+/// git's `apply_mailmap_to_header`: when `--use-mailmap`/`log.mailmap` is active
+/// the `--author`/`--committer` grep runs against the *mailmapped* identity
+/// header. Rewrites `Name <email> <ts> <tz>` → `MappedName <mapped@email> ...`.
+/// With no mailmap (or an empty one) the original header bytes are returned.
+fn log_mailmapped_identity_header(
+    raw: &[u8],
+    mailmap: Option<&commands::utility::Mailmap>,
+) -> Vec<u8> {
+    let Some(mailmap) = mailmap.filter(|m| !m.is_empty()) else {
+        return raw.to_vec();
+    };
+    let (name, email) = mailmap.rewrite_identity(raw);
+    // Preserve the trailing ` <ts> <tz>` (everything after the closing `>`).
+    let tail = raw
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|idx| &raw[idx + 1..])
+        .unwrap_or(b"");
+    let mut out = Vec::with_capacity(name.len() + email.len() + tail.len() + 4);
+    out.extend_from_slice(&name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(&email);
+    out.push(b'>');
+    out.extend_from_slice(tail);
+    out
 }
 
 fn log_grep_matcher_matches(

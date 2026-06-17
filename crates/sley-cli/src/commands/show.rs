@@ -392,6 +392,14 @@ fn show_commit(
 ) -> Result<()> {
     let options = context.options;
     let decorations = context.decorations;
+    // `git show` is a log variant: `log.mailmap` (default true) controls whether
+    // the default `Author:` line and lower-case identity atoms are mapped; the
+    // upper-case `%aN`/… atoms always map.
+    let use_mailmap = context
+        .config
+        .get_bool("log", None, "mailmap")
+        .unwrap_or(true);
+    let mailmap = commands::utility::Mailmap::load_default(context.git_dir, context.format)?;
     let record = sley_rev::CommitRecord {
         oid: *oid,
         parents: commit.parents.clone(),
@@ -452,7 +460,11 @@ fn show_commit(
                     .join(" ");
                 writeln!(stdout, "Merge: {parents}")?;
             }
-            writeln!(stdout, "Author: {}", commit_author_identity(&commit.author))?;
+            writeln!(
+                stdout,
+                "Author: {}",
+                commit_identity_mailmapped(&commit.author, use_mailmap.then_some(&mailmap))
+            )?;
             writeln!(
                 stdout,
                 "Date:   {}",
@@ -498,6 +510,8 @@ fn show_commit(
                     date_mode: &options.date_mode,
                     source_oid: None,
                     describe: None,
+                    mailmap: &mailmap,
+                    use_mailmap,
                     color: false,
                     output_encoding: "UTF-8",
                 },
