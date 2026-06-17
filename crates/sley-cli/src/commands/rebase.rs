@@ -639,10 +639,66 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
         return Err(rebase_usage_error());
     }
 
-    let in_progress = seq::in_progress(&ctx.git_dir);
+    // The apply backend keeps its state in `.git/rebase-apply/` (marked by a
+    // `head-name` file). When such a rebase is in progress, the resume verbs
+    // route to the am-based driver instead of the merge sequencer.
+    let apply_in_progress = commands::am::rebase_apply_in_progress(&ctx.git_dir);
+    let merge_in_progress = seq::in_progress(&ctx.git_dir);
+    let in_progress = apply_in_progress || merge_in_progress;
     if parsed.action != RebaseAction::None && !in_progress {
         eprintln!("fatal: no rebase in progress");
         return Err(GitError::Exit(128));
+    }
+
+    if apply_in_progress {
+        match parsed.action {
+            RebaseAction::Continue => {
+                return commands::am::rebase_apply_continue(
+                    &ctx.git_dir,
+                    &ctx.common_git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                );
+            }
+            RebaseAction::Skip => {
+                return commands::am::rebase_apply_skip(
+                    &ctx.git_dir,
+                    &ctx.common_git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                );
+            }
+            RebaseAction::Abort => {
+                return commands::am::rebase_apply_abort(
+                    &ctx.git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                );
+            }
+            RebaseAction::Quit => {
+                let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
+                return Ok(());
+            }
+            RebaseAction::ShowCurrentPatch => {
+                let path = ctx.git_dir.join("rebase-apply").join("patch");
+                if let Ok(patch) = fs::read(path) {
+                    io::stdout().write_all(&patch)?;
+                    return Ok(());
+                }
+                eprintln!("fatal: there is no current patch");
+                return Err(GitError::Exit(128));
+            }
+            RebaseAction::EditTodo => {
+                eprintln!("error: The --edit-todo action can only be used during interactive rebase.");
+                return Err(GitError::Exit(1));
+            }
+            RebaseAction::None => {
+                eprintln!(
+                    "fatal: It looks like 'git am' is in progress. Cannot rebase."
+                );
+                return Err(GitError::Exit(128));
+            }
+        }
     }
 
     match parsed.action {
@@ -663,7 +719,7 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
         RebaseAction::None => {}
     }
 
-    if in_progress {
+    if merge_in_progress {
         eprintln!(
             "fatal: It seems that there is already a rebase-merge directory, and\nI wonder if you are in the middle of another rebase.  If that is the\ncase, please try\n\tgit rebase (--continue | --abort | --skip)\nIf that is not the case, please\n\trm -fr \"{}\"\nand run me again.  I am stopping in case you still have something\nvaluable there.",
             seq::merge_dir(&ctx.git_dir).display()
@@ -683,6 +739,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     let refs = ctx.refs();
 
     let interactive_explicit = args.interactive;
+    // `--ignore-whitespace` pushes `ignore-space-change` into `strategy_opts` for
+    // the merge backend, but it does NOT by itself force a backend (it is honoured
+    // on whichever one is selected). So compute merge-implication ignoring that
+    // single auto-added opt.
+    let other_strategy_opts: Vec<&String> = args
+        .strategy_opts
+        .iter()
+        .filter(|opt| !(args.ignore_whitespace && opt.as_str() == "ignore-space-change"))
+        .collect();
     let implied_merge = interactive_explicit
         || args.merge_backend
         || !args.exec.is_empty()
@@ -690,8 +755,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         || args.empty != EmptyMode::Unspecified
         || args.keep_empty
         || args.strategy.is_some()
-        || !args.strategy_opts.is_empty();
-    let _ = implied_merge;
+        || !other_strategy_opts.is_empty();
+
+    // The apply backend (`git rebase --apply` / `git-rebase--am`) is selected by
+    // an explicit `--apply`. It is incompatible with the merge-only options.
+    let use_apply_backend = args.apply_backend;
+    if use_apply_backend && implied_merge {
+        eprintln!("fatal: apply options and merge options cannot be used together");
+        return Err(GitError::Exit(128));
+    }
 
     // Resolve upstream.
     let upstream_name = match args.positional.first() {
@@ -940,6 +1012,22 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Apply backend: generate the `upstream..orig_head` patch series and replay
+    // it via the am engine into `.git/rebase-apply/`. This is the only path that
+    // honours `git am`-style `--ignore-whitespace` patch fuzzing.
+    if use_apply_backend {
+        return run_apply_backend(
+            ctx,
+            &db,
+            &args,
+            upstream.as_ref(),
+            &orig_head,
+            &onto,
+            &onto_name,
+            head_name.as_deref(),
+        );
+    }
+
     let opts = MachineOpts {
         quiet: args.quiet,
         verbose: args.verbose,
@@ -1005,6 +1093,151 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         &onto_name,
         interactive_explicit,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Apply backend (git rebase --apply via the am engine)
+// ---------------------------------------------------------------------------
+
+/// Split a raw committer/author identity (`Name <email> <seconds> <tz>`) into
+/// `(name, email, "<seconds> <tz>")`. The date piece is `None` when the line has
+/// no `< … >` email delimiters.
+fn split_identity(identity: &[u8]) -> Option<(String, String, Option<String>)> {
+    let text = String::from_utf8_lossy(identity);
+    let open = text.find('<')?;
+    let close = text[open..].find('>')? + open;
+    let name = text[..open].trim_end().to_string();
+    let email = text[open + 1..close].to_string();
+    let date = text[close + 1..].trim();
+    let date = if date.is_empty() {
+        None
+    } else {
+        Some(date.to_string())
+    };
+    Some((name, email, date))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_apply_backend(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    args: &RebaseArgs,
+    upstream: Option<&ObjectId>,
+    orig_head: &ObjectId,
+    onto: &ObjectId,
+    onto_name: &str,
+    head_name: Option<&str>,
+) -> Result<()> {
+    // Build the pick series exactly like the merge backend does (skip merges and
+    // empty commits unless --keep-empty), then turn each into an apply patch.
+    let records = make_script_commits(ctx, db, upstream, orig_head, args.keep_empty)?;
+
+    if records.is_empty() {
+        // Nothing to replay: detach onto the new base and finish (matches git's
+        // "noop" apply-backend run, which still moves the branch to onto).
+        checkout_onto_for_apply(ctx, db, onto, onto_name, orig_head)?;
+        if let Some(head_name) = head_name
+            && head_name.starts_with("refs/heads/")
+        {
+            let committer = commit_identity_from_env("COMMITTER")?;
+            move_to_original_branch(ctx, head_name, *orig_head, *onto, committer)?;
+        }
+        if !args.quiet {
+            eprintln!(
+                "Successfully rebased and updated {}.",
+                head_name
+                    .and_then(|name| name.strip_prefix("refs/heads/"))
+                    .unwrap_or("detached HEAD")
+            );
+        }
+        return Ok(());
+    }
+
+    let mut commits = Vec::with_capacity(records.len());
+    for record in &records {
+        let parent_tree = match record.parents.first() {
+            Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
+            None => ObjectId::empty_tree(ctx.format),
+        };
+        let diff = render_tree_to_tree_patch(db, ctx.format, &parent_tree, &record.commit.tree)?;
+        let (name, email, date) = split_identity(&record.commit.author)
+            .ok_or_else(|| GitError::InvalidObject("commit author has no identity".into()))?;
+        let mut message = record.commit.message.clone();
+        if !message.ends_with(b"\n") {
+            message.push(b'\n');
+        }
+        commits.push(commands::am::RebaseApplyCommit {
+            author_name: name,
+            author_email: email,
+            author_date: date,
+            message,
+            diff,
+        });
+    }
+
+    // Detach HEAD onto the new base (the am series commits onto it).
+    checkout_onto_for_apply(ctx, db, onto, onto_name, orig_head)?;
+
+    commands::am::start_rebase_apply(
+        &ctx.git_dir,
+        &ctx.common_git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        commands::am::RebaseApplyParams {
+            commits,
+            quiet: args.quiet,
+            signoff: args.signoff,
+            committer_date_is_author_date: args.committer_date_is_author_date,
+            ignore_date: args.ignore_date,
+            ignore_whitespace: args.ignore_whitespace,
+            head_name: head_name.map(str::to_string),
+            orig_head: *orig_head,
+            onto: *onto,
+        },
+    )
+}
+
+/// Detach HEAD onto `base` for the apply backend, refusing if the checkout would
+/// clobber untracked files (mirrors the merge backend's `checkout_onto_base`).
+fn checkout_onto_for_apply(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    base: &ObjectId,
+    onto_name: &str,
+    orig_head: &ObjectId,
+) -> Result<()> {
+    let refs = ctx.refs();
+    let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let base_tree = commit_tree_oid(db, ctx.format, base)?;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &base_tree)?;
+    if !overwritten.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by checkout:"
+        );
+        for path in &overwritten {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you switch branches.");
+        eprintln!("Aborting");
+        eprintln!("error: could not detach HEAD");
+        return Err(GitError::Exit(1));
+    }
+    sley_worktree::reset_index_and_worktree_to_commit(
+        &ctx.worktree_root,
+        &ctx.git_dir,
+        ctx.format,
+        base,
+    )?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    detach_head_with_reflog(
+        ctx,
+        old,
+        *base,
+        ctx.reflog("start", Some(&format!("checkout {onto_name}"))),
+        committer,
+    )?;
+    fs::write(ctx.git_dir.join("ORIG_HEAD"), format!("{orig_head}\n"))?;
+    Ok(())
 }
 
 fn default_upstream_name(ctx: &Ctx, refs: &FileRefStore) -> Option<String> {
