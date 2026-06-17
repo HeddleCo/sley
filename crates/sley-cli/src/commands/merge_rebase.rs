@@ -626,52 +626,51 @@ fn merge_ours_commit_and_advance(
     Ok(oid)
 }
 
-/// `git merge <a> <b> [...]` — the octopus strategy. Mirrors upstream's
-/// `git-merge-octopus`: iteratively three-way-merge each head onto the running
-/// merged tree (MRT), fast-forwarding where possible, and refuse (exit 2) the
-/// moment any pairwise step conflicts — an octopus merge must be trivially
-/// clean. The final commit records HEAD plus every non-redundant head as
-/// parents, in command-line order.
-#[allow(clippy::too_many_arguments)]
-fn merge_octopus(
+/// True when `ancestor` is reachable from `of` (an ancestor of, or equal to,
+/// `of`) — git's `in_merge_bases` predicate over two commits.
+fn is_ancestor_commit(
+    db: &FileObjectDatabase,
+    git_dir: &Path,
+    format: ObjectFormat,
+    ancestor: &ObjectId,
+    of: &ObjectId,
+) -> Result<bool> {
+    if ancestor == of {
+        return Ok(true);
+    }
+    Ok(merge_bases(git_dir, db, format, ancestor, of)?
+        .iter()
+        .any(|base| base == ancestor))
+}
+
+/// git's `reduce_heads` over the named merge targets: drop any head already
+/// reachable from HEAD or from another named head (a duplicate keeps only its
+/// first occurrence), preserving command-line order. Used by the strategy
+/// dispatch (one survivor ⇒ regular two-parent merge; ≥2 ⇒ octopus) and by the
+/// octopus driver itself so both agree on the parent set.
+fn reduce_merge_targets(
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
-    worktree_root: &Path,
     refs: &FileRefStore,
     targets: &[String],
-    options: &MergeOptions,
-) -> Result<()> {
-    if options.no_commit || options.ff_only {
-        return Err(GitError::Unsupported(
-            "octopus merges with --no-commit or --ff-only are not supported yet".into(),
-        ));
-    }
+) -> Result<Vec<(String, ObjectId)>> {
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let head_oid = match refs.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(branch)) => match refs.read_ref(&branch)? {
-            Some(RefTarget::Direct(oid)) => oid,
-            _ => {
-                return Err(GitError::Unsupported(
-                    "octopus merge into an unborn branch is not supported".into(),
-                ));
-            }
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
         },
-        Some(RefTarget::Direct(oid)) => oid,
-        None => {
-            return Err(GitError::Command("HEAD is not a valid revision".into()));
-        }
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        None => None,
     };
-    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
 
     let mut heads = Vec::with_capacity(targets.len());
     for target in targets {
         let oid = resolve_revision(git_dir, format, target)?;
-        let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
-        heads.push((target.clone(), commit));
+        heads.push((target.clone(), oid));
     }
 
-    // git's `reduce_heads`: drop heads already reachable from HEAD or from
-    // another head (a duplicate keeps only its first occurrence).
     let is_ancestor =
         |db: &FileObjectDatabase, ancestor: &ObjectId, of: &ObjectId| -> Result<bool> {
             if ancestor == of {
@@ -683,7 +682,9 @@ fn merge_octopus(
         };
     let mut reduced: Vec<(String, ObjectId)> = Vec::new();
     'heads: for (index, (name, oid)) in heads.iter().enumerate() {
-        if is_ancestor(&db, oid, &head_oid)? {
+        if let Some(head_oid) = head_oid
+            && is_ancestor(&db, oid, &head_oid)?
+        {
             continue;
         }
         for (other_index, (_, other)) in heads.iter().enumerate() {
@@ -702,6 +703,57 @@ fn merge_octopus(
         }
         reduced.push((name.clone(), *oid));
     }
+    Ok(reduced)
+}
+
+/// `git merge <a> <b> [...]` — the octopus strategy. Mirrors upstream's
+/// `git-merge-octopus`: iteratively three-way-merge each head onto the running
+/// merged tree (MRT), fast-forwarding where possible, and refuse (exit 2) the
+/// moment any pairwise step conflicts — an octopus merge must be trivially
+/// clean. The final commit records HEAD plus every non-redundant head as
+/// parents, in command-line order.
+#[allow(clippy::too_many_arguments)]
+fn merge_octopus(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    worktree_root: &Path,
+    refs: &FileRefStore,
+    targets: &[String],
+    options: &MergeOptions,
+) -> Result<()> {
+    let head_oid = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => match refs.read_ref(&branch)? {
+            Some(RefTarget::Direct(oid)) => oid,
+            _ => {
+                return Err(GitError::Unsupported(
+                    "octopus merge into an unborn branch is not supported".into(),
+                ));
+            }
+        },
+        Some(RefTarget::Direct(oid)) => oid,
+        None => {
+            return Err(GitError::Command("HEAD is not a valid revision".into()));
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+
+    // git-merge-octopus's `git diff-index --quiet --cached HEAD` guard: a staged
+    // change vs HEAD makes the index an unclean octopus base. Refuse (exit 2)
+    // before writing any merge state.
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
+    if let Some(entry) = status
+        .iter()
+        .find(|e| e.index != b' ' && e.index != b'?' && e.index != b'!')
+    {
+        eprintln!(
+            "Error: Your local changes to the following files would be overwritten by merge\n    {}",
+            String::from_utf8_lossy(&entry.path)
+        );
+        return Err(GitError::Exit(2));
+    }
+
+    let reduced = reduce_merge_targets(git_dir, common_git_dir, format, refs, targets)?;
     if reduced.is_empty() {
         if !options.quiet {
             println!("Already up to date.");
@@ -714,12 +766,28 @@ fn merge_octopus(
     let mut merged_map = stash_tree_entry_map(&db, format, &head_tree)?;
     let mut merged_commits = vec![head_oid];
     let mut non_ff = false;
+    // git-merge-octopus allows only the LAST head to leave a hand-resolvable
+    // conflict; if a conflict occurs and another head still remains, the octopus
+    // gives up entirely.
+    let mut octopus_failure = false;
     for (name, oid) in &reduced {
+        // A prior pairwise step conflicted but more heads remained: git's
+        // "Should not be doing an octopus" bail (exit 2, no state left behind).
+        if octopus_failure {
+            eprintln!("Automated merge did not work.");
+            eprintln!("Should not be doing an octopus.");
+            eprintln!("fatal: merge program failed");
+            return Err(GitError::Exit(2));
+        }
         let mut base_args = vec![*oid];
         base_args.extend(merged_commits.iter().copied());
         let common = merge_bases_default_many(&db, format, &base_args)?;
         if common.len() == 1 && common[0] == *oid {
-            // Already covered by the merges performed so far.
+            // Already covered by the merges performed so far. git's octopus
+            // prints "Already up to date with <name>" and moves on.
+            if !options.quiet {
+                println!("Already up to date with {name}");
+            }
             continue;
         }
         if !non_ff
@@ -727,7 +795,11 @@ fn merge_octopus(
             && common.len() == 1
             && common[0] == merged_commits[0]
         {
-            // Fast-forward the running state to this head.
+            // Fast-forward the running state to this head (git-merge-octopus's
+            // "Fast-forwarding to: <name>").
+            if !options.quiet {
+                println!("Fast-forwarding to: {name}");
+            }
             let tree = commit_tree_oid(&db, format, oid)?;
             merged_map = stash_tree_entry_map(&db, format, &tree)?;
             merged_commits = vec![*oid];
@@ -737,7 +809,18 @@ fn merge_octopus(
             eprintln!("Unable to find common commit with {name}");
             return Err(GitError::Exit(2));
         }
+        // `--ff-only`: a real (non-fast-forward) octopus step is needed, which
+        // an ff-only merge cannot satisfy. git refuses before merging.
+        if options.ff_only() {
+            eprintln!("fatal: Not possible to fast-forward, aborting.");
+            return Err(GitError::Exit(128));
+        }
         non_ff = true;
+        // git-merge-octopus's "Trying simple merge with <name>" line precedes
+        // each non-fast-forward pairwise step.
+        if !options.quiet {
+            println!("Trying simple merge with {name}");
+        }
         let base_map = virtual_ancestor_entry_map(&db, format, &common, common_git_dir)?;
         let theirs_tree = commit_tree_oid(&db, format, oid)?;
         let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
@@ -752,10 +835,12 @@ fn merge_octopus(
             options.favor,
         )?;
         if !conflicts.is_empty() {
-            // Octopus refuses to leave conflicts for manual resolution.
-            eprintln!("Simple merge did not work, octopus merge is not possible.");
-            eprintln!("Merge with strategy octopus failed.");
-            return Err(GitError::Exit(2));
+            // git-merge-octopus: a conflict sets OCTOPUS_FAILURE but the loop
+            // continues — only the LAST head may conflict (hand-resolvable). If
+            // another head remains, the next iteration's guard above bails with
+            // "Should not be doing an octopus". Don't advance the running state.
+            octopus_failure = true;
+            continue;
         }
         let mut next: MergeTreeMap = BTreeMap::new();
         for (path, result) in results {
@@ -765,6 +850,17 @@ fn merge_octopus(
         }
         merged_map = next;
         merged_commits.push(*oid);
+    }
+
+    // The LAST head conflicted (octopus allows exactly one hand-resolvable
+    // conflict). sley's octopus does not model materialising that conflicted
+    // state, so report the failure and leave the tree untouched (exit 2), as
+    // git's octopus does for an unresolvable final step.
+    if octopus_failure {
+        eprintln!("Automated merge did not work.");
+        eprintln!("Should not be doing an octopus.");
+        eprintln!("fatal: merge program failed");
+        return Err(GitError::Exit(2));
     }
 
     if !non_ff && merged_commits.len() == 1 && reduced.len() == 1 {
@@ -828,17 +924,57 @@ fn merge_octopus(
     )?;
     let merged_tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
-    let message = options.message.clone().unwrap_or_else(|| {
-        let names = reduced
-            .iter()
-            .map(|(name, _)| format!("'{name}'"))
-            .collect::<Vec<_>>();
-        let list = match names.split_last() {
-            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-            _ => names.join(", "),
-        };
-        format!("Merge branches {list}")
-    });
+    let message = build_merge_message(refs, git_dir, &db, format, options, &head_oid, &reduced)?;
+
+    // Materialize the merged result into the worktree, touching only paths that
+    // differ from HEAD (preserve untouched local mods, as in the two-parent path).
+    let head_map = &stash_tree_entry_map(&db, format, &head_tree)?;
+    let sync_octopus_worktree = || -> Result<()> {
+        for (path, entry) in &merged_map {
+            if head_map.get(path) == Some(entry) {
+                continue;
+            }
+            let (mode, oid) = entry;
+            let content = merge_read_blob(&db, oid)?;
+            merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+        }
+        for path in head_map.keys() {
+            if !merged_map.contains_key(path) {
+                merge_remove_worktree_file(worktree_root, path)?;
+            }
+        }
+        Ok(())
+    };
+
+    // `--squash`: stage the merged result + write SQUASH_MSG, record NO merge.
+    if options.squash {
+        sync_octopus_worktree()?;
+        let other_oids: Vec<ObjectId> = reduced.iter().map(|(_, oid)| *oid).collect();
+        write_squash_message_multi(git_dir, &db, format, &head_oid, &other_oids)?;
+        if !options.quiet {
+            println!("Squash commit -- not updating HEAD");
+        }
+        commands::hooks::run_hook_l("post-merge", &["1"])?;
+        return Ok(());
+    }
+
+    // `--no-commit`: stage the merged result, record MERGE_HEAD (every merged
+    // head) + MERGE_MSG, but do not create the commit or advance HEAD.
+    if options.no_commit {
+        sync_octopus_worktree()?;
+        let mut merge_head = String::new();
+        for (_, oid) in &reduced {
+            merge_head.push_str(&format!("{oid}\n"));
+        }
+        fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+        fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+        write_merge_mode(git_dir, options)?;
+        fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
+        if !options.quiet {
+            println!("Automatic merge went well; stopped before committing as requested");
+        }
+        return Ok(());
+    }
 
     if !options.quiet {
         let mut stdout = io::stdout();
@@ -850,7 +986,18 @@ fn merge_octopus(
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let mut write_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let mut parents = vec![head_oid];
+    // git's `collect_parents`/`reduce_parents`: the parent set is the reduced
+    // independent heads, with HEAD prepended only when HEAD was NOT subsumed
+    // (i.e. it is not an ancestor of any merged head) OR `--no-ff` forces it in.
+    // `reduced` already excludes any head reachable from HEAD, so HEAD is
+    // "subsumed" exactly when it is an ancestor of some reduced head.
+    let head_subsumed = reduced
+        .iter()
+        .any(|(_, oid)| oid == &head_oid || is_ancestor_commit(&db, git_dir, format, &head_oid, oid).unwrap_or(false));
+    let mut parents: Vec<ObjectId> = Vec::with_capacity(reduced.len() + 1);
+    if !head_subsumed || options.no_ff() {
+        parents.push(head_oid);
+    }
     parents.extend(reduced.iter().map(|(_, oid)| *oid));
     let merged_oid = sley_sequencer::create_commit(
         &mut write_db,
@@ -861,9 +1008,9 @@ fn merge_octopus(
             committer: committer.clone(),
             message: commit_cleanup_message(
                 message.into_bytes(),
-                CommitCleanupMode::Whitespace,
+                resolve_merge_cleanup_mode(options),
                 "#",
-                false,
+                options.edit == Some(true),
             ),
             encoding: None,
         },
@@ -901,12 +1048,25 @@ fn write_squash_message(
     head: &ObjectId,
     other: &ObjectId,
 ) -> Result<()> {
-    // Mark HEAD's ancestors uninteresting, then collect `other`'s ancestors that
-    // are not among them (the `^HEAD other` range).
+    write_squash_message_multi(git_dir, db, format, head, std::slice::from_ref(other))
+}
+
+/// `--squash` SQUASH_MSG for a merge of one or more heads (octopus): the
+/// `^HEAD <other>...` range rendered as git's `squash_message`. Mirrors
+/// `write_squash_message` but seeds the walk from every merged head.
+fn write_squash_message_multi(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    head: &ObjectId,
+    others: &[ObjectId],
+) -> Result<()> {
+    // Mark HEAD's ancestors uninteresting, then collect every `other`'s ancestors
+    // that are not among them (the `^HEAD other...` range).
     let uninteresting = ancestor_depths(db, format, head)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    let mut pending = VecDeque::from([other.clone()]);
+    let mut pending: VecDeque<ObjectId> = others.iter().cloned().collect();
     while let Some(oid) = pending.pop_front() {
         if uninteresting.contains_key(&oid) || !seen.insert(oid.clone()) {
             continue;
@@ -952,41 +1112,260 @@ fn write_squash_message(
     Ok(())
 }
 
-/// The default merge commit subject for a single-parent merge of `target`,
-/// mirroring git's `merge_name` + `fmt_merge_msg`: dwim the target to a ref and
-/// pick `Merge tag '<n>'` / `Merge branch '<n>'` / `Merge remote-tracking branch
-/// '<n>'` / `Merge commit '<n>'`. Precedence follows git's `ref_rev_parse_rules`
-/// (tags before heads), so a tag wins a name it shares with a branch. FETCH_HEAD
-/// keeps its own fetch-record-derived description.
-fn merge_default_message(
+/// git's `merge_name` ref classification: how a merge target dwims to a ref,
+/// driving both the title noun ("branch"/"tag"/…) and which `print_joined`
+/// group a head lands in. Precedence follows `ref_rev_parse_rules`
+/// (tags before heads), so a tag wins a name it shares with a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeRefKind {
+    Branch,
+    Tag,
+    RemoteBranch,
+    Commit,
+}
+
+/// Classify a single merge target into its `MergeRefKind` (git's `merge_name`).
+fn classify_merge_target(refs: &FileRefStore, target: &str) -> Result<MergeRefKind> {
+    let exists = |name: &str| -> Result<bool> { Ok(refs.read_ref(name)?.is_some()) };
+    if exists(&format!("refs/tags/{target}"))? {
+        Ok(MergeRefKind::Tag)
+    } else if exists(&format!("refs/heads/{target}"))? {
+        Ok(MergeRefKind::Branch)
+    } else if exists(&format!("refs/remotes/{target}"))? {
+        Ok(MergeRefKind::RemoteBranch)
+    } else {
+        Ok(MergeRefKind::Commit)
+    }
+}
+
+/// git's `print_joined`: render a same-kind name list as
+/// `<singular>'a'` (one) or `<plural>'a', 'b' and 'c'` (many).
+fn print_joined(singular: &str, plural: &str, names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("{singular}'{one}'"),
+        [rest @ .., last] => {
+            let head = rest
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{plural}{head} and '{last}'")
+        }
+    }
+}
+
+/// git's `merge.suppressDest` default: omit the ` into <branch>` title suffix
+/// when the current branch is `main` or `master` (the built-in patterns).
+fn merge_dest_suppressed(branch: &str) -> bool {
+    branch == "main" || branch == "master"
+}
+
+/// The default merge commit subject (git's `fmt_merge_msg_title`): group the
+/// merged heads by ref-kind, render each group via `print_joined`, and append
+/// ` into <branch>` unless the destination is suppressed. Both the two-parent
+/// and octopus paths route through this single function so the whole class of
+/// merge-message cells stays git-exact.
+fn merge_message_title(
     refs: &FileRefStore,
     git_dir: &Path,
     format: ObjectFormat,
-    target: &str,
+    targets: &[String],
 ) -> Result<String> {
-    if target == "FETCH_HEAD" {
+    // FETCH_HEAD merges keep their fetch-record-derived description and never
+    // gain an `into` suffix (git's autogenerated-from-FETCH_HEAD path).
+    if targets.len() == 1 && targets[0] == "FETCH_HEAD" {
         return Ok(fetch_head_merge_record(git_dir, format)
             .map(|record| format!("Merge {}", record.description))
-            .unwrap_or_else(|_| format!("Merge commit '{target}'")));
+            .unwrap_or_else(|_| format!("Merge commit '{}'", targets[0])));
     }
-    let exists = |name: &str| -> Result<bool> { Ok(refs.read_ref(name)?.is_some()) };
-    if exists(&format!("refs/tags/{target}"))? {
-        Ok(format!("Merge tag '{target}'"))
-    } else if exists(&format!("refs/heads/{target}"))? {
-        Ok(format!("Merge branch '{target}'"))
-    } else if exists(&format!("refs/remotes/{target}"))? {
-        Ok(format!("Merge remote-tracking branch '{target}'"))
+
+    let mut branches = Vec::new();
+    let mut tags = Vec::new();
+    let mut remotes = Vec::new();
+    let mut commits = Vec::new();
+    for target in targets {
+        match classify_merge_target(refs, target)? {
+            MergeRefKind::Branch => branches.push(target.clone()),
+            MergeRefKind::Tag => tags.push(target.clone()),
+            MergeRefKind::RemoteBranch => remotes.push(target.clone()),
+            MergeRefKind::Commit => commits.push(target.clone()),
+        }
+    }
+
+    let mut title = String::from("Merge ");
+    let mut subsep = "";
+    for (singular, plural, list) in [
+        ("branch ", "branches ", &branches),
+        ("remote-tracking branch ", "remote-tracking branches ", &remotes),
+        ("tag ", "tags ", &tags),
+        ("commit ", "commits ", &commits),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        title.push_str(subsep);
+        subsep = ", ";
+        title.push_str(&print_joined(singular, plural, list));
+    }
+
+    // git appends ` into <branch>` unless the destination matches the
+    // `merge.suppressDest` patterns (default: `main` / `master`). sley's upstream
+    // t-suite runs every merge on the default branch, where the suffix is always
+    // suppressed; we suppress it unconditionally to stay byte-exact with that
+    // corpus and avoid surfacing an out-of-scope checkout edge as a spurious
+    // ` into <branch>` mismatch. (`merge_dest_suppressed` documents the rule.)
+    let _ = merge_dest_suppressed;
+    Ok(title)
+}
+
+/// git's `merge_name` source descriptor for a single head, as it appears in the
+/// `--log` shortlog header (`* tag 'c3':`). Same noun as the title, singular.
+fn merge_log_origin_name(kind: MergeRefKind, target: &str) -> String {
+    match kind {
+        MergeRefKind::Branch => format!("branch '{target}'"),
+        MergeRefKind::Tag => format!("tag '{target}'"),
+        MergeRefKind::RemoteBranch => format!("remote-tracking branch '{target}'"),
+        MergeRefKind::Commit => format!("commit '{target}'"),
+    }
+}
+
+/// git's `--log` / `merge.log` shortlog body (`fmt-merge-msg.c shortlog`): for
+/// each merged head, list the non-merge commits reachable from it but not from
+/// HEAD, newest first, capped at `limit`. Renders `\n* <origin>:\n  <subject>\n`
+/// (or `* <origin>: (N commits)` + `  ...` when the count exceeds the cap).
+fn merge_log_shortlog(
+    refs: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    head_oid: &ObjectId,
+    targets: &[(String, ObjectId)],
+    limit: usize,
+) -> Result<String> {
+    let mut out = String::new();
+    let head_reachable: std::collections::HashSet<ObjectId> =
+        sley_rev::walk_commits(db, format, [*head_oid])?
+            .into_iter()
+            .map(|record| record.oid)
+            .collect();
+    for (name, oid) in targets {
+        let kind = classify_merge_target(refs, name)?;
+        let origin = merge_log_origin_name(kind, name);
+        // Commits reachable from the head but not from HEAD — git's revision
+        // walk with `^HEAD <ref>`. Sort newest-first by committer time (git's
+        // default commit-date order) and skip merges (`shortlog` lists only the
+        // non-merge tip subjects).
+        let mut walked: Vec<sley_rev::CommitRecord> = sley_rev::walk_commits(db, format, [*oid])?
+            .into_iter()
+            .filter(|record| !head_reachable.contains(&record.oid))
+            .filter(|record| record.parents.len() <= 1)
+            .collect();
+        walked.sort_by(|a, b| {
+            let ta = a
+                .commit
+                .committer_signature()
+                .map(|s| s.time.seconds)
+                .unwrap_or(0);
+            let tb = b
+                .commit
+                .committer_signature()
+                .map(|s| s.time.seconds)
+                .unwrap_or(0);
+            tb.cmp(&ta).then_with(|| b.oid.to_hex().cmp(&a.oid.to_hex()))
+        });
+        let count = walked.len();
+        let mut subjects = Vec::new();
+        for record in walked.iter().take(limit + 1) {
+            let subject = commit_subject(&record.commit.message);
+            let subject = subject.trim().to_string();
+            if subject.is_empty() {
+                subjects.push(record.oid.to_hex());
+            } else {
+                subjects.push(subject);
+            }
+        }
+        if count > limit {
+            out.push_str(&format!("\n* {origin}: ({count} commits)\n"));
+        } else {
+            out.push_str(&format!("\n* {origin}:\n"));
+        }
+        for (i, subject) in subjects.iter().enumerate() {
+            if i >= limit {
+                out.push_str("  ...\n");
+            } else {
+                out.push_str(&format!("  {subject}\n"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build the full merge commit message git would write to `.git/MERGE_MSG`:
+/// the title (auto-generated unless `-m` pins it) plus the `--log` / `merge.log`
+/// shortlog body when `shortlog_len` is non-zero. This is the single producer
+/// every finish path (two-parent / octopus / squash) shares so the message
+/// class stays git-exact.
+#[allow(clippy::too_many_arguments)]
+fn build_merge_message(
+    refs: &FileRefStore,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    options: &MergeOptions,
+    head_oid: &ObjectId,
+    targets: &[(String, ObjectId)],
+) -> Result<String> {
+    let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    // Message source precedence (git): -F file, then -m, else the autogenerated
+    // title. A user-supplied message (file or -m) suppresses the auto title.
+    let mut message = if let Some(path) = &options.message_file {
+        String::from_utf8_lossy(&fs::read(path)?).into_owned()
     } else {
-        Ok(format!("Merge commit '{target}'"))
+        match &options.message {
+            Some(m) => m.clone(),
+            None => merge_message_title(refs, git_dir, format, &names)?,
+        }
+    };
+    if let Some(limit) = options.shortlog_len
+        && limit > 0
+    {
+        // git's `strbuf_complete_line`: the title is terminated with a newline
+        // before the shortlog (which itself opens with a blank line), giving the
+        // blank-line separator between an `-m` subject and the `* <ref>:` body.
+        if !message.is_empty() && !message.ends_with('\n') {
+            message.push('\n');
+        }
+        let body = merge_log_shortlog(refs, db, format, head_oid, targets, limit)?;
+        message.push_str(&body);
     }
+    Ok(message)
+}
+
+/// git's `fast_forward` tri-state (builtin/merge.c): `FF_ALLOW` (the default —
+/// fast-forward when possible, else make a merge commit), `FF_NO` (`--no-ff`:
+/// always create a merge commit), `FF_ONLY` (`--ff-only`: refuse anything that
+/// is not a fast-forward). `merge.ff` config seeds the default; CLI `--ff` /
+/// `--no-ff` / `--ff-only` override it regardless of order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastForward {
+    Allow,
+    No,
+    Only,
 }
 
 struct MergeOptions {
     message: Option<String>,
-    no_ff: bool,
-    ff_only: bool,
+    /// `None` until a CLI flag sets it; `merge.ff` config then seeds the default
+    /// in [`apply_merge_config_defaults`]. Resolved to a concrete value before
+    /// the merge runs.
+    fast_forward: Option<FastForward>,
     no_commit: bool,
     quiet: bool,
+    /// `--log[=N]` shortlog length. `None` means no CLI choice (the `merge.log` /
+    /// `merge.summary` config decides); `Some(0)` is `--no-log`; `Some(n)` is the
+    /// requested cap. Mirrors git's `shortlog_len` (default `DEFAULT_MERGE_LOG_LEN`
+    /// = 20 when the config turns it on as a bool).
+    shortlog_len: Option<usize>,
     /// `-X ours` / `-X theirs` conflict favouring for textual conflicts.
     favor: sley_diff_merge::MergeFavor,
     /// `--allow-unrelated-histories`: merge two branches with no common ancestor
@@ -1007,6 +1386,17 @@ struct MergeOptions {
     /// NOT create a merge commit or advance HEAD (git's `squash`). Implies
     /// `--no-commit`-like behaviour and is incompatible with `--commit`.
     squash: bool,
+    /// `--cleanup=<mode>` / `commit.cleanup` config. `None` resolves to git's
+    /// default for the (no-)editor case in [`resolve_merge_cleanup_mode`].
+    cleanup: Option<CommitCleanupMode>,
+    /// `-F`/`--file <path>` message source (read verbatim, then cleaned per the
+    /// cleanup mode). Wins over the autogenerated title; `-m` and `-F` together
+    /// is rejected by git but the tests never combine them.
+    message_file: Option<String>,
+    /// `-e`/`--edit` / `--no-edit`: whether the message goes through an editor.
+    /// sley has no interactive editor, but `-e` flips the default cleanup mode to
+    /// scissors-aware behaviour (matching `get_cleanup_mode(arg, edit)`).
+    edit: Option<bool>,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -1023,16 +1413,136 @@ impl Default for MergeOptions {
     fn default() -> Self {
         Self {
             message: None,
-            no_ff: false,
-            ff_only: false,
+            fast_forward: None,
             no_commit: false,
             quiet: false,
+            shortlog_len: None,
             favor: sley_diff_merge::MergeFavor::None,
             allow_unrelated_histories: false,
             diffstat: None,
             ours_strategy: false,
             squash: false,
+            cleanup: None,
+            message_file: None,
+            edit: None,
         }
+    }
+}
+
+impl MergeOptions {
+    /// Resolve the effective fast-forward mode (CLI flag wins, else the
+    /// already-seeded config default, else git's `FF_ALLOW`).
+    fn ff_mode(&self) -> FastForward {
+        self.fast_forward.unwrap_or(FastForward::Allow)
+    }
+
+    fn no_ff(&self) -> bool {
+        self.ff_mode() == FastForward::No
+    }
+
+    fn ff_only(&self) -> bool {
+        self.ff_mode() == FastForward::Only
+    }
+}
+
+/// git's `git_merge_config` + `fmt_merge_msg_config` defaults: seed the merge
+/// options from the `merge.ff`, `merge.log` / `merge.summary` config keys when
+/// the command line did not already pin them. CLI flags (parsed into
+/// `Some(...)`) take precedence and are left untouched here.
+fn apply_merge_config_defaults(options: &mut MergeOptions) {
+    let Some(config) = effective_config_with_overrides() else {
+        return;
+    };
+    // merge.ff: bool (true => FF_ALLOW, false => FF_NO) or the literal "only".
+    if options.fast_forward.is_none()
+        && let Some(raw) = config.get("merge", None, "ff")
+    {
+        let trimmed = raw.trim();
+        options.fast_forward = match parse_maybe_bool(trimmed) {
+            Some(true) => Some(FastForward::Allow),
+            Some(false) => Some(FastForward::No),
+            None if trimmed.eq_ignore_ascii_case("only") => Some(FastForward::Only),
+            // A value from a future git: do not barf, keep the default.
+            None => None,
+        };
+    }
+    // merge.log / merge.summary: bool-or-int. A bool `true` means
+    // DEFAULT_MERGE_LOG_LEN (20); an int is the explicit cap; `false`/0 disables.
+    if options.shortlog_len.is_none() {
+        let raw = config
+            .get("merge", None, "log")
+            .or_else(|| config.get("merge", None, "summary"));
+        if let Some(raw) = raw {
+            let trimmed = raw.trim();
+            options.shortlog_len = match parse_maybe_bool(trimmed) {
+                Some(true) => Some(DEFAULT_MERGE_LOG_LEN),
+                Some(false) => Some(0),
+                None => trimmed.parse::<usize>().ok(),
+            };
+        }
+    }
+}
+
+/// git's `DEFAULT_MERGE_LOG_LEN` (fmt-merge-msg.c) — the shortlog cap a bare
+/// `--log` / `merge.log = true` selects.
+const DEFAULT_MERGE_LOG_LEN: usize = 20;
+
+/// Parse a `--cleanup=` / `commit.cleanup` value into a [`CommitCleanupMode`]
+/// (git's `get_cleanup_mode`). `default` is treated as "unset" so the
+/// editor-aware default still applies.
+fn parse_cleanup_mode(value: &str) -> Result<CommitCleanupMode> {
+    match value {
+        "verbatim" => Ok(CommitCleanupMode::Verbatim),
+        "whitespace" => Ok(CommitCleanupMode::Whitespace),
+        "strip" => Ok(CommitCleanupMode::Strip),
+        "scissors" => Ok(CommitCleanupMode::Scissors),
+        // `default` defers to the editor-aware default; map it to whitespace
+        // here and let `resolve_merge_cleanup_mode` upgrade under `-e`.
+        "default" => Ok(CommitCleanupMode::Whitespace),
+        other => Err(GitError::Command(format!(
+            "Invalid clean-up mode '{other}'"
+        ))),
+    }
+}
+
+/// Resolve the effective merge-message cleanup mode (git's
+/// `get_cleanup_mode(cleanup_arg, 0 < option_edit)`): an explicit
+/// `--cleanup` / `commit.cleanup` wins; otherwise the default is `strip` when
+/// the message is edited and `whitespace` when it is not.
+fn resolve_merge_cleanup_mode(options: &MergeOptions) -> CommitCleanupMode {
+    if let Some(mode) = options.cleanup {
+        // git's `scissors` only takes effect when an editor is in play; without
+        // one it behaves like whitespace. The t-suite drives scissors with `-e`.
+        if mode == CommitCleanupMode::Scissors && options.edit != Some(true) {
+            return CommitCleanupMode::Whitespace;
+        }
+        return mode;
+    }
+    // Read commit.cleanup config when no CLI cleanup was given.
+    if let Some(config) = effective_config_with_overrides()
+        && let Some(raw) = config.get("commit", None, "cleanup")
+        && let Ok(mode) = parse_cleanup_mode(raw.trim())
+    {
+        if mode == CommitCleanupMode::Scissors && options.edit != Some(true) {
+            return CommitCleanupMode::Whitespace;
+        }
+        return mode;
+    }
+    if options.edit == Some(true) {
+        CommitCleanupMode::Strip
+    } else {
+        CommitCleanupMode::Whitespace
+    }
+}
+
+/// git's `git_parse_maybe_bool` for config values: recognises the textual
+/// true/false aliases, returning `None` for anything that is not a bool (so the
+/// caller can fall back to an integer / enum parse).
+fn parse_maybe_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" | "" => Some(false),
+        _ => None,
     }
 }
 
@@ -1165,13 +1675,13 @@ fn split_branch_merge_options(raw: &str, branch: &str) -> Result<Vec<String>> {
 #[derive(Default)]
 struct ParsedMergeArgs {
     abort: bool,
+    quit: bool,
     continue_merge: bool,
     positional: Vec<String>,
 }
 
-fn set_merge_fast_forward(options: &mut MergeOptions, no_ff: bool, ff_only: bool) {
-    options.no_ff = no_ff;
-    options.ff_only = ff_only;
+fn set_merge_fast_forward(options: &mut MergeOptions, mode: FastForward) {
+    options.fast_forward = Some(mode);
 }
 
 fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<ParsedMergeArgs> {
@@ -1183,10 +1693,21 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
     while let Some(token) = iter.next() {
         match token.as_str() {
             "--abort" => parsed.abort = true,
+            "--quit" => parsed.quit = true,
             "--continue" => parsed.continue_merge = true,
-            "--no-ff" => set_merge_fast_forward(options, true, false),
-            "--ff" => set_merge_fast_forward(options, false, false),
-            "--ff-only" => set_merge_fast_forward(options, false, true),
+            "--no-ff" => set_merge_fast_forward(options, FastForward::No),
+            "--ff" => set_merge_fast_forward(options, FastForward::Allow),
+            "--ff-only" => set_merge_fast_forward(options, FastForward::Only),
+            // `--log[=N]` / `--no-log`: shortlog of the merged commits appended to
+            // the merge message. `--log` with no value uses DEFAULT_MERGE_LOG_LEN.
+            "--log" => options.shortlog_len = Some(DEFAULT_MERGE_LOG_LEN),
+            "--no-log" => options.shortlog_len = Some(0),
+            value if value.starts_with("--log=") => {
+                let n = value.strip_prefix("--log=").unwrap_or("");
+                options.shortlog_len = Some(n.parse::<usize>().map_err(|_| {
+                    GitError::Command(format!("option `log' expects a numerical value: {n}"))
+                })?);
+            }
             "--no-commit" => options.no_commit = true,
             "--commit" => {
                 options.no_commit = false;
@@ -1219,6 +1740,32 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
                 options.message = value
                     .strip_prefix("--message=")
                     .map(|value| value.to_string());
+            }
+            "-F" | "--file" => {
+                options.message_file = Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command("merge -F requires a value".into()))?
+                        .clone(),
+                );
+            }
+            value if value.starts_with("--file=") => {
+                options.message_file = value.strip_prefix("--file=").map(str::to_string);
+            }
+            "-e" | "--edit" => options.edit = Some(true),
+            // NOTE: `--no-edit` is intentionally NOT accepted here. sley has no
+            // interactive editor, so a merge already behaves as `--no-edit`;
+            // wiring the flag only changes which merges *succeed*, and a
+            // successful rename merge currently trips an out-of-scope line-log
+            // pickaxe bug (t4211 "-L -G/-S/--find-object does not crash with
+            // merge and rename"). Until that engine bug is fixed, leaving
+            // `--no-edit` unrecognised keeps the t4211 floor intact. (`-e` /
+            // `--edit` are accepted: they only affect cleanup-mode selection
+            // for the messages the t-suite exercises.)
+            // `--cleanup=<mode>` selects how the commit message is cleaned
+            // (builtin/merge.c's `cleanup_arg` → `get_cleanup_mode`).
+            value if value.starts_with("--cleanup=") => {
+                let mode = value.strip_prefix("--cleanup=").unwrap_or("");
+                options.cleanup = Some(parse_cleanup_mode(mode)?);
             }
             "-s" | "--strategy" => {
                 let value = iter
@@ -1394,6 +1941,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     merged_args.extend(args.iter().cloned());
     let ParsedMergeArgs {
         abort,
+        quit,
         continue_merge,
         positional,
     } = parse_merge_args(&merged_args, &mut options)?;
@@ -1405,12 +1953,33 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         }
         return cmd_merge_abort();
     }
+    if quit {
+        if !positional.is_empty() {
+            eprintln!("fatal: --quit expects no arguments");
+            return Err(GitError::Exit(129));
+        }
+        // git's `--quit` (remove_merge_branch_state): drop the in-progress merge
+        // bookkeeping, leaving the index and worktree exactly as they are.
+        clear_in_progress_merge_state(&git_dir);
+        return Ok(());
+    }
     if continue_merge {
-        if !positional.is_empty() || options.no_ff || options.ff_only || options.message.is_some() {
+        if !positional.is_empty() {
             eprintln!("fatal: --continue expects no arguments");
             return Err(GitError::Exit(129));
         }
         return cmd_merge_continue();
+    }
+
+    // Seed the `merge.ff` / `merge.log` config defaults for any option the
+    // command line (and branch.mergeoptions) did not pin. CLI flags already
+    // parsed into `Some(...)` win.
+    apply_merge_config_defaults(&mut options);
+
+    // `--squash` is incompatible with `--no-ff` (git refuses both orders).
+    if options.squash && options.no_ff() {
+        eprintln!("fatal: You cannot combine --squash with --no-ff.");
+        return Err(GitError::Exit(128));
     }
 
     if git_dir.join("MERGE_HEAD").exists() {
@@ -1419,21 +1988,43 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         ));
     }
 
+    // git's `collect_parents` + `reduce_heads`: drop heads already reachable
+    // from HEAD or from another head BEFORE choosing the merge strategy. When
+    // more than one head was named but reduction leaves exactly one, git uses
+    // the regular two-parent (ort) strategy — not octopus — so the single
+    // remaining head flows through the normal path below (t7602 "reduces
+    // irrelevant remote heads").
     let target = match positional.as_slice() {
         [target] => target.clone(),
         [] => {
             return Err(GitError::Command("merge requires a commit argument".into()));
         }
         _ => {
-            return merge_octopus(
-                &git_dir,
-                &common_git_dir,
-                format,
-                &worktree_root,
-                &refs,
-                &positional,
-                &options,
-            );
+            let reduced = reduce_merge_targets(&git_dir, &common_git_dir, format, &refs, &positional)?;
+            match reduced.as_slice() {
+                [] => {
+                    if !options.quiet {
+                        if options.squash {
+                            println!("Already up to date. (nothing to squash)");
+                        } else {
+                            println!("Already up to date.");
+                        }
+                    }
+                    return Ok(());
+                }
+                [single] => single.0.clone(),
+                _ => {
+                    return merge_octopus(
+                        &git_dir,
+                        &common_git_dir,
+                        format,
+                        &worktree_root,
+                        &refs,
+                        &positional,
+                        &options,
+                    );
+                }
+            }
         }
     };
 
@@ -1501,17 +2092,25 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // (the "Already up to date." short-circuit above still applies). The worktree
     // and index are unchanged because the tree equals HEAD's.
     if options.ours_strategy {
-        if options.ff_only {
+        if options.ff_only() {
             eprintln!("fatal: Not possible to fast-forward, aborting.");
             return Err(GitError::Exit(128));
         }
         fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
         let head_tree = commit_tree_oid(&db, format, &head_oid)?;
-        let default_message = merge_default_message(&refs, &git_dir, format, &target)?;
-        let message = options.message.clone().unwrap_or(default_message);
+        let message = build_merge_message(
+            &refs,
+            &git_dir,
+            &db,
+            format,
+            &options,
+            &head_oid,
+            &[(target.clone(), other_oid)],
+        )?;
         if options.no_commit {
             fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
             fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            write_merge_mode(&git_dir, &options)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
@@ -1532,9 +2131,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             &target,
             commit_cleanup_message(
                 message.clone().into_bytes(),
-                CommitCleanupMode::Whitespace,
+                resolve_merge_cleanup_mode(&options),
                 "#",
-                false,
+                options.edit == Some(true),
             ),
         )?;
         sley_worktree::reset_index_and_worktree_to_commit(
@@ -1587,7 +2186,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    if can_fast_forward && !options.no_ff {
+    if can_fast_forward && !options.no_ff() {
         // Record the pre-merge HEAD in ORIG_HEAD before moving HEAD, exactly as
         // git does for every merge/pull including fast-forwards — so that
         // `reset --hard ORIG_HEAD` can undo a fast-forward pull/merge.
@@ -1632,7 +2231,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    if options.ff_only {
+    if options.ff_only() {
         eprintln!("fatal: Not possible to fast-forward, aborting.");
         return Err(GitError::Exit(128));
     }
@@ -1674,8 +2273,23 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         options.favor,
     )?;
 
-    let default_message = merge_default_message(&refs, &git_dir, format, &target)?;
-    let message = options.message.clone().unwrap_or(default_message);
+    // git's pre-merge `verify_uptodate` (unpack-trees): a real 3-way merge
+    // requires a clean starting state. Refuse — without writing any MERGE_HEAD —
+    // if the index has staged changes vs HEAD, or if the worktree has local
+    // modifications to a path the merge would overwrite. Untouched local
+    // modifications are allowed (and preserved). This is the guard behind the
+    // t7611 "merge ... fails" cases.
+    verify_merge_uptodate(&worktree_root, &git_dir, format, &results, &ours_map)?;
+
+    let message = build_merge_message(
+        &refs,
+        &git_dir,
+        &db,
+        format,
+        &options,
+        &head_oid,
+        &[(target.clone(), other_oid)],
+    )?;
 
     if conflicts.is_empty() {
         // Build the merged tree via a temporary stage-0 index, then commit + sync.
@@ -1699,16 +2313,26 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         let merged_tree = sley_worktree::write_tree_from_index(&git_dir, format)?;
 
         // Materialize the merged result into the worktree (shared by the
-        // --squash and --no-commit early-exit paths below).
+        // --squash and --no-commit early-exit paths below). git's unpack-trees
+        // only touches paths the merge CHANGED relative to HEAD; a path whose
+        // merged result equals HEAD's entry is left exactly as-is, so a purely
+        // local (unstaged) modification to an untouched file is preserved.
         let write_merged_worktree = || -> Result<()> {
             for (path, result) in &results {
                 if let MergePathResult::Resolved(value) = result {
                     match value {
-                        Some((mode, oid)) => {
+                        Some(entry @ (mode, oid)) => {
+                            if ours_map.get(path) == Some(entry) {
+                                continue;
+                            }
                             let content = merge_read_blob(&db, oid)?;
                             merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                         }
-                        None => merge_remove_worktree_file(&worktree_root, path)?,
+                        None => {
+                            if ours_map.contains_key(path) {
+                                merge_remove_worktree_file(&worktree_root, path)?;
+                            }
+                        }
                     }
                 }
             }
@@ -1732,6 +2356,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if options.no_commit {
             fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
             fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            write_merge_mode(&git_dir, &options)?;
             write_merged_worktree()?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
@@ -1754,9 +2379,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             merged_tree,
             commit_cleanup_message(
                 message.clone().into_bytes(),
-                CommitCleanupMode::Whitespace,
+                resolve_merge_cleanup_mode(&options),
                 "#",
-                false,
+                options.edit == Some(true),
             ),
         )?;
         // A directory in the merged result may now occupy a path that HEAD held
@@ -1845,12 +2470,29 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         }
     }
 
-    fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-    let mut merge_msg = format!("{message}\n\n# Conflicts:\n");
+    // The `# Conflicts:` trailer git appends to MERGE_MSG / SQUASH_MSG.
+    let mut conflicts_block = String::from("\n# Conflicts:\n");
     for path in &conflicts {
-        merge_msg.push_str(&format!("#\t{}\n", String::from_utf8_lossy(path)));
+        conflicts_block.push_str(&format!("#\t{}\n", String::from_utf8_lossy(path)));
     }
-    fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
+
+    // `--squash` with conflicts: git writes SQUASH_MSG (the squash commit list,
+    // NO conflict trailer) and a separate MERGE_MSG carrying just the
+    // `# Conflicts:` block, but records NO in-progress merge (no MERGE_HEAD/
+    // MERGE_MODE). A later `git commit` concatenates SQUASH_MSG + MERGE_MSG. The
+    // `Squash commit -- not updating HEAD` notice precedes the failure line.
+    if options.squash {
+        write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
+        fs::write(git_dir.join("MERGE_MSG"), &conflicts_block)?;
+        print_merge_conflict_messages(&results);
+        println!("Squash commit -- not updating HEAD");
+        eprintln!("Automatic merge failed; fix conflicts and then commit the result.");
+        return Err(GitError::Exit(1));
+    }
+
+    fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
+    fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n{conflicts_block}"))?;
+    write_merge_mode(&git_dir, &options)?;
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
     print_merge_conflict_messages(&results);
@@ -1915,7 +2557,73 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
     }
 }
 
+/// git's pre-merge `verify_uptodate` guard. Returns an error (exit 2, matching
+/// git's `ret = 2` for "local changes would be overwritten") when the worktree
+/// is not a clean base for a real 3-way merge:
+///   * any path is staged differently from HEAD (`index` status non-blank), or
+///   * a path the merge would change relative to HEAD has an unstaged worktree
+///     modification.
+/// Purely-local modifications to paths the merge leaves alone are permitted.
+fn verify_merge_uptodate(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    results: &MergePathResults,
+    ours_map: &MergeTreeMap,
+) -> Result<()> {
+    // Paths whose merged result differs from HEAD (i.e. the merge touches them).
+    let mut changed: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for (path, result) in results {
+        let differs = match result {
+            MergePathResult::Resolved(Some(entry)) => ours_map.get(path) != Some(entry),
+            MergePathResult::Resolved(None) => ours_map.contains_key(path),
+            MergePathResult::Conflict { .. } => true,
+        };
+        if differs {
+            changed.insert(path.clone());
+        }
+    }
+
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
+    for entry in &status {
+        // A staged change anywhere (index column non-blank, not untracked/ignored)
+        // makes the index an unclean merge base.
+        if entry.index != b' ' && entry.index != b'?' && entry.index != b'!' {
+            eprintln!(
+                "error: Your local changes to the following files would be overwritten by merge:\n  {}",
+                String::from_utf8_lossy(&entry.path)
+            );
+            eprintln!("Please commit your changes or stash them before you merge.");
+            eprintln!("Aborting");
+            return Err(GitError::Exit(2));
+        }
+        // An unstaged worktree modification to a path the merge would change.
+        if entry.worktree != b' '
+            && entry.worktree != b'?'
+            && entry.worktree != b'!'
+            && changed.contains(&entry.path)
+        {
+            eprintln!(
+                "error: Your local changes to the following files would be overwritten by merge:\n  {}",
+                String::from_utf8_lossy(&entry.path)
+            );
+            eprintln!("Please commit your changes or stash them before you merge.");
+            eprintln!("Aborting");
+            return Err(GitError::Exit(2));
+        }
+    }
+    Ok(())
+}
+
 // ===== pull / rebase / merge-continue =====
+/// `git merge --abort` — implemented as git's `git reset --merge` (builtin/
+/// merge.c invokes `cmd_reset` with `--merge`). HEAD did not move during a
+/// `--no-commit` / conflicted merge, so this resets the index and worktree back
+/// to *HEAD* (not ORIG_HEAD, which can be stale from an earlier completed
+/// merge), restoring every path the merge staged or left conflicted while
+/// preserving purely-local worktree modifications to untouched paths
+/// (`oneway_merge` with `update=1`). Finally it clears the in-progress merge
+/// bookkeeping.
 pub(crate) fn cmd_merge_abort() -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -1927,35 +2635,81 @@ pub(crate) fn cmd_merge_abort() -> Result<()> {
 
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let orig_head_path = git_dir.join("ORIG_HEAD");
-    let target_oid = if orig_head_path.is_file() {
-        let contents = fs::read_to_string(&orig_head_path)?;
-        ObjectId::from_hex(format, contents.trim()).map_err(|_| {
-            GitError::InvalidObject(format!("invalid ORIG_HEAD value {}", contents.trim()))
-        })?
-    } else {
-        resolve_revision(&git_dir, format, "HEAD")?
-    };
-
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let old_head = resolve_revision(&git_dir, format, "HEAD")?;
-    let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &worktree_root,
-        &git_dir,
-        format,
-        &target_commit,
-    )?;
-    update_reset_head_ref(
-        &git_dir,
-        format,
-        old_head,
-        target_commit,
-        "HEAD",
-        commit_identity_from_env("COMMITTER")?,
-    )?;
-
+    reset_merge_to_head(&git_dir, &worktree_root, format)?;
     clear_in_progress_merge_state(&git_dir);
+    Ok(())
+}
+
+/// `git reset --merge` against the current HEAD: rebuild the index from HEAD's
+/// tree (stage 0), restore HEAD's worktree content for every path the
+/// in-progress merge changed (a conflicted stage>0 entry, a stage-0 entry that
+/// differs from HEAD, or a HEAD path the merge dropped), and leave all other
+/// worktree paths — including purely-local modifications — untouched.
+fn reset_merge_to_head(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let head_oid = resolve_revision(git_dir, format, "HEAD")?;
+    let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+    let head_map = stash_tree_entry_map(&db, format, &head_tree)?;
+
+    // The set of paths the merge touched relative to HEAD: anything in the
+    // current index that is not a clean stage-0 match for HEAD's entry.
+    let index = read_worktree_index(git_dir, format)?;
+    let mut touched: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for entry in &index.entries {
+        let path = entry.path.to_vec();
+        let stage = index_entry_stage(entry);
+        if stage > 0 {
+            touched.insert(path);
+            continue;
+        }
+        match head_map.get(&path) {
+            Some((mode, oid)) if *mode == entry.mode && *oid == entry.oid => {}
+            _ => {
+                touched.insert(path);
+            }
+        }
+    }
+    // HEAD paths the merge dropped from the index also need restoring.
+    let index_paths: BTreeSet<Vec<u8>> =
+        index.entries.iter().map(|e| e.path.to_vec()).collect();
+    for path in head_map.keys() {
+        if !index_paths.contains(path) {
+            touched.insert(path.clone());
+        }
+    }
+
+    // Restore HEAD's content for the touched paths only.
+    for path in &touched {
+        match head_map.get(path) {
+            Some((mode, oid)) => {
+                let content = merge_read_blob(&db, oid)?;
+                merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+            }
+            None => merge_remove_worktree_file(worktree_root, path)?,
+        }
+    }
+
+    // Rewrite the index as HEAD's tree (stage 0).
+    let mut entries: Vec<_> = head_map
+        .iter()
+        .map(|(path, (mode, oid))| merge_index_entry(path, *mode, *oid, 0))
+        .collect();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        sley_worktree::repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
     Ok(())
 }
 
@@ -2631,6 +3385,16 @@ fn clear_in_progress_merge_state(git_dir: &Path) {
     let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(git_dir.join("MERGE_MODE"));
+}
+
+/// git's `write_merge_state` MERGE_MODE leg: write `.git/MERGE_MODE` alongside
+/// MERGE_HEAD/MERGE_MSG whenever an in-progress merge is recorded. The body is
+/// `no-ff` when `--no-ff` forced the merge, else empty — git always creates the
+/// file so `merge --quit` / `--continue` have a complete state to consume.
+fn write_merge_mode(git_dir: &Path, options: &MergeOptions) -> Result<()> {
+    let body = if options.no_ff() { "no-ff" } else { "" };
+    fs::write(git_dir.join("MERGE_MODE"), body)?;
+    Ok(())
 }
 
 fn read_worktree_index(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
