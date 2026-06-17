@@ -1100,6 +1100,9 @@ impl FileRefStore {
                 update_index: 0,
                 value: ReftableRefValue::Deletion,
             }])?;
+            // git drops the reflog when the ref goes away; tombstone the log
+            // records so `git reflog` / `git stash list` stop seeing them.
+            self.remove_reflog_file(name);
             return Ok(oid);
         }
         let Some(reference) = self.read_loose_ref(name)? else {
@@ -1453,24 +1456,6 @@ impl FileRefStore {
         Ok(entries)
     }
 
-    /// Whether any log record exists for `name` in the reftable stack — including
-    /// the existence marker that `create-reflog` writes. Mirrors git's
-    /// `reftable_be_reflog_exists`. Last-writer-wins across the stack: a deletion
-    /// tombstone in a newer table for the same update index masks an entry from
-    /// an older one, so a reflog whose every entry is masked is "absent".
-    fn reftable_reflog_exists(&self, name: &str) -> Result<bool> {
-        let mut by_index: BTreeMap<u64, bool> = BTreeMap::new();
-        for table in self.reftables()? {
-            for record in table.logs {
-                if record.refname != name {
-                    continue;
-                }
-                let present = !matches!(record.value, ReftableLogValue::Deletion);
-                by_index.insert(record.update_index, present);
-            }
-        }
-        Ok(by_index.into_values().any(|present| present))
-    }
 
     fn collect_loose_refs(
         &self,
@@ -1573,6 +1558,13 @@ impl FileRefStore {
     /// later `refs/heads/l` cannot create its own `logs/refs/heads/l` reflog
     /// file (t3200 #14, #18).
     fn remove_reflog_file(&self, name: &str) {
+        // Reftable repos keep the reflog inside the table stack, not as a loose
+        // file: deleting a ref must tombstone its log records or `git stash
+        // list` / `git reflog` keep surfacing them (t0610 'basic: stash').
+        if matches!(self.uses_reftable(), Ok(true)) {
+            let _ = self.tombstone_reftable_logs(name);
+            return;
+        }
         let path = self.reflog_path(name);
         let _ = fs::remove_file(&path);
         let base = self.ref_base_dir(name).to_path_buf();
@@ -1580,6 +1572,13 @@ impl FileRefStore {
         if let Some(parent) = path.parent() {
             prune_empty_dirs_up_to(parent, &logs_refs_root);
         }
+    }
+
+    /// Mask every live log record for `name` with deletion tombstones, so the
+    /// reflog reads as absent. Mirrors git unlinking `logs/<name>` on the loose
+    /// backend; the reftable analogue is an all-tombstone table.
+    fn tombstone_reftable_logs(&self, name: &str) -> Result<()> {
+        self.rewrite_reftable_logs(name, &[])
     }
 
     /// Mirror git's `files_log_ref_write`: when a transaction updates a branch
@@ -1917,6 +1916,39 @@ fn reftable_table_name(min_update_index: u64, max_update_index: u64) -> String {
     // pick distinct names; truncate to 32 bits to match git's `%08x`.
     let salt = (nanos as u64) ^ (u64::from(std::process::id()) << 16);
     format!("0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref", salt as u32)
+}
+
+/// Whether `name` parses as a valid reftable file name the way git's
+/// `table_has_valid_name` (reftable/fsck.c) does: three hex tokens separated by
+/// `-`, ending in `.ref` (or `.log`). Used to keep sley's generated names from
+/// regressing into a shape `git fsck` would reject.
+#[cfg(test)]
+fn reftable_table_name_is_valid(name: &str) -> bool {
+    fn hex_prefix(s: &str) -> Option<&str> {
+        // strtoull(base 16) skips an optional leading 0x and consumes hex digits.
+        let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+        let consumed = body.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(body.len());
+        if consumed == 0 {
+            return None;
+        }
+        Some(&body[consumed..])
+    }
+    let Some(rest) = hex_prefix(name) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some(rest) = hex_prefix(rest) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some(rest) = hex_prefix(rest) else {
+        return false;
+    };
+    rest == ".ref" || rest == ".log"
 }
 
 fn repository_common_dir(git_dir: &Path) -> PathBuf {
@@ -5267,13 +5299,20 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list"))
             .expect("test operation should succeed");
         assert_eq!(tables.lines().count(), 2);
+        let last = tables
+            .lines()
+            .last()
+            .expect("test operation should succeed");
+        // The rust-written table name follows git's `0x%012x-0x%012x-%08x.ref`
+        // shape (reftable/stack.c::format_name) so `git fsck` accepts it; the
+        // earlier `-sley-<nanos>` token tripped `badReftableTableName`.
         assert!(
-            tables
-                .lines()
-                .last()
-                .expect("test operation should succeed")
-                .contains("sley"),
-            "expected rust-written reftable in tables.list, got {tables}"
+            last.starts_with("0x") && last.ends_with(".ref"),
+            "expected git-format reftable name in tables.list, got {tables}"
+        );
+        assert!(
+            reftable_table_name_is_valid(last),
+            "rust-written reftable name must parse as git's hex format, got {last}"
         );
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
