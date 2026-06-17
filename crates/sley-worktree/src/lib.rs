@@ -11741,6 +11741,20 @@ pub fn remove_index_and_worktree_paths(
         .iter()
         .map(|entry| entry.path.as_bytes().to_vec())
         .collect();
+    // Paths tracked as a gitlink (mode 160000) at stage 0. Removing one of these
+    // from the worktree is a *submodule* removal: git's builtin/rm.c flags the
+    // entry `is_submodule = S_ISGITLINK(ce->ce_mode)` and removes the populated
+    // submodule *directory* via `remove_dir_recursively` rather than `unlink`,
+    // which would fail with EISDIR ("Is a directory") on the submodule checkout.
+    // That EISDIR is exactly the gate that blocked the t1013/t7112/t6438/t2013
+    // submodule setups. Use the single `sley_index::is_gitlink` rule — no new
+    // predicate. (Unmerged gitlinks have no stage-0 entry and are not submodule
+    // removals here, matching git, which keys `is_submodule` off the matched ce.)
+    let gitlink_paths: BTreeSet<Vec<u8>> = index_entry_list
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal && sley_index::is_gitlink(entry.mode))
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
     // Paths selected for removal. A single selected path removes ALL of its
     // stage entries (so resolving an unmerged path by removal drops stages
     // 1/2/3 together), matching git's name-keyed removal.
@@ -11958,7 +11972,8 @@ pub fn remove_index_and_worktree_paths(
     if !options.cached {
         let mut removed_any = false;
         for path in &selected {
-            match remove_tracked_worktree_path(worktree_root, path)? {
+            let is_gitlink = gitlink_paths.contains(path);
+            match remove_tracked_worktree_path(worktree_root, path, is_gitlink)? {
                 true => removed_any = true,
                 false if !removed_any => {
                     eprintln!(
@@ -12001,11 +12016,18 @@ pub fn remove_index_and_worktree_paths(
 }
 
 /// Remove a tracked path from the working tree, mirroring builtin/rm.c's
-/// `remove_path`: unlink the file and prune now-empty parent directories.
-/// Returns `Ok(true)` when a file was removed, `Ok(false)` when the path could
-/// not be unlinked because it is a directory (the caller decides whether that
-/// aborts the run). A path that has already vanished is a no-op success.
-fn remove_tracked_worktree_path(root: &Path, path: &[u8]) -> Result<bool> {
+/// removal loop. For a plain path this is `remove_path`: unlink the file and
+/// prune now-empty parent directories. For a gitlink (`is_gitlink`, mode
+/// 160000) it is the submodule branch — git removes the populated submodule
+/// *directory* with `remove_dir_recursively` (NOT `unlink`, which fails EISDIR),
+/// descending into and deleting the nested `.git` because the `git rm` call site
+/// passes `flag` *without* `REMOVE_DIR_KEEP_NESTED_GIT`; it `die`s only if that
+/// recursive removal genuinely fails.
+///
+/// Returns `Ok(true)` when the path was removed, `Ok(false)` when a *plain* path
+/// could not be unlinked because it is a directory (the caller decides whether
+/// that aborts the run). A path that has already vanished is a no-op success.
+fn remove_tracked_worktree_path(root: &Path, path: &[u8], is_gitlink: bool) -> Result<bool> {
     let file = worktree_path(root, path)?;
     match fs::symlink_metadata(&file) {
         Err(err)
@@ -12018,10 +12040,23 @@ fn remove_tracked_worktree_path(root: &Path, path: &[u8]) -> Result<bool> {
         }
         Err(err) if err.raw_os_error() == Some(20) => return Ok(true), // ENOTDIR
         Err(err) => return Err(err.into()),
-        // A directory in the worktree where a plain file is tracked cannot be
-        // unlinked (git's remove_path fails on EISDIR). Report it so the caller
-        // can abort the removal without committing the index.
-        Ok(meta) if meta.is_dir() => return Ok(false),
+        Ok(meta) if meta.is_dir() => {
+            if is_gitlink {
+                // Submodule removal. Mirror builtin/rm.c's `is_submodule` branch:
+                // `remove_dir_recursively(&buf, force ? REMOVE_DIR_PURGE_ORIGINAL_CWD : 0)`.
+                // No `REMOVE_DIR_KEEP_NESTED_GIT` flag, so the whole subtree —
+                // including the nested `.git` of the populated submodule — is
+                // removed. git `die`s ("could not remove '<path>'") if the
+                // recursive removal fails; propagate the IO error to match.
+                fs::remove_dir_all(&file)?;
+                prune_empty_parents(root, file.parent())?;
+                return Ok(true);
+            }
+            // A directory in the worktree where a plain file is tracked cannot
+            // be unlinked (git's remove_path fails on EISDIR). Report it so the
+            // caller can abort the removal without committing the index.
+            return Ok(false);
+        }
         Ok(_) => {}
     }
     fs::remove_file(&file)?;
