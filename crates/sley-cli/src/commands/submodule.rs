@@ -751,6 +751,21 @@ fn cmd_submodule_foreach(args: &[String], quiet: bool) -> Result<()> {
     run_submodule_foreach_tree(&cwd, &worktree_root, &index, &submodules, &options)
 }
 
+/// A single gitlink change to summarize, the analogue of git's `struct
+/// module_cb`. Built by diffing the source tree (HEAD or a given commit) against
+/// the index (default / `--cached`) or, for `--files`, the index against the
+/// worktree. `summary` iterates over these, mirroring git's
+/// `compute_summary_module_list` + `submodule_summary_callback`.
+struct SubmoduleSummaryEntry {
+    sm_path: String,
+    /// `'A'` add, `'D'` delete, `'M'` modify, `'T'` type-change.
+    status: char,
+    mod_src: u32,
+    mod_dst: u32,
+    oid_src: ObjectId,
+    oid_dst: ObjectId,
+}
+
 fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
     let options = parse_submodule_summary_options(args, quiet)?;
     let cwd = env::current_dir()?;
@@ -760,21 +775,275 @@ fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
     if options.quiet || options.summary_limit == Some(0) {
         return Ok(());
     }
-    let submodules = read_submodule_configs(&worktree_root)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+    // module_summary: resolve the source-side commit. With a commit arg, use it;
+    // otherwise HEAD, falling back to the empty tree before the first commit.
+    let head_tree = summary_source_tree(&db, &git_dir, format, options.commit.as_deref())?;
+
     let index = read_repository_index(&git_dir, format)?;
-    let selected = select_submodules_for_summary(&cwd, &worktree_root, &submodules, &options);
-    for submodule in selected {
-        print_submodule_summary(
+    let mut entries = if options.files {
+        // --files: diff-files (index vs worktree).
+        compute_summary_diff_files(&worktree_root, format, &index)?
+    } else {
+        // default / --cached: diff-index (source tree vs index).
+        compute_summary_diff_index(&worktree_root, format, &head_tree, &index, options.cached)?
+    };
+
+    // Restrict to the requested pathspecs (git passes them through to diff).
+    if !options.positionals.is_empty() {
+        let specs: Vec<String> = options
+            .positionals
+            .iter()
+            .map(|path| normalize_submodule_pathspec(&cwd, &worktree_root, path))
+            .collect();
+        entries.retain(|entry| {
+            specs
+                .iter()
+                .any(|spec| submodule_path_matches_pathspec(&entry.sm_path, spec))
+        });
+    }
+
+    for entry in &entries {
+        generate_submodule_summary(
             &cwd,
-            &git_dir,
             &worktree_root,
             &index,
-            submodule,
+            entry,
             options.cached,
             options.summary_limit,
         )?;
     }
     Ok(())
+}
+
+/// `module_summary`'s source-OID resolution: a tree of `(path -> (mode, oid))`
+/// for every gitlink in the source side. `commit` is the optional positional;
+/// `None` means HEAD (or the empty tree before the first commit). Returns the
+/// flattened gitlink set keyed by path.
+fn summary_source_tree(
+    db: &FileObjectDatabase,
+    git_dir: &Path,
+    format: ObjectFormat,
+    commit: Option<&str>,
+) -> Result<BTreeMap<String, (u32, ObjectId)>> {
+    let tree_oid = match commit {
+        Some(rev) => match resolve_revision(git_dir, format, rev) {
+            Ok(oid) => Some(commit_tree_oid(db, format, &oid)?),
+            // git: a bad rev that isn't "HEAD" dies; "HEAD" before first commit
+            // falls back to the empty tree. We treat an unresolvable rev as the
+            // empty tree, which matches the no-commits-yet case the tests hit.
+            Err(_) => None,
+        },
+        None => match resolve_revision(git_dir, format, "HEAD") {
+            Ok(oid) => Some(commit_tree_oid(db, format, &oid)?),
+            Err(_) => None,
+        },
+    };
+    match tree_oid {
+        Some(tree) => collect_tree_gitlinks(db, format, &tree),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+fn commit_tree_oid(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<ObjectId> {
+    let object = db.read_object(commit_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {commit_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Commit::parse_ref(format, &object.body)?.tree)
+}
+
+/// Recursively collect every gitlink (mode 160000) entry in `tree`, keyed by its
+/// full slash-joined path. This is the source side of the summary's gitlink diff.
+fn collect_tree_gitlinks(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<BTreeMap<String, (u32, ObjectId)>> {
+    let mut out = BTreeMap::new();
+    collect_tree_gitlinks_into(db, format, tree_oid, "", &mut out)?;
+    Ok(out)
+}
+
+fn collect_tree_gitlinks_into(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: &str,
+    out: &mut BTreeMap<String, (u32, ObjectId)>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Ok(());
+    }
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name);
+        let path = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match entry.mode {
+            0o160000 => {
+                out.insert(path, (entry.mode, entry.oid));
+            }
+            0o040000 => {
+                collect_tree_gitlinks_into(db, format, &entry.oid, &path, out)?;
+            }
+            // A regular blob at a path that is a gitlink on the other side is a
+            // type-change; the index/tree walk on the other side records its
+            // mode, so capture blobs too (needed for submodule->blob detection).
+            _ => {
+                out.insert(path, (entry.mode, entry.oid));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `diff-index` for summary: pair the source tree (`old`) against the index
+/// (`new`). The "new" side is the index modes/oids; in the default (non-cached)
+/// mode, a gitlink whose checked-out submodule HEAD has moved off the index oid
+/// gets its dst oid refilled from that HEAD, which is how `run_diff_index(0)`
+/// surfaces a forward/backward move even after the superproject committed it.
+/// `--cached` reads the dst oid straight from the index.
+fn compute_summary_diff_index(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    old: &BTreeMap<String, (u32, ObjectId)>,
+    index: &Option<Index>,
+    cached: bool,
+) -> Result<Vec<SubmoduleSummaryEntry>> {
+    let mut new = index_relevant_paths(index, old);
+    if !cached {
+        // Default mode: run_diff_index(0) compares against the WORKTREE.
+        // For each gitlink: if the submodule is checked out, the dst is its
+        // current HEAD (the dirty-submodule fill); if the worktree path is gone
+        // entirely, the dst is null (a deletion, via check_removed).
+        let mut removed = Vec::new();
+        for (path, slot) in new.iter_mut() {
+            if slot.0 == 0o160000 {
+                let submodule_root = worktree_root.join(path);
+                if let Ok((_, head_oid)) = submodule_head(&submodule_root) {
+                    slot.1 = head_oid;
+                } else if !submodule_root.exists() {
+                    removed.push(path.clone());
+                }
+            }
+        }
+        for path in removed {
+            new.remove(&path);
+        }
+    }
+    Ok(diff_gitlink_sides(format, old, &new))
+}
+
+/// `diff-files` for summary `--files`: index (`old`) vs worktree-HEAD (`new`).
+/// The worktree side of a gitlink is the submodule's current HEAD commit; a
+/// type-change to a regular file uses the worktree blob's mode.
+fn compute_summary_diff_files(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    index: &Option<Index>,
+) -> Result<Vec<SubmoduleSummaryEntry>> {
+    let old = index_relevant_paths(index, &BTreeMap::new());
+    let mut new = BTreeMap::new();
+    for (path, (mode, oid)) in &old {
+        let submodule_root = worktree_root.join(path);
+        if *mode == 0o160000 {
+            if let Ok((_, head_oid)) = submodule_head(&submodule_root) {
+                new.insert(path.clone(), (*mode, head_oid));
+                continue;
+            }
+        }
+        // Not a checked-out gitlink: leave the worktree side equal to the index
+        // (no change), so only real moves surface.
+        new.insert(path.clone(), (*mode, *oid));
+    }
+    Ok(diff_gitlink_sides(format, &old, &new)
+        .into_iter()
+        .filter(|entry| entry.status == 'M' || entry.status == 'T')
+        .collect())
+}
+
+/// The index modes/oids at every stage-0 path that is a gitlink in the index OR
+/// a gitlink on the `tree_side` (so a `gitlink -> blob` type-change is captured
+/// from the index's blob mode). Keyed by path.
+fn index_relevant_paths(
+    index: &Option<Index>,
+    tree_side: &BTreeMap<String, (u32, ObjectId)>,
+) -> BTreeMap<String, (u32, ObjectId)> {
+    use sley_index::Stage;
+    let mut out = BTreeMap::new();
+    if let Some(index) = index {
+        for entry in &index.entries {
+            if entry.stage() != Stage::Normal {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            let tree_is_gitlink = tree_side.get(&path).is_some_and(|(m, _)| *m == 0o160000);
+            if entry.mode == 0o160000 || tree_is_gitlink {
+                out.insert(path, (entry.mode, entry.oid));
+            }
+        }
+    }
+    out
+}
+
+/// The diff core: pair `old` (source) against `new` (dest) over the union of
+/// paths, emitting a [`SubmoduleSummaryEntry`] per changed path where either
+/// side is a gitlink. Mirrors `submodule_summary_callback`'s filter
+/// (`S_ISGITLINK(one) || S_ISGITLINK(two)`).
+fn diff_gitlink_sides(
+    format: ObjectFormat,
+    old: &BTreeMap<String, (u32, ObjectId)>,
+    new: &BTreeMap<String, (u32, ObjectId)>,
+) -> Vec<SubmoduleSummaryEntry> {
+    let mut paths: BTreeSet<&String> = BTreeSet::new();
+    paths.extend(old.keys());
+    paths.extend(new.keys());
+    let null = ObjectId::null(format);
+    let mut entries = Vec::new();
+    for path in paths {
+        let src = old.get(path).copied();
+        let dst = new.get(path).copied();
+        let (mod_src, oid_src) = src.unwrap_or((0, null));
+        let (mod_dst, oid_dst) = dst.unwrap_or((0, null));
+        // Only gitlink-touching pairs matter.
+        if mod_src != 0o160000 && mod_dst != 0o160000 {
+            continue;
+        }
+        if mod_src == mod_dst && oid_src == oid_dst {
+            continue;
+        }
+        let status = if mod_src == 0 {
+            'A'
+        } else if mod_dst == 0 {
+            'D'
+        } else if mod_src != mod_dst {
+            'T'
+        } else {
+            'M'
+        };
+        entries.push(SubmoduleSummaryEntry {
+            sm_path: path.clone(),
+            status,
+            mod_src,
+            mod_dst,
+            oid_src,
+            oid_dst,
+        });
+    }
+    entries
 }
 
 fn cmd_submodule_set_url(args: &[String], quiet: bool) -> Result<()> {
@@ -863,8 +1132,11 @@ struct SubmoduleForeachOptions {
 
 struct SubmoduleSummaryOptions {
     cached: bool,
+    files: bool,
     quiet: bool,
     summary_limit: Option<isize>,
+    /// The optional `[<commit>]` argument (resolved as the diff source side).
+    commit: Option<String>,
     positionals: Vec<String>,
 }
 
@@ -1070,13 +1342,15 @@ fn parse_submodule_summary_options(
     let mut cached = false;
     let mut files = false;
     let mut summary_limit = None;
-    let mut positionals = Vec::new();
+    // git collects all non-option args first, then peels the leading one off as
+    // the `<commit>` if it resolves; the rest are pathspecs.
+    let mut operands = Vec::new();
     let mut positional_only = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if positional_only {
-            positionals.push(arg.clone());
+            operands.push(arg.clone());
             index += 1;
             continue;
         }
@@ -1085,7 +1359,11 @@ fn parse_submodule_summary_options(
             "--quiet" | "-q" => quiet = true,
             "--cached" => cached = true,
             "--files" => files = true,
-            "--summary-limit" => {
+            // `--for-status` is accepted (it tweaks ignore=all skipping, which
+            // sley's diff-driven summary handles structurally) and otherwise
+            // behaves like a plain summary.
+            "--for-status" => {}
+            "--summary-limit" | "-n" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return submodule_usage();
@@ -1095,8 +1373,11 @@ fn parse_submodule_summary_options(
             value if let Some(value) = value.strip_prefix("--summary-limit=") => {
                 summary_limit = Some(parse_submodule_summary_limit(value)?);
             }
+            value if let Some(value) = value.strip_prefix("-n") => {
+                summary_limit = Some(parse_submodule_summary_limit(value)?);
+            }
             value if value.starts_with('-') => return submodule_usage(),
-            value => positionals.push(value.to_string()),
+            value => operands.push(value.to_string()),
         }
         index += 1;
     }
@@ -1104,10 +1385,23 @@ fn parse_submodule_summary_options(
         eprintln!("fatal: options '--cached' and '--files' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    // Peel the leading operand as the commit; the rest are pathspecs. A leading
+    // operand of "HEAD" is also consumed as the commit. (git resolves it with
+    // repo_get_oid; an unresolvable leading operand still consumes the slot and
+    // resolves to the empty tree, matching `nonexistent commit`.)
+    let (commit, positionals) = if operands.is_empty() {
+        (None, Vec::new())
+    } else {
+        let mut iter = operands.into_iter();
+        let commit = iter.next();
+        (commit, iter.collect())
+    };
     Ok(SubmoduleSummaryOptions {
         cached,
+        files,
         quiet,
         summary_limit,
+        commit,
         positionals,
     })
 }
@@ -1155,29 +1449,6 @@ fn filter_submodule_configs<'a>(
     selected.sort_by(|left, right| left.path.cmp(&right.path));
     selected.dedup_by(|left, right| left.path == right.path);
     Ok(selected)
-}
-
-fn select_submodules_for_summary<'a>(
-    cwd: &Path,
-    worktree_root: &Path,
-    submodules: &'a [SubmoduleConfigEntry],
-    options: &SubmoduleSummaryOptions,
-) -> Vec<&'a SubmoduleConfigEntry> {
-    if options.positionals.is_empty() {
-        return submodules.iter().collect();
-    }
-    let mut selected = Vec::new();
-    for path in &options.positionals {
-        let normalized = normalize_submodule_pathspec(cwd, worktree_root, path);
-        selected.extend(
-            submodules
-                .iter()
-                .filter(|submodule| submodule_path_matches_pathspec(&submodule.path, &normalized)),
-        );
-    }
-    selected.sort_by(|left, right| left.path.cmp(&right.path));
-    selected.dedup_by(|left, right| left.path == right.path);
-    selected
 }
 
 /// Resolve a `.gitmodules` submodule url to the concrete url recorded in
@@ -1379,136 +1650,288 @@ fn run_submodule_foreach_command(
     Err(GitError::Exit(128))
 }
 
-fn print_submodule_summary(
+/// Port of `generate_submodule_summary` (git `builtin/submodule--helper.c`).
+/// Emits one `* <path> <src>...<dst> (<n>):` block per gitlink change, with the
+/// `--pretty`-style log lines (`> `/`< ` for forward/backward, or the
+/// type-change blob/submodule header). The submodule repo provides the commit
+/// objects; a submodule that isn't checked out (no readable repo) is skipped for
+/// modifications, matching git's `is_nonbare_repository_dir` gate, but
+/// additions/deletions/type-changes still print their header.
+fn generate_submodule_summary(
     cwd: &Path,
-    git_dir: &Path,
     worktree_root: &Path,
-    index: &Option<Index>,
-    submodule: &SubmoduleConfigEntry,
+    _index: &Option<Index>,
+    entry: &SubmoduleSummaryEntry,
     cached: bool,
     summary_limit: Option<isize>,
 ) -> Result<()> {
-    let Some(index_oid) = submodule_index_oid(index, &submodule.path) else {
+    let submodule_root = worktree_root.join(&entry.sm_path);
+    let sub_repo = submodule_head(&submodule_root)
+        .ok()
+        .map(|(git_dir, _)| git_dir);
+
+    // git's `generate_submodule_summary`: when not --cached and the dst oid is
+    // null but the path is a gitlink, fill it from the submodule's HEAD; when the
+    // dst is a blob/regular file, hash the worktree file. We only need the
+    // gitlink-from-HEAD branch for the summary-without-cached forward case.
+    let mut oid_dst = entry.oid_dst;
+    if !cached && entry.oid_dst.is_null() && entry.mod_dst == 0o160000 {
+        if let Some(git_dir) = &sub_repo {
+            let format = repository_object_format(git_dir)?;
+            if let Ok(head_oid) = resolve_revision(git_dir, format, "HEAD") {
+                oid_dst = head_oid;
+            }
+        }
+    }
+    let oid_src = entry.oid_src;
+
+    // Skip a plain modification whose submodule isn't checked out (git's
+    // is_nonbare_repository_dir gate in prepare_submodule_summary). Adds /
+    // deletes / type-changes still print.
+    if (entry.status == 'M') && sub_repo.is_none() {
         return Ok(());
-    };
-    let submodule_root = worktree_root.join(&submodule.path);
-    let Ok((submodule_git_dir, head_oid)) = submodule_head(&submodule_root) else {
-        return Ok(());
-    };
-    let old_oid = if cached {
-        let format = repository_object_format(git_dir)?;
-        let Some(head_index_oid) = submodule_head_tree_oid(git_dir, format, &submodule.path)?
-        else {
-            return Ok(());
+    }
+
+    let src_is_gitlink = entry.mod_src == 0o160000;
+    let dst_is_gitlink = entry.mod_dst == 0o160000;
+
+    // Abbreviations: git runs `rev-parse --short <oid>^0` inside the submodule;
+    // a missing commit falls back to the 7-char prefix of the full oid. We use
+    // the 7-char prefix uniformly (the test submodules are small, so the unique
+    // abbrev is 7), and track "missing" to suppress the commit count.
+    let (src_abbrev, missing_src) =
+        summary_abbrev(sub_repo.as_deref(), &oid_src, src_is_gitlink, entry.status == 'D');
+    let (dst_abbrev, missing_dst) =
+        summary_abbrev(sub_repo.as_deref(), &oid_dst, dst_is_gitlink, false);
+
+    let display_path = display_submodule_path(cwd, worktree_root, &entry.sm_path)?;
+
+    // Commit count via the submodule repo (git: rev-list --first-parent --count).
+    let mut total_commits: Option<usize> = None;
+    let mut errmsg: Option<String> = None;
+    if !missing_src && !missing_dst {
+        if let Some(git_dir) = &sub_repo {
+            let format = repository_object_format(git_dir)?;
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            if src_is_gitlink && dst_is_gitlink {
+                total_commits = Some(summary_symmetric_count(&db, format, &oid_src, &oid_dst)?);
+            } else {
+                // Single-sided (add/delete/type-change): count from the present
+                // side back to root.
+                let side = if src_is_gitlink { &oid_src } else { &oid_dst };
+                total_commits = Some(summary_count_to_root(&db, format, side)?);
+            }
+        }
+    } else if dst_is_gitlink {
+        // Missing-commit warning, only when the dst is still a submodule.
+        let msg = if missing_src && missing_dst {
+            format!(
+                "  Warn: {display_path} doesn't contain commits {} and {}\n",
+                oid_src.to_hex(),
+                oid_dst.to_hex()
+            )
+        } else {
+            let missing = if missing_src { &oid_src } else { &oid_dst };
+            format!(
+                "  Warn: {display_path} doesn't contain commit {}\n",
+                missing.to_hex()
+            )
         };
-        head_index_oid
+        errmsg = Some(msg);
+    }
+
+    // Header line.
+    if entry.status == 'T' {
+        if dst_is_gitlink {
+            print!("* {display_path} {src_abbrev}(blob)->{dst_abbrev}(submodule)");
+        } else {
+            print!("* {display_path} {src_abbrev}(submodule)->{dst_abbrev}(blob)");
+        }
     } else {
-        index_oid
-    };
-    let new_oid = if cached { index_oid } else { head_oid };
-    if new_oid == old_oid {
-        return Ok(());
+        print!("* {display_path} {src_abbrev}...{dst_abbrev}");
     }
-    let format = repository_object_format(&submodule_git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&submodule_git_dir, format);
-    let (marker, commits) = submodule_summary_commits(&db, format, &old_oid, &new_oid)?;
-    if commits.is_empty() {
-        return Ok(());
+    match total_commits {
+        Some(n) => println!(" ({n}):"),
+        None => println!(":"),
     }
-    let display_path = display_submodule_path(cwd, worktree_root, &submodule.path)?;
-    println!(
-        "* {} {}...{} ({}):",
-        display_path,
-        format_log_abbrev_oid(&old_oid),
-        format_log_abbrev_oid(&new_oid),
-        commits.len()
-    );
-    let limit = summary_limit
-        .and_then(|limit| usize::try_from(limit).ok())
-        .unwrap_or(commits.len());
-    for (_, commit) in commits.iter().take(limit) {
-        println!("  {marker} {}", commit_subject(&commit.message));
+
+    // Body.
+    if let Some(msg) = errmsg {
+        print!("{msg}");
+    } else if total_commits.is_some_and(|n| n > 0) {
+        if let Some(git_dir) = &sub_repo {
+            let format = repository_object_format(git_dir)?;
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            let limit = summary_limit.and_then(|limit| usize::try_from(limit).ok());
+            if src_is_gitlink && dst_is_gitlink {
+                // log --pretty='  %m %s' --first-parent <src>...<dst>: the `%m`
+                // marker is `>` for commits reachable only from dst (forward),
+                // `<` for commits reachable only from src (backward). git lists
+                // the dst-only (`>`) commits first, then the src-only (`<`).
+                let marked = summary_symmetric_log(&db, format, &oid_src, &oid_dst)?;
+                let take = limit.unwrap_or(marked.len());
+                for (marker, commit) in marked.iter().take(take) {
+                    println!("  {marker} {}", commit_subject(&commit.message));
+                }
+            } else if dst_is_gitlink {
+                // log --pretty='  > %s' -1 <dst>
+                let commit = summary_tip_commit(&db, format, &oid_dst)?;
+                if let Some(commit) = commit {
+                    println!("  > {}", commit_subject(&commit.message));
+                }
+            } else {
+                // log --pretty='  < %s' -1 <src>
+                let commit = summary_tip_commit(&db, format, &oid_src)?;
+                if let Some(commit) = commit {
+                    println!("  < {}", commit_subject(&commit.message));
+                }
+            }
+        }
     }
     println!();
     Ok(())
 }
 
-fn submodule_head_tree_oid(
-    git_dir: &Path,
-    format: ObjectFormat,
-    path: &str,
-) -> Result<Option<ObjectId>> {
-    let Ok(head_oid) = resolve_revision(git_dir, format, "HEAD") else {
-        return Ok(None);
-    };
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let object = db.read_object(&head_oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "expected commit {}, found {}",
-            head_oid,
-            object.object_type.as_str()
-        )));
+/// Abbreviate a summary-side oid the way `verify_submodule_committish` does:
+/// if the commit is present in the submodule repo, use its short hash (7 chars
+/// here); if it's null/absent, fall back to the 7-char prefix and mark missing.
+/// `is_delete_src` suppresses the existence check for a deletion's src (git skips
+/// `verify_submodule_committish` for status 'D').
+fn summary_abbrev(
+    sub_git_dir: Option<&Path>,
+    oid: &ObjectId,
+    is_gitlink: bool,
+    is_delete_src: bool,
+) -> (String, bool) {
+    let hex7 = format_log_abbrev_oid(oid);
+    if !is_gitlink {
+        // Non-gitlink side: always the plain prefix, never "missing".
+        return (hex7, false);
     }
-    let commit = Commit::parse_ref(format, &object.body)?;
-    let tree_object = db.read_object(&commit.tree)?;
-    if tree_object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {}, found {}",
-            commit.tree,
-            tree_object.object_type.as_str()
-        )));
+    if oid.is_null() {
+        return (hex7, false);
     }
-    let components = path
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    let Some(entry) = find_tree_entry(&db, format, &tree_object.body, &components)? else {
-        return Ok(None);
-    };
-    if entry.mode != 0o160000 {
-        return Ok(None);
+    if is_delete_src {
+        return (hex7, false);
     }
-    Ok(Some(entry.oid))
-}
-
-fn submodule_summary_commits(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    index_oid: &ObjectId,
-    head_oid: &ObjectId,
-) -> Result<(char, Vec<(ObjectId, Commit)>)> {
-    let forward = submodule_summary_forward_commits(db, format, index_oid, head_oid)?;
-    if !forward.is_empty() {
-        return Ok(('>', forward));
-    }
-    let reverse = submodule_summary_forward_commits(db, format, head_oid, index_oid)?;
-    Ok(('<', reverse))
-}
-
-fn submodule_summary_forward_commits(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    old_oid: &ObjectId,
-    new_oid: &ObjectId,
-) -> Result<Vec<(ObjectId, Commit)>> {
-    let old_ancestors = ancestor_depths(db, format, old_oid)?;
-    let mut commits = Vec::new();
-    let mut seen = HashSet::new();
-    let mut pending = VecDeque::from([*new_oid]);
-    while let Some(oid) = pending.pop_front() {
-        if old_ancestors.contains_key(&oid) || !seen.insert(oid) {
-            continue;
+    // Present in the submodule repo?
+    if let Some(git_dir) = sub_git_dir {
+        if let Ok(format) = repository_object_format(git_dir) {
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            if db.read_object(oid).is_ok() {
+                return (hex7, false);
+            }
         }
-        let object = db.read_object(&oid)?;
+    }
+    (hex7, true)
+}
+
+/// `rev-list --first-parent --count A...B` for two commits in the submodule:
+/// the number of commits reachable from exactly one side (the symmetric
+/// difference along first-parent chains).
+fn summary_symmetric_count(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    a: &ObjectId,
+    b: &ObjectId,
+) -> Result<usize> {
+    let forward = summary_first_parent_only(db, format, b, a)?;
+    let backward = summary_first_parent_only(db, format, a, b)?;
+    Ok(forward.len() + backward.len())
+}
+
+/// Single-sided count to the root (`rev-list --first-parent --count <oid>`).
+fn summary_count_to_root(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<usize> {
+    Ok(summary_first_parent_chain(db, format, oid)?.len())
+}
+
+/// Walk the first-parent chain from `tip` and return the commits not reachable
+/// (along the same chain) from `base`. Mirrors `rev-list --first-parent base..tip`.
+fn summary_first_parent_only(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tip: &ObjectId,
+    base: &ObjectId,
+) -> Result<Vec<(ObjectId, Commit)>> {
+    let base_chain: HashSet<ObjectId> = summary_first_parent_chain(db, format, base)?
+        .into_iter()
+        .map(|(oid, _)| oid)
+        .collect();
+    let mut out = Vec::new();
+    for (oid, commit) in summary_first_parent_chain(db, format, tip)? {
+        if base_chain.contains(&oid) {
+            break;
+        }
+        out.push((oid, commit));
+    }
+    Ok(out)
+}
+
+/// The full first-parent chain from `oid` back to the root.
+fn summary_first_parent_chain(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Vec<(ObjectId, Commit)>> {
+    let mut chain = Vec::new();
+    let mut current = Some(*oid);
+    let mut seen = HashSet::new();
+    while let Some(cur) = current {
+        if !seen.insert(cur) {
+            break;
+        }
+        let object = match db.read_object(&cur) {
+            Ok(object) => object,
+            Err(_) => break,
+        };
         if object.object_type != ObjectType::Commit {
-            continue;
+            break;
         }
         let commit = Commit::parse(format, &object.body)?;
-        pending.extend(commit.parents.iter().copied());
-        commits.push((oid, commit));
+        current = commit.parents.first().copied();
+        chain.push((cur, commit));
     }
-    Ok(commits)
+    Ok(chain)
+}
+
+/// `log --pretty='  %m %s' --first-parent <src>...<dst>` for a two-gitlink
+/// modification: the symmetric difference along first-parent chains, with the
+/// dst-only commits marked `>` (forward) listed first, then the src-only commits
+/// marked `<` (backward). Both sub-lists are newest-first, matching git's
+/// reverse-chronological log over the `A...B` range.
+fn summary_symmetric_log(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    src: &ObjectId,
+    dst: &ObjectId,
+) -> Result<Vec<(char, Commit)>> {
+    let mut out = Vec::new();
+    for (_, commit) in summary_first_parent_only(db, format, dst, src)? {
+        out.push(('>', commit));
+    }
+    for (_, commit) in summary_first_parent_only(db, format, src, dst)? {
+        out.push(('<', commit));
+    }
+    Ok(out)
+}
+
+/// `log -1 <oid>`: the single commit at `oid`, if present.
+fn summary_tip_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<Commit>> {
+    let Ok(object) = db.read_object(oid) else {
+        return Ok(None);
+    };
+    if object.object_type != ObjectType::Commit {
+        return Ok(None);
+    }
+    Ok(Some(Commit::parse(format, &object.body)?))
 }
 
 fn submodule_index_oid(index: &Option<Index>, path: &str) -> Option<ObjectId> {
