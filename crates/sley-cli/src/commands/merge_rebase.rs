@@ -2437,12 +2437,28 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         }
     }
 
-    fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-    let mut merge_msg = format!("{message}\n\n# Conflicts:\n");
+    // The `# Conflicts:` trailer git appends to MERGE_MSG / SQUASH_MSG.
+    let mut conflicts_block = String::from("\n# Conflicts:\n");
     for path in &conflicts {
-        merge_msg.push_str(&format!("#\t{}\n", String::from_utf8_lossy(path)));
+        conflicts_block.push_str(&format!("#\t{}\n", String::from_utf8_lossy(path)));
     }
-    fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
+
+    // `--squash` with conflicts: git writes SQUASH_MSG (the squash commit list,
+    // NO conflict trailer) and a separate MERGE_MSG carrying just the
+    // `# Conflicts:` block, but records NO in-progress merge (no MERGE_HEAD/
+    // MERGE_MODE). A later `git commit` concatenates SQUASH_MSG + MERGE_MSG. The
+    // `Squash commit -- not updating HEAD` notice precedes the failure line.
+    if options.squash {
+        write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
+        fs::write(git_dir.join("MERGE_MSG"), &conflicts_block)?;
+        print_merge_conflict_messages(&results);
+        println!("Squash commit -- not updating HEAD");
+        eprintln!("Automatic merge failed; fix conflicts and then commit the result.");
+        return Err(GitError::Exit(1));
+    }
+
+    fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
+    fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n{conflicts_block}"))?;
     write_merge_mode(&git_dir, &options)?;
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
