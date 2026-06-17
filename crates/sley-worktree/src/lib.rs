@@ -12335,6 +12335,16 @@ fn restore_index_entry(
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
 ) -> Result<()> {
+    // A gitlink (mode 160000) names a commit in the submodule's repository, not
+    // a blob here — reading it as a blob fails ("not found: blob object"). git's
+    // `checkout_entry` S_IFGITLINK arm just ensures the submodule directory
+    // exists and never touches an object; the submodule's content is `submodule
+    // update` territory. Single gitlink rule via `sley_index::is_gitlink`.
+    if sley_index::is_gitlink(entry.mode) {
+        let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
+        fs::create_dir_all(&dir_path)?;
+        return Ok(());
+    }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let body: Cow<'_, [u8]> = match smudge_config {
         Some(config) => {
@@ -12423,11 +12433,14 @@ fn restore_head_entry_to_worktree_and_index(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
-    let file_path = write_worktree_blob_entry(db, worktree_root, path, entry)?;
-    let metadata = fs::symlink_metadata(&file_path)?;
-    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
-    index_entry.mode = entry.mode;
-    Ok(index_entry)
+    // Route through the single gitlink-aware materializer rather than calling
+    // `write_worktree_blob_entry` directly: a gitlink (mode 160000) has no blob
+    // in this object store, so the blob read would fail with "not found: blob
+    // object <commit-oid>". `materialize_tree_entry` owns the
+    // gitlink-vs-blob/symlink decision (mkdir the submodule dir, never read an
+    // object) in ONE place, so `checkout <tree> -- <gitlink-path>` /
+    // `restore --source` inherit the same gitlink correctness as `reset --hard`.
+    materialize_tree_entry(db, worktree_root, path, entry)
 }
 
 fn index_has_entry_under(entries: &[IndexEntry], directory: &[u8]) -> bool {
