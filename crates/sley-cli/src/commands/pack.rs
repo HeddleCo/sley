@@ -764,6 +764,9 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut write_midx = false;
     let mut keep_packs: Vec<String> = Vec::new();
     let mut pack_kept_objects = false;
+    let mut cruft = false;
+    let mut cruft_expiration: Option<Option<u32>> = None;
+    let mut expire_to: Option<String> = None;
     let mut iter = expand_repack_short_clusters(args).into_iter().peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -773,6 +776,28 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             "--no-write-bitmap-index" => write_bitmaps = Some(false),
             "-a" | "-A" => all = true,
             "-m" | "--write-midx" => write_midx = true,
+            "--cruft" => cruft = true,
+            "--cruft-expiration" => {
+                cruft = true;
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `cruft-expiration' requires a value".into())
+                })?;
+                cruft_expiration = Some(parse_cruft_expiration(&value)?);
+            }
+            value if value.starts_with("--cruft-expiration=") => {
+                cruft = true;
+                cruft_expiration =
+                    Some(parse_cruft_expiration(&value["--cruft-expiration=".len()..])?);
+            }
+            "--expire-to" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `expire-to' requires a value".into())
+                })?;
+                expire_to = Some(value);
+            }
+            value if value.starts_with("--expire-to=") => {
+                expire_to = Some(value["--expire-to=".len()..].to_string());
+            }
             "-k" | "--keep-unreachable" | "--pack-kept-objects" => {
                 if arg == "--pack-kept-objects" {
                     pack_kept_objects = true;
@@ -796,6 +821,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             value if value.starts_with("--keep-pack=") => {
                 keep_packs.push(strip_pack_suffix(&value["--keep-pack=".len()..]));
             }
+            "--no-cruft" => cruft = false,
             // Accepted no-ops.
             "-l" | "-f" | "-F" | "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
             value
@@ -803,6 +829,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
                     || value.starts_with("--depth")
                     || value.starts_with("--threads")
                     || value.starts_with("--max-pack-size")
+                    || value.starts_with("--max-cruft-size")
+                    || value.starts_with("--combine-cruft-below-size")
                     || value.starts_with("--pack.packSizeLimit") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
@@ -844,6 +872,18 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             write_bitmaps,
             &keep_packs,
             pack_kept_objects,
+        );
+    }
+
+    if cruft {
+        return cmd_repack_cruft(
+            &git_dir,
+            &common_git_dir,
+            format,
+            prune,
+            cruft_expiration.flatten(),
+            expire_to.as_deref(),
+            write_midx,
         );
     }
 
@@ -960,6 +1000,122 @@ fn cmd_repack_geometric(
         cmd_multi_pack_index_write(&midx_args)?;
     }
     let _ = git_dir;
+    Ok(())
+}
+
+/// Parse a `--cruft-expiration` value. Returns `None` for "never" (zero), else
+/// the UNIX-seconds cutoff (`now`/`all` → u32::MAX so everything expires).
+///
+/// git's expiry timestamp is UNSIGNED (`timestamp_t`); `parse_expiry_date`
+/// renders the `now`/`all` sentinel as `u64::MAX` (which is `-1` reinterpreted
+/// as `i64`). We interpret the value as unsigned so the sentinel saturates to
+/// `u32::MAX` (everything older than "the end of time" expires) rather than
+/// collapsing to `0`.
+fn parse_cruft_expiration(spec: &str) -> Result<Option<u32>> {
+    let ts = crate::commands::approxidate::parse_expiry_date(spec)
+        .ok_or_else(|| GitError::Command(format!("malformed expiration date '{spec}'")))?;
+    let ts = ts as u64;
+    Ok(if ts == 0 {
+        None
+    } else if ts >= u32::MAX as u64 {
+        Some(u32::MAX)
+    } else {
+        Some(ts as u32)
+    })
+}
+
+/// `git repack --cruft [--cruft-expiration=<t>] [--expire-to=<dir>] [-d]`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_repack_cruft(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    prune: bool,
+    cruft_expiration: Option<u32>,
+    expire_to: Option<&str>,
+    write_midx: bool,
+) -> Result<()> {
+    let roots = repack_traversal_roots(git_dir, common_git_dir, format)?;
+
+    // With `--expire-to` + `-d`, the main cruft pack expires (drops) objects
+    // older than the cutoff; those expired objects are written into the
+    // expire-to repo as a second cruft pack (with no expiration, so it keeps
+    // them all). Compute the pre-expiry unreachable set first so we can diff.
+    let pre_expiry = if expire_to.is_some() && prune {
+        Some(sley_odb::repack_cruft(common_git_dir, format, &roots, None)?)
+    } else {
+        None
+    };
+
+    let result = sley_odb::repack_cruft(common_git_dir, format, &roots, cruft_expiration)?;
+    sley_odb::install_cruft_repack_result(common_git_dir, format, &result, prune)?;
+
+    // Move the expired objects into the --expire-to repository.
+    if let (Some(dir), Some(pre)) = (expire_to, pre_expiry.as_ref()) {
+        let kept: HashSet<ObjectId> = result
+            .cruft
+            .as_ref()
+            .map(|c| c.oids.iter().copied().collect())
+            .unwrap_or_default();
+        let expired: Vec<ObjectId> = pre
+            .cruft
+            .as_ref()
+            .map(|c| {
+                c.oids
+                    .iter()
+                    .copied()
+                    .filter(|oid| !kept.contains(oid))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !expired.is_empty() {
+            write_expire_to_cruft_pack(common_git_dir, format, dir, &expired, cruft_expiration)?;
+        }
+    }
+
+    if write_midx && pack_dir_has_packs(common_git_dir, format)? {
+        cmd_multi_pack_index_write(&[])?;
+    }
+    Ok(())
+}
+
+/// Write a cruft pack of `expired` objects into the `--expire-to` repository's
+/// pack directory (an `<dir>/pack` prefix like git's `--expire-to=.../pack`).
+fn write_expire_to_cruft_pack(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    expire_to: &str,
+    expired: &[ObjectId],
+    cruft_expiration: Option<u32>,
+) -> Result<()> {
+    let _ = cruft_expiration;
+    // `--expire-to=<repo>/objects/pack/pack` names a pack-file prefix. Resolve
+    // the directory it lives in and write the limbo cruft pack there.
+    let prefix = Path::new(expire_to);
+    let dest_dir = prefix
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&dest_dir)?;
+
+    let objects_dir = repository_objects_dir(common_git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+
+    // Stamp each expired object with the best mtime from its on-disk copy.
+    let on_disk = sley_odb::object_mtimes_on_disk_pub(&objects_dir, format)?;
+    let mut survivors: HashMap<ObjectId, u32> = HashMap::new();
+    for oid in expired {
+        let mtime = on_disk.get(oid).copied().unwrap_or(0);
+        survivors.insert(*oid, mtime);
+    }
+    let Some(cruft) = sley_odb::build_cruft_pack_pub(&database, format, &survivors)? else {
+        return Ok(());
+    };
+    let pack_name = format!("pack-{}", cruft.checksum.to_hex());
+    fs::write(dest_dir.join(format!("{pack_name}.pack")), &cruft.pack)?;
+    fs::write(dest_dir.join(format!("{pack_name}.rev")), &cruft.rev)?;
+    fs::write(dest_dir.join(format!("{pack_name}.mtimes")), &cruft.mtimes)?;
+    fs::write(dest_dir.join(format!("{pack_name}.idx")), &cruft.idx)?;
     Ok(())
 }
 

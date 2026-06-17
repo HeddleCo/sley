@@ -1282,6 +1282,425 @@ fn validate_pack_checksum(
     Ok(())
 }
 
+/// The UNIX-seconds mtime of a path, or `0` when unavailable.
+fn path_mtime_secs(path: &Path) -> u32 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_secs() as u32)
+        .unwrap_or(0)
+}
+
+/// The bytes of one cruft `.mtimes` pack plus its sidecars and checksum, ready
+/// to install under `objects/pack/`.
+#[derive(Debug, Clone)]
+pub struct CruftPack {
+    pub pack: Vec<u8>,
+    pub idx: Vec<u8>,
+    pub rev: Vec<u8>,
+    pub mtimes: Vec<u8>,
+    pub checksum: ObjectId,
+    /// Object ids the cruft pack holds (its surviving unreachable set).
+    pub oids: Vec<ObjectId>,
+}
+
+/// Outcome of `git repack --cruft`: the reachable pack (if any) plus the cruft
+/// `.mtimes` pack of surviving unreachable objects.
+#[derive(Debug, Clone)]
+pub struct CruftRepackResult {
+    /// The all-into-one reachable pack, or `None` when nothing is reachable.
+    pub reachable: Option<RepackResult>,
+    /// The cruft pack of unreachable objects, or `None` when there are none.
+    pub cruft: Option<CruftPack>,
+    /// Pre-existing non-cruft, non-kept pack `.pack` paths superseded by the
+    /// reachable pack (removed under `-d`).
+    pub obsolete_packs: Vec<PathBuf>,
+    /// Pre-existing cruft `.pack` paths whose objects are now in the new cruft
+    /// pack (removed under `-d`).
+    pub obsolete_cruft_packs: Vec<PathBuf>,
+}
+
+/// Gather every object id on disk together with the best (max) mtime of any
+/// copy: a packed object contributes its pack's mtime (or its own recorded
+/// mtime inside a cruft pack), a loose object contributes its file mtime.
+pub fn object_mtimes_on_disk_pub(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashMap<ObjectId, u32>> {
+    object_mtimes_on_disk(objects_dir, format)
+}
+
+fn object_mtimes_on_disk(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashMap<ObjectId, u32>> {
+    let mut mtimes: HashMap<ObjectId, u32> = HashMap::new();
+    let mut record = |oid: ObjectId, mtime: u32| {
+        mtimes
+            .entry(oid)
+            .and_modify(|existing| {
+                if mtime > *existing {
+                    *existing = mtime;
+                }
+            })
+            .or_insert(mtime);
+    };
+
+    let pack_dir = objects_dir.join("pack");
+    if let Ok(entries) = fs::read_dir(&pack_dir) {
+        let mut idx_paths: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
+                idx_paths.push(path);
+            }
+        }
+        idx_paths.sort();
+        for idx_path in idx_paths {
+            let index = PackIndex::parse(&fs::read(&idx_path)?, format)?;
+            let pack_path = idx_path.with_extension("pack");
+            let mtimes_path = idx_path.with_extension("mtimes");
+            let pack_object_mtimes: Option<Vec<u32>> =
+                fs::read(&mtimes_path).ok().and_then(|bytes| {
+                    sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
+                        .ok()
+                        .map(|parsed| parsed.mtimes)
+                });
+            let pack_mtime = path_mtime_secs(&pack_path);
+            for (pos, entry) in index.entries.iter().enumerate() {
+                let mtime = pack_object_mtimes
+                    .as_ref()
+                    .and_then(|table| table.get(pos).copied())
+                    .unwrap_or(pack_mtime);
+                record(entry.oid, mtime);
+            }
+        }
+    }
+
+    let store = LooseObjectStore::new(objects_dir.to_path_buf(), format);
+    for oid in loose_object_ids(objects_dir, format)? {
+        let path = store.object_path(&oid)?;
+        record(oid, path_mtime_secs(&path));
+    }
+    Ok(mtimes)
+}
+
+/// Public wrapper over [`build_cruft_pack`] for the `--expire-to` limbo pack.
+pub fn build_cruft_pack_pub(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    survivors: &HashMap<ObjectId, u32>,
+) -> Result<Option<CruftPack>> {
+    build_cruft_pack(database, format, survivors)
+}
+
+/// Build the cruft `.mtimes` pack from the surviving unreachable objects and
+/// their timestamps.
+fn build_cruft_pack(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    survivors: &HashMap<ObjectId, u32>,
+) -> Result<Option<CruftPack>> {
+    if survivors.is_empty() {
+        return Ok(None);
+    }
+    let mut ordered: Vec<(ObjectId, u32)> = survivors.iter().map(|(o, m)| (*o, *m)).collect();
+    ordered.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    let mut oids: Vec<ObjectId> = Vec::with_capacity(ordered.len());
+    let mut objects: Vec<Arc<EncodedObject>> = Vec::with_capacity(ordered.len());
+    let mut mtime_by_oid: HashMap<ObjectId, u32> = HashMap::with_capacity(ordered.len());
+    for (oid, mtime) in ordered {
+        match database.read_object(&oid) {
+            Ok(object) => {
+                oids.push(oid);
+                objects.push(object);
+                mtime_by_oid.insert(oid, mtime);
+            }
+            Err(GitError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if oids.is_empty() {
+        return Ok(None);
+    }
+
+    let inputs: Vec<PackInput<'_>> = oids
+        .iter()
+        .zip(&objects)
+        .map(|(oid, object)| PackInput {
+            oid,
+            object: object.as_ref(),
+        })
+        .collect();
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+
+    // `.mtimes` table is in lexicographic (index/fanout) order.
+    let mut sorted_entries: Vec<&sley_pack::PackIndexEntry> = written.entries.iter().collect();
+    sorted_entries.sort_by(|a, b| a.oid.as_bytes().cmp(b.oid.as_bytes()));
+    let mtimes_table: Vec<u32> = sorted_entries
+        .iter()
+        .map(|entry| mtime_by_oid.get(&entry.oid).copied().unwrap_or(0))
+        .collect();
+    let positions = sley_pack::pack_order_index_positions(&written.entries);
+    let rev = sley_pack::PackReverseIndex::write(format, &positions, &written.checksum)?;
+    let mtimes = sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
+
+    let mut cruft_oids: Vec<ObjectId> = sorted_entries.iter().map(|e| e.oid).collect();
+    cruft_oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    Ok(Some(CruftPack {
+        pack: written.pack,
+        idx: written.index,
+        rev,
+        mtimes,
+        checksum: written.checksum,
+        oids: cruft_oids,
+    }))
+}
+
+/// `git repack --cruft [--cruft-expiration=<t>] [-d]`: pack the reachable
+/// closure of `roots` into one new pack, then collect every unreachable object
+/// into a `.mtimes`-stamped cruft pack (honouring `cruft_expiration`). The
+/// caller installs the result and, under `-d`, removes the superseded non-cruft
+/// and old cruft packs.
+///
+/// Mirrors builtin/repack.c's PACK_CRUFT path + repack-cruft.c `write_cruft_pack`
+/// without the per-pack stdin protocol: unreachable objects are everything on
+/// disk minus the reachable set.
+pub fn repack_cruft(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    cruft_expiration: Option<u32>,
+) -> Result<CruftRepackResult> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+
+    // Reachable closure → the new "reachable" pack.
+    let reachable_ids = collect_reachable_object_ids(&database, format, roots.iter().copied())?;
+    let reachable_result = if reachable_ids.is_empty() {
+        None
+    } else {
+        let mut ids: Vec<ObjectId> = reachable_ids.iter().copied().collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut objects = Vec::with_capacity(ids.len());
+        for oid in &ids {
+            match database.read_object(oid) {
+                Ok(object) => objects.push(ReachablePackObject { oid: *oid, object }),
+                Err(GitError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if objects.is_empty() {
+            None
+        } else {
+            let inputs = pack_inputs(&objects);
+            let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+            let packed_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+            let mut packed_loose: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+                .into_iter()
+                .filter(|oid| packed_set.contains(oid))
+                .collect();
+            packed_loose.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            Some(RepackResult {
+                pack: written.pack,
+                idx: written.index,
+                object_count: written.entries.len(),
+                obsolete_packs: Vec::new(),
+                packed_loose,
+                pack_checksum: written.checksum,
+                index_entries: written.entries,
+            })
+        }
+    };
+
+    // Unreachable objects = everything on disk minus the reachable set, stamped
+    // with their best mtime.
+    let mut survivors: HashMap<ObjectId, u32> = object_mtimes_on_disk(&objects_dir, format)?
+        .into_iter()
+        .filter(|(oid, _)| !reachable_ids.contains(oid))
+        .collect();
+
+    // Expiration: rescue older objects reachable from a recent one, drop the rest.
+    if let Some(expiration) = cruft_expiration {
+        rescue_and_expire_cruft_objects(&database, format, &mut survivors, expiration)?;
+    }
+
+    let cruft = build_cruft_pack(&database, format, &survivors)?;
+
+    // The packs the reachable+cruft packs supersede: every pre-existing
+    // non-kept pack. Cruft packs are tracked separately.
+    let pack_dir = objects_dir.join("pack");
+    let mut obsolete_packs = Vec::new();
+    let mut obsolete_cruft_packs = Vec::new();
+    for pack_path in existing_pack_files(&pack_dir)? {
+        if pack_path.with_extension("keep").exists() {
+            continue;
+        }
+        if pack_path.with_extension("mtimes").exists() {
+            obsolete_cruft_packs.push(pack_path);
+        } else {
+            obsolete_packs.push(pack_path);
+        }
+    }
+
+    Ok(CruftRepackResult {
+        reachable: reachable_result,
+        cruft,
+        obsolete_packs,
+        obsolete_cruft_packs,
+    })
+}
+
+/// Apply `--cruft-expiration` over the survivor map in place: starting from the
+/// recent candidates (mtime strictly newer than `expiration`), walk reachability
+/// and rescue every dependency at the cutoff mtime; drop older candidates that
+/// no recent object reaches. Mirrors the pack-objects cruft expiry traversal.
+fn rescue_and_expire_cruft_objects(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    survivors: &mut HashMap<ObjectId, u32>,
+    expiration: u32,
+) -> Result<()> {
+    let recent: Vec<ObjectId> = survivors
+        .iter()
+        .filter(|(_, mtime)| **mtime > expiration)
+        .map(|(oid, _)| *oid)
+        .collect();
+
+    let mut keep: HashSet<ObjectId> = HashSet::new();
+    let mut pending: Vec<ObjectId> = recent.clone();
+    while let Some(oid) = pending.pop() {
+        if !keep.insert(oid) {
+            continue;
+        }
+        let Ok(object) = database.read_object(&oid) else {
+            continue;
+        };
+        match object.object_type {
+            ObjectType::Commit => {
+                if let Ok(commit) = Commit::parse_ref(format, &object.body) {
+                    pending.extend(commit.parents.iter().copied());
+                    pending.push(commit.tree);
+                }
+            }
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, &object.body).flatten() {
+                    if !entry.is_gitlink() {
+                        pending.push(entry.oid);
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                if let Ok(tag) = Tag::parse_ref(format, &object.body) {
+                    pending.push(tag.object);
+                }
+            }
+            ObjectType::Blob => {}
+        }
+    }
+
+    // Drop any survivor that is neither recent nor rescued; rescued-but-older
+    // objects keep their recorded mtime (already >= 0), recent ones unchanged.
+    survivors.retain(|oid, mtime| *mtime > expiration || keep.contains(oid));
+    Ok(())
+}
+
+/// Install a [`repack_cruft`] result: write the reachable pack and the cruft
+/// `.mtimes` pack, then under `prune` remove the superseded non-cruft packs, old
+/// cruft packs, and the loose objects now served.
+pub fn install_cruft_repack_result(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &CruftRepackResult,
+    prune: bool,
+) -> Result<()> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    fs::create_dir_all(&pack_dir)?;
+
+    // Names of packs we are about to remove (so we never delete the new ones).
+    let new_reachable_name = result
+        .reachable
+        .as_ref()
+        .map(|r| format!("pack-{}.pack", r.pack_checksum.to_hex()));
+    let new_cruft_name = result
+        .cruft
+        .as_ref()
+        .map(|c| format!("pack-{}.pack", c.checksum.to_hex()));
+
+    // Write the reachable pack (idx + rev + pack), content-addressed.
+    if let Some(reachable) = result.reachable.as_ref() {
+        let parsed_index = PackIndex::parse(&reachable.idx, format)?;
+        let pack_name = format!("pack-{}", reachable.pack_checksum.to_hex());
+        let reverse_index = sley_pack::PackReverseIndex::write(
+            format,
+            &sley_pack::pack_order_index_positions(&parsed_index.entries),
+            &reachable.pack_checksum,
+        )?;
+        write_pack_component(&pack_dir.join(format!("{pack_name}.pack")), &reachable.pack)?;
+        write_pack_component(&pack_dir.join(format!("{pack_name}.rev")), &reverse_index)?;
+        write_pack_component(&pack_dir.join(format!("{pack_name}.idx")), &reachable.idx)?;
+    }
+
+    // Write the cruft pack (pack + rev + mtimes + idx).
+    if let Some(cruft) = result.cruft.as_ref() {
+        let pack_name = format!("pack-{}", cruft.checksum.to_hex());
+        write_pack_component(&pack_dir.join(format!("{pack_name}.pack")), &cruft.pack)?;
+        write_pack_component(&pack_dir.join(format!("{pack_name}.rev")), &cruft.rev)?;
+        write_pack_component(&pack_dir.join(format!("{pack_name}.mtimes")), &cruft.mtimes)?;
+        write_pack_component(&pack_dir.join(format!("{pack_name}.idx")), &cruft.idx)?;
+    }
+
+    if !prune {
+        return Ok(());
+    }
+
+    // Objects now served by the new packs.
+    let mut present: HashSet<ObjectId> = HashSet::new();
+    if let Some(reachable) = result.reachable.as_ref() {
+        present.extend(reachable.index_entries.iter().map(|e| e.oid));
+    }
+    if let Some(cruft) = result.cruft.as_ref() {
+        present.extend(cruft.oids.iter().copied());
+    }
+
+    // Remove superseded non-cruft + old cruft packs (skip the new ones).
+    let mut removed_stems: HashSet<String> = HashSet::new();
+    for pack_path in result
+        .obsolete_packs
+        .iter()
+        .chain(result.obsolete_cruft_packs.iter())
+    {
+        let file_name = pack_path.file_name().and_then(|n| n.to_str());
+        if file_name == new_reachable_name.as_deref() || file_name == new_cruft_name.as_deref() {
+            continue;
+        }
+        if pack_path.with_extension("keep").exists() {
+            continue;
+        }
+        if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) {
+            removed_stems.insert(stem.to_string());
+        }
+        remove_file_if_exists(pack_path)?;
+        remove_file_if_exists(&pack_path.with_extension("idx"))?;
+        for ext in ["rev", "mtimes", "bitmap", "promisor"] {
+            remove_file_if_exists(&pack_path.with_extension(ext))?;
+        }
+    }
+
+    // Drop loose objects now in a new pack.
+    let loose_now_packed: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| present.contains(oid))
+        .collect();
+    prune_loose_objects(&objects_dir, format, loose_now_packed.iter(), &present)?;
+
+    prune_stale_multi_pack_index(&pack_dir, format, &removed_stems)?;
+    Ok(())
+}
+
 fn pack_index_entries_match_writer(
     parsed: &[PackIndexEntry],
     writer_entries: &[PackIndexEntry],
