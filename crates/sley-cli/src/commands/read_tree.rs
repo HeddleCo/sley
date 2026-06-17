@@ -104,7 +104,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
 
     match &parsed.mode {
         ReadTreeMode::Read => {
-            let entries = read_tree_overlay(db, format, &tree_oids)?;
+            let entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
             }
@@ -113,7 +113,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             // `--reset` accepts up to three trees but only the resulting union
             // matters; higher-stage entries are simply dropped (we never create
             // them here). With `-u` the worktree is updated to match.
-            let mut entries = read_tree_overlay(db, format, &tree_oids)?;
+            let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 reset_worktree_to_entries(
@@ -130,7 +130,8 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             }
         }
         ReadTreeMode::Prefix(prefix) => {
-            let mut entries = read_tree_prefix(git_dir, format, db, &tree_oids, prefix)?;
+            let mut entries =
+                read_tree_prefix(git_dir, format, db, repo.config(), &tree_oids, prefix)?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 update_worktree_for_entries(
@@ -151,7 +152,14 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             // through the shared `sley-unpack-trees` engine (git's
             // oneway/twoway/threeway_merge). The engine computes the result
             // index and the worktree update plan; we apply the plan with `-u`.
-            let entries = merge_trees(git_dir, format, db, &tree_oids, apply_worktree)?;
+            let entries = merge_trees(
+                git_dir,
+                format,
+                db,
+                repo.config(),
+                &tree_oids,
+                apply_worktree,
+            )?;
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
             }
@@ -374,11 +382,14 @@ fn leaves_to_stage0(leaves: LeafMap) -> Vec<(Vec<u8>, StagedEntry)> {
 fn read_tree_overlay(
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    config: &GitConfig,
     tree_oids: &[ObjectId],
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
+    let path_rules = ReadTreePathRules::from_config(config);
     let mut merged: LeafMap = BTreeMap::new();
     for tree_oid in tree_oids {
         for (path, value) in tree_leaf_map(db, format, tree_oid)? {
+            verify_read_tree_path(&path, path_rules)?;
             merged.insert(path, value);
         }
     }
@@ -392,9 +403,11 @@ fn read_tree_prefix(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    config: &GitConfig,
     tree_oids: &[ObjectId],
     prefix: &[u8],
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
+    let path_rules = ReadTreePathRules::from_config(config);
     let mut merged: LeafMap = current_index_stage0(git_dir, format)?;
 
     // `prefix` is normalized to end in `/`; the root prefix is the sentinel
@@ -405,11 +418,98 @@ fn read_tree_prefix(
         for (path, value) in tree_leaf_map(db, format, tree_oid)? {
             let mut full = real_prefix.to_vec();
             full.extend_from_slice(&path);
+            verify_read_tree_path(&full, path_rules)?;
             merged.insert(full, value);
         }
     }
 
     Ok(leaves_to_stage0(merged))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadTreePathRules {
+    protect_hfs: bool,
+    protect_ntfs: bool,
+}
+
+impl ReadTreePathRules {
+    fn from_config(config: &GitConfig) -> Self {
+        Self {
+            protect_hfs: config.get_bool("core", None, "protectHFS").unwrap_or(false),
+            protect_ntfs: config.get_bool("core", None, "protectNTFS").unwrap_or(false),
+        }
+    }
+}
+
+/// git's `verify_path()` check for tree entries read into the index. It rejects
+/// paths that would address `.git` (or its HFS/NTFS aliases), `.`/`..`, or an
+/// embedded NUL before any index/worktree mutation.
+fn verify_read_tree_path(path: &[u8], rules: ReadTreePathRules) -> Result<()> {
+    if path.is_empty() || path.contains(&0) {
+        return invalid_read_tree_path(path);
+    }
+
+    for component in path.split(|&byte| byte == b'/') {
+        if component.is_empty() || component == b"." || component == b".." {
+            return invalid_read_tree_path(path);
+        }
+        if component.eq_ignore_ascii_case(b".git") {
+            return invalid_read_tree_path(path);
+        }
+        if rules.protect_hfs && is_hfs_dotgit(component) {
+            return invalid_read_tree_path(path);
+        }
+        if rules.protect_ntfs && is_ntfs_dotgit(component) {
+            return invalid_read_tree_path(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn invalid_read_tree_path(path: &[u8]) -> Result<()> {
+    eprintln!("error: invalid path '{}'", String::from_utf8_lossy(path));
+    Err(GitError::Exit(128))
+}
+
+fn is_hfs_dotgit(name: &[u8]) -> bool {
+    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".git")
+}
+
+fn is_ntfs_dotgit(name: &[u8]) -> bool {
+    for segment in name.split(|&byte| byte == b'\\') {
+        let stream_name = segment
+            .iter()
+            .position(|&byte| byte == b':')
+            .map_or(segment, |colon| &segment[..colon]);
+        let mut end = stream_name.len();
+        while end > 0 && (stream_name[end - 1] == b'.' || stream_name[end - 1] == b' ') {
+            end -= 1;
+        }
+        let trimmed = &stream_name[..end];
+        if trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1") {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_hfs_ignorable(name: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(name) else {
+        return name.to_vec();
+    };
+    text.chars()
+        .filter(|ch| !is_hfs_ignorable(*ch))
+        .collect::<String>()
+        .into_bytes()
+}
+
+fn is_hfs_ignorable(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x200c | 0x200d | 0x200e | 0x200f | 0x202a..=0x202e | 0x206a..=0x206f
+        | 0xfeff | 0x00ad | 0x034f | 0x115f | 0x1160 | 0x17b4 | 0x17b5 | 0x2060..=0x2064
+    )
 }
 
 /// Read the current on-disk index's stage-0 entries into a path -> (mode, oid)
@@ -873,6 +973,7 @@ fn merge_trees(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    config: &GitConfig,
     tree_oids: &[ObjectId],
     update_worktree: bool,
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
@@ -889,9 +990,16 @@ fn merge_trees(
     };
 
     let index = current_index_flat(git_dir, format)?;
+    let path_rules = ReadTreePathRules::from_config(config);
     let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
         .iter()
-        .map(|oid| tree_leaf_map(db, format, oid))
+        .map(|oid| {
+            let tree = tree_leaf_map(db, format, oid)?;
+            for path in tree.keys() {
+                verify_read_tree_path(path, path_rules)?;
+            }
+            Ok(tree)
+        })
         .collect::<Result<_>>()?;
 
     let mut opts = UnpackTreesOptions::new(format);

@@ -378,9 +378,13 @@ declare -A FLOOR=(
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
-    [t6300-for-each-ref.sh]=378
+    [t6300-for-each-ref.sh]=382
+    # codex-wave-4 (2026-06-17): for-each-ref atoms (sley-ref-filter) t6302 enroll@17.
+    [t6302-for-each-ref-filter.sh]=17
+    # codex-wave-4: merge-tree --write-tree t4301 enroll@18; blame siblings t8001 99->110/t8002 117->128/t8012 98->109; sparse t1091 40->45.
+    [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
-    [t7004-tag.sh]=189
+    [t7004-tag.sh]=190
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
@@ -393,10 +397,11 @@ declare -A FLOOR=(
     [t2107-update-index-basic.sh]=10
     [t7810-grep.sh]=230
     [t3301-notes.sh]=144
-    [t1461-refs-list.sh]=378
+    [t1461-refs-list.sh]=382
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
-    [t6423-merge-rename-directories.sh]=23
+    # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).
+    [t6423-merge-rename-directories.sh]=27
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
@@ -420,6 +425,10 @@ declare -A FLOOR=(
     [t3600-rm.sh]=55
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
     [t4202-log.sh]=96
+    # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
+    # confusing-path rejection (.git/HFS/NTFS/backslash/NUL) 4->28 FULL PASS (safe trees still load).
+    [t4201-shortlog.sh]=21
+    [t1014-read-tree-confusing.sh]=28
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
@@ -430,8 +439,10 @@ declare -A FLOOR=(
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=172
-    [t4014-format-patch.sh]=154
-    [t4150-am.sh]=54
+    # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
+    [t4014-format-patch.sh]=164
+    # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
+    [t4150-am.sh]=56
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
@@ -454,16 +465,18 @@ declare -A FLOOR=(
     # output + -L /regex/ ranges + -b/--first-parent/^rev/abbrev parity): NEW floors.
     # t8002 54->117, t8001 44->99, t8012 44->98. Residual: :funcname ranges,
     # --contents working-tree overlay, --progress, --color-lines/--color-by-age.
-    [t8002-blame.sh]=117
-    [t8001-annotate.sh]=99
-    [t8012-blame-colors.sh]=98
+    [t8002-blame.sh]=128
+    [t8001-annotate.sh]=110
+    [t8012-blame-colors.sh]=109
     # t3903-stash FLAKY: cell #46 "stash symlink to file (stage rm)" oscillates 82/83
     # (symlink<->file type-change race, independent of any wave — flips on a pristine
     # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
     # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
     [t3903-stash.sh]=82
     [t4209-log-pickaxe.sh]=45
-    [t4211-line-log.sh]=69
+    # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
+    # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
+    [t4211-line-log.sh]=70
     [t5300-pack-object.sh]=46
     [t5302-pack-index.sh]=31
     [t5303-pack-corruption-resilience.sh]=21
@@ -486,14 +499,16 @@ declare -A FLOOR=(
     [t7502-commit-porcelain.sh]=75
     # codex-wave-1 (2026-06-17): config stop-at-non-option (+3) + commit SQUASH_MSG (+2),
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
-    [t7600-merge.sh]=49
+    # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
+    [t7600-merge.sh]=50
     [t6120-describe.sh]=84
     [t7900-maintenance.sh]=12
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
     [t3701-add-interactive.sh]=85
     [t4011-diff-symlink.sh]=1
-    [t6402-merge-rename.sh]=30
+    # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
+    [t6402-merge-rename.sh]=34
     [t5400-send-pack.sh]=12
     [t5404-tracking-branches.sh]=6
     [t5543-atomic-push.sh]=7
@@ -511,7 +526,7 @@ declare -A FLOOR=(
     [t3437-rebase-fixup-options.sh]=7
     [t1404-update-ref-errors.sh]=38
     [t1416-ref-transaction-hooks.sh]=7
-    [t1091-sparse-checkout-builtin.sh]=40
+    [t1091-sparse-checkout-builtin.sh]=45
     [t1092-sparse-checkout-compatibility.sh]=3
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/

@@ -6,7 +6,9 @@
 //! point instead of a home for every command's formatting state.
 
 use sley_core::{DateMode, GitError, ObjectId, Result};
-use sley_strbuf_expand::{AtomTable, ExpandFormat, ExpandSegment};
+use sley_strbuf_expand::{
+    AtomTable, ExpandFormat, ExpandSegment, MagicPrefix, PaddingAlign, PaddingSpec,
+};
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,13 +305,391 @@ pub fn write_for_each_ref_format(
     reset_color_at_eol: bool,
     mut write_atom: impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
 ) -> Result<()> {
-    format.inner.write_to(stdout, &mut write_atom, |stdout, value| {
-        write_for_each_ref_quoted_atom(stdout, value, quote)
-    })?;
+    if !format
+        .inner
+        .segments()
+        .iter()
+        .any(for_each_ref_segment_has_control)
+    {
+        format.inner.write_to(stdout, &mut write_atom, |stdout, value| {
+            write_for_each_ref_quoted_atom(stdout, value, quote)
+        })?;
+        if reset_color_at_eol {
+            stdout.write_all(b"\x1b[m")?;
+        }
+        return Ok(());
+    }
+
+    let mut rendered = Vec::new();
+    let (idx, stop) = write_for_each_ref_format_range(
+        &mut rendered,
+        format.inner.segments(),
+        0,
+        &[],
+        quote,
+        &mut write_atom,
+    )?;
+    if idx != format.inner.segments().len() || stop.is_some() {
+        return Err(GitError::Command(
+            "improper for-each-ref format control atom usage".into(),
+        ));
+    }
+    stdout.write_all(&rendered)?;
     if reset_color_at_eol {
         stdout.write_all(b"\x1b[m")?;
     }
     Ok(())
+}
+
+fn for_each_ref_segment_has_control(segment: &ExpandSegment<ForEachRefAtom>) -> bool {
+    match segment {
+        ExpandSegment::Atom(atom) => for_each_ref_control_atom(&atom.atom).is_some(),
+        ExpandSegment::Literal(_) | ExpandSegment::Padding(_) => false,
+    }
+}
+
+fn write_for_each_ref_format_range(
+    out: &mut Vec<u8>,
+    segments: &[ExpandSegment<ForEachRefAtom>],
+    mut idx: usize,
+    stops: &[ForEachRefControlStop],
+    quote: ForEachRefQuoteMode,
+    write_atom: &mut impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
+) -> Result<(usize, Option<ForEachRefControlStop>)> {
+    let mut pending_padding = None;
+    while idx < segments.len() {
+        match &segments[idx] {
+            ExpandSegment::Literal(literal) => out.extend_from_slice(literal),
+            ExpandSegment::Padding(padding) => pending_padding = Some(*padding),
+            ExpandSegment::Atom(atom) => {
+                if let Some(control) = for_each_ref_control_atom(&atom.atom) {
+                    if let Some(stop) = control.stop()
+                        && stops.contains(&stop)
+                    {
+                        return Ok((idx, Some(stop)));
+                    }
+                    match control {
+                        ForEachRefControlAtom::Align(options) => {
+                            let (value, next) = render_for_each_ref_align(
+                                segments,
+                                idx + 1,
+                                &options,
+                                write_atom,
+                            )?;
+                            let mut value = value;
+                            apply_for_each_ref_padding(&mut value, pending_padding.take());
+                            apply_for_each_ref_magic(out, atom.magic, &value);
+                            write_for_each_ref_quoted_atom(out, &value, quote)?;
+                            idx = next;
+                            continue;
+                        }
+                        ForEachRefControlAtom::If(condition) => {
+                            let (value, next) = render_for_each_ref_if(
+                                segments,
+                                idx + 1,
+                                &condition,
+                                quote,
+                                write_atom,
+                            )?;
+                            let mut value = value;
+                            apply_for_each_ref_padding(&mut value, pending_padding.take());
+                            apply_for_each_ref_magic(out, atom.magic, &value);
+                            out.extend_from_slice(&value);
+                            idx = next;
+                            continue;
+                        }
+                        ForEachRefControlAtom::Then
+                        | ForEachRefControlAtom::Else
+                        | ForEachRefControlAtom::End => {
+                            return Err(GitError::Command(
+                                "improper for-each-ref format control atom usage".into(),
+                            ));
+                        }
+                    }
+                }
+
+                let mut value = Vec::new();
+                write_atom(&mut value, &atom.atom)?;
+                apply_for_each_ref_padding(&mut value, pending_padding.take());
+                apply_for_each_ref_magic(out, atom.magic, &value);
+                write_for_each_ref_quoted_atom(out, &value, quote)?;
+            }
+        }
+        idx += 1;
+    }
+    Ok((idx, None))
+}
+
+fn render_for_each_ref_align(
+    segments: &[ExpandSegment<ForEachRefAtom>],
+    start: usize,
+    options: &ForEachRefAlignOptions,
+    write_atom: &mut impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
+) -> Result<(Vec<u8>, usize)> {
+    let mut value = Vec::new();
+    let (idx, stop) = write_for_each_ref_format_range(
+        &mut value,
+        segments,
+        start,
+        &[ForEachRefControlStop::End],
+        ForEachRefQuoteMode::None,
+        write_atom,
+    )?;
+    if stop != Some(ForEachRefControlStop::End) {
+        return Err(GitError::Command(
+            "missing %(end) atom for %(align)".into(),
+        ));
+    }
+    apply_for_each_ref_align(&mut value, options);
+    Ok((value, idx + 1))
+}
+
+fn render_for_each_ref_if(
+    segments: &[ExpandSegment<ForEachRefAtom>],
+    start: usize,
+    condition: &ForEachRefIfCondition,
+    quote: ForEachRefQuoteMode,
+    write_atom: &mut impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
+) -> Result<(Vec<u8>, usize)> {
+    let mut test = Vec::new();
+    let (then_idx, stop) = write_for_each_ref_format_range(
+        &mut test,
+        segments,
+        start,
+        &[ForEachRefControlStop::Then],
+        ForEachRefQuoteMode::None,
+        write_atom,
+    )?;
+    if stop != Some(ForEachRefControlStop::Then) {
+        return Err(GitError::Command("missing %(then) atom for %(if)".into()));
+    }
+
+    let mut true_value = Vec::new();
+    let (branch_idx, branch_stop) = write_for_each_ref_format_range(
+        &mut true_value,
+        segments,
+        then_idx + 1,
+        &[ForEachRefControlStop::Else, ForEachRefControlStop::End],
+        quote,
+        write_atom,
+    )?;
+
+    let mut false_value = Vec::new();
+    let end_idx = match branch_stop {
+        Some(ForEachRefControlStop::End) => branch_idx,
+        Some(ForEachRefControlStop::Else) => {
+            let (idx, stop) = write_for_each_ref_format_range(
+                &mut false_value,
+                segments,
+                branch_idx + 1,
+                &[ForEachRefControlStop::End],
+                quote,
+                write_atom,
+            )?;
+            if stop != Some(ForEachRefControlStop::End) {
+                return Err(GitError::Command("missing %(end) atom for %(if)".into()));
+            }
+            idx
+        }
+        Some(ForEachRefControlStop::Then) | None => {
+            return Err(GitError::Command("missing %(end) atom for %(if)".into()));
+        }
+    };
+
+    let test = trim_ascii(&test);
+    let matched = match condition {
+        ForEachRefIfCondition::NonEmpty => !test.is_empty(),
+        ForEachRefIfCondition::Equals(value) => test == value.as_bytes(),
+        ForEachRefIfCondition::NotEquals(value) => test != value.as_bytes(),
+    };
+    Ok((if matched { true_value } else { false_value }, end_idx + 1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForEachRefControlStop {
+    Then,
+    Else,
+    End,
+}
+
+enum ForEachRefControlAtom {
+    Align(ForEachRefAlignOptions),
+    If(ForEachRefIfCondition),
+    Then,
+    Else,
+    End,
+}
+
+impl ForEachRefControlAtom {
+    fn stop(&self) -> Option<ForEachRefControlStop> {
+        match self {
+            Self::Then => Some(ForEachRefControlStop::Then),
+            Self::Else => Some(ForEachRefControlStop::Else),
+            Self::End => Some(ForEachRefControlStop::End),
+            Self::Align(_) | Self::If(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ForEachRefAlignPosition {
+    Left,
+    Middle,
+    Right,
+}
+
+struct ForEachRefAlignOptions {
+    width: usize,
+    position: ForEachRefAlignPosition,
+}
+
+enum ForEachRefIfCondition {
+    NonEmpty,
+    Equals(String),
+    NotEquals(String),
+}
+
+fn for_each_ref_control_atom(atom: &ForEachRefAtom) -> Option<ForEachRefControlAtom> {
+    let ForEachRefAtom::Raw(value) = atom else {
+        return None;
+    };
+    if let Some(options) = value.strip_prefix("align:") {
+        return parse_for_each_ref_align_options(options).map(ForEachRefControlAtom::Align);
+    }
+    if value == "if" {
+        return Some(ForEachRefControlAtom::If(ForEachRefIfCondition::NonEmpty));
+    }
+    if let Some(expected) = value.strip_prefix("if:equals=") {
+        return Some(ForEachRefControlAtom::If(ForEachRefIfCondition::Equals(
+            expected.to_string(),
+        )));
+    }
+    if let Some(expected) = value.strip_prefix("if:notequals=") {
+        return Some(ForEachRefControlAtom::If(
+            ForEachRefIfCondition::NotEquals(expected.to_string()),
+        ));
+    }
+    match value.as_str() {
+        "then" => Some(ForEachRefControlAtom::Then),
+        "else" => Some(ForEachRefControlAtom::Else),
+        "end" => Some(ForEachRefControlAtom::End),
+        _ => None,
+    }
+}
+
+fn parse_for_each_ref_align_options(value: &str) -> Option<ForEachRefAlignOptions> {
+    let mut width = None;
+    let mut position = ForEachRefAlignPosition::Left;
+    for part in value.split(',') {
+        if let Some(rest) = part.strip_prefix("width=") {
+            width = rest.parse::<usize>().ok();
+        } else if let Some(rest) = part.strip_prefix("position=") {
+            position = parse_for_each_ref_align_position(rest)?;
+        } else if let Ok(parsed) = part.parse::<usize>() {
+            width = Some(parsed);
+        } else {
+            position = parse_for_each_ref_align_position(part)?;
+        }
+    }
+    Some(ForEachRefAlignOptions {
+        width: width?,
+        position,
+    })
+}
+
+fn parse_for_each_ref_align_position(value: &str) -> Option<ForEachRefAlignPosition> {
+    match value {
+        "left" => Some(ForEachRefAlignPosition::Left),
+        "middle" => Some(ForEachRefAlignPosition::Middle),
+        "right" => Some(ForEachRefAlignPosition::Right),
+        _ => None,
+    }
+}
+
+fn apply_for_each_ref_align(value: &mut Vec<u8>, options: &ForEachRefAlignOptions) {
+    let width = for_each_ref_display_width(value);
+    if width >= options.width {
+        return;
+    }
+    let extra = options.width - width;
+    let (left, right) = match options.position {
+        ForEachRefAlignPosition::Left => (0, extra),
+        ForEachRefAlignPosition::Middle => (extra / 2, extra - extra / 2),
+        ForEachRefAlignPosition::Right => (extra, 0),
+    };
+    let mut padded = Vec::with_capacity(value.len() + extra);
+    padded.extend(std::iter::repeat_n(b' ', left));
+    padded.extend_from_slice(value);
+    padded.extend(std::iter::repeat_n(b' ', right));
+    *value = padded;
+}
+
+fn apply_for_each_ref_magic(out: &mut Vec<u8>, magic: MagicPrefix, value: &[u8]) {
+    match (magic, value.is_empty()) {
+        (MagicPrefix::None, _) | (MagicPrefix::DeleteLfBeforeEmpty, _) => {}
+        (MagicPrefix::AddLfBeforeNonEmpty, false) => out.extend_from_slice(b"\n"),
+        (MagicPrefix::AddSpaceBeforeNonEmpty, false) => out.extend_from_slice(b" "),
+        (MagicPrefix::AddLfBeforeNonEmpty | MagicPrefix::AddSpaceBeforeNonEmpty, true) => {}
+    }
+    if magic == MagicPrefix::DeleteLfBeforeEmpty && value.is_empty() {
+        while out.last().copied() == Some(b'\n') {
+            out.pop();
+        }
+    }
+}
+
+fn apply_for_each_ref_padding(value: &mut Vec<u8>, padding: Option<PaddingSpec>) {
+    let Some(padding) = padding else {
+        return;
+    };
+    let width = for_each_ref_display_width(value);
+    let target = padding.width.max(0) as usize;
+    if width >= target {
+        return;
+    }
+    let extra = target - width;
+    let (left, right) = match padding.align {
+        PaddingAlign::Left => (0, extra),
+        PaddingAlign::Right | PaddingAlign::LeftAndSteal => (extra, 0),
+        PaddingAlign::Center => (extra / 2, extra - extra / 2),
+    };
+    let mut padded = Vec::with_capacity(value.len() + extra);
+    padded.extend(std::iter::repeat_n(b' ', left));
+    padded.extend_from_slice(value);
+    padded.extend(std::iter::repeat_n(b' ', right));
+    *value = padded;
+}
+
+fn for_each_ref_display_width(value: &[u8]) -> usize {
+    let mut width = 0usize;
+    let mut idx = 0usize;
+    while idx < value.len() {
+        if value[idx] == 0x1b
+            && value.get(idx + 1) == Some(&b'[')
+            && let Some(end) = value[idx + 2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+        {
+            idx += end + 3;
+            continue;
+        }
+        width += 1;
+        idx += 1;
+    }
+    width
+}
+
+fn trim_ascii(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    &value[start..end]
 }
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]

@@ -106,6 +106,7 @@ jobs:
             t0027-auto-crlf.sh
             t1006-cat-file.sh
             t1007-hash-object.sh
+            t1014-read-tree-confusing.sh
             t1300-config.sh
             t1400-update-ref.sh
             t1401-symbolic-ref.sh
@@ -123,6 +124,7 @@ jobs:
             t3103-ls-tree-misc.sh
             t3200-branch.sh
             t3301-notes.sh
+            t4301-merge-tree-write-tree.sh
             t3403-rebase-skip.sh
             t3404-rebase-interactive.sh
             t3406-rebase-message.sh
@@ -148,6 +150,7 @@ jobs:
             t4052-stat-output.sh
             t4124-apply-ws-rule.sh
             t4150-am.sh
+            t4201-shortlog.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh
             t4216-log-bloom.sh
@@ -170,6 +173,7 @@ jobs:
             t6113-rev-list-bitmap-filters.sh
             t6120-describe.sh
             t6300-for-each-ref.sh
+            t6302-for-each-ref-filter.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
             t7102-reset.sh
