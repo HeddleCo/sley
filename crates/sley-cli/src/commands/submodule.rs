@@ -557,7 +557,7 @@ fn update_one_submodule(
     // makes the nested git-dir land in `<this>/.git/modules/<sub>` (which, via
     // the gitdir-file chain, is `super/.git/modules/<path>/modules/<sub>`).
     if options.recursive {
-        recurse_submodule_update(&path, &display, options)?;
+        return recurse_submodule_update(&path, &display, options);
     }
 
     Ok(UpdateOutcome::Done)
@@ -800,8 +800,9 @@ fn run_submodule_update_command(
         match strategy.kind {
             UpdateType::Checkout => {
                 eprintln!("fatal: Unable to checkout '{oid}' in submodule path '{display}'");
-                // git returns the `git checkout` exit code WITHOUT die()ing the
-                // whole run, so sibling submodules still update.
+                // git returns the `git checkout` exit code (1) WITHOUT die()ing
+                // the whole run, so sibling submodules still update (the loop in
+                // update_submodules continues on any code != 128).
                 return Ok(UpdateOutcome::NonFatalCheckoutError(GitError::Exit(1)));
             }
             UpdateType::Rebase => {
@@ -818,7 +819,9 @@ fn run_submodule_update_command(
             }
             UpdateType::None | UpdateType::Unspecified => {}
         }
-        return Err(GitError::Exit(1));
+        // rebase/merge/command failures are git's `die_message` (exit 128):
+        // fatal, stop the whole run immediately.
+        return Err(GitError::Exit(128));
     }
 
     if !quiet {
@@ -856,7 +859,7 @@ fn recurse_submodule_update(
     submodule_root: &Path,
     display: &str,
     options: &SubmoduleUpdateOptions<'_>,
-) -> Result<()> {
+) -> Result<UpdateOutcome> {
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
     let mut command = ProcessCommand::new(exe);
     command.arg("submodule");
@@ -875,11 +878,20 @@ fn recurse_submodule_update(
         .current_dir(submodule_root)
         .status()
         .map_err(|err| GitError::Io(err.to_string()))?;
-    if !status.success() {
-        eprintln!("fatal: Failed to recurse into submodule path '{display}'");
-        return Err(GitError::Exit(1));
+    if status.success() {
+        return Ok(UpdateOutcome::Done);
     }
-    Ok(())
+    eprintln!("fatal: Failed to recurse into submodule path '{display}'");
+    // git's update_submodules loop continues on a non-128 code (a nested
+    // checkout error, code 1) but stops immediately on 128 (a nested
+    // rebase/merge/command/clone error). Carry the child's exit code so the
+    // outer loop preserves that distinction.
+    let code = status.code().unwrap_or(128);
+    if code == 128 {
+        Err(GitError::Exit(128))
+    } else {
+        Ok(UpdateOutcome::NonFatalCheckoutError(GitError::Exit(code)))
+    }
 }
 
 fn parse_submodule_update_options(
