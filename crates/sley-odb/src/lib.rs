@@ -833,6 +833,223 @@ pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Opti
     }))
 }
 
+/// A local, non-kept, non-cruft pack considered for a geometric rollup,
+/// paired with the object count that orders it in the progression.
+#[derive(Debug, Clone)]
+struct GeometryPack {
+    /// Absolute path to the `.pack` file.
+    pack_path: PathBuf,
+    /// Object ids the pack holds (from its `.idx`).
+    oids: Vec<ObjectId>,
+    /// `num_objects` weight used to order the progression.
+    weight: u64,
+    /// True when this pack is a promisor pack (`.promisor` sidecar).
+    is_promisor: bool,
+}
+
+/// The outcome of a geometric rollup: the new pack (if one was written) plus
+/// the rolled-up packs whose objects it now serves.
+#[derive(Debug, Clone)]
+pub struct GeometricRepackResult {
+    /// `Some` when a new pack was written; `None` when nothing needed packing.
+    pub result: Option<RepackResult>,
+    /// Pack `.pack` paths below the split that may now be removed under `-d`.
+    pub rolled_up_packs: Vec<PathBuf>,
+}
+
+/// Collect the local non-cruft, non-kept packs eligible for geometric rollup,
+/// keyed by promisor-ness, ordered ascending by object count.
+fn collect_geometry_packs(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    kept_pack_stems: &HashSet<String>,
+) -> Result<Vec<GeometryPack>> {
+    let pack_dir = objects_dir.join("pack");
+    let mut packs = Vec::new();
+    for pack_path in existing_pack_files(&pack_dir)? {
+        // Cruft packs (`.mtimes` sidecar) and kept packs are excluded from the
+        // progression, matching `pack_geometry_init` in repack-geometry.c.
+        if pack_path.with_extension("mtimes").exists() {
+            continue;
+        }
+        if pack_path.with_extension("keep").exists() {
+            continue;
+        }
+        let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if kept_pack_stems.contains(stem) {
+            continue;
+        }
+        let index_path = pack_path.with_extension("idx");
+        if !index_path.exists() {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
+        let oids: Vec<ObjectId> = index.entries.iter().map(|entry| entry.oid).collect();
+        let weight = oids.len() as u64;
+        packs.push(GeometryPack {
+            is_promisor: pack_path.with_extension("promisor").exists(),
+            pack_path,
+            oids,
+            weight,
+        });
+    }
+    // Ascending by weight; pack_path breaks ties deterministically.
+    packs.sort_by(|a, b| a.weight.cmp(&b.weight).then(a.pack_path.cmp(&b.pack_path)));
+    Ok(packs)
+}
+
+/// Port of `compute_pack_geometry_split` (repack-geometry.c): given packs in
+/// ascending weight order, return the split index — packs `[0..split)` roll up
+/// into one new pack, packs `[split..)` are left alone.
+fn compute_geometry_split(packs: &[GeometryPack], split_factor: u64) -> usize {
+    let pack_nr = packs.len();
+    if pack_nr == 0 {
+        return 0;
+    }
+    // Count packs (descending size) that already form a geometric progression.
+    let mut i = pack_nr - 1;
+    while i > 0 {
+        let ours = packs[i].weight;
+        let prev = packs[i - 1].weight;
+        if ours < split_factor.saturating_mul(prev) {
+            break;
+        }
+        i -= 1;
+    }
+    let mut split = i;
+    if split != 0 {
+        // The top of the last-compared pair can't be in the progression.
+        split += 1;
+    }
+
+    // Roll up everything below `split`; pulling those into a new pack may break
+    // the progression in the heavy half, so absorb heavy-half packs until it
+    // holds again.
+    let mut total_size: u64 = packs[..split].iter().map(|p| p.weight).sum();
+    let mut split = split;
+    for pack in &packs[split..] {
+        if pack.weight < split_factor.saturating_mul(total_size) {
+            split += 1;
+            total_size = total_size.saturating_add(pack.weight);
+        } else {
+            break;
+        }
+    }
+    split
+}
+
+/// `git repack --geometric=<factor>`: roll up the smallest packs (plus loose
+/// unpacked objects) so the surviving packs form a geometric progression by
+/// object count. Objects in the rolled-up packs and loose objects are gathered
+/// into one new pack; packs at/above the split are left in place. The new pack
+/// excludes objects already served by a left-alone pack.
+///
+/// Returns the new pack plus the rolled-up pack paths the caller may delete
+/// under `-d`. Returns an all-`None`/empty result when nothing needs packing
+/// ("Nothing new to pack").
+pub fn repack_geometric(
+    git_dir: &Path,
+    format: ObjectFormat,
+    split_factor: u64,
+    kept_pack_stems: &HashSet<String>,
+) -> Result<GeometricRepackResult> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+
+    // Promisor packs follow their own progression; the non-promisor packs are
+    // the common case the test-suite exercises. Build the rollup from the
+    // non-promisor packs plus loose objects.
+    let all_packs = collect_geometry_packs(&objects_dir, format, kept_pack_stems)?;
+    let packs: Vec<GeometryPack> = all_packs
+        .into_iter()
+        .filter(|pack| !pack.is_promisor)
+        .collect();
+
+    let split = compute_geometry_split(&packs, split_factor);
+
+    let loose_oids = loose_object_ids(&objects_dir, format)?;
+
+    // The objects that end up in the new pack: every object in a rolled-up pack,
+    // plus every loose object — but NOT objects already served by a pack left in
+    // place (those above the split). This mirrors the `^pack` exclusion markers
+    // that repack.c feeds to `pack-objects --stdin-packs`.
+    let mut excluded_oids: HashSet<ObjectId> = HashSet::new();
+    for pack in &packs[split..] {
+        excluded_oids.extend(pack.oids.iter().copied());
+    }
+
+    let mut included: Vec<ObjectId> = Vec::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for pack in &packs[..split] {
+        for oid in &pack.oids {
+            if excluded_oids.contains(oid) {
+                continue;
+            }
+            if seen.insert(*oid) {
+                included.push(*oid);
+            }
+        }
+    }
+    for oid in &loose_oids {
+        if excluded_oids.contains(oid) {
+            continue;
+        }
+        if seen.insert(*oid) {
+            included.push(*oid);
+        }
+    }
+
+    // "Nothing new to pack": no packs roll up and no loose objects need packing.
+    if included.is_empty() {
+        return Ok(GeometricRepackResult {
+            result: None,
+            rolled_up_packs: Vec::new(),
+        });
+    }
+
+    included.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut objects = Vec::with_capacity(included.len());
+    for oid in &included {
+        objects.push(ReachablePackObject {
+            oid: *oid,
+            object: database.read_object(oid)?,
+        });
+    }
+
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_count = written.entries.len();
+
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_oids
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let rolled_up_packs: Vec<PathBuf> = packs[..split]
+        .iter()
+        .map(|pack| pack.pack_path.clone())
+        .collect();
+
+    let pack_checksum = written.checksum;
+    let index_entries = written.entries.clone();
+    Ok(GeometricRepackResult {
+        result: Some(RepackResult {
+            pack: written.pack,
+            idx: written.index,
+            object_count,
+            obsolete_packs: rolled_up_packs.clone(),
+            packed_loose,
+            pack_checksum,
+            index_entries,
+        }),
+        rolled_up_packs,
+    })
+}
+
 /// Write the consolidated pack from a [`RepackResult`] into
 /// `objects/pack/` and, when `prune` is set, remove the now-redundant
 /// pre-existing packs and packed loose objects.
@@ -936,6 +1153,99 @@ pub fn install_repack_result_with_bitmap(
 
     prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
     prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
+    Ok(())
+}
+
+/// Install a [`repack_geometric`] result: write the new pack, then under `prune`
+/// remove EXACTLY the rolled-up packs (those below the geometric split) plus the
+/// loose objects now packed. Unlike [`install_repack_result`], packs left in
+/// place above the split are never removed even though some of their objects may
+/// also live in the new pack.
+pub fn install_geometric_repack_result(
+    git_dir: &Path,
+    format: ObjectFormat,
+    geometric: &GeometricRepackResult,
+    prune: bool,
+    bitmap_tips: Option<&HashSet<ObjectId>>,
+) -> Result<()> {
+    let Some(result) = geometric.result.as_ref() else {
+        return Ok(());
+    };
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    fs::create_dir_all(&pack_dir)?;
+
+    validate_pack_checksum(&result.pack, format, &result.pack_checksum, "repack")?;
+    let parsed_index = PackIndex::parse(&result.idx, format)?;
+    if parsed_index.pack_checksum != result.pack_checksum {
+        return Err(GitError::InvalidFormat(
+            "repack index checksum does not match the new pack".into(),
+        ));
+    }
+    if !pack_index_entries_match_writer(&parsed_index.entries, &result.index_entries) {
+        return Err(GitError::InvalidFormat(
+            "repack index does not match the new pack contents".into(),
+        ));
+    }
+    let pack_name = format!("pack-{}", result.pack_checksum.to_hex());
+    let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
+    let new_rev_path = pack_dir.join(format!("{pack_name}.rev"));
+    let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
+    let reverse_index = sley_pack::PackReverseIndex::write(
+        format,
+        &sley_pack::pack_order_index_positions(&parsed_index.entries),
+        &result.pack_checksum,
+    )?;
+    write_pack_component(&new_pack_path, &result.pack)?;
+    write_pack_component(&new_rev_path, &reverse_index)?;
+    write_pack_component(&new_index_path, &result.idx)?;
+
+    if let Some(tips) = bitmap_tips {
+        let database = FileObjectDatabase::new(objects_dir.clone(), format);
+        if let Some(bitmap) = build_pack_bitmap(
+            &database,
+            format,
+            &result.index_entries,
+            &result.pack_checksum,
+            tips,
+        )? {
+            let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
+            remove_file_if_exists(&bitmap_path)?;
+            write_pack_component(&bitmap_path, &bitmap)?;
+        }
+    }
+
+    if !prune {
+        return Ok(());
+    }
+
+    // Remove exactly the rolled-up packs (below the split). Never touch packs
+    // left in place above the split.
+    for pack_path in &geometric.rolled_up_packs {
+        if *pack_path == new_pack_path {
+            continue;
+        }
+        if pack_path.with_extension("keep").exists() {
+            continue;
+        }
+        remove_file_if_exists(pack_path)?;
+        remove_file_if_exists(&pack_path.with_extension("idx"))?;
+        for ext in ["rev", "mtimes", "bitmap", "promisor"] {
+            remove_file_if_exists(&pack_path.with_extension(ext))?;
+        }
+    }
+
+    // Drop loose copies now served by the new pack.
+    let present: HashSet<ObjectId> = parsed_index.entries.iter().map(|entry| entry.oid).collect();
+    prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
+
+    // A multi-pack-index that references any removed pack is now stale.
+    let removed_stems: HashSet<String> = geometric
+        .rolled_up_packs
+        .iter()
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    prune_stale_multi_pack_index(&pack_dir, format, &removed_stems)?;
     Ok(())
 }
 

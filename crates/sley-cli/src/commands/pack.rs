@@ -640,7 +640,7 @@ fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
             && bytes[0] == b'-'
             && bytes[1..]
                 .iter()
-                .all(|&ch| matches!(ch, b'a' | b'A' | b'b' | b'd' | b'f' | b'F' | b'l' | b'q'))
+                .all(|&ch| matches!(ch, b'a' | b'A' | b'b' | b'd' | b'f' | b'F' | b'l' | b'm' | b'n' | b'q'))
         {
             expanded.extend(bytes[1..].iter().map(|&ch| format!("-{}", ch as char)));
         } else {
@@ -760,16 +760,50 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut all = false;
     let mut write_bitmaps: Option<bool> = None;
-    for arg in &expand_repack_short_clusters(args) {
+    let mut geometric: Option<u64> = None;
+    let mut write_midx = false;
+    let mut keep_packs: Vec<String> = Vec::new();
+    let mut pack_kept_objects = false;
+    let mut iter = expand_repack_short_clusters(args).into_iter().peekable();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-d" => prune = true,
             "-q" | "--quiet" => quiet = true,
             "-b" | "--write-bitmap-index" => write_bitmaps = Some(true),
             "--no-write-bitmap-index" => write_bitmaps = Some(false),
             "-a" | "-A" => all = true,
+            "-m" | "--write-midx" => write_midx = true,
+            "-k" | "--keep-unreachable" | "--pack-kept-objects" => {
+                if arg == "--pack-kept-objects" {
+                    pack_kept_objects = true;
+                }
+            }
+            "-g" | "--geometric" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `geometric' requires a value".into())
+                })?;
+                geometric = Some(parse_geometric_factor(&value)?);
+            }
+            "--keep-pack" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `keep-pack' requires a value".into())
+                })?;
+                keep_packs.push(strip_pack_suffix(&value));
+            }
+            value if value.starts_with("--geometric=") => {
+                geometric = Some(parse_geometric_factor(&value["--geometric=".len()..])?);
+            }
+            value if value.starts_with("--keep-pack=") => {
+                keep_packs.push(strip_pack_suffix(&value["--keep-pack=".len()..]));
+            }
             // Accepted no-ops.
-            "-l" | "-f" | "-F" | "--progress" | "--no-progress" => {}
-            value if value.starts_with("--window") || value.starts_with("--depth") => {}
+            "-l" | "-f" | "-F" | "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
+            value
+                if value.starts_with("--window")
+                    || value.starts_with("--depth")
+                    || value.starts_with("--threads")
+                    || value.starts_with("--max-pack-size")
+                    || value.starts_with("--pack.packSizeLimit") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
                     "unsupported repack option {value}"
@@ -791,7 +825,29 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             .get_bool("repack", None, "writeBitmaps")
             .unwrap_or(false),
     };
-    if write_bitmaps && !all {
+
+    if let Some(split_factor) = geometric {
+        // `--geometric` and `-a`/`-A` are mutually exclusive (builtin/repack.c).
+        if all {
+            return Err(GitError::Command(
+                "options '--geometric' and '-A/-a' cannot be used together".into(),
+            ));
+        }
+        return cmd_repack_geometric(
+            &git_dir,
+            &common_git_dir,
+            format,
+            split_factor,
+            prune,
+            quiet,
+            write_midx,
+            write_bitmaps,
+            &keep_packs,
+            pack_kept_objects,
+        );
+    }
+
+    if write_bitmaps && !all && !write_midx {
         // Upstream cmd_repack: bitmaps require an all-into-one repack.
         eprintln!(
             "fatal: Incremental repacks are incompatible with bitmap indexes.  Use
@@ -823,8 +879,140 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             bitmap_tips.as_ref(),
         )?;
     }
+    if write_midx {
+        cmd_multi_pack_index_write(&[])?;
+    }
     let _ = quiet;
     Ok(())
+}
+
+fn parse_geometric_factor(value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| GitError::Command(format!("cannot parse geometric factor: {value}")))
+}
+
+fn strip_pack_suffix(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base.strip_suffix(".pack")
+        .or_else(|| base.strip_suffix(".idx"))
+        .unwrap_or(base)
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_repack_geometric(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    split_factor: u64,
+    prune: bool,
+    quiet: bool,
+    write_midx: bool,
+    write_bitmaps: bool,
+    keep_packs: &[String],
+    _pack_kept_objects: bool,
+) -> Result<()> {
+    let kept_stems: HashSet<String> = keep_packs.iter().cloned().collect();
+    let geometric =
+        sley_odb::repack_geometric(common_git_dir, format, split_factor, &kept_stems)?;
+
+    if geometric.result.is_none() {
+        if !quiet {
+            println!("Nothing new to pack.");
+        }
+        // Even with nothing new, `--write-midx` (re)writes the MIDX so it stays
+        // current with the on-disk packs — but only when packs exist AND the
+        // existing MIDX (if any) does not already cover them. An up-to-date MIDX
+        // is left byte-for-byte untouched (builtin/repack.c midx_has_unknown_packs).
+        if write_midx
+            && pack_dir_has_packs(common_git_dir, format)?
+            && !midx_covers_current_packs(common_git_dir, format)?
+        {
+            cmd_multi_pack_index_write(&[])?;
+        }
+        return Ok(());
+    }
+
+    // A geometric repack writes its bitmap through the MIDX (not a pack bitmap),
+    // so only pass pack-bitmap tips when not writing a MIDX.
+    let bitmap_tips = if write_bitmaps && !write_midx {
+        let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+        Some(repack_preferred_bitmap_tips(common_git_dir, &db, format)?)
+    } else {
+        None
+    };
+    sley_odb::install_geometric_repack_result(
+        common_git_dir,
+        format,
+        &geometric,
+        prune,
+        bitmap_tips.as_ref(),
+    )?;
+
+    if write_midx && pack_dir_has_packs(common_git_dir, format)? {
+        let mut midx_args: Vec<String> = Vec::new();
+        if write_bitmaps {
+            midx_args.push("--bitmap".to_string());
+        }
+        cmd_multi_pack_index_write(&midx_args)?;
+    }
+    let _ = git_dir;
+    Ok(())
+}
+
+/// True when `objects/pack` holds at least one `.pack` file.
+fn pack_dir_has_packs(common_git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let _ = format;
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(false);
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("pack") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// True when a `multi-pack-index` exists and already names exactly the set of
+/// non-cruft `.idx` files currently on disk — i.e. rewriting it would be a
+/// no-op, so an up-to-date MIDX must be left untouched (its mtime preserved).
+fn midx_covers_current_packs(common_git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let midx_path = pack_dir.join("multi-pack-index");
+    let Ok(midx_bytes) = fs::read(&midx_path) else {
+        return Ok(false);
+    };
+    let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
+        return Ok(false);
+    };
+    let midx_names: HashSet<String> = midx.pack_names.into_iter().collect();
+
+    // The MIDX indexes only non-cruft packs; compare against the current
+    // non-cruft `.idx` basenames.
+    let mut current: HashSet<String> = HashSet::new();
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(false);
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+            continue;
+        }
+        // Skip cruft packs (`.mtimes` sidecar): the MIDX excludes them by default.
+        if path.with_extension("mtimes").exists() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            current.insert(name.to_string());
+        }
+    }
+    Ok(midx_names == current)
 }
 
 pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
