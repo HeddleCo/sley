@@ -1176,6 +1176,7 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
         let text = String::from_utf8_lossy(&stripped);
         let mut new_body: Vec<String> = Vec::new();
         let mut saw_content = false;
+        let mut saw_invalid_content = false;
         for line in text.split('\n') {
             if line.starts_with("@@ ") {
                 // Header line in the edited buffer: ignore (we recount ourselves).
@@ -1187,9 +1188,11 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
                 saw_content = true;
             } else if line.is_empty() {
                 // trailing blank from the split — skip.
+            } else {
+                saw_invalid_content = true;
             }
         }
-        if !saw_content {
+        if !saw_content && !saw_invalid_content {
             // The user deleted everything → abort, keep original.
             return EditResult::Abandoned;
         }
@@ -1210,7 +1213,7 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
 
         // Validate: reassemble a patch (file header + just this candidate hunk) and
         // run `sley apply --cached --check`. On success, commit the edit.
-        if edited_hunk_applies(fd, &candidate) {
+        if !saw_invalid_content && edited_hunk_applies(fd, &candidate) {
             std::mem::swap(&mut fd.hunks[hunk_index], &mut candidate);
             return EditResult::Applied;
         }
