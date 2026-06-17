@@ -292,6 +292,45 @@ fn log_source_label<'a>(
         .or(source)
 }
 
+fn log_source_labels_for_selected(
+    selected: &[&sley_rev::CommitRecord],
+    source_starts: &[(ObjectId, String)],
+    first_parent: bool,
+) -> HashMap<ObjectId, String> {
+    let shown = selected
+        .iter()
+        .map(|record| record.oid)
+        .collect::<HashSet<_>>();
+    let mut pending = HashMap::<ObjectId, String>::new();
+    for (oid, label) in source_starts {
+        pending.insert(*oid, label.clone());
+    }
+    let mut labels = HashMap::new();
+    for record in selected {
+        let Some(label) = pending.get(&record.oid).cloned() else {
+            continue;
+        };
+        labels.insert(record.oid, label.clone());
+        let parents = if first_parent {
+            &record.parents[..record.parents.len().min(1)]
+        } else {
+            record.parents.as_slice()
+        };
+        for parent in parents {
+            if shown.contains(parent) {
+                pending.entry(*parent).or_insert_with(|| label.clone());
+            }
+        }
+    }
+    labels
+}
+
+fn log_unborn_head_branch(git_dir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let target = head.trim().strip_prefix("ref: ")?;
+    target.strip_prefix("refs/heads/").map(str::to_string)
+}
+
 fn emit_plain_oneline_limited_commit(
     db: &FileObjectDatabase,
     record: &sley_rev::CommitMetadata,
@@ -388,6 +427,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut ignored_missing_input = false;
     let mut revision_input_with_ignore_missing = false;
     let mut end_of_options_revs: Vec<String> = Vec::new();
+    let mut inserted_default_head = false;
     // Diff-output options (`-p`, `--stat`, ...): rendered per commit against
     // its first parent, mirroring git's log diff machinery.
     let mut diff_opts = LogDiffOptions::default();
@@ -1416,6 +1456,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     }
     if !default_revision_given && !revision_input_with_ignore_missing {
         setup_args.splice(0..0, ["--default".to_string(), "HEAD".to_string()]);
+        inserted_default_head = true;
     }
     // `diff.indentHeuristic` sets the default; a CLI
     // `--indent-heuristic`/`--no-indent-heuristic` (tracked above) overrides it.
@@ -1447,7 +1488,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let use_mailmap = use_mailmap_explicit
         .unwrap_or_else(|| config.get_bool("log", None, "mailmap").unwrap_or(true));
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
-    let setup = sley_rev::setup_revisions(
+    let setup = match sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {
             git_dir: &git_dir,
@@ -1457,13 +1498,28 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             reader: &db,
             config: Some(&config),
         },
-    )?;
+    ) {
+        Ok(setup) => setup,
+        Err(err) if inserted_default_head => {
+            if let Some(branch) = log_unborn_head_branch(&git_dir) {
+                eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
+                return Err(GitError::Exit(128));
+            }
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(leftover) = setup.leftovers.first() {
         return Err(GitError::Command(format!(
             "unsupported log option {leftover}"
         )));
     }
-    let revision_options = setup.options;
+    let mut revision_options = setup.options;
+    if revision_options.ignore_missing {
+        revision_options
+            .positives
+            .retain(|tip| db.read_object(&tip.oid).is_ok());
+    }
     let max_count = revision_options.max_count;
     let skip = revision_options.skip;
     let max_age = revision_options.date_window.min_time;
@@ -2333,13 +2389,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.uses_source());
     let source_labels: Option<HashMap<ObjectId, String>> =
         if (format_uses_source || show_source) && !source_starts.is_empty() {
-            let mut map = HashMap::new();
-            for (start_oid, label) in &source_starts {
-                for record in rev_list_walk_commits(&db, format, [*start_oid], first_parent)? {
-                    map.insert(record.oid, label.clone());
-                }
-            }
-            Some(map)
+            Some(log_source_labels_for_selected(
+                &selected,
+                &source_starts,
+                first_parent,
+            ))
         } else {
             None
         };
