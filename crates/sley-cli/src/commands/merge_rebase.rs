@@ -1144,8 +1144,7 @@ fn print_joined(singular: &str, plural: &str, names: &[String]) -> String {
     match names {
         [] => String::new(),
         [one] => format!("{singular}'{one}'"),
-        _ => {
-            let (last, rest) = names.split_last().unwrap();
+        [rest @ .., last] => {
             let head = rest
                 .iter()
                 .map(|n| format!("'{n}'"))
