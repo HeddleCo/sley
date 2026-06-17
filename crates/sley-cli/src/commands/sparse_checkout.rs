@@ -109,8 +109,19 @@ fn cmd_sparse_init(args: &[String]) -> Result<()> {
         }
     }
     let ctx = sparse_context()?;
-    // Cone is the default at init time unless explicitly disabled.
-    let cone_mode = !matches!(cone, ConeFlag::NoCone);
+    // Cone is the default for a fresh init, but a plain `init` over an existing
+    // sparse checkout preserves the recorded mode.
+    let cone_mode = match cone {
+        ConeFlag::Cone => true,
+        ConeFlag::NoCone => false,
+        ConeFlag::Unset => {
+            if sparse_checkout_enabled(&ctx)? {
+                sparse_cone_enabled(&ctx)?
+            } else {
+                true
+            }
+        }
+    };
     enable_sparse_checkout(&ctx, cone_mode)?;
     apply_sparse_index_flag(&ctx, sparse_index)?;
     // Preserve any existing patterns; otherwise seed the cone-style root file so
@@ -155,7 +166,7 @@ fn cmd_sparse_list(args: &[String]) -> Result<()> {
     };
     let cone = sparse_cone_enabled(&ctx)?;
     let mut out = io::stdout();
-    if cone {
+    if cone && cone_patterns_are_valid(&patterns, true) {
         // Cone entries are emitted through git's `quote_c_style`, so a directory
         // with unusual bytes is C-quoted exactly as `ls-files` would render it.
         for dir in cone_list_entries(&patterns) {
@@ -218,6 +229,10 @@ fn cmd_sparse_add(args: &[String]) -> Result<()> {
     let existing = read_sparse_patterns(&ctx)?.unwrap_or_default();
     // Build (and validate) the merged pattern file before writing anything.
     let content = if cone_mode {
+        if !cone_patterns_are_valid(&existing, true) {
+            eprintln!("fatal: existing sparse-checkout patterns do not use cone mode");
+            return Err(GitError::Exit(128));
+        }
         // Recover the directory set from the existing cone file and union it with
         // the new directories, then regenerate.
         let mut dirs = cone_list_entries(&existing);
@@ -943,6 +958,110 @@ fn slash_wrapped(dir: &[u8]) -> Vec<u8> {
 // `list` output
 // --------------------------------------------------------------------------
 
+fn cone_patterns_are_valid(patterns: &[Vec<u8>], warn: bool) -> bool {
+    let mut recursive: Vec<Vec<u8>> = Vec::new();
+    let mut parent: Vec<Vec<u8>> = Vec::new();
+    for raw in patterns {
+        let line = clean_pattern_line(raw);
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        if line == b"/*" || line == b"!/*/" {
+            continue;
+        }
+        let (negative, pattern) = if let Some(rest) = line.strip_prefix(b"!") {
+            (true, rest)
+        } else {
+            (false, line)
+        };
+        if pattern.len() < 2
+            || pattern.first() != Some(&b'/')
+            || contains_double_star(pattern)
+            || contains_unescaped_glob(pattern)
+        {
+            warn_bad_cone_pattern(line, false, warn);
+            return false;
+        }
+        if negative {
+            let Some(dir) = pattern.strip_suffix(b"/*/") else {
+                warn_bad_cone_pattern(line, true, warn);
+                return false;
+            };
+            if !recursive.iter().any(|seen| seen == dir) {
+                warn_bad_cone_pattern(line, true, warn);
+                return false;
+            }
+            if !parent.iter().any(|seen| seen == dir) {
+                parent.push(dir.to_vec());
+            }
+            recursive.retain(|seen| seen != dir);
+        } else {
+            if !pattern.ends_with(b"/") || pattern == b"/" {
+                warn_bad_cone_pattern(line, false, warn);
+                return false;
+            }
+            let dir = &pattern[..pattern.len() - 1];
+            if parent.iter().any(|seen| seen == dir) {
+                if warn {
+                    eprintln!(
+                        "warning: your sparse-checkout file may have issues: pattern '{}' is repeated",
+                        String::from_utf8_lossy(line)
+                    );
+                    eprintln!("warning: disabling cone pattern matching");
+                }
+                return false;
+            }
+            if !recursive.iter().any(|seen| seen == dir) {
+                recursive.push(dir.to_vec());
+            }
+        }
+    }
+    true
+}
+
+fn warn_bad_cone_pattern(pattern: &[u8], negative: bool, warn: bool) {
+    if !warn {
+        return;
+    }
+    if negative {
+        eprintln!(
+            "warning: unrecognized negative pattern: '{}'",
+            String::from_utf8_lossy(pattern)
+        );
+    } else {
+        eprintln!(
+            "warning: unrecognized pattern: '{}'",
+            String::from_utf8_lossy(pattern)
+        );
+    }
+    eprintln!("warning: disabling cone pattern matching");
+}
+
+fn contains_double_star(pattern: &[u8]) -> bool {
+    pattern.windows(2).any(|window| window == b"**")
+}
+
+fn contains_unescaped_glob(pattern: &[u8]) -> bool {
+    for (index, byte) in pattern.iter().enumerate() {
+        if !matches!(*byte, b'*' | b'\\' | b'[' | b'?') {
+            continue;
+        }
+        let prev = index.checked_sub(1).and_then(|i| pattern.get(i)).copied();
+        let next = pattern.get(index + 1).copied();
+        if prev == Some(b'\\') {
+            continue;
+        }
+        if *byte == b'\\' && matches!(next, Some(b'*' | b'\\' | b'[' | b'?')) {
+            continue;
+        }
+        if prev == Some(b'/') && *byte == b'*' && matches!(next, None | Some(b'/')) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// Recovers the sorted list of cone directories from a cone pattern file, i.e.
 /// the directories `git sparse-checkout list` prints (the recursive leaves, with
 /// surrounding slashes stripped). Parent guard lines and the `/*` / `!/*/` header
@@ -1180,6 +1299,18 @@ fn read_sparse_patterns(ctx: &SparseContext) -> Result<Option<Vec<Vec<u8>>>> {
 fn write_sparse_file(ctx: &SparseContext, content: &[u8]) -> Result<()> {
     let info_dir = ctx.git_dir.join("info");
     fs::create_dir_all(&info_dir)?;
+    let lock_path = info_dir.join("sparse-checkout.lock");
+    if lock_path.exists() {
+        eprintln!(
+            "fatal: Unable to create '{}': File exists.",
+            lock_path.display()
+        );
+        eprintln!();
+        eprintln!(
+            "Another git process seems to be running in this repository, or the lock file may be stale"
+        );
+        return Err(GitError::Exit(128));
+    }
     fs::write(sparse_file_path(&ctx.git_dir), content)?;
     Ok(())
 }
