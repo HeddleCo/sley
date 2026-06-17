@@ -264,21 +264,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --ref-format requires a value".into())
                 })?;
-                if value != "files" {
-                    return Err(GitError::Command(format!(
-                        "unsupported clone --ref-format value {value}"
-                    )));
-                }
+                reject_unknown_clone_ref_format(value)?;
             }
             value if value.starts_with("--ref-format=") => {
                 let value = value.strip_prefix("--ref-format=").ok_or_else(|| {
                     GitError::Command("clone --ref-format requires a value".into())
                 })?;
-                if value != "files" {
-                    return Err(GitError::Command(format!(
-                        "unsupported clone --ref-format value {value}"
-                    )));
-                }
+                reject_unknown_clone_ref_format(value)?;
             }
             "-c" | "--config" => {
                 let assignment = iter
@@ -1326,6 +1318,25 @@ fn clone_jobs_error() -> &'static str {
     "error: option `jobs' expects an integer value with an optional k/m/g suffix"
 }
 
+/// Validate `git clone --ref-format=<name>`. Upstream resolves the name through
+/// `ref_storage_format_by_name`; an unknown name (e.g. `garbage`) dies with
+/// `fatal: unknown ref storage format '<name>'` (exit 128). sley implements only
+/// the `files` backend, so `reftable` — a name git *does* recognise — is reported
+/// as unsupported rather than unknown, keeping the unknown-format diagnostic
+/// exact for the names git would also reject.
+fn reject_unknown_clone_ref_format(value: &str) -> Result<()> {
+    match value {
+        "files" => Ok(()),
+        "reftable" => Err(GitError::Unsupported(
+            "the reftable ref storage backend is not implemented".into(),
+        )),
+        _ => {
+            eprintln!("fatal: unknown ref storage format '{value}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 /// Parse a `--depth` value the way `git clone`/`git fetch` do: an optional `+`
 /// sign then ASCII digits, rejecting non-positive depths with git's message. The
 /// numeric value is clamped to `u32::MAX` (git stores depth as a C `int`; the
@@ -2173,13 +2184,25 @@ fn configure_clone_remote(
 
 fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<()> {
     let mut config = read_repo_config_on_disk(git_dir)?;
+    let mut entries = vec![
+        ConfigEntry::new("remote", Some(remote.to_string())),
+        ConfigEntry::new("merge", Some(format!("refs/heads/{branch}"))),
+    ];
+    // Upstream `install_branch_config` consults `branch.autosetuprebase`: for a
+    // remote-tracking branch (origin is the remote, always set during clone),
+    // `remote` and `always` write `branch.<name>.rebase = true`. The value lives
+    // in the full effective config — global `~/.gitconfig` and system files —
+    // not just the on-disk repo config the write side starts from, so read the
+    // layered stack here.
+    if let Some(autosetuprebase) = clone_effective_config_value(git_dir, "branch", "autosetuprebase")
+        && matches!(autosetuprebase.to_ascii_lowercase().as_str(), "remote" | "always")
+    {
+        entries.push(ConfigEntry::new("rebase", Some("true".to_string())));
+    }
     config.sections.push(ConfigSection::new(
         "branch",
         Some(branch.to_string()),
-        vec![
-            ConfigEntry::new("remote", Some(remote.to_string())),
-            ConfigEntry::new("merge", Some(format!("refs/heads/{branch}"))),
-        ],
+        entries,
     ));
     write_repo_config(git_dir, &config)
 }
@@ -6264,6 +6287,21 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
 /// repo's config. Includes (`include.path` / `includeIf`) are still resolved.
 pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
     sley_config::read_repo_config(git_dir, None)
+}
+
+/// A single `<section>.<key>` value from the *full effective config* (system +
+/// global + repository, includes resolved) for `git_dir`. Unlike
+/// [`read_repo_config`] — which reads only the repo's own `config` file — this
+/// layers the global `~/.gitconfig` and system files, as git does for settings
+/// like `branch.autosetuprebase` that are configured outside the cloned repo.
+fn clone_effective_config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir).ok()?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.clone()),
+        repo_current_branch_name(git_dir),
+    );
+    let config = sley_config::load_effective_config(&common_git_dir, &context).ok()?;
+    config.get(section, None, key).map(str::to_owned)
 }
 
 /// Short branch name from `HEAD` (e.g. "main"), or None when detached/unborn.
