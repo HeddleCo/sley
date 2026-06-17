@@ -396,7 +396,8 @@ declare -A FLOOR=(
     [t1461-refs-list.sh]=378
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
-    [t6423-merge-rename-directories.sh]=23
+    # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).
+    [t6423-merge-rename-directories.sh]=27
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
@@ -434,8 +435,10 @@ declare -A FLOOR=(
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=172
-    [t4014-format-patch.sh]=154
-    [t4150-am.sh]=54
+    # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
+    [t4014-format-patch.sh]=164
+    # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
+    [t4150-am.sh]=56
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
@@ -467,7 +470,9 @@ declare -A FLOOR=(
     # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
     [t3903-stash.sh]=82
     [t4209-log-pickaxe.sh]=45
-    [t4211-line-log.sh]=69
+    # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
+    # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
+    [t4211-line-log.sh]=70
     [t5300-pack-object.sh]=46
     [t5302-pack-index.sh]=31
     [t5303-pack-corruption-resilience.sh]=21
@@ -490,14 +495,16 @@ declare -A FLOOR=(
     [t7502-commit-porcelain.sh]=75
     # codex-wave-1 (2026-06-17): config stop-at-non-option (+3) + commit SQUASH_MSG (+2),
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
-    [t7600-merge.sh]=49
+    # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
+    [t7600-merge.sh]=50
     [t6120-describe.sh]=84
     [t7900-maintenance.sh]=12
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
     [t3701-add-interactive.sh]=85
     [t4011-diff-symlink.sh]=1
-    [t6402-merge-rename.sh]=30
+    # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
+    [t6402-merge-rename.sh]=34
     [t5400-send-pack.sh]=12
     [t5404-tracking-branches.sh]=6
     [t5543-atomic-push.sh]=7
