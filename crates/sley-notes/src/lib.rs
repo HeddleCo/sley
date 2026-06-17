@@ -2,8 +2,8 @@
 //! note blob, reachable from `refs/notes/*`.
 //!
 //! Notes trees may use git's fanout layout (two-hex-digit subtrees); this crate
-//! reads any fanout depth and writes flat (un-fanned) trees, which git reads
-//! back identically.
+//! reads any fanout depth and writes either flat trees or Git-compatible
+//! one-level fanout trees once the note count is large enough.
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
@@ -14,7 +14,7 @@ use sley_object::{
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
 use sley_sequencer::{CommitCreate, create_commit};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// Default notes ref when none is selected via `GIT_NOTES_REF` or `core.notesRef`.
@@ -79,6 +79,41 @@ pub enum RemoveNoteOutcome {
     Removed { notes_commit: ObjectId },
     /// The notes ref was absent or none of the requested annotated objects had notes.
     Unchanged,
+}
+
+/// Conflict resolution strategy for `git notes merge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotesMergeStrategy {
+    Manual,
+    Ours,
+    Theirs,
+    Union,
+    CatSortUniq,
+}
+
+/// One unresolved note-level conflict from a notes merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotesMergeConflict {
+    pub annotated: ObjectId,
+    pub base: Option<ObjectId>,
+    pub local: Option<ObjectId>,
+    pub remote: Option<ObjectId>,
+}
+
+/// Result of merging one notes ref into another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotesMergeOutcome {
+    /// The local ref was already up to date.
+    AlreadyUpToDate { result: ObjectId },
+    /// The merge fast-forwarded to the remote notes commit.
+    FastForward { result: ObjectId },
+    /// A merge commit was created and the local ref advanced to it.
+    Merged { result: ObjectId },
+    /// A partial merge commit was created; conflicts must be resolved by the caller.
+    Conflicted {
+        partial: ObjectId,
+        conflicts: Vec<NotesMergeConflict>,
+    },
 }
 
 /// Resolve the notes ref using git's precedence: explicit override, then
@@ -316,6 +351,202 @@ pub fn write_notes(
         ref_expected,
     )?;
     Ok(())
+}
+
+/// Merge `remote_ref` into `local_ref`, matching Git's note-level three-way
+/// merge rules. The caller is responsible for persisting conflict worktree
+/// files when [`NotesMergeOutcome::Conflicted`] is returned.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    local_ref: &NotesRef,
+    remote_ref: &NotesRef,
+    strategy: NotesMergeStrategy,
+    message: &str,
+    identity: &NotesCommitIdentity,
+) -> Result<NotesMergeOutcome> {
+    let local_oid = notes_head_oid(store, local_ref)?;
+    let remote_oid = notes_head_oid(store, remote_ref)?;
+
+    match (local_oid, remote_oid) {
+        (None, None) => {
+            return Err(GitError::InvalidFormat(format!(
+                "Cannot merge empty notes ref ({}) into empty notes ref ({})",
+                remote_ref.as_str(),
+                local_ref.as_str()
+            )));
+        }
+        (None, Some(remote)) => {
+            update_notes_ref_to_commit(git_dir, format, store, local_ref, None, remote, message, identity)?;
+            return Ok(NotesMergeOutcome::FastForward { result: remote });
+        }
+        (Some(local), None) => {
+            return Ok(NotesMergeOutcome::AlreadyUpToDate { result: local });
+        }
+        (Some(local), Some(remote)) if local == remote => {
+            return Ok(NotesMergeOutcome::AlreadyUpToDate { result: local });
+        }
+        _ => {}
+    }
+
+    let (Some(local_oid), Some(remote_oid)) = (local_oid, remote_oid) else {
+        return Err(GitError::InvalidFormat("missing notes merge endpoint".into()));
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let bases = merge_base_oids(&db, format, &local_oid, &remote_oid)?;
+    let base_oid = bases.first().copied();
+
+    if base_oid == Some(remote_oid) {
+        return Ok(NotesMergeOutcome::AlreadyUpToDate { result: local_oid });
+    }
+    if base_oid == Some(local_oid) {
+        update_notes_ref_to_commit(
+            git_dir,
+            format,
+            store,
+            local_ref,
+            Some(local_oid),
+            remote_oid,
+            message,
+            identity,
+        )?;
+        return Ok(NotesMergeOutcome::FastForward { result: remote_oid });
+    }
+
+    let base_tree = match base_oid {
+        Some(oid) => commit_tree_oid(&db, format, &oid)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let local_tree = commit_tree_oid(&db, format, &local_oid)?;
+    let remote_tree = commit_tree_oid(&db, format, &remote_oid)?;
+
+    let base_notes = notes_map_from_tree(&db, format, base_tree)?;
+    let local_notes = notes_map_from_tree(&db, format, local_tree)?;
+    let remote_notes = notes_map_from_tree(&db, format, remote_tree)?;
+    let mut merged = local_notes.clone();
+    let mut conflicts = Vec::new();
+
+    let mut candidates: Vec<ObjectId> = base_notes
+        .keys()
+        .chain(remote_notes.keys())
+        .copied()
+        .collect();
+    candidates.sort_by_key(|oid| oid.to_hex());
+    candidates.dedup();
+
+    for annotated in candidates {
+        let base = base_notes.get(&annotated).copied();
+        let local = local_notes.get(&annotated).copied();
+        let remote = remote_notes.get(&annotated).copied();
+
+        if base == remote || local == remote {
+            continue;
+        }
+        if local == base {
+            set_note_option(&mut merged, annotated, remote);
+            continue;
+        }
+
+        match strategy {
+            NotesMergeStrategy::Manual => {
+                merged.remove(&annotated);
+                conflicts.push(NotesMergeConflict {
+                    annotated,
+                    base,
+                    local,
+                    remote,
+                });
+            }
+            NotesMergeStrategy::Ours => {}
+            NotesMergeStrategy::Theirs => set_note_option(&mut merged, annotated, remote),
+            NotesMergeStrategy::Union => {
+                if let Some(blob) =
+                    combine_note_blobs(git_dir, &db, format, local, remote, NoteBlobCombine::Union)?
+                {
+                    merged.insert(annotated, blob);
+                }
+            }
+            NotesMergeStrategy::CatSortUniq => {
+                if let Some(blob) =
+                    combine_note_blobs(
+                        git_dir,
+                        &db,
+                        format,
+                        local,
+                        remote,
+                        NoteBlobCombine::CatSortUniq,
+                    )?
+                {
+                    merged.insert(annotated, blob);
+                }
+            }
+        }
+    }
+
+    let notes = notes_vec_from_map(merged);
+    let parents = vec![local_oid, remote_oid];
+    let result = commit_notes_update_with_parents(
+        git_dir,
+        format,
+        store,
+        local_ref,
+        &notes,
+        message.as_bytes(),
+        identity,
+        &parents,
+        Some(RefTarget::Direct(local_oid)),
+        conflicts.is_empty(),
+    )?;
+
+    if conflicts.is_empty() {
+        Ok(NotesMergeOutcome::Merged { result })
+    } else {
+        Ok(NotesMergeOutcome::Conflicted {
+            partial: result,
+            conflicts,
+        })
+    }
+}
+
+/// Finalize a previous conflicting notes merge by adding resolved worktree
+/// entries to the partial notes tree and creating the final merge commit.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_notes_merge(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    partial_commit: ObjectId,
+    resolved: &[(ObjectId, Vec<u8>)],
+    identity: &NotesCommitIdentity,
+) -> Result<ObjectId> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let partial = read_commit(&db, format, &partial_commit)?;
+    let mut notes = notes_map_from_tree(&db, format, partial.tree)?;
+    let writable = FileObjectDatabase::from_git_dir(git_dir, format);
+    for (annotated, body) in resolved {
+        let blob = writable.write_object(EncodedObject::new(ObjectType::Blob, body.clone()))?;
+        notes.insert(*annotated, blob);
+    }
+    let expected = partial
+        .parents
+        .first()
+        .copied()
+        .map(RefTarget::Direct);
+    commit_notes_update_with_parents(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        &notes_vec_from_map(notes),
+        &partial.message,
+        identity,
+        &partial.parents,
+        expected,
+        true,
+    )
 }
 
 /// Incrementally upsert a single note, reading any fanout layout and writing a
@@ -558,11 +789,229 @@ fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     sley_config::read_repo_config(git_dir, None)
 }
 
+fn read_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Commit> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidFormat(format!(
+            "{} is not a commit",
+            oid.to_hex()
+        )));
+    }
+    Commit::parse(format, &object.body)
+}
+
+fn commit_tree_oid(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<ObjectId> {
+    Ok(read_commit(db, format, oid)?.tree)
+}
+
+fn merge_base_oids(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left: &ObjectId,
+    right: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let left_depths = ancestor_depths(db, format, left)?;
+    let right_depths = ancestor_depths(db, format, right)?;
+    let candidates: Vec<ObjectId> = left_depths
+        .keys()
+        .filter(|oid| right_depths.contains_key(*oid))
+        .copied()
+        .collect();
+    let mut bases: Vec<ObjectId> = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidates.iter().any(|other| {
+                other != *candidate
+                    && depth_lt(&left_depths, other, candidate)
+                    && depth_lt(&right_depths, other, candidate)
+            })
+        })
+        .copied()
+        .collect();
+    bases.sort_by_key(|oid| oid.to_hex());
+    Ok(bases)
+}
+
+fn ancestor_depths(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    start: &ObjectId,
+) -> Result<HashMap<ObjectId, usize>> {
+    let mut depths = HashMap::new();
+    let mut pending = VecDeque::from([(*start, 0usize)]);
+    while let Some((oid, depth)) = pending.pop_front() {
+        if depths.get(&oid).is_some_and(|seen| *seen <= depth) {
+            continue;
+        }
+        depths.insert(oid, depth);
+        for parent in read_commit(db, format, &oid)?.parents {
+            pending.push_back((parent, depth + 1));
+        }
+    }
+    Ok(depths)
+}
+
+fn depth_lt(depths: &HashMap<ObjectId, usize>, left: &ObjectId, right: &ObjectId) -> bool {
+    match (depths.get(left), depths.get(right)) {
+        (Some(left), Some(right)) => left < right,
+        _ => false,
+    }
+}
+
 fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<ObjectId>> {
     Ok(match store.read_ref(notes_ref.as_str())? {
         Some(RefTarget::Direct(oid)) => Some(oid),
         _ => None,
     })
+}
+
+fn notes_map_from_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: ObjectId,
+) -> Result<BTreeMap<ObjectId, ObjectId>> {
+    let mut notes = BTreeMap::new();
+    if tree_oid == ObjectId::empty_tree(format) {
+        return Ok(notes);
+    }
+    collect_notes_from_tree(db, format, tree_oid, "", &mut notes)?;
+    Ok(notes)
+}
+
+fn collect_notes_from_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: ObjectId,
+    prefix: &str,
+    out: &mut BTreeMap<ObjectId, ObjectId>,
+) -> Result<()> {
+    for (name, mode, oid) in load_hex_tree_entries(db, format, &tree_oid)? {
+        let mut hex = prefix.to_string();
+        hex.push_str(&name);
+        if tree_entry_object_type(mode) == ObjectType::Tree {
+            collect_notes_from_tree(db, format, oid, &hex, out)?;
+        } else if hex.len() == format.hex_len()
+            && let Ok(annotated) = ObjectId::from_hex(format, &hex)
+        {
+            out.insert(annotated, oid);
+        }
+    }
+    Ok(())
+}
+
+fn notes_vec_from_map(notes: BTreeMap<ObjectId, ObjectId>) -> Vec<Note> {
+    notes
+        .into_iter()
+        .map(|(annotated, blob)| Note { annotated, blob })
+        .collect()
+}
+
+fn set_note_option(
+    notes: &mut BTreeMap<ObjectId, ObjectId>,
+    annotated: ObjectId,
+    blob: Option<ObjectId>,
+) {
+    match blob {
+        Some(blob) => {
+            notes.insert(annotated, blob);
+        }
+        None => {
+            notes.remove(&annotated);
+        }
+    }
+}
+
+enum NoteBlobCombine {
+    Union,
+    CatSortUniq,
+}
+
+fn combine_note_blobs(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    local: Option<ObjectId>,
+    remote: Option<ObjectId>,
+    mode: NoteBlobCombine,
+) -> Result<Option<ObjectId>> {
+    match mode {
+        NoteBlobCombine::Union => combine_note_blobs_union(git_dir, db, format, local, remote),
+        NoteBlobCombine::CatSortUniq => {
+            combine_note_blobs_cat_sort_uniq(git_dir, db, format, local, remote)
+        }
+    }
+}
+
+fn read_blob_bytes(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Option<Vec<u8>>> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Blob || object.body.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(object.body.clone()))
+}
+
+fn combine_note_blobs_union(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    local: Option<ObjectId>,
+    remote: Option<ObjectId>,
+) -> Result<Option<ObjectId>> {
+    let Some(remote_oid) = remote else {
+        return Ok(local);
+    };
+    let Some(remote_body) = read_blob_bytes(db, &remote_oid)? else {
+        return Ok(local);
+    };
+    let Some(local_oid) = local else {
+        return Ok(Some(remote_oid));
+    };
+    let Some(mut local_body) = read_blob_bytes(db, &local_oid)? else {
+        return Ok(Some(remote_oid));
+    };
+    if local_body.last() == Some(&b'\n') {
+        local_body.pop();
+    }
+    local_body.extend_from_slice(b"\n\n");
+    local_body.extend_from_slice(&remote_body);
+    let writable = FileObjectDatabase::from_git_dir(git_dir, format);
+    writable
+        .write_object(EncodedObject::new(ObjectType::Blob, local_body))
+        .map(Some)
+}
+
+fn combine_note_blobs_cat_sort_uniq(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    local: Option<ObjectId>,
+    remote: Option<ObjectId>,
+) -> Result<Option<ObjectId>> {
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for oid in [local, remote].into_iter().flatten() {
+        if let Some(body) = read_blob_bytes(db, &oid)? {
+            lines.extend(body.split(|byte| *byte == b'\n').map(|line| line.to_vec()));
+        }
+    }
+    lines.retain(|line| !line.is_empty());
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    lines.sort();
+    lines.dedup();
+    let mut body = Vec::new();
+    for line in lines {
+        body.extend_from_slice(&line);
+        body.push(b'\n');
+    }
+    let writable = FileObjectDatabase::from_git_dir(git_dir, format);
+    writable
+        .write_object(EncodedObject::new(ObjectType::Blob, body))
+        .map(Some)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -576,36 +1025,56 @@ fn commit_notes_update(
     identity: &NotesCommitIdentity,
     ref_expected: Option<RefTarget>,
 ) -> Result<ObjectId> {
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
     let parent = notes_head_oid(store, notes_ref)?;
+    let parents = parent.iter().cloned().collect::<Vec<_>>();
+    commit_notes_update_with_parents(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        notes,
+        format!("{message}\n").as_bytes(),
+        identity,
+        &parents,
+        ref_expected,
+        true,
+    )
+}
 
-    let mut entries: Vec<TreeEntry> = notes
-        .iter()
-        .map(|note| TreeEntry {
-            mode: 0o100644,
-            name: BString::from(note.annotated.to_hex().as_bytes()),
-            oid: note.blob,
-        })
-        .collect();
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    let tree = Tree { entries };
-    let tree_oid = db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))?;
+#[allow(clippy::too_many_arguments)]
+fn commit_notes_update_with_parents(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    notes: &[Note],
+    message: &[u8],
+    identity: &NotesCommitIdentity,
+    parents: &[ObjectId],
+    ref_expected: Option<RefTarget>,
+    update_ref: bool,
+) -> Result<ObjectId> {
+    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let tree_oid = write_notes_tree(&mut db, notes)?;
 
-    let parents = parent.iter().cloned().collect();
     let commit_oid = create_commit(
         &mut db,
         CommitCreate {
             tree: tree_oid,
-            parents,
+            parents: parents.to_vec(),
             author: identity.author.clone(),
             committer: identity.committer.clone(),
-            message: format!("{message}\n").into_bytes(),
+            message: message.to_vec(),
             encoding: None,
         },
     )?;
 
-    let old_oid = parent.unwrap_or(zero_oid(format)?);
+    if !update_ref {
+        return Ok(commit_oid);
+    }
+    let old_oid = parents.first().copied().unwrap_or(zero_oid(format)?);
     let mut tx = store.transaction();
+    let reflog_message = reflog_message_from_commit_message(message);
     tx.update(RefUpdate {
         name: notes_ref.as_str().to_string(),
         expected: ref_expected,
@@ -616,11 +1085,113 @@ fn commit_notes_update(
             committer: identity.committer.clone(),
             // git prefixes the notes reflog message with "notes: " (the commit
             // message itself is left unprefixed).
-            message: format!("notes: {message}").into_bytes(),
+            message: reflog_message,
         }),
     });
     tx.commit()?;
     Ok(commit_oid)
+}
+
+fn update_notes_ref_to_commit(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    message: &str,
+    identity: &NotesCommitIdentity,
+) -> Result<()> {
+    let old_oid = old.unwrap_or(zero_oid(format)?);
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: notes_ref.as_str().to_string(),
+        expected: old.map(RefTarget::Direct),
+        new: RefTarget::Direct(new),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: new,
+            committer: identity.committer.clone(),
+            message: format!("notes: {message}").into_bytes(),
+        }),
+    });
+    let _ = git_dir;
+    tx.commit()
+}
+
+fn reflog_message_from_commit_message(message: &[u8]) -> Vec<u8> {
+    let subject = message
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or(message);
+    let mut out = b"notes: ".to_vec();
+    out.extend_from_slice(subject);
+    out
+}
+
+fn write_notes_tree(
+    db: &mut FileObjectDatabase,
+    notes: &[Note],
+) -> Result<ObjectId> {
+    if notes.len() >= 256 {
+        write_fanout_notes_tree(db, notes)
+    } else {
+        write_flat_notes_tree(db, notes)
+    }
+}
+
+fn write_flat_notes_tree(db: &mut FileObjectDatabase, notes: &[Note]) -> Result<ObjectId> {
+    let mut entries: Vec<TreeEntry> = notes
+        .iter()
+        .map(|note| TreeEntry {
+            mode: 0o100644,
+            name: BString::from(note.annotated.to_hex().as_bytes()),
+            oid: note.blob,
+        })
+        .collect();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree { entries }.write(),
+    ))
+}
+
+fn write_fanout_notes_tree(db: &mut FileObjectDatabase, notes: &[Note]) -> Result<ObjectId> {
+    let mut groups: BTreeMap<String, Vec<TreeEntry>> = BTreeMap::new();
+    for note in notes {
+        let hex = note.annotated.to_hex();
+        let (prefix, suffix) = hex.split_at(2);
+        groups
+            .entry(prefix.to_string())
+            .or_default()
+            .push(TreeEntry {
+                mode: 0o100644,
+                name: BString::from(suffix.as_bytes()),
+                oid: note.blob,
+            });
+    }
+
+    let mut root_entries = Vec::new();
+    for (prefix, mut entries) in groups {
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let subtree_oid = db.write_object(EncodedObject::new(
+            ObjectType::Tree,
+            Tree { entries }.write(),
+        ))?;
+        root_entries.push(TreeEntry {
+            mode: 0o040000,
+            name: BString::from(prefix.as_bytes()),
+            oid: subtree_oid,
+        });
+    }
+    root_entries.sort_by(|left, right| left.name.cmp(&right.name));
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree {
+            entries: root_entries,
+        }
+        .write(),
+    ))
 }
 
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {

@@ -2,8 +2,10 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
+use sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
 use sley_notes::{
-    NotesCommitIdentity, NotesRef, list_notes, notes_ref_expected, read_note, remove_note,
+    NotesCommitIdentity, NotesMergeConflict, NotesMergeOutcome, NotesMergeStrategy, NotesRef,
+    finalize_notes_merge, list_notes, merge_notes, notes_ref_expected, read_note, remove_note,
     resolve_notes_ref_with_config, upsert_note, write_notes,
 };
 
@@ -114,6 +116,11 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
             // the "too few arguments" usage error taking precedence like git.
             refuse_outside("copy")?;
             notes_copy(&git_dir, format, &notes_ref, sub_args)
+        }
+        "merge" => {
+            refuse_outside("merge")?;
+            refuse_non_ref("merge")?;
+            notes_merge_cmd(&git_dir, format, &notes_ref, sub_args)
         }
         "get-ref" => notes_get_ref(&notes_ref, sub_args),
         other => notes_unknown_subcommand_error(other),
@@ -1239,6 +1246,372 @@ fn notes_copy_from_stdin(
     Ok(())
 }
 
+#[derive(Default)]
+struct NotesMergeArgs {
+    strategy: Option<String>,
+    commit: bool,
+    abort: bool,
+    verbosity: i32,
+    remote: Option<String>,
+}
+
+fn notes_merge_cmd(
+    git_dir: &Path,
+    format: ObjectFormat,
+    notes_ref: &str,
+    args: &[String],
+) -> Result<()> {
+    let parsed = parse_notes_merge_args(args)?;
+    let do_merge = parsed.strategy.is_some() || (!parsed.commit && !parsed.abort);
+    let modes = usize::from(do_merge) + usize::from(parsed.commit) + usize::from(parsed.abort);
+    if modes != 1 {
+        eprintln!("error: cannot mix --commit, --abort or -s/--strategy");
+        print_notes_usage(NotesUsage::Merge);
+        return Err(GitError::Exit(129));
+    }
+    if do_merge && parsed.remote.is_none() {
+        eprintln!("error: must specify a notes ref to merge");
+        print_notes_usage(NotesUsage::Merge);
+        return Err(GitError::Exit(129));
+    }
+    if !do_merge && parsed.remote.is_some() {
+        return Err(notes_too_many_arguments(NotesUsage::Merge));
+    }
+
+    if parsed.abort {
+        abort_notes_merge_state(git_dir)?;
+        return Ok(());
+    }
+    if parsed.commit {
+        return commit_notes_merge_state(git_dir, format);
+    }
+
+    let store = FileRefStore::new(git_dir, format);
+    let local_ref = notes_ref_handle(notes_ref);
+    let remote_arg = parsed.remote.as_deref().unwrap_or_default();
+    let remote_ref = notes_ref_handle(remote_arg);
+    let strategy = resolve_notes_merge_strategy(notes_ref, parsed.strategy.as_deref())?;
+    let message = format!(
+        "Merged notes from {} into {}",
+        remote_ref.as_str(),
+        local_ref.as_str()
+    );
+    let identity = notes_commit_identity()?;
+
+    match merge_notes(
+        git_dir,
+        format,
+        &store,
+        &local_ref,
+        &remote_ref,
+        strategy,
+        &message,
+        &identity,
+    )? {
+        NotesMergeOutcome::AlreadyUpToDate { .. } => {
+            if parsed.verbosity >= 0 {
+                println!("Already up to date.");
+            }
+            Ok(())
+        }
+        NotesMergeOutcome::FastForward { .. } => {
+            if parsed.verbosity >= 0 {
+                println!("Fast-forward");
+            }
+            Ok(())
+        }
+        NotesMergeOutcome::Merged { .. } => Ok(()),
+        NotesMergeOutcome::Conflicted { partial, conflicts } => {
+            write_notes_merge_conflicts(
+                git_dir,
+                format,
+                local_ref.as_str(),
+                remote_ref.as_str(),
+                &conflicts,
+                parsed.verbosity,
+            )?;
+            write_notes_merge_state(git_dir, partial, local_ref.as_str())?;
+            eprintln!(
+                "Automatic notes merge failed. Fix conflicts in {} and commit the result with 'git notes merge --commit', or abort the merge with 'git notes merge --abort'.",
+                git_dir.join("NOTES_MERGE_WORKTREE").display()
+            );
+            Err(GitError::Exit(1))
+        }
+    }
+}
+
+fn parse_notes_merge_args(args: &[String]) -> Result<NotesMergeArgs> {
+    let mut parsed = NotesMergeArgs::default();
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if positional_only {
+            parsed.remote = Some(set_single_object(parsed.remote, arg, NotesUsage::Merge)?);
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "-q" | "--quiet" => parsed.verbosity -= 1,
+            "-v" | "--verbose" => parsed.verbosity += 1,
+            "--commit" => parsed.commit = true,
+            "--abort" => parsed.abort = true,
+            "-s" | "--strategy" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `strategy' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                parsed.strategy = Some(value.clone());
+            }
+            value if value.starts_with("--strategy=") => {
+                parsed.strategy = Some(value["--strategy=".len()..].to_string());
+            }
+            value if value.starts_with("-s") && value.len() > 2 => {
+                parsed.strategy = Some(value[2..].to_string());
+            }
+            value if value.starts_with('-') && value.len() > 1 && value != "-" => {
+                return Err(notes_unknown_option(value, NotesUsage::Merge));
+            }
+            value => {
+                parsed.remote = Some(set_single_object(parsed.remote, value, NotesUsage::Merge)?);
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn resolve_notes_merge_strategy(
+    notes_ref: &str,
+    explicit: Option<&str>,
+) -> Result<NotesMergeStrategy> {
+    if let Some(value) = explicit {
+        return parse_notes_merge_strategy_option(value);
+    }
+    let config = identity_effective_config();
+    let short_ref = notes_ref.strip_prefix("refs/notes/").unwrap_or(notes_ref);
+    if let Some(config) = &config {
+        if let Some(value) = config.get("notes", Some(short_ref), "mergeStrategy") {
+            return parse_notes_merge_strategy_config(
+                &format!("notes.{short_ref}.mergeStrategy"),
+                value,
+            );
+        }
+        if let Some(value) = config.get("notes", None, "mergeStrategy") {
+            return parse_notes_merge_strategy_config("notes.mergeStrategy", value);
+        }
+    }
+    Ok(NotesMergeStrategy::Manual)
+}
+
+fn parse_notes_merge_strategy_option(value: &str) -> Result<NotesMergeStrategy> {
+    parse_notes_merge_strategy(value).ok_or_else(|| {
+        eprintln!("error: unknown -s/--strategy: {value}");
+        print_notes_usage(NotesUsage::Merge);
+        GitError::Exit(129)
+    })
+}
+
+fn parse_notes_merge_strategy_config(key: &str, value: &str) -> Result<NotesMergeStrategy> {
+    parse_notes_merge_strategy(value).ok_or_else(|| {
+        eprintln!("error: unknown notes merge strategy {value}");
+        eprintln!("fatal: unable to parse '{key}' from command-line config");
+        GitError::Exit(128)
+    })
+}
+
+fn parse_notes_merge_strategy(value: &str) -> Option<NotesMergeStrategy> {
+    match value {
+        "manual" => Some(NotesMergeStrategy::Manual),
+        "ours" => Some(NotesMergeStrategy::Ours),
+        "theirs" => Some(NotesMergeStrategy::Theirs),
+        "union" => Some(NotesMergeStrategy::Union),
+        "cat_sort_uniq" => Some(NotesMergeStrategy::CatSortUniq),
+        _ => None,
+    }
+}
+
+fn write_notes_merge_conflicts(
+    git_dir: &Path,
+    format: ObjectFormat,
+    local_ref: &str,
+    remote_ref: &str,
+    conflicts: &[NotesMergeConflict],
+    verbosity: i32,
+) -> Result<()> {
+    let worktree = git_dir.join("NOTES_MERGE_WORKTREE");
+    if worktree.exists() && fs::read_dir(&worktree)?.next().is_some() {
+        eprintln!(
+            "fatal: You have not concluded your previous notes merge ({} exists).",
+            git_dir.join("NOTES_MERGE_*").display()
+        );
+        return Err(GitError::Exit(128));
+    }
+    fs::create_dir_all(&worktree)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    for conflict in conflicts {
+        if verbosity >= 0 {
+            println!("Auto-merging notes for {}", conflict.annotated.to_hex());
+        }
+        let body = conflict_note_body(&db, conflict, local_ref, remote_ref, verbosity)?;
+        fs::write(worktree.join(conflict.annotated.to_hex()), body)?;
+    }
+    Ok(())
+}
+
+fn conflict_note_body(
+    db: &FileObjectDatabase,
+    conflict: &NotesMergeConflict,
+    local_ref: &str,
+    remote_ref: &str,
+    verbosity: i32,
+) -> Result<Vec<u8>> {
+    match (conflict.local, conflict.remote) {
+        (None, Some(remote)) => {
+            if verbosity >= -1 {
+                println!(
+                    "CONFLICT (delete/modify): Notes for object {} deleted in {} and modified in {}. Version from {} left in tree.",
+                    conflict.annotated.to_hex(),
+                    local_ref,
+                    remote_ref,
+                    remote_ref
+                );
+            }
+            Ok(read_note_blob_body(db, &remote)?)
+        }
+        (Some(local), None) => {
+            if verbosity >= -1 {
+                println!(
+                    "CONFLICT (delete/modify): Notes for object {} deleted in {} and modified in {}. Version from {} left in tree.",
+                    conflict.annotated.to_hex(),
+                    remote_ref,
+                    local_ref,
+                    local_ref
+                );
+            }
+            Ok(read_note_blob_body(db, &local)?)
+        }
+        (Some(local), Some(remote)) => {
+            if verbosity >= -1 {
+                let reason = if conflict.base.is_some() { "content" } else { "add/add" };
+                println!(
+                    "CONFLICT ({reason}): Merge conflict in notes for object {}",
+                    conflict.annotated.to_hex()
+                );
+            }
+            let base = match conflict.base {
+                Some(base) => read_note_blob_body(db, &base)?,
+                None => Vec::new(),
+            };
+            let local = read_note_blob_body(db, &local)?;
+            let remote = read_note_blob_body(db, &remote)?;
+            Ok(merge_blobs(
+                &base,
+                &local,
+                &remote,
+                &MergeBlobOptions {
+                    ours_label: local_ref,
+                    theirs_label: remote_ref,
+                    base_label: "base",
+                    style: ConflictStyle::Merge,
+                },
+            )
+            .content)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn read_note_blob_body(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidFormat(format!(
+            "note {} is not a blob",
+            oid.to_hex()
+        )));
+    }
+    Ok(object.body.clone())
+}
+
+fn write_notes_merge_state(git_dir: &Path, partial: ObjectId, notes_ref: &str) -> Result<()> {
+    fs::write(
+        git_dir.join("NOTES_MERGE_PARTIAL"),
+        format!("{}\n", partial.to_hex()),
+    )?;
+    fs::write(
+        git_dir.join("NOTES_MERGE_REF"),
+        format!("ref: {notes_ref}\n"),
+    )?;
+    Ok(())
+}
+
+fn read_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<(ObjectId, NotesRef)> {
+    let partial_text = fs::read_to_string(git_dir.join("NOTES_MERGE_PARTIAL")).map_err(|_| {
+        eprintln!("fatal: failed to read ref NOTES_MERGE_PARTIAL");
+        GitError::Exit(128)
+    })?;
+    let partial = ObjectId::from_hex(format, partial_text.trim()).map_err(|_| {
+        eprintln!("fatal: failed to read ref NOTES_MERGE_PARTIAL");
+        GitError::Exit(128)
+    })?;
+    let ref_text = fs::read_to_string(git_dir.join("NOTES_MERGE_REF")).map_err(|_| {
+        eprintln!("fatal: failed to resolve NOTES_MERGE_REF");
+        GitError::Exit(128)
+    })?;
+    let target = ref_text
+        .trim()
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .unwrap_or_else(|| ref_text.trim());
+    Ok((partial, NotesRef::expand(target)))
+}
+
+fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let (partial, notes_ref) = read_notes_merge_state(git_dir, format)?;
+    let worktree = git_dir.join("NOTES_MERGE_WORKTREE");
+    let mut resolved = Vec::new();
+    for entry in fs::read_dir(&worktree)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != format.hex_len() || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let annotated = ObjectId::from_hex(format, name)?;
+        let body = fs::read(entry.path())?;
+        resolved.push((annotated, body));
+    }
+    resolved.sort_by_key(|(oid, _)| oid.to_hex());
+    let store = FileRefStore::new(git_dir, format);
+    finalize_notes_merge(
+        git_dir,
+        format,
+        &store,
+        &notes_ref,
+        partial,
+        &resolved,
+        &notes_commit_identity()?,
+    )?;
+    abort_notes_merge_state(git_dir)
+}
+
+fn abort_notes_merge_state(git_dir: &Path) -> Result<()> {
+    let _ = fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
+    let _ = fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
+    let worktree = git_dir.join("NOTES_MERGE_WORKTREE");
+    if let Ok(entries) = fs::read_dir(&worktree) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn notes_get_ref(notes_ref: &str, args: &[String]) -> Result<()> {
     // get-ref takes no parameters: an unknown option is reported as such, while
     // any stray positional is "too many arguments".
@@ -1318,6 +1691,7 @@ enum NotesUsage {
     Append,
     Edit,
     Copy,
+    Merge,
     Show,
     Remove,
     GetRef,
@@ -1441,6 +1815,20 @@ fn print_notes_usage(usage: NotesUsage) {
     --[no-]stdin          read objects from stdin
     --[no-]for-rewrite <command>
                           load rewriting config for <command> (implies --stdin)
+
+"#
+        }
+        NotesUsage::Merge => {
+            r#"usage: git notes merge [<options>] <notes-ref>
+   or: git notes merge --commit [<options>]
+   or: git notes merge --abort [<options>]
+
+    -v, --[no-]verbose    be more verbose
+    -q, --[no-]quiet      be more quiet
+    -s, --[no-]strategy <strategy>
+                          resolve notes conflicts using the given strategy (manual/ours/theirs/union/cat_sort_uniq)
+    --commit              finalize notes merge by committing unmerged notes
+    --abort               abort notes merge
 
 "#
         }

@@ -220,6 +220,47 @@ fn render_notes_block(
     Ok(out)
 }
 
+fn render_pretty_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    display_refs: &[String],
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for reff in display_refs {
+        let handle = NotesRef::expand(reff);
+        if let Some(body) = read_note_bytes(git_dir, format, store, &handle, oid)? {
+            out.extend_from_slice(&body);
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_compiled_log_format_with_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    display_refs: &[String],
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let mut start = 0usize;
+    for (idx, token) in compiled.tokens.iter().enumerate() {
+        if !matches!(token, FormatToken::NoteName) {
+            continue;
+        }
+        emit_compiled_log_format(record, compiled, context, out, start..idx)?;
+        let notes = render_pretty_notes(git_dir, format, store, display_refs, &record.oid)?;
+        out.extend_from_slice(&notes);
+        start = idx + 1;
+    }
+    emit_compiled_log_format(record, compiled, context, out, start..compiled.tokens.len())
+}
+
 pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     cmd_log_impl(args, false)
 }
@@ -2448,7 +2489,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // medium (no-`--pretty`) format; an explicit `--notes`/`--no-notes` flag
     // overrides. The empty list short-circuits all per-commit note lookups.
     let notes_store = FileRefStore::new(&git_dir, format);
-    let notes_default_format = matches!(output, LogOutput::Default(LogDefaultKind::Medium));
+    let pretty_format_uses_notes =
+        matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.tokens.iter().any(|token| matches!(token, FormatToken::NoteName)));
+    let notes_default_format =
+        matches!(output, LogOutput::Default(LogDefaultKind::Medium)) || pretty_format_uses_notes;
     let display_notes_refs = if notes_display.is_active(notes_default_format) {
         notes_display.resolve_refs(&git_dir, &notes_store)?
     } else {
@@ -2728,12 +2772,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 } else if let Some(prefix) = &line_prefix {
                     // `--line-prefix=<p>` prefixes every output line.
                     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_compiled_log_format(
+                    emit_compiled_log_format_with_notes(
+                        &git_dir,
+                        format,
+                        &notes_store,
+                        &display_notes_refs,
                         record,
                         compiled,
                         &format_context,
                         &mut line,
-                        0..compiled.tokens.len(),
                     )?;
                     let mut stdout = io::stdout();
                     let mut start = 0usize;
@@ -2751,7 +2798,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         stdout.write_all(prefix.as_bytes())?;
                     }
                 } else {
-                    print_log_format(record, compiled, format_context)?;
+                    let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
+                    emit_compiled_log_format_with_notes(
+                        &git_dir,
+                        format,
+                        &notes_store,
+                        &display_notes_refs,
+                        record,
+                        compiled,
+                        &format_context,
+                        &mut out,
+                    )?;
+                    io::stdout().write_all(&out)?;
                 }
                 if final_newline {
                     io::stdout().write_all(term)?;
