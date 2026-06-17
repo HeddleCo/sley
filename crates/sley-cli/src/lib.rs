@@ -10682,7 +10682,21 @@ fn identity_effective_config() -> Option<GitConfig> {
         Some(common_git_dir.clone()),
         repo_current_branch_name(&git_dir),
     );
-    sley_config::load_effective_config(&common_git_dir, &context).ok()
+    let mut config = sley_config::load_effective_config(&common_git_dir, &context).ok()?;
+    // Layer the command-line `-c`/`--config-env` overrides on top, so reads like
+    // `mailmap.blob`/`mailmap.file` see the same values `git config` would (the
+    // CLI cannot push `-c` into the process env, so reconstruct it here).
+    let parameters_env = effective_config_parameters_env();
+    if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env.as_deref()) {
+        let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let _ = sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            &base,
+        );
+    }
+    Some(config)
 }
 
 fn commit_signoff_from_env() -> Result<Vec<u8>> {
