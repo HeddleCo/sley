@@ -19,6 +19,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut verify = false;
     let mut list = false;
     let mut explicit_list = false;
+    let mut edit = false;
+    let mut edit_disabled = false;
     let mut ignore_case = false;
     // Seed sort keys from `tag.sort` config (in config order). Git reads these
     // before parsing the command line, so command-line `--sort` keys are
@@ -250,8 +252,13 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             "--no-cleanup" => cleanup_mode = TagCleanupMode::Strip,
             "-e" | "--edit" => {
                 annotated = true;
+                edit = true;
+                edit_disabled = false;
             }
-            "--no-edit" => {}
+            "--no-edit" => {
+                edit = false;
+                edit_disabled = true;
+            }
             value
                 if value.len() >= 3
                     && matches!(
@@ -452,6 +459,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         && file_message.is_none()
         && trailers.is_empty()
         && !create_reflog
+        && !edit
+        && !edit_disabled
     {
         return print_default_tag_list(&git_dir, format, &store);
     }
@@ -579,12 +588,40 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     };
     let target_oid = resolve_tag_target(&git_dir, format, target)?;
     if annotated {
-        if messages.is_empty() && file_message.is_none() && trailers.is_empty() {
+        let has_message_source = !messages.is_empty() || file_message.is_some();
+        let use_editor = edit || (!edit_disabled && !has_message_source);
+        if !use_editor && messages.is_empty() && file_message.is_none() && trailers.is_empty() {
             eprintln!("fatal: no tag message?");
             return Err(GitError::Exit(128));
         }
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let target_object = db.read_object(&target_oid)?;
+        let mut message = if let Some(message) = file_message {
+            message
+        } else if messages.is_empty() {
+            if force {
+                existing_annotated_tag_message(&store, &db, format, tag)?.unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            tag_message_from_chunks_verbatim(&messages)
+        };
+        let mut editmsg_written = false;
+        if use_editor {
+            message = tag_message_for_editor(message, &trailers);
+            message = launch_tag_editor(&git_dir, tag, &message)?;
+            editmsg_written = true;
+        } else {
+            message = tag_message_with_trailers(tag_cleanup_message(message, cleanup_mode), &trailers);
+        }
+        if use_editor {
+            message = tag_cleanup_message(message, cleanup_mode);
+            if message.is_empty() {
+                eprintln!("fatal: no tag message?");
+                return Err(GitError::Exit(128));
+            }
+        }
         let tag_oid = sley_sequencer::create_annotated_tag(
             &mut db,
             sley_sequencer::TagCreate {
@@ -592,13 +629,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 object_type: target_object.object_type,
                 name: tag.as_bytes().to_vec(),
                 tagger: commit_identity_from_env("COMMITTER")?,
-                message: tag_message_with_trailers(
-                    tag_cleanup_message(
-                        file_message.unwrap_or_else(|| tag_message_from_chunks_verbatim(&messages)),
-                        cleanup_mode,
-                    ),
-                    &trailers,
-                ),
+                message,
             },
         )?;
         create_or_update_tag(TagCreateOrUpdate {
@@ -611,6 +642,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             force,
             create_reflog,
         })?;
+        if editmsg_written {
+            remove_tag_editmsg(&git_dir)?;
+        }
     } else {
         create_or_update_tag(TagCreateOrUpdate {
             git_dir: &git_dir,
@@ -927,7 +961,7 @@ fn tag_create_reflog_entry(
     target: &ObjectId,
     create_reflog: bool,
 ) -> Result<Option<ReflogEntry>> {
-    if !create_reflog {
+    if !tag_should_write_reflog(git_dir, create_reflog)? {
         return Ok(None);
     }
     Ok(Some(ReflogEntry {
@@ -936,6 +970,22 @@ fn tag_create_reflog_entry(
         committer: tag_reflog_committer_identity()?,
         message: tag_reflog_message(git_dir, format, target)?,
     }))
+}
+
+fn tag_should_write_reflog(git_dir: &Path, create_reflog: bool) -> Result<bool> {
+    if create_reflog {
+        return Ok(true);
+    }
+    if let Some(value) = global_config_value("core.logAllRefUpdates")? {
+        return Ok(value.eq_ignore_ascii_case("always"));
+    }
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+        return Ok(false);
+    };
+    Ok(config
+        .get("core", None, "logAllRefUpdates")
+        .is_some_and(|value| value.eq_ignore_ascii_case("always")))
 }
 
 /// Build the committer identity for a tag reflog entry. Unlike the tag *object*,
@@ -1135,6 +1185,82 @@ fn tag_message_from_chunks_verbatim(chunks: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(chunk);
     }
     out
+}
+
+fn existing_annotated_tag_message(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tag: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Ok(name) = tag_ref_name(tag) else {
+        return Ok(None);
+    };
+    let Some(RefTarget::Direct(oid)) = store.read_ref(&name)? else {
+        return Ok(None);
+    };
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Tag {
+        return Ok(None);
+    }
+    let parsed = Tag::parse(format, &object.body)?;
+    Ok(Some(parsed.message))
+}
+
+fn tag_message_for_editor(message: Vec<u8>, trailers: &[Vec<u8>]) -> Vec<u8> {
+    if message.is_empty() && !trailers.is_empty() {
+        let mut out = Vec::from(&b"\n"[..]);
+        for trailer in trailers {
+            out.extend_from_slice(trailer);
+            out.push(b'\n');
+        }
+        out
+    } else {
+        tag_message_with_trailers(message, trailers)
+    }
+}
+
+fn launch_tag_editor(git_dir: &Path, tag: &str, message: &[u8]) -> Result<Vec<u8>> {
+    let path = git_dir.join("TAG_EDITMSG");
+    let mut buffer = message.to_vec();
+    append_tag_editor_template(git_dir, tag, &mut buffer);
+    fs::write(&path, buffer)?;
+    commands::replay::launch_editor(git_dir, &path)?;
+    Ok(fs::read(path)?)
+}
+
+fn append_tag_editor_template(git_dir: &Path, tag: &str, buffer: &mut Vec<u8>) {
+    let comment = commands::replay::comment_char(git_dir);
+    if buffer.is_empty() {
+        buffer.push(b'\n');
+    } else if !buffer.ends_with(b"\n") {
+        buffer.push(b'\n');
+        buffer.push(b'\n');
+    } else {
+        buffer.push(b'\n');
+    }
+    buffer.push(comment);
+    buffer.push(b'\n');
+    buffer.push(comment);
+    buffer.extend_from_slice(b" Write a message for tag:\n");
+    buffer.push(comment);
+    buffer.extend_from_slice(b"   ");
+    buffer.extend_from_slice(tag.as_bytes());
+    buffer.push(b'\n');
+    buffer.push(comment);
+    buffer.push(b'\n');
+    buffer.push(comment);
+    buffer.extend_from_slice(b" Lines starting with '");
+    buffer.push(comment);
+    buffer.extend_from_slice(b"' will be ignored.\n");
+}
+
+fn remove_tag_editmsg(git_dir: &Path) -> Result<()> {
+    match fs::remove_file(git_dir.join("TAG_EDITMSG")) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub(crate) fn tag_message_with_trailers(mut message: Vec<u8>, trailers: &[Vec<u8>]) -> Vec<u8> {
