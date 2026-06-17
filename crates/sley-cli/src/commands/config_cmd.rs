@@ -259,8 +259,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     // only when no explicit config file source was given).
     let mut respect_includes_opt: Option<bool> = None;
     let mut iter = args.iter();
+    let mut parse_options = true;
     while let Some(arg) = iter.next() {
+        if !parse_options {
+            positional.push(arg.as_str());
+            continue;
+        }
         match arg.as_str() {
+            "--" => parse_options = false,
             "--local" => use_local = true,
             "--global" => use_global = true,
             "--system" => use_system = true,
@@ -449,7 +455,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 eprintln!("error: unknown option `{}'", &value[2..]);
                 return Err(GitError::Exit(129));
             }
-            value => positional.push(value),
+            value => {
+                positional.push(value);
+                parse_options = false;
+            }
         }
     }
     let action = if let Some(action) = action {
