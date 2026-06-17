@@ -633,14 +633,10 @@ fn parse_g_atom(value: &str) -> Result<(FormatToken, usize)> {
         Some('F') => FormatToken::GFingerprint,
         Some('P') => FormatToken::GPassthrough,
         Some(other) => {
-            return Err(GitError::Command(format!(
-                "unsupported log format placeholder %G{other}"
-            )));
+            return Ok((FormatToken::Literal(format!("%G{other}")), 2));
         }
         None => {
-            return Err(GitError::Command(
-                "unterminated log format placeholder %G".into(),
-            ));
+            return Ok((FormatToken::Literal("%G".into()), 1));
         }
     };
     Ok((token, 2))
