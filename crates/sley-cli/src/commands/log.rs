@@ -282,6 +282,16 @@ fn log_plain_oneline_format(compiled: &CompiledLogFormat) -> bool {
     )
 }
 
+fn log_source_label<'a>(
+    oid: &ObjectId,
+    source: Option<&'a str>,
+    source_oid: Option<&'a HashMap<ObjectId, String>>,
+) -> Option<&'a str> {
+    source_oid
+        .and_then(|map| map.get(oid).map(String::as_str))
+        .or(source)
+}
+
 fn emit_plain_oneline_limited_commit(
     db: &FileObjectDatabase,
     record: &sley_rev::CommitMetadata,
@@ -337,6 +347,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut show_parents = false;
     let mut show_children = false;
     let mut abbrev_commit = false;
+    let mut abbrev_commit_explicit = false;
     let mut abbrev_len = Some(7usize);
     let mut abbrev_len_explicit = false;
     // `--use-mailmap`/`--mailmap` (and their `--no-` forms). `None` means the CLI
@@ -372,6 +383,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // instead of newline.
     let mut null_terminate = false;
     let mut graph = false;
+    let mut show_linear_break = false;
+    let mut show_source = false;
+    let mut ignored_missing_input = false;
+    let mut revision_input_with_ignore_missing = false;
+    let mut end_of_options_revs: Vec<String> = Vec::new();
     // Diff-output options (`-p`, `--stat`, ...): rendered per commit against
     // its first parent, mirroring git's log diff machinery.
     let mut diff_opts = LogDiffOptions::default();
@@ -439,6 +455,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 setup_args.extend(iter.cloned());
                 break;
             }
+            "--end-of-options" => {
+                end_of_options_revs.extend(iter.cloned());
+                default_revision_given = true;
+                break;
+            }
             "--not" => {
                 setup_not = !setup_not;
                 setup_args.push(arg.clone());
@@ -457,11 +478,23 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--simplify-merges" | "--show-pulls" | "--ancestry-path" | "--reverse"
             | "--topo-order" | "--date-order" | "--author-date-order" | "--first-parent"
             | "--no-walk" | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" | "--all"
-            | "--branches" | "--tags" | "--remotes" => setup_args.push(arg.clone()),
+            | "--branches" | "--tags" | "--remotes" | "--no-ignore-missing" => {
+                setup_args.push(arg.clone())
+            }
+            "--ignore-missing" => {
+                ignored_missing_input = true;
+                setup_args.push(arg.clone());
+            }
             "--parents" => show_parents = true,
             "--children" => show_children = true,
-            "--abbrev-commit" => abbrev_commit = true,
-            "--no-abbrev-commit" => abbrev_commit = false,
+            "--abbrev-commit" => {
+                abbrev_commit = true;
+                abbrev_commit_explicit = true;
+            }
+            "--no-abbrev-commit" => {
+                abbrev_commit = false;
+                abbrev_commit_explicit = true;
+            }
             "--abbrev" => {
                 abbrev_len = Some(7);
                 abbrev_len_explicit = true;
@@ -635,7 +668,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--quiet"
             | "--no-quiet"
             | "--unpacked"
-            | "--no-source"
             | "--show-signature"
             | "--no-show-signature"
             | "--full-diff"
@@ -660,6 +692,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "-B"
             | "-D"
             | "-W" => {}
+            "--source" => show_source = true,
+            "--no-source" => show_source = false,
             "--no-renames" => {
                 renames_override = Some(false);
                 copies_override = Some(false);
@@ -927,6 +961,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             "--graph" => graph = true,
             "--no-graph" => graph = false,
+            "--show-linear-break" => show_linear_break = true,
+            value if value.starts_with("--show-linear-break=") => show_linear_break = true,
             "--color" => color_always = true,
             "--no-color" => color_always = false,
             "--line-prefix" => {
@@ -1315,7 +1351,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported log option {value}")));
             }
-            value => setup_args.push(value.to_string()),
+            value => {
+                if ignored_missing_input {
+                    revision_input_with_ignore_missing = true;
+                }
+                setup_args.push(value.to_string());
+            }
         }
     }
     // `-L` defaults to a patch only when no explicit diff output format was
@@ -1331,6 +1372,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         if setup_not {
             setup_args.push("--not".to_string());
         }
+        if ignored_missing_input && input.lines().any(|line| !line.is_empty()) {
+            revision_input_with_ignore_missing = true;
+        }
         setup_args.extend(
             input
                 .lines()
@@ -1345,12 +1389,34 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
     }
-    if !default_revision_given {
-        setup_args.splice(0..0, ["--default".to_string(), "HEAD".to_string()]);
-    }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let cwd = env::current_dir()?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    for rev in end_of_options_revs {
+        if rev.starts_with('-') {
+            match resolve_revision(&git_dir, format, &rev) {
+                Ok(oid) => setup_args.push(oid.to_hex()),
+                Err(_) => {
+                    let head_ref = format!("refs/heads/{rev}");
+                    let tag_ref = format!("refs/tags/{rev}");
+                    match resolve_revision(&git_dir, format, &head_ref)
+                        .or_else(|_| resolve_revision(&git_dir, format, &tag_ref))
+                    {
+                        Ok(oid) => setup_args.push(oid.to_hex()),
+                        Err(_) => setup_args.push(rev),
+                    }
+                }
+            }
+        } else {
+            setup_args.push(rev);
+        }
+    }
+    if !default_revision_given && !revision_input_with_ignore_missing {
+        setup_args.splice(0..0, ["--default".to_string(), "HEAD".to_string()]);
+    }
     // `diff.indentHeuristic` sets the default; a CLI
     // `--indent-heuristic`/`--no-indent-heuristic` (tracked above) overrides it.
     if !indent_heuristic_explicit {
@@ -1368,8 +1434,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if diff_opts.merges.is_none() {
         diff_opts.merges = config_diff_merges;
     }
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let output_encoding = log_output_encoding(&config);
+    if !abbrev_commit_explicit
+        && config.get_bool("log", None, "abbrevcommit").unwrap_or(false)
+    {
+        abbrev_commit = true;
+    }
     // Mailmap: git's `log.mailmap` defaults to true (`use_mailmap_config = 1`);
     // `--use-mailmap`/`--no-use-mailmap` (and `--mailmap`/`--no-mailmap` aliases)
     // override. When enabled, the *whole* identity is mapped (default formats and
@@ -1377,8 +1447,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let use_mailmap = use_mailmap_explicit
         .unwrap_or_else(|| config.get_bool("log", None, "mailmap").unwrap_or(true));
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
-    let cwd = env::current_dir()?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
     let setup = sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {
@@ -1415,8 +1483,20 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
     let full_history = revision_options.full_history;
+    if graph && reverse {
+        eprintln!("fatal: options '--reverse' and '--graph' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if graph && show_linear_break {
+        eprintln!("fatal: options '--show-linear-break' and '--graph' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if graph && !walk {
-        eprintln!("fatal: cannot combine --no-walk with --graph");
+        eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if graph && walk_reflogs {
+        eprintln!("fatal: options '--walk-reflogs' and '--graph' cannot be used together");
         return Err(GitError::Exit(128));
     }
     // Compile any `-I<regex>` patterns now (a malformed regex fails like git's
@@ -1576,15 +1656,30 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 true => !abbrev_commit,
                 false => abbrev_len.is_none(),
             };
-            output = LogOutput::Compiled {
-                compiled: presets::log_oneline(
+            let compiled = if show_source {
+                let oid = if use_full_oid { "%H" } else { "%h" };
+                let parents = if show_parents { " %P" } else { "" };
+                let decorations = if decoration != LogDecorationMode::Off {
+                    "%d"
+                } else {
+                    ""
+                };
+                CompiledLogFormat::compile(
+                    &format!("{oid}{parents}%x09%S{decorations} %s"),
+                    LogFormatDialect::Log,
+                )?
+            } else {
+                presets::log_oneline(
                     decoration != LogDecorationMode::Off,
                     use_full_oid,
                     show_parents,
-                )?,
+                )?
+            };
+            output = LogOutput::Compiled {
+                compiled,
                 final_newline: true,
                 show_children,
-                inline_children: true,
+                inline_children: !show_source,
             };
         }
     } else if let LogOutput::Compiled {
@@ -2237,7 +2332,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let format_uses_source =
         matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.uses_source());
     let source_labels: Option<HashMap<ObjectId, String>> =
-        if format_uses_source && !source_starts.is_empty() {
+        if (format_uses_source || show_source) && !source_starts.is_empty() {
             let mut map = HashMap::new();
             for (start_oid, label) in &source_starts {
                 for record in rev_list_walk_commits(&db, format, [*start_oid], first_parent)? {
@@ -2349,6 +2444,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         "commit {}",
                         format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
                     )?;
+                    if show_source
+                        && let Some(source) = log_source_label(
+                            &record.oid,
+                            log_format_source.as_deref(),
+                            source_labels.as_ref(),
+                        )
+                    {
+                        write!(out, "\t{source}")?;
+                    }
                     if let Some(labels) = decorations.get(&record.oid)
                         && !labels.is_empty()
                     {
@@ -2436,6 +2540,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     "commit {}",
                     format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
                 );
+                if show_source
+                    && let Some(source) = log_source_label(
+                        &record.oid,
+                        log_format_source.as_deref(),
+                        source_labels.as_ref(),
+                    )
+                {
+                    print!("\t{source}");
+                }
                 print_log_decorations(&record.oid, &decorations);
                 print_log_selected_parent_oids(
                     record,
