@@ -1977,8 +1977,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             || min_parents.is_some_and(|min| record.parents.len() < min)
             || max_parents.is_some_and(|max| record.parents.len() > max)
             || !log_age_filters_match(record, max_age, min_age)?
-            || !log_author_matcher_matches(record, author_filters.as_ref())
-            || !log_committer_matcher_matches(record, committer_filters.as_ref())
+            || !log_author_matcher_matches(
+                record,
+                author_filters.as_ref(),
+                use_mailmap.then_some(&mailmap),
+            )
+            || !log_committer_matcher_matches(
+                record,
+                committer_filters.as_ref(),
+                use_mailmap.then_some(&mailmap),
+            )
             || !log_grep_matcher_matches(
                 record,
                 grep_filters.as_ref(),
@@ -3063,15 +3071,48 @@ fn compile_log_filter_matcher(
 fn log_author_matcher_matches(
     record: &sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
+    mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
-    filter.is_none_or(|filter| filter.matches_any(&record.commit.author))
+    filter.is_none_or(|filter| {
+        filter.matches_any(&log_mailmapped_identity_header(&record.commit.author, mailmap))
+    })
 }
 
 fn log_committer_matcher_matches(
     record: &sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
+    mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
-    filter.is_none_or(|filter| filter.matches_any(&record.commit.committer))
+    filter.is_none_or(|filter| {
+        filter.matches_any(&log_mailmapped_identity_header(&record.commit.committer, mailmap))
+    })
+}
+
+/// git's `apply_mailmap_to_header`: when `--use-mailmap`/`log.mailmap` is active
+/// the `--author`/`--committer` grep runs against the *mailmapped* identity
+/// header. Rewrites `Name <email> <ts> <tz>` → `MappedName <mapped@email> ...`.
+/// With no mailmap (or an empty one) the original header bytes are returned.
+fn log_mailmapped_identity_header(
+    raw: &[u8],
+    mailmap: Option<&commands::utility::Mailmap>,
+) -> Vec<u8> {
+    let Some(mailmap) = mailmap.filter(|m| !m.is_empty()) else {
+        return raw.to_vec();
+    };
+    let (name, email) = mailmap.rewrite_identity(raw);
+    // Preserve the trailing ` <ts> <tz>` (everything after the closing `>`).
+    let tail = raw
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|idx| &raw[idx + 1..])
+        .unwrap_or(b"");
+    let mut out = Vec::with_capacity(name.len() + email.len() + tail.len() + 4);
+    out.extend_from_slice(&name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(&email);
+    out.push(b'>');
+    out.extend_from_slice(tail);
+    out
 }
 
 fn log_grep_matcher_matches(
