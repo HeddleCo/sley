@@ -176,12 +176,12 @@ impl CacheEntry {
 
 /// git's `S_ISGITLINK(mode)`: the entry is a submodule (gitlink) when the file
 /// type bits of its raw git mode are `0o160000`. `CacheEntry::mode` holds the
-/// same raw git mode git stores (`0o100644`, `0o120000`, `0o160000`, …), so the
-/// file-type mask matches how every other mode comparison in this crate reads
-/// it.
-fn is_gitlink(mode: u32) -> bool {
-    (mode & 0o170000) == 0o160000
-}
+/// same raw git mode git stores (`0o100644`, `0o120000`, `0o160000`, …).
+///
+/// The engine does NOT re-derive the file-type-mask test — it reuses the single
+/// `sley_index::is_gitlink` definition, so "what is a gitlink" has one owner
+/// shared by the index, this unpack-trees engine, and every CLI consumer.
+use sley_index::is_gitlink;
 
 /// git's `same()`: two slots are equal iff both absent, or both present with
 /// equal mode and oid. (Upstream additionally treats either side being

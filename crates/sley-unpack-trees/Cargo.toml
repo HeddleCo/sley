@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 sley-core = { path = "../sley-core" }
+sley-index = { path = "../sley-index" }
 
 [lints]
 workspace = true

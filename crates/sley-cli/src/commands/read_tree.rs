@@ -539,7 +539,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // not a blob), so the engine must not try to `fs::read` it. The
         // submodule's own dirtiness is handled separately by
         // `check_submodule_move_head`.
-        if (ce.mode & 0o170000) == 0o160000 {
+        if sley_index::is_gitlink(ce.mode) {
             return Ok(());
         }
         // The engine hands us the *current index* entry for the path; reuse the
@@ -1348,7 +1348,7 @@ fn write_blob_to_worktree(
     // it never reads an object here. Ensure the directory exists (an
     // already-populated submodule is left untouched) and record a zeroed stat,
     // exactly as git's `write_entry` S_IFGITLINK arm and `materialize_tree_entry`.
-    if (mode & 0o170000) == 0o160000 {
+    if sley_index::is_gitlink(mode) {
         create_leading_directories(worktree_root, &file_path)?;
         fs::create_dir_all(&file_path)?;
         return Ok(None);
