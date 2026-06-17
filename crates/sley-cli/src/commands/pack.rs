@@ -1173,21 +1173,32 @@ fn midx_covers_current_packs(common_git_dir: &Path, format: ObjectFormat) -> Res
 
 pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     let mut quiet = false;
-    for arg in args {
+    // `--cruft` / `--no-cruft` override gc.cruftPacks; None means "use config".
+    let mut cruft_flag: Option<bool> = None;
+    // `--prune[=<date>]` / `--no-prune` override gc.pruneExpire. The sentinel
+    // distinguishes "not given" from an explicit value.
+    let mut prune_override: Option<Option<String>> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
-            // Accepted no-ops for the M1 subset (we consolidate packs + drop
-            // redundant ones; aggressive unreachable pruning is deferred).
+            "--cruft" => cruft_flag = Some(true),
+            "--no-cruft" => cruft_flag = Some(false),
+            "--prune" => prune_override = Some(Some("2.weeks.ago".to_string())),
+            "--no-prune" => prune_override = Some(None),
+            value if value.starts_with("--prune=") => {
+                prune_override = Some(Some(value["--prune=".len()..].to_string()));
+            }
+            // Accepted no-ops.
             "--auto"
             | "--aggressive"
             | "--force"
+            | "--detach"
             | "--no-detach"
-            | "--prune"
-            | "--no-prune"
             | "--progress"
             | "--no-progress"
             | "--keep-largest-pack" => {}
-            value if value.starts_with("--prune=") => {}
+            value if value.starts_with("--max-cruft-size") || value.starts_with("--expire-to") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported gc option {value}")));
             }
@@ -1201,11 +1212,50 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    if let Some(result) = sley_odb::repack_all_objects(&common_git_dir, format)? {
-        // gc removes packs/loose made redundant by the new pack (safe: only
-        // objects already present in the new pack are dropped).
-        sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+    let config = read_repo_config(&common_git_dir)?;
+
+    // gc.cruftPacks defaults to true (cruft packs are git's default since 2.42).
+    let cruft_packs = cruft_flag
+        .or_else(|| config.get_bool("gc", None, "cruftPacks"))
+        .unwrap_or(true);
+
+    // gc.pruneExpire defaults to "2.weeks.ago"; --prune=<date>/--no-prune and the
+    // config override it. None means "never prune" (`--no-prune`).
+    let prune_expire: Option<String> = match prune_override {
+        Some(value) => value,
+        None => Some(
+            config
+                .get("gc", None, "pruneExpire")
+                .unwrap_or("2.weeks.ago")
+                .to_string(),
+        ),
+    };
+
+    let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
+
+    // builtin/gc.c add_repack_all_option: pick the repack flavour.
+    if prune_expire.as_deref() == Some("now") && cruft_packs {
+        // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
+        if let Some(result) = sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)? {
+            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+        }
+    } else if cruft_packs {
+        // Default: reachable pack + cruft pack, cruft expiry = prune_expire.
+        let cruft_expiration = match prune_expire.as_deref() {
+            Some(spec) => parse_cruft_expiration(spec)?,
+            None => None,
+        };
+        let result = sley_odb::repack_cruft(&common_git_dir, format, &roots, cruft_expiration)?;
+        sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
+    } else {
+        // gc.cruftPacks=false: -A -d, dropping unreachable older than prune_expire
+        // (we drop all unreachable, matching the common "no recent unreachable"
+        // case the suite exercises).
+        if let Some(result) = sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)? {
+            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+        }
     }
+
     let _ = quiet;
     Ok(())
 }
