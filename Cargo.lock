@@ -1194,6 +1194,7 @@ dependencies = [
 name = "sley-formats"
 version = "0.0.3"
 dependencies = [
+ "flate2",
  "sley-config",
  "sley-core",
  "sley-index",

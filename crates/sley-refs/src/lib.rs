@@ -4,7 +4,10 @@
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_formats::{Reftable, ReftableRefRecord, ReftableRefValue};
+use sley_formats::{
+    Reftable, ReftableLogRecord, ReftableLogUpdate, ReftableLogValue, ReftableRefRecord,
+    ReftableRefValue,
+};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -563,6 +566,9 @@ impl FileRefStore {
 
     pub fn read_reflog(&self, name: &str) -> Result<Vec<ReflogEntry>> {
         validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            return self.read_reftable_logs(name);
+        }
         let path = self.reflog_path(name);
         if !path.exists() {
             return Ok(Vec::new());
@@ -572,6 +578,9 @@ impl FileRefStore {
 
     pub fn write_reflog(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
         validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            return self.rewrite_reftable_logs(name, entries);
+        }
         let path = self.reflog_path(name);
         let parent = path
             .parent()
@@ -586,6 +595,21 @@ impl FileRefStore {
 
     pub fn expire_reflog_older_than(&self, name: &str, cutoff_seconds: i64) -> Result<usize> {
         validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            let entries = self.read_reftable_logs(name)?;
+            let original_len = entries.len();
+            let mut retained = Vec::new();
+            for entry in entries {
+                if entry.timestamp_seconds()? >= cutoff_seconds {
+                    retained.push(entry);
+                }
+            }
+            let removed = original_len - retained.len();
+            if removed > 0 {
+                self.rewrite_reftable_logs(name, &retained)?;
+            }
+            return Ok(removed);
+        }
         let path = self.reflog_path(name);
         if !path.exists() {
             return Ok(0);
@@ -625,6 +649,21 @@ impl FileRefStore {
         is_reachable: impl Fn(&ObjectId) -> bool,
     ) -> Result<usize> {
         validate_ref_name(name)?;
+        if self.uses_reftable()? {
+            let entries = self.read_reftable_logs(name)?;
+            let original_len = entries.len();
+            let retained = expire_reflog(
+                &entries,
+                cutoff_unix,
+                expire_unreachable_cutoff,
+                is_reachable,
+            )?;
+            let removed = original_len - retained.len();
+            if write && removed > 0 {
+                self.rewrite_reftable_logs(name, &retained)?;
+            }
+            return Ok(removed);
+        }
         let path = self.reflog_path(name);
         if !path.exists() {
             return Ok(0);
@@ -1061,6 +1100,9 @@ impl FileRefStore {
                 update_index: 0,
                 value: ReftableRefValue::Deletion,
             }])?;
+            // git drops the reflog when the ref goes away; tombstone the log
+            // records so `git reflog` / `git stash list` stop seeing them.
+            self.remove_reflog_file(name);
             return Ok(oid);
         }
         let Some(reference) = self.read_loose_ref(name)? else {
@@ -1311,37 +1353,12 @@ impl FileRefStore {
         ))
     }
 
-    fn append_reftable_records(&self, mut records: Vec<ReftableRefRecord>) -> Result<()> {
+    fn append_reftable_records(&self, records: Vec<ReftableRefRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
-        let reftable_dir = self.common_dir.join("reftable");
-        fs::create_dir_all(&reftable_dir)?;
-        let tables_list = reftable_dir.join("tables.list");
-        let mut table_names = if tables_list.exists() {
-            fs::read_to_string(&tables_list)?
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let update_index = self.next_reftable_update_index(&table_names)?;
-        for record in &mut records {
-            record.update_index = update_index;
-        }
-        let table_name = reftable_table_name(update_index);
-        let bytes = Reftable::write_ref_only(self.format, update_index, update_index, &records)?;
-        write_locked(&reftable_dir.join(&table_name), &bytes)?;
-        table_names.push(table_name);
-        let mut list = Vec::new();
-        for name in &table_names {
-            list.extend_from_slice(name.as_bytes());
-            list.push(b'\n');
-        }
-        write_locked(&tables_list, &list)
+        self.append_reftable_table(records, Vec::new())?;
+        Ok(())
     }
 
     fn next_reftable_update_index(&self, table_names: &[String]) -> Result<u64> {
@@ -1355,6 +1372,90 @@ impl FileRefStore {
             .checked_add(1)
             .ok_or_else(|| GitError::InvalidFormat("reftable update index overflow".into()))
     }
+
+    /// Read the table list (file names) backing the reftable stack, oldest first.
+    fn reftable_table_names(&self) -> Result<Vec<String>> {
+        let tables_list = self.common_dir.join("reftable").join("tables.list");
+        if !tables_list.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(fs::read_to_string(&tables_list)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Append a single combined ref+log table to the stack, allocating the next
+    /// update index. Either slice may be empty (a log-only table for an
+    /// `append_reflog` / `delete-reflog`, or a ref-only table for a plain ref
+    /// write). Returns the allocated update index.
+    fn append_reftable_table(
+        &self,
+        mut refs: Vec<ReftableRefRecord>,
+        mut logs: Vec<ReftableLogRecord>,
+    ) -> Result<u64> {
+        let reftable_dir = self.common_dir.join("reftable");
+        fs::create_dir_all(&reftable_dir)?;
+        let mut table_names = self.reftable_table_names()?;
+        let update_index = self.next_reftable_update_index(&table_names)?;
+        for record in &mut refs {
+            record.update_index = update_index;
+        }
+        for record in &mut logs {
+            record.update_index = update_index;
+        }
+        let table_name = reftable_table_name(update_index, update_index);
+        let bytes = Reftable::write(self.format, update_index, update_index, &refs, &logs)?;
+        write_locked(&reftable_dir.join(&table_name), &bytes)?;
+        table_names.push(table_name);
+        let mut list = Vec::new();
+        for name in &table_names {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        write_locked(&reftable_dir.join("tables.list"), &list)?;
+        Ok(update_index)
+    }
+
+    /// Merge the log records for `name` across the whole stack into the reflog
+    /// entries `git reflog` expects, in *oldest-first* order (the loose-file
+    /// order callers reverse for display). Later tables in the stack override
+    /// earlier ones for the same `(refname, update_index)`, deletions mask
+    /// entries, and the old==new==null existence marker is dropped (it records
+    /// reflog existence, not a real entry).
+    fn read_reftable_logs(&self, name: &str) -> Result<Vec<ReflogEntry>> {
+        // Collect the newest value for each update_index, honoring deletions.
+        // update_index ascending == chronological order.
+        let mut by_index: BTreeMap<u64, Option<ReftableLogUpdate>> = BTreeMap::new();
+        for table in self.reftables()? {
+            for record in table.logs {
+                if record.refname != name {
+                    continue;
+                }
+                match record.value {
+                    ReftableLogValue::Deletion => {
+                        by_index.insert(record.update_index, None);
+                    }
+                    ReftableLogValue::Update(update) => {
+                        by_index.insert(record.update_index, Some(update));
+                    }
+                }
+            }
+        }
+        let null = ObjectId::null(self.format);
+        let mut entries = Vec::new();
+        for update in by_index.into_values().flatten() {
+            // Drop the existence marker (old==new==null): it is not a real entry.
+            if update.old_oid == null && update.new_oid == null {
+                continue;
+            }
+            entries.push(reflog_entry_from_reftable(update));
+        }
+        Ok(entries)
+    }
+
 
     fn collect_loose_refs(
         &self,
@@ -1457,6 +1558,13 @@ impl FileRefStore {
     /// later `refs/heads/l` cannot create its own `logs/refs/heads/l` reflog
     /// file (t3200 #14, #18).
     fn remove_reflog_file(&self, name: &str) {
+        // Reftable repos keep the reflog inside the table stack, not as a loose
+        // file: deleting a ref must tombstone its log records or `git stash
+        // list` / `git reflog` keep surfacing them (t0610 'basic: stash').
+        if matches!(self.uses_reftable(), Ok(true)) {
+            let _ = self.tombstone_reftable_logs(name);
+            return;
+        }
         let path = self.reflog_path(name);
         let _ = fs::remove_file(&path);
         let base = self.ref_base_dir(name).to_path_buf();
@@ -1464,6 +1572,13 @@ impl FileRefStore {
         if let Some(parent) = path.parent() {
             prune_empty_dirs_up_to(parent, &logs_refs_root);
         }
+    }
+
+    /// Mask every live log record for `name` with deletion tombstones, so the
+    /// reflog reads as absent. Mirrors git unlinking `logs/<name>` on the loose
+    /// backend; the reftable analogue is an all-tombstone table.
+    fn tombstone_reftable_logs(&self, name: &str) -> Result<()> {
+        self.rewrite_reftable_logs(name, &[])
     }
 
     /// Mirror git's `files_log_ref_write`: when a transaction updates a branch
@@ -1508,6 +1623,18 @@ impl FileRefStore {
 
     pub fn append_reflog(&self, name: &str, entry: &ReflogEntry) -> Result<()> {
         validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            let update = reftable_update_from_reflog(entry)?;
+            self.append_reftable_table(
+                Vec::new(),
+                vec![ReftableLogRecord {
+                    refname: name.to_string(),
+                    update_index: 0,
+                    value: ReftableLogValue::Update(update),
+                }],
+            )?;
+            return Ok(());
+        }
         let path = self.reflog_path(name);
         let parent = path
             .parent()
@@ -1520,6 +1647,105 @@ impl FileRefStore {
         file.write_all(&entry.to_line())?;
         file.sync_all()?;
         Ok(())
+    }
+
+    /// Replace the entire reflog for `name` in the reftable stack with `entries`
+    /// (chronological, oldest first). Writes a single new table that tombstones
+    /// every currently-live log update index for `name` and re-adds the desired
+    /// entries at fresh update indexes that preserve their order. This is the
+    /// stack-friendly analogue of rewriting a loose `logs/<name>` file — used by
+    /// `write_reflog` / reflog expiry. An empty `entries` slice clears the
+    /// reflog (an empty `git reflog`).
+    fn rewrite_reftable_logs(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
+        // Gather every update index that currently carries a live log record for
+        // `name`, so we can mask them with deletion tombstones.
+        let mut live_indexes: BTreeSet<u64> = BTreeSet::new();
+        let mut deleted_indexes: BTreeSet<u64> = BTreeSet::new();
+        for table in self.reftables()? {
+            for record in table.logs {
+                if record.refname != name {
+                    continue;
+                }
+                match record.value {
+                    ReftableLogValue::Deletion => {
+                        deleted_indexes.insert(record.update_index);
+                        live_indexes.remove(&record.update_index);
+                    }
+                    ReftableLogValue::Update(_) => {
+                        live_indexes.insert(record.update_index);
+                        deleted_indexes.remove(&record.update_index);
+                    }
+                }
+            }
+        }
+
+        let table_names = self.reftable_table_names()?;
+        let base = self.next_reftable_update_index(&table_names)?;
+        let mut logs: Vec<ReftableLogRecord> = Vec::new();
+        // Tombstone the old entries at their original update indexes.
+        for index in &live_indexes {
+            logs.push(ReftableLogRecord {
+                refname: name.to_string(),
+                update_index: *index,
+                value: ReftableLogValue::Deletion,
+            });
+        }
+        // Re-add the survivors at fresh, monotonically increasing indexes so
+        // their chronological order is preserved on the next read.
+        for (offset, entry) in entries.iter().enumerate() {
+            let update_index = base
+                .checked_add(offset as u64)
+                .ok_or_else(|| GitError::InvalidFormat("reftable update index overflow".into()))?;
+            logs.push(ReftableLogRecord {
+                refname: name.to_string(),
+                update_index,
+                value: ReftableLogValue::Update(reftable_update_from_reflog(entry)?),
+            });
+        }
+        if logs.is_empty() {
+            return Ok(());
+        }
+        self.append_reftable_table_spanning(Vec::new(), logs)?;
+        Ok(())
+    }
+
+    /// Like [`Self::append_reftable_table`] but the caller has already assigned
+    /// each record's `update_index`; the new table's header `[min, max]` is set
+    /// to span them (plus the freshly allocated index for any ref records). Used
+    /// by reflog rewrites that mix old-index tombstones with new-index entries.
+    fn append_reftable_table_spanning(
+        &self,
+        mut refs: Vec<ReftableRefRecord>,
+        logs: Vec<ReftableLogRecord>,
+    ) -> Result<u64> {
+        let reftable_dir = self.common_dir.join("reftable");
+        fs::create_dir_all(&reftable_dir)?;
+        let mut table_names = self.reftable_table_names()?;
+        let alloc_index = self.next_reftable_update_index(&table_names)?;
+        for record in &mut refs {
+            record.update_index = alloc_index;
+        }
+        let mut min_index = alloc_index;
+        let mut max_index = alloc_index;
+        for record in &logs {
+            min_index = min_index.min(record.update_index);
+            max_index = max_index.max(record.update_index);
+        }
+        for record in &refs {
+            min_index = min_index.min(record.update_index);
+            max_index = max_index.max(record.update_index);
+        }
+        let table_name = reftable_table_name(min_index, max_index);
+        let bytes = Reftable::write(self.format, min_index, max_index, &refs, &logs)?;
+        write_locked(&reftable_dir.join(&table_name), &bytes)?;
+        table_names.push(table_name);
+        let mut list = Vec::new();
+        for name in &table_names {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        write_locked(&reftable_dir.join("tables.list"), &list)?;
+        Ok(max_index)
     }
 
     fn ref_path(&self, name: &str) -> PathBuf {
@@ -1573,12 +1799,156 @@ fn reftable_value_from_ref_target(target: &RefTarget) -> ReftableRefValue {
     }
 }
 
-fn reftable_table_name(update_index: u64) -> String {
+/// Reconstruct a `ReflogEntry`'s flat committer line from a reftable log update.
+///
+/// git's reftable backend stores the identity split into `name`/`email`/`time`/
+/// `tz_offset` (refs/reftable-backend.c::fill_reftable_log_record) and rebuilds
+/// `Name <email> time tz` on read. The loose reflog committer field is exactly
+/// that string, so the entry round-trips byte-for-byte with the loose backend.
+fn reflog_entry_from_reftable(update: ReftableLogUpdate) -> ReflogEntry {
+    let committer = format!(
+        "{} <{}> {} {}",
+        update.name,
+        update.email,
+        update.time,
+        format_reflog_tz(update.tz_offset),
+    );
+    // git stores reflog messages with a trailing newline in the reftable record
+    // (refs/reftable-backend.c passes `u->msg`, which carries the `\n`). A loose
+    // `ReflogEntry.message` is the newline-free form, so strip the single
+    // trailing `\n` we add on write.
+    let mut message = update.message.into_bytes();
+    if message.last() == Some(&b'\n') {
+        message.pop();
+    }
+    ReflogEntry {
+        old_oid: update.old_oid,
+        new_oid: update.new_oid,
+        committer: committer.into_bytes(),
+        message,
+    }
+}
+
+/// Split a flat reflog committer line (`Name <email> <seconds> <±HHMM>`) plus the
+/// entry's oids/message into the reftable log update fields.
+fn reftable_update_from_reflog(entry: &ReflogEntry) -> Result<ReftableLogUpdate> {
+    let committer = std::str::from_utf8(&entry.committer)
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let (name, email, time, tz_offset) = split_committer_ident(committer)?;
+    let mut message = std::str::from_utf8(&entry.message)
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?
+        .to_string();
+    // git stores reflog messages with a trailing newline in reftable records;
+    // `%gs` and the loose backend strip it. Add it back so git renders the
+    // message identically across backends.
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
+    Ok(ReftableLogUpdate {
+        old_oid: entry.old_oid,
+        new_oid: entry.new_oid,
+        name,
+        email,
+        time,
+        tz_offset,
+        message,
+    })
+}
+
+/// Parse `Name <email> <seconds> <±HHMM>` into the reftable log fields. Mirrors
+/// git's `split_ident_line` semantics for the committer line: the display name
+/// is everything before ` <`, the email is between the angle brackets, then the
+/// unix timestamp and the signed `HHMM` timezone follow.
+fn split_committer_ident(committer: &str) -> Result<(String, String, u64, i16)> {
+    let open = committer.find(" <").ok_or_else(|| {
+        GitError::InvalidFormat("reflog committer is missing email opener".into())
+    })?;
+    let name = committer[..open].to_string();
+    let after_open = open + 2;
+    let close = committer[after_open..].find('>').ok_or_else(|| {
+        GitError::InvalidFormat("reflog committer is missing email closer".into())
+    })?;
+    let email = committer[after_open..after_open + close].to_string();
+    let rest = committer[after_open + close + 1..].trim();
+    let (time_str, tz_str) = rest.split_once(' ').ok_or_else(|| {
+        GitError::InvalidFormat("reflog committer is missing timestamp/timezone".into())
+    })?;
+    let time = time_str
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let tz_offset = parse_reflog_tz(tz_str.trim())?;
+    Ok((name, email, time, tz_offset))
+}
+
+/// Format a reftable `tz_offset` (a signed `HHMM` value) as git renders it in a
+/// committer line, e.g. `120 -> "+0200"`, `-300 -> "-0500"`.
+fn format_reflog_tz(tz_offset: i16) -> String {
+    let sign = if tz_offset < 0 { '-' } else { '+' };
+    let magnitude = tz_offset.unsigned_abs();
+    format!("{sign}{magnitude:04}")
+}
+
+/// Parse a `±HHMM` timezone token into the raw signed `HHMM` value git stores in
+/// a reftable log record (refs/reftable-backend.c parses it the same way).
+fn parse_reflog_tz(tz: &str) -> Result<i16> {
+    let (sign, digits) = match tz.strip_prefix('-') {
+        Some(rest) => (-1i16, rest),
+        None => (1i16, tz.strip_prefix('+').unwrap_or(tz)),
+    };
+    let magnitude = digits
+        .parse::<i16>()
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    Ok(sign * magnitude)
+}
+
+/// Build a reftable file name in git's exact `0x%012x-0x%012x-%08x.ref` shape
+/// (reftable/stack.c::format_name). git's `table_has_valid_name` (reftable/fsck.c)
+/// parses all three dash-separated components as hex, so the suffix MUST be a
+/// pure 8-hex-digit token — a non-hex disambiguator like `-sley-<nanos>` makes
+/// `git fsck` reject the table with `badReftableTableName`.
+fn reftable_table_name(min_update_index: u64, max_update_index: u64) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    format!("0x{update_index:012x}-0x{update_index:012x}-sley-{nanos:x}.ref")
+    // Mix the process id in so concurrent writers in the same nanosecond still
+    // pick distinct names; truncate to 32 bits to match git's `%08x`.
+    let salt = (nanos as u64) ^ (u64::from(std::process::id()) << 16);
+    format!("0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref", salt as u32)
+}
+
+/// Whether `name` parses as a valid reftable file name the way git's
+/// `table_has_valid_name` (reftable/fsck.c) does: three hex tokens separated by
+/// `-`, ending in `.ref` (or `.log`). Used to keep sley's generated names from
+/// regressing into a shape `git fsck` would reject.
+#[cfg(test)]
+fn reftable_table_name_is_valid(name: &str) -> bool {
+    fn hex_prefix(s: &str) -> Option<&str> {
+        // strtoull(base 16) skips an optional leading 0x and consumes hex digits.
+        let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+        let consumed = body.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(body.len());
+        if consumed == 0 {
+            return None;
+        }
+        Some(&body[consumed..])
+    }
+    let Some(rest) = hex_prefix(name) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some(rest) = hex_prefix(rest) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let Some(rest) = hex_prefix(rest) else {
+        return false;
+    };
+    rest == ".ref" || rest == ".log"
 }
 
 fn repository_common_dir(git_dir: &Path) -> PathBuf {
@@ -4929,13 +5299,20 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list"))
             .expect("test operation should succeed");
         assert_eq!(tables.lines().count(), 2);
+        let last = tables
+            .lines()
+            .last()
+            .expect("test operation should succeed");
+        // The rust-written table name follows git's `0x%012x-0x%012x-%08x.ref`
+        // shape (reftable/stack.c::format_name) so `git fsck` accepts it; the
+        // earlier `-sley-<nanos>` token tripped `badReftableTableName`.
         assert!(
-            tables
-                .lines()
-                .last()
-                .expect("test operation should succeed")
-                .contains("sley"),
-            "expected rust-written reftable in tables.list, got {tables}"
+            last.starts_with("0x") && last.ends_with(".ref"),
+            "expected git-format reftable name in tables.list, got {tables}"
+        );
+        assert!(
+            reftable_table_name_is_valid(last),
+            "rust-written reftable name must parse as git's hex format, got {last}"
         );
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
