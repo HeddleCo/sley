@@ -36,7 +36,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut annotation_lines = None;
     let mut omit_empty = false;
     let mut color = false;
+    let config_column = tag_list_column_from_config(&config);
     let mut column = TagListColumn::None;
+    let mut column_explicit = false;
     let mut points_at = None;
     let mut contains = None;
     let mut merged = None;
@@ -103,10 +105,12 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             "--column" => {
                 list = true;
                 column = TagListColumn::Aligned;
+                column_explicit = true;
             }
             "--no-column" | "--column=auto" | "--column=never" | "--column=plain" => {
                 list = true;
                 column = TagListColumn::None;
+                column_explicit = true;
             }
             "--omit-empty" => {
                 list = true;
@@ -308,6 +312,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             value if value.starts_with("--column=") => {
                 list = true;
                 column = parse_tag_list_column(&value["--column=".len()..])?;
+                column_explicit = true;
             }
             value if value.starts_with("--no-column=") => {
                 return tag_option_takes_no_value_error("no-column");
@@ -519,10 +524,17 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 "tag listing currently supports: tag [-l|--list] [--format <format>|--no-format] [--sort <key>|--no-sort] [-i|--ignore-case|--no-ignore-case] [--omit-empty|--no-omit-empty] [--points-at <object-ish>|--no-points-at|--contains <commit-ish>|--no-contains <commit-ish>|--merged [<commit-ish>]|--no-merged [<commit-ish>]] [<pattern>...]".into(),
             ));
         }
-        if column != TagListColumn::None && annotation_lines.is_some() {
+        if column_explicit && column != TagListColumn::None && annotation_lines.is_some() {
             eprintln!("fatal: options '--column' and '-n' cannot be used together");
             return Err(GitError::Exit(128));
         }
+        let column = if column_explicit {
+            column
+        } else if annotation_lines.is_none() {
+            config_column
+        } else {
+            TagListColumn::None
+        };
         let points_at = points_at
             .as_deref()
             .map(|rev| resolve_tag_points_at_filter(&git_dir, format, rev))
@@ -1404,6 +1416,54 @@ fn resolve_versionsort_prereleases(config: &GitConfig) -> Vec<String> {
     suffix.or(prerelease).unwrap_or_default()
 }
 
+fn tag_list_column_from_config(config: &GitConfig) -> TagListColumn {
+    let ui = config
+        .get("column", None, "ui")
+        .map(tag_column_config_tokens)
+        .unwrap_or_default();
+    let tag = config
+        .get("column", None, "tag")
+        .map(tag_column_config_tokens)
+        .unwrap_or_default();
+    if tag.disable || ui.disable {
+        return TagListColumn::None;
+    }
+    if tag.enable || ui.enable {
+        if tag.dense || ui.dense {
+            TagListColumn::Dense
+        } else {
+            TagListColumn::Aligned
+        }
+    } else {
+        TagListColumn::None
+    }
+}
+
+#[derive(Default)]
+struct TagColumnConfig {
+    enable: bool,
+    disable: bool,
+    dense: bool,
+}
+
+fn tag_column_config_tokens(value: &str) -> TagColumnConfig {
+    let mut config = TagColumnConfig::default();
+    for token in value.split(|ch: char| ch == ',' || ch.is_ascii_whitespace()) {
+        match token {
+            "" => {}
+            "never" | "plain" => {
+                config.disable = true;
+                config.enable = false;
+            }
+            "always" | "auto" | "column" | "row" => config.enable = true,
+            "dense" => config.dense = true,
+            "nodense" => config.dense = false,
+            _ => {}
+        }
+    }
+    config
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TagListColumn {
     None,
@@ -1941,30 +2001,49 @@ fn write_tag_list_columns(
     }
     match column {
         TagListColumn::None => {}
-        TagListColumn::Dense => {
-            for (idx, entry) in entries.iter().enumerate() {
-                if idx != 0 {
-                    write!(stdout, "  ")?;
-                }
-                write!(stdout, "{}", entry.name)?;
-            }
-            writeln!(stdout)?;
-        }
-        TagListColumn::Aligned => {
-            let width = entries
+        TagListColumn::Dense | TagListColumn::Aligned => {
+            let terminal_width = env::var("COLUMNS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(80);
+            let cell_width = entries
                 .iter()
                 .map(|entry| entry.name.chars().count())
                 .max()
                 .unwrap_or(0)
                 + 2;
-            for (idx, entry) in entries.iter().enumerate() {
-                if idx + 1 == entries.len() {
-                    write!(stdout, "{}", entry.name)?;
-                } else {
-                    write!(stdout, "{:<width$}", entry.name, width = width)?;
+            let columns = std::cmp::max(1, terminal_width / cell_width);
+            let columns = std::cmp::min(columns, entries.len());
+            let rows = entries.len().div_ceil(columns);
+            let mut widths = vec![cell_width; columns];
+            if column == TagListColumn::Dense {
+                for (col, width) in widths.iter_mut().enumerate() {
+                    let mut max = 0;
+                    for row in 0..rows {
+                        let idx = row * columns + col;
+                        if let Some(entry) = entries.get(idx) {
+                            max = std::cmp::max(max, entry.name.chars().count());
+                        }
+                    }
+                    *width = max + 2;
                 }
             }
-            writeln!(stdout)?;
+            for row in 0..rows {
+                for (col, width) in widths.iter().enumerate().take(columns) {
+                    let idx = row * columns + col;
+                    let Some(entry) = entries.get(idx) else {
+                        continue;
+                    };
+                    let is_last = col + 1 == columns || idx + 1 == entries.len();
+                    if is_last {
+                        write!(stdout, "{}", entry.name)?;
+                    } else {
+                        write!(stdout, "{:<width$}", entry.name, width = *width)?;
+                    }
+                }
+                writeln!(stdout)?;
+            }
         }
     }
     stdout.flush()?;
