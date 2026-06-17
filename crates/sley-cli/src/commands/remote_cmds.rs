@@ -509,7 +509,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     }
 
     if sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
-        return clone_http_repository(CloneHttpOptions {
+        clone_http_repository(CloneHttpOptions {
             repository: &repository,
             destination: &destination,
             destination_display: &destination_display,
@@ -532,10 +532,18 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
-        });
+        })?;
+        return recurse_clone_submodules(
+            &destination,
+            &submodule_active,
+            bare,
+            checkout,
+            depth,
+            quiet,
+        );
     }
     if fetch_source_is_ssh(&repository)? {
-        return clone_ssh_repository(CloneHttpOptions {
+        clone_ssh_repository(CloneHttpOptions {
             repository: &repository,
             destination: &destination,
             destination_display: &destination_display,
@@ -558,10 +566,18 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
-        });
+        })?;
+        return recurse_clone_submodules(
+            &destination,
+            &submodule_active,
+            bare,
+            checkout,
+            depth,
+            quiet,
+        );
     }
     if fetch_source_is_git(&repository)? {
-        return clone_git_repository(CloneHttpOptions {
+        clone_git_repository(CloneHttpOptions {
             repository: &repository,
             destination: &destination,
             destination_display: &destination_display,
@@ -584,7 +600,15 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
-        });
+        })?;
+        return recurse_clone_submodules(
+            &destination,
+            &submodule_active,
+            bare,
+            checkout,
+            depth,
+            quiet,
+        );
     }
 
     let remote_git_dir = ls_remote_git_dir(&repository)?;
@@ -884,7 +908,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if !quiet && local_source {
         eprintln!("done.");
     }
-    Ok(())
+    recurse_clone_submodules(&destination, &submodule_active, bare, checkout, depth, quiet)
 }
 
 struct CloneHttpOptions<'a> {
@@ -1733,6 +1757,52 @@ fn apply_clone_submodule_active(git_dir: &Path, active: &[String]) -> Result<()>
         config_set_value(&mut config, &key, value, true);
     }
     write_repo_config(git_dir, &config)
+}
+
+/// After a `--recurse-submodules` clone, populate the submodules — git's
+/// `clone.c` runs `git submodule update --init --recursive` once the
+/// superproject worktree is checked out. Without this, the submodule worktrees
+/// stay empty (only `submodule.active` is set), so a nested superproject is left
+/// half-cloned. `active` carries the `--recurse-submodules[=<pathspec>]` values
+/// (`.` = all); a `bare`/no-checkout clone has no worktree to populate.
+fn recurse_clone_submodules(
+    destination: &Path,
+    active: &[String],
+    bare: bool,
+    checkout: bool,
+    depth: Option<u32>,
+    quiet: bool,
+) -> Result<()> {
+    if active.is_empty() || bare || !checkout {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command = ProcessCommand::new(exe);
+    command.arg("submodule");
+    if quiet {
+        command.arg("--quiet");
+    }
+    command
+        .arg("update")
+        .arg("--init")
+        .arg("--recursive");
+    if let Some(depth) = depth {
+        command.arg(format!("--depth={depth}"));
+    }
+    // Restrict to the requested pathspecs unless `.` (all) was given.
+    for value in active {
+        if value != "." {
+            command.arg(value);
+        }
+    }
+    let status = command
+        .current_dir(destination)
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if !status.success() {
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
 }
 
 fn apply_clone_sparse_checkout(
