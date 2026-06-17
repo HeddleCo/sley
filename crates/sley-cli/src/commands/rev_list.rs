@@ -909,7 +909,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    let (mut selected_objects, mut omitted_objects) = if objects {
+    let (mut selected_objects, mut omitted_objects, mut missing_objects) = if objects {
         rev_list_objects(
             &db,
             format,
@@ -920,7 +920,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             missing_action,
         )?
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
     if !provided_objects.is_empty() {
         // A provided object is emitted once, as the provided entry.
@@ -1137,34 +1137,41 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         }
         }
     }
-    for record in boundary_records {
-        write_rev_list_boundary_record(
-            &record,
-            RevListBoundaryOptions {
-                pretty: &pretty,
-                abbrev_commit,
-                abbrev_len,
-                timestamp,
-                parents,
-                decorations: &decorations,
-                date_mode: &date_mode,
-                mailmap: &mailmap,
-                use_mailmap,
-            },
-        )?;
-    }
-    for object in selected_tag_objects {
-        write_rev_list_object_line(&object, object_names, nul_terminated)?;
-    }
-    for object in &provided_objects {
-        write_rev_list_object_line(object, object_names, nul_terminated)?;
-    }
-    for object in selected_objects {
-        write_rev_list_object_line(&object, object_names, nul_terminated)?;
+    if !quiet {
+        for record in boundary_records {
+            write_rev_list_boundary_record(
+                &record,
+                RevListBoundaryOptions {
+                    pretty: &pretty,
+                    abbrev_commit,
+                    abbrev_len,
+                    timestamp,
+                    parents,
+                    decorations: &decorations,
+                    date_mode: &date_mode,
+                    mailmap: &mailmap,
+                    use_mailmap,
+                },
+            )?;
+        }
+        for object in selected_tag_objects {
+            write_rev_list_object_line(&object, object_names, nul_terminated)?;
+        }
+        for object in &provided_objects {
+            write_rev_list_object_line(object, object_names, nul_terminated)?;
+        }
+        for object in selected_objects {
+            write_rev_list_object_line(&object, object_names, nul_terminated)?;
+        }
     }
     if filter_print_omitted {
         for object in omitted_objects.drain(..) {
             write_rev_list_omitted_object_line(&object, nul_terminated)?;
+        }
+    }
+    if missing_action == RevListMissingAction::Print {
+        for object in missing_objects.drain(..) {
+            write_rev_list_missing_object_line(&object, nul_terminated)?;
         }
     }
     io::stdout().flush()?;
@@ -1761,9 +1768,9 @@ fn rev_list_objects(
     filter: &RevListObjectFilter,
     collect_omitted: bool,
     missing_action: RevListMissingAction,
-) -> Result<(Vec<RevListObject>, Vec<RevListObject>)> {
+) -> Result<(Vec<RevListObject>, Vec<RevListObject>, Vec<RevListObject>)> {
     if !collect_omitted && filter.tree_depth_limit() == Some(0) {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let mut seen = HashSet::new();
     for oid in excluded {
@@ -1793,7 +1800,7 @@ fn rev_list_objects(
             0,
         )?;
     }
-    Ok((state.objects, state.omitted))
+    Ok((state.objects, state.omitted, state.missing))
 }
 
 struct RevListObjectWalk<'a> {
@@ -1808,8 +1815,10 @@ struct RevListObjectWalk<'a> {
 struct RevListObjectState {
     objects: Vec<RevListObject>,
     omitted: Vec<RevListObject>,
+    missing: Vec<RevListObject>,
     emitted_oids: HashSet<ObjectId>,
     omitted_oids: HashSet<ObjectId>,
+    missing_oids: HashSet<ObjectId>,
 }
 
 fn rev_list_mark_tree_objects(
@@ -1899,8 +1908,18 @@ fn rev_list_collect_tree_objects(
             if !seen.insert(entry.oid) {
                 continue;
             }
-            let size = if rev_list_filter_needs_blob_size(walk.filter) && entry_type == ObjectType::Blob {
-                Some(walk.db.read_object(&entry.oid)?.body.len())
+            let size = if entry_type == ObjectType::Blob
+                && (rev_list_filter_needs_blob_size(walk.filter)
+                    || walk.missing_action != RevListMissingAction::AllowAny)
+            {
+                let object = match walk.db.read_object(&entry.oid) {
+                    Ok(object) => object,
+                    Err(err) => {
+                        rev_list_handle_missing_object(walk, &entry.oid, state, err)?;
+                        continue;
+                    }
+                };
+                Some(object.body.len())
             } else {
                 None
             };
@@ -1996,8 +2015,8 @@ fn rev_list_handle_missing_object(
         RevListMissingAction::Error => Err(err),
         RevListMissingAction::AllowAny => Ok(()),
         RevListMissingAction::Print => {
-            if state.omitted_oids.insert(*oid) {
-                state.omitted.push(RevListObject {
+            if state.missing_oids.insert(*oid) {
+                state.missing.push(RevListObject {
                     oid: *oid,
                     name: Vec::new(),
                 });
@@ -2048,6 +2067,16 @@ fn write_rev_list_omitted_object_line(
 ) -> Result<()> {
     let mut stdout = io::stdout();
     write!(stdout, "~{}", object.oid)?;
+    stdout.write_all(if nul_terminated { b"\0" } else { b"\n" })?;
+    Ok(())
+}
+
+fn write_rev_list_missing_object_line(
+    object: &RevListObject,
+    nul_terminated: bool,
+) -> Result<()> {
+    let mut stdout = io::stdout();
+    write!(stdout, "?{}", object.oid)?;
     stdout.write_all(if nul_terminated { b"\0" } else { b"\n" })?;
     Ok(())
 }
