@@ -1024,6 +1024,14 @@ fn parse_cruft_expiration(spec: &str) -> Result<Option<u32>> {
     })
 }
 
+/// True when `<section>.<key>` is set to a "never"/"false" timestamp sentinel.
+fn is_config_never(config: &GitConfig, section: &str, key: &str) -> bool {
+    matches!(
+        config.get(section, None, key),
+        Some("never") | Some("false")
+    )
+}
+
 /// `git repack --cruft [--cruft-expiration=<t>] [--expire-to=<dir>] [-d]`.
 #[allow(clippy::too_many_arguments)]
 fn cmd_repack_cruft(
@@ -1230,6 +1238,24 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
                 .to_string(),
         ),
     };
+
+    // gc_before_repack runs `reflog expire --all` unless BOTH gc.reflogExpire
+    // and gc.reflogExpireUnreachable are "never" (builtin/gc.c gc_config). The
+    // expire drops reflog entries pointing at unreachable history, which is what
+    // turns once-referenced commits into cruft for the repack below.
+    let reflog_expire_never = is_config_never(&config, "gc", "reflogExpire");
+    let reflog_unreachable_never = is_config_never(&config, "gc", "reflogExpireUnreachable");
+    if !(reflog_expire_never && reflog_unreachable_never) {
+        let mut expire_args = vec!["expire".to_string(), "--all".to_string()];
+        if reflog_expire_never {
+            expire_args.push("--expire=never".to_string());
+        }
+        if reflog_unreachable_never {
+            expire_args.push("--expire-unreachable=never".to_string());
+        }
+        // Best-effort: a reflog-expire failure must not abort the whole gc.
+        let _ = commands::refs::cmd_reflog(&expire_args);
+    }
 
     let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
 

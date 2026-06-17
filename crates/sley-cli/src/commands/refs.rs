@@ -553,8 +553,13 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let mut targets = BTreeSet::new();
+    // References discovered via `--all` silently skip an empty/missing reflog
+    // (git's `reflog expire --all` only walks reflogs that exist); explicit
+    // references still error on a missing reflog.
+    let mut all_discovered: BTreeSet<String> = BTreeSet::new();
     if options.all {
-        collect_repository_reflog_names(&git_dir, &mut targets)?;
+        collect_repository_reflog_names(&git_dir, &mut all_discovered)?;
+        targets.extend(all_discovered.iter().cloned());
     }
     for reference in refs {
         targets.insert(reflog_reference_name(Some(&reference))?);
@@ -562,6 +567,10 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut exit_code = 0;
     for reference in targets {
+        // A `--all`-discovered reflog that is empty is not an error.
+        if all_discovered.contains(&reference) && store.read_reflog(&reference)?.is_empty() {
+            continue;
+        }
         if let Err(GitError::Exit(code)) =
             expire_reflog_entries(&store, &db, &git_dir, format, &reference, options)
         {
