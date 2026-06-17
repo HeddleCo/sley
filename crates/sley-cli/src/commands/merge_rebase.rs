@@ -1976,6 +1976,14 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         options.favor,
     )?;
 
+    // git's pre-merge `verify_uptodate` (unpack-trees): a real 3-way merge
+    // requires a clean starting state. Refuse — without writing any MERGE_HEAD —
+    // if the index has staged changes vs HEAD, or if the worktree has local
+    // modifications to a path the merge would overwrite. Untouched local
+    // modifications are allowed (and preserved). This is the guard behind the
+    // t7611 "merge ... fails" cases.
+    verify_merge_uptodate(&worktree_root, &git_dir, format, &results, &ours_map)?;
+
     let message = build_merge_message(
         &refs,
         &git_dir,
@@ -2008,16 +2016,26 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         let merged_tree = sley_worktree::write_tree_from_index(&git_dir, format)?;
 
         // Materialize the merged result into the worktree (shared by the
-        // --squash and --no-commit early-exit paths below).
+        // --squash and --no-commit early-exit paths below). git's unpack-trees
+        // only touches paths the merge CHANGED relative to HEAD; a path whose
+        // merged result equals HEAD's entry is left exactly as-is, so a purely
+        // local (unstaged) modification to an untouched file is preserved.
         let write_merged_worktree = || -> Result<()> {
             for (path, result) in &results {
                 if let MergePathResult::Resolved(value) = result {
                     match value {
-                        Some((mode, oid)) => {
+                        Some(entry @ (mode, oid)) => {
+                            if ours_map.get(path) == Some(entry) {
+                                continue;
+                            }
                             let content = merge_read_blob(&db, oid)?;
                             merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                         }
-                        None => merge_remove_worktree_file(&worktree_root, path)?,
+                        None => {
+                            if ours_map.contains_key(path) {
+                                merge_remove_worktree_file(&worktree_root, path)?;
+                            }
+                        }
                     }
                 }
             }
@@ -2224,7 +2242,73 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
     }
 }
 
+/// git's pre-merge `verify_uptodate` guard. Returns an error (exit 2, matching
+/// git's `ret = 2` for "local changes would be overwritten") when the worktree
+/// is not a clean base for a real 3-way merge:
+///   * any path is staged differently from HEAD (`index` status non-blank), or
+///   * a path the merge would change relative to HEAD has an unstaged worktree
+///     modification.
+/// Purely-local modifications to paths the merge leaves alone are permitted.
+fn verify_merge_uptodate(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    results: &MergePathResults,
+    ours_map: &MergeTreeMap,
+) -> Result<()> {
+    // Paths whose merged result differs from HEAD (i.e. the merge touches them).
+    let mut changed: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for (path, result) in results {
+        let differs = match result {
+            MergePathResult::Resolved(Some(entry)) => ours_map.get(path) != Some(entry),
+            MergePathResult::Resolved(None) => ours_map.contains_key(path),
+            MergePathResult::Conflict { .. } => true,
+        };
+        if differs {
+            changed.insert(path.clone());
+        }
+    }
+
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
+    for entry in &status {
+        // A staged change anywhere (index column non-blank, not untracked/ignored)
+        // makes the index an unclean merge base.
+        if entry.index != b' ' && entry.index != b'?' && entry.index != b'!' {
+            eprintln!(
+                "error: Your local changes to the following files would be overwritten by merge:\n  {}",
+                String::from_utf8_lossy(&entry.path)
+            );
+            eprintln!("Please commit your changes or stash them before you merge.");
+            eprintln!("Aborting");
+            return Err(GitError::Exit(2));
+        }
+        // An unstaged worktree modification to a path the merge would change.
+        if entry.worktree != b' '
+            && entry.worktree != b'?'
+            && entry.worktree != b'!'
+            && changed.contains(&entry.path)
+        {
+            eprintln!(
+                "error: Your local changes to the following files would be overwritten by merge:\n  {}",
+                String::from_utf8_lossy(&entry.path)
+            );
+            eprintln!("Please commit your changes or stash them before you merge.");
+            eprintln!("Aborting");
+            return Err(GitError::Exit(2));
+        }
+    }
+    Ok(())
+}
+
 // ===== pull / rebase / merge-continue =====
+/// `git merge --abort` — implemented as git's `git reset --merge` (builtin/
+/// merge.c invokes `cmd_reset` with `--merge`). HEAD did not move during a
+/// `--no-commit` / conflicted merge, so this resets the index and worktree back
+/// to *HEAD* (not ORIG_HEAD, which can be stale from an earlier completed
+/// merge), restoring every path the merge staged or left conflicted while
+/// preserving purely-local worktree modifications to untouched paths
+/// (`oneway_merge` with `update=1`). Finally it clears the in-progress merge
+/// bookkeeping.
 pub(crate) fn cmd_merge_abort() -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -2236,35 +2320,81 @@ pub(crate) fn cmd_merge_abort() -> Result<()> {
 
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let orig_head_path = git_dir.join("ORIG_HEAD");
-    let target_oid = if orig_head_path.is_file() {
-        let contents = fs::read_to_string(&orig_head_path)?;
-        ObjectId::from_hex(format, contents.trim()).map_err(|_| {
-            GitError::InvalidObject(format!("invalid ORIG_HEAD value {}", contents.trim()))
-        })?
-    } else {
-        resolve_revision(&git_dir, format, "HEAD")?
-    };
-
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let old_head = resolve_revision(&git_dir, format, "HEAD")?;
-    let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &worktree_root,
-        &git_dir,
-        format,
-        &target_commit,
-    )?;
-    update_reset_head_ref(
-        &git_dir,
-        format,
-        old_head,
-        target_commit,
-        "HEAD",
-        commit_identity_from_env("COMMITTER")?,
-    )?;
-
+    reset_merge_to_head(&git_dir, &worktree_root, format)?;
     clear_in_progress_merge_state(&git_dir);
+    Ok(())
+}
+
+/// `git reset --merge` against the current HEAD: rebuild the index from HEAD's
+/// tree (stage 0), restore HEAD's worktree content for every path the
+/// in-progress merge changed (a conflicted stage>0 entry, a stage-0 entry that
+/// differs from HEAD, or a HEAD path the merge dropped), and leave all other
+/// worktree paths — including purely-local modifications — untouched.
+fn reset_merge_to_head(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let head_oid = resolve_revision(git_dir, format, "HEAD")?;
+    let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+    let head_map = stash_tree_entry_map(&db, format, &head_tree)?;
+
+    // The set of paths the merge touched relative to HEAD: anything in the
+    // current index that is not a clean stage-0 match for HEAD's entry.
+    let index = read_worktree_index(git_dir, format)?;
+    let mut touched: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for entry in &index.entries {
+        let path = entry.path.to_vec();
+        let stage = index_entry_stage(entry);
+        if stage > 0 {
+            touched.insert(path);
+            continue;
+        }
+        match head_map.get(&path) {
+            Some((mode, oid)) if *mode == entry.mode && *oid == entry.oid => {}
+            _ => {
+                touched.insert(path);
+            }
+        }
+    }
+    // HEAD paths the merge dropped from the index also need restoring.
+    let index_paths: BTreeSet<Vec<u8>> =
+        index.entries.iter().map(|e| e.path.to_vec()).collect();
+    for path in head_map.keys() {
+        if !index_paths.contains(path) {
+            touched.insert(path.clone());
+        }
+    }
+
+    // Restore HEAD's content for the touched paths only.
+    for path in &touched {
+        match head_map.get(path) {
+            Some((mode, oid)) => {
+                let content = merge_read_blob(&db, oid)?;
+                merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+            }
+            None => merge_remove_worktree_file(worktree_root, path)?,
+        }
+    }
+
+    // Rewrite the index as HEAD's tree (stage 0).
+    let mut entries: Vec<_> = head_map
+        .iter()
+        .map(|(path, (mode, oid))| merge_index_entry(path, *mode, *oid, 0))
+        .collect();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        sley_worktree::repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
     Ok(())
 }
 
