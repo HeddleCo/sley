@@ -50,6 +50,8 @@ struct MergeTreeOptions {
     messages: Option<bool>,
     /// Suppress all output and exit as early as possible.
     quiet: bool,
+    /// Read a batch of merge requests from stdin.
+    stdin: bool,
     /// Allow merging histories with no common ancestor.
     allow_unrelated_histories: bool,
     /// An explicit merge base (`--merge-base=<tree-ish>`); when set, the two
@@ -69,6 +71,7 @@ impl Default for MergeTreeOptions {
             name_only: false,
             messages: None,
             quiet: false,
+            stdin: false,
             allow_unrelated_histories: false,
             merge_base: None,
             strategy_options: Vec::new(),
@@ -109,6 +112,9 @@ fn usage_error() -> GitError {
 /// `git merge-tree` entry point.
 pub(crate) fn cmd_merge_tree(args: &[String]) -> Result<()> {
     let options = parse_merge_tree_args(args)?;
+    if options.stdin {
+        return run_stdin_merges(&options);
+    }
     let mode = resolve_merge_tree_mode(&options)?;
     match mode {
         MergeTreeMode::RealMerge => run_real_merge(&options),
@@ -141,11 +147,7 @@ fn parse_merge_tree_args(args: &[String]) -> Result<MergeTreeOptions> {
             "--no-quiet" => options.quiet = false,
             "--allow-unrelated-histories" => options.allow_unrelated_histories = true,
             "--no-allow-unrelated-histories" => options.allow_unrelated_histories = false,
-            "--stdin" => {
-                return Err(GitError::Unsupported(
-                    "merge-tree --stdin is not supported yet".into(),
-                ));
-            }
+            "--stdin" => options.stdin = true,
             "--merge-base" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("merge-tree --merge-base requires a value".into())
@@ -171,6 +173,11 @@ fn parse_merge_tree_args(args: &[String]) -> Result<MergeTreeOptions> {
                 options.strategy_options.push(value[2..].to_string());
             }
             value if value.starts_with('-') && value != "-" => {
+                if let Some(name) = value.strip_prefix("--") {
+                    eprintln!("error: unknown option `{name}'");
+                } else {
+                    eprintln!("error: unknown switch `{}`", &value[1..]);
+                }
                 return Err(usage_error());
             }
             value => options.positionals.push(value.to_string()),
@@ -182,6 +189,12 @@ fn parse_merge_tree_args(args: &[String]) -> Result<MergeTreeOptions> {
 /// Resolve the effective mode, applying upstream's inference rules and rejecting
 /// invalid argument counts for the selected mode.
 fn resolve_merge_tree_mode(options: &MergeTreeOptions) -> Result<MergeTreeMode> {
+    if options.stdin {
+        if !options.positionals.is_empty() || options.merge_base.is_some() {
+            return Err(usage_error());
+        }
+        return Ok(MergeTreeMode::RealMerge);
+    }
     match options.mode {
         MergeTreeMode::RealMerge => {
             // `--merge-base` provides the base directly, so exactly two branches
@@ -260,6 +273,25 @@ struct MergeOutcome {
 }
 
 fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
+    let outcome = compute_real_merge(options)?;
+
+    if options.quiet {
+        return if outcome.clean {
+            Ok(())
+        } else {
+            Err(GitError::Exit(1))
+        };
+    }
+
+    emit_real_merge(options, &outcome)?;
+    if outcome.clean {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
+}
+
+fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -302,6 +334,7 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     };
 
     let strategy = parse_strategy_favor(&options.strategy_options)?;
+    let detect_renames = merge_tree_detect_renames(&git_dir);
     let mut write_db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let merge = sley_diff_merge::merge_trees(
         &mut write_db,
@@ -314,32 +347,100 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
             theirs_label: branch2,
             ancestor_label: "merged common ancestors",
             favor: strategy,
-            // merge-tree --write-tree is a non-recursive single-base merge; the
-            // historical write-tree path is purely path-keyed, so renames are
-            // off here (stage-a wires rename-awareness through the porcelain
-            // merge path; merge-tree parity is preserved byte-for-byte).
-            detect_renames: false,
+            detect_renames,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            directory_renames: sley_diff_merge::DirectoryRenames::False,
+            directory_renames: sley_diff_merge::DirectoryRenames::Conflict,
             style: sley_diff_merge::ConflictStyle::Merge,
         },
     )?;
-    let outcome = render_merge_outcome(&merge, branch1, branch2);
+    Ok(render_merge_outcome(&merge, branch1, branch2))
+}
 
-    if options.quiet {
-        return if outcome.clean {
-            Ok(())
-        } else {
-            Err(GitError::Exit(1))
-        };
+fn merge_tree_detect_renames(git_dir: &Path) -> bool {
+    let params = effective_config_parameters_env();
+    let Ok(config) = sley_config::read_repo_config(git_dir, params.as_deref()) else {
+        return true;
+    };
+    config.get_bool("diff", None, "renames") != Some(false)
+}
+
+fn run_stdin_merges(options: &MergeTreeOptions) -> Result<()> {
+    if options.merge_base.is_some() {
+        eprintln!("fatal: --merge-base and --stdin cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if !options.positionals.is_empty() {
+        return Err(usage_error());
     }
 
-    emit_real_merge(options, &outcome)?;
-    if outcome.clean {
-        Ok(())
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    let records: Vec<&[u8]> = if options.nul {
+        input.split(|b| *b == b'\0').collect()
     } else {
-        Err(GitError::Exit(1))
+        input.split(|b| *b == b'\n').collect()
+    };
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for record in records {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(mut batch) = stdin_record_options(options, record)? else {
+            continue;
+        };
+        batch.mode = MergeTreeMode::RealMerge;
+        batch.nul = true;
+        batch.quiet = false;
+        batch.stdin = false;
+
+        let outcome = compute_real_merge(&batch)?;
+        out.write_all(if outcome.clean { b"1\0" } else { b"0\0" })?;
+        emit_real_merge_to(&mut out, &batch, &outcome)?;
+        out.write_all(b"\0")?;
     }
+    out.flush()?;
+    Ok(())
+}
+
+fn stdin_record_options(options: &MergeTreeOptions, record: &[u8]) -> Result<Option<MergeTreeOptions>> {
+    let text = std::str::from_utf8(record)
+        .map_err(|_| GitError::Command("merge-tree --stdin input is not UTF-8".into()))?;
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let mut batch = MergeTreeOptions {
+        mode: MergeTreeMode::RealMerge,
+        nul: true,
+        name_only: options.name_only,
+        messages: options.messages,
+        quiet: false,
+        stdin: false,
+        allow_unrelated_histories: options.allow_unrelated_histories,
+        merge_base: None,
+        strategy_options: options.strategy_options.clone(),
+        positionals: Vec::new(),
+    };
+
+    match tokens.as_slice() {
+        [left, right] => {
+            batch.positionals.push((*left).to_string());
+            batch.positionals.push((*right).to_string());
+        }
+        [base, "--", left, right] => {
+            batch.merge_base = Some((*base).to_string());
+            batch.positionals.push((*left).to_string());
+            batch.positionals.push((*right).to_string());
+        }
+        _ => {
+            eprintln!("fatal: malformed input line: {}", String::from_utf8_lossy(record));
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(Some(batch))
 }
 
 /// Interpret recognised `-X` strategy options. Only the conflict-resolution
@@ -612,15 +713,23 @@ fn push_conflicted_stages(
 fn emit_real_merge(options: &MergeTreeOptions, outcome: &MergeOutcome) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    emit_real_merge_to(&mut out, options, outcome)?;
+    out.flush()?;
+    Ok(())
+}
 
+fn emit_real_merge_to(
+    out: &mut impl Write,
+    options: &MergeTreeOptions,
+    outcome: &MergeOutcome,
+) -> Result<()> {
     let oid_terminator: &[u8] = if options.nul { b"\0" } else { b"\n" };
     out.write_all(outcome.tree.to_hex().as_bytes())?;
     out.write_all(oid_terminator)?;
 
     if outcome.clean {
         // Conflicted-file-info section is empty on a clean merge.
-        emit_messages(&mut out, options, outcome, /* clean */ true)?;
-        out.flush()?;
+        emit_messages(out, options, outcome, /* clean */ true)?;
         return Ok(());
     }
 
@@ -629,7 +738,7 @@ fn emit_real_merge(options: &MergeTreeOptions, outcome: &MergeOutcome) -> Result
         let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
         for entry in &outcome.conflicted {
             if seen.insert(entry.path.as_slice()) {
-                write_conflicted_path(&mut out, options.nul, &entry.path)?;
+                write_conflicted_path(out, options.nul, &entry.path)?;
             }
         }
     } else {
@@ -642,12 +751,11 @@ fn emit_real_merge(options: &MergeTreeOptions, outcome: &MergeOutcome) -> Result
                 entry.stage
             );
             out.write_all(prefix.as_bytes())?;
-            write_conflicted_path(&mut out, options.nul, &entry.path)?;
+            write_conflicted_path(out, options.nul, &entry.path)?;
         }
     }
 
-    emit_messages(&mut out, options, outcome, /* clean */ false)?;
-    out.flush()?;
+    emit_messages(out, options, outcome, /* clean */ false)?;
     Ok(())
 }
 
