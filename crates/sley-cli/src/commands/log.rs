@@ -248,17 +248,110 @@ fn emit_compiled_log_format_with_notes(
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut start = 0usize;
-    for (idx, token) in compiled.tokens.iter().enumerate() {
-        if !matches!(token, FormatToken::NoteName) {
-            continue;
-        }
-        emit_compiled_log_format(record, compiled, context, out, start..idx)?;
-        let notes = render_pretty_notes(git_dir, format, store, display_refs, &record.oid)?;
-        out.extend_from_slice(&notes);
-        start = idx + 1;
+    let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
+    let (committer_name, committer_email) = commit_identity_name_email(&record.commit.committer);
+    let author_timestamp = commit_identity_timestamp(&record.commit.author);
+    let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
+
+    let mut wrap_width = 0i32;
+    let mut wrap_indent1 = 0i32;
+    let mut wrap_indent2 = 0i32;
+    let mut wrap_start = out.len();
+    let mut resolver = LogFormatNoteResolver {
+        git_dir,
+        format,
+        store,
+        display_refs,
+        record,
+        context,
+        author_name: &author_name,
+        author_email: &author_email,
+        committer_name: &committer_name,
+        committer_email: &committer_email,
+        author_timestamp: &author_timestamp,
+        committer_timestamp: &committer_timestamp,
+    };
+    let segment_range = compiled.segment_range_for_tokens(0..compiled.tokens.len());
+    compiled.expand.append_range_to_with_atom(
+        out,
+        segment_range,
+        &mut resolver,
+        |out, token, value| {
+            if let FormatToken::Wrap(spec) = token {
+                let new_w = spec.width as i32;
+                let new_i1 = spec.indent1 as i32;
+                let new_i2 = spec.indent2 as i32;
+                if (new_w, new_i1, new_i2) != (wrap_width, wrap_indent1, wrap_indent2) {
+                    if wrap_start < out.len() {
+                        log_rewrap(out, wrap_start, wrap_width, wrap_indent1, wrap_indent2);
+                    }
+                    wrap_start = out.len();
+                    wrap_width = new_w;
+                    wrap_indent1 = new_i1;
+                    wrap_indent2 = new_i2;
+                }
+            } else {
+                out.extend_from_slice(value);
+            }
+            Ok(())
+        },
+    )?;
+    if (wrap_width, wrap_indent1, wrap_indent2) != (0, 0, 0) && wrap_start < out.len() {
+        log_rewrap(out, wrap_start, wrap_width, wrap_indent1, wrap_indent2);
     }
-    emit_compiled_log_format(record, compiled, context, out, start..compiled.tokens.len())
+    Ok(())
+}
+
+struct LogFormatNoteResolver<'a, 'b> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    store: &'a FileRefStore,
+    display_refs: &'a [String],
+    record: &'a sley_rev::CommitRecord,
+    context: &'a LogFormatContext<'b>,
+    author_name: &'a str,
+    author_email: &'a str,
+    committer_name: &'a str,
+    committer_email: &'a str,
+    author_timestamp: &'a str,
+    committer_timestamp: &'a str,
+}
+
+impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_, '_> {
+    fn resolve_atom(&mut self, out: &mut Vec<u8>, atom: &FormatToken) -> Result<()> {
+        if matches!(atom, FormatToken::NoteName)
+            && matches!(self.context.dialect, LogFormatDialect::Log)
+        {
+            let notes = render_pretty_notes(
+                self.git_dir,
+                self.format,
+                self.store,
+                self.display_refs,
+                &self.record.oid,
+            )?;
+            out.extend_from_slice(&notes);
+            return Ok(());
+        }
+        emit_log_one_token(
+            atom,
+            self.record,
+            self.context,
+            out,
+            self.author_name,
+            self.author_email,
+            self.committer_name,
+            self.committer_email,
+            self.author_timestamp,
+            self.committer_timestamp,
+        )
+    }
+
+    fn is_modifier_atom(&self, atom: &FormatToken) -> bool {
+        matches!(
+            atom,
+            FormatToken::ColorParen(_) | FormatToken::ColorName(_) | FormatToken::ColorAuto
+        )
+    }
 }
 
 pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
@@ -321,6 +414,13 @@ fn log_plain_oneline_format(compiled: &CompiledLogFormat) -> bool {
             FormatToken::Subject
         ] if space == " "
     )
+}
+
+fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
+    compiled
+        .tokens
+        .iter()
+        .any(|token| matches!(token, FormatToken::NoteName))
 }
 
 fn log_source_label<'a>(
@@ -2032,7 +2132,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && pathspecs.is_empty()
         && !full_history
         && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
-            if compiled.is_metadata_emitable() && compiled.uses_oid() && !compiled.uses_decorations())
+            if compiled.is_metadata_emitable()
+                && compiled.uses_oid()
+                && !compiled.uses_decorations()
+                && !compiled_format_uses_notes(compiled))
         && decoration == LogDecorationMode::Off
         && !show_children
         && excluded.is_empty()
@@ -2130,7 +2233,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && pathspecs.is_empty()
         && !full_history
         && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
-            if log_limited_commit_format_supported(compiled))
+            if log_limited_commit_format_supported(compiled) && !compiled_format_uses_notes(compiled))
         && decoration == LogDecorationMode::Off
         && !show_children
         && excluded.is_empty()
@@ -2490,7 +2593,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // overrides. The empty list short-circuits all per-commit note lookups.
     let notes_store = FileRefStore::new(&git_dir, format);
     let pretty_format_uses_notes =
-        matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.tokens.iter().any(|token| matches!(token, FormatToken::NoteName)));
+        matches!(&output, LogOutput::Compiled { compiled, .. } if compiled_format_uses_notes(compiled));
     let notes_default_format =
         matches!(output, LogOutput::Default(LogDefaultKind::Medium)) || pretty_format_uses_notes;
     let display_notes_refs = if notes_display.is_active(notes_default_format) {
@@ -2547,12 +2650,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         use_mailmap,
                     };
                     let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_compiled_log_format(
+                    emit_compiled_log_format_with_notes(
+                        &git_dir,
+                        format,
+                        &notes_store,
+                        &display_notes_refs,
                         record,
                         compiled,
                         &format_context,
                         &mut msg,
-                        0..compiled.tokens.len(),
                     )?;
                     if let Some(log_diff) = &log_diff {
                         let mut padding = String::new();
@@ -2822,9 +2928,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     let block = log_diff.render(record, log_prefix_display_width(prefix))?;
                     if !block.is_empty() {
                         let mut stdout = io::stdout();
-                        if !final_newline {
-                            stdout.write_all(term)?;
-                        }
+                        stdout.write_all(b"\n")?;
                         if prefix.is_empty() {
                             stdout.write_all(&block)?;
                         } else {
