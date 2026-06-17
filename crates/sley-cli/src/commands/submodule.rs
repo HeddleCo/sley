@@ -117,6 +117,7 @@ struct SubmoduleAddOptions {
 
 struct SubmoduleUpdateOptions<'a> {
     init: bool,
+    recursive: bool,
     quiet: bool,
     paths: Vec<&'a str>,
 }
@@ -429,8 +430,39 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
                 );
             }
         }
+        // `submodule update --recursive`: after populating + checking out this
+        // submodule, recurse into ITS submodules with `update --init --recursive`
+        // (git's RECURSE_SUBMODULES_ON path). Done in the submodule's worktree,
+        // which is where its own `.gitmodules` + `.git/config` live.
+        if options.recursive {
+            run_submodule_update_recursive(&path, options.quiet)?;
+        }
     }
     Ok(())
+}
+
+/// Recurse `submodule update --init --recursive` into the submodule rooted at
+/// `submodule_root`. Mirrors git's `update --recursive` step that, after a
+/// submodule is checked out, runs the same update on the submodule's own
+/// submodules. Runs in `submodule_root` (where the nested `.gitmodules` lives).
+fn run_submodule_update_recursive(submodule_root: &Path, quiet: bool) -> Result<()> {
+    // The nested submodule may have no submodules of its own; that's a no-op.
+    let nested = read_submodule_configs(submodule_root)?;
+    if nested.is_empty() {
+        return Ok(());
+    }
+    let previous = env::current_dir()?;
+    env::set_current_dir(submodule_root)?;
+    let mut args = Vec::new();
+    if quiet {
+        args.push("-q".to_string());
+    }
+    args.push("--init".to_string());
+    args.push("--recursive".to_string());
+    let result = cmd_submodule_update(&args, quiet);
+    // Always restore the cwd, even on error, so the outer loop stays anchored.
+    env::set_current_dir(previous)?;
+    result
 }
 
 fn parse_submodule_update_options(
@@ -438,6 +470,7 @@ fn parse_submodule_update_options(
     mut quiet: bool,
 ) -> Result<SubmoduleUpdateOptions<'_>> {
     let mut init = false;
+    let mut recursive = false;
     let mut paths = Vec::new();
     let mut positional_only = false;
     let mut index = 0;
@@ -452,6 +485,7 @@ fn parse_submodule_update_options(
             "--" => positional_only = true,
             "--quiet" | "-q" => quiet = true,
             "--init" => init = true,
+            "--recursive" => recursive = true,
             // `-N/--no-fetch` skips the fetch step of an update; the native
             // implementation performs no separate fetch, so it is a no-op
             // (NOT "skip checkout" — the checkout below still happens).
@@ -459,7 +493,6 @@ fn parse_submodule_update_options(
             "--checkout"
             | "--merge"
             | "--rebase"
-            | "--recursive"
             | "--recommend-shallow"
             | "--no-recommend-shallow"
             | "--single-branch"
@@ -486,7 +519,12 @@ fn parse_submodule_update_options(
         }
         index += 1;
     }
-    Ok(SubmoduleUpdateOptions { init, quiet, paths })
+    Ok(SubmoduleUpdateOptions {
+        init,
+        recursive,
+        quiet,
+        paths,
+    })
 }
 
 fn submodule_usage_text() -> &'static str {
@@ -1434,7 +1472,12 @@ fn filter_submodule_configs<'a>(
     paths: &[&str],
 ) -> Result<Vec<&'a SubmoduleConfigEntry>> {
     if paths.is_empty() {
-        return Ok(submodules.iter().collect());
+        // git's `module_list_compute` returns submodules sorted by path, not in
+        // .gitmodules declaration order; foreach/update/status all depend on
+        // that ordering (e.g. `nested1` before `sub1`).
+        let mut selected = submodules.iter().collect::<Vec<_>>();
+        selected.sort_by(|left, right| left.path.cmp(&right.path));
+        return Ok(selected);
     }
     let mut selected = Vec::new();
     for path in paths {
@@ -2322,6 +2365,15 @@ fn submodule_status_suffix(git_dir: Option<&Path>, oid: &ObjectId) -> Result<Str
         {
             return Ok(format!(" ({})", display_submodule_ref(&reference.name)));
         }
+    }
+    // git's `compute_rev_name` ends with `git describe --all --always <oid>`,
+    // whose `--always` fallback prints the abbreviated commit hash for an oid
+    // no ref tip resolves to (a detached commit, e.g. an ancestor of the
+    // submodule's branch). Reproduce that bare-hash form so status never shows
+    // an empty suffix when the oid is a real commit.
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if db.read_object(oid).is_ok() {
+        return Ok(format!(" ({})", format_log_abbrev_oid(oid)));
     }
     Ok(String::new())
 }
