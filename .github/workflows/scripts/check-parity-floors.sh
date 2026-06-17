@@ -378,9 +378,13 @@ declare -A FLOOR=(
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
-    [t6300-for-each-ref.sh]=378
+    [t6300-for-each-ref.sh]=382
+    # codex-wave-4 (2026-06-17): for-each-ref atoms (sley-ref-filter) t6302 enroll@17.
+    [t6302-for-each-ref-filter.sh]=17
+    # codex-wave-4: merge-tree --write-tree t4301 enroll@18; blame siblings t8001 99->110/t8002 117->128/t8012 98->109; sparse t1091 40->45.
+    [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
-    [t7004-tag.sh]=189
+    [t7004-tag.sh]=190
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
@@ -393,7 +397,7 @@ declare -A FLOOR=(
     [t2107-update-index-basic.sh]=10
     [t7810-grep.sh]=230
     [t3301-notes.sh]=144
-    [t1461-refs-list.sh]=378
+    [t1461-refs-list.sh]=382
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
     # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).
@@ -461,9 +465,9 @@ declare -A FLOOR=(
     # output + -L /regex/ ranges + -b/--first-parent/^rev/abbrev parity): NEW floors.
     # t8002 54->117, t8001 44->99, t8012 44->98. Residual: :funcname ranges,
     # --contents working-tree overlay, --progress, --color-lines/--color-by-age.
-    [t8002-blame.sh]=117
-    [t8001-annotate.sh]=99
-    [t8012-blame-colors.sh]=98
+    [t8002-blame.sh]=128
+    [t8001-annotate.sh]=110
+    [t8012-blame-colors.sh]=109
     # t3903-stash FLAKY: cell #46 "stash symlink to file (stage rm)" oscillates 82/83
     # (symlink<->file type-change race, independent of any wave — flips on a pristine
     # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
@@ -522,7 +526,7 @@ declare -A FLOOR=(
     [t3437-rebase-fixup-options.sh]=7
     [t1404-update-ref-errors.sh]=38
     [t1416-ref-transaction-hooks.sh]=7
-    [t1091-sparse-checkout-builtin.sh]=40
+    [t1091-sparse-checkout-builtin.sh]=45
     [t1092-sparse-checkout-compatibility.sh]=3
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/

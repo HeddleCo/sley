@@ -124,6 +124,7 @@ jobs:
             t3103-ls-tree-misc.sh
             t3200-branch.sh
             t3301-notes.sh
+            t4301-merge-tree-write-tree.sh
             t3403-rebase-skip.sh
             t3404-rebase-interactive.sh
             t3406-rebase-message.sh
@@ -172,6 +173,7 @@ jobs:
             t6113-rev-list-bitmap-filters.sh
             t6120-describe.sh
             t6300-for-each-ref.sh
+            t6302-for-each-ref-filter.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
             t7102-reset.sh
