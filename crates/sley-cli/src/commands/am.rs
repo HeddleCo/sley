@@ -33,6 +33,8 @@ struct AmOptions {
     /// Keep non-empty commits whose patch is empty rather than erroring
     /// (`-k`/`--keep` / `--keep-non-patch`).
     keep_non_patch: bool,
+    /// What to do with a mail message that has no patch (`--empty=<action>`).
+    empty_action: AmEmptyAction,
     /// Keep the subject line verbatim, skipping all mailinfo cleanup
     /// (`-k`/`--keep`).
     keep_subject: bool,
@@ -66,6 +68,14 @@ impl AmOptions {
             keep_non_patch_brackets: self.keep_non_patch_brackets,
         }
     }
+}
+
+/// `git am --empty=<action>` handling for messages without a patch.
+#[derive(Clone, Copy, PartialEq)]
+enum AmEmptyAction {
+    Stop,
+    Drop,
+    Keep,
 }
 
 /// How a patch's `Subject:` header should be cleaned, mirroring git's mailinfo
@@ -135,6 +145,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     // *same* mode is accepted (t4150 "accepts repeated --show-current-patch").
     let mut resume = None;
     let mut show_patch: Option<ShowPatchMode> = None;
+    let mut allow_empty_resume = false;
     let mut option_args = Vec::new();
     for arg in args {
         match arg.as_str() {
@@ -158,6 +169,10 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                 let arg = &value["--show-current-patch=".len()..];
                 eprintln!("error: invalid value for '--show-current-patch': '{arg}'");
                 return Err(GitError::Exit(129));
+            }
+            "--allow-empty" => {
+                allow_empty_resume = true;
+                option_args.push(arg.to_string());
             }
             other => option_args.push(other.to_string()),
         }
@@ -190,6 +205,16 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     }
 
     let mut options = parse_am_options(&option_args)?;
+
+    if allow_empty_resume && options.mboxes.is_empty() && state_dir.exists() {
+        return am_continue_allow_empty(
+            &git_dir,
+            &common_git_dir,
+            &worktree_root,
+            format,
+            &state_dir,
+        );
+    }
 
     // git seeds am.messageid / am.threeWay from config, then lets the
     // command-line flag (handled in parse_am_options) override. parse_am_options
@@ -343,6 +368,7 @@ pub(crate) fn start_rebase_apply(
         signoff: params.signoff,
         three_way: false,
         keep_non_patch: false,
+        empty_action: AmEmptyAction::Stop,
         keep_subject: false,
         keep_non_patch_brackets: false,
         message_id: false,
@@ -443,6 +469,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         signoff: false,
         three_way: false,
         keep_non_patch: false,
+        empty_action: AmEmptyAction::Stop,
         keep_subject: false,
         keep_non_patch_brackets: false,
         message_id: false,
@@ -493,6 +520,14 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--verify" => options.no_verify = false,
             "--keep-cr" => options.keep_cr = true,
             "--no-keep-cr" => options.keep_cr = false,
+            "--empty" => {
+                let value = args.get(index + 1).map(String::as_str).unwrap_or("");
+                eprintln!("error: invalid value for '--empty': '{value}'");
+                return Err(GitError::Exit(129));
+            }
+            "--empty=drop" => options.empty_action = AmEmptyAction::Drop,
+            "--empty=keep" => options.empty_action = AmEmptyAction::Keep,
+            "--empty=stop" => options.empty_action = AmEmptyAction::Stop,
             // Accepted no-ops: these affect mail parsing / cosmetics we already
             // handle or that do not change the resulting commits for the inputs
             // `git format-patch` produces.
@@ -505,13 +540,13 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             | "--whitespace"
             | "--rerere-autoupdate"
             | "--no-rerere-autoupdate"
-            | "--allow-empty"
-            | "--empty=drop"
-            | "--empty=keep"
-            | "--empty=stop" => {}
+            | "--allow-empty" => {}
             value if value.starts_with("--whitespace=") => {}
             value if value.starts_with("--patch-format=") => {}
-            value if value.starts_with("--empty=") => {}
+            value if let Some(invalid) = value.strip_prefix("--empty=") => {
+                eprintln!("error: invalid value for '--empty': '{invalid}'");
+                return Err(GitError::Exit(129));
+            }
             value if value.starts_with("--exclude=") || value.starts_with("--include=") => {}
             value if value.starts_with("--directory=") || value.starts_with("-p") => {}
             value if value.starts_with('-') && value != "-" => {
@@ -1213,6 +1248,7 @@ fn write_am_state_dir(
     fs::write(state_dir.join("sign"), bool_flag(options.signoff))?;
     fs::write(state_dir.join("threeway"), bool_flag(options.three_way))?;
     fs::write(state_dir.join("keep"), bool_flag(options.keep_non_patch))?;
+    fs::write(state_dir.join("empty"), empty_action_name(options.empty_action))?;
     fs::write(state_dir.join("messageid"), bool_flag(options.message_id))?;
     fs::write(
         state_dir.join("committer-date-is-author-date"),
@@ -1369,6 +1405,25 @@ fn read_state_bool(state_dir: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn empty_action_name(action: AmEmptyAction) -> &'static str {
+    match action {
+        AmEmptyAction::Stop => "stop\n",
+        AmEmptyAction::Drop => "drop\n",
+        AmEmptyAction::Keep => "keep\n",
+    }
+}
+
+fn read_empty_action(state_dir: &Path) -> AmEmptyAction {
+    match fs::read_to_string(state_dir.join("empty"))
+        .unwrap_or_default()
+        .trim()
+    {
+        "drop" => AmEmptyAction::Drop,
+        "keep" => AmEmptyAction::Keep,
+        _ => AmEmptyAction::Stop,
+    }
+}
+
 /// Read the commit-affecting flags back from the state directory so a resumed
 /// (`--continue`/`--skip`) run builds identical commits to an uninterrupted one.
 fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
@@ -1409,7 +1464,7 @@ fn run_am_series(
     let last = read_state_usize(state_dir, "last")?;
     let quiet = read_state_bool(state_dir, "quiet");
     let three_way = read_state_bool(state_dir, "threeway");
-    let keep_non_patch = read_state_bool(state_dir, "keep");
+    let empty_action = read_empty_action(state_dir);
     let ignore_whitespace = read_state_bool(state_dir, "ignore-whitespace");
     let commit_opts = read_am_commit_opts(state_dir);
 
@@ -1419,12 +1474,38 @@ fn run_am_series(
         let mut patch = read_patch_file(state_dir, number)?;
         write_current_patch_state(state_dir, &patch)?;
 
-        // A message that carried no diff stops the series with git's empty-patch
-        // report (unless --keep/--keep-non-patch was requested).
-        if patch.diff.is_empty() && !keep_non_patch {
-            am_print_empty_patch_hints();
-            println!("Patch is empty.");
-            return Err(GitError::Exit(128));
+        if patch.diff.is_empty() {
+            match empty_action {
+                AmEmptyAction::Stop => {
+                    am_print_empty_patch_hints();
+                    println!("Patch is empty.");
+                    return Err(GitError::Exit(128));
+                }
+                AmEmptyAction::Drop => {
+                    if !quiet {
+                        println!("Skipping: {}", patch.subject);
+                    }
+                    number += 1;
+                    continue;
+                }
+                AmEmptyAction::Keep => {
+                    patch.message = prepare_am_commit_message(git_dir, &patch, commit_opts)?;
+                    if !quiet {
+                        println!("Creating an empty commit: {}", patch.subject);
+                    }
+                    let new_oid = create_am_commit(
+                        git_dir,
+                        common_git_dir,
+                        worktree_root,
+                        format,
+                        &patch,
+                        commit_opts,
+                    )?;
+                    record_rebase_rewrite(state_dir, format, number, &new_oid)?;
+                    number += 1;
+                    continue;
+                }
+            }
         }
 
         // git runs the applypatch-msg hook BEFORE applying the patch, so a
@@ -1448,6 +1529,7 @@ fn run_am_series(
             commit_opts,
             three_way,
             ignore_whitespace,
+            quiet,
         )? {
             ApplyResult::Committed => number += 1,
             ApplyResult::Conflict => {
@@ -1538,6 +1620,7 @@ fn apply_one_patch(
     commit_opts: AmCommitOpts,
     three_way: bool,
     ignore_whitespace: bool,
+    quiet: bool,
 ) -> Result<ApplyResult> {
     let file_patches = sley_diff_merge::parse_unified_patch(&patch.diff)?;
 
@@ -1558,7 +1641,9 @@ fn apply_one_patch(
         }
         None => {
             if three_way {
-                println!("Using index info to reconstruct a base tree...");
+                if !quiet {
+                    println!("Using index info to reconstruct a base tree...");
+                }
                 return apply_three_way(
                     git_dir,
                     common_git_dir,
@@ -1569,6 +1654,7 @@ fn apply_one_patch(
                     patch,
                     &file_patches,
                     commit_opts,
+                    quiet,
                 );
             }
             for file in &file_patches {
@@ -2168,6 +2254,7 @@ fn apply_three_way(
     patch: &AmPatch,
     file_patches: &[sley_diff_merge::FilePatch],
     commit_opts: AmCommitOpts,
+    quiet: bool,
 ) -> Result<ApplyResult> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
@@ -2244,9 +2331,13 @@ fn apply_three_way(
 
     // Report the paths that differ between the reconstructed base and HEAD, the
     // way git's "reconstruct a base tree" step does (`<status>\t<path>`).
-    print_three_way_base_status(&base_map, &ours_map);
+    if !quiet {
+        print_three_way_base_status(&base_map, &ours_map);
+    }
 
-    println!("Falling back to patching base and 3-way merge...");
+    if !quiet {
+        println!("Falling back to patching base and 3-way merge...");
+    }
     let (results, conflicts) = three_way_merge_trees(
         &db,
         format,
@@ -2258,8 +2349,10 @@ fn apply_three_way(
     )?;
 
     // git prints "Auto-merging <path>" for every file changed on both sides.
-    for path in three_way_auto_merged_paths(&base_map, &ours_map, &theirs_map) {
-        println!("Auto-merging {}", String::from_utf8_lossy(&path));
+    if !quiet {
+        for path in three_way_auto_merged_paths(&base_map, &ours_map, &theirs_map) {
+            println!("Auto-merging {}", String::from_utf8_lossy(&path));
+        }
     }
 
     write_merge_index_and_worktree(git_dir, worktree_root, format, &db, &ours_map, &results)?;
@@ -2889,6 +2982,69 @@ fn am_continue(
         commit_opts,
     )?;
     record_rebase_rewrite(state_dir, format, next, &new_oid)?;
+    run_am_series(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        state_dir,
+        next + 1,
+    )
+}
+
+/// `git am --allow-empty`: when an empty patch stopped the series, record it as
+/// an empty commit and continue. For non-empty/conflicted states, use the normal
+/// `--continue` validation so clean or unmerged indexes are still rejected.
+fn am_continue_allow_empty(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    state_dir: &Path,
+) -> Result<()> {
+    am_require_in_progress(state_dir)?;
+    let next = read_state_usize(state_dir, "next")?;
+    let mut patch = read_patch_file(state_dir, next)?;
+    if !patch.diff.is_empty() {
+        return Err(GitError::Exit(128));
+    }
+
+    let index = read_repository_index(git_dir, format)?;
+    let has_unmerged = index.as_ref().is_some_and(|index| {
+        index
+            .entries
+            .iter()
+            .any(|entry| (entry.flags >> 12) & 0x3 != 0)
+    });
+    if has_unmerged {
+        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir);
+    }
+
+    let refs = FileRefStore::new(git_dir, format);
+    if let Some(head_oid) = head_commit_oid(&refs)?
+        && am_index_is_dirty(git_dir, common_git_dir, format, &head_oid)?
+    {
+        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir);
+    }
+
+    let commit_opts = read_am_commit_opts(state_dir);
+    let quiet = read_state_bool(state_dir, "quiet");
+    patch.message = prepare_am_commit_message(git_dir, &patch, commit_opts)?;
+    if !quiet {
+        println!("Applying: {}", patch.subject);
+    }
+    let new_oid = create_am_commit(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        &patch,
+        commit_opts,
+    )?;
+    record_rebase_rewrite(state_dir, format, next, &new_oid)?;
+    if !quiet {
+        println!("No changes - recorded it as an empty commit.");
+    }
     run_am_series(
         git_dir,
         common_git_dir,
