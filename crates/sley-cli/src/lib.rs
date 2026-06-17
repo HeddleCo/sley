@@ -8733,24 +8733,14 @@ fn emit_log_one_token(
         "UTF-8",
     );
     let message: &[u8] = &reencoded_message;
-    // Resolve the three identity views git uses (pretty.c `format_person_part`):
-    //   raw      → `%an`/`%ae` with mailmap OFF
-    //   display  → `%an`/`%ae` honoring `--use-mailmap`/`log.mailmap`
-    //   mapped   → `%aN`/`%aE` (always mailmapped)
+    // git's `format_person_part`: only the UPPER-case `%aN`/`%aE`/`%aL` atoms run
+    // through the mailmap; the lower-case `%an`/`%ae`/`%al` are ALWAYS raw, even
+    // under `--use-mailmap` (that flag only maps the default `Author:` line via
+    // `pp_user_info`, handled in the default-format path — not here).
     let mailmap = context.mailmap;
     let (mapped_author_name, mapped_author_email) = mailmap.map_user(author_name, author_email);
     let (mapped_committer_name, mapped_committer_email) =
         mailmap.map_user(committer_name, committer_email);
-    let (display_author_name, display_author_email): (&str, &str) = if context.use_mailmap {
-        (&mapped_author_name, &mapped_author_email)
-    } else {
-        (author_name, author_email)
-    };
-    let (display_committer_name, display_committer_email): (&str, &str) = if context.use_mailmap {
-        (&mapped_committer_name, &mapped_committer_email)
-    } else {
-        (committer_name, committer_email)
-    };
     {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
@@ -8837,11 +8827,10 @@ fn emit_log_one_token(
             | FormatToken::GDateIso
             | FormatToken::GDateIsoStrict
             | FormatToken::GDateRfc2822 => {}
-            FormatToken::AuthorName => out.extend_from_slice(display_author_name.as_bytes()),
-            FormatToken::AuthorEmail => out.extend_from_slice(display_author_email.as_bytes()),
+            FormatToken::AuthorName => out.extend_from_slice(author_name.as_bytes()),
+            FormatToken::AuthorEmail => out.extend_from_slice(author_email.as_bytes()),
             FormatToken::AuthorEmailLocal => {
-                write!(out, "{}", log_email_local_part(display_author_email))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(author_email)).map_err(io::Error::from)?;
             }
             FormatToken::AuthorNameMapped => out.extend_from_slice(mapped_author_name.as_bytes()),
             FormatToken::AuthorEmailMapped => out.extend_from_slice(mapped_author_email.as_bytes()),
@@ -8890,14 +8879,10 @@ fn emit_log_one_token(
                 )
                 .map_err(io::Error::from)?;
             }
-            FormatToken::CommitterName => {
-                out.extend_from_slice(display_committer_name.as_bytes())
-            }
-            FormatToken::CommitterEmail => {
-                out.extend_from_slice(display_committer_email.as_bytes())
-            }
+            FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
+            FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
             FormatToken::CommitterEmailLocal => {
-                write!(out, "{}", log_email_local_part(display_committer_email))
+                write!(out, "{}", log_email_local_part(committer_email))
                     .map_err(io::Error::from)?;
             }
             FormatToken::CommitterNameMapped => {
