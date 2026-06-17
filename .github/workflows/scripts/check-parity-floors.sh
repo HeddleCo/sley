@@ -396,6 +396,9 @@ declare -A FLOOR=(
     [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10
     [t7810-grep.sh]=230
+    # codex-wave-4-recovery: notes merge t3309 enroll@31 / t3311 enroll@24 (full pass).
+    [t3309-notes-merge-auto-resolve.sh]=31
+    [t3311-notes-merge-fanout.sh]=24
     [t3301-notes.sh]=144
     [t1461-refs-list.sh]=382
     [t1462-refs-exists.sh]=12
@@ -413,6 +416,9 @@ declare -A FLOOR=(
     [t6030-bisect-porcelain.sh]=95
     [t5310-pack-bitmaps.sh]=221
     [t5326-multi-pack-bitmaps.sh]=344
+    # codex-wave-4-recovery: rev_list filters t6006 enroll@56 / t6112 enroll@48.
+    [t6006-rev-list-format.sh]=56
+    [t6112-rev-list-filters-objects.sh]=48
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     [t2020-checkout-detach.sh]=16
