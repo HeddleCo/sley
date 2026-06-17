@@ -7917,6 +7917,27 @@ pub(crate) fn commit_author_identity(raw: &[u8]) -> String {
         .to_string()
 }
 
+/// `commit_author_identity` with an optional mailmap pass — the default/medium/
+/// full pretty formats route the whole `Name <email>` through the mailmap when
+/// `git log --use-mailmap`/`log.mailmap` is active (git's `pp_user_info`). When
+/// `mailmap` is `None` (or empty) this is identical to `commit_author_identity`.
+pub(crate) fn commit_identity_mailmapped(
+    raw: &[u8],
+    mailmap: Option<&commands::utility::Mailmap>,
+) -> String {
+    let identity = commit_author_identity(raw);
+    let Some(mailmap) = mailmap.filter(|m| !m.is_empty()) else {
+        return identity;
+    };
+    // Split `Name <email>` (commit_author_identity already trimmed the date).
+    let (name, email) = match identity.rsplit_once(" <") {
+        Some((name, rest)) => (name, rest.strip_suffix('>').unwrap_or(rest)),
+        None => return identity,
+    };
+    let (name, email) = mailmap.map_user(name, email);
+    format!("{name} <{email}>")
+}
+
 #[derive(Debug)]
 struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
@@ -8502,6 +8523,14 @@ struct LogFormatContext<'a> {
     color: bool,
     /// Desired log output encoding (git's `get_log_output_encoding`).
     output_encoding: &'a str,
+    /// The mailmap engine. `%aN`/`%aE`/`%cN`/`%cE` (and `%aL`/`%cL`) always
+    /// consult it; `--use-mailmap`/`log.mailmap` (see `use_mailmap`) additionally
+    /// routes the lower-case `%an`/`%ae`/… atoms and the default `Author:` line
+    /// through it.
+    mailmap: &'a commands::utility::Mailmap,
+    /// `--use-mailmap` / `log.mailmap`: apply the mailmap to the *whole* identity
+    /// (default formats + lower-case person atoms), mirroring git's `pp->mailmap`.
+    use_mailmap: bool,
 }
 
 struct LogDescribeContext<'a> {
@@ -8543,6 +8572,8 @@ pub(crate) fn format_subst_for_commit(
     let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
     let decorations = HashMap::new();
     let date_mode = DateMode::Default;
+    // `export-subst` substitution does not mailmap (git uses the raw ident).
+    let mailmap = commands::utility::Mailmap::default();
     let context = LogFormatContext {
         abbrev_len: None,
         decorations: &decorations,
@@ -8554,6 +8585,8 @@ pub(crate) fn format_subst_for_commit(
         describe: None,
         color: false,
         output_encoding: "UTF-8",
+        mailmap: &mailmap,
+        use_mailmap: false,
     };
     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
     emit_compiled_log_format(record, &compiled, &context, &mut out, 0..compiled.tokens.len())?;
@@ -8687,6 +8720,7 @@ fn emit_log_one_token(
         describe,
         color,
         output_encoding,
+        ..
     } = *context;
     // git formats in UTF-8 (re-encoding the stored message to UTF-8 up front),
     // computes alignment/width in UTF-8, and re-encodes the *final* output to the
@@ -8699,6 +8733,24 @@ fn emit_log_one_token(
         "UTF-8",
     );
     let message: &[u8] = &reencoded_message;
+    // Resolve the three identity views git uses (pretty.c `format_person_part`):
+    //   raw      → `%an`/`%ae` with mailmap OFF
+    //   display  → `%an`/`%ae` honoring `--use-mailmap`/`log.mailmap`
+    //   mapped   → `%aN`/`%aE` (always mailmapped)
+    let mailmap = context.mailmap;
+    let (mapped_author_name, mapped_author_email) = mailmap.map_user(author_name, author_email);
+    let (mapped_committer_name, mapped_committer_email) =
+        mailmap.map_user(committer_name, committer_email);
+    let (display_author_name, display_author_email): (&str, &str) = if context.use_mailmap {
+        (&mapped_author_name, &mapped_author_email)
+    } else {
+        (author_name, author_email)
+    };
+    let (display_committer_name, display_committer_email): (&str, &str) = if context.use_mailmap {
+        (&mapped_committer_name, &mapped_committer_email)
+    } else {
+        (committer_name, committer_email)
+    };
     {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
@@ -8785,10 +8837,17 @@ fn emit_log_one_token(
             | FormatToken::GDateIso
             | FormatToken::GDateIsoStrict
             | FormatToken::GDateRfc2822 => {}
-            FormatToken::AuthorName => out.extend_from_slice(author_name.as_bytes()),
-            FormatToken::AuthorEmail => out.extend_from_slice(author_email.as_bytes()),
+            FormatToken::AuthorName => out.extend_from_slice(display_author_name.as_bytes()),
+            FormatToken::AuthorEmail => out.extend_from_slice(display_author_email.as_bytes()),
             FormatToken::AuthorEmailLocal => {
-                write!(out, "{}", log_email_local_part(&author_email)).map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(display_author_email))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorNameMapped => out.extend_from_slice(mapped_author_name.as_bytes()),
+            FormatToken::AuthorEmailMapped => out.extend_from_slice(mapped_author_email.as_bytes()),
+            FormatToken::AuthorEmailLocalMapped => {
+                write!(out, "{}", log_email_local_part(&mapped_author_email))
+                    .map_err(io::Error::from)?;
             }
             FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
             FormatToken::AuthorDate => {
@@ -8831,10 +8890,24 @@ fn emit_log_one_token(
                 )
                 .map_err(io::Error::from)?;
             }
-            FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
-            FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
+            FormatToken::CommitterName => {
+                out.extend_from_slice(display_committer_name.as_bytes())
+            }
+            FormatToken::CommitterEmail => {
+                out.extend_from_slice(display_committer_email.as_bytes())
+            }
             FormatToken::CommitterEmailLocal => {
-                write!(out, "{}", log_email_local_part(&committer_email))
+                write!(out, "{}", log_email_local_part(display_committer_email))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterNameMapped => {
+                out.extend_from_slice(mapped_committer_name.as_bytes())
+            }
+            FormatToken::CommitterEmailMapped => {
+                out.extend_from_slice(mapped_committer_email.as_bytes())
+            }
+            FormatToken::CommitterEmailLocalMapped => {
+                write!(out, "{}", log_email_local_part(&mapped_committer_email))
                     .map_err(io::Error::from)?;
             }
             FormatToken::CommitterTimestamp => {
@@ -9367,6 +9440,9 @@ fn emit_compiled_log_format_metadata_inner(
             | FormatToken::AuthorName
             | FormatToken::AuthorEmail
             | FormatToken::AuthorEmailLocal
+            | FormatToken::AuthorNameMapped
+            | FormatToken::AuthorEmailMapped
+            | FormatToken::AuthorEmailLocalMapped
             | FormatToken::AuthorTimestamp
             | FormatToken::AuthorDate
             | FormatToken::AuthorDateIso
@@ -9376,6 +9452,9 @@ fn emit_compiled_log_format_metadata_inner(
             | FormatToken::CommitterName
             | FormatToken::CommitterEmail
             | FormatToken::CommitterEmailLocal
+            | FormatToken::CommitterNameMapped
+            | FormatToken::CommitterEmailMapped
+            | FormatToken::CommitterEmailLocalMapped
             | FormatToken::CommitterTimestamp
             | FormatToken::CommitterDate
             | FormatToken::CommitterDateIso
@@ -9488,9 +9567,15 @@ pub(crate) fn emit_compiled_stash_format(
             | FormatToken::GDateIso
             | FormatToken::GDateIsoStrict
             | FormatToken::GDateRfc2822 => {}
-            FormatToken::AuthorName => out.extend_from_slice(author_name.as_bytes()),
-            FormatToken::AuthorEmail => out.extend_from_slice(author_email.as_bytes()),
-            FormatToken::AuthorEmailLocal => {
+            // The stash-metadata path has no mailmap context; the upper-case
+            // (mapped) atoms degrade to the raw identity.
+            FormatToken::AuthorName | FormatToken::AuthorNameMapped => {
+                out.extend_from_slice(author_name.as_bytes())
+            }
+            FormatToken::AuthorEmail | FormatToken::AuthorEmailMapped => {
+                out.extend_from_slice(author_email.as_bytes())
+            }
+            FormatToken::AuthorEmailLocal | FormatToken::AuthorEmailLocalMapped => {
                 write!(out, "{}", log_email_local_part(&author_email)).map_err(io::Error::from)?;
             }
             FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
@@ -9530,9 +9615,13 @@ pub(crate) fn emit_compiled_stash_format(
                 )
                 .map_err(io::Error::from)?;
             }
-            FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
-            FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
-            FormatToken::CommitterEmailLocal => {
+            FormatToken::CommitterName | FormatToken::CommitterNameMapped => {
+                out.extend_from_slice(committer_name.as_bytes())
+            }
+            FormatToken::CommitterEmail | FormatToken::CommitterEmailMapped => {
+                out.extend_from_slice(committer_email.as_bytes())
+            }
+            FormatToken::CommitterEmailLocal | FormatToken::CommitterEmailLocalMapped => {
                 write!(out, "{}", log_email_local_part(&committer_email))
                     .map_err(io::Error::from)?;
             }

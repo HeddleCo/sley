@@ -8,6 +8,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut parents = false;
     let mut children = false;
+    // `--use-mailmap`/`--mailmap` (and `--no-` forms). rev-list, unlike `log`,
+    // has no `log.mailmap` default — mapping is off unless explicitly requested.
+    let mut use_mailmap = false;
     let mut count = false;
     let mut min_parents = None;
     let mut max_parents = None;
@@ -123,6 +126,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
             "--parents" => parents = true,
             "--no-parents" => parents = false,
+            "--use-mailmap" | "--mailmap" => use_mailmap = true,
+            "--no-use-mailmap" | "--no-mailmap" => use_mailmap = false,
             "--children" => children = true,
             "--count" => count = true,
             "--no-count" => count = false,
@@ -352,6 +357,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    // Mailmap engine for `--use-mailmap` custom-format atoms (the upper-case
+    // `%aN`/… always map; lower-case map only under the flag).
+    let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
@@ -747,6 +755,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         describe: None,
                         color: want_color,
                         output_encoding: "UTF-8",
+                        mailmap: &mailmap,
+                        use_mailmap,
                     },
                     line,
                 )?;
@@ -1037,6 +1047,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         describe: None,
                         color: want_color,
                         output_encoding: "UTF-8",
+                        mailmap: &mailmap,
+                        use_mailmap,
                     };
                     if children {
                         print!(
@@ -1116,6 +1128,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         describe: None,
                         color: want_color,
                         output_encoding: "UTF-8",
+                        mailmap: &mailmap,
+                        use_mailmap,
                     },
                 )?;
                 println!();
@@ -1133,6 +1147,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 parents,
                 decorations: &decorations,
                 date_mode: &date_mode,
+                mailmap: &mailmap,
+                use_mailmap,
             },
         )?;
     }
@@ -1373,6 +1389,8 @@ struct RevListBoundaryOptions<'a> {
     parents: bool,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     date_mode: &'a DateMode,
+    mailmap: &'a commands::utility::Mailmap,
+    use_mailmap: bool,
 }
 
 fn write_rev_list_boundary_record(
@@ -1387,6 +1405,8 @@ fn write_rev_list_boundary_record(
         parents,
         decorations,
         date_mode,
+        mailmap,
+        use_mailmap,
     } = options;
     match pretty {
         RevListPretty::Default
@@ -1426,6 +1446,8 @@ fn write_rev_list_boundary_record(
                         describe: None,
                         color: false,
                         output_encoding: "UTF-8",
+                        mailmap,
+                        use_mailmap,
                     },
                 )?;
             } else {
@@ -1476,6 +1498,8 @@ fn write_rev_list_boundary_record(
                     describe: None,
                     color: false,
                     output_encoding: "UTF-8",
+                    mailmap,
+                    use_mailmap,
                 },
             )?;
             println!();

@@ -614,6 +614,22 @@ impl Mailmap {
         Self::load(git_dir, format, &[])
     }
 
+    /// Load the mailmap when there may be no repository (git's `read_mailmap`
+    /// non-repo branch: `.mailmap` from the *current directory* — symlinks
+    /// followed — plus the `mailmap.file` config path). Used by the stdin path
+    /// of `shortlog`, which git lets run outside a repo. Falls back to
+    /// [`Self::load_default`] when a repo is present so blob sources still work.
+    pub(crate) fn load_cwd() -> Result<Self> {
+        let mut mailmap = Self::default();
+        mailmap.add_file(Path::new(".mailmap"))?;
+        if let Some(config) = identity_effective_config()
+            && let Some(path) = config.get("mailmap", None, "file")
+        {
+            mailmap.add_file(Path::new(&path))?;
+        }
+        Ok(mailmap)
+    }
+
     /// True when no mapping entries were loaded — lets consumers short-circuit
     /// the lookup entirely (git gates on `mail_map->nr`).
     pub(crate) fn is_empty(&self) -> bool {
