@@ -1124,28 +1124,42 @@ fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
     let mut config = read_repo_config(&git_dir)?;
     let mut changed = false;
     for submodule in selected {
+        // git's `init_submodule` copies the url and the update setting in two
+        // INDEPENDENT guards — each is copied only when not already present in
+        // `.git/config`. (The old single-guard form skipped the update copy for
+        // an already-url-registered submodule; t7406 #29/#30/#35 re-init after
+        // editing `.gitmodules update`.)
         if config
             .get("submodule", Some(&submodule.name), "url")
-            .is_some()
+            .is_none()
         {
-            continue;
+            let Some(url) = &submodule.url else {
+                continue;
+            };
+            let url = resolve_submodule_init_url(&worktree_root, &config, url);
+            set_submodule_config_value(&mut config, &submodule.name, "active", "true");
+            set_submodule_config_value(&mut config, &submodule.name, "url", &url);
+            if !quiet {
+                eprintln!(
+                    "Submodule '{}' ({}) registered for path '{}'",
+                    submodule.name, url, submodule.path
+                );
+            }
+            changed = true;
         }
-        let Some(url) = &submodule.url else {
-            continue;
-        };
-        let url = resolve_submodule_init_url(&worktree_root, &config, url);
-        set_submodule_config_value(&mut config, &submodule.name, "active", "true");
-        set_submodule_config_value(&mut config, &submodule.name, "url", &url);
-        if let Some(update) = &submodule.update {
+
+        // Copy the `update` setting when unset. A `!command` from `.gitmodules`
+        // never reaches here (read_submodule_configs already fatal'd on it), so
+        // `submodule.update` only holds checkout/merge/rebase/none — copy it
+        // verbatim, matching git's `submodule_update_type_to_string` path.
+        if config
+            .get("submodule", Some(&submodule.name), "update")
+            .is_none()
+            && let Some(update) = &submodule.update
+        {
             set_submodule_config_value(&mut config, &submodule.name, "update", update);
+            changed = true;
         }
-        if !quiet {
-            eprintln!(
-                "Submodule '{}' ({}) registered for path '{}'",
-                submodule.name, url, submodule.path
-            );
-        }
-        changed = true;
     }
     if changed {
         write_repo_config(&git_dir, &config)?;
