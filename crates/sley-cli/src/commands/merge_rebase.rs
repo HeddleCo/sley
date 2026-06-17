@@ -626,6 +626,69 @@ fn merge_ours_commit_and_advance(
     Ok(oid)
 }
 
+/// git's `reduce_heads` over the named merge targets: drop any head already
+/// reachable from HEAD or from another named head (a duplicate keeps only its
+/// first occurrence), preserving command-line order. Used by the strategy
+/// dispatch (one survivor ⇒ regular two-parent merge; ≥2 ⇒ octopus) and by the
+/// octopus driver itself so both agree on the parent set.
+fn reduce_merge_targets(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    refs: &FileRefStore,
+    targets: &[String],
+) -> Result<Vec<(String, ObjectId)>> {
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let head_oid = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => match refs.read_ref(&branch)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        None => None,
+    };
+
+    let mut heads = Vec::with_capacity(targets.len());
+    for target in targets {
+        let oid = resolve_revision(git_dir, format, target)?;
+        heads.push((target.clone(), oid));
+    }
+
+    let is_ancestor =
+        |db: &FileObjectDatabase, ancestor: &ObjectId, of: &ObjectId| -> Result<bool> {
+            if ancestor == of {
+                return Ok(true);
+            }
+            Ok(merge_bases(git_dir, db, format, ancestor, of)?
+                .iter()
+                .any(|base| base == ancestor))
+        };
+    let mut reduced: Vec<(String, ObjectId)> = Vec::new();
+    'heads: for (index, (name, oid)) in heads.iter().enumerate() {
+        if let Some(head_oid) = head_oid
+            && is_ancestor(&db, oid, &head_oid)?
+        {
+            continue;
+        }
+        for (other_index, (_, other)) in heads.iter().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            if oid == other {
+                if other_index < index {
+                    continue 'heads;
+                }
+                continue;
+            }
+            if is_ancestor(&db, oid, other)? {
+                continue 'heads;
+            }
+        }
+        reduced.push((name.clone(), *oid));
+    }
+    Ok(reduced)
+}
+
 /// `git merge <a> <b> [...]` — the octopus strategy. Mirrors upstream's
 /// `git-merge-octopus`: iteratively three-way-merge each head onto the running
 /// merged tree (MRT), fast-forwarding where possible, and refuse (exit 2) the
@@ -658,45 +721,22 @@ fn merge_octopus(
     };
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
 
-    let mut heads = Vec::with_capacity(targets.len());
-    for target in targets {
-        let oid = resolve_revision(git_dir, format, target)?;
-        let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
-        heads.push((target.clone(), commit));
+    // git-merge-octopus's `git diff-index --quiet --cached HEAD` guard: a staged
+    // change vs HEAD makes the index an unclean octopus base. Refuse (exit 2)
+    // before writing any merge state.
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
+    if let Some(entry) = status
+        .iter()
+        .find(|e| e.index != b' ' && e.index != b'?' && e.index != b'!')
+    {
+        eprintln!(
+            "Error: Your local changes to the following files would be overwritten by merge\n    {}",
+            String::from_utf8_lossy(&entry.path)
+        );
+        return Err(GitError::Exit(2));
     }
 
-    // git's `reduce_heads`: drop heads already reachable from HEAD or from
-    // another head (a duplicate keeps only its first occurrence).
-    let is_ancestor =
-        |db: &FileObjectDatabase, ancestor: &ObjectId, of: &ObjectId| -> Result<bool> {
-            if ancestor == of {
-                return Ok(true);
-            }
-            Ok(merge_bases(git_dir, db, format, ancestor, of)?
-                .iter()
-                .any(|base| base == ancestor))
-        };
-    let mut reduced: Vec<(String, ObjectId)> = Vec::new();
-    'heads: for (index, (name, oid)) in heads.iter().enumerate() {
-        if is_ancestor(&db, oid, &head_oid)? {
-            continue;
-        }
-        for (other_index, (_, other)) in heads.iter().enumerate() {
-            if other_index == index {
-                continue;
-            }
-            if oid == other {
-                if other_index < index {
-                    continue 'heads;
-                }
-                continue;
-            }
-            if is_ancestor(&db, oid, other)? {
-                continue 'heads;
-            }
-        }
-        reduced.push((name.clone(), *oid));
-    }
+    let reduced = reduce_merge_targets(git_dir, common_git_dir, format, refs, targets)?;
     if reduced.is_empty() {
         if !options.quiet {
             println!("Already up to date.");
@@ -714,7 +754,11 @@ fn merge_octopus(
         base_args.extend(merged_commits.iter().copied());
         let common = merge_bases_default_many(&db, format, &base_args)?;
         if common.len() == 1 && common[0] == *oid {
-            // Already covered by the merges performed so far.
+            // Already covered by the merges performed so far. git's octopus
+            // prints "Already up to date with <name>" and moves on.
+            if !options.quiet {
+                println!("Already up to date with {name}");
+            }
             continue;
         }
         if !non_ff
@@ -722,7 +766,11 @@ fn merge_octopus(
             && common.len() == 1
             && common[0] == merged_commits[0]
         {
-            // Fast-forward the running state to this head.
+            // Fast-forward the running state to this head (git-merge-octopus's
+            // "Fast-forwarding to: <name>").
+            if !options.quiet {
+                println!("Fast-forwarding to: {name}");
+            }
             let tree = commit_tree_oid(&db, format, oid)?;
             merged_map = stash_tree_entry_map(&db, format, &tree)?;
             merged_commits = vec![*oid];
@@ -733,6 +781,11 @@ fn merge_octopus(
             return Err(GitError::Exit(2));
         }
         non_ff = true;
+        // git-merge-octopus's "Trying simple merge with <name>" line precedes
+        // each non-fast-forward pairwise step.
+        if !options.quiet {
+            println!("Trying simple merge with {name}");
+        }
         let base_map = virtual_ancestor_entry_map(&db, format, &common, common_git_dir)?;
         let theirs_tree = commit_tree_oid(&db, format, oid)?;
         let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
@@ -825,6 +878,55 @@ fn merge_octopus(
 
     let message = build_merge_message(refs, git_dir, &db, format, options, &head_oid, &reduced)?;
 
+    // Materialize the merged result into the worktree, touching only paths that
+    // differ from HEAD (preserve untouched local mods, as in the two-parent path).
+    let head_map = &stash_tree_entry_map(&db, format, &head_tree)?;
+    let sync_octopus_worktree = || -> Result<()> {
+        for (path, entry) in &merged_map {
+            if head_map.get(path) == Some(entry) {
+                continue;
+            }
+            let (mode, oid) = entry;
+            let content = merge_read_blob(&db, oid)?;
+            merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+        }
+        for path in head_map.keys() {
+            if !merged_map.contains_key(path) {
+                merge_remove_worktree_file(worktree_root, path)?;
+            }
+        }
+        Ok(())
+    };
+
+    // `--squash`: stage the merged result + write SQUASH_MSG, record NO merge.
+    if options.squash {
+        sync_octopus_worktree()?;
+        let other_oids: Vec<ObjectId> = reduced.iter().map(|(_, oid)| *oid).collect();
+        write_squash_message_multi(git_dir, &db, format, &head_oid, &other_oids)?;
+        if !options.quiet {
+            println!("Squash commit -- not updating HEAD");
+        }
+        commands::hooks::run_hook_l("post-merge", &["1"])?;
+        return Ok(());
+    }
+
+    // `--no-commit`: stage the merged result, record MERGE_HEAD (every merged
+    // head) + MERGE_MSG, but do not create the commit or advance HEAD.
+    if options.no_commit {
+        sync_octopus_worktree()?;
+        let mut merge_head = String::new();
+        for (_, oid) in &reduced {
+            merge_head.push_str(&format!("{oid}\n"));
+        }
+        fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+        fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+        fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
+        if !options.quiet {
+            println!("Automatic merge went well; stopped before committing as requested");
+        }
+        return Ok(());
+    }
+
     if !options.quiet {
         let mut stdout = io::stdout();
         writeln!(stdout, "Merge made by the 'octopus' strategy.")?;
@@ -886,12 +988,25 @@ fn write_squash_message(
     head: &ObjectId,
     other: &ObjectId,
 ) -> Result<()> {
-    // Mark HEAD's ancestors uninteresting, then collect `other`'s ancestors that
-    // are not among them (the `^HEAD other` range).
+    write_squash_message_multi(git_dir, db, format, head, std::slice::from_ref(other))
+}
+
+/// `--squash` SQUASH_MSG for a merge of one or more heads (octopus): the
+/// `^HEAD <other>...` range rendered as git's `squash_message`. Mirrors
+/// `write_squash_message` but seeds the walk from every merged head.
+fn write_squash_message_multi(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    head: &ObjectId,
+    others: &[ObjectId],
+) -> Result<()> {
+    // Mark HEAD's ancestors uninteresting, then collect every `other`'s ancestors
+    // that are not among them (the `^HEAD other...` range).
     let uninteresting = ancestor_depths(db, format, head)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    let mut pending = VecDeque::from([other.clone()]);
+    let mut pending: VecDeque<ObjectId> = others.iter().cloned().collect();
     while let Some(oid) = pending.pop_front() {
         if uninteresting.contains_key(&oid) || !seen.insert(oid.clone()) {
             continue;
@@ -1714,21 +1829,43 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         ));
     }
 
+    // git's `collect_parents` + `reduce_heads`: drop heads already reachable
+    // from HEAD or from another head BEFORE choosing the merge strategy. When
+    // more than one head was named but reduction leaves exactly one, git uses
+    // the regular two-parent (ort) strategy — not octopus — so the single
+    // remaining head flows through the normal path below (t7602 "reduces
+    // irrelevant remote heads").
     let target = match positional.as_slice() {
         [target] => target.clone(),
         [] => {
             return Err(GitError::Command("merge requires a commit argument".into()));
         }
         _ => {
-            return merge_octopus(
-                &git_dir,
-                &common_git_dir,
-                format,
-                &worktree_root,
-                &refs,
-                &positional,
-                &options,
-            );
+            let reduced = reduce_merge_targets(&git_dir, &common_git_dir, format, &refs, &positional)?;
+            match reduced.as_slice() {
+                [] => {
+                    if !options.quiet {
+                        if options.squash {
+                            println!("Already up to date. (nothing to squash)");
+                        } else {
+                            println!("Already up to date.");
+                        }
+                    }
+                    return Ok(());
+                }
+                [single] => single.0.clone(),
+                _ => {
+                    return merge_octopus(
+                        &git_dir,
+                        &common_git_dir,
+                        format,
+                        &worktree_root,
+                        &refs,
+                        &positional,
+                        &options,
+                    );
+                }
+            }
         }
     };
 
