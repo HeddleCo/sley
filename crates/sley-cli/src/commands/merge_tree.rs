@@ -273,6 +273,13 @@ struct MergeOutcome {
 }
 
 fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
+    let _quiet_cleanup = if options.quiet {
+        let cwd = env::current_dir()?;
+        let git_dir = discover_git_dir(&cwd)?;
+        Some(QuietLooseObjectCleanup::new(git_dir)?)
+    } else {
+        None
+    };
     let outcome = compute_real_merge(options)?;
 
     if options.quiet {
@@ -289,6 +296,68 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     } else {
         Err(GitError::Exit(1))
     }
+}
+
+struct QuietLooseObjectCleanup {
+    git_dir: PathBuf,
+    before: BTreeSet<PathBuf>,
+}
+
+impl QuietLooseObjectCleanup {
+    fn new(git_dir: PathBuf) -> Result<Self> {
+        let before = loose_object_files(&git_dir)?;
+        Ok(Self { git_dir, before })
+    }
+}
+
+impl Drop for QuietLooseObjectCleanup {
+    fn drop(&mut self) {
+        let Ok(after) = loose_object_files(&self.git_dir) else {
+            return;
+        };
+        for path in after {
+            if self.before.contains(&path) {
+                continue;
+            }
+            let full = self.git_dir.join("objects").join(&path);
+            let parent = full.parent().map(Path::to_path_buf);
+            let _ = fs::remove_file(&full);
+            if let Some(parent) = parent {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
+fn loose_object_files(git_dir: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut files = BTreeSet::new();
+    let objects = git_dir.join("objects");
+    let Ok(dirs) = fs::read_dir(&objects) else {
+        return Ok(files);
+    };
+    for dir in dirs {
+        let dir = dir?;
+        if !dir.file_type()?.is_dir() {
+            continue;
+        }
+        let dir_name = dir.file_name();
+        let dir_name = dir_name.to_string_lossy();
+        if dir_name.len() != 2 || !dir_name.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            continue;
+        }
+        for entry in fs::read_dir(dir.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.len() == 38 && file_name.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+                files.insert(PathBuf::from(dir_name.as_ref()).join(file_name.as_ref()));
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
