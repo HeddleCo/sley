@@ -528,6 +528,45 @@ fn render_merge_outcome(
                     ),
                 });
             }
+            sley_diff_merge::MergeConflictKind::DirRenameLocation {
+                old_path,
+                renamed_from,
+                added_in,
+                dir_renamed_in,
+            } => {
+                let new_path = String::from_utf8_lossy(path);
+                let message = match renamed_from {
+                    Some(source) => format!(
+                        "CONFLICT (file location): {src} renamed to {old} in {added_in}, inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {new_path}.",
+                        src = String::from_utf8_lossy(source),
+                        old = String::from_utf8_lossy(old_path),
+                    ),
+                    None => format!(
+                        "CONFLICT (file location): {old} added in {added_in} inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {new_path}.",
+                        old = String::from_utf8_lossy(old_path),
+                    ),
+                };
+                conflict_messages.push(InfoMessage {
+                    paths: vec![old_path.clone(), path.clone()],
+                    stable_type: "CONFLICT (file location)".to_string(),
+                    message,
+                });
+            }
+            sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources } => {
+                let source_list = sources
+                    .iter()
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conflict_messages.push(InfoMessage {
+                    paths: vec![path.clone()],
+                    stable_type: "CONFLICT (implicit dir rename)".to_string(),
+                    message: format!(
+                        "CONFLICT (implicit dir rename): Existing file/dir at {new} in the way of implicit directory rename(s) putting the following path(s) there: {source_list}.",
+                        new = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
         }
         push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }

@@ -36,6 +36,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut local = None::<bool>;
     let mut deepen_since = None::<i64>;
     let mut deepen_not = Vec::<String>::new();
+    // `--reject-shallow` / `--no-reject-shallow` are a tri-state (upstream
+    // `option_reject_shallow = -1` when unspecified); the CLI flag overrides the
+    // `clone.rejectshallow` config when present.
+    let mut option_reject_shallow = None::<bool>;
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -55,7 +59,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             "--no-single-branch" => explicit_single_branch = Some(false),
             "--tags" => tag_opt = None,
             "--no-tags" => tag_opt = Some("--no-tags".to_string()),
-            "--reject-shallow" | "--no-reject-shallow" => {}
+            "--reject-shallow" => option_reject_shallow = Some(true),
+            "--no-reject-shallow" => option_reject_shallow = Some(false),
             "--depth" => {
                 let value = iter
                     .next()
@@ -259,21 +264,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --ref-format requires a value".into())
                 })?;
-                if value != "files" {
-                    return Err(GitError::Command(format!(
-                        "unsupported clone --ref-format value {value}"
-                    )));
-                }
+                reject_unknown_clone_ref_format(value)?;
             }
             value if value.starts_with("--ref-format=") => {
                 let value = value.strip_prefix("--ref-format=").ok_or_else(|| {
                     GitError::Command("clone --ref-format requires a value".into())
                 })?;
-                if value != "files" {
-                    return Err(GitError::Command(format!(
-                        "unsupported clone --ref-format value {value}"
-                    )));
-                }
+                reject_unknown_clone_ref_format(value)?;
             }
             "-c" | "--config" => {
                 let assignment = iter
@@ -652,6 +649,19 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         && !parse_remote_url(&repository)
             .map(|url| url.transport == RemoteTransport::File)
             .unwrap_or(false);
+    // Upstream `builtin/clone.c`: `clone.rejectshallow` (config) is overridden by
+    // `--[no-]reject-shallow` (CLI). When the resolved value is true and the
+    // source repository is shallow (a `shallow` file in its git dir), the clone
+    // is refused. For a true local-mechanism clone git only `warning`s and falls
+    // back to the transport, but sley always serves locally through the
+    // in-process upload-pack, so the rejection applies whenever the source is
+    // shallow — matching `--no-local` (the only way to reject-shallow a path).
+    let reject_shallow =
+        option_reject_shallow.or(clone_reject_shallow_config(&config_overrides)?);
+    if reject_shallow == Some(true) && remote_common_git_dir.join("shallow").exists() {
+        eprintln!("fatal: source repository is shallow, reject to clone.");
+        return Err(GitError::Exit(128));
+    }
     if !quiet {
         if bare {
             eprintln!(
@@ -1332,6 +1342,25 @@ fn clone_jobs_error() -> &'static str {
     "error: option `jobs' expects an integer value with an optional k/m/g suffix"
 }
 
+/// Validate `git clone --ref-format=<name>`. Upstream resolves the name through
+/// `ref_storage_format_by_name`; an unknown name (e.g. `garbage`) dies with
+/// `fatal: unknown ref storage format '<name>'` (exit 128). sley implements only
+/// the `files` backend, so `reftable` — a name git *does* recognise — is reported
+/// as unsupported rather than unknown, keeping the unknown-format diagnostic
+/// exact for the names git would also reject.
+fn reject_unknown_clone_ref_format(value: &str) -> Result<()> {
+    match value {
+        "files" => Ok(()),
+        "reftable" => Err(GitError::Unsupported(
+            "the reftable ref storage backend is not implemented".into(),
+        )),
+        _ => {
+            eprintln!("fatal: unknown ref storage format '{value}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 /// Parse a `--depth` value the way `git clone`/`git fetch` do: an optional `+`
 /// sign then ASCII digits, rejecting non-positive depths with git's message. The
 /// numeric value is clamped to `u32::MAX` (git stores depth as a C `int`; the
@@ -1592,14 +1621,43 @@ fn parse_clone_config_override(value: &str) -> Result<GlobalConfigOverride> {
     })
 }
 
+/// Resolve `clone.rejectshallow` for the reject-shallow gate, reading the same
+/// config git's second `git_config` pass sees: the global `-c` / `GIT_CONFIG_*`
+/// injection plus any `clone -c clone.rejectshallow=<bool>`. Returns the last
+/// (highest-precedence) value, or `None` when unset. The CLI `--reject-shallow`
+/// flag overrides this at the call site (upstream `option_reject_shallow`).
+fn clone_reject_shallow_config(config_overrides: &[GlobalConfigOverride]) -> Result<Option<bool>> {
+    let mut resolved = None;
+    for parameter in crate::injected_config_parameters()? {
+        let (section, subsection, key) = parameter.split_key();
+        if section == "clone" && subsection.is_none() && key == "rejectshallow" {
+            let value = parameter.value.as_deref().unwrap_or("true");
+            resolved = sley_config::parse_config_bool(value);
+        }
+    }
+    for override_entry in config_overrides {
+        let key = override_entry.key.to_ascii_lowercase();
+        if key == "clone.rejectshallow" {
+            resolved = sley_config::parse_config_bool(&override_entry.value);
+        }
+    }
+    Ok(resolved)
+}
+
 fn apply_clone_config_overrides(git_dir: &Path, overrides: &[GlobalConfigOverride]) -> Result<()> {
     if overrides.is_empty() {
         return Ok(());
     }
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     for override_entry in overrides {
         let key = parse_config_key(&override_entry.key)?;
-        config_set_value(&mut config, &key, &override_entry.value, false);
+        // Each `clone -c key=value` is an independent multivar addition, matching
+        // upstream `write_one_config`'s `repo_config_set_multivar_gently(...,
+        // CONFIG_REGEX_NONE, 0)` (CONFIG_REGEX_NONE => always append). Repeating
+        // `-c` on the same key accumulates (`core.foo=bar -c core.foo=baz`), an
+        // empty value persists a blank entry, and a `-c remote.<o>.fetch=<spec>`
+        // adds a second fetch refspec alongside clone's default one.
+        config_set_value(&mut config, &key, &override_entry.value, true);
     }
     write_repo_config(git_dir, &config)
 }
@@ -1616,7 +1674,7 @@ fn apply_clone_template(git_dir: &Path, template: Option<&Path>, copy_config: bo
     let template_config_path = template.join("config");
     if copy_config && template_config_path.is_file() {
         let mut template_config = GitConfig::read(template_config_path)?;
-        let current_config = read_repo_config(git_dir)?;
+        let current_config = read_repo_config_on_disk(git_dir)?;
         template_config.sections.extend(current_config.sections);
         write_repo_config(git_dir, &template_config)?;
     }
@@ -1751,7 +1809,7 @@ fn apply_clone_submodule_active(git_dir: &Path, active: &[String]) -> Result<()>
     if active.is_empty() {
         return Ok(());
     }
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let key = parse_config_key("submodule.active")?;
     for value in active {
         config_set_value(&mut config, &key, value, true);
@@ -1877,7 +1935,7 @@ fn apply_clone_sparse_checkout(
     fs::create_dir_all(git_dir.join("info"))?;
     fs::write(git_dir.join("info/sparse-checkout"), b"/*\n!/*/\n")?;
 
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let key = parse_config_key("extensions.worktreeConfig")?;
     config_set_value(&mut config, &key, "true", false);
     write_repo_config(git_dir, &config)?;
@@ -2203,7 +2261,7 @@ fn configure_clone_remote(
     tag_opt: Option<&str>,
     partial_clone_filter: Option<&str>,
 ) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     if let Some(fetch_refspec) = fetch_refspec {
         entries.push(ConfigEntry::new("fetch", Some(fetch_refspec)));
@@ -2230,14 +2288,26 @@ fn configure_clone_remote(
 }
 
 fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    let mut entries = vec![
+        ConfigEntry::new("remote", Some(remote.to_string())),
+        ConfigEntry::new("merge", Some(format!("refs/heads/{branch}"))),
+    ];
+    // Upstream `install_branch_config` consults `branch.autosetuprebase`: for a
+    // remote-tracking branch (origin is the remote, always set during clone),
+    // `remote` and `always` write `branch.<name>.rebase = true`. The value lives
+    // in the full effective config — global `~/.gitconfig` and system files —
+    // not just the on-disk repo config the write side starts from, so read the
+    // layered stack here.
+    if let Some(autosetuprebase) = clone_effective_config_value(git_dir, "branch", "autosetuprebase")
+        && matches!(autosetuprebase.to_ascii_lowercase().as_str(), "remote" | "always")
+    {
+        entries.push(ConfigEntry::new("rebase", Some("true".to_string())));
+    }
     config.sections.push(ConfigSection::new(
         "branch",
         Some(branch.to_string()),
-        vec![
-            ConfigEntry::new("remote", Some(remote.to_string())),
-            ConfigEntry::new("merge", Some(format!("refs/heads/{branch}"))),
-        ],
+        entries,
     ));
     write_repo_config(git_dir, &config)
 }
@@ -4992,9 +5062,16 @@ pub(crate) fn cmd_remote(args: &[String]) -> Result<()> {
         "set-url" => cmd_remote_set_url(&args[idx + 1..]),
         "show" => cmd_remote_show(&args[idx + 1..]),
         "update" => cmd_remote_update(&args[idx + 1..], verbose),
-        other => Err(GitError::Command(format!(
-            "unsupported remote subcommand {other}"
-        ))),
+        other => {
+            // Upstream `builtin/remote.c`: an unknown subcommand emits
+            // `error("unknown subcommand: \`%s'")` then `usage_with_options`
+            // (exit 129). The conformance test only greps the `error:` prefix.
+            eprintln!("error: unknown subcommand: `{other}'");
+            Err(remote_usage_error(
+                "git remote [-v | --verbose]",
+                "",
+            ))
+        }
     }
 }
 /// Emit a `git remote <sub>` usage block to stderr and return git's usage exit
@@ -5178,10 +5255,35 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     if mirror == RemoteAddMirror::Both {
         entries.push(ConfigEntry::new("mirror", Some("true".into())));
     }
+    // Upstream `builtin/remote.c::check_remote_collision`: a new remote may not
+    // nest with an existing one. When the new name is `<existing>/…` it is a
+    // subset of that remote; when an existing name is `<new>/…` the new name is
+    // a superset. Either collision dies (exit 128).
+    for existing in remote_names(&config) {
+        if let Some(rest) = name.strip_prefix(&existing)
+            && rest.starts_with('/')
+        {
+            eprintln!("fatal: remote name '{name}' is a subset of existing remote '{existing}'");
+            return Err(GitError::Exit(128));
+        }
+        if let Some(rest) = existing.strip_prefix(name)
+            && rest.starts_with('/')
+        {
+            eprintln!(
+                "fatal: remote name '{name}' is a superset of existing remote '{existing}'"
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
     match sley_config::remotes::add_remote(&mut config, name, entries) {
         Ok(()) => {}
         Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
-            return Err(GitError::Command(format!("remote {name} already exists")));
+            // Upstream `builtin/remote.c::add`: `error("remote %s already
+            // exists.")` then `exit(3)`. A remote counts as existing when it has
+            // any config (e.g. a foreign-vcs `remote.<name>.vcs`), which the
+            // `[remote "<name>"]` section presence already captures.
+            eprintln!("error: remote {name} already exists.");
+            return Err(GitError::Exit(3));
         }
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
             return Err(GitError::remote_not_found(name));
@@ -5284,7 +5386,10 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     match sley_config::remotes::remove_remote(&mut config, name) {
         Ok(()) => {}
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
-            return Err(GitError::remote_not_found(name));
+            // Upstream `builtin/remote.c::rm`: `error("No such remote: '%s'")`
+            // then `exit(2)`.
+            eprintln!("error: No such remote: '{name}'");
+            return Err(GitError::Exit(2));
         }
         Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
             return Err(GitError::Command(format!("remote {name} already exists")));
@@ -5425,17 +5530,30 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     }
     let old = positional[0];
     let new = positional[1];
-    validate_remote_name(old)?;
-    validate_remote_name(new)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config(&git_dir)?;
+    // Upstream `builtin/remote.c::mv` order: the old remote's existence is
+    // checked first (`error` + `exit(2)`), then the new name's collision
+    // (`exit(3)`), and only then the new name's format (`die`, exit 128). The
+    // old name is never format-validated — a configured remote with an odd name
+    // can still be renamed away.
+    let old_exists = config
+        .sections
+        .iter()
+        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(old));
+    if !old_exists {
+        eprintln!("error: No such remote: '{old}'");
+        return Err(GitError::Exit(2));
+    }
     if config
         .sections
         .iter()
         .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(new))
     {
-        return Err(GitError::Command(format!("remote {new} already exists")));
+        eprintln!("error: remote {new} already exists.");
+        return Err(GitError::Exit(3));
     }
+    validate_remote_name(new)?;
     let mut renamed = false;
     for section in &mut config.sections {
         if section.name == "remote" && section.subsection.as_deref() == Some(old) {
@@ -6264,6 +6382,33 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     sley_config::read_repo_config(git_dir, crate::effective_config_parameters_env().as_deref())
 }
 
+/// The repository's on-disk `config` file alone, with NO command-line `-c` /
+/// `GIT_CONFIG_*` injection layered on. Use this for the read side of any
+/// read-modify-write that persists the result back to the config file:
+/// [`read_repo_config`] folds the process-level injection into the returned
+/// config, so writing it back would persist `git -c key=value` into the file
+/// (upstream keeps `-c` injections process-local and never writes them out).
+/// This is the bug class behind clone wrongly baking `git -c …` into the cloned
+/// repo's config. Includes (`include.path` / `includeIf`) are still resolved.
+pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
+    sley_config::read_repo_config(git_dir, None)
+}
+
+/// A single `<section>.<key>` value from the *full effective config* (system +
+/// global + repository, includes resolved) for `git_dir`. Unlike
+/// [`read_repo_config`] — which reads only the repo's own `config` file — this
+/// layers the global `~/.gitconfig` and system files, as git does for settings
+/// like `branch.autosetuprebase` that are configured outside the cloned repo.
+fn clone_effective_config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir).ok()?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.clone()),
+        repo_current_branch_name(git_dir),
+    );
+    let config = sley_config::load_effective_config(&common_git_dir, &context).ok()?;
+    config.get(section, None, key).map(str::to_owned)
+}
+
 /// Short branch name from `HEAD` (e.g. "main"), or None when detached/unborn.
 /// Used for `includeIf "onbranch:<glob>"` resolution; reads HEAD directly so it
 /// needs no object-format or ref-store context.
@@ -6300,12 +6445,21 @@ pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
     // git's `valid_remote_name` (remote.c) builds the fetch refspec
     // `refs/heads/test:refs/remotes/<name>/test` and rejects the name if that is
     // not a valid fetch refspec — this catches names with a colon, control
-    // chars, or other refname-invalid spellings (e.g. `some:url`).
+    // chars, or other refname-invalid spellings (e.g. `some:url`). The refspec
+    // parser only screens delimiter bytes, so apply git's full
+    // `check_refname_format` to the destination ref the name produces, matching
+    // upstream's `valid_fetch_refspec` (which runs `check_refname_format` on the
+    // refspec ends): this rejects `..` (e.g. `invalid...name`), trailing dots,
+    // and `@{` that the delimiter screen lets through.
     let probe = format!("refs/heads/test:refs/remotes/{name}/test");
-    if sley_protocol::parse_refspec(&probe).is_err() {
-        return Err(GitError::InvalidFormat(format!(
-            "'{name}' is not a valid remote name"
-        )));
+    let probe_dst = format!("refs/remotes/{name}/test");
+    if sley_protocol::parse_refspec(&probe).is_err()
+        || sley_refs::check_refname_format(&probe_dst, false).is_err()
+    {
+        // Upstream `builtin/remote.c` (add / rename): `die("'%s' is not a valid
+        // remote name")` — a `fatal:` line and exit 128.
+        eprintln!("fatal: '{name}' is not a valid remote name");
+        return Err(GitError::Exit(128));
     }
     Ok(())
 }

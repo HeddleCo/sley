@@ -433,19 +433,47 @@ fn three_way_merge_trees_inner(
     let mut results = BTreeMap::new();
     let mut conflicts = Vec::new();
     for entry in merge.paths {
+        // A directory-rename location "conflict" (=conflict mode) is purely
+        // advisory: git stages the re-homed content cleanly at stage 0 and only
+        // emits an informational `CONFLICT (file location)` message + nonzero
+        // exit. Carry the resolved leaf in the `ours` stage slot and rely on the
+        // index/worktree writers to stage `DirRenameLocation` at stage 0.
+        let advisory_location = matches!(
+            entry.conflict,
+            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. })
+                | Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
+        );
         if entry.conflict.is_some() {
             conflicts.push(entry.path.clone());
-            results.insert(
-                entry.path,
-                MergePathResult::Conflict {
-                    base: entry.stages.base,
-                    ours: entry.stages.ours,
-                    theirs: entry.stages.theirs,
-                    worktree: entry.worktree,
-                    kind: entry.conflict,
-                    auto_merged: entry.auto_merged,
-                },
-            );
+            if advisory_location {
+                let worktree = match entry.result {
+                    Some((mode, oid)) => Some((mode, merge_read_blob(db, &oid)?)),
+                    None => None,
+                };
+                results.insert(
+                    entry.path,
+                    MergePathResult::Conflict {
+                        base: None,
+                        ours: entry.result,
+                        theirs: None,
+                        worktree,
+                        kind: entry.conflict,
+                        auto_merged: entry.auto_merged,
+                    },
+                );
+            } else {
+                results.insert(
+                    entry.path,
+                    MergePathResult::Conflict {
+                        base: entry.stages.base,
+                        ours: entry.stages.ours,
+                        theirs: entry.stages.theirs,
+                        worktree: entry.worktree,
+                        kind: entry.conflict,
+                        auto_merged: entry.auto_merged,
+                    },
+                );
+            }
         } else {
             results.insert(entry.path, MergePathResult::Resolved(entry.result));
         }
@@ -2407,6 +2435,22 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 entries.push(merge_index_entry(path, *mode, *oid, 0));
             }
             MergePathResult::Resolved(None) => {}
+            // A directory-rename location/implicit-collision advisory is staged
+            // cleanly at stage 0 (the path content is fully resolved); the
+            // conflict is purely a message + nonzero exit, not an unmerged entry.
+            MergePathResult::Conflict {
+                ours,
+                kind:
+                    Some(
+                        sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
+                        | sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
+                    ),
+                ..
+            } => {
+                if let Some((mode, oid)) = ours {
+                    entries.push(merge_index_entry(path, *mode, *oid, 0));
+                }
+            }
             MergePathResult::Conflict {
                 base, ours, theirs, ..
             } => {
@@ -2550,6 +2594,32 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(original_path)
                 );
             }
+            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation {
+                old_path,
+                renamed_from,
+                added_in,
+                dir_renamed_in,
+            }) => match renamed_from {
+                Some(source) => println!(
+                    "CONFLICT (file location): {src} renamed to {old} in {added_in}, inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {path_str}.",
+                    src = String::from_utf8_lossy(source),
+                    old = String::from_utf8_lossy(old_path),
+                ),
+                None => println!(
+                    "CONFLICT (file location): {old} added in {added_in} inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {path_str}.",
+                    old = String::from_utf8_lossy(old_path),
+                ),
+            },
+            Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources }) => {
+                let source_list = sources
+                    .iter()
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "CONFLICT (implicit dir rename): Existing file/dir at {path_str} in the way of implicit directory rename(s) putting the following path(s) there: {source_list}."
+                );
+            }
             None => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
             }
@@ -2580,6 +2650,16 @@ fn verify_merge_uptodate(
             MergePathResult::Conflict { .. } => true,
         };
         if differs {
+            changed.insert(path.clone());
+        }
+    }
+    // A HEAD path that the merge result no longer carries was vacated — e.g. a
+    // directory rename moved `z/c` to `y/c`, so the merge deletes `z/c`. Such a
+    // path is "changed" even though it never appears as a result entry, and a
+    // dirty worktree file there must still trip the uptodate guard (t6423 11b/d).
+    for path in ours_map.keys() {
+        let carried = matches!(results.get(path), Some(MergePathResult::Resolved(Some(_))));
+        if !carried {
             changed.insert(path.clone());
         }
     }
