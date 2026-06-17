@@ -749,7 +749,19 @@ fn merge_octopus(
     let mut merged_map = stash_tree_entry_map(&db, format, &head_tree)?;
     let mut merged_commits = vec![head_oid];
     let mut non_ff = false;
+    // git-merge-octopus allows only the LAST head to leave a hand-resolvable
+    // conflict; if a conflict occurs and another head still remains, the octopus
+    // gives up entirely.
+    let mut octopus_failure = false;
     for (name, oid) in &reduced {
+        // A prior pairwise step conflicted but more heads remained: git's
+        // "Should not be doing an octopus" bail (exit 2, no state left behind).
+        if octopus_failure {
+            eprintln!("Automated merge did not work.");
+            eprintln!("Should not be doing an octopus.");
+            eprintln!("fatal: merge program failed");
+            return Err(GitError::Exit(2));
+        }
         let mut base_args = vec![*oid];
         base_args.extend(merged_commits.iter().copied());
         let common = merge_bases_default_many(&db, format, &base_args)?;
@@ -806,10 +818,12 @@ fn merge_octopus(
             options.favor,
         )?;
         if !conflicts.is_empty() {
-            // Octopus refuses to leave conflicts for manual resolution.
-            eprintln!("Simple merge did not work, octopus merge is not possible.");
-            eprintln!("Merge with strategy octopus failed.");
-            return Err(GitError::Exit(2));
+            // git-merge-octopus: a conflict sets OCTOPUS_FAILURE but the loop
+            // continues — only the LAST head may conflict (hand-resolvable). If
+            // another head remains, the next iteration's guard above bails with
+            // "Should not be doing an octopus". Don't advance the running state.
+            octopus_failure = true;
+            continue;
         }
         let mut next: MergeTreeMap = BTreeMap::new();
         for (path, result) in results {
@@ -819,6 +833,17 @@ fn merge_octopus(
         }
         merged_map = next;
         merged_commits.push(*oid);
+    }
+
+    // The LAST head conflicted (octopus allows exactly one hand-resolvable
+    // conflict). sley's octopus does not model materialising that conflicted
+    // state, so report the failure and leave the tree untouched (exit 2), as
+    // git's octopus does for an unresolvable final step.
+    if octopus_failure {
+        eprintln!("Automated merge did not work.");
+        eprintln!("Should not be doing an octopus.");
+        eprintln!("fatal: merge program failed");
+        return Err(GitError::Exit(2));
     }
 
     if !non_ff && merged_commits.len() == 1 && reduced.len() == 1 {
@@ -926,6 +951,7 @@ fn merge_octopus(
         }
         fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
         fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+        write_merge_mode(git_dir, options)?;
         fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
         if !options.quiet {
             println!("Automatic merge went well; stopped before committing as requested");
@@ -2051,6 +2077,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if options.no_commit {
             fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
             fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            write_merge_mode(&git_dir, &options)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
@@ -2296,6 +2323,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if options.no_commit {
             fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
             fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            write_merge_mode(&git_dir, &options)?;
             write_merged_worktree()?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
@@ -2415,6 +2443,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         merge_msg.push_str(&format!("#\t{}\n", String::from_utf8_lossy(path)));
     }
     fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
+    write_merge_mode(&git_dir, &options)?;
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
     print_merge_conflict_messages(&results);
@@ -3307,6 +3336,16 @@ fn clear_in_progress_merge_state(git_dir: &Path) {
     let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(git_dir.join("MERGE_MODE"));
+}
+
+/// git's `write_merge_state` MERGE_MODE leg: write `.git/MERGE_MODE` alongside
+/// MERGE_HEAD/MERGE_MSG whenever an in-progress merge is recorded. The body is
+/// `no-ff` when `--no-ff` forced the merge, else empty — git always creates the
+/// file so `merge --quit` / `--continue` have a complete state to consume.
+fn write_merge_mode(git_dir: &Path, options: &MergeOptions) -> Result<()> {
+    let body = if options.no_ff() { "no-ff" } else { "" };
+    fs::write(git_dir.join("MERGE_MODE"), body)?;
+    Ok(())
 }
 
 fn read_worktree_index(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
