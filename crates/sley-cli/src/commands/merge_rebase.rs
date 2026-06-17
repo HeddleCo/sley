@@ -433,19 +433,46 @@ fn three_way_merge_trees_inner(
     let mut results = BTreeMap::new();
     let mut conflicts = Vec::new();
     for entry in merge.paths {
+        // A directory-rename location "conflict" (=conflict mode) is purely
+        // advisory: git stages the re-homed content cleanly at stage 0 and only
+        // emits an informational `CONFLICT (file location)` message + nonzero
+        // exit. Carry the resolved leaf in the `ours` stage slot and rely on the
+        // index/worktree writers to stage `DirRenameLocation` at stage 0.
+        let advisory_location = matches!(
+            entry.conflict,
+            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. })
+        );
         if entry.conflict.is_some() {
             conflicts.push(entry.path.clone());
-            results.insert(
-                entry.path,
-                MergePathResult::Conflict {
-                    base: entry.stages.base,
-                    ours: entry.stages.ours,
-                    theirs: entry.stages.theirs,
-                    worktree: entry.worktree,
-                    kind: entry.conflict,
-                    auto_merged: entry.auto_merged,
-                },
-            );
+            if advisory_location {
+                let worktree = match entry.result {
+                    Some((mode, oid)) => Some((mode, merge_read_blob(db, &oid)?)),
+                    None => None,
+                };
+                results.insert(
+                    entry.path,
+                    MergePathResult::Conflict {
+                        base: None,
+                        ours: entry.result,
+                        theirs: None,
+                        worktree,
+                        kind: entry.conflict,
+                        auto_merged: entry.auto_merged,
+                    },
+                );
+            } else {
+                results.insert(
+                    entry.path,
+                    MergePathResult::Conflict {
+                        base: entry.stages.base,
+                        ours: entry.stages.ours,
+                        theirs: entry.stages.theirs,
+                        worktree: entry.worktree,
+                        kind: entry.conflict,
+                        auto_merged: entry.auto_merged,
+                    },
+                );
+            }
         } else {
             results.insert(entry.path, MergePathResult::Resolved(entry.result));
         }
@@ -2407,6 +2434,18 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 entries.push(merge_index_entry(path, *mode, *oid, 0));
             }
             MergePathResult::Resolved(None) => {}
+            // A directory-rename location advisory is staged cleanly at stage 0
+            // (the re-homed content is fully resolved); the conflict is purely a
+            // message + nonzero exit, not an unmerged index entry.
+            MergePathResult::Conflict {
+                ours,
+                kind: Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }),
+                ..
+            } => {
+                if let Some((mode, oid)) = ours {
+                    entries.push(merge_index_entry(path, *mode, *oid, 0));
+                }
+            }
             MergePathResult::Conflict {
                 base, ours, theirs, ..
             } => {
