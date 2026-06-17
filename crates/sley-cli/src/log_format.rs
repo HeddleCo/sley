@@ -1078,6 +1078,37 @@ mod tests {
     }
 
     #[test]
+    fn known_g_signature_atoms_are_not_literals() {
+        let compiled = CompiledLogFormat::compile(
+            "%GG|%G?|%GS|%GK|%GF|%GP|%GT|%GX|%G",
+            LogFormatDialect::Log,
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.tokens,
+            vec![
+                FormatToken::GPlaceholder,
+                FormatToken::Literal("|".into()),
+                FormatToken::GRefname,
+                FormatToken::Literal("|".into()),
+                FormatToken::GSignature,
+                FormatToken::Literal("|".into()),
+                FormatToken::GKey,
+                FormatToken::Literal("|".into()),
+                FormatToken::GFingerprint,
+                FormatToken::Literal("|".into()),
+                FormatToken::GPassthrough,
+                FormatToken::Literal("|".into()),
+                FormatToken::GTrailers,
+                FormatToken::Literal("|".into()),
+                FormatToken::Literal("%GX".into()),
+                FormatToken::Literal("|".into()),
+                FormatToken::Literal("%G".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn decorations_tier_is_full() {
         let compiled = CompiledLogFormat::compile("%h %d", LogFormatDialect::Log).unwrap();
         assert_eq!(compiled.tier(), FormatTier::Full);

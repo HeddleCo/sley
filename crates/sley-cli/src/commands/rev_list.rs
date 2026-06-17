@@ -543,7 +543,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             && committer_filters.is_empty()
             && grep_filters.is_empty()
             && !ignore_missing
-            && !matches!(object_filter, RevListObjectFilter::TreeDepth(depth) if depth > 0)
+            && object_filter.bitmap_eligible()
             && if count {
                 // A max-count of reachable *objects* cannot be answered from
                 // a bitmap (no commit/object association); commit counting
@@ -1651,6 +1651,18 @@ impl RevListObjectFilter {
         }
     }
 
+    fn bitmap_eligible(&self) -> bool {
+        match self {
+            Self::None
+            | Self::BlobNone
+            | Self::BlobLimit(_)
+            | Self::ObjectType(_) => true,
+            Self::TreeDepth(depth) => *depth == 0,
+            Self::Combine(filters) => filters.iter().all(Self::bitmap_eligible),
+            Self::SparseOid(_) | Self::Sparse(_) => false,
+        }
+    }
+
     fn includes_object(
         &self,
         object_type: ObjectType,
@@ -2398,11 +2410,25 @@ fn rev_list_bitmap_apply_filter(
                 }
             }
         }
+        RevListObjectFilter::Combine(ref filters) => {
+            for filter in filters {
+                let subquery = RevListBitmapQuery {
+                    want_roots: query.want_roots,
+                    exclude_tips: query.exclude_tips,
+                    objects: query.objects,
+                    count: query.count,
+                    max_count: query.max_count,
+                    object_filter: filter.clone(),
+                    filter_provided_objects: query.filter_provided_objects,
+                    unpacked: query.unpacked,
+                };
+                rev_list_bitmap_apply_filter(bitmap, db, result, &subquery)?;
+            }
+        }
         // Excluded by the eligibility allowlist.
         RevListObjectFilter::TreeDepth(_)
         | RevListObjectFilter::SparseOid(_)
-        | RevListObjectFilter::Sparse(_)
-        | RevListObjectFilter::Combine(_) => unreachable!("composite filters fall back"),
+        | RevListObjectFilter::Sparse(_) => unreachable!("unsupported filters fall back"),
     }
     Ok(())
 }
