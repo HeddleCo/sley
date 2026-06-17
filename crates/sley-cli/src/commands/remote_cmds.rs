@@ -5226,7 +5226,10 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     match sley_config::remotes::remove_remote(&mut config, name) {
         Ok(()) => {}
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
-            return Err(GitError::remote_not_found(name));
+            // Upstream `builtin/remote.c::rm`: `error("No such remote: '%s'")`
+            // then `exit(2)`.
+            eprintln!("error: No such remote: '{name}'");
+            return Err(GitError::Exit(2));
         }
         Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
             return Err(GitError::Command(format!("remote {name} already exists")));
@@ -5367,17 +5370,30 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     }
     let old = positional[0];
     let new = positional[1];
-    validate_remote_name(old)?;
-    validate_remote_name(new)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config(&git_dir)?;
+    // Upstream `builtin/remote.c::mv` order: the old remote's existence is
+    // checked first (`error` + `exit(2)`), then the new name's collision
+    // (`exit(3)`), and only then the new name's format (`die`, exit 128). The
+    // old name is never format-validated — a configured remote with an odd name
+    // can still be renamed away.
+    let old_exists = config
+        .sections
+        .iter()
+        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(old));
+    if !old_exists {
+        eprintln!("error: No such remote: '{old}'");
+        return Err(GitError::Exit(2));
+    }
     if config
         .sections
         .iter()
         .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(new))
     {
-        return Err(GitError::Command(format!("remote {new} already exists")));
+        eprintln!("error: remote {new} already exists.");
+        return Err(GitError::Exit(3));
     }
+    validate_remote_name(new)?;
     let mut renamed = false;
     for section in &mut config.sections {
         if section.name == "remote" && section.subsection.as_deref() == Some(old) {
@@ -6254,12 +6270,21 @@ pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
     // git's `valid_remote_name` (remote.c) builds the fetch refspec
     // `refs/heads/test:refs/remotes/<name>/test` and rejects the name if that is
     // not a valid fetch refspec — this catches names with a colon, control
-    // chars, or other refname-invalid spellings (e.g. `some:url`).
+    // chars, or other refname-invalid spellings (e.g. `some:url`). The refspec
+    // parser only screens delimiter bytes, so apply git's full
+    // `check_refname_format` to the destination ref the name produces, matching
+    // upstream's `valid_fetch_refspec` (which runs `check_refname_format` on the
+    // refspec ends): this rejects `..` (e.g. `invalid...name`), trailing dots,
+    // and `@{` that the delimiter screen lets through.
     let probe = format!("refs/heads/test:refs/remotes/{name}/test");
-    if sley_protocol::parse_refspec(&probe).is_err() {
-        return Err(GitError::InvalidFormat(format!(
-            "'{name}' is not a valid remote name"
-        )));
+    let probe_dst = format!("refs/remotes/{name}/test");
+    if sley_protocol::parse_refspec(&probe).is_err()
+        || sley_refs::check_refname_format(&probe_dst, false).is_err()
+    {
+        // Upstream `builtin/remote.c` (add / rename): `die("'%s' is not a valid
+        // remote name")` — a `fatal:` line and exit 128.
+        eprintln!("fatal: '{name}' is not a valid remote name");
+        return Err(GitError::Exit(128));
     }
     Ok(())
 }
