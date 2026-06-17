@@ -633,14 +633,10 @@ fn parse_g_atom(value: &str) -> Result<(FormatToken, usize)> {
         Some('F') => FormatToken::GFingerprint,
         Some('P') => FormatToken::GPassthrough,
         Some(other) => {
-            return Err(GitError::Command(format!(
-                "unsupported log format placeholder %G{other}"
-            )));
+            return Ok((FormatToken::Literal(format!("%G{other}")), 2));
         }
         None => {
-            return Err(GitError::Command(
-                "unterminated log format placeholder %G".into(),
-            ));
+            return Ok((FormatToken::Literal("%G".into()), 1));
         }
     };
     Ok((token, 2))
@@ -1079,6 +1075,37 @@ mod tests {
     fn g_placeholders_are_not_oid_only() {
         let compiled = CompiledLogFormat::compile("%G?|%GS", LogFormatDialect::Log).unwrap();
         assert!(!compiled.is_oid_only());
+    }
+
+    #[test]
+    fn known_g_signature_atoms_are_not_literals() {
+        let compiled = CompiledLogFormat::compile(
+            "%GG|%G?|%GS|%GK|%GF|%GP|%GT|%GX|%G",
+            LogFormatDialect::Log,
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.tokens,
+            vec![
+                FormatToken::GPlaceholder,
+                FormatToken::Literal("|".into()),
+                FormatToken::GRefname,
+                FormatToken::Literal("|".into()),
+                FormatToken::GSignature,
+                FormatToken::Literal("|".into()),
+                FormatToken::GKey,
+                FormatToken::Literal("|".into()),
+                FormatToken::GFingerprint,
+                FormatToken::Literal("|".into()),
+                FormatToken::GPassthrough,
+                FormatToken::Literal("|".into()),
+                FormatToken::GTrailers,
+                FormatToken::Literal("|".into()),
+                FormatToken::Literal("%GX".into()),
+                FormatToken::Literal("|".into()),
+                FormatToken::Literal("%G".into()),
+            ]
+        );
     }
 
     #[test]
