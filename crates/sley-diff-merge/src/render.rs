@@ -522,10 +522,9 @@ fn score_add_split(m: &SplitMeasurement, s: &mut SplitScore) {
 
     s.effective_indent += indent;
 
-    if indent == -1 {
-        // No additional adjustments needed.
-    } else if m.pre_indent == -1 {
-        // No additional adjustments needed.
+    if indent == -1 || m.pre_indent == -1 {
+        // End of file, or no non-blank predecessor: no adjustment needed
+        // (git's two separate `indent == -1` / `pre_indent == -1` no-op arms).
     } else if indent > m.pre_indent {
         s.penalty += if any_blanks {
             RELATIVE_INDENT_WITH_BLANK_PENALTY
