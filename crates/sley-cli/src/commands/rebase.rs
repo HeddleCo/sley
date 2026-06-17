@@ -2735,7 +2735,7 @@ fn stop_with_patch(
     db: &FileObjectDatabase,
     opts: &MachineOpts,
     record: &sley_rev::CommitRecord,
-    item: &RebaseTodoItem,
+    _item: &RebaseTodoItem,
     exit_code: i32,
     to_amend: bool,
 ) -> Result<PickOutcome> {

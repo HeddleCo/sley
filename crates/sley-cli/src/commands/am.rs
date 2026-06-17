@@ -1574,6 +1574,18 @@ fn try_straight_apply(
 ) -> Result<Option<Vec<ApplyFileAction>>> {
     let mut actions = Vec::new();
     for patch in file_patches {
+        // git apply (`check_to_create` in apply.c) rejects a create patch when
+        // the target already exists in the working tree — the whole patch fails
+        // ("already exists in working directory"), which the am/rebase caller
+        // turns into a conflict. Without this, a "new file" patch silently
+        // clobbers an existing file instead of conflicting.
+        if patch.is_new
+            && let Some(target) = patch.new_path.as_deref().or(patch.old_path.as_deref())
+            && let Ok(rel) = std::str::from_utf8(target)
+            && worktree_root.join(rel).exists()
+        {
+            return Ok(None);
+        }
         let base = if patch.is_new {
             Vec::new()
         } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
