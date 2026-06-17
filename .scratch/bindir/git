@@ -1,0 +1,7 @@
+#!/bin/sh
+SLEY_BIN='/home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-merge-porcelain/release/sley'
+SHIM_DIR='/home/heddleco/dev/HeddleCo/workspace/parity-merge-porcelain/.scratch/bindir'
+case "${1:-}" in
+  --exec-path|--man-path|--html-path|--info-path) printf '%s\n' "$SHIM_DIR"; exit 0;;
+esac
+exec "$SLEY_BIN" "$@"

@@ -1,0 +1,49 @@
+not ok 3 - merge -h with invalid index
+not ok 11 - merge from unborn branch
+not ok 12 - merge c1 with c2
+not ok 13 - merge c1 with c2 when index.lock exists
+not ok 14 - merge --squash c3 with c7
+not ok 15 - merge --squash --autostash conflict does not attempt to apply autostash
+not ok 16 - merge c3 with c7 with commit.cleanup = scissors
+not ok 17 - merge c3 with c7 with --squash commit.cleanup = scissors
+not ok 18 - merge c1 with c2 and c3
+not ok 19 - merges with --ff-only
+not ok 20 - merges with merge.ff=only
+not ok 23 - merge c1 with c2 and c3 (no-commit)
+not ok 28 - merge c1 with c2 and c3 (squash)
+not ok 29 - merge c1 with c2 (no-commit in config)
+not ok 30 - merge c1 with c2 (log in config)
+not ok 31 - merge c1 with c2 (log in config gets overridden)
+not ok 32 - merge c1 with c2 (squash in config)
+not ok 33 - override config option -n with --summary
+not ok 34 - override config option -n with --stat
+not ok 35 - override config option --stat
+not ok 36 - merge c1 with c2 (override --no-commit)
+not ok 37 - merge c1 with c2 (override --squash)
+not ok 40 - combine branch.main.mergeoptions with merge.ff
+not ok 46 - merge c0 with c1 (ff overrides no-ff)
+not ok 47 - merge log message
+not ok 52 - in-index merge
+not ok 54 - merge with --autostash
+not ok 55 - merge with merge.autoStash
+not ok 56 - fast-forward merge with --autostash
+not ok 57 - failed fast-forward merge with --autostash
+not ok 58 - octopus merge with --autostash
+not ok 59 - failed merge (exit 2) with --autostash
+not ok 60 - conflicted merge with --autostash, --abort restores stash
+not ok 61 - completed merge (git commit) with --no-commit and --autostash
+not ok 62 - completed merge (git merge --continue) with --no-commit and --autostash
+not ok 63 - aborted merge (merge --abort) with --no-commit and --autostash
+not ok 64 - aborted merge (reset --hard) with --no-commit and --autostash
+not ok 65 - quit merge with --no-commit and --autostash
+not ok 66 - merge with conflicted --autostash changes
+not ok 67 - merge early part of c2
+not ok 70 - merge --no-ff --edit
+not ok 71 - merge annotated/signed tag w/o tracking
+not ok 72 - merge annotated/signed tag w/ tracking
+not ok 73 - merge --ff-only tag
+not ok 74 - merge --no-edit tag should skip editor
+not ok 80 - killed merge can be completed with --continue
+not ok 81 - merge --quit
+not ok 82 - merge suggests matching remote refname
+not ok 83 - suggested names are not ambiguous

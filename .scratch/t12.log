@@ -1,0 +1,110 @@
+ok 1 - setup
+ok 2 - test option parsing
+ok 3 # skip merge -h with invalid index (--run)
+ok 4 - reject non-strategy with a git-merge-foo name
+ok 5 - merge c0 with c1
+ok 6 - merge c0 with c1 with --ff-only
+ok 7 - the same merge with merge.stat=diffstat
+ok 8 - the same merge with compact summary
+ok 9 - the same merge with compact summary
+ok 10 - the same merge with merge.stat=compact
+not ok 11 - merge from unborn branch
+#	
+#		git checkout -f main &&
+#		test_might_fail git branch -D kid &&
+#	
+#		echo "OBJID HEAD@{0}: initial pull" >reflog.expected &&
+#	
+#		git checkout --orphan kid &&
+#		test_when_finished "git checkout -f main" &&
+#		git rm -fr . &&
+#		test_tick &&
+#		git merge --ff-only c1 &&
+#		verify_merge file result.1 &&
+#		verify_head "$c1" &&
+#	
+#		git reflog -1 >reflog.actual &&
+#		sed "s/$_x05[0-9a-f][0-9a-f]/OBJID/g" reflog.actual >reflog.fuzzy &&
+#		test_cmp reflog.expected reflog.fuzzy
+#	
+not ok 12 - merge c1 with c2
+#	
+#		git reset --hard c1 &&
+#		test_tick &&
+#		git merge c2 &&
+#		verify_merge file result.1-5 msg.1-5 &&
+#		verify_parents $c1 $c2
+#	
+ok 13 # skip merge c1 with c2 when index.lock exists (--run)
+ok 14 # skip merge --squash c3 with c7 (--run)
+ok 15 # skip merge --squash --autostash conflict does not attempt to apply autostash (--run)
+ok 16 # skip merge c3 with c7 with commit.cleanup = scissors (--run)
+ok 17 # skip merge c3 with c7 with --squash commit.cleanup = scissors (--run)
+ok 18 # skip merge c1 with c2 and c3 (--run)
+ok 19 # skip merges with --ff-only (--run)
+ok 20 # skip merges with merge.ff=only (--run)
+ok 21 # skip merge c0 with c1 (no-commit) (--run)
+ok 22 # skip merge c1 with c2 (no-commit) (--run)
+ok 23 # skip merge c1 with c2 and c3 (no-commit) (--run)
+ok 24 # skip merge c0 with c1 (squash) (--run)
+ok 25 # skip merge c0 with c1 (squash, ff-only) (--run)
+ok 26 # skip merge c1 with c2 (squash) (--run)
+ok 27 # skip unsuccessful merge of c1 with c2 (squash, ff-only) (--run)
+ok 28 # skip merge c1 with c2 and c3 (squash) (--run)
+ok 29 # skip merge c1 with c2 (no-commit in config) (--run)
+ok 30 # skip merge c1 with c2 (log in config) (--run)
+ok 31 # skip merge c1 with c2 (log in config gets overridden) (--run)
+ok 32 # skip merge c1 with c2 (squash in config) (--run)
+ok 33 # skip override config option -n with --summary (--run)
+ok 34 # skip override config option -n with --stat (--run)
+ok 35 # skip override config option --stat (--run)
+ok 36 # skip merge c1 with c2 (override --no-commit) (--run)
+ok 37 # skip merge c1 with c2 (override --squash) (--run)
+ok 38 # skip merge c0 with c1 (no-ff) (--run)
+ok 39 # skip merge c0 with c1 (merge.ff=false) (--run)
+ok 40 # skip combine branch.main.mergeoptions with merge.ff (--run)
+ok 41 # skip tolerate unknown values for merge.ff (--run)
+ok 42 # skip combining --squash and --no-ff is refused (--run)
+ok 43 # skip combining --squash and --commit is refused (--run)
+ok 44 # skip option --ff-only overwrites --no-ff (--run)
+ok 45 # skip option --no-ff overrides merge.ff=only config (--run)
+ok 46 # skip merge c0 with c1 (ff overrides no-ff) (--run)
+ok 47 # skip merge log message (--run)
+ok 48 # skip merge c1 with c0, c2, c0, and c1 (--run)
+ok 49 # skip merge c1 with c0, c2, c0, and c1 (--run)
+ok 50 # skip merge c1 with c1 and c2 (--run)
+ok 51 # skip merge fast-forward in a dirty tree (--run)
+ok 52 # skip in-index merge (--run)
+ok 53 # skip refresh the index before merging (--run)
+ok 54 # skip merge with --autostash (--run)
+ok 55 # skip merge with merge.autoStash (--run)
+ok 56 # skip fast-forward merge with --autostash (--run)
+ok 57 # skip failed fast-forward merge with --autostash (--run)
+ok 58 # skip octopus merge with --autostash (--run)
+ok 59 # skip failed merge (exit 2) with --autostash (--run)
+ok 60 # skip conflicted merge with --autostash, --abort restores stash (--run)
+ok 61 # skip completed merge (git commit) with --no-commit and --autostash (--run)
+ok 62 # skip completed merge (git merge --continue) with --no-commit and --autostash (--run)
+ok 63 # skip aborted merge (merge --abort) with --no-commit and --autostash (--run)
+ok 64 # skip aborted merge (reset --hard) with --no-commit and --autostash (--run)
+ok 65 # skip quit merge with --no-commit and --autostash (--run)
+ok 66 # skip merge with conflicted --autostash changes (--run)
+ok 67 # skip merge early part of c2 (--run)
+ok 68 # skip merge --no-ff --no-commit && commit (--run)
+ok 69 # skip amending no-ff merge commit (--run)
+ok 70 # skip merge --no-ff --edit (--run)
+ok 71 # skip merge annotated/signed tag w/o tracking (--run)
+ok 72 # skip merge annotated/signed tag w/ tracking (--run)
+ok 73 # skip merge --ff-only tag (--run)
+ok 74 # skip merge --no-edit tag should skip editor (--run)
+ok 75 # skip set up mod-256 conflict scenario (--run)
+ok 76 # skip merge detects mod-256 conflicts (recursive) (--run)
+ok 77 # skip merge detects mod-256 conflicts (resolve) (--run)
+ok 78 # skip merge nothing into void (--run)
+ok 79 # skip merge can be completed with --continue (--run)
+ok 80 # skip killed merge can be completed with --continue (--run)
+ok 81 # skip merge --quit (--run)
+ok 82 # skip merge suggests matching remote refname (--run)
+ok 83 # skip suggested names are not ambiguous (--run)
+# failed 2 among 83 test(s)
+1..83
