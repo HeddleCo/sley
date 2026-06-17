@@ -1180,35 +1180,35 @@ fn select_submodules_for_summary<'a>(
     selected
 }
 
-fn resolve_submodule_init_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
-    if !(url.starts_with("../") || url.starts_with("./")) {
-        return url.to_string();
+/// Resolve a `.gitmodules` submodule url to the concrete url recorded in
+/// `.git/config`, via the `sley-submodule` `relative_url` primitive (git's
+/// `submodule--helper.c::resolve_relative_url`). When the superproject has no
+/// `remote.<default>.url`, git warns and falls back to its own worktree root as
+/// the authoritative upstream (`xgetcwd()`); `warn_on_missing_remote` mirrors the
+/// `init` path's warning, which `sync` suppresses.
+fn resolve_submodule_relative_url(
+    worktree_root: &Path,
+    config: &GitConfig,
+    url: &str,
+    warn_on_missing_remote: bool,
+) -> String {
+    let base = config.get("remote", Some("origin"), "url");
+    if base.is_none() && warn_on_missing_remote && (url.starts_with("../") || url.starts_with("./"))
+    {
+        eprintln!(
+            "warning: could not look up configuration 'remote.origin.url'. Assuming this repository is its own authoritative upstream."
+        );
     }
-    let base = config
-        .get("remote", Some("origin"), "url")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .and_then(|path| path.parent().map(|parent| parent.join(url)))
-        .unwrap_or_else(|| {
-            eprintln!(
-                "warning: could not look up configuration 'remote.origin.url'. Assuming this repository is its own authoritative upstream."
-            );
-            worktree_root.join(url)
-        });
-    normalize_lexical_path(&base).display().to_string()
+    let cwd_fallback = worktree_root.to_string_lossy();
+    sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None)
+}
+
+fn resolve_submodule_init_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
+    resolve_submodule_relative_url(worktree_root, config, url, true)
 }
 
 fn resolve_submodule_sync_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
-    if !(url.starts_with("../") || url.starts_with("./")) {
-        return url.to_string();
-    }
-    let base = config
-        .get("remote", Some("origin"), "url")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .and_then(|path| path.parent().map(|parent| parent.join(url)))
-        .unwrap_or_else(|| worktree_root.join(url));
-    normalize_lexical_path(&base).display().to_string()
+    resolve_submodule_relative_url(worktree_root, config, url, false)
 }
 
 fn set_submodule_config_value(config: &mut GitConfig, name: &str, key: &str, value: &str) {
