@@ -359,11 +359,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff output indicator controls are not supported for this output mode".into(),
         ));
     }
-    if diff_patch_context_control && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff patch context controls are not supported for this output mode".into(),
-        ));
-    }
+    let patch_context = if diff_patch_context_control {
+        sley_diff_merge::render::enable_function_context(context.unwrap_or(3))
+    } else {
+        context.unwrap_or(3)
+    };
     if diff_patch_output_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff patch output controls are not supported for this output mode".into(),
@@ -418,7 +418,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             &cwd,
             &paths,
             DiffNoIndexParams {
-                context: context.unwrap_or(3),
+                context: patch_context,
                 color: color_always,
                 word_diff_mode,
                 word_diff_regex: word_diff_regex.as_deref(),
@@ -851,7 +851,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 worktree_root.as_deref(),
                 use_worktree_new,
                 interhunk.unwrap_or(0),
-                context.unwrap_or(3),
+                patch_context,
                 ws_ignore,
                 ignore_blank_lines,
                 &ignore_regexes,
@@ -1040,7 +1040,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     abbrev: patch_abbrev,
                     src_prefix: &src_prefix,
                     dst_prefix: &dst_prefix,
-                    context: context.unwrap_or(3),
+                    context: patch_context,
                     userdiff: Some(&userdiff),
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
