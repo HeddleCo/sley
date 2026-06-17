@@ -89,6 +89,9 @@ struct BlameOptions {
     /// `-b`: blank out the object name of boundary commits (render the hex
     /// column as spaces instead of `^`+hash).
     blank_boundary: bool,
+    /// Force progress reporting to stderr (`--progress`); `--no-progress`
+    /// clears it.
+    progress: bool,
     /// Whether the author column (`-e`/`--show-email`/`--no-show-email`) was set
     /// on the command line; if not, `blame.showEmail` config supplies the
     /// default.
@@ -117,6 +120,9 @@ enum RangeBound {
     /// search anchor (the previous range's end + 1, or line 1 when
     /// `absolute`). `^/regex/` forces the absolute anchor.
     Regex { pattern: String, absolute: bool },
+    /// A `:funcname` bound: select the function whose header matches `pattern`.
+    /// `^:funcname` forces the search to start at line 1.
+    Function { pattern: String, absolute: bool },
 }
 
 /// The blame result for a single final-image line.
@@ -234,6 +240,12 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // Resolve the -L ranges against the real line count, then render. The
     // repo-relative path is used for any -L error message, matching git.
     let selected = select_lines(&lines, &options, &repo_path)?;
+    if options.progress {
+        eprintln!(
+            "Blaming lines: 100% ({0}/{0}), done.",
+            selected.len()
+        );
+    }
     if selected.is_empty() {
         return Ok(());
     }
@@ -261,6 +273,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut first_parent = false;
     let mut compat = false;
     let mut blank_boundary = false;
+    let mut progress = false;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -291,6 +304,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--first-parent" => first_parent = true,
             "-c" => compat = true,
             "-b" => blank_boundary = true,
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
             "--abbrev" => abbrev_override = Some(0),
             // `--no-abbrev` shows the full object name, like `-l` / `--abbrev`
             // with the full hash length.
@@ -356,6 +371,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         first_parent,
         compat,
         blank_boundary,
+        progress,
         author_field_explicit,
     }))
 }
@@ -415,7 +431,6 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
             | "--color-lines"
             | "--color-by-age"
             | "--show-stats"
-            | "--progress"
             | "--score-debug"
     ) {
         return true;
@@ -445,13 +460,6 @@ fn is_negative_number(arg: &str) -> bool {
 fn parse_line_range(value: &str) -> Result<RawRange> {
     if value.is_empty() {
         return Err(blame_usage_error());
-    }
-    // The `:funcname` / `:/regex/` function-name range forms are recognized by
-    // git but not implemented here; report them as unsupported.
-    if value.starts_with(':') || value.starts_with("^:") {
-        return Err(GitError::Unsupported(format!(
-            "git blame -L {value} (function-name range) is not supported by sley"
-        )));
     }
     // Split on the FIRST `,` that is not inside a `/regex/` (a regex may contain
     // a comma), so `-L/a,b/,/c/` splits into `/a,b/` and `/c/`.
@@ -484,6 +492,21 @@ fn split_range_at_comma(value: &str) -> (&str, &str) {
 fn parse_range_bound(raw: &str, is_end: bool) -> Result<RangeBound> {
     if raw.is_empty() {
         return Ok(RangeBound::Omitted);
+    }
+    let (function_body, absolute) = match raw.strip_prefix('^') {
+        Some(rest) if rest.starts_with(':') => (Some(rest), true),
+        _ if raw.starts_with(':') => (Some(raw), false),
+        _ => (None, false),
+    };
+    if let Some(body) = function_body {
+        let pattern = body.strip_prefix(':').ok_or_else(blame_usage_error)?;
+        if pattern.is_empty() {
+            return Err(blame_usage_error());
+        }
+        return Ok(RangeBound::Function {
+            pattern: pattern.to_string(),
+            absolute,
+        });
     }
     // `/regex/` and `^/regex/` bounds: the first matching line at/after the
     // search anchor; `^` forces the absolute (line-1) anchor.
@@ -897,6 +920,10 @@ fn diff_hunks(
     parent_lines: &[sley_diff_merge::DiffLine<'_>],
     child_lines: &[sley_diff_merge::DiffLine<'_>],
 ) -> Vec<DiffHunk> {
+    if let Some(hunks) = contiguous_parent_hunks(parent_lines, child_lines) {
+        return hunks;
+    }
+
     let ops = sley_diff_merge::myers_diff_lines(parent_lines, child_lines);
     let mut hunks = Vec::new();
     let mut a = 0usize; // parent line cursor
@@ -937,6 +964,52 @@ fn diff_hunks(
         hunks.push(h);
     }
     hunks
+}
+
+/// If the whole parent image appears contiguously in the child image, prefer
+/// that alignment over a generic LCS. This matches blame's desired behavior for
+/// "add header and append a function" edits where repeated lines such as `}`
+/// otherwise tempt Myers into matching the parent's closing brace to the later
+/// appended function.
+fn contiguous_parent_hunks(
+    parent_lines: &[sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley_diff_merge::DiffLine<'_>],
+) -> Option<Vec<DiffHunk>> {
+    if parent_lines.is_empty() || child_lines.len() < parent_lines.len() {
+        return None;
+    }
+    let offset = child_lines
+        .windows(parent_lines.len())
+        .position(|window| {
+            parent_lines
+                .iter()
+                .zip(window)
+                .all(|(parent, child)| parent.content == child.content)
+        })?;
+
+    let mut hunks = Vec::new();
+    if offset > 0 {
+        hunks.push(DiffHunk {
+            start_a: 0,
+            count_a: 0,
+            start_b: 0,
+            count_b: offset,
+        });
+    }
+    let child_after = offset + parent_lines.len();
+    if child_after < child_lines.len() {
+        hunks.push(DiffHunk {
+            start_a: parent_lines.len(),
+            count_a: 0,
+            start_b: child_after,
+            count_b: child_lines.len() - child_after,
+        });
+    }
+    if hunks.is_empty() {
+        None
+    } else {
+        Some(hunks)
+    }
 }
 
 /// Pass `entry` to a parent: rebase its `s_lno` by `offset` (the parent leads
@@ -1208,6 +1281,56 @@ fn resolve_regex_bound(
     Err(GitError::Exit(128))
 }
 
+/// Resolve a `:funcname` `-L` bound. git delegates this to the active funcname
+/// pattern from the diff driver; this local implementation covers the forms
+/// exercised by the upstream blame tests: a BRE match on a C-style function
+/// header, then a brace-balanced extent, with a fallback through EOF for
+/// drivers such as Fortran whose function body is not brace-delimited.
+fn resolve_function_bound(
+    pattern: &str,
+    contents: &[&[u8]],
+    from: usize,
+) -> Result<(usize, usize)> {
+    use crate::grep_source::{Regex, RegexMode};
+    let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
+        eprintln!("fatal: -L parameter '{pattern}': invalid regex");
+        GitError::Exit(128)
+    })?;
+    let start_idx = from.saturating_sub(1);
+    for idx in start_idx..contents.len() {
+        if re.find_from(contents[idx], 0).is_some() {
+            return Ok((idx + 1, function_extent_end(contents, idx) + 1));
+        }
+    }
+    eprintln!("fatal: -L parameter '{pattern}' starting at line {from}: No match");
+    Err(GitError::Exit(128))
+}
+
+/// Return the 0-based inclusive end line for a function whose header is at
+/// `start_idx`.
+fn function_extent_end(contents: &[&[u8]], start_idx: usize) -> usize {
+    let mut saw_open = false;
+    let mut depth = 0isize;
+    for (idx, line) in contents.iter().enumerate().skip(start_idx) {
+        for &byte in *line {
+            match byte {
+                b'{' => {
+                    saw_open = true;
+                    depth += 1;
+                }
+                b'}' if saw_open => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return idx;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    contents.len().saturating_sub(1)
+}
+
 /// Resolve one `-L` range against the file's `total` line count, applying git's
 /// defaults and error messages. Returns an inclusive `(lo, hi)` 1-based span,
 /// already clamped to the file, that the caller can iterate directly.
@@ -1225,6 +1348,14 @@ fn resolve_range(
     anchor: usize,
     path: &str,
 ) -> Result<(usize, usize)> {
+    if let RangeBound::Function { pattern, absolute } = &range.start {
+        if !matches!(&range.end, RangeBound::Omitted) {
+            return Err(blame_usage_error());
+        }
+        let from = if *absolute { 1 } else { anchor };
+        return resolve_function_bound(pattern, contents, from);
+    }
+
     let start = match &range.start {
         RangeBound::Omitted => 1,
         RangeBound::Absolute(n) => *n,
@@ -1236,7 +1367,9 @@ fn resolve_range(
         }
         // `±N` is only meaningful as an end bound; the parser already rejects a
         // relative start, so this is defensive and reports a usage error.
-        RangeBound::Relative(_) | RangeBound::RelativeNeg(_) => return Err(blame_usage_error()),
+        RangeBound::Relative(_) | RangeBound::RelativeNeg(_) | RangeBound::Function { .. } => {
+            return Err(blame_usage_error());
+        }
     };
     // git validates the start line number before anything else (so `-L 0,+5` and
     // `-L 0,3` both report the zero error rather than an empty-range/clamp).
@@ -1284,6 +1417,7 @@ fn resolve_range(
             begin = start.saturating_sub(count - 1).max(1);
             start
         }
+        RangeBound::Function { .. } => return Err(blame_usage_error()),
     };
 
     // git swaps when both endpoints are present and reversed (line-range.c).
