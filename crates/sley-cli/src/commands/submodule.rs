@@ -129,6 +129,10 @@ struct SubmoduleUpdateOptions<'a> {
     depth: Option<u32>,
     /// `--filter <spec>` partial-clone filter (requires `--init`).
     filter: Option<String>,
+    /// git's `--super-prefix=<path>/`: the displaypath prefix carried into a
+    /// recursive child so nested "Submodule path '<a/b>'" lines are anchored at
+    /// the recursion root. Empty at the top level.
+    super_prefix: String,
     paths: Vec<&'a str>,
 }
 
@@ -376,7 +380,12 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
             // An unmerged (stage > 0) gitlink is skipped with a notice — git's
             // `prepare_to_clone_next_submodule` "Skipping unmerged submodule".
             if submodule_index_is_unmerged(&index, &submodule.path) {
-                let display = display_submodule_path(&cwd, &worktree_root, &submodule.path)?;
+                let display = submodule_displaypath(
+                    &cwd,
+                    &worktree_root,
+                    &submodule.path,
+                    &options.super_prefix,
+                )?;
                 eprintln!("Skipping unmerged submodule {display}");
             }
             continue;
@@ -427,7 +436,7 @@ fn update_one_submodule(
     target_oid: &ObjectId,
     options: &SubmoduleUpdateOptions<'_>,
 ) -> Result<UpdateOutcome> {
-    let display = display_submodule_path(cwd, worktree_root, &submodule.path)?;
+    let display = submodule_displaypath(cwd, worktree_root, &submodule.path, &options.super_prefix)?;
     let path = worktree_root.join(&submodule.path);
 
     // git's `prepare_to_clone_next_submodule`: an update=none submodule (from
@@ -455,8 +464,13 @@ fn update_one_submodule(
         .get("submodule", Some(&submodule.name), "url")
         .map(str::to_string)
     else {
-        eprintln!("Submodule path '{}' not initialized", submodule.path);
-        eprintln!("Maybe you want to use 'update --init'?");
+        // git only emits this nudge when an explicit pathspec named the
+        // uninitialized submodule (`warn_if_uninitialized`); a bare `update`
+        // silently skips uninitialized ones.
+        if !options.paths.is_empty() {
+            eprintln!("Submodule path '{display}' not initialized");
+            eprintln!("Maybe you want to use 'update --init'?");
+        }
         return Ok(UpdateOutcome::Done);
     };
 
@@ -852,6 +866,9 @@ fn recurse_submodule_update(
     if options.force {
         command.arg("--force");
     }
+    // Carry the displaypath prefix so the child's nested messages read
+    // `<this>/<sub>` — git's `--super-prefix=<displaypath>/`.
+    command.arg(format!("--super-prefix={display}/"));
     io::stdout().flush()?;
     let status = command
         .current_dir(submodule_root)
@@ -877,6 +894,7 @@ fn parse_submodule_update_options(
     let mut cli_default = UpdateType::Unspecified;
     let mut depth = None;
     let mut filter = None;
+    let mut super_prefix = String::new();
     let mut paths = Vec::new();
     let mut positional_only = false;
     let mut index = 0;
@@ -952,6 +970,10 @@ fn parse_submodule_update_options(
             value if let Some(value) = value.strip_prefix("--filter=") => {
                 filter = Some(value.to_string());
             }
+            // Internal: the recursion displaypath prefix (git's --super-prefix).
+            value if let Some(value) = value.strip_prefix("--super-prefix=") => {
+                super_prefix = value.to_string();
+            }
             value if value.starts_with('-') => return submodule_usage(),
             value => paths.push(value),
         }
@@ -972,6 +994,7 @@ fn parse_submodule_update_options(
         cli_default,
         depth,
         filter,
+        super_prefix,
         paths,
     })
 }
@@ -2727,6 +2750,24 @@ fn normalize_submodule_pathspec(cwd: &Path, worktree_root: &Path, path: &str) ->
 fn display_submodule_path(cwd: &Path, worktree_root: &Path, path: &str) -> Result<String> {
     let absolute = fs::canonicalize(worktree_root)?.join(path);
     relative_path_from_absolute(cwd, &absolute).map(|path| path.trim_end_matches('/').to_string())
+}
+
+/// git's `get_submodule_displaypath`: when a `super_prefix` is carried (a
+/// recursive child), the displaypath is `super_prefix + path` so nested
+/// submodule messages are anchored at the recursion root (e.g. `middle/bottom`
+/// rather than just `bottom`). At the top level the prefix is empty and we fall
+/// back to the cwd-relative form.
+fn submodule_displaypath(
+    cwd: &Path,
+    worktree_root: &Path,
+    path: &str,
+    super_prefix: &str,
+) -> Result<String> {
+    if super_prefix.is_empty() {
+        display_submodule_path(cwd, worktree_root, path)
+    } else {
+        Ok(format!("{super_prefix}{path}"))
+    }
 }
 
 fn lexical_relative_path(root: &Path, target: &Path) -> Option<String> {
