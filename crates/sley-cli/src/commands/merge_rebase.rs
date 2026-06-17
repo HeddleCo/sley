@@ -937,8 +937,10 @@ fn merge_octopus(
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let mut write_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let mut parents = vec![head_oid];
-    parents.extend(reduced.iter().map(|(_, oid)| *oid));
+    // git-merge-octopus records its MRC chain as the parent set: HEAD, with the
+    // first parent replaced by the head it fast-forwarded to, then every
+    // subsequently-merged head appended. `merged_commits` is exactly that chain.
+    let parents = merged_commits.clone();
     let merged_oid = sley_sequencer::create_commit(
         &mut write_db,
         sley_sequencer::CommitCreate {
