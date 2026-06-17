@@ -2638,6 +2638,16 @@ fn verify_merge_uptodate(
             changed.insert(path.clone());
         }
     }
+    // A HEAD path that the merge result no longer carries was vacated — e.g. a
+    // directory rename moved `z/c` to `y/c`, so the merge deletes `z/c`. Such a
+    // path is "changed" even though it never appears as a result entry, and a
+    // dirty worktree file there must still trip the uptodate guard (t6423 11b/d).
+    for path in ours_map.keys() {
+        let carried = matches!(results.get(path), Some(MergePathResult::Resolved(Some(_))));
+        if !carried {
+            changed.insert(path.clone());
+        }
+    }
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {

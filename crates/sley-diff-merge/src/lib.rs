@@ -5095,7 +5095,7 @@ pub fn merge_entry_maps(
     };
 
     // Build the effective per-side maps with file renames applied.
-    let (eff_base, mut eff_ours, mut eff_theirs) =
+    let (mut eff_base, mut eff_ours, mut eff_theirs) =
         apply_merge_renames(base_map, ours_map, theirs_map, &renames);
 
     // Directory-rename detection: when one side renamed a whole directory and
@@ -5114,12 +5114,14 @@ pub fn merge_entry_maps(
             compute_directory_renames(base_map, ours_map, theirs_map, ours_side, theirs_side);
         let outcome = apply_directory_renames(
             base_map,
+            &eff_base,
             &eff_ours,
             &eff_theirs,
             ours_side,
             theirs_side,
             &dir_renames,
         );
+        eff_base = outcome.base;
         eff_ours = outcome.ours;
         eff_theirs = outcome.theirs;
         rehomed_paths = outcome.rehomed;
@@ -6196,9 +6198,12 @@ struct RehomeInfo {
     added_on_ours: bool,
 }
 
-/// Outcome of applying directory renames to both sides.
+/// Outcome of applying directory renames to all three effective maps.
 struct DirRenameOutcome {
-    /// Rewritten ours/theirs maps with re-homed paths moved to their destinations.
+    /// Rewritten base/ours/theirs maps with re-homed paths moved to their
+    /// destinations. `base` moves too so a re-homed content-merge keeps its
+    /// ancestor at the new location.
+    base: MergeEntryMap,
     ours: MergeEntryMap,
     theirs: MergeEntryMap,
     /// Re-homed destination path -> provenance (for `=conflict`-mode reporting).
@@ -6224,49 +6229,68 @@ struct DirRenameOutcome {
 ///   - splits (a source dir with no majority target -> conflict, leave in place).
 fn apply_directory_renames(
     base_map: &MergeEntryMap,
-    ours_map: &MergeEntryMap,
-    theirs_map: &MergeEntryMap,
+    eff_base: &MergeEntryMap,
+    eff_ours: &MergeEntryMap,
+    eff_theirs: &MergeEntryMap,
     ours_side: &SideRenames,
     theirs_side: &SideRenames,
     dir_renames: &DirectoryRenameMaps,
 ) -> DirRenameOutcome {
-    let mut ours = ours_map.clone();
-    let mut theirs = theirs_map.clone();
+    let mut base = eff_base.clone();
+    let mut ours = eff_ours.clone();
+    let mut theirs = eff_theirs.clone();
     let mut rehomed = BTreeMap::new();
     let mut dirty = false;
-
-    // Ours' paths follow THEIRS' directory renames; exclusions are OURS' own
-    // renamed-into dirs. Symmetrically for theirs.
-    let ours_excl = exclusion_dirs(&dir_renames.ours);
-    let theirs_excl = exclusion_dirs(&dir_renames.theirs);
 
     // Ours' paths follow THEIRS' directory renames; the exclusions are OURS' own
     // renamed-into dirs (never re-home a path into a directory this same side
     // renamed). Symmetrically for theirs.
-    rehome_side(
+    let ours_excl = exclusion_dirs(&dir_renames.ours);
+    let theirs_excl = exclusion_dirs(&dir_renames.theirs);
+
+    // Plan ours' moves (following theirs' dir-renames) and theirs' moves
+    // (following ours' dir-renames). Planning before applying lets us detect
+    // collisions (N paths onto one destination) across the whole side.
+    let ours_moves = plan_rehome(
         base_map,
-        &mut ours,
+        &ours,
         ours_side,
         &dir_renames.theirs,
         &ours_excl,
         &dir_renames.split_dirs,
-        true, // these are ours' paths
-        &mut rehomed,
         &mut dirty,
     );
-    rehome_side(
+    let theirs_moves = plan_rehome(
         base_map,
-        &mut theirs,
+        &theirs,
         theirs_side,
         &dir_renames.ours,
         &theirs_excl,
         &dir_renames.split_dirs,
-        false, // these are theirs' paths
+        &mut dirty,
+    );
+
+    apply_rehome_moves(
+        &mut base,
+        &mut ours,
+        &mut theirs,
+        ours_moves,
+        true,
+        &mut rehomed,
+        &mut dirty,
+    );
+    apply_rehome_moves(
+        &mut base,
+        &mut ours,
+        &mut theirs,
+        theirs_moves,
+        false,
         &mut rehomed,
         &mut dirty,
     );
 
     DirRenameOutcome {
+        base,
         ours,
         theirs,
         rehomed,
@@ -6290,40 +6314,44 @@ fn exclusion_dirs(side_dir_renames: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeSet<Vec
 /// maps into `exclusions` (a dir this side renamed) is left alone. Collisions
 /// (two candidates landing on one destination) and splits mark the merge dirty
 /// and the colliding/split paths are left in place.
+/// Plan the directory-rename moves for one side: which of its added/renamed
+/// paths re-home where, following `renamer_dirs` (the OTHER side's dir-renames).
+///
+/// Candidates are paths present on this side and absent in base — both freshly
+/// added files AND this side's own rename destinations (the latter give the
+/// transitive-rename behaviour). A candidate whose target directory is in
+/// `exclusions` (a dir this side itself renamed) is skipped. Splits and N-to-1
+/// collisions mark the merge dirty and yield no move. Returns the surviving
+/// single moves (one per destination).
 #[allow(clippy::too_many_arguments)]
-fn rehome_side(
+fn plan_rehome(
     base_map: &MergeEntryMap,
-    target: &mut MergeEntryMap,
+    side: &MergeEntryMap,
     side_renames: &SideRenames,
     renamer_dirs: &BTreeMap<Vec<u8>, Vec<u8>>,
     exclusions: &BTreeSet<Vec<u8>>,
     split_dirs: &BTreeSet<Vec<u8>>,
-    side_is_ours: bool,
-    rehomed: &mut BTreeMap<Vec<u8>, RehomeInfo>,
     dirty: &mut bool,
-) {
+) -> Vec<DirRenameMove> {
     if renamer_dirs.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    // The rename destinations this side produced, mapped back to their sources;
-    // these are eligible for a transitive rewrite even though they look like
-    // ordinary entries (and carry the original source for message wording).
+    // This side's rename destinations -> sources; eligible for a transitive
+    // rewrite and carry the original source for message wording.
     let side_rename_src: BTreeMap<&[u8], &[u8]> = side_renames
         .pairs
         .iter()
         .map(|(o, n)| (n.as_slice(), o.as_slice()))
         .collect();
 
-    // Compute the planned moves first, detecting collisions onto a single
-    // destination, before mutating `target`.
-    let candidates: Vec<Vec<u8>> = target
+    let candidates: Vec<Vec<u8>> = side
         .keys()
         .filter(|p| !base_map.contains_key(*p) || side_rename_src.contains_key(p.as_slice()))
         .cloned()
         .collect();
 
-    // dest -> list of source paths that want to land there (collision detection).
+    // dest -> the moves wanting to land there (collision detection).
     let mut planned: BTreeMap<Vec<u8>, Vec<DirRenameMove>> = BTreeMap::new();
     for path in candidates {
         let Some((old_dir, new_dir)) = check_dir_renamed(&path, renamer_dirs) else {
@@ -6336,15 +6364,13 @@ fn rehome_side(
         }
         // dir_rename_exclusions: don't apply a rename INTO a directory this side
         // itself renamed; that would cause a spurious rename/rename(1to2). The
-        // file instead follows this side's own rename (already reflected in
-        // `target`), so leave it.
+        // file instead follows this side's own rename, so leave it.
         if exclusions.contains(new_dir) {
             continue;
         }
         let dest = apply_dir_rename(old_dir, new_dir, &path);
         if dest == path {
-            // Directory rename causes a rename-to-self: the path is already where
-            // the directory rename would put it. Nothing to move.
+            // Directory rename causes a rename-to-self: already in place.
             continue;
         }
         let renamed_from = side_rename_src.get(path.as_slice()).map(|s| s.to_vec());
@@ -6355,28 +6381,64 @@ fn rehome_side(
         });
     }
 
-    for (_dest, moves) in planned {
-        if moves.len() > 1 {
+    let mut moves = Vec::new();
+    for (_dest, group) in planned {
+        if group.len() > 1 {
             // Multiple paths map to one destination: an implicit-dir-rename
             // collision. git leaves all of them in place and conflicts.
             *dirty = true;
             continue;
         }
-        let mv = moves.into_iter().next().expect("non-empty");
-        // A single re-home. If the destination is already occupied on this side
-        // by an unrelated entry (file in the way), that's a collision; conflict
-        // and leave the source in place.
-        if target.contains_key(&mv.to) && mv.to != mv.from {
+        moves.push(group.into_iter().next().expect("non-empty"));
+    }
+    moves
+}
+
+/// Apply a side's planned re-home moves to all three effective maps.
+///
+/// `side_is_ours` says whether the moves originate from ours' (true) or theirs'
+/// (false) paths — used both for `=conflict`-mode provenance and to decide which
+/// side's entry the move primarily belongs to. A move whose source is a
+/// content-merge path (present on the other side and in base too) re-homes
+/// across `base`/`ours`/`theirs` together, so the 3-way merge follows it to the
+/// new location; a pure add re-homes only its own side.
+fn apply_rehome_moves(
+    base: &mut MergeEntryMap,
+    ours: &mut MergeEntryMap,
+    theirs: &mut MergeEntryMap,
+    moves: Vec<DirRenameMove>,
+    side_is_ours: bool,
+    rehomed: &mut BTreeMap<Vec<u8>, RehomeInfo>,
+    dirty: &mut bool,
+) {
+    for mv in moves {
+        // A file in the way at the destination (an unrelated entry already there
+        // on any map, not part of this move) is a collision; leave in place.
+        let occupied = |m: &MergeEntryMap| m.contains_key(&mv.to);
+        if (occupied(base) || occupied(ours) || occupied(theirs)) && mv.to != mv.from {
+            // The destination may legitimately be occupied only if THIS move's
+            // own side will overwrite it; but for a fresh destination produced by
+            // a directory rename it should be empty. If it is occupied by content
+            // that is not the same move, conflict.
             *dirty = true;
             continue;
         }
-        if let Some(entry) = target.remove(&mv.from) {
-            target.insert(mv.to.clone(), entry);
+        // Move the path on every map that holds it (base for the ancestor, and
+        // whichever sides carry content at the path). This keeps a content-merge
+        // keyed consistently at the re-homed destination.
+        let mut moved = false;
+        for m in [&mut *base, &mut *ours, &mut *theirs] {
+            if let Some(entry) = m.remove(&mv.from) {
+                m.insert(mv.to.clone(), entry);
+                moved = true;
+            }
+        }
+        if moved {
             rehomed.insert(
-                mv.to,
+                mv.to.clone(),
                 RehomeInfo {
-                    old_path: mv.from,
-                    renamed_from: mv.renamed_from,
+                    old_path: mv.from.clone(),
+                    renamed_from: mv.renamed_from.clone(),
                     added_on_ours: side_is_ours,
                 },
             );

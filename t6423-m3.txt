@@ -1,0 +1,109 @@
+sley upstream test report
+run label: 2026-06-17T05:10:36Z
+sley binary: /home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-merge-ort-dirrename/release/sley
+upstream t/: /tmp/git-pcre-src/t
+default hash: sha1
+per-script timeout: 300s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t6423-merge-rename-directories.sh FAIL        19    63  rc=1 (1..82) # still have 2 known breakage(s)|# failed 61 among remaining 80 test(s)|1..82
+
+----- t6423-merge-rename-directories.sh (FAIL): failing assertions -----
+  [#4] 1d: Directory renames cause a rename/rename(2to1) conflict
+  [#6] 1f: Split a directory into two other directories
+  [#7] 2a: Directory split into two on one side, with equal numbers of paths
+  [#10] 3b: Avoid implicit rename if involved as source on current side
+  [#12] 5a: Merge directories, other side adds files to original and target
+  [#13] 5b: Rename/delete in order to get add/add/add conflict
+  [#14] 5c: Transitive rename would cause rename/rename/rename/add/add/add
+  [#15] 5d: Directory/file/file conflict due to directory rename
+  [#16] 6a: Tricky rename/delete
+  [#18] 6b2: Same rename done on both sides
+  [#19] 6c: Rename only done on same side
+  [#20] 6d: We do not always want transitive renaming
+  [#21] 6e: Add/add from one side
+  [#22] 7a: rename-dir vs. rename-dir (NOT split evenly) PLUS add-other-file
+  [#23] 7b: rename/rename(2to1), but only due to transitive rename
+  [#24] 7c: rename/rename(1to...2or3); transitive rename may add complexity
+  [#25] 7d: transitive rename involved in rename/delete; how is it reported?
+  [#26] 7e: transitive rename in rename/delete AND dirs in the way
+  [#27] 8a: Dual-directory rename, one into the others way
+  [#28] 8b: Dual-directory rename, one into the others way, with conflicting filenames
+  [#29] 8c: modify/delete or rename+modify/delete
+  [#31] 8e: Both sides rename, one side adds to original directory
+  [#33] 9b: Transitive rename with content merge
+  [#34] 9c: Doubly transitive rename?
+  [#35] 9d: N-way transitive rename?
+  [#36] 9e: N-to-1 whammo
+  [#38] 9g: Renamed directory that only contained immediate subdirs, immediate subdirs renamed # TODO known breakage
+  [#40] 10a: Overwrite untracked with normal rename/delete
+  [#41] 10b: Overwrite untracked with dir rename + delete
+  [#42] 10c1: Overwrite untracked with dir rename/rename(1to2)
+  [#43] 10c2: Overwrite untracked with dir rename/rename(1to2), other direction
+  [#44] 10d: Delete untracked with dir rename/rename(2to1)
+  [#45] 10e: Does git complain about untracked file that is not really in the way?
+  [#47] 11b: Avoid losing dirty file involved in directory rename
+  [#48] 11c: Avoid losing not-uptodate with rename + D/F conflict
+  [#49] 11d: Avoid losing not-uptodate with rename + D/F conflict
+  [#50] 11e: Avoid deleting not-uptodate with dir rename/rename(1to2)/add
+  [#51] 11f: Avoid deleting not-uptodate with dir rename/rename(2to1)
+  [#53] 12b1: Moving two directory hierarchies into each other
+  [#55] 12c1: Moving one directory hierarchy into another w/ content merge
+  [#59] 12f: Trivial directory resolve, caching, all kinds of fun
+  [#60] 12g: Testcase with two kinds of "relevant" renames
+  [#61] 12h: renaming a file within a renamed directory # TODO known breakage
+  [#62] 12i: Directory rename causes rename-to-self
+  [#63] 12i2: Directory rename causes rename-to-self
+  [#64] 12j: Directory rename to root causes rename-to-self
+  [#65] 12k: Directory rename with sibling causes rename-to-self
+  [#66] 12l (B into A): Rename into each other + add/add conflict
+  [#67] 12l (A into B): Rename into each other + add/add conflict
+  [#68] 12m: Change parent of renamed-dir to symlink on other side
+  [#69] 12n: Directory rename transitively makes rename back to self
+  [#70] 12n2: Directory rename transitively makes rename back to self
+  [#71] 12o: Directory rename hits other rename source; file still in way on same side
+  [#72] 12p: Directory rename hits other rename source; file still in way on other side
+  [#73] 12q: Directory rename hits other rename source; file removed though
+  [#75] 13a(info): messages for newly added files
+  [#76] 13b(conflict): messages for transitive rename with conflicted content
+  [#77] 13b(info): messages for transitive rename with conflicted content
+  [#78] 13c(conflict): messages for rename/rename(1to1) via transitive rename
+  [#79] 13c(info): messages for rename/rename(1to1) via transitive rename
+  [#80] 13d(conflict): messages for rename/rename(1to1) via dual transitive rename
+  [#81] 13d(info): messages for rename/rename(1to1) via dual transitive rename
+  [#82] 13e: directory rename detection in recursive case
+----- t6423-merge-rename-directories.sh (FAIL) last 25 lines -----
+#		)
+#	
+not ok 82 - 13e: directory rename detection in recursive case
+#	
+#		test_setup_13e &&
+#		(
+#			cd 13e &&
+#	
+#			git checkout --quiet D^0 &&
+#	
+#			git -c merge.directoryRenames=conflict merge -s recursive C^0 >out 2>err &&
+#	
+#			test_grep ! CONFLICT out &&
+#			test_grep ! BUG: err &&
+#			test_grep ! core.dumped err &&
+#			test_must_be_empty err &&
+#	
+#			git ls-files >paths &&
+#			! grep a/x paths &&
+#			grep b/x paths
+#		)
+#	
+# still have 2 known breakage(s)
+# failed 61 among remaining 80 test(s)
+1..82
+----- end t6423-merge-rename-directories.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t6423-merge-rename-directories.sh FAIL             19     63     82  23%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
