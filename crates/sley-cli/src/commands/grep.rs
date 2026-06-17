@@ -53,6 +53,8 @@ struct GrepOptions {
     after_context: usize,
     show_function: bool,
     function_context: bool,
+    heading: bool,
+    break_between_files: bool,
     revs: Vec<String>,
     pathspecs: Vec<String>,
 }
@@ -90,6 +92,8 @@ impl GrepOptions {
             after_context: 0,
             show_function: false,
             function_context: false,
+            heading: false,
+            break_between_files: false,
             revs: Vec::new(),
             pathspecs: Vec::new(),
         }
@@ -318,6 +322,10 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             "--cached" => opts.cached = true,
             "-p" | "--show-function" => opts.show_function = true,
             "-W" | "--function-context" => opts.function_context = true,
+            "--heading" => opts.heading = true,
+            "--no-heading" => opts.heading = false,
+            "--break" => opts.break_between_files = true,
+            "--no-break" => opts.break_between_files = false,
             "--no-index" => no_index = true,
             "-r" | "--recursive" => opts.max_depth = Some(-1),
             "--no-recursive" => opts.max_depth = Some(0),
@@ -390,11 +398,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             | "--no-recurse-submodules"
             | "--untracked"
             | "--no-exclude-standard"
-            | "--exclude-standard"
-            | "--heading"
-            | "--no-heading"
-            | "--break"
-            | "--no-break" => {
+            | "--exclude-standard" => {
                 // Accepted-but-no-op flags whose default behaviour we already match.
             }
             "--threads" => {
@@ -1025,7 +1029,7 @@ fn grep_buffer(
         if !any {
             write_path_line(out, rev, display_path, list_term, opts.null_data)?;
         }
-        return Ok(any);
+        return Ok(!any);
     }
 
     if !any {
@@ -1278,6 +1282,17 @@ fn emit_lines(
     };
 
     let has_context = opts.before_context > 0 || opts.after_context > 0 || opts.function_context;
+    let heading = opts.heading && show_filename;
+    let mut wrote_in_file = false;
+
+    if opts.break_between_files && *printed_file {
+        out.write_all(b"\n")?;
+    }
+
+    if heading {
+        write_path_line(out, rev, display_path, b'\n', false)?;
+        wrote_in_file = true;
+    }
 
     let mut last_printed: Option<usize> = None;
     for (i, flag) in flags.iter().enumerate() {
@@ -1294,7 +1309,7 @@ fn emit_lines(
                     }
                     out.write_all(b"--\n")?;
                 }
-            } else if *printed_file {
+            } else if *printed_file && !opts.break_between_files && !heading {
                 out.write_all(b"--\n")?;
             }
         }
@@ -1305,7 +1320,9 @@ fn emit_lines(
         } else {
             b"-"
         };
-        write_match_prefix_sep(out, rev, display_path, show_filename, sep)?;
+        if !heading {
+            write_match_prefix_sep(out, rev, display_path, show_filename, sep)?;
+        }
         if opts.line_number {
             out.write_all((i + 1).to_string().as_bytes())?;
             out.write_all(sep)?;
@@ -1318,8 +1335,11 @@ fn emit_lines(
         out.write_all(lines[i])?;
         out.write_all(b"\n")?;
         last_printed = Some(i);
+        wrote_in_file = true;
     }
-    *printed_file = true;
+    if wrote_in_file {
+        *printed_file = true;
+    }
     Ok(())
 }
 
