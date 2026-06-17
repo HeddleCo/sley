@@ -1391,7 +1391,8 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            if let Some(err) = transaction.check_batch_df_against_queued(&name) {
+            let requested = effective.requested.clone();
+            if let Some(err) = transaction.check_batch_df_against_queued(&requested, &name) {
                 return Err(err);
             }
             update_ref_stdin_write(
@@ -1403,7 +1404,7 @@ fn dispatch_ref_stdin_command(
                     expected_oid: expected.as_ref(),
                 },
             )
-            .map_err(|err| transaction.reshape_df_conflict(err))
+            .map_err(|err| transaction.reshape_df_conflict(&requested, err))
         }
         "create" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1457,7 +1458,8 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            if let Some(err) = transaction.check_batch_df_against_queued(&name) {
+            let requested = effective.requested.clone();
+            if let Some(err) = transaction.check_batch_df_against_queued(&requested, &name) {
                 return Err(err);
             }
             update_ref_stdin_write(
@@ -1469,7 +1471,7 @@ fn dispatch_ref_stdin_command(
                     expected_oid: Some(&zero),
                 },
             )
-            .map_err(|err| transaction.reshape_df_conflict(err))
+            .map_err(|err| transaction.reshape_df_conflict(&requested, err))
         }
         "delete" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1752,7 +1754,7 @@ impl UpdateRefStdinTransaction {
     /// `cannot process`, a pre-existing-then-deleted name yields
     /// `'<other>' exists; cannot create '<name>'` (the delete's old value still
     /// existed at batch start). Returns the failure if a conflict exists.
-    fn check_batch_df_against_queued(&self, name: &str) -> Option<GitError> {
+    fn check_batch_df_against_queued(&self, requested: &str, name: &str) -> Option<GitError> {
         for other in self.originals.keys() {
             if other == name {
                 continue;
@@ -1771,7 +1773,12 @@ impl UpdateRefStdinTransaction {
             } else {
                 // `other` existed at batch start (a delete of a real ref): git
                 // reports it as an existing-ref conflict against the new name.
-                eprintln!("fatal: cannot lock ref '{name}': '{other}' exists; cannot create '{name}'");
+                // The lock-ref prefix names the *requested* ref (the symref for
+                // an indirect update), while `cannot create` names the effective
+                // target.
+                eprintln!(
+                    "fatal: cannot lock ref '{requested}': '{other}' exists; cannot create '{name}'"
+                );
             }
             return Some(GitError::Exit(128));
         }
@@ -1790,7 +1797,10 @@ impl UpdateRefStdinTransaction {
     ///     failed` (exit 1) the backend's `Transaction` error renders as.
     ///
     /// Returns the original error if the message is not a D/F conflict.
-    fn reshape_df_conflict(&self, err: GitError) -> GitError {
+    /// `requested` is the ref the user typed (the symref for an indirect update);
+    /// it replaces the effective ref in the `cannot lock ref '<...>'` prefix so
+    /// an indirect create reports the symref, matching git.
+    fn reshape_df_conflict(&self, requested: &str, err: GitError) -> GitError {
         let GitError::Transaction(message) = &err else {
             return err;
         };
@@ -1807,7 +1817,9 @@ impl UpdateRefStdinTransaction {
             };
             eprintln!("fatal: cannot process '{parent}' and '{child}' at the same time");
         } else {
-            eprintln!("fatal: {message}");
+            eprintln!(
+                "fatal: cannot lock ref '{requested}': '{existing_ref}' exists; cannot create '{new_ref}'"
+            );
         }
         GitError::Exit(128)
     }
