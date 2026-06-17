@@ -58,6 +58,9 @@ struct RebaseArgs {
     signoff: bool,
     no_verify: bool,
     reschedule_failed_exec: Option<bool>,
+    committer_date_is_author_date: bool,
+    ignore_date: bool,
+    ignore_whitespace: bool,
     root: bool,
     fork_point: Option<bool>,
     reapply_cherry_picks: Option<bool>,
@@ -93,6 +96,9 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         signoff: false,
         no_verify: false,
         reschedule_failed_exec: None,
+        committer_date_is_author_date: false,
+        ignore_date: false,
+        ignore_whitespace: false,
         root: false,
         fork_point: None,
         reapply_cherry_picks: None,
@@ -204,12 +210,21 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--verify" => out.no_verify = false,
             "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
             "--allow-empty-message" => {}
-            "--committer-date-is-author-date" | "--reset-author-date" | "--ignore-date" => {
+            "--committer-date-is-author-date" => {
+                out.committer_date_is_author_date = true;
                 out.force = true;
             }
+            "--no-committer-date-is-author-date" => out.committer_date_is_author_date = false,
+            "--reset-author-date" | "--ignore-date" => {
+                out.ignore_date = true;
+                out.force = true;
+            }
+            "--no-reset-author-date" | "--no-ignore-date" => out.ignore_date = false,
             "--ignore-whitespace" => {
+                out.ignore_whitespace = true;
                 out.strategy_opts.push("ignore-space-change".to_string());
             }
+            "--no-ignore-whitespace" => out.ignore_whitespace = false,
             _ if arg.starts_with("-C") => {
                 let value = &arg[2..];
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -332,6 +347,8 @@ struct MachineOpts {
     drop_redundant_commits: bool,
     keep_redundant_commits: bool,
     reschedule_failed_exec: bool,
+    committer_date_is_author_date: bool,
+    ignore_date: bool,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
@@ -368,6 +385,12 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     } else {
         fs::write(dir.join("no-reschedule-failed-exec"), b"")?;
     }
+    if opts.committer_date_is_author_date {
+        fs::write(dir.join("cdate_is_adate"), b"")?;
+    }
+    if opts.ignore_date {
+        fs::write(dir.join("ignore_date"), b"")?;
+    }
     Ok(())
 }
 
@@ -392,6 +415,8 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         drop_redundant_commits: exists("drop_redundant_commits"),
         keep_redundant_commits: exists("keep_redundant_commits"),
         reschedule_failed_exec: exists("reschedule-failed-exec"),
+        committer_date_is_author_date: exists("cdate_is_adate"),
+        ignore_date: exists("ignore_date"),
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -923,6 +948,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         drop_redundant_commits: empty == EmptyMode::Drop,
         keep_redundant_commits: empty == EmptyMode::Keep,
         reschedule_failed_exec,
+        committer_date_is_author_date: args.committer_date_is_author_date,
+        ignore_date: args.ignore_date,
         head_name: head_name.clone(),
         onto,
         orig_head,
@@ -1271,83 +1298,153 @@ fn make_script_commits(
     Ok(out)
 }
 
+/// `format_subject(sb, msg, " ")`: the subject paragraph (lines up to the first
+/// blank line) folded into one line joined with spaces. Autosquash matches
+/// `fixup!`/`squash!` against this folded subject, so a multi-line original
+/// subject (`To\nfixup`) is matched by `fixup! To fixup`.
+fn format_subject(message: &[u8]) -> String {
+    let text = String::from_utf8_lossy(message);
+    let mut out = String::new();
+    let mut first = true;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if first {
+                // leading blank lines are skipped
+                continue;
+            }
+            break;
+        }
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(line);
+        first = false;
+    }
+    out
+}
+
+/// `skip_fixupish`: strip one `fixup! `/`amend! `/`squash! ` prefix, returning
+/// the remainder.
+fn skip_fixupish(subject: &str) -> Option<&str> {
+    subject
+        .strip_prefix("fixup! ")
+        .or_else(|| subject.strip_prefix("amend! "))
+        .or_else(|| subject.strip_prefix("squash! "))
+}
+
+/// `todo_list_rearrange_squash`: move `fixup!`/`squash!`/`amend!` commits
+/// directly after their targets and rewrite their command. Faithful port of
+/// sequencer.c: targets are matched first by exact title, then by commit
+/// name (sha/ref) when the remainder has no space, and finally as a prefix of
+/// an earlier subject. `amend!` becomes `fixup -C` (replace message).
 fn rearrange_squash(
     ctx: &Ctx,
     db: &FileObjectDatabase,
     items: Vec<RebaseTodoItem>,
 ) -> Result<Vec<RebaseTodoItem>> {
-    let _ = (ctx, db);
-    // `--autosquash`: move fixup!/squash! commits behind their targets.
-    let mut subjects: Vec<(usize, String)> = Vec::new();
-    let mut moved: Vec<Option<Vec<usize>>> = vec![None; items.len()];
-    let mut used = vec![false; items.len()];
-    let mut rewritten: Vec<Option<TodoCommand>> = vec![None; items.len()];
-    for (idx, item) in items.iter().enumerate() {
-        if item.command != TodoCommand::Pick {
+    let n = items.len();
+    // Per-item subject (from the commit), or None for drop/comment/no-commit.
+    let mut subjects: Vec<Option<String>> = vec![None; n];
+    // Title -> first item index with that exact subject.
+    let mut subject2item: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Resolved commit oid -> item index (for the commit-name match tier).
+    let mut commit2item: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
+    let mut next = vec![-1i64; n];
+    let mut tail = vec![-1i64; n];
+    let mut rewritten: Vec<Option<(TodoCommand, u8)>> = vec![None; n];
+    let mut rearranged = false;
+
+    for i in 0..n {
+        let item = &items[i];
+        if item.oid.is_none() || item.command == TodoCommand::Drop {
             continue;
         }
-        let subject = item.arg.strip_prefix("# ").unwrap_or(&item.arg).to_string();
-        let mut rest = subject.as_str();
-        let mut command = None;
-        loop {
-            if let Some(stripped) = rest.strip_prefix("fixup! ") {
-                rest = stripped;
-                command.get_or_insert(TodoCommand::Fixup);
-            } else if let Some(stripped) = rest.strip_prefix("squash! ") {
-                rest = stripped;
-                command.get_or_insert(TodoCommand::Squash);
-            } else if let Some(stripped) = rest.strip_prefix("amend! ") {
-                rest = stripped;
-                command.get_or_insert(TodoCommand::Fixup);
+        // The subject is read off the commit, not the (potentially custom)
+        // instruction-format arg.
+        let record = read_rev_list_commit_record(db, ctx.format, item.oid.expect("checked"))?;
+        let subject = format_subject(&record.commit.message);
+        subjects[i] = Some(subject.clone());
+
+        let mut i2: i64 = -1;
+        if let Some(mut p) = skip_fixupish(&subject) {
+            // Skip any nested fixup!/squash!/amend! prefixes (with whitespace).
+            loop {
+                p = p.trim_start();
+                match skip_fixupish(p) {
+                    Some(rest) => p = rest,
+                    None => break,
+                }
+            }
+            if let Some(&found) = subject2item.get(p) {
+                // found by title
+                i2 = found as i64;
+            } else if !p.contains(' ')
+                && let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, p)
+                && let Ok(peeled) = sley_rev::peel_to_commit(db, ctx.format, &oid)
+                && let Some(&found) = commit2item.get(&peeled)
+            {
+                // found by commit name (sha/ref)
+                i2 = found as i64;
             } else {
-                break;
+                // copy can be a prefix of the commit subject
+                for (j, subj) in subjects.iter().enumerate().take(i) {
+                    if let Some(subj) = subj
+                        && subj.starts_with(p)
+                    {
+                        i2 = j as i64;
+                        break;
+                    }
+                }
             }
         }
-        if let Some(command) = command {
-            // Find the target: latest earlier item whose subject matches
-            // `rest` (exact or prefix).
-            let target = subjects
-                .iter()
-                .rev()
-                .find(|(_, s)| s == rest || s.starts_with(rest))
-                .map(|(i, _)| *i);
-            if let Some(target) = target {
-                moved[target].get_or_insert_with(Vec::new).push(idx);
-                used[idx] = true;
-                rewritten[idx] = Some(command);
-                continue;
+
+        if i2 >= 0 {
+            rearranged = true;
+            let rewrite = if subject.starts_with("fixup!") {
+                (TodoCommand::Fixup, 0u8)
+            } else if subject.starts_with("amend!") {
+                (TodoCommand::Fixup, seq::FLAG_REPLACE_FIXUP_MSG)
+            } else {
+                (TodoCommand::Squash, 0u8)
+            };
+            rewritten[i] = Some(rewrite);
+            let i2u = i2 as usize;
+            if tail[i2u] < 0 {
+                next[i] = next[i2u];
+                next[i2u] = i as i64;
+            } else {
+                let t = tail[i2u] as usize;
+                next[i] = next[t];
+                next[t] = i as i64;
             }
+            tail[i2u] = i as i64;
+        } else {
+            subject2item.entry(subject).or_insert(i);
         }
-        subjects.push((idx, subject));
+        commit2item.insert(item.oid.expect("checked"), i);
     }
-    if used.iter().all(|&u| !u) {
+
+    if !rearranged {
         return Ok(items);
     }
-    let mut out = Vec::with_capacity(items.len());
-    fn push_chain(
-        idx: usize,
-        items: &[RebaseTodoItem],
-        moved: &[Option<Vec<usize>>],
-        rewritten: &[Option<TodoCommand>],
-        out: &mut Vec<RebaseTodoItem>,
-    ) {
-        let mut item = items[idx].clone();
-        if let Some(command) = rewritten[idx] {
-            item.command = command;
-        }
-        out.push(item);
-        if let Some(fixups) = &moved[idx] {
-            for &fixup in fixups {
-                push_chain(fixup, items, moved, rewritten, out);
-            }
-        }
-    }
-    for (idx, item) in items.iter().enumerate() {
-        if used[idx] {
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // Items already rearranged into a chain are emitted from their target.
+        if rewritten[i].is_some() {
             continue;
         }
-        let _ = item;
-        push_chain(idx, &items, &moved, &rewritten, &mut out);
+        let mut cur = i as i64;
+        while cur >= 0 {
+            let idx = cur as usize;
+            let mut item = items[idx].clone();
+            if let Some((command, flags)) = rewritten[idx] {
+                item.command = command;
+                item.flags = flags;
+            }
+            out.push(item);
+            cur = next[idx];
+        }
     }
     Ok(out)
 }
@@ -2486,7 +2583,173 @@ fn commented_lines(text: &[u8], comment: u8) -> Vec<u8> {
     out
 }
 
-/// `update_squash_messages` for plain fixup/squash (no `-c`/`-C` flags).
+/// `commit_subject_length`: bytes of the subject paragraph (up to and including
+/// the blank line that ends it), so `amend!`/`fixup!`/`squash!` subjects can be
+/// commented out while the body stays verbatim.
+fn commit_subject_length(body: &[u8]) -> usize {
+    let mut p = 0usize;
+    while p < body.len() {
+        // skip_blank_lines: if the current line is blank, the subject ends here.
+        let next = skip_blank_lines(&body[p..]) + p;
+        if next != p {
+            break;
+        }
+        // advance past this (non-blank) line.
+        match body[p..].iter().position(|&b| b == b'\n') {
+            Some(off) => p += off + 1,
+            None => return body.len(),
+        }
+    }
+    p
+}
+
+/// `skip_blank_lines`: return the offset past any leading all-whitespace lines.
+fn skip_blank_lines(buf: &[u8]) -> usize {
+    let mut p = 0usize;
+    loop {
+        let eol = buf[p..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|off| p + off)
+            .unwrap_or(buf.len());
+        if buf[p..eol].iter().any(|&b| !b.is_ascii_whitespace()) {
+            return p;
+        }
+        if eol >= buf.len() {
+            return buf.len();
+        }
+        p = eol + 1;
+    }
+}
+
+/// `seen_squash`: the current fixup chain contains a `squash` command.
+fn seen_squash(ctx: &Ctx) -> bool {
+    fs::read_to_string(ctx.state_path("current-fixups"))
+        .map(|text| {
+            text.starts_with("squash") || text.contains("\nsquash")
+        })
+        .unwrap_or(false)
+}
+
+/// `is_fixup_flag`: a `fixup -C` / `fixup -c` (replaces the prior message).
+fn is_fixup_flag(command: TodoCommand, flags: u8) -> bool {
+    command == TodoCommand::Fixup
+        && (flags & seq::FLAG_REPLACE_FIXUP_MSG != 0 || flags & seq::FLAG_EDIT_FIXUP_MSG != 0)
+}
+
+/// `update_squash_message_for_fixup`: when a `fixup -C/-c` follows earlier
+/// messages, re-comment any still-uncommented prior commit message so only the
+/// replacing message survives. Mirrors sequencer.c by rewriting the
+/// "This is the …th commit message:" headers to their "will be skipped" form
+/// and commenting the bodies they introduce.
+fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
+    let comment_str = (comment as char).to_string();
+    // The header markers (kept) and their skipped variants, both already
+    // carrying the comment prefix.
+    let kept_first = format!("{comment_str} This is the 1st commit message:");
+    let skip_first = format!("{comment_str} The 1st commit message will be skipped:");
+    let mut out = Vec::with_capacity(msg.len());
+    let mut commenting = false;
+    let mut idx = 1usize;
+    // Build the "This is the commit message #N:" / "...#N will be skipped:"
+    // markers lazily as we walk.
+    let kept_nth =
+        |n: usize| format!("{comment_str} This is the commit message #{n}:");
+    let skip_nth =
+        |n: usize| format!("{comment_str} The commit message #{n} will be skipped:");
+    for line in msg.split_inclusive(|&b| b == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let text = String::from_utf8_lossy(body);
+        if text == kept_first {
+            out.extend_from_slice(skip_first.as_bytes());
+            out.push(b'\n');
+            commenting = true;
+            continue;
+        }
+        if text == kept_nth(idx + 1) {
+            out.extend_from_slice(skip_nth(idx + 1).as_bytes());
+            out.push(b'\n');
+            idx += 1;
+            commenting = true;
+            continue;
+        }
+        if text == skip_first || text == skip_nth(idx + 1) {
+            if text == skip_nth(idx + 1) {
+                idx += 1;
+            }
+            out.extend_from_slice(line);
+            commenting = false;
+            continue;
+        }
+        if commenting {
+            // Comment out the message body, but leave blank lines untouched.
+            if body.is_empty() {
+                out.push(b'\n');
+            } else if body.first() == Some(&comment) {
+                out.extend_from_slice(line);
+            } else {
+                out.push(comment);
+                out.push(b' ');
+                out.extend_from_slice(line);
+            }
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+/// Append the replacing/squashed message body (`append_squash_message`):
+/// the "commit message #N" header plus the fixup commit's body. For
+/// `fixup -C/-c` the body replaces the message, so it is added verbatim
+/// (uncommented) and may be persisted to `message-fixup`.
+fn append_squash_message(
+    ctx: &Ctx,
+    buf: &mut Vec<u8>,
+    body: &[u8],
+    command: TodoCommand,
+    flags: u8,
+    comment: u8,
+    count: usize,
+) -> Result<()> {
+    let comment_str = (comment as char).to_string();
+    // `amend!` subjects (and fixup!/squash! when squashing) get their subject
+    // commented out.
+    let commented_len = if body.starts_with(b"amend!")
+        || ((command == TodoCommand::Squash || seen_squash(ctx))
+            && (body.starts_with(b"squash!") || body.starts_with(b"fixup!")))
+    {
+        commit_subject_length(body)
+    } else {
+        0
+    };
+    buf.push(b'\n');
+    buf.extend_from_slice(
+        format!("{comment_str} This is the commit message #{}:\n\n", count + 2).as_bytes(),
+    );
+    buf.extend_from_slice(&commented_lines(&body[..commented_len], comment));
+    let fixup_off = buf.len();
+    buf.extend_from_slice(&body[commented_len..]);
+
+    if is_fixup_flag(command, flags) && !seen_squash(ctx) {
+        if (flags & seq::FLAG_REPLACE_FIXUP_MSG != 0)
+            && (ctx.state_path("message-fixup").exists()
+                || !ctx.state_path("message-squash").exists())
+        {
+            let fixup_msg = &buf[fixup_off + skip_blank_lines(&buf[fixup_off..])..];
+            fs::write(ctx.state_path("message-fixup"), fixup_msg)?;
+        } else {
+            let _ = fs::remove_file(ctx.state_path("message-fixup"));
+        }
+    } else {
+        let _ = fs::remove_file(ctx.state_path("message-fixup"));
+    }
+    Ok(())
+}
+
+/// `update_squash_messages`: build the combined `message-squash` (and, for plain
+/// fixup chains, `message-fixup`). Handles `squash`, plain `fixup`, and
+/// `fixup -C`/`-c` (`FLAG_REPLACE_FIXUP_MSG` / `FLAG_EDIT_FIXUP_MSG`).
 fn update_squash_messages(
     ctx: &Ctx,
     db: &FileObjectDatabase,
@@ -2496,6 +2759,7 @@ fn update_squash_messages(
     let comment = comment_char(&ctx.git_dir);
     let comment_str = (comment as char).to_string();
     let count = current_fixup_count(ctx);
+    let flagged = is_fixup_flag(item.command, item.flags);
     let mut buf: Vec<u8>;
     if count > 0 {
         let existing = fs::read(ctx.state_path("message-squash"))?;
@@ -2514,35 +2778,38 @@ fn update_squash_messages(
         )
         .into_bytes();
         buf.extend_from_slice(&existing[eol..]);
+        if flagged && !seen_squash(ctx) {
+            buf = update_squash_message_for_fixup(&buf, comment);
+        }
     } else {
         let refs = ctx.refs();
         let head = head_commit_oid(&refs)?
             .ok_or_else(|| GitError::Command("need a HEAD to fixup".into()))?;
         let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
         let head_body = &head_record.commit.message;
+        // Plain fixup (no flag) seeds message-fixup with HEAD's body.
         if item.command == TodoCommand::Fixup && item.flags == 0 {
             fs::write(ctx.state_path("message-fixup"), head_body)?;
         }
         buf = format!("{comment_str} This is a combination of 2 commits.\n").into_bytes();
-        buf.extend_from_slice(
-            format!("{comment_str} This is the 1st commit message:\n\n").as_bytes(),
-        );
-        buf.extend_from_slice(head_body);
+        if flagged {
+            buf.extend_from_slice(
+                format!("{comment_str} The 1st commit message will be skipped:\n\n").as_bytes(),
+            );
+            buf.extend_from_slice(&commented_lines(head_body, comment));
+        } else {
+            buf.extend_from_slice(
+                format!("{comment_str} This is the 1st commit message:\n\n").as_bytes(),
+            );
+            buf.extend_from_slice(head_body);
+        }
     }
 
     let body = &record.commit.message;
-    if item.command == TodoCommand::Squash {
-        buf.push(b'\n');
-        buf.extend_from_slice(
-            format!(
-                "{comment_str} This is the commit message #{}:\n\n",
-                count + 2
-            )
-            .as_bytes(),
-        );
-        buf.extend_from_slice(body);
-        let _ = fs::remove_file(ctx.state_path("message-fixup"));
+    if item.command == TodoCommand::Squash || flagged {
+        append_squash_message(ctx, &mut buf, body, item.command, item.flags, comment, count)?;
     } else {
+        // Plain fixup: the message is skipped.
         buf.push(b'\n');
         buf.extend_from_slice(
             format!(
@@ -2610,7 +2877,24 @@ fn machine_commit(
 
     if commit.edit {
         let path = ctx.git_dir.join("COMMIT_EDITMSG");
-        fs::write(&path, &message)?;
+        let comment = comment_char(&ctx.git_dir);
+        let mut template = message.clone();
+        if !template.ends_with(b"\n") {
+            template.push(b'\n');
+        }
+        // git seeds COMMIT_EDITMSG with the message followed by a blank line and
+        // the standard help comment block; the trailing blank line is what lets
+        // an appended line (e.g. `fixup -c`'s amended subject) land in its own
+        // paragraph after stripspace.
+        template.push(b'\n');
+        let c = comment as char;
+        template.extend_from_slice(
+            format!(
+                "{c} Please enter the commit message for your changes. Lines starting\n{c} with '{c}' will be ignored, and an empty message aborts the commit.\n"
+            )
+            .as_bytes(),
+        );
+        fs::write(&path, template)?;
         launch_editor(&ctx.git_dir, &path)?;
         message = fs::read(&path)?;
     }
@@ -2657,7 +2941,29 @@ fn machine_commit(
         }
     }
 
-    let committer = commit_identity_from_env("COMMITTER")?;
+    // Apply `--reset-author-date`/`--ignore-date` and
+    // `--committer-date-is-author-date`, mirroring sequencer.c's
+    // try_to_commit. `ignore_date` rewrites the author date to "now"; the
+    // committer date is then either "now" (`ignore_date`), the author's date
+    // (`committer_date_is_author_date` without `ignore_date`), or the
+    // environment's committer date.
+    let author = if opts.ignore_date {
+        reset_identity_date(&author, &rebase_now_date())
+    } else {
+        author
+    };
+    let committer = if opts.committer_date_is_author_date {
+        if opts.ignore_date {
+            reset_identity_date(&commit_identity_from_env("COMMITTER")?, &rebase_now_date())
+        } else {
+            let author_date = identity_date(&author).unwrap_or_else(rebase_now_date);
+            commit_identity_from_env_with_date("COMMITTER", &author_date)?
+        }
+    } else if opts.ignore_date {
+        reset_identity_date(&commit_identity_from_env("COMMITTER")?, &rebase_now_date())
+    } else {
+        commit_identity_from_env("COMMITTER")?
+    };
     let mut writer = ctx.db();
     let new_oid = sley_sequencer::create_commit(
         &mut writer,
@@ -2691,6 +2997,45 @@ fn machine_commit(
 
     let _ = opts;
     Ok(CommitOutcome::Committed)
+}
+
+/// The current wall-clock time as git's raw `@<seconds> +0000`. Mirrors git's
+/// `reset_ident_date()` + `datestamp()` path used by `--ignore-date` /
+/// `--committer-date-is-author-date`: the upstream tests run under `TZ=UTC`, so
+/// the synthesized "now" carries a `+0000` offset.
+fn rebase_now_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("@{secs} +0000")
+}
+
+/// Extract the `@<seconds> <tz>` date portion from a raw identity line
+/// (`Name <email> <seconds> <tz>`), suitable for `commit_identity_from_env_with_date`.
+fn identity_date(identity: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(identity).ok()?;
+    let close = text.rfind('>')?;
+    let rest = text[close + 1..].trim();
+    let mut parts = rest.split_whitespace();
+    let seconds = parts.next()?;
+    let tz = parts.next()?;
+    Some(format!("@{seconds} {tz}"))
+}
+
+/// Replace the date portion of a raw identity line (`Name <email> <seconds> <tz>`)
+/// with `new_date` (any form `canonicalize_commit_date` accepts), keeping the
+/// name+email. Used to reset author/committer dates to "now".
+fn reset_identity_date(identity: &[u8], new_date: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(identity);
+    let Some(close) = text.rfind('>') else {
+        return identity.to_vec();
+    };
+    let canonical = canonicalize_commit_date(new_date);
+    let mut out = text[..=close].as_bytes().to_vec();
+    out.push(b' ');
+    out.extend_from_slice(canonical.as_bytes());
+    out
 }
 
 fn read_author_script_identity(ctx: &Ctx) -> Result<Option<Vec<u8>>> {
