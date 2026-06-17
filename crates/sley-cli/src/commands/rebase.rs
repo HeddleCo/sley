@@ -61,10 +61,13 @@ struct RebaseArgs {
     committer_date_is_author_date: bool,
     ignore_date: bool,
     ignore_whitespace: bool,
+    whitespace: Option<String>,
+    context_lines: Option<u32>,
     root: bool,
     fork_point: Option<bool>,
     reapply_cherry_picks: Option<bool>,
     update_refs: Option<bool>,
+    rebase_merges: Option<bool>,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
     positional: Vec<String>,
@@ -99,10 +102,13 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         committer_date_is_author_date: false,
         ignore_date: false,
         ignore_whitespace: false,
+        whitespace: None,
+        context_lines: None,
         root: false,
         fork_point: None,
         reapply_cherry_picks: None,
         update_refs: None,
+        rebase_merges: None,
         strategy: None,
         strategy_opts: Vec::new(),
         positional: Vec::new(),
@@ -231,6 +237,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                     eprintln!("fatal: switch `C' expects a numerical value");
                     return Err(GitError::Exit(128));
                 }
+                let Ok(context) = value.parse() else {
+                    eprintln!("fatal: switch `C' expects a numerical value");
+                    return Err(GitError::Exit(128));
+                };
+                out.context_lines = Some(context);
             }
             _ if arg.starts_with("--whitespace=") => {
                 let value = &arg["--whitespace=".len()..];
@@ -241,9 +252,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                     eprintln!("fatal: Invalid whitespace option: '{value}'");
                     return Err(GitError::Exit(128));
                 }
+                out.whitespace = Some(value.to_string());
             }
-            "--rebase-merges" | "-r" => {}
-            _ if arg.starts_with("--rebase-merges=") => {}
+            "--rebase-merges" | "-r" => out.rebase_merges = Some(true),
+            "--no-rebase-merges" => out.rebase_merges = Some(false),
+            _ if arg.starts_with("--rebase-merges=") => out.rebase_merges = Some(true),
             "--" => {
                 out.positional.extend(args[index + 1..].iter().cloned());
                 break;
@@ -753,6 +766,12 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     let refs = ctx.refs();
 
     let interactive_explicit = args.interactive;
+    let config_rebase_merges = args
+        .rebase_merges
+        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "rebaseMerges").unwrap_or(false));
+    let config_update_refs = args
+        .update_refs
+        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "updateRefs").unwrap_or(false));
     // `--ignore-whitespace` pushes `ignore-space-change` into `strategy_opts` for
     // the merge backend, but it does NOT by itself force a backend (it is honoured
     // on whichever one is selected). So compute merge-implication ignoring that
@@ -768,13 +787,27 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         || args.autosquash == Some(true)
         || args.empty != EmptyMode::Unspecified
         || args.keep_empty
+        || args.reapply_cherry_picks.is_some()
+        || (args.root && args.onto_name.is_none())
+        || config_rebase_merges
+        || config_update_refs
         || args.strategy.is_some()
         || !other_strategy_opts.is_empty();
 
     // The apply backend (`git rebase --apply` / `git-rebase--am`) is selected by
-    // an explicit `--apply`. It is incompatible with the merge-only options.
-    let use_apply_backend = args.apply_backend;
+    // an explicit `--apply` and by apply-only knobs. It is incompatible with
+    // merge-only options.
+    let use_apply_backend =
+        args.apply_backend || args.whitespace.is_some() || args.context_lines.is_some();
     if use_apply_backend && implied_merge {
+        if args.rebase_merges.is_none() && config_rebase_merges {
+            eprintln!("fatal: apply options are incompatible with rebase.rebaseMerges; use --no-rebase-merges");
+            return Err(GitError::Exit(128));
+        }
+        if args.update_refs.is_none() && config_update_refs {
+            eprintln!("fatal: apply options are incompatible with rebase.updateRefs; use --no-update-refs");
+            return Err(GitError::Exit(128));
+        }
         eprintln!("fatal: apply options and merge options cannot be used together");
         return Err(GitError::Exit(128));
     }
