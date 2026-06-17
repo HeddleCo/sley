@@ -1044,7 +1044,14 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     };
 
     // Generate the todo list.
-    let records = make_script_commits(ctx, &db, upstream.as_ref(), &orig_head, args.keep_empty)?;
+    let records = make_script_commits(
+        ctx,
+        &db,
+        upstream.as_ref(),
+        &orig_head,
+        args.keep_empty,
+        args.reapply_cherry_picks.unwrap_or(false),
+    )?;
     let mut items: Vec<RebaseTodoItem> = records
         .iter()
         .map(|record| RebaseTodoItem {
@@ -1130,7 +1137,14 @@ fn run_apply_backend(
 ) -> Result<()> {
     // Build the pick series exactly like the merge backend does (skip merges and
     // empty commits unless --keep-empty), then turn each into an apply patch.
-    let records = make_script_commits(ctx, db, upstream, orig_head, args.keep_empty)?;
+    let records = make_script_commits(
+        ctx,
+        db,
+        upstream,
+        orig_head,
+        args.keep_empty,
+        args.reapply_cherry_picks.unwrap_or(false),
+    )?;
 
     if records.is_empty() {
         // Nothing to replay: detach onto the new base and finish (matches git's
@@ -1455,6 +1469,7 @@ fn make_script_commits(
     upstream: Option<&ObjectId>,
     orig_head: &ObjectId,
     keep_empty: bool,
+    reapply_cherry_picks: bool,
 ) -> Result<Vec<sley_rev::CommitRecord>> {
     // Mark everything reachable from upstream.
     let mut excluded = std::collections::HashSet::new();
@@ -1468,6 +1483,49 @@ fn make_script_commits(
             queue.extend(record.parents.iter().copied());
         }
     }
+
+    // `--cherry-mark` duplicate detection (git make_script: revs.cherry_mark =
+    // !reapply_cherry_picks). Build the set of patch-ids carried by the
+    // *left-only* side — upstream commits that are not also reachable from the
+    // merge base with orig_head — and drop right-side commits whose patch-id
+    // matches, so an already-applied commit isn't replayed onto a base that
+    // already has it. Skipped when --reapply-cherry-picks is set.
+    let upstream_patch_ids: std::collections::HashSet<Vec<u8>> = if reapply_cherry_picks {
+        std::collections::HashSet::new()
+    } else if let Some(upstream) = upstream {
+        // Bound the comparison to the symmetric difference: only consider
+        // upstream commits reachable from upstream but not from the merge base
+        // (matching git's `upstream...orig_head` left side).
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
+        let mut base_reachable = std::collections::HashSet::new();
+        let mut bq: Vec<ObjectId> = bases.clone();
+        while let Some(oid) = bq.pop() {
+            if !base_reachable.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            bq.extend(record.parents.iter().copied());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut uq = vec![*upstream];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(oid) = uq.pop() {
+            if base_reachable.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            uq.extend(record.parents.iter().copied());
+            if record.parents.len() > 1 {
+                continue; // merges carry no single-parent patch-id
+            }
+            if let Some(id) = commit_patch_id(db, ctx.format, &record)? {
+                ids.insert(id);
+            }
+        }
+        ids
+    } else {
+        std::collections::HashSet::new()
+    };
     // Collect the right side.
     let mut records: BTreeMap<ObjectId, sley_rev::CommitRecord> = BTreeMap::new();
     let mut order = Vec::new();
@@ -1526,9 +1584,38 @@ fn make_script_commits(
         if record.commit.tree == parent_tree && !keep_empty {
             continue;
         }
+        // Drop commits whose patch already lives upstream (git PATCHSAME). An
+        // *empty* commit is never marked PATCHSAME, so only non-empty commits
+        // are eligible — matching `!is_empty && (flags & PATCHSAME)`.
+        if !upstream_patch_ids.is_empty()
+            && record.commit.tree != parent_tree
+            && let Some(id) = commit_patch_id(db, ctx.format, &record)?
+            && upstream_patch_ids.contains(&id)
+        {
+            continue;
+        }
         out.push(record);
     }
     Ok(out)
+}
+
+/// Patch-id of a single (non-merge) commit's diff against its first parent, for
+/// `--cherry-mark` duplicate detection. `None` when the diff is empty.
+fn commit_patch_id(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+) -> Result<Option<Vec<u8>>> {
+    if record.parents.len() > 1 {
+        return Ok(None);
+    }
+    let parent_tree = match record.parents.first() {
+        Some(parent) => commit_tree_oid(db, format, parent)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+        .unwrap_or_default();
+    Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
 
 /// `format_subject(sb, msg, " ")`: the subject paragraph (lines up to the first

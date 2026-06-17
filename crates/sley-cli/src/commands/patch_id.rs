@@ -140,6 +140,29 @@ pub(crate) fn cmd_patch_id(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Compute the patch-id of a single rendered diff (as produced by
+/// `git diff` / `render_tree_to_tree_patch`), for rebase's `--cherry-mark`
+/// duplicate detection. Returns `None` when the diff carries no patch content
+/// (e.g. an empty commit), so the caller can treat such commits as non-matching.
+///
+/// git's `--cherry-mark` uses the default *unstable* commit patch-id
+/// (diff_flush_patch_id with `diff_header_only` off, no stable reordering), so
+/// this hashes with `stable: false`. The same mode is used for both sides of
+/// the comparison, which is all the dedup requires.
+pub(crate) fn patch_id_for_diff(diff: &[u8], format: ObjectFormat) -> Option<Vec<u8>> {
+    let options = PatchIdOptions {
+        stable: false,
+        verbatim: false,
+    };
+    let lines = split_keep_newlines(diff);
+    let mut cursor = 0usize;
+    let patch = get_one_patchid(&lines, &mut cursor, format, &options);
+    if patch.patchlen == 0 {
+        return None;
+    }
+    Some(patch.result)
+}
+
 /// The outcome of argument parsing: a runnable invocation or a help request.
 enum PatchIdInvocation {
     Run(PatchIdOptions),
