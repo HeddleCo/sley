@@ -624,11 +624,9 @@ fn remote_target_oid(
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
 
     if !options.nofetch {
-        let mut fetch_args = vec!["-C".to_string(), path.display().to_string()];
-        fetch_args.push(remote.clone());
-        // Run the fetch via self-invocation so the submodule's own config/remote
-        // is used (git spawns `git -C <sm_path> fetch`).
-        let status = self_sley(&fetch_args)?;
+        // Run `sley fetch <remote>` inside the submodule worktree so its own
+        // config/remote is used (git spawns `git -C <sm_path> fetch`).
+        let status = self_sley_fetch(path, &remote)?;
         if !status.success() {
             eprintln!("fatal: Unable to fetch in submodule path '{display}'");
             return Err(GitError::Exit(128));
@@ -643,15 +641,14 @@ fn remote_target_oid(
     Err(GitError::Exit(128))
 }
 
-/// Run a `sley fetch -C <sm_path> <remote>`-style self-invocation. The first
-/// argument must be the bare subcommand args (e.g. `["-C", path, remote]`);
-/// `fetch` is prepended here.
-fn self_sley(fetch_args: &[String]) -> Result<std::process::ExitStatus> {
+/// Run `sley fetch <remote>` inside the submodule worktree (git's `git -C
+/// <sm_path> fetch <remote>`).
+fn self_sley_fetch(path: &Path, remote: &str) -> Result<std::process::ExitStatus> {
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
     let mut command = ProcessCommand::new(exe);
-    command.arg("fetch");
-    command.args(fetch_args);
+    command.arg("fetch").arg(remote);
     command
+        .current_dir(path)
         .status()
         .map_err(|err| GitError::Io(err.to_string()))
 }
