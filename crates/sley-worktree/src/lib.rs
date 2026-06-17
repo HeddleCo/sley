@@ -3,7 +3,9 @@ use sley_core::{
     BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, RepoPath,
     Result,
 };
-use sley_index::{BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, Stage};
+use sley_index::{
+    BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, SPARSE_DIR_MODE, Stage,
+};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectPresenceChecker, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
@@ -11041,6 +11043,16 @@ pub fn index_from_tree(
 /// * **Out of cone**: the skip-worktree bit is set and any existing worktree
 ///   file is removed (empty parent directories are pruned).
 ///
+/// Returns `true` when `path` is inside the sparse-checkout described by
+/// `sparse` under the given matching `mode`. This is the engine behind
+/// `git sparse-checkout check-rules`: a path is "in" the sparse-checkout when
+/// the compiled matcher would keep its worktree file. Cone and full (gitignore)
+/// grammars are both handled, exactly as the apply engine interprets them, so
+/// `check-rules` and `set`/`reapply` agree by construction.
+pub fn path_in_sparse_checkout(path: &[u8], sparse: &SparseCheckout, mode: SparseCheckoutMode) -> bool {
+    SparseMatcher::new(sparse, mode).includes_file(path)
+}
+
 /// Conflicted entries (stage != 0) are never given the skip-worktree bit and
 /// are left alone, matching upstream Git. The index is rewritten in place.
 pub fn apply_sparse_checkout(
@@ -11081,6 +11093,13 @@ pub fn apply_sparse_checkout_with_mode(
     };
     let matcher = SparseMatcher::new(sparse, mode);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    // Expand any collapsed sparse-directory entries to a full index before we
+    // reconcile per-path: the apply loop reasons about individual blob paths, so
+    // it must never see a sparse-dir entry. (Re-collapse happens at the end when
+    // a sparse index is requested.)
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        expand_sparse_index(&mut index, &db, format)?;
+    }
     let mut materialized = Vec::new();
     let mut skipped = Vec::new();
     let mut not_up_to_date = Vec::new();
@@ -11119,12 +11138,226 @@ pub fn apply_sparse_checkout_with_mode(
     }
     not_up_to_date.sort();
     normalize_index_version_for_extended_flags(&mut index);
+    // When a sparse index was requested (cone mode + index.sparse), collapse the
+    // fully-out-of-cone directories into single sparse-directory entries and
+    // mark the index with the `sdir` extension. Otherwise ensure the index is
+    // written full (and any prior `sdir` marker is cleared).
+    if sparse.sparse_index {
+        collapse_to_sparse_index(&mut index, &matcher, &db, format)?;
+    } else {
+        index.clear_sparse_extension()?;
+    }
     fs::write(index_path, index.write(format)?)?;
     Ok(ApplySparseResult {
         materialized,
         skipped,
         not_up_to_date,
     })
+}
+
+/// Expands every sparse-directory entry in `index` back into the full set of
+/// blob (and nested-directory) entries it collapses, reading each directory's
+/// tree from `db`. After this the index contains no sparse-directory entries and
+/// carries no `sdir` marker — it is a full index that any per-path command can
+/// operate on without sparse-index awareness.
+///
+/// This is the **close-the-class** primitive: a command never needs to special-
+/// case a sparse index, because the moment it loads the index it expands to the
+/// full form. The collapsed shape is purely an on-disk storage optimization.
+pub fn expand_sparse_index(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<bool> {
+    if !index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        // Still strip a stray `sdir` marker so the written index is recorded full.
+        let had_marker = index.is_sparse();
+        index.clear_sparse_extension()?;
+        return Ok(had_marker);
+    }
+    let mut expanded: Vec<IndexEntry> = Vec::with_capacity(index.entries.len());
+    for entry in std::mem::take(&mut index.entries) {
+        if !entry.is_sparse_dir() {
+            expanded.push(entry);
+            continue;
+        }
+        // The sparse-dir path ends in `/`; its OID is the directory's tree.
+        let dir = entry.path.as_bytes();
+        let dir_prefix = dir; // includes the trailing slash
+        for (rel, (mode, oid)) in sley_diff_merge::flatten_tree(db, format, &entry.oid)? {
+            let mut full_path = dir_prefix.to_vec();
+            full_path.extend_from_slice(&rel);
+            let mut blob = blank_sparse_blob_entry(format, &full_path, mode, oid);
+            // Re-collapsed entries are skip-worktree (they live outside the cone).
+            blob.set_skip_worktree(true);
+            expanded.push(blob);
+        }
+    }
+    expanded.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    index.entries = expanded;
+    index.clear_sparse_extension()?;
+    normalize_index_version_for_extended_flags(index);
+    Ok(true)
+}
+
+/// Builds a minimal index entry for an expanded sparse blob: zeroed stat fields
+/// (the file is not in the worktree), the given mode/oid, and a fresh name
+/// length. Stat fields are zero because a skip-worktree file has no on-disk
+/// presence to record.
+fn blank_sparse_blob_entry(
+    format: ObjectFormat,
+    path: &[u8],
+    mode: u32,
+    oid: ObjectId,
+) -> IndexEntry {
+    let _ = format;
+    let mut entry = IndexEntry {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds: 0,
+        mtime_nanoseconds: 0,
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid,
+        flags: 0,
+        flags_extended: 0,
+        path: path.into(),
+    };
+    entry.refresh_name_length();
+    entry
+}
+
+/// Collapses fully-out-of-cone directories in `index` into single sparse-
+/// directory entries (mode `040000`, skip-worktree, the directory tree's OID),
+/// then marks the index with the `sdir` extension. A directory is collapsible
+/// when *every* entry under it is skip-worktree and stage 0 — i.e. nothing in it
+/// is in the cone or conflicted. The shallowest such directory subsumes deeper
+/// ones, matching git's `convert_to_sparse` cache-tree walk.
+fn collapse_to_sparse_index(
+    index: &mut Index,
+    matcher: &SparseMatcher,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<()> {
+    // First expand any pre-existing sparse-dir entries so the collapse decision
+    // sees a uniform full index (idempotent re-collapse).
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        expand_sparse_index(index, db, format)?;
+    }
+
+    // Any unmerged (stage != 0) entry forbids a sparse index entirely (the cache
+    // tree cannot be built), so stay full — matching git's bail.
+    if index.entries.iter().any(|e| index_entry_stage(e) != 0) {
+        index.clear_sparse_extension()?;
+        return Ok(());
+    }
+
+    index
+        .entries
+        .sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+
+    // Determine, for every directory prefix, whether it contains any in-cone
+    // path. A directory with no in-cone descendant is collapsible.
+    use std::collections::BTreeMap;
+    let mut dir_has_in_cone: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
+    for entry in &index.entries {
+        let path = entry.path.as_bytes();
+        let in_cone = matcher.includes_file(path);
+        let mut start = 0usize;
+        while let Some(rel) = path.get(start..).and_then(|s| s.iter().position(|b| *b == b'/')) {
+            let end = start + rel;
+            let dir = path[..end].to_vec();
+            let flag = dir_has_in_cone.entry(dir).or_insert(false);
+            *flag = *flag || in_cone;
+            start = end + 1;
+        }
+    }
+
+    // The collapsible directories are those with no in-cone descendant; keep only
+    // the shallowest (a directory whose ancestor is also collapsible is subsumed).
+    let collapsible: Vec<Vec<u8>> = {
+        let all: Vec<Vec<u8>> = dir_has_in_cone
+            .iter()
+            .filter(|(_, has)| !**has)
+            .map(|(dir, _)| dir.clone())
+            .collect();
+        all.iter()
+            .filter(|dir| {
+                !all.iter().any(|other| {
+                    other != *dir
+                        && dir
+                            .strip_prefix(other.as_slice())
+                            .is_some_and(|rest| rest.first() == Some(&b'/'))
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    if collapsible.is_empty() {
+        index.clear_sparse_extension()?;
+        return Ok(());
+    }
+
+    let mut checker = db.presence_checker();
+    let mut new_entries: Vec<IndexEntry> = Vec::with_capacity(index.entries.len());
+    let mut consumed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for dir in &collapsible {
+        // Gather the entries that live strictly under this directory.
+        let mut subtree: Vec<&IndexEntry> = index
+            .entries
+            .iter()
+            .filter(|e| {
+                e.path
+                    .as_bytes()
+                    .strip_prefix(dir.as_slice())
+                    .is_some_and(|rest| rest.first() == Some(&b'/'))
+            })
+            .collect();
+        if subtree.is_empty() {
+            continue;
+        }
+        subtree.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        // Build the subtree object and capture its OID.
+        let mut prefix = dir.clone();
+        prefix.push(b'/');
+        let tree_entries: Vec<WriteTreeEntry<'_>> = subtree
+            .iter()
+            .map(|e| WriteTreeEntry {
+                path: e.path.as_bytes(),
+                mode: e.mode,
+                oid: e.oid.clone(),
+            })
+            .collect();
+        let tree_oid =
+            write_tree_entries_stream(&tree_entries, &prefix, None, db, &mut checker, false)?;
+        // Mark every consumed path so the second pass drops them.
+        for e in &subtree {
+            consumed.insert(e.path.as_bytes().to_vec());
+        }
+        // The sparse-dir entry's name is the directory path WITH a trailing slash.
+        let mut sparse_path = dir.clone();
+        sparse_path.push(b'/');
+        let mut sparse_entry =
+            blank_sparse_blob_entry(format, &sparse_path, SPARSE_DIR_MODE, tree_oid);
+        sparse_entry.set_skip_worktree(true);
+        new_entries.push(sparse_entry);
+    }
+    // Carry forward every entry that was not collapsed.
+    for entry in &index.entries {
+        if consumed.contains(entry.path.as_bytes()) {
+            continue;
+        }
+        new_entries.push(entry.clone());
+    }
+    new_entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    index.entries = new_entries;
+    index.set_sparse_extension();
+    normalize_index_version_for_extended_flags(index);
+    Ok(())
 }
 
 /// Whether the worktree file described by `metadata` is up to date with `entry`'s

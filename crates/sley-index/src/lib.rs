@@ -109,6 +109,14 @@ impl IndexEntry {
         self.flags_extended & INDEX_EXTENDED_FLAG_SKIP_WORKTREE != 0
     }
 
+    /// Whether this is a *sparse-directory* entry: a collapsed cone-excluded
+    /// directory stored as a single tree entry (mode `040000`, skip-worktree,
+    /// path ending in `/`) instead of every blob under it. This is the on-disk
+    /// shape of a sparse index (`extensions.sparseIndex`).
+    pub fn is_sparse_dir(&self) -> bool {
+        self.mode == SPARSE_DIR_MODE && self.is_skip_worktree()
+    }
+
     /// Set or clear the intent-to-add bit, keeping the `extended` flag in sync.
     /// (The writer only emits extended entries for index version 3+.)
     pub fn set_intent_to_add(&mut self, intent: bool) {
@@ -673,6 +681,70 @@ pub const INDEX_FLAG_NAME_LENGTH_MASK: u16 = 0x0fff;
 pub const INDEX_EXTENDED_FLAG_INTENT_TO_ADD: u16 = 0x2000;
 /// Skip-worktree (sparse checkout) bit in [`IndexEntry::flags_extended`].
 pub const INDEX_EXTENDED_FLAG_SKIP_WORKTREE: u16 = 0x4000;
+
+/// File mode of a sparse-directory entry in a sparse index: a directory
+/// (`040000`). Git treats an entry with this mode as a collapsed cone-excluded
+/// subtree (`S_ISSPARSEDIR`), its OID the tree object for that directory.
+pub const SPARSE_DIR_MODE: u32 = 0o040000;
+
+/// The four-byte signature of the optional `sdir` index extension
+/// (`CACHE_EXT_SPARSE_DIRECTORIES`, `0x73646972`). The extension carries no
+/// body; its mere presence marks the index as collapsed so a reader knows to
+/// expand sparse-directory entries before operating on individual paths.
+pub const INDEX_EXT_SPARSE_DIRECTORIES: [u8; 4] = *b"sdir";
+
+impl Index {
+    /// Whether this index is collapsed (carries `sdir` or any sparse-directory
+    /// entry). A collapsed index must be expanded before per-path operations.
+    pub fn is_sparse(&self) -> bool {
+        self.entries.iter().any(IndexEntry::is_sparse_dir)
+            || self
+                .extension_chunks()
+                .map(|chunks| {
+                    chunks
+                        .iter()
+                        .any(|(sig, _)| *sig == INDEX_EXT_SPARSE_DIRECTORIES)
+                })
+                .unwrap_or(false)
+    }
+
+    /// Appends the zero-length `sdir` extension to this index's raw extension
+    /// block if it is not already present, marking the index as a sparse index.
+    /// Idempotent.
+    pub fn set_sparse_extension(&mut self) {
+        let already = self
+            .extension_chunks()
+            .map(|chunks| {
+                chunks
+                    .iter()
+                    .any(|(sig, _)| *sig == INDEX_EXT_SPARSE_DIRECTORIES)
+            })
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        self.extensions
+            .extend_from_slice(&INDEX_EXT_SPARSE_DIRECTORIES);
+        self.extensions.extend_from_slice(&0u32.to_be_bytes());
+    }
+
+    /// Removes the `sdir` extension chunk (and any sparse-directory marker) from
+    /// the raw extension block, leaving the index recorded as a full index.
+    pub fn clear_sparse_extension(&mut self) -> Result<()> {
+        let chunks = self.extension_chunks()?;
+        let mut rebuilt = Vec::with_capacity(self.extensions.len());
+        for (sig, body) in chunks {
+            if sig == INDEX_EXT_SPARSE_DIRECTORIES {
+                continue;
+            }
+            rebuilt.extend_from_slice(&sig);
+            rebuilt.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            rebuilt.extend_from_slice(body);
+        }
+        self.extensions = rebuilt;
+        Ok(())
+    }
+}
 
 /// The merge stage encoded in an index entry's flags (a closed 0..=3 domain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
