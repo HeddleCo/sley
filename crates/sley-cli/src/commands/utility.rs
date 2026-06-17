@@ -116,6 +116,243 @@ pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn cmd_repo(args: &[String]) -> Result<()> {
+    match args {
+        [subcommand, rest @ ..] if subcommand == "info" => cmd_repo_info(rest),
+        [subcommand, ..] => {
+            eprintln!("error: unknown subcommand `{subcommand}`");
+            repo_usage()
+        }
+        [] => repo_usage(),
+    }
+}
+
+fn repo_usage<T>() -> Result<T> {
+    eprintln!("usage: git repo info [--format=(lines|nul) | -z] [--all | <key>...]");
+    eprintln!("   or: git repo info --keys [--format=(lines|nul) | -z]");
+    Err(GitError::Exit(129))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepoInfoFormat {
+    Lines,
+    Nul,
+    Table,
+}
+
+struct ParsedRepoInfo {
+    format: RepoInfoFormat,
+    all: bool,
+    keys: bool,
+    fields: Vec<String>,
+}
+
+const REPO_INFO_KEYS: &[&str] = &[
+    "layout.bare",
+    "layout.shallow",
+    "object.format",
+    "references.format",
+];
+
+fn cmd_repo_info(args: &[String]) -> Result<()> {
+    let parsed = parse_repo_info_args(args)?;
+    if parsed.keys {
+        if parsed.all || !parsed.fields.is_empty() {
+            eprintln!("fatal: --keys cannot be used with a <key> or --all");
+            return Err(GitError::Exit(128));
+        }
+        if parsed.format == RepoInfoFormat::Table {
+            eprintln!("fatal: --keys can only be used with --format=lines or --format=nul");
+            return Err(GitError::Exit(128));
+        }
+        return repo_info_print_keys(parsed.format);
+    }
+    if parsed.all && !parsed.fields.is_empty() {
+        eprintln!("fatal: --all and <key> cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if parsed.format == RepoInfoFormat::Table {
+        eprintln!("fatal: unsupported output format");
+        return Err(GitError::Exit(128));
+    }
+
+    let fields = if parsed.all {
+        REPO_INFO_KEYS.iter().map(|key| (*key).to_string()).collect()
+    } else {
+        parsed.fields
+    };
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let info = repo_info_collect(&git_dir, &common_git_dir)?;
+    let mut had_error = false;
+    for field in fields {
+        match repo_info_value(&info, &field) {
+            Some(value) => repo_info_print_value(parsed.format, &field, value)?,
+            None => {
+                eprintln!("error: key '{field}' not found");
+                had_error = true;
+            }
+        }
+    }
+    if had_error {
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_repo_info_args(args: &[String]) -> Result<ParsedRepoInfo> {
+    let mut format = RepoInfoFormat::Lines;
+    let mut all = false;
+    let mut keys = false;
+    let mut fields = Vec::new();
+    let mut iter = args.iter();
+    let mut positional_only = false;
+    while let Some(arg) = iter.next() {
+        if positional_only {
+            fields.push(arg.to_string());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "-h" | "--help" => {
+                print_repo_info_usage_stdout();
+                return Err(GitError::Exit(129));
+            }
+            "-z" => format = RepoInfoFormat::Nul,
+            "--format" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `format' requires a value");
+                    print_repo_info_usage_stderr();
+                    return Err(GitError::Exit(129));
+                };
+                format = parse_repo_info_format(value)?;
+            }
+            value if value.starts_with("--format=") => {
+                format = parse_repo_info_format(&value["--format=".len()..])?;
+            }
+            "--all" => all = true,
+            "--no-all" => all = false,
+            "--keys" => keys = true,
+            "--no-keys" => keys = false,
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                print_repo_info_usage_stderr();
+                return Err(GitError::Exit(129));
+            }
+            value => fields.push(value.to_string()),
+        }
+    }
+    Ok(ParsedRepoInfo {
+        format,
+        all,
+        keys,
+        fields,
+    })
+}
+
+fn parse_repo_info_format(value: &str) -> Result<RepoInfoFormat> {
+    match value {
+        "lines" => Ok(RepoInfoFormat::Lines),
+        "nul" => Ok(RepoInfoFormat::Nul),
+        "table" => Ok(RepoInfoFormat::Table),
+        other => {
+            eprintln!("fatal: invalid format '{other}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn print_repo_info_usage_stdout() {
+    println!("usage: git repo info [--format=(lines|nul) | -z] [--all | <key>...]");
+    println!("   or: git repo info --keys [--format=(lines|nul) | -z]");
+    println!();
+    println!("    --format <format>     output format");
+    println!("    -z                    synonym for --format=nul");
+    println!("    --[no-]all            print all keys/values");
+    println!("    --[no-]keys           show keys");
+    println!();
+}
+
+fn print_repo_info_usage_stderr() {
+    eprintln!("usage: git repo info [--format=(lines|nul) | -z] [--all | <key>...]");
+    eprintln!("   or: git repo info --keys [--format=(lines|nul) | -z]");
+    eprintln!();
+    eprintln!("    --format <format>     output format");
+    eprintln!("    -z                    synonym for --format=nul");
+    eprintln!("    --[no-]all            print all keys/values");
+    eprintln!("    --[no-]keys           show keys");
+    eprintln!();
+}
+
+struct RepoInfo {
+    bare: bool,
+    shallow: bool,
+    object_format: String,
+    references_format: String,
+}
+
+fn repo_info_collect(git_dir: &Path, common_git_dir: &Path) -> Result<RepoInfo> {
+    let config = read_repo_config(common_git_dir).ok();
+    let object_format = repository_object_format(common_git_dir)?.name().to_string();
+    let references_format = config
+        .as_ref()
+        .and_then(|config| config.get("extensions", None, "refStorage"))
+        .filter(|value| value.eq_ignore_ascii_case("reftable"))
+        .map(|_| "reftable".to_string())
+        .unwrap_or_else(|| "files".to_string());
+    Ok(RepoInfo {
+        bare: sley_worktree::worktree_root_for_git_dir(git_dir)?.is_none(),
+        shallow: common_git_dir.join("shallow").is_file(),
+        object_format,
+        references_format,
+    })
+}
+
+fn repo_info_value<'a>(info: &'a RepoInfo, key: &str) -> Option<&'a str> {
+    match key {
+        "layout.bare" => Some(if info.bare { "true" } else { "false" }),
+        "layout.shallow" => Some(if info.shallow { "true" } else { "false" }),
+        "object.format" => Some(&info.object_format),
+        "references.format" => Some(&info.references_format),
+        _ => None,
+    }
+}
+
+fn repo_info_print_value(format: RepoInfoFormat, key: &str, value: &str) -> Result<()> {
+    match format {
+        RepoInfoFormat::Lines => println!("{key}={value}"),
+        RepoInfoFormat::Nul => {
+            let mut out = io::stdout().lock();
+            out.write_all(key.as_bytes())?;
+            out.write_all(b"\n")?;
+            out.write_all(value.as_bytes())?;
+            out.write_all(b"\0")?;
+        }
+        RepoInfoFormat::Table => {}
+    }
+    Ok(())
+}
+
+fn repo_info_print_keys(format: RepoInfoFormat) -> Result<()> {
+    match format {
+        RepoInfoFormat::Lines => {
+            for key in REPO_INFO_KEYS {
+                println!("{key}");
+            }
+        }
+        RepoInfoFormat::Nul => {
+            let mut out = io::stdout().lock();
+            for key in REPO_INFO_KEYS {
+                out.write_all(key.as_bytes())?;
+                out.write_all(b"\0")?;
+            }
+        }
+        RepoInfoFormat::Table => {}
+    }
+    Ok(())
+}
+
 fn bugreport_usage_error(arg: Option<&str>) -> Result<()> {
     if let Some(arg) = arg {
         eprintln!("error: unknown argument `{arg}`");

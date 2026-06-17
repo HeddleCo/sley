@@ -247,6 +247,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "gc" => commands::pack::cmd_gc(&args[1..]),
         "maintenance" => commands::pack::cmd_maintenance(&args[1..]),
         "repack" => commands::pack::cmd_repack(&args[1..]),
+        "repo" => commands::utility::cmd_repo(&args[1..]),
         "apply" => commands::plumbing::cmd_apply(&args[1..]),
         "commit" => commands::workspace::cmd_commit(&args[1..]),
         "commit-graph" => commands::plumbing::cmd_commit_graph(&args[1..]),
@@ -273,6 +274,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
                 commands::merge_rebase::cmd_pull(&args[1..])
             }
         }
+        "replay" => commands::replay::cmd_replay(&args[1..]),
         "rebase" => commands::rebase::cmd_rebase(&args[1..]),
         "cherry-pick" => commands::replay::cmd_cherry_pick(&args[1..]),
         "revert" => commands::replay::cmd_revert(&args[1..]),
