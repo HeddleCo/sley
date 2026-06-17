@@ -441,6 +441,7 @@ fn three_way_merge_trees_inner(
         let advisory_location = matches!(
             entry.conflict,
             Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. })
+                | Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
         );
         if entry.conflict.is_some() {
             conflicts.push(entry.path.clone());
@@ -2434,12 +2435,16 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 entries.push(merge_index_entry(path, *mode, *oid, 0));
             }
             MergePathResult::Resolved(None) => {}
-            // A directory-rename location advisory is staged cleanly at stage 0
-            // (the re-homed content is fully resolved); the conflict is purely a
-            // message + nonzero exit, not an unmerged index entry.
+            // A directory-rename location/implicit-collision advisory is staged
+            // cleanly at stage 0 (the path content is fully resolved); the
+            // conflict is purely a message + nonzero exit, not an unmerged entry.
             MergePathResult::Conflict {
                 ours,
-                kind: Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }),
+                kind:
+                    Some(
+                        sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
+                        | sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
+                    ),
                 ..
             } => {
                 if let Some((mode, oid)) = ours {
@@ -2605,6 +2610,16 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     old = String::from_utf8_lossy(old_path),
                 ),
             },
+            Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources }) => {
+                let source_list = sources
+                    .iter()
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "CONFLICT (implicit dir rename): Existing file/dir at {path_str} in the way of implicit directory rename(s) putting the following path(s) there: {source_list}."
+                );
+            }
             None => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
             }

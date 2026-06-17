@@ -1,0 +1,8 @@
+script,command,result,ok,notok,total,plan_total
+t6423-merge-rename-directories.sh,t6423-merge-rename-directories.sh,FAIL,23,59,82,82
+t6422-merge-rename-corner-cases.sh,t6422-merge-rename-corner-cases.sh,FAIL,2,24,26,26
+t6404-recursive-merge.sh,t6404-recursive-merge.sh,FAIL,4,2,6,6
+t6418-merge-text-auto.sh,t6418-merge-text-auto.sh,FAIL,5,6,11,11
+t6436-merge-overwrite.sh,t6436-merge-overwrite.sh,FAIL,6,12,18,18
+t6402-merge-rename.sh,t6402-merge-rename.sh,FAIL,30,16,46,46
+t6430-merge-recursive.sh,t6430-merge-recursive.sh,FAIL,23,13,36,36

@@ -552,6 +552,21 @@ fn render_merge_outcome(
                     message,
                 });
             }
+            sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources } => {
+                let source_list = sources
+                    .iter()
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conflict_messages.push(InfoMessage {
+                    paths: vec![path.clone()],
+                    stable_type: "CONFLICT (implicit dir rename)".to_string(),
+                    message: format!(
+                        "CONFLICT (implicit dir rename): Existing file/dir at {new} in the way of implicit directory rename(s) putting the following path(s) there: {source_list}.",
+                        new = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
         }
         push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }
