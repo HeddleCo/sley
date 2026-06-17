@@ -379,7 +379,8 @@ declare -A FLOOR=(
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=378
-    [t7004-tag.sh]=176
+    # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
+    [t7004-tag.sh]=189
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf is FLAKY (oscillates 27/28 — a sley crlf-ordering non-determinism, tracked
@@ -416,7 +417,8 @@ declare -A FLOOR=(
     [t5318-commit-graph.sh]=93
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=55
-    [t4202-log.sh]=80
+    # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
+    [t4202-log.sh]=96
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     [t3403-rebase-skip.sh]=16
