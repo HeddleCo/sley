@@ -355,14 +355,18 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     if options.init {
-        cmd_submodule_init(
-            &options
-                .paths
-                .iter()
-                .map(|path| (*path).to_string())
-                .collect::<Vec<_>>(),
-            options.quiet,
-        )?;
+        let mut init_args = options
+            .paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        // Forward the recursion displaypath prefix so init's "registered for
+        // path '<a/b>'" lines are anchored at the recursion root, matching git's
+        // `--super-prefix` pass-through to the recursive init.
+        if !options.super_prefix.is_empty() {
+            init_args.push(format!("--super-prefix={}", options.super_prefix));
+        }
+        cmd_submodule_init(&init_args, options.quiet)?;
     }
     let submodules = read_submodule_configs(&worktree_root)?;
     let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &options.paths)?;
@@ -1112,7 +1116,7 @@ fn stage_submodule_paths(
 }
 
 fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet) = parse_submodule_init_options(args, quiet)?;
+    let (paths, quiet, super_prefix) = parse_submodule_init_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -1160,9 +1164,11 @@ fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
             set_submodule_config_value(&mut config, &submodule.name, "active", "true");
             set_submodule_config_value(&mut config, &submodule.name, "url", &url);
             if !quiet {
+                let display =
+                    submodule_displaypath(&cwd, &worktree_root, &submodule.path, &super_prefix)?;
                 eprintln!(
                     "Submodule '{}' ({}) registered for path '{}'",
-                    submodule.name, url, submodule.path
+                    submodule.name, url, display
                 );
             }
             changed = true;
@@ -1669,8 +1675,12 @@ fn cmd_submodule_set_branch(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_submodule_init_options(args: &[String], mut quiet: bool) -> Result<(Vec<&str>, bool)> {
+fn parse_submodule_init_options(
+    args: &[String],
+    mut quiet: bool,
+) -> Result<(Vec<&str>, bool, String)> {
     let mut paths = Vec::new();
+    let mut super_prefix = String::new();
     let mut positional_only = false;
     for arg in args {
         if positional_only {
@@ -1680,11 +1690,15 @@ fn parse_submodule_init_options(args: &[String], mut quiet: bool) -> Result<(Vec
         match arg.as_str() {
             "--" => positional_only = true,
             "--quiet" | "-q" => quiet = true,
+            // Internal: the recursion displaypath prefix (git's --super-prefix).
+            value if let Some(value) = value.strip_prefix("--super-prefix=") => {
+                super_prefix = value.to_string();
+            }
             value if value.starts_with('-') => return submodule_usage(),
             value => paths.push(value),
         }
     }
-    Ok((paths, quiet))
+    Ok((paths, quiet, super_prefix))
 }
 
 struct SubmoduleDeinitOptions<'a> {
