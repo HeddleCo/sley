@@ -302,6 +302,33 @@ fn emit_compiled_log_format_with_notes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_encoded_compiled_log_format_with_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    display_refs: &[String],
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format_with_notes(
+        git_dir,
+        format,
+        store,
+        display_refs,
+        record,
+        compiled,
+        context,
+        &mut line,
+    )?;
+    let encoded = log_reencode_message(&line, "UTF-8", context.output_encoding);
+    out.extend_from_slice(&encoded);
+    Ok(())
+}
+
 struct LogFormatNoteResolver<'a, 'b> {
     git_dir: &'a Path,
     format: ObjectFormat,
@@ -2650,7 +2677,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         use_mailmap,
                     };
                     let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_compiled_log_format_with_notes(
+                    emit_encoded_compiled_log_format_with_notes(
                         &git_dir,
                         format,
                         &notes_store,
@@ -2878,7 +2905,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 } else if let Some(prefix) = &line_prefix {
                     // `--line-prefix=<p>` prefixes every output line.
                     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_compiled_log_format_with_notes(
+                    emit_encoded_compiled_log_format_with_notes(
                         &git_dir,
                         format,
                         &notes_store,
@@ -2905,7 +2932,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     }
                 } else {
                     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_compiled_log_format_with_notes(
+                    emit_encoded_compiled_log_format_with_notes(
                         &git_dir,
                         format,
                         &notes_store,
