@@ -80,10 +80,54 @@ pub struct ReftableRefRecord {
     pub value: ReftableRefValue,
 }
 
+/// The value of a reftable log record — either a reflog update entry or a
+/// tombstone that masks an entry from an earlier table in the stack. Mirrors
+/// `reftable_log_record`'s `value_type` discriminant (reftable/record.c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReftableLogValue {
+    /// A log deletion (`REFTABLE_LOG_DELETION`): a placeholder that hides the
+    /// `(refname, update_index)` entry recorded in an older table.
+    Deletion,
+    /// A reflog entry (`REFTABLE_LOG_UPDATE`).
+    Update(ReftableLogUpdate),
+}
+
+/// A single reflog entry as stored in a reftable log block. The field set is
+/// exactly `reftable_log_record`'s `update` arm: old/new object ids, committer
+/// identity, and the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReftableLogUpdate {
+    pub old_oid: ObjectId,
+    pub new_oid: ObjectId,
+    pub name: String,
+    pub email: String,
+    /// Seconds since the Unix epoch.
+    pub time: u64,
+    /// Committer timezone offset in `[+-]HHMM` minutes, encoded as a signed
+    /// 16-bit big-endian quantity on disk.
+    pub tz_offset: i16,
+    pub message: String,
+}
+
+/// A reftable log record: the reflog of `refname` at a given `update_index`.
+///
+/// Log records are keyed by `refname` plus the *reversed* update index
+/// (`~0 - update_index`), so newer entries sort first — matching
+/// `reftable_log_record_key` in reftable/record.c.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReftableLogRecord {
+    pub refname: String,
+    pub update_index: u64,
+    pub value: ReftableLogValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reftable {
     pub header: ReftableHeader,
     pub refs: Vec<ReftableRefRecord>,
+    /// Reflog records carried by the table's log blocks, in on-disk order
+    /// (newest `update_index` first within each refname).
+    pub logs: Vec<ReftableLogRecord>,
 }
 
 impl Reftable {
@@ -149,7 +193,8 @@ impl Reftable {
             )?);
             offset = block_end;
         }
-        Ok(Self { header, refs })
+        let logs = parse_reftable_log_section(bytes, &footer, footer_start, header)?;
+        Ok(Self { header, refs, logs })
     }
 
     pub fn write_ref_only(
@@ -157,6 +202,23 @@ impl Reftable {
         min_update_index: u64,
         max_update_index: u64,
         refs: &[ReftableRefRecord],
+    ) -> Result<Vec<u8>> {
+        Self::write(format, min_update_index, max_update_index, refs, &[])
+    }
+
+    /// Serialize a single reftable carrying both refs and reflog records.
+    ///
+    /// The layout follows reftable/writer.c: a `ReftableHeader`, the `'r'` ref
+    /// block(s), then the `'g'` log block(s) (zlib-deflated bodies), then the
+    /// footer with `log_position` set to the start of the first log block. The
+    /// reflog records are keyed by `refname` and the *reversed* update index so
+    /// newer entries sort first, matching `reftable_log_record_key`.
+    pub fn write(
+        format: ObjectFormat,
+        min_update_index: u64,
+        max_update_index: u64,
+        refs: &[ReftableRefRecord],
+        logs: &[ReftableLogRecord],
     ) -> Result<Vec<u8>> {
         let version = match format {
             ObjectFormat::Sha1 => ReftableVersion::V1,
@@ -211,7 +273,12 @@ impl Reftable {
             }
             write_u24_at(&mut out, block_start + 1, block_len as u32)?;
         }
-        out.extend_from_slice(&write_reftable_footer(header, 0, 0, 0, 0, 0)?);
+        let log_position = if logs.is_empty() {
+            0
+        } else {
+            write_reftable_log_block(&mut out, format, logs)?
+        };
+        out.extend_from_slice(&write_reftable_footer(header, 0, 0, 0, 0, log_position)?);
         Ok(out)
     }
 }
@@ -524,6 +591,337 @@ fn write_reftable_ref_record(
         }
     }
     Ok(())
+}
+
+/// Encode the on-disk key for a log record: `refname \0 <8-byte big-endian ts>`,
+/// where `ts = ~0 - update_index` so larger update indices sort first
+/// (reftable/record.c::reftable_log_record_key).
+fn reftable_log_key(refname: &str, update_index: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(refname.len() + 9);
+    key.extend_from_slice(refname.as_bytes());
+    key.push(0);
+    let ts = u64::MAX - update_index;
+    key.extend_from_slice(&ts.to_be_bytes());
+    key
+}
+
+/// Write the single `'g'` log block to `out`, deflating its body, and return the
+/// byte offset at which the block begins (its `log_position` in the footer).
+///
+/// The body is built uncompressed first — `[type:1][len:3]` header, then the
+/// prefix-compressed log records, the be24 restart offsets, and the be16 restart
+/// count — and then everything after the 4-byte header is zlib-deflated and
+/// written back over the uncompressed bytes (reftable/block.c::block_writer_finish).
+fn write_reftable_log_block(
+    out: &mut Vec<u8>,
+    format: ObjectFormat,
+    logs: &[ReftableLogRecord],
+) -> Result<u64> {
+    // git sorts log records by (refname asc, update_index desc) which is exactly
+    // ascending key order, since the key embeds the reversed update index.
+    let mut logs = logs.to_vec();
+    logs.sort_by(|left, right| {
+        reftable_log_key(&left.refname, left.update_index)
+            .cmp(&reftable_log_key(&right.refname, right.update_index))
+    });
+
+    let block_start = out.len() as u64;
+    let header_off = out.len();
+    out.push(b'g');
+    out.extend_from_slice(&[0, 0, 0]);
+
+    // Build the uncompressed block body (records + restart table) in a scratch
+    // buffer so we can deflate the whole thing in one shot.
+    let mut body = Vec::new();
+    let mut previous_key: Vec<u8> = Vec::new();
+    let mut restart_offsets: Vec<u32> = Vec::new();
+    // The uncompressed body's record region starts right after the 4-byte block
+    // header; restart offsets are relative to the block start (header_off==0
+    // here because the body buffer holds only post-header bytes, and git's
+    // restart offsets point at the record start counting from the block's first
+    // byte — i.e. the post-header offset plus 4).
+    for (index, record) in logs.iter().enumerate() {
+        let key = reftable_log_key(&record.refname, record.update_index);
+        let restart = index == 0;
+        let prefix_len = if restart {
+            0
+        } else {
+            common_prefix_len(&previous_key, &key)
+        };
+        if restart {
+            restart_offsets.push((body.len() + 4) as u32);
+        }
+        let val_type = match &record.value {
+            ReftableLogValue::Deletion => 0u64,
+            ReftableLogValue::Update(_) => 1u64,
+        };
+        let suffix = &key[prefix_len..];
+        write_reftable_varint(&mut body, prefix_len as u64);
+        write_reftable_varint(&mut body, ((suffix.len() as u64) << 3) | val_type);
+        body.extend_from_slice(suffix);
+        if let ReftableLogValue::Update(update) = &record.value {
+            write_reftable_log_value(&mut body, format, update)?;
+        }
+        previous_key = key;
+    }
+    for offset in &restart_offsets {
+        write_u24(&mut body, *offset)?;
+    }
+    let restart_count = u16::try_from(restart_offsets.len())
+        .map_err(|_| GitError::InvalidFormat("too many reftable log restart offsets".into()))?;
+    body.extend_from_slice(&restart_count.to_be_bytes());
+
+    // The 3-byte block length records the *uncompressed* on-disk size
+    // (4-byte header + uncompressed body), per block_writer_finish.
+    let uncompressed_len = 4 + body.len();
+    if uncompressed_len > REFTABLE_MAX_BLOCK_SIZE as usize {
+        return Err(GitError::InvalidFormat(
+            "reftable log block exceeds maximum size".into(),
+        ));
+    }
+    write_u24_at(out, header_off + 1, uncompressed_len as u32)?;
+
+    let compressed = deflate_zlib(&body)?;
+    out.extend_from_slice(&compressed);
+    Ok(block_start)
+}
+
+fn write_reftable_log_value(
+    out: &mut Vec<u8>,
+    format: ObjectFormat,
+    update: &ReftableLogUpdate,
+) -> Result<()> {
+    if update.old_oid.format() != format || update.new_oid.format() != format {
+        return Err(GitError::InvalidFormat(
+            "reftable log object format mismatch".into(),
+        ));
+    }
+    out.extend_from_slice(update.old_oid.as_bytes());
+    out.extend_from_slice(update.new_oid.as_bytes());
+    write_reftable_string(out, update.name.as_bytes());
+    write_reftable_string(out, update.email.as_bytes());
+    write_reftable_varint(out, update.time);
+    out.extend_from_slice(&update.tz_offset.to_be_bytes());
+    write_reftable_string(out, update.message.as_bytes());
+    Ok(())
+}
+
+/// A varint-length-prefixed byte string (reftable/record.c::encode_string).
+fn write_reftable_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_reftable_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn read_reftable_string(block: &[u8], offset: &mut usize, end: usize) -> Result<String> {
+    let len = read_reftable_varint(block, offset, end)? as usize;
+    let str_end = offset
+        .checked_add(len)
+        .ok_or_else(|| GitError::InvalidFormat("reftable string overflow".into()))?;
+    if str_end > end {
+        return Err(GitError::InvalidFormat("truncated reftable string".into()));
+    }
+    let value = std::str::from_utf8(&block[*offset..str_end])
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?
+        .to_string();
+    *offset = str_end;
+    Ok(value)
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+/// Walk the `'g'` log section starting at `footer.log_position`, inflating each
+/// block and decoding its log records. Returns an empty vector when the table
+/// carries no logs.
+fn parse_reftable_log_section(
+    bytes: &[u8],
+    footer: &ReftableFooter,
+    footer_start: usize,
+    header: ReftableHeader,
+) -> Result<Vec<ReftableLogRecord>> {
+    if footer.log_position == 0 {
+        return Ok(Vec::new());
+    }
+    let log_end = [footer.log_index_position, footer_start as u64]
+        .into_iter()
+        .filter(|position| *position != 0)
+        .min()
+        .unwrap_or(footer_start as u64) as usize;
+    let mut logs = Vec::new();
+    let mut offset = footer.log_position as usize;
+    while offset < log_end {
+        if bytes[offset] == 0 {
+            offset += 1;
+            continue;
+        }
+        if bytes[offset] != b'g' {
+            break;
+        }
+        let uncompressed_len = read_u24(bytes, offset + 1)? as usize;
+        // The on-disk block body after the 4-byte header is zlib-compressed and
+        // runs to the next block (or the log index / footer). We inflate the
+        // remaining bytes of the section; zlib stops at the stream end.
+        let compressed = &bytes[offset + 4..log_end];
+        let (inflated, consumed) = inflate_zlib(compressed, uncompressed_len.saturating_sub(4))?;
+        // Reconstruct the logical block: 4-byte header + inflated body.
+        let mut block = Vec::with_capacity(uncompressed_len);
+        block.extend_from_slice(&bytes[offset..offset + 4]);
+        block.extend_from_slice(&inflated);
+        logs.extend(parse_reftable_log_block(&block, header)?);
+        offset += 4 + consumed;
+    }
+    Ok(logs)
+}
+
+fn parse_reftable_log_block(
+    block: &[u8],
+    header: ReftableHeader,
+) -> Result<Vec<ReftableLogRecord>> {
+    if block.len() < 6 || block[0] != b'g' {
+        return Err(GitError::InvalidFormat("invalid reftable log block".into()));
+    }
+    let restart_count = read_u16(block, block.len() - 2)? as usize;
+    if restart_count == 0 {
+        return Err(GitError::InvalidFormat(
+            "reftable log block has no restart offsets".into(),
+        ));
+    }
+    let restart_table_start = block
+        .len()
+        .checked_sub(2 + restart_count * 3)
+        .ok_or_else(|| GitError::InvalidFormat("truncated reftable log restart table".into()))?;
+    let mut offset = 4;
+    let mut previous_key: Vec<u8> = Vec::new();
+    let mut records = Vec::new();
+    while offset < restart_table_start {
+        let record = parse_reftable_log_record(
+            block,
+            &mut offset,
+            restart_table_start,
+            header,
+            &mut previous_key,
+        )?;
+        records.push(record);
+    }
+    if offset != restart_table_start {
+        return Err(GitError::InvalidFormat(
+            "reftable log block ended inside record".into(),
+        ));
+    }
+    Ok(records)
+}
+
+fn parse_reftable_log_record(
+    block: &[u8],
+    offset: &mut usize,
+    end: usize,
+    header: ReftableHeader,
+    previous_key: &mut Vec<u8>,
+) -> Result<ReftableLogRecord> {
+    let prefix_len = read_reftable_varint(block, offset, end)? as usize;
+    if prefix_len > previous_key.len() {
+        return Err(GitError::InvalidFormat(
+            "reftable log prefix exceeds previous key".into(),
+        ));
+    }
+    let suffix_len_and_type = read_reftable_varint(block, offset, end)?;
+    let suffix_len = (suffix_len_and_type >> 3) as usize;
+    let value_type = (suffix_len_and_type & 0x7) as u8;
+    let suffix_end = offset
+        .checked_add(suffix_len)
+        .ok_or_else(|| GitError::InvalidFormat("reftable log suffix overflow".into()))?;
+    if suffix_end > end {
+        return Err(GitError::InvalidFormat(
+            "truncated reftable log suffix".into(),
+        ));
+    }
+    let mut key = previous_key[..prefix_len].to_vec();
+    key.extend_from_slice(&block[*offset..suffix_end]);
+    *offset = suffix_end;
+    // The key is `refname \0 <8-byte BE ts>`: at least 9 trailing bytes, and the
+    // byte before the timestamp must be the NUL separator.
+    if key.len() < 9 || key[key.len() - 9] != 0 {
+        return Err(GitError::InvalidFormat("malformed reftable log key".into()));
+    }
+    let refname = std::str::from_utf8(&key[..key.len() - 9])
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?
+        .to_string();
+    let ts_bytes: [u8; 8] = key[key.len() - 8..]
+        .try_into()
+        .map_err(|_| GitError::InvalidFormat("truncated reftable log timestamp".into()))?;
+    let update_index = u64::MAX - u64::from_be_bytes(ts_bytes);
+    *previous_key = key;
+    let value = match value_type {
+        0 => ReftableLogValue::Deletion,
+        1 => {
+            let old_oid = read_reftable_oid(block, offset, end, header.object_format)?;
+            let new_oid = read_reftable_oid(block, offset, end, header.object_format)?;
+            let name = read_reftable_string(block, offset, end)?;
+            let email = read_reftable_string(block, offset, end)?;
+            let time = read_reftable_varint(block, offset, end)?;
+            let tz_offset = i16::from_be_bytes([
+                *block
+                    .get(*offset)
+                    .ok_or_else(|| GitError::InvalidFormat("truncated reftable log tz".into()))?,
+                *block.get(*offset + 1).ok_or_else(|| {
+                    GitError::InvalidFormat("truncated reftable log tz".into())
+                })?,
+            ]);
+            *offset += 2;
+            let message = read_reftable_string(block, offset, end)?;
+            ReftableLogValue::Update(ReftableLogUpdate {
+                old_oid,
+                new_oid,
+                name,
+                email,
+                time,
+                tz_offset,
+                message,
+            })
+        }
+        other => {
+            return Err(GitError::InvalidFormat(format!(
+                "unsupported reftable log value type {other}"
+            )));
+        }
+    };
+    Ok(ReftableLogRecord {
+        refname,
+        update_index,
+        value,
+    })
+}
+
+/// Deflate `data` with a zlib header/trailer at level 9, matching git's
+/// `deflateInit(stream, 9)` for reftable log blocks.
+fn deflate_zlib(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(9));
+    encoder
+        .write_all(data)
+        .map_err(|err| GitError::InvalidFormat(format!("reftable log deflate failed: {err}")))?;
+    encoder
+        .finish()
+        .map_err(|err| GitError::InvalidFormat(format!("reftable log deflate failed: {err}")))
+}
+
+/// Inflate a single zlib stream from `data`, expecting `expected_len`
+/// decompressed bytes. Returns the decompressed body and the number of
+/// compressed bytes consumed, so the caller can find the next log block.
+fn inflate_zlib(data: &[u8], expected_len: usize) -> Result<(Vec<u8>, usize)> {
+    use flate2::Decompress;
+    use flate2::FlushDecompress;
+    let mut decoder = Decompress::new(true);
+    let mut out = Vec::with_capacity(expected_len);
+    decoder
+        .decompress_vec(data, &mut out, FlushDecompress::Finish)
+        .map_err(|err| GitError::InvalidFormat(format!("reftable log inflate failed: {err}")))?;
+    Ok((out, decoder.total_in() as usize))
 }
 
 fn read_reftable_oid(
@@ -2939,6 +3337,161 @@ mod tests {
             );
         };
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reftable_log_records_round_trip() {
+        let old = oid("0000000000000000000000000000000000000000");
+        let new1 = oid("1111111111111111111111111111111111111111");
+        let new2 = oid("2222222222222222222222222222222222222222");
+        let refs = vec![ReftableRefRecord {
+            name: "refs/heads/main".into(),
+            update_index: 2,
+            value: ReftableRefValue::Direct(new2.clone()),
+        }];
+        let logs = vec![
+            ReftableLogRecord {
+                refname: "refs/heads/main".into(),
+                update_index: 1,
+                value: ReftableLogValue::Update(ReftableLogUpdate {
+                    old_oid: old.clone(),
+                    new_oid: new1.clone(),
+                    name: "Committer One".into(),
+                    email: "one@example.com".into(),
+                    time: 1_700_000_000,
+                    tz_offset: 120,
+                    message: "commit (initial): first".into(),
+                }),
+            },
+            ReftableLogRecord {
+                refname: "refs/heads/main".into(),
+                update_index: 2,
+                value: ReftableLogValue::Update(ReftableLogUpdate {
+                    old_oid: new1.clone(),
+                    new_oid: new2.clone(),
+                    name: "Committer Two".into(),
+                    email: "two@example.com".into(),
+                    time: 1_700_000_100,
+                    tz_offset: -300,
+                    message: "commit: second".into(),
+                }),
+            },
+        ];
+
+        let bytes = Reftable::write(ObjectFormat::Sha1, 1, 2, &refs, &logs)
+            .expect("test operation should succeed");
+        let table = Reftable::parse(&bytes).expect("test operation should succeed");
+
+        assert_eq!(table.refs.len(), 1);
+        // Newest update index sorts first within a refname.
+        assert_eq!(table.logs.len(), 2);
+        assert_eq!(table.logs[0].update_index, 2);
+        assert_eq!(table.logs[1].update_index, 1);
+        let ReftableLogValue::Update(update0) = &table.logs[0].value else {
+            panic!("expected update");
+        };
+        assert_eq!(update0.tz_offset, -300);
+        assert_eq!(update0.old_oid, new1);
+        assert_eq!(update0.new_oid, new2);
+        assert_eq!(update0.message, "commit: second");
+        let ReftableLogValue::Update(update1) = &table.logs[1].value else {
+            panic!("expected update");
+        };
+        assert_eq!(update1.tz_offset, 120);
+        assert_eq!(update1.old_oid, old);
+        assert_eq!(update1.message, "commit (initial): first");
+    }
+
+    /// Anti-stub conformance: upstream git must read the reflog out of a reftable
+    /// our writer produced, log blocks and all.
+    #[test]
+    fn upstream_git_reads_rust_written_reftable_log() {
+        let root = unique_temp_dir("reftable-log-upstream");
+        fs::create_dir_all(&root).expect("create temp repo");
+        {
+            run_success("git", &root, &["init", "-q"]);
+            // Build a real commit so the ref points at a commit (git's reflog show
+            // requires it). Empty tree -> commit, both written into the loose ODB.
+            let empty_tree = run_success_with_stdin("git", &root, &["mktree"], b"");
+            let empty_tree = String::from_utf8(empty_tree).expect("tree oid is utf8");
+            let commit_oid = run_success(
+                "git",
+                &root,
+                &[
+                    "-c",
+                    "user.name=Reftable Writer",
+                    "-c",
+                    "user.email=writer@example.com",
+                    "commit-tree",
+                    empty_tree.trim(),
+                    "-m",
+                    "seed",
+                ],
+            );
+            let commit_str = String::from_utf8(commit_oid).expect("commit oid is utf8");
+            let new_oid = ObjectId::from_hex(ObjectFormat::Sha1, commit_str.trim())
+                .expect("test operation should succeed");
+            let zero = oid("0000000000000000000000000000000000000000");
+            let git_dir = root.join(".git");
+            fs::write(
+                git_dir.join("config"),
+                b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n",
+            )
+            .expect("write config");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n").expect("write HEAD");
+            let reftable_dir = git_dir.join("reftable");
+            fs::create_dir_all(&reftable_dir).expect("create reftable dir");
+            // git's `table_has_valid_name` parses all three dash-separated fields
+            // as hex; the trailing token must be pure hex, ending in `.ref`.
+            let table_name = "0x000000000001-0x000000000001-00000001.ref";
+            let table = Reftable::write(
+                ObjectFormat::Sha1,
+                1,
+                1,
+                &[ReftableRefRecord {
+                    name: "refs/heads/main".into(),
+                    update_index: 1,
+                    value: ReftableRefValue::Direct(new_oid.clone()),
+                }],
+                &[ReftableLogRecord {
+                    refname: "refs/heads/main".into(),
+                    update_index: 1,
+                    value: ReftableLogValue::Update(ReftableLogUpdate {
+                        old_oid: zero,
+                        new_oid: new_oid.clone(),
+                        name: "Reftable Writer".into(),
+                        email: "writer@example.com".into(),
+                        time: 1_700_000_000,
+                        tz_offset: 0,
+                        // git stores reflog messages with a trailing newline.
+                        message: "commit (initial): seed\n".into(),
+                    }),
+                }],
+            )
+            .expect("test operation should succeed");
+            fs::write(reftable_dir.join(table_name), table).expect("write reftable");
+            fs::write(reftable_dir.join("tables.list"), format!("{table_name}\n"))
+                .expect("write tables.list");
+
+            // git parses the log block and surfaces the reflog message.
+            let output = run_success(
+                "git",
+                &root,
+                &["reflog", "show", "--format=%H %gs", "refs/heads/main"],
+            );
+            let text = String::from_utf8(output).expect("reflog output is utf8");
+            assert!(
+                text.contains("commit (initial): seed"),
+                "git reflog did not surface our log message: {text:?}"
+            );
+            assert!(
+                text.contains(&new_oid.to_string()),
+                "git reflog did not surface our new oid: {text:?}"
+            );
+        };
+        if std::env::var_os("SLEY_KEEP").is_none() {
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

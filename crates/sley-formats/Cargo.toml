@@ -8,11 +8,25 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Reftable log blocks are zlib-deflated (reftable/block.c). No backend is baked
+# into the dep line: the backend is picked by exactly one of the mutually-
+# exclusive `zlib-rs`/`pure-rust` crate features below, matching sley-pack /
+# sley-archive so Cargo resolves a single flate2 backend across the workspace
+# (no C toolchain).
+flate2 = { version = "1", default-features = false }
 sley-core = { path = "../sley-core", version = "0.0.3" }
 sley-config = { path = "../sley-config", version = "0.0.3" }
 sley-index = { path = "../sley-index", version = "0.0.3" }
 sley-object = { path = "../sley-object", version = "0.0.3" }
 
+[features]
+default = ["zlib-rs"]
+# Default backend: zlib-rs, a pure-Rust port of zlib-ng — ~zlib-ng throughput,
+# NO C toolchain / cmake.
+zlib-rs = ["flate2/zlib-rs"]
+# Fallback backend: flate2's miniz_oxide (`rust_backend`); decompression is
+# byte-identical. Select with `--no-default-features --features pure-rust`.
+pure-rust = ["flate2/rust_backend"]
+
 [lints]
 workspace = true
-
