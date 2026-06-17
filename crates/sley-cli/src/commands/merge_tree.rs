@@ -404,8 +404,9 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
 
     let strategy = parse_strategy_favor(&options.strategy_options)?;
     let detect_renames = merge_tree_detect_renames(&git_dir);
+    ensure_merge_tree_inputs_readable(&db, format, base_tree.as_ref(), &ours_tree, &theirs_tree)?;
     let mut write_db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let merge = sley_diff_merge::merge_trees(
+    let merge = match sley_diff_merge::merge_trees(
         &mut write_db,
         format,
         base_tree.as_ref(),
@@ -421,8 +422,56 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
             directory_renames: sley_diff_merge::DirectoryRenames::Conflict,
             style: sley_diff_merge::ConflictStyle::Merge,
         },
-    )?;
+    ) {
+        Ok(merge) => merge,
+        Err(err) => return Err(merge_tree_merge_error(err)),
+    };
     Ok(render_merge_outcome(&merge, branch1, branch2))
+}
+
+fn ensure_merge_tree_inputs_readable(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base_tree: Option<&ObjectId>,
+    ours_tree: &ObjectId,
+    theirs_tree: &ObjectId,
+) -> Result<()> {
+    for oid in [base_tree, Some(ours_tree), Some(theirs_tree)]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(err) = db.read_object(oid) {
+            if merge_tree_missing_oid(&err).is_some() {
+                let base = match base_tree {
+                    Some(base) => *base,
+                    None => sley_core::object_id_for_bytes(format, "tree", b"")?,
+                };
+                eprintln!("error: Could not read {oid}");
+                eprintln!(
+                    "error: collecting merge info failed for trees {base}, {ours_tree}, {theirs_tree}"
+                );
+                eprintln!("fatal: failure to merge");
+                return Err(GitError::Exit(128));
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn merge_tree_merge_error(err: GitError) -> GitError {
+    if let Some(oid) = merge_tree_missing_oid(&err) {
+        eprintln!("error: unable to read blob object {oid}");
+        return GitError::Exit(128);
+    }
+    err
+}
+
+fn merge_tree_missing_oid(err: &GitError) -> Option<ObjectId> {
+    match err {
+        GitError::NotFound(kind) => kind.object_id(),
+        _ => None,
+    }
 }
 
 fn merge_tree_detect_renames(git_dir: &Path) -> bool {
