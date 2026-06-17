@@ -1315,6 +1315,10 @@ fn render_blame(
 ) -> Result<()> {
     let (abbrev, hex_width) = blame_display_abbrev(git_dir, format, options)?;
 
+    // git blame *always* reads the mailmap (`read_mailmap`, no flag) and maps the
+    // displayed author name/email through it.
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+
     // Column widths are computed over the displayed lines only, matching git
     // (e.g. `-L 2,2` does not pad the line number to the whole file's width).
     let max_lineno = selected.iter().copied().max().unwrap_or(1);
@@ -1327,7 +1331,7 @@ fn render_blame(
     if !options.suppress_author {
         for &line_no in selected {
             let blame = &lines[line_no - 1];
-            let (author, date) = author_and_date(db, format, blame, options)?;
+            let (author, date) = author_and_date(db, format, blame, options, &mailmap)?;
             author_strings.push(author);
             date_strings.push(date);
         }
@@ -1468,18 +1472,18 @@ fn author_and_date(
     format: ObjectFormat,
     blame: &LineBlame,
     options: &BlameOptions,
+    mailmap: &commands::utility::Mailmap,
 ) -> Result<(String, String)> {
     let object = db.read_object(&blame.commit)?;
     let commit = Commit::parse(format, &object.body)?;
     let identity = &commit.author;
 
+    // git blame maps the author through the mailmap before display (both the
+    // `-e` email column and the default name column use the mapped identity).
+    let (mapped_name, mapped_email) = mailmap.rewrite_identity(identity);
     let author = match options.author_field {
-        AuthorField::Name => for_each_ref_identity_name(identity)
-            .map(|name| String::from_utf8_lossy(name).into_owned())
-            .unwrap_or_default(),
-        AuthorField::Email => for_each_ref_identity_email(identity, ForEachRefEmailMode::Bracketed)
-            .map(|email| String::from_utf8_lossy(email).into_owned())
-            .unwrap_or_default(),
+        AuthorField::Name => String::from_utf8_lossy(&mapped_name).into_owned(),
+        AuthorField::Email => format!("<{}>", String::from_utf8_lossy(&mapped_email)),
     };
 
     // The default date column is ISO `YYYY-MM-DD HH:MM:SS +ZZZZ` (in the
