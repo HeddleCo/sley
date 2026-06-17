@@ -558,6 +558,14 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         )?
     };
 
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    let entries = filter_racy_clean_equivalent_worktree_entries(
+        entries,
+        worktree_root,
+        git_dir,
+        format,
+        &config,
+    )?;
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if o.reverse {
         reverse_diff_entries(entries)
@@ -772,6 +780,94 @@ fn diff_files_stat_entry_has_content_change(data: &DiffStatEntryData<'_>) -> boo
         DiffLineStats::Binary { unchanged, .. } => !unchanged,
         DiffLineStats::Text { inserted, deleted } => inserted != 0 || deleted != 0,
     }
+}
+
+fn filter_racy_clean_equivalent_worktree_entries(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let index = Index::parse(&fs::read(sley_worktree::repository_index_path(git_dir))?, format)?;
+    let mut filtered = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if diff_files_entry_is_racy_clean_equivalent(
+            &entry,
+            &index,
+            worktree_root,
+            git_dir,
+            format,
+            config,
+        )? {
+            continue;
+        }
+        filtered.push(entry);
+    }
+    Ok(filtered)
+}
+
+fn diff_files_entry_is_racy_clean_equivalent(
+    entry: &sley_diff_merge::NameStatusEntry,
+    index: &Index,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<bool> {
+    if entry.status != sley_diff_merge::NameStatus::Modified
+        || entry.old_mode != entry.new_mode
+    {
+        return Ok(false);
+    }
+    let Some(old_oid) = entry.old_oid else {
+        return Ok(false);
+    };
+    let path = entry.path.as_bytes();
+    let Some(index_entry) = index
+        .entries
+        .iter()
+        .find(|candidate| {
+            candidate.stage() == sley_index::Stage::Normal && candidate.path.as_bytes() == path
+        })
+    else {
+        return Ok(false);
+    };
+    if index_entry.oid != old_oid || Some(index_entry.mode) != entry.old_mode {
+        return Ok(false);
+    }
+    let absolute = diff_files_worktree_path(worktree_root, path);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(false),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    if index_entry.size != diff_files_index_size(&metadata) {
+        return Ok(false);
+    }
+    let body = fs::read(&absolute)?;
+    let clean = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
+    let clean_oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
+    Ok(clean_oid == old_oid)
+}
+
+fn diff_files_index_size(metadata: &fs::Metadata) -> u32 {
+    metadata.len().min(u32::MAX as u64) as u32
+}
+
+#[cfg(unix)]
+fn diff_files_worktree_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    worktree_root.join(OsStr::from_bytes(path))
+}
+
+#[cfg(not(unix))]
+fn diff_files_worktree_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
+    worktree_root.join(String::from_utf8_lossy(path).as_ref())
 }
 
 /// Render a single entry for `--name-only` / `--name-status`, honouring `-z`

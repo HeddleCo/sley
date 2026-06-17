@@ -437,6 +437,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut deduplicate = false;
     let mut error_unmatch = false;
     let mut show_eol = false;
+    let mut debug = false;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -499,13 +500,14 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-error-unmatch" => error_unmatch = false,
             "--eol" => show_eol = true,
             "--no-eol" => show_eol = false,
+            "--debug" => debug = true,
+            "--no-debug" => debug = false,
             "--recurse-submodules"
             | "--no-recurse-submodules"
             | "--sparse"
             | "--no-sparse"
             | "--no-killed"
-            | "--no-resolve-undo"
-            | "--no-debug" => {}
+            | "--no-resolve-undo" => {}
             "--abbrev" => oid_abbrev = Some(7),
             "--no-abbrev" => oid_abbrev = None,
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
@@ -540,7 +542,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             value if !value.starts_with('-') => path_args.push(arg.clone()),
             value => {
                 return Err(GitError::Command(format!(
-                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --abbrev[=<n>], --no-abbrev, and -z"
+                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --debug, --abbrev[=<n>], --no-abbrev, and -z"
                 )));
             }
         }
@@ -582,6 +584,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     if !selected
         && !output_stage
         && !show_eol
+        && !debug
         && oid_abbrev.is_none()
         && !nul
         && path_args.is_empty()
@@ -682,6 +685,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         oid_abbrev,
                         oid_candidates: &oid_candidates,
                         eol,
+                        debug,
                     },
                 )?;
             } else {
@@ -699,6 +703,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         oid_abbrev,
                         oid_candidates: &oid_candidates,
                         eol,
+                        debug,
                     },
                 )?;
             }
@@ -720,6 +725,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 oid_abbrev,
                 &oid_candidates,
                 eol,
+                debug,
             )?;
         } else if (deleted || modified) && output_stage {
             write_ls_files_index_with_selected(
@@ -736,6 +742,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                     oid_abbrev,
                     oid_candidates: &oid_candidates,
                     eol,
+                    debug,
                 },
             )?;
         } else {
@@ -748,6 +755,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 oid_abbrev,
                 &oid_candidates,
                 eol,
+                debug,
             )?;
         }
     }
@@ -780,6 +788,7 @@ fn write_ls_files_unmerged<'a>(
     oid_abbrev: Option<usize>,
     oid_candidates: &[ObjectId],
     eol: Option<&EolContext>,
+    debug: bool,
 ) -> Result<()> {
     for entry in entries {
         if index_entry_stage(entry) == 0 {
@@ -794,6 +803,7 @@ fn write_ls_files_unmerged<'a>(
             oid_abbrev,
             oid_candidates,
             eol,
+            debug,
         )?;
     }
     Ok(())
@@ -809,6 +819,7 @@ fn write_ls_files_index<'a>(
     oid_abbrev: Option<usize>,
     oid_candidates: &[ObjectId],
     eol: Option<&EolContext>,
+    debug: bool,
 ) -> Result<()> {
     for entry in entries {
         let Some(path) = pathspec.display(&entry.path) else {
@@ -831,7 +842,29 @@ fn write_ls_files_index<'a>(
         }
         write_ls_files_path(stdout, &path, terminator)?;
         stdout.write_all(&[terminator])?;
+        if debug {
+            write_ls_files_debug(stdout, entry)?;
+        }
     }
+    Ok(())
+}
+
+fn write_ls_files_debug(stdout: &mut io::Stdout, entry: &sley_index::IndexEntry) -> Result<()> {
+    let flags = entry.flags & !0x0fff;
+    write!(
+        stdout,
+        "  ctime: {}:{}\n  mtime: {}:{}\n  dev: {}\tino: {}\n  uid: {}\tgid: {}\n  size: {}\tflags: {}\n",
+        entry.ctime_seconds,
+        entry.ctime_nanoseconds,
+        entry.mtime_seconds,
+        entry.mtime_nanoseconds,
+        entry.dev,
+        entry.ino,
+        entry.uid,
+        entry.gid,
+        entry.size,
+        flags,
+    )?;
     Ok(())
 }
 
@@ -865,6 +898,7 @@ fn write_ls_files_index_with_selected<'a>(
             options.oid_abbrev,
             options.oid_candidates,
             options.eol,
+            options.debug,
         )?;
     }
     Ok(())
@@ -944,6 +978,9 @@ fn write_ls_files_entry(
     }
     write_ls_files_path(stdout, &path, options.terminator)?;
     stdout.write_all(&[options.terminator])?;
+    if options.debug {
+        write_ls_files_debug(stdout, entry)?;
+    }
     Ok(())
 }
 
@@ -1014,6 +1051,7 @@ struct LsFilesWriteOptions<'a> {
     oid_abbrev: Option<usize>,
     oid_candidates: &'a [ObjectId],
     eol: Option<&'a EolContext>,
+    debug: bool,
 }
 
 pub(crate) fn cmd_ls_tree(args: &[String]) -> Result<()> {

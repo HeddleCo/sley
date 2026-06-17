@@ -383,10 +383,11 @@ declare -A FLOOR=(
     [t7004-tag.sh]=189
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
-    # t0020-crlf is FLAKY (oscillates 27/28 — a sley crlf-ordering non-determinism, tracked
-    # separately). Wave-9 bumped it 27->28 from a flaky read; that silently reddened the weekly
-    # floor gate ~1-in-3. Floor = the safe LOWER bound 27. (Lesson: re-measure small +1 bumps.)
-    [t0020-crlf.sh]=27
+    # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
+    # readdir + checkout-- stat-refresh SCOPED to the call site (R4: reset's tree-sourced entries
+    # stay zero-stat so `reset --mixed --no-refresh` is unaffected). Now DETERMINISTIC at 29
+    # (stable 8x+). The flake was diff-files comparing raw vs clean-filtered bytes + stale cached stat.
+    [t0020-crlf.sh]=29
     [t0021-conversion.sh]=21
     [t3920-crlf-messages.sh]=9
     [t2107-update-index-basic.sh]=10

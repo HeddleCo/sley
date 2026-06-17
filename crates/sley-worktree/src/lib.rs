@@ -10331,7 +10331,7 @@ fn restore_worktree_paths_inner(
     if !index_path.exists() {
         return Err(GitError::Exit(1));
     }
-    let index = Index::parse(&fs::read(index_path)?, format)?;
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut restored = BTreeSet::new();
     for path in paths {
@@ -10349,13 +10349,29 @@ fn restore_worktree_paths_inner(
             || absolute.is_dir()
             || index_has_entry_under(&index.entries, &git_path);
         let mut matched = false;
-        for entry in &index.entries {
-            if entry.path.as_bytes() == git_path.as_slice()
-                || (recursive && index_entry_is_under_path(entry.path.as_bytes(), &git_path))
-            {
-                restore_index_entry(worktree_root, git_dir, format, &db, entry, smudge_config)?;
-                restored.insert(entry.path.clone());
-                matched = true;
+        let matched_positions = index
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                (entry.path.as_bytes() == git_path.as_slice()
+                    || (recursive && index_entry_is_under_path(entry.path.as_bytes(), &git_path)))
+                .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        for position in matched_positions {
+            let refreshed = restore_index_entry(
+                worktree_root,
+                git_dir,
+                format,
+                &db,
+                &index.entries[position],
+                smudge_config,
+            )?;
+            restored.insert(index.entries[position].path.clone());
+            matched = true;
+            if let Some(refreshed) = refreshed {
+                index.entries[position] = refreshed;
             }
         }
         if !matched {
@@ -10366,6 +10382,7 @@ fn restore_worktree_paths_inner(
             return Err(GitError::Exit(1));
         }
     }
+    fs::write(&index_path, index.write(format)?)?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -10681,6 +10698,8 @@ pub fn reset_index_and_worktree_to_commit(
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
 
     // git's `reset --hard` runs a one-way merge through unpack-trees: EVERY path
     // present in the current index (at ANY stage) that the target tree does not
@@ -10696,7 +10715,14 @@ pub fn reset_index_and_worktree_to_commit(
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
+        index_entries.push(materialize_tree_entry_filtered(
+            &db,
+            worktree_root,
+            path,
+            entry,
+            &config,
+            &attributes,
+        )?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     fs::write(
@@ -10768,6 +10794,31 @@ fn materialize_tree_entry(
         });
     }
     let file_path = write_worktree_blob_entry(db, worktree_root, path, entry)?;
+    let metadata = fs::symlink_metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
+}
+
+fn materialize_tree_entry_filtered(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+    config: &GitConfig,
+    attributes: &AttributeMatcher,
+) -> Result<IndexEntry> {
+    if sley_index::is_gitlink(entry.mode) || (entry.mode & 0o170000) == 0o120000 {
+        return materialize_tree_entry(db, worktree_root, path, entry);
+    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
+    let checks = attributes.attributes_for_path(path, &filter_attribute_names(), false);
+    let body = apply_smudge_filter_with_attributes_cow(config, &checks, path, &object.body)?;
+    let file_path = worktree_path(worktree_root, path)?;
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
+    fs::write(&file_path, &body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
@@ -12379,7 +12430,7 @@ fn restore_index_entry(
     db: &FileObjectDatabase,
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
-) -> Result<()> {
+) -> Result<Option<IndexEntry>> {
     // A gitlink (mode 160000) names a commit in the submodule's repository, not
     // a blob here — reading it as a blob fails ("not found: blob object"). git's
     // `checkout_entry` S_IFGITLINK arm just ensures the submodule directory
@@ -12388,7 +12439,7 @@ fn restore_index_entry(
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
         fs::create_dir_all(&dir_path)?;
-        return Ok(());
+        return Ok(None);
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let body: Cow<'_, [u8]> = match smudge_config {
@@ -12413,37 +12464,32 @@ fn restore_index_entry(
     remove_existing_worktree_path(&file_path)?;
     fs::write(&file_path, &body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
-    Ok(())
+    let metadata = fs::symlink_metadata(&file_path)?;
+    Ok(Some(index_entry_with_refreshed_stat(entry, &metadata)))
+}
+
+fn index_entry_with_refreshed_stat(entry: &IndexEntry, metadata: &fs::Metadata) -> IndexEntry {
+    let mut refreshed = index_entry_from_metadata(entry.path.clone(), entry.oid, metadata);
+    refreshed.mode = entry.mode;
+    refreshed.flags = entry.flags;
+    refreshed.flags_extended = entry.flags_extended;
+    refreshed
 }
 
 fn restored_head_index_entry(
-    worktree_root: &Path,
-    db: &FileObjectDatabase,
+    _worktree_root: &Path,
+    _db: &FileObjectDatabase,
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
-    let file_path = worktree_path(worktree_root, path)?;
     // This restores the index from a tree (reset --mixed / stash / sparse) WITHOUT
     // rewriting the worktree file, so the file on disk may hold different content
     // than `entry.oid`. Crucially we must NOT copy the worktree file's stat onto
     // this entry: that would make the cached stat match a file whose real content
     // hashes to a DIFFERENT oid, breaking git's "stat-match implies oid-match"
-    // invariant that the status stat-cache relies on. Leave the stat zeroed so
-    // status always re-hashes this path and detects any modification -- exactly
-    // git's behavior for tree-sourced entries until a later refresh validates them.
-    let size = if sley_index::is_gitlink(entry.mode) {
-        // A gitlink's oid names a commit in the submodule's repository — it is
-        // not readable here, and a tree-sourced gitlink entry carries size 0.
-        0
-    } else {
-        match fs::metadata(&file_path) {
-            Ok(metadata) => metadata.len().min(u32::MAX as u64) as u32,
-            Err(_) => {
-                let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-                object.body.len().min(u32::MAX as usize) as u32
-            }
-        }
-    };
+    // invariant that the status stat-cache relies on. Leave the whole stat tuple
+    // zeroed, including size, so `reset --mixed --no-refresh` remains stat-dirty
+    // until an explicit/default refresh validates it (t7102 cell 28).
     Ok(IndexEntry {
         ctime_seconds: 0,
         ctime_nanoseconds: 0,
@@ -12454,7 +12500,7 @@ fn restored_head_index_entry(
         mode: entry.mode,
         uid: 0,
         gid: 0,
-        size,
+        size: 0,
         oid: entry.oid,
         flags: path.len().min(0x0fff) as u16,
         flags_extended: 0,
@@ -12521,7 +12567,7 @@ fn index_entry_from_metadata(
     let mode = file_mode(metadata);
     let path = path.into();
     let flags = path.len().min(0x0fff) as u16;
-    IndexEntry {
+    let mut entry = IndexEntry {
         ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
         ctime_nanoseconds: duration.subsec_nanos(),
         mtime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
@@ -12531,12 +12577,33 @@ fn index_entry_from_metadata(
         mode,
         uid: 0,
         gid: 0,
-        size: metadata.len().min(u32::MAX as u64) as u32,
+        size: index_size_from_metadata(metadata),
         oid,
         flags,
         flags_extended: 0,
         path,
-    }
+    };
+    apply_unix_metadata_to_index_entry(&mut entry, metadata);
+    entry
+}
+
+#[cfg(unix)]
+fn apply_unix_metadata_to_index_entry(entry: &mut IndexEntry, metadata: &fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    entry.ctime_seconds = metadata.ctime().min(u32::MAX as i64).max(0) as u32;
+    entry.ctime_nanoseconds = metadata.ctime_nsec().min(u32::MAX as i64).max(0) as u32;
+    entry.dev = metadata.dev() as u32;
+    entry.ino = metadata.ino() as u32;
+    entry.uid = metadata.uid();
+    entry.gid = metadata.gid();
+}
+
+#[cfg(not(unix))]
+fn apply_unix_metadata_to_index_entry(_entry: &mut IndexEntry, _metadata: &fs::Metadata) {}
+
+fn index_size_from_metadata(metadata: &fs::Metadata) -> u32 {
+    metadata.len().min(u32::MAX as u64) as u32
 }
 
 fn read_expected_object(
@@ -12693,6 +12760,10 @@ impl IndexStatCache {
             mode: entry.mode,
             oid: entry.oid,
         })
+    }
+
+    fn index_entry(&self, git_path: &[u8]) -> Option<&IndexEntry> {
+        self.entries.get(git_path)
     }
 
     /// Returns the cached [`TrackedEntry`] for `git_path` (reusing its stored
@@ -13216,7 +13287,19 @@ fn worktree_entry_for_git_path(
     } else {
         let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
         let body = fs::read(&absolute)?;
-        apply_clean_filter(worktree_root, git_dir, &config, git_path, &body)?
+        let clean = apply_clean_filter(worktree_root, git_dir, &config, git_path, &body)?;
+        let oid = match stat_cache.and_then(|cache| cache.index_entry(git_path)) {
+            Some(index_entry) => clean_filtered_oid_for_status(
+                format,
+                &body,
+                clean,
+                index_entry.oid,
+                index_entry.size,
+                &metadata,
+            )?,
+            None => EncodedObject::new(ObjectType::Blob, clean).object_id(format)?,
+        };
+        return Ok(Some(TrackedEntry { mode, oid }));
     };
     let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
     Ok(Some(TrackedEntry { mode, oid }))
@@ -13293,7 +13376,17 @@ fn worktree_entry_for_index_entry_with_attributes(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+        let clean =
+            apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+        let oid = clean_filtered_oid_for_status(
+            format,
+            &body,
+            clean,
+            index_entry.oid,
+            index_entry.size,
+            &metadata,
+        )?;
+        return Ok(Some(TrackedEntry { mode, oid }));
     };
     let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
     Ok(Some(TrackedEntry { mode, oid }))
@@ -13370,10 +13463,35 @@ fn worktree_entry_for_index_entry_ref_with_attributes(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?
+        let clean =
+            apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+        let oid = clean_filtered_oid_for_status(
+            format,
+            &body,
+            clean,
+            index_entry.oid,
+            index_entry.size,
+            &metadata,
+        )?;
+        return Ok(Some(TrackedEntry { mode, oid }));
     };
     let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
     Ok(Some(TrackedEntry { mode, oid }))
+}
+
+fn clean_filtered_oid_for_status(
+    format: ObjectFormat,
+    raw_body: &[u8],
+    clean_body: Vec<u8>,
+    index_oid: ObjectId,
+    index_size: u32,
+    metadata: &fs::Metadata,
+) -> Result<ObjectId> {
+    let clean_oid = EncodedObject::new(ObjectType::Blob, clean_body).object_id(format)?;
+    if clean_oid == index_oid && index_size != index_size_from_metadata(metadata) {
+        return EncodedObject::new(ObjectType::Blob, raw_body.to_vec()).object_id(format);
+    }
+    Ok(clean_oid)
 }
 
 struct TrackedOnlyCleanFilter {
@@ -13533,8 +13651,9 @@ fn collect_worktree_entries(
     if let Some(ignores) = context.ignores.as_deref_mut() {
         read_dir_ignore_patterns_for_base(dir, dir_git_path, ignores)?;
     }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let mut dir_entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    dir_entries.sort_by_key(|entry| entry.file_name());
+    for entry in dir_entries {
         let file_name = entry.file_name();
         let path = entry.path();
         if is_dot_git_entry(&path) {
@@ -13664,7 +13783,38 @@ fn collect_worktree_entries(
                     context
                         .matcher
                         .attributes_for_path(&git_path, context.requested, false);
-                apply_clean_filter_with_attributes(context.config, &checks, &git_path, &body)?
+                let clean =
+                    apply_clean_filter_with_attributes(context.config, &checks, &git_path, &body)?;
+                let oid = match context
+                    .stat_cache
+                    .and_then(|cache| cache.index_entry(&git_path))
+                {
+                    Some(index_entry) => clean_filtered_oid_for_status(
+                        context.format,
+                        &body,
+                        clean,
+                        index_entry.oid,
+                        index_entry.size,
+                        &metadata,
+                    )?,
+                    None => EncodedObject::new(ObjectType::Blob, clean).object_id(context.format)?,
+                };
+                let tracked = TrackedEntry {
+                    mode: entry_mode,
+                    oid,
+                };
+                if context
+                    .stat_cache
+                    .is_some_and(|cache| cache.contains(&git_path))
+                {
+                    context.mark_tracked_present(&git_path);
+                    if context.should_record_tracked_entry(&git_path, &tracked) {
+                        context.entries.insert(git_path, tracked);
+                    }
+                } else {
+                    context.entries.insert(git_path, tracked);
+                }
+                continue;
             };
             let oid = EncodedObject::new(ObjectType::Blob, body).object_id(context.format)?;
             let tracked = TrackedEntry {
