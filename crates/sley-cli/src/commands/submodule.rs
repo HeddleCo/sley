@@ -198,6 +198,19 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+
+    // git's `module_add`: a `./` or `../` repository is resolved against the
+    // superproject's `remote.origin.url` for the CLONE + `.git/config` url
+    // (`realrepo`), while `.gitmodules` keeps the ORIGINAL relative form. This
+    // is what makes `submodule add ../sub` work when the superproject is itself
+    // a submodule (the recursive `add ... subsubmodule` case).
+    let real_repo = if options.repository.starts_with("../") || options.repository.starts_with("./")
+    {
+        let config = read_repo_config(&git_dir)?;
+        resolve_submodule_relative_url(&worktree_root, &config, &options.repository, false)
+    } else {
+        options.repository.clone()
+    };
     let path = options
         .path
         .clone()
@@ -242,7 +255,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         }
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
-        clone_args.push(options.repository.clone());
+        clone_args.push(real_repo.clone());
         clone_args.push(destination.display().to_string());
         super::remote_cmds::cmd_clone(&clone_args)?;
 
@@ -262,6 +275,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         &worktree_root,
         &normalized_path,
         &options.repository,
+        &real_repo,
         options.branch.as_deref(),
         options.name.as_deref(),
     )?;
@@ -1081,24 +1095,28 @@ fn write_submodule_mapping(
     git_dir: &Path,
     worktree_root: &Path,
     path: &str,
-    url: &str,
+    gitmodules_url: &str,
+    config_url: &str,
     branch: Option<&str>,
     name_override: Option<&str>,
 ) -> Result<()> {
+    // git records the ORIGINAL (possibly relative) url in `.gitmodules`, but the
+    // RESOLVED `realrepo` in `.git/config` — so a `../sub` add stays portable in
+    // `.gitmodules` while `.git/config` holds the concrete clone url.
     let gitmodules_path = worktree_root.join(".gitmodules");
     let mut gitmodules = GitConfig::read(&gitmodules_path).unwrap_or_default();
     let name = name_override.map(str::to_string).unwrap_or_else(|| {
         submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string())
     });
     set_submodule_config_value(&mut gitmodules, &name, "path", path);
-    set_submodule_config_value(&mut gitmodules, &name, "url", url);
+    set_submodule_config_value(&mut gitmodules, &name, "url", gitmodules_url);
     if let Some(branch) = branch {
         set_submodule_config_value(&mut gitmodules, &name, "branch", branch);
     }
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
 
     let mut config = read_repo_config(git_dir)?;
-    set_submodule_config_value(&mut config, &name, "url", url);
+    set_submodule_config_value(&mut config, &name, "url", config_url);
     set_submodule_config_value(&mut config, &name, "active", "true");
     write_repo_config(git_dir, &config)?;
     Ok(())
