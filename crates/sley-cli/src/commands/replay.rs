@@ -1392,6 +1392,18 @@ fn verify_worktree_safe(
                 }
             }
             None => {
+                // A gitlink target (mode 160000) is a submodule directory, not an
+                // untracked file to preserve. git's unpack-trees `verify_absent_1`
+                // routes a gitlink/submodule entry to `check_submodule_move_head`
+                // instead of `check_ok_to_remove`, so a directory in the way of a
+                // *new* gitlink never trips the untracked-overwrite refusal (the
+                // `revert "Replace sub1 with directory"` case: the on-disk `sub1`
+                // dir holds tracked files being removed by this same apply, and the
+                // gitlink is materialized in their place). Skip the untracked check
+                // for gitlink targets exactly as git skips `check_ok_to_remove`.
+                if matches!(target, Some((mode, _)) if sley_index::is_gitlink(mode)) {
+                    continue;
+                }
                 // Untracked file in the way of a new path.
                 let would_write =
                     target.is_some() || matches!(result, MergePathResult::Conflict { .. });
@@ -1509,7 +1521,18 @@ fn apply_merge_results_to_index_and_worktree(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = crate::commands::merge_rebase::merge_read_blob(db, oid)?;
+                    // A gitlink (submodule) entry's oid is a *commit* recorded in
+                    // the submodule, NOT a blob in the superproject ODB — reading
+                    // it as a blob fails ("not found"/"expected blob"). git's
+                    // entry.c gitlink arm never reads object content: it only
+                    // `mkdir`s the submodule dir. `merge_write_worktree_file`
+                    // ignores `content` for a gitlink mode (it materializes the
+                    // directory), so pass empty content and skip the ODB read.
+                    let content = if sley_index::is_gitlink(*mode) {
+                        Vec::new()
+                    } else {
+                        crate::commands::merge_rebase::merge_read_blob(db, oid)?
+                    };
                     crate::commands::merge_rebase::merge_write_worktree_file(
                         &ctx.worktree_root,
                         path,

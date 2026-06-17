@@ -63,6 +63,20 @@ pub(crate) fn merge_write_worktree_file(
     // change (regular file ⇄ symlink) is overwritten rather than written *through*
     // an existing symlink or left stale — the symlink-stash-apply / merge cases.
     merge_unlink_path_in_the_way(&full)?;
+    if sley_index::is_gitlink(mode) {
+        // Gitlink (submodule) entry: the `oid` is a *commit*, not a blob, so it
+        // must NOT be written as file content (the prior unconditional blob write
+        // produced an "Is a directory"/garbage-content failure that gated the
+        // revert/cherry-pick-over-submodule worktree apply, e.g.
+        // create_lib_submodule_repo's `git revert HEAD`). git's entry.c
+        // `write_entry` S_IFGITLINK arm only `mkdir`s the submodule directory
+        // (`submodule_move_head` — the embedded checkout — is a higher layer sley
+        // does not perform), so materialize the gitlink exactly as
+        // `sley_worktree::materialize_tree_entry`'s gitlink branch: create the
+        // directory and return, writing no content.
+        fs::create_dir_all(&full)?;
+        return Ok(());
+    }
     if (mode & 0o170000) == 0o120000 {
         // Symlink entry (mode 120000): the blob bytes are the link target.
         #[cfg(unix)]
@@ -188,6 +202,30 @@ pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> R
     // lstat (symlink_metadata): `Path::exists` follows symlinks and misses a
     // dangling one, leaving it behind on removal.
     match fs::symlink_metadata(&full) {
+        Ok(metadata) if metadata.is_dir() => {
+            // A directory occupies a tracked path being removed: this is a
+            // gitlink (submodule checkout). git's entry.c `unlink_entry` ⇒
+            // `remove_or_warn(mode, ..)` dispatches on `S_ISGITLINK(mode)` to
+            // `rmdir_or_warn` (vs `unlink_or_warn` for blobs/symlinks), so the
+            // submodule's *directory* is removed, never `unlink`ed (which is the
+            // `EISDIR` "Is a directory" failure that gated revert/cherry-pick
+            // over a populated submodule — t1013/t7112/t6438 setup). git first
+            // deinits via `submodule_move_head` (a higher layer sley does not
+            // perform), then `rmdir`s; `rmdir` of a still-populated submodule
+            // fails with ENOTEMPTY and git only *warns*, leaving the directory
+            // in place rather than erroring (`warn_if_unremovable`). Mirror that:
+            // try to remove the (now-empty-or-not) directory, but never fail the
+            // operation on a non-empty submodule directory.
+            match fs::remove_dir(&full) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    // ENOTEMPTY (populated submodule) and friends: git warns and
+                    // continues. Match the warn-and-continue, do not propagate.
+                    eprintln!("warning: unable to rmdir '{rel}': Directory not empty");
+                }
+            }
+        }
         Ok(_) => fs::remove_file(&full)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
