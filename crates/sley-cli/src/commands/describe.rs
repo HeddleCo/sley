@@ -187,14 +187,12 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         }
     }
 
-    if options.contains {
-        return Err(GitError::Command(
-            "describe --contains is not implemented".into(),
-        ));
-    }
     if options.long && options.abbrev == Some(0) {
         eprintln!("fatal: options '--long' and '--abbrev=0' cannot be used together");
         return Err(GitError::Exit(128));
+    }
+    if options.contains {
+        return describe_contains(&options, &commits);
     }
     if options.dirty.is_some() && !commits.is_empty() {
         eprintln!("fatal: option '--dirty' and commit-ishes cannot be used together");
@@ -405,6 +403,23 @@ fn describe_ref_names(refname: &str, options: &DescribeOptions) -> Option<Descri
     if !options.all {
         return None;
     }
+    if let Some(branch) = refname.strip_prefix("refs/heads/") {
+        return Some(DescribeRefName {
+            display: format!("heads/{branch}"),
+            match_name: branch.to_string(),
+            is_tag: false,
+        });
+    }
+    if let Some(remote) = refname.strip_prefix("refs/remotes/") {
+        return Some(DescribeRefName {
+            display: format!("remotes/{remote}"),
+            match_name: remote.to_string(),
+            is_tag: false,
+        });
+    }
+    if !options.patterns.is_empty() || !options.exclude_patterns.is_empty() {
+        return None;
+    }
     // `--all` considers every ref; the display name drops the leading `refs/`.
     let display = refname.strip_prefix("refs/").unwrap_or(refname).to_string();
     Some(DescribeRefName {
@@ -412,6 +427,36 @@ fn describe_ref_names(refname: &str, options: &DescribeOptions) -> Option<Descri
         display,
         is_tag: false,
     })
+}
+
+/// `git describe --contains` is implemented upstream by delegating to
+/// `name-rev --peel-tag --name-only --no-undefined`, with tag-only filtering
+/// unless `--all` was requested. Keep that route so the two commands share the
+/// same naming walk and exact-tag handling.
+fn describe_contains(options: &DescribeOptions, commits: &[String]) -> Result<()> {
+    let mut args = vec![
+        "--peel-tag".to_string(),
+        "--name-only".to_string(),
+        "--no-undefined".to_string(),
+    ];
+    if options.always {
+        args.push("--always".to_string());
+    }
+    if !options.all {
+        args.push("--tags".to_string());
+        for pattern in &options.patterns {
+            args.push(format!("--refs=refs/tags/{pattern}"));
+        }
+        for pattern in &options.exclude_patterns {
+            args.push(format!("--exclude=refs/tags/{pattern}"));
+        }
+    }
+    if commits.is_empty() {
+        args.push("HEAD".to_string());
+    } else {
+        args.extend(commits.iter().cloned());
+    }
+    crate::commands::name_rev::cmd_name_rev(&args)
 }
 
 fn describe_ref_passes_filters(match_name: &str, options: &DescribeOptions) -> bool {
