@@ -1,0 +1,332 @@
+sley upstream test report
+run label: 2026-06-17T04:55:27Z
+sley binary: /home/heddleco/dev/HeddleCo/.heddleco-orchestrator/target/parity-rebase-i-cont/release/sley
+upstream t/: /tmp/git-pcre-src/t
+default hash: sha1
+per-script timeout: 300s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3418-rebase-continue.sh     FAIL        11    19  rc=1 (1..30) #		|# failed 19 among 30 test(s)|1..30
+
+----- t3418-rebase-continue.sh (FAIL): failing assertions -----
+  [#6] rebase --continue remembers merge strategy and options
+  [#7] rebase -r passes merge strategy options correctly
+  [#8] --skip after failed fixup cleans commit message
+  [#10] rebase --apply --continue remembers --rerere-autoupdate
+  [#11] rebase --apply --continue honors rerere.autoUpdate
+  [#12] rebase --apply --continue remembers --no-rerere-autoupdate
+  [#13] rebase -m --continue remembers --rerere-autoupdate
+  [#14] rebase -m --continue honors rerere.autoUpdate
+  [#15] rebase -m --continue remembers --no-rerere-autoupdate
+  [#16] rebase -i --continue remembers --rerere-autoupdate
+  [#17] rebase -i --continue honors rerere.autoUpdate
+  [#18] rebase -i --continue remembers --no-rerere-autoupdate
+  [#19] the todo command "break" works
+  [#20] patch file is removed before break command
+  [#26] no change in comment character due to conflicts markers with core.commentChar=auto
+  [#27] rebase --apply sets ORIG_HEAD correctly
+  [#28] rebase --apply <upstream> <branch> sets ORIG_HEAD correctly
+  [#29] rebase --merge sets ORIG_HEAD correctly
+  [#30] rebase --merge <upstream> <branch> sets ORIG_HEAD correctly
+----- t3418-rebase-continue.sh (FAIL) last 25 lines -----
+#	
+not ok 27 - rebase --apply sets ORIG_HEAD correctly
+#	
+#			git checkout topic &&
+#			git reset --hard commit-new-file-F2-on-topic-branch &&
+#			test_orig_head_helper $type main
+#		
+not ok 28 - rebase --apply <upstream> <branch> sets ORIG_HEAD correctly
+#	
+#			git checkout main &&
+#			test_orig_head_helper $type main topic
+#		
+not ok 29 - rebase --merge sets ORIG_HEAD correctly
+#	
+#			git checkout topic &&
+#			git reset --hard commit-new-file-F2-on-topic-branch &&
+#			test_orig_head_helper $type main
+#		
+not ok 30 - rebase --merge <upstream> <branch> sets ORIG_HEAD correctly
+#	
+#			git checkout main &&
+#			test_orig_head_helper $type main topic
+#		
+# failed 19 among 30 test(s)
+1..30
+----- end t3418-rebase-continue.sh -----
+
+t3406-rebase-message.sh      FAIL        26     6  rc=1 (1..32) ok 32 - rebase -i onto unrelated history|# failed 6 among 32 test(s)|1..32
+
+----- t3406-rebase-message.sh (FAIL): failing assertions -----
+  [#15] rebase --merge --abort reflog
+  [#20] rebase --merge --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#22] rebase --apply reflog
+  [#25] rebase --apply --abort reflog
+  [#27] rebase --apply reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#30] rebase --apply --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+----- t3406-rebase-message.sh (FAIL) last 25 lines -----
+#			if test -n "$reflog_action"
+#			then
+#				GIT_REFLOG_ACTION="$reflog_action" &&
+#				export GIT_REFLOG_ACTION
+#			fi &&
+#			test_must_fail git rebase $mode main &&
+#			git rebase --abort
+#		) &&
+#	
+#		git log -g --format=%gs -3 >actual &&
+#		write_reflog_expect <<-EOF &&
+#		${reflog_action:-rebase} (abort): returning to refs/heads/conflicts
+#		${reflog_action:-rebase} (pick): P
+#		${reflog_action:-rebase} (start): checkout main
+#		EOF
+#		test_cmp expect actual &&
+#	
+#		# check branch reflog is unchanged
+#		git log -g -1 conflicts >branch-actual &&
+#		test_cmp branch-expect branch-actual
+#		
+ok 31 - rebase --apply --abort detached HEAD reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 32 - rebase -i onto unrelated history
+# failed 6 among 32 test(s)
+1..32
+----- end t3406-rebase-message.sh -----
+
+t3420-rebase-autostash.sh    FAIL        37    15  rc=1 (1..52) #	|# failed 15 among 52 test(s)|1..52
+
+----- t3420-rebase-autostash.sh (FAIL): failing assertions -----
+  [#6] rebase --apply: restore autostash when branch checkout fails
+  [#9] rebase --apply --autostash: check output
+  [#11] rebase --apply: conflicting rebase
+  [#12] rebase --apply: --continue
+  [#13] rebase --apply: --skip
+  [#14] rebase --apply: --abort
+  [#15] rebase --apply: --quit
+  [#16] rebase --apply: non-conflicting rebase, conflicting stash
+  [#17] rebase --apply: check output with conflicting stash
+  [#18] rebase --merge: restore autostash when pre-rebase hook fails
+  [#20] rebase --merge: restore autostash when branch checkout fails
+  [#21] rebase --merge: dirty worktree, --no-autostash
+  [#22] rebase --merge: dirty worktree, non-conflicting rebase
+  [#49] autostash with dirty submodules
+  [#52] autostash commit is marked as reachable
+----- t3420-rebase-autostash.sh (FAIL) last 25 lines -----
+ok 48 - autostash is saved on editor failure with conflict
+not ok 49 - autostash with dirty submodules
+#	
+#		test_when_finished "git reset --hard && git checkout main" &&
+#		git checkout -b with-submodule &&
+#		git -c protocol.file.allow=always submodule add ./ sub &&
+#		test_tick &&
+#		git commit -m add-submodule &&
+#		echo changed >sub/file0 &&
+#		git rebase -i --autostash HEAD
+#	
+ok 50 - branch is left alone when possible
+ok 51 - never change active branch
+not ok 52 - autostash commit is marked as reachable
+#	
+#		echo changed >file0 &&
+#		git rebase --autostash --exec "git prune --expire=now" \
+#			feature-branch^ feature-branch &&
+#		# git rebase succeeds if the stash cannot be applied so we need to check
+#		# the contents of file0
+#		echo changed >expect &&
+#		test_cmp expect file0
+#	
+# failed 15 among 52 test(s)
+1..52
+----- end t3420-rebase-autostash.sh -----
+
+t3404-rebase-interactive.sh  FAIL        47    85  rc=1 (1..132) ok 132 - $EDITOR and friends are unchanged|# failed 85 among 132 test(s)|1..132
+
+----- t3404-rebase-interactive.sh (FAIL): failing assertions -----
+  [#22] show conflicted patch
+  [#30] verbose flag is heeded, even after --continue
+  [#33] commit message used after conflict
+  [#34] commit message retained after conflict
+  [#35] squash and fixup generate correct log messages
+  [#36] squash ignores comments
+  [#37] squash ignores blank lines
+  [#38] squash works as expected
+  [#39] interrupted squash works as expected
+  [#40] interrupted squash works as expected (case 2)
+  [#41] --continue tries to commit, even for "edit"
+  [#42] aborted --continue does not squash commits after "edit"
+  [#43] auto-amend only edited commits after "edit"
+  [#45] rebase a detached HEAD
+  [#46] rebase a commit violating pre-commit
+  [#47] rebase with a file named HEAD in worktree
+  [#48] do "noop" when there is nothing to cherry-pick
+  [#50] submodule rebase -i
+  [#52] rebase -i continue with only submodule staged
+  [#53] rebase -i continue with unstaged submodule
+  [#54] avoid unnecessary reset
+  [#56] reword fast-forwarded empty commit
+  [#57] no uncommitted changes when rewording and the todo list is reloaded
+  [#58] rebase -i can copy notes
+  [#59] rebase -i can copy notes over a fixup
+  [#60] rebase while detaching HEAD
+  [#61] always cherry-pick with --no-ff
+  [#63] rebase-i history with funny messages
+  [#65] running "git rebase -i --exec git show HEAD"
+  [#66] running "git rebase --exec git show HEAD -i"
+  [#67] running "git rebase -ix git show HEAD"
+  [#68] rebase -ix with several <CMD>
+  [#69] rebase -ix with several instances of --exec
+  [#70] rebase -ix with --autosquash
+  [#71] rebase --exec works without -i 
+  [#72] rebase -i --exec without <CMD>
+  [#73] rebase -i --root re-order and drop commits
+  [#74] rebase -i --root retain root commit author and message
+  [#75] rebase -i --root temporary sentinel commit
+  [#76] rebase -i --root fixup root commit
+  [#77] rebase -i --root reword original root commit
+  [#78] rebase -i --root reword new root commit
+  [#79] rebase -i --root when root has untracked file conflict
+  [#80] rebase -i --root reword root when root has untracked file conflict
+  [#81] rebase --edit-todo does not work on non-interactive rebase
+  [#82] rebase --edit-todo can be used to modify todo
+  [#83] rebase -i produces readable reflog
+  [#84] rebase -i respects core.commentchar
+  [#85] rebase -i respects core.commentchar=auto
+  [#87] rebase -i with --strategy and -X
+  [#88] interrupted rebase -i with --strategy and -X
+  [#91] short commit ID collide
+  [#92] respect core.abbrev
+  [#94] rebase -i commits that overwrite untracked files (pick)
+  [#95] rebase -i commits that overwrite untracked files (squash)
+  [#96] rebase -i commits that overwrite untracked files (no ff)
+  [#98] drop
+  [#99] rebase -i respects rebase.missingCommitsCheck = ignore
+  [#100] rebase -i respects rebase.missingCommitsCheck = warn
+  [#101] rebase -i respects rebase.missingCommitsCheck = error
+  [#102] rebase --edit-todo respects rebase.missingCommitsCheck = ignore
+  [#103] rebase --edit-todo respects rebase.missingCommitsCheck = warn
+  [#104] rebase --edit-todo respects rebase.missingCommitsCheck = error
+  [#106] rebase.missingCommitsCheck = error when editing for a second time
+  [#107] respects rebase.abbreviateCommands with fixup, squash and exec
+  [#108] static check of bad command
+  [#109] the first command cannot be a fixup
+  [#111] static check of bad SHA-1
+  [#113] rebase -i --gpg-sign=<key-id>
+  [#114] rebase -i --gpg-sign=<key-id> overrides commit.gpgSign
+  [#115] valid author header after --root swap
+  [#117] post-commit hook is called
+  [#118] correct error message for partial commit after empty pick
+  [#119] correct error message for commit --amend after empty pick
+  [#120] todo has correct onto hash
+  [#122] --update-refs adds label and update-ref commands
+  [#123] --update-refs adds commands with --rebase-merges
+  [#124] --update-refs updates refs correctly
+  [#125] respect user edits to update-ref steps
+  [#126] --update-refs: all update-ref lines removed
+  [#127] --update-refs: all update-ref lines removed, then some re-added
+  [#128] --update-refs: --edit-todo with no update-ref lines
+  [#129] --update-refs: check failed ref update
+  [#130] bad labels and refs rejected when parsing todo list
+  [#131] non-merge commands reject merge commits
+----- t3404-rebase-interactive.sh (FAIL) last 25 lines -----
+#		error: ${SQ}reword${SQ} does not accept merge commits
+#		hint: ${SQ}reword${SQ} does not take a merge commit. If you wanted to
+#		hint: replay the merge and reword the commit message, use
+#		hint: ${SQ}merge -c${SQ} on the commit
+#		hint: Disable this message with "git config set advice.rebaseTodoError false"
+#		error: invalid line 2: reword $oid
+#		error: ${SQ}edit${SQ} does not accept merge commits
+#		hint: ${SQ}edit${SQ} does not take a merge commit. If you wanted to
+#		hint: replay the merge, use ${SQ}merge -C${SQ} on the commit, and then
+#		hint: ${SQ}break${SQ} to give the control back to you so that you can
+#		hint: do ${SQ}git commit --amend && git rebase --continue${SQ}.
+#		hint: Disable this message with "git config set advice.rebaseTodoError false"
+#		error: invalid line 3: edit $oid
+#		error: cannot squash merge commit into another commit
+#		error: invalid line 4: fixup $oid
+#		error: cannot squash merge commit into another commit
+#		error: invalid line 5: squash $oid
+#		You can fix this with ${SQ}git rebase --edit-todo${SQ} and then run ${SQ}git rebase --continue${SQ}.
+#		Or you can abort the rebase with ${SQ}git rebase --abort${SQ}.
+#		EOF
+#		test_cmp expect actual
+#	
+ok 132 - $EDITOR and friends are unchanged
+# failed 85 among 132 test(s)
+1..132
+----- end t3404-rebase-interactive.sh -----
+
+t4150-am.sh                  FAIL        54    33  rc=1 (1..87) ok 87 - cannot create empty commits when there is unmerged index due to merge conflicts|# failed 33 among 87 test(s)|1..87
+
+----- t4150-am.sh (FAIL): failing assertions -----
+  [#2] setup
+  [#3] am applies patch correctly
+  [#5] am applies patch e-mail not in a mbox
+  [#6] am applies patch e-mail not in a mbox with CRLF
+  [#7] am applies patch e-mail with preceding whitespace
+  [#8] am applies stgit patch
+  [#9] am --patch-format=stgit applies stgit patch
+  [#10] am applies stgit series
+  [#11] am applies hg patch
+  [#12] am --patch-format=hg applies hg patch
+  [#13] am with applypatch-msg hook
+  [#15] am with failing applypatch-msg hook (no verify)
+  [#16] am with pre-applypatch hook
+  [#18] am with failing pre-applypatch hook (no verify)
+  [#19] am with post-applypatch hook
+  [#20] am with failing post-applypatch hook
+  [#21] am --scissors cuts the message at the scissors line
+  [#22] am --no-scissors overrides mailinfo.scissors
+  [#41] am -3 -q is quiet
+  [#54] am takes patches from a Pine mailbox
+  [#63] am into an unborn branch
+  [#70] am -3 works with rerere
+  [#72] am --patch-format=mboxrd handles mboxrd
+  [#73] am works with multi-line in-body headers
+  [#75] am and .gitattibutes
+  [#76] apply binary blob in partial clone
+  [#78] invalid when passing the --empty option alone
+  [#79] a message without a patch is an error (default)
+  [#80] a message without a patch is an error where an explicit "--empty=stop" is given
+  [#81] a message without a patch will be skipped when "--empty=drop" is given
+  [#82] record as an empty commit when meeting e-mail message that lacks a patch
+  [#83] skip an empty patch in the middle of an am session
+  [#84] record an empty patch as an empty commit in the middle of an am session
+----- t4150-am.sh (FAIL) last 25 lines -----
+#		grep "To record the empty patch as an empty commit, run \"git am --allow-empty\"." err &&
+#		git am --skip &&
+#		test_path_is_missing .git/rebase-apply &&
+#		git rev-parse empty-commit^ >expected &&
+#		git rev-parse HEAD >actual &&
+#		test_cmp expected actual
+#	
+not ok 84 - record an empty patch as an empty commit in the middle of an am session
+#	
+#		git checkout empty-commit^ &&
+#		test_must_fail git am empty-commit.patch >out 2>err &&
+#		grep "Patch is empty." out &&
+#		grep "To record the empty patch as an empty commit, run \"git am --allow-empty\"." err &&
+#		git am --allow-empty >output &&
+#		grep "No changes - recorded it as an empty commit." output &&
+#		test_path_is_missing .git/rebase-apply &&
+#		git show empty-commit --format="%B" >expected &&
+#		git show HEAD --format="%B" >actual &&
+#		grep -f actual expected
+#	
+ok 85 - create an non-empty commit when the index IS changed though "--allow-empty" is given
+ok 86 - cannot create empty commits when there is a clean index due to merge conflicts
+ok 87 - cannot create empty commits when there is unmerged index due to merge conflicts
+# failed 33 among 87 test(s)
+1..87
+----- end t4150-am.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t3418-rebase-continue.sh FAIL             11     19     30  36%
+t3406-rebase-message.sh FAIL             26      6     32  81%
+t3420-rebase-autostash.sh FAIL             37     15     52  71%
+t3404-rebase-interactive.sh FAIL             47     85    132  35%
+t4150-am.sh    FAIL             54     33     87  62%
+
+SUMMARY: 5 script(s): 0 passed, 5 failed, 0 timed out.

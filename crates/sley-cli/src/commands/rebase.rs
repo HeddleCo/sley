@@ -639,10 +639,80 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
         return Err(rebase_usage_error());
     }
 
-    let in_progress = seq::in_progress(&ctx.git_dir);
+    // The apply backend keeps its state in `.git/rebase-apply/` (marked by a
+    // `head-name` file). When such a rebase is in progress, the resume verbs
+    // route to the am-based driver instead of the merge sequencer.
+    let apply_in_progress = commands::am::rebase_apply_in_progress(&ctx.git_dir);
+    let merge_in_progress = seq::in_progress(&ctx.git_dir);
+    let in_progress = apply_in_progress || merge_in_progress;
     if parsed.action != RebaseAction::None && !in_progress {
         eprintln!("fatal: no rebase in progress");
         return Err(GitError::Exit(128));
+    }
+
+    if apply_in_progress {
+        match parsed.action {
+            RebaseAction::Continue => {
+                let result = commands::am::rebase_apply_continue(
+                    &ctx.git_dir,
+                    &ctx.common_git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                );
+                // Ok iff the whole series completed; restore the autostash then
+                // (a fresh conflict returns Err and keeps it for the next step).
+                if result.is_ok() {
+                    finish_apply_autostash(&ctx);
+                }
+                return result;
+            }
+            RebaseAction::Skip => {
+                let result = commands::am::rebase_apply_skip(
+                    &ctx.git_dir,
+                    &ctx.common_git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                );
+                if result.is_ok() {
+                    finish_apply_autostash(&ctx);
+                }
+                return result;
+            }
+            RebaseAction::Abort => {
+                let result = commands::am::rebase_apply_abort(
+                    &ctx.git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                );
+                // Abort always ends the rebase; restore the autostash on top of
+                // the restored orig_head (git applies it after reset).
+                finish_apply_autostash(&ctx);
+                return result;
+            }
+            RebaseAction::Quit => {
+                let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
+                return Ok(());
+            }
+            RebaseAction::ShowCurrentPatch => {
+                let path = ctx.git_dir.join("rebase-apply").join("patch");
+                if let Ok(patch) = fs::read(path) {
+                    io::stdout().write_all(&patch)?;
+                    return Ok(());
+                }
+                eprintln!("fatal: there is no current patch");
+                return Err(GitError::Exit(128));
+            }
+            RebaseAction::EditTodo => {
+                eprintln!("error: The --edit-todo action can only be used during interactive rebase.");
+                return Err(GitError::Exit(1));
+            }
+            RebaseAction::None => {
+                eprintln!(
+                    "fatal: It looks like 'git am' is in progress. Cannot rebase."
+                );
+                return Err(GitError::Exit(128));
+            }
+        }
     }
 
     match parsed.action {
@@ -663,7 +733,7 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
         RebaseAction::None => {}
     }
 
-    if in_progress {
+    if merge_in_progress {
         eprintln!(
             "fatal: It seems that there is already a rebase-merge directory, and\nI wonder if you are in the middle of another rebase.  If that is the\ncase, please try\n\tgit rebase (--continue | --abort | --skip)\nIf that is not the case, please\n\trm -fr \"{}\"\nand run me again.  I am stopping in case you still have something\nvaluable there.",
             seq::merge_dir(&ctx.git_dir).display()
@@ -683,6 +753,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     let refs = ctx.refs();
 
     let interactive_explicit = args.interactive;
+    // `--ignore-whitespace` pushes `ignore-space-change` into `strategy_opts` for
+    // the merge backend, but it does NOT by itself force a backend (it is honoured
+    // on whichever one is selected). So compute merge-implication ignoring that
+    // single auto-added opt.
+    let other_strategy_opts: Vec<&String> = args
+        .strategy_opts
+        .iter()
+        .filter(|opt| !(args.ignore_whitespace && opt.as_str() == "ignore-space-change"))
+        .collect();
     let implied_merge = interactive_explicit
         || args.merge_backend
         || !args.exec.is_empty()
@@ -690,8 +769,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         || args.empty != EmptyMode::Unspecified
         || args.keep_empty
         || args.strategy.is_some()
-        || !args.strategy_opts.is_empty();
-    let _ = implied_merge;
+        || !other_strategy_opts.is_empty();
+
+    // The apply backend (`git rebase --apply` / `git-rebase--am`) is selected by
+    // an explicit `--apply`. It is incompatible with the merge-only options.
+    let use_apply_backend = args.apply_backend;
+    if use_apply_backend && implied_merge {
+        eprintln!("fatal: apply options and merge options cannot be used together");
+        return Err(GitError::Exit(128));
+    }
 
     // Resolve upstream.
     let upstream_name = match args.positional.first() {
@@ -765,12 +851,29 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         }
     };
 
+    // git creates the autostash BEFORE running the pre-rebase hook, and a hook
+    // refusal restores it (builtin/rebase.c: create_autostash → pre-rebase →
+    // cleanup_autostash on failure). Resolve the config flag here so the order
+    // matches; the value is reused below in place of the later re-read.
+    let autostash = args
+        .autostash
+        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "autostash").unwrap_or(false));
+    if autostash {
+        create_autostash(ctx, use_apply_backend)?;
+    }
+
     if !args.no_verify {
         let mut hook_args = vec![upstream_name.as_str()];
         if args.positional.get(1).is_some() {
             hook_args.push(branch_name.as_str());
         }
-        commands::hooks::run_hook_l("pre-rebase", &hook_args)?;
+        if let Err(err) = commands::hooks::run_hook_l("pre-rebase", &hook_args) {
+            // The hook refused the rebase: restore the autostash and drop any
+            // state so no rebase is left in progress (t3420 #18).
+            apply_autostash(ctx);
+            seq::remove_merge_state(&ctx.git_dir);
+            return Err(err);
+        }
     }
 
     // Onto.
@@ -821,9 +924,6 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         }
     };
 
-    let autostash = args
-        .autostash
-        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "autostash").unwrap_or(false));
     let autosquash = args.autosquash.unwrap_or_else(|| {
         interactive_explicit && rebase_config_bool(ctx, "rebase", "autosquash").unwrap_or(false)
     });
@@ -847,10 +947,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     });
     let force = args.force || args.signoff;
 
-    // Autostash before the clean-tree check.
-    if autostash {
-        create_autostash(ctx)?;
-    }
+    // Autostash was already created above (before the pre-rebase hook, matching
+    // git's order), so the clean-tree gate below sees the stashed-clean tree.
 
     // Clean-tree gate.
     if let Err(err) = require_clean_work_tree(ctx, "rebase", true) {
@@ -940,6 +1038,22 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Apply backend: generate the `upstream..orig_head` patch series and replay
+    // it via the am engine into `.git/rebase-apply/`. This is the only path that
+    // honours `git am`-style `--ignore-whitespace` patch fuzzing.
+    if use_apply_backend {
+        return run_apply_backend(
+            ctx,
+            &db,
+            &args,
+            upstream.as_ref(),
+            &orig_head,
+            &onto,
+            &onto_name,
+            head_name.as_deref(),
+        );
+    }
+
     let opts = MachineOpts {
         quiet: args.quiet,
         verbose: args.verbose,
@@ -956,7 +1070,14 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     };
 
     // Generate the todo list.
-    let records = make_script_commits(ctx, &db, upstream.as_ref(), &orig_head, args.keep_empty)?;
+    let records = make_script_commits(
+        ctx,
+        &db,
+        upstream.as_ref(),
+        &orig_head,
+        args.keep_empty,
+        args.reapply_cherry_picks.unwrap_or(false),
+    )?;
     let mut items: Vec<RebaseTodoItem> = records
         .iter()
         .map(|record| RebaseTodoItem {
@@ -1005,6 +1126,190 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         &onto_name,
         interactive_explicit,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Apply backend (git rebase --apply via the am engine)
+// ---------------------------------------------------------------------------
+
+/// Split a raw committer/author identity (`Name <email> <seconds> <tz>`) into
+/// `(name, email, "<seconds> <tz>")`. The date piece is `None` when the line has
+/// no `< … >` email delimiters.
+fn split_identity(identity: &[u8]) -> Option<(String, String, Option<String>)> {
+    let text = String::from_utf8_lossy(identity);
+    let open = text.find('<')?;
+    let close = text[open..].find('>')? + open;
+    let name = text[..open].trim_end().to_string();
+    let email = text[open + 1..close].to_string();
+    let date = text[close + 1..].trim();
+    let date = if date.is_empty() {
+        None
+    } else {
+        Some(date.to_string())
+    };
+    Some((name, email, date))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_apply_backend(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    args: &RebaseArgs,
+    upstream: Option<&ObjectId>,
+    orig_head: &ObjectId,
+    onto: &ObjectId,
+    onto_name: &str,
+    head_name: Option<&str>,
+) -> Result<()> {
+    // Build the pick series exactly like the merge backend does (skip merges and
+    // empty commits unless --keep-empty), then turn each into an apply patch.
+    let records = make_script_commits(
+        ctx,
+        db,
+        upstream,
+        orig_head,
+        args.keep_empty,
+        args.reapply_cherry_picks.unwrap_or(false),
+    )?;
+
+    if records.is_empty() {
+        // Nothing to replay: detach onto the new base and finish (matches git's
+        // "noop" apply-backend run, which still moves the branch to onto).
+        checkout_onto_for_apply(ctx, db, onto, onto_name, orig_head)?;
+        if let Some(head_name) = head_name
+            && head_name.starts_with("refs/heads/")
+        {
+            let committer = commit_identity_from_env("COMMITTER")?;
+            move_to_original_branch(ctx, head_name, *orig_head, *onto, committer)?;
+        }
+        // A noop rebase still finishes, so restore any autostash now.
+        finish_apply_autostash(ctx);
+        if !args.quiet {
+            eprintln!(
+                "Successfully rebased and updated {}.",
+                head_name
+                    .and_then(|name| name.strip_prefix("refs/heads/"))
+                    .unwrap_or("detached HEAD")
+            );
+        }
+        return Ok(());
+    }
+
+    let mut commits = Vec::with_capacity(records.len());
+    for record in &records {
+        let parent_tree = match record.parents.first() {
+            Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
+            None => ObjectId::empty_tree(ctx.format),
+        };
+        let diff = render_tree_to_tree_patch(db, ctx.format, &parent_tree, &record.commit.tree)?;
+        let (name, email, date) = split_identity(&record.commit.author)
+            .ok_or_else(|| GitError::InvalidObject("commit author has no identity".into()))?;
+        let mut message = record.commit.message.clone();
+        if !message.ends_with(b"\n") {
+            message.push(b'\n');
+        }
+        commits.push(commands::am::RebaseApplyCommit {
+            author_name: name,
+            author_email: email,
+            author_date: date,
+            message,
+            diff,
+            orig_commit: record.oid,
+        });
+    }
+
+    // The apply backend (git-rebase--am) announces the rewind before replaying.
+    if !args.quiet {
+        eprintln!("First, rewinding head to replay your work on top of it...");
+    }
+
+    // Detach HEAD onto the new base (the am series commits onto it). If the
+    // checkout is refused (untracked-file clobber), the rebase never starts:
+    // restore the autostash and drop all state so no rebase is left in progress
+    // (t3420 #5 — `rebase --quit` must then report "no rebase in progress").
+    if let Err(err) = checkout_onto_for_apply(ctx, db, onto, onto_name, orig_head) {
+        apply_autostash(ctx);
+        seq::remove_merge_state(&ctx.git_dir);
+        let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
+        return Err(err);
+    }
+
+    let result = commands::am::start_rebase_apply(
+        &ctx.git_dir,
+        &ctx.common_git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        commands::am::RebaseApplyParams {
+            commits,
+            quiet: args.quiet,
+            signoff: args.signoff,
+            committer_date_is_author_date: args.committer_date_is_author_date,
+            ignore_date: args.ignore_date,
+            ignore_whitespace: args.ignore_whitespace,
+            head_name: head_name.map(str::to_string),
+            orig_head: *orig_head,
+            onto: *onto,
+        },
+    );
+    // The series finished cleanly (Ok) iff the whole rebase completed; restore
+    // the autostash then. A conflict returns Err and leaves the stash in place
+    // for the eventual `--continue`/`--abort` to handle.
+    if result.is_ok() {
+        finish_apply_autostash(ctx);
+    }
+    result
+}
+
+/// Restore an autostash for a completed apply-backend rebase and clean up the
+/// stray `rebase-merge/` directory `create_autostash` writes the autostash into
+/// (the apply backend otherwise only removes `rebase-apply/`, leaving an empty
+/// `rebase-merge/` that the next rebase mistakes for an interrupted one).
+fn finish_apply_autostash(ctx: &Ctx) {
+    apply_autostash(ctx);
+    seq::remove_merge_state(&ctx.git_dir);
+}
+
+/// Detach HEAD onto `base` for the apply backend, refusing if the checkout would
+/// clobber untracked files (mirrors the merge backend's `checkout_onto_base`).
+fn checkout_onto_for_apply(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    base: &ObjectId,
+    onto_name: &str,
+    orig_head: &ObjectId,
+) -> Result<()> {
+    let refs = ctx.refs();
+    let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let base_tree = commit_tree_oid(db, ctx.format, base)?;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &base_tree)?;
+    if !overwritten.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by checkout:"
+        );
+        for path in &overwritten {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you switch branches.");
+        eprintln!("Aborting");
+        eprintln!("error: could not detach HEAD");
+        return Err(GitError::Exit(1));
+    }
+    sley_worktree::reset_index_and_worktree_to_commit(
+        &ctx.worktree_root,
+        &ctx.git_dir,
+        ctx.format,
+        base,
+    )?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    detach_head_with_reflog(
+        ctx,
+        old,
+        *base,
+        ctx.reflog("start", Some(&format!("checkout {onto_name}"))),
+        committer,
+    )?;
+    fs::write(ctx.git_dir.join("ORIG_HEAD"), format!("{orig_head}\n"))?;
+    Ok(())
 }
 
 fn default_upstream_name(ctx: &Ctx, refs: &FileRefStore) -> Option<String> {
@@ -1222,6 +1527,7 @@ fn make_script_commits(
     upstream: Option<&ObjectId>,
     orig_head: &ObjectId,
     keep_empty: bool,
+    reapply_cherry_picks: bool,
 ) -> Result<Vec<sley_rev::CommitRecord>> {
     // Mark everything reachable from upstream.
     let mut excluded = std::collections::HashSet::new();
@@ -1235,6 +1541,49 @@ fn make_script_commits(
             queue.extend(record.parents.iter().copied());
         }
     }
+
+    // `--cherry-mark` duplicate detection (git make_script: revs.cherry_mark =
+    // !reapply_cherry_picks). Build the set of patch-ids carried by the
+    // *left-only* side — upstream commits that are not also reachable from the
+    // merge base with orig_head — and drop right-side commits whose patch-id
+    // matches, so an already-applied commit isn't replayed onto a base that
+    // already has it. Skipped when --reapply-cherry-picks is set.
+    let upstream_patch_ids: std::collections::HashSet<Vec<u8>> = if reapply_cherry_picks {
+        std::collections::HashSet::new()
+    } else if let Some(upstream) = upstream {
+        // Bound the comparison to the symmetric difference: only consider
+        // upstream commits reachable from upstream but not from the merge base
+        // (matching git's `upstream...orig_head` left side).
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
+        let mut base_reachable = std::collections::HashSet::new();
+        let mut bq: Vec<ObjectId> = bases.clone();
+        while let Some(oid) = bq.pop() {
+            if !base_reachable.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            bq.extend(record.parents.iter().copied());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut uq = vec![*upstream];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(oid) = uq.pop() {
+            if base_reachable.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            uq.extend(record.parents.iter().copied());
+            if record.parents.len() > 1 {
+                continue; // merges carry no single-parent patch-id
+            }
+            if let Some(id) = commit_patch_id(db, ctx.format, &record)? {
+                ids.insert(id);
+            }
+        }
+        ids
+    } else {
+        std::collections::HashSet::new()
+    };
     // Collect the right side.
     let mut records: BTreeMap<ObjectId, sley_rev::CommitRecord> = BTreeMap::new();
     let mut order = Vec::new();
@@ -1293,9 +1642,38 @@ fn make_script_commits(
         if record.commit.tree == parent_tree && !keep_empty {
             continue;
         }
+        // Drop commits whose patch already lives upstream (git PATCHSAME). An
+        // *empty* commit is never marked PATCHSAME, so only non-empty commits
+        // are eligible — matching `!is_empty && (flags & PATCHSAME)`.
+        if !upstream_patch_ids.is_empty()
+            && record.commit.tree != parent_tree
+            && let Some(id) = commit_patch_id(db, ctx.format, &record)?
+            && upstream_patch_ids.contains(&id)
+        {
+            continue;
+        }
         out.push(record);
     }
     Ok(out)
+}
+
+/// Patch-id of a single (non-merge) commit's diff against its first parent, for
+/// `--cherry-mark` duplicate detection. `None` when the diff is empty.
+fn commit_patch_id(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+) -> Result<Option<Vec<u8>>> {
+    if record.parents.len() > 1 {
+        return Ok(None);
+    }
+    let parent_tree = match record.parents.first() {
+        Some(parent) => commit_tree_oid(db, format, parent)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+        .unwrap_or_default();
+    Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
 
 /// `format_subject(sb, msg, " ")`: the subject paragraph (lines up to the first
@@ -2502,7 +2880,7 @@ fn stop_with_patch(
     db: &FileObjectDatabase,
     opts: &MachineOpts,
     record: &sley_rev::CommitRecord,
-    item: &RebaseTodoItem,
+    _item: &RebaseTodoItem,
     exit_code: i32,
     to_amend: bool,
 ) -> Result<PickOutcome> {
@@ -3395,17 +3773,11 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
     let mut tx = refs.transaction();
     match &opts.head_name {
         Some(head_name) => {
-            tx.update(RefUpdate {
-                name: head_name.clone(),
-                expected: None,
-                new: RefTarget::Direct(target),
-                reflog: Some(ReflogEntry {
-                    old_oid: old_head,
-                    new_oid: target,
-                    committer: committer.clone(),
-                    message: reflog_message.clone(),
-                }),
-            });
+            // The merge backend ran on a DETACHED HEAD (the pick loop detaches
+            // onto `onto`), so the branch ref never moved off orig_head — abort
+            // only re-attaches HEAD to it. Updating the branch ref here would
+            // add a spurious branch-reflog entry; git leaves it untouched
+            // (t3406 #15).
             tx.update(RefUpdate {
                 name: "HEAD".into(),
                 expected: None,
@@ -3486,7 +3858,7 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
 // Autostash
 // ---------------------------------------------------------------------------
 
-fn create_autostash(ctx: &Ctx) -> Result<()> {
+fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
     let dirty = status
         .iter()
@@ -3499,7 +3871,16 @@ fn create_autostash(ctx: &Ctx) -> Result<()> {
         eprintln!("fatal: Cannot autostash");
         return Err(GitError::Exit(128));
     };
-    let dir = seq::merge_dir(&ctx.git_dir);
+    // git records the autostash inside the active backend's state dir
+    // (`rebase-apply/` for the apply backend, `rebase-merge/` for the merge
+    // sequencer). The t-suite asserts on `$dotest/autostash` per backend, and
+    // routing it to the wrong dir both fails those asserts and leaves the other
+    // dir behind for the next rebase to trip over.
+    let dir = if use_apply_backend {
+        ctx.git_dir.join("rebase-apply")
+    } else {
+        seq::merge_dir(&ctx.git_dir)
+    };
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("autostash"), oid.to_hex())?;
     let db = ctx.db();
@@ -3525,7 +3906,16 @@ fn save_autostash(ctx: &Ctx) {
 }
 
 fn apply_save_autostash(ctx: &Ctx, attempt_apply: bool) {
-    let path = ctx.state_path("autostash");
+    // The autostash lives in whichever backend's state dir created it:
+    // `rebase-merge/autostash` (merge sequencer) or `rebase-apply/autostash`
+    // (apply backend). Check both so the restore path is backend-agnostic.
+    let merge_path = ctx.state_path("autostash");
+    let apply_path = ctx.git_dir.join("rebase-apply").join("autostash");
+    let path = if merge_path.exists() {
+        merge_path
+    } else {
+        apply_path
+    };
     let Ok(text) = fs::read_to_string(&path) else {
         return;
     };

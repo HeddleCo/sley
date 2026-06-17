@@ -54,6 +54,9 @@ struct AmOptions {
     /// Keep CR at the end of mail lines instead of stripping it (`--keep-cr`).
     /// Default (false / `--no-keep-cr`) strips the CR a CRLF transport added.
     keep_cr: bool,
+    /// Match patch context/deleted lines ignoring whitespace differences
+    /// (`--ignore-whitespace`). Used by the rebase apply backend.
+    ignore_whitespace: bool,
 }
 
 impl AmOptions {
@@ -86,6 +89,11 @@ struct AmCommitOpts {
     ignore_date: bool,
     /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
     no_verify: bool,
+    /// When set, the per-commit reflog uses the rebase apply-backend format
+    /// `<action> (pick): <subject>` (git runs am under the rebase backend with
+    /// `GIT_REFLOG_ACTION="<action> (pick)"`, builtin/rebase.c run_am), instead
+    /// of the bare `am: <subject>` a standalone `git am` writes.
+    rebase_pick_reflog: bool,
 }
 
 /// A single message extracted from an mbox: identity, message, and raw diff.
@@ -249,6 +257,184 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     )
 }
 
+// ===========================================================================
+// Rebase apply backend (the `git rebase --apply` / `git-rebase--am` path)
+// ===========================================================================
+//
+// `git rebase --apply` (and the implicit am path triggered by `--ignore-whitespace`
+// / `-C` / `--whitespace`) generates a `format-patch` series for
+// `upstream..orig_head` and feeds it to `git am`. We do the same here without a
+// mbox round-trip: the caller in `rebase.rs` hands us each pick commit's
+// author/message + the unified diff, and we drive the existing am series engine.
+// The state lives in `.git/rebase-apply/` (NOT `rebase-merge/`), with three extra
+// files — `head-name`, `onto`, `orig-head` — that mark this as a rebase so
+// `finish_am` returns to the original branch instead of just dropping state.
+
+/// One commit to replay through the apply backend.
+pub(crate) struct RebaseApplyCommit {
+    pub author_name: String,
+    pub author_email: String,
+    /// Raw author date as `<seconds> <±HHMM>` (or any `Date:` form the patch
+    /// would carry); `None` falls back to the env author date.
+    pub author_date: Option<String>,
+    /// Full commit message (subject + blank + body), newline-terminated.
+    pub message: Vec<u8>,
+    /// Unified diff of the commit against its first parent.
+    pub diff: Vec<u8>,
+    /// The original commit being replayed. Recorded so the apply backend can feed
+    /// the `post-rewrite` hook the `<old> <new>` mapping (git's `state->orig_commit`,
+    /// from each patch's `From <sha>` line). Drives the per-commit `rewritten` file.
+    pub orig_commit: ObjectId,
+}
+
+/// Options for a fresh `git rebase --apply` run.
+pub(crate) struct RebaseApplyParams {
+    pub commits: Vec<RebaseApplyCommit>,
+    pub quiet: bool,
+    pub signoff: bool,
+    pub committer_date_is_author_date: bool,
+    pub ignore_date: bool,
+    pub ignore_whitespace: bool,
+    /// `refs/heads/<branch>` to return to, or `None` for a detached HEAD rebase.
+    pub head_name: Option<String>,
+    /// The commit HEAD/orig branch started at (for `--abort`).
+    pub orig_head: ObjectId,
+    /// The new base (already checked out as detached HEAD by the caller).
+    pub onto: ObjectId,
+}
+
+/// Convert a subject line out of a full commit message (first line).
+fn subject_of_message(message: &[u8]) -> String {
+    let end = message
+        .iter()
+        .position(|b| *b == b'\n')
+        .unwrap_or(message.len());
+    String::from_utf8_lossy(&message[..end]).into_owned()
+}
+
+/// Start a fresh `git rebase --apply` series. The caller has already detached
+/// HEAD onto `onto`; here we write the apply state dir and drive the series.
+pub(crate) fn start_rebase_apply(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    params: RebaseApplyParams,
+) -> Result<()> {
+    let state_dir = git_dir.join("rebase-apply");
+    let patches: Vec<AmPatch> = params
+        .commits
+        .iter()
+        .map(|commit| AmPatch {
+            author_name: commit.author_name.clone(),
+            author_email: commit.author_email.clone(),
+            author_date: commit.author_date.clone(),
+            author_date_raw: commit.author_date.clone(),
+            subject: subject_of_message(&commit.message),
+            message: commit.message.clone(),
+            message_id: None,
+            diff: commit.diff.clone(),
+        })
+        .collect();
+
+    let options = AmOptions {
+        mboxes: Vec::new(),
+        quiet: params.quiet,
+        signoff: params.signoff,
+        three_way: false,
+        keep_non_patch: false,
+        keep_subject: false,
+        keep_non_patch_brackets: false,
+        message_id: false,
+        committer_date_is_author_date: params.committer_date_is_author_date,
+        ignore_date: params.ignore_date,
+        no_verify: false,
+        keep_cr: false,
+        ignore_whitespace: params.ignore_whitespace,
+    };
+
+    let refs = FileRefStore::new(git_dir, format);
+    let head_oid = head_commit_oid(&refs)?
+        .ok_or_else(|| GitError::Command("rebase --apply: cannot read HEAD".into()))?;
+
+    write_am_state_dir(&state_dir, &patches, &options, &head_oid)?;
+    // git records each patch's original commit (`state->orig_commit`, parsed from
+    // the `From <sha>` line format-patch emits) and, in `do_commit`, appends
+    // `<orig> <new>` to `rebase-apply/rewritten`. We don't round-trip a `From <sha>`
+    // line through the RFC822 patch parser, so persist the per-patch original shas
+    // in a parallel `orig-commits` file (line N = patch N's original) that the
+    // series driver looks up by patch number when each commit lands.
+    let orig_commits: String = params
+        .commits
+        .iter()
+        .map(|commit| format!("{}\n", commit.orig_commit))
+        .collect();
+    fs::write(state_dir.join("orig-commits"), orig_commits)?;
+    // The `rebasing` marker selects git's post-rewrite firing path (am.c keys the
+    // whole `rewritten`/post-rewrite mechanism off `state->rebasing`).
+    fs::write(state_dir.join("rebasing"), b"")?;
+    // Rebase markers: their presence makes `finish_am` / `am --abort` behave as a
+    // rebase (return to the original branch) rather than a bare `git am`.
+    let head_name = params
+        .head_name
+        .clone()
+        .unwrap_or_else(|| "detached HEAD".to_string());
+    fs::write(state_dir.join("head-name"), format!("{head_name}\n"))?;
+    fs::write(state_dir.join("onto"), format!("{}\n", params.onto))?;
+    fs::write(state_dir.join("orig-head"), format!("{}\n", params.orig_head))?;
+    // The apply backend's `--abort`/finish restores `orig_head`, not the
+    // post-detach HEAD, so overwrite abort-safety with orig_head.
+    fs::write(
+        state_dir.join("abort-safety"),
+        format!("{}\n", params.orig_head),
+    )?;
+    fs::write(
+        state_dir.join("quiet"),
+        bool_flag(params.quiet),
+    )?;
+
+    run_am_series(git_dir, common_git_dir, worktree_root, format, &state_dir, 1)
+}
+
+/// Whether a `.git/rebase-apply/` state dir belongs to a `git rebase --apply`
+/// (vs a bare `git am`): the rebase backend writes a `head-name` marker.
+pub(crate) fn rebase_apply_in_progress(git_dir: &Path) -> bool {
+    let state_dir = git_dir.join("rebase-apply");
+    state_dir.is_dir() && state_dir.join("head-name").exists()
+}
+
+/// `git rebase --apply --continue`: resume the am series, then finish the rebase.
+pub(crate) fn rebase_apply_continue(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let state_dir = git_dir.join("rebase-apply");
+    am_continue(git_dir, common_git_dir, worktree_root, format, &state_dir)
+}
+
+/// `git rebase --apply --skip`.
+pub(crate) fn rebase_apply_skip(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let state_dir = git_dir.join("rebase-apply");
+    am_skip(git_dir, common_git_dir, worktree_root, format, &state_dir)
+}
+
+/// `git rebase --apply --abort`: restore the original branch and drop state.
+pub(crate) fn rebase_apply_abort(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let state_dir = git_dir.join("rebase-apply");
+    am_abort(git_dir, worktree_root, format, &state_dir)
+}
+
 /// Parse the non-resume flags of `git am`.
 fn parse_am_options(args: &[String]) -> Result<AmOptions> {
     let mut options = AmOptions {
@@ -264,6 +450,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         ignore_date: false,
         no_verify: false,
         keep_cr: false,
+        ignore_whitespace: false,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -282,6 +469,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-signoff" => options.signoff = false,
             "-3" | "--3way" => options.three_way = true,
             "--no-3way" => options.three_way = false,
+            "--ignore-whitespace" => options.ignore_whitespace = true,
+            "--no-ignore-whitespace" => options.ignore_whitespace = false,
             "-k" | "--keep" => {
                 options.keep_non_patch = true;
                 options.keep_subject = true;
@@ -313,8 +502,6 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             | "-c"
             | "--scissors"
             | "--no-scissors"
-            | "--ignore-whitespace"
-            | "--no-ignore-whitespace"
             | "--whitespace"
             | "--rerere-autoupdate"
             | "--no-rerere-autoupdate"
@@ -611,7 +798,12 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
             }
             "date" => {
                 author_date_raw = Some(value.clone());
-                author_date = parse_rfc2822_date(value);
+                // RFC 2822 is the format `git format-patch` emits, but the rebase
+                // apply backend stores the commit's raw git date (`<secs> <tz>` /
+                // `@<secs> <tz>`) directly; accept that too so the round-trip
+                // through the state dir preserves the author date.
+                author_date =
+                    parse_rfc2822_date(value).or_else(|| parse_raw_git_date_normalized(value));
             }
             "subject" => subject = clean_subject(value, cleanup),
             "message-id" if !value.is_empty() => message_id = Some(value.clone()),
@@ -901,6 +1093,29 @@ fn parse_rfc2822_date(value: &str) -> Option<String> {
     Some(format!("{seconds} {}", timezone.0))
 }
 
+/// Parse a raw git date (`<seconds> <±HHMM>` or `@<seconds> <±HHMM>`) into the
+/// normalised `<seconds> <±HHMM>` form `author_date` carries. Returns `None` if
+/// the value is not exactly two whitespace-separated raw-date fields.
+fn parse_raw_git_date_normalized(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let seconds = parts.next()?;
+    let tz = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let seconds = seconds.strip_prefix('@').unwrap_or(seconds);
+    if seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if tz.len() != 5
+        || !matches!(tz.as_bytes()[0], b'+' | b'-')
+        || !tz.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    Some(format!("{seconds} {tz}"))
+}
+
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 fn month_index(token: &str) -> Option<u32> {
@@ -1008,6 +1223,10 @@ fn write_am_state_dir(
         bool_flag(options.ignore_date),
     )?;
     fs::write(state_dir.join("no-verify"), bool_flag(options.no_verify))?;
+    fs::write(
+        state_dir.join("ignore-whitespace"),
+        bool_flag(options.ignore_whitespace),
+    )?;
     fs::write(state_dir.join("utf8"), b"t\n")?;
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
@@ -1162,6 +1381,10 @@ fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
         ),
         ignore_date: read_state_bool(state_dir, "ignore-date"),
         no_verify: read_state_bool(state_dir, "no-verify"),
+        // The `head-name` marker is written only by the rebase apply backend
+        // (start_rebase_apply); a bare `git am` never writes it. Its presence
+        // selects the rebase per-pick reflog format.
+        rebase_pick_reflog: state_dir.join("head-name").exists(),
     }
 }
 
@@ -1187,6 +1410,7 @@ fn run_am_series(
     let quiet = read_state_bool(state_dir, "quiet");
     let three_way = read_state_bool(state_dir, "threeway");
     let keep_non_patch = read_state_bool(state_dir, "keep");
+    let ignore_whitespace = read_state_bool(state_dir, "ignore-whitespace");
     let commit_opts = read_am_commit_opts(state_dir);
 
     let mut number = start;
@@ -1218,9 +1442,12 @@ fn run_am_series(
             common_git_dir,
             worktree_root,
             format,
+            state_dir,
+            number,
             &patch,
             commit_opts,
             three_way,
+            ignore_whitespace,
         )? {
             ApplyResult::Committed => number += 1,
             ApplyResult::Conflict => {
@@ -1299,21 +1526,25 @@ fn am_index_is_dirty(
 /// fails and `-3` was requested, falls back to a 3-way merge against the index's
 /// recorded blobs. A clean result is committed and HEAD advanced; an unresolved
 /// 3-way leaves conflict markers in the worktree and a conflicted index.
+#[allow(clippy::too_many_arguments)]
 fn apply_one_patch(
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    state_dir: &Path,
+    number: usize,
     patch: &AmPatch,
     commit_opts: AmCommitOpts,
     three_way: bool,
+    ignore_whitespace: bool,
 ) -> Result<ApplyResult> {
     let file_patches = sley_diff_merge::parse_unified_patch(&patch.diff)?;
 
-    match try_straight_apply(worktree_root, &file_patches)? {
+    match try_straight_apply(worktree_root, &file_patches, ignore_whitespace)? {
         Some(actions) => {
             apply_actions(worktree_root, &actions)?;
-            stage_and_commit(
+            let new_oid = stage_and_commit(
                 git_dir,
                 common_git_dir,
                 worktree_root,
@@ -1322,6 +1553,7 @@ fn apply_one_patch(
                 &actions,
                 commit_opts,
             )?;
+            record_rebase_rewrite(state_dir, format, number, &new_oid)?;
             Ok(ApplyResult::Committed)
         }
         None => {
@@ -1332,6 +1564,8 @@ fn apply_one_patch(
                     common_git_dir,
                     worktree_root,
                     format,
+                    state_dir,
+                    number,
                     patch,
                     &file_patches,
                     commit_opts,
@@ -1371,9 +1605,22 @@ enum ApplyFileAction {
 fn try_straight_apply(
     worktree_root: &Path,
     file_patches: &[sley_diff_merge::FilePatch],
+    ignore_whitespace: bool,
 ) -> Result<Option<Vec<ApplyFileAction>>> {
     let mut actions = Vec::new();
     for patch in file_patches {
+        // git apply (`check_to_create` in apply.c) rejects a create patch when
+        // the target already exists in the working tree — the whole patch fails
+        // ("already exists in working directory"), which the am/rebase caller
+        // turns into a conflict. Without this, a "new file" patch silently
+        // clobbers an existing file instead of conflicting.
+        if patch.is_new
+            && let Some(target) = patch.new_path.as_deref().or(patch.old_path.as_deref())
+            && let Ok(rel) = std::str::from_utf8(target)
+            && worktree_root.join(rel).exists()
+        {
+            return Ok(None);
+        }
         let base = if patch.is_new {
             Vec::new()
         } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
@@ -1385,7 +1632,20 @@ fn try_straight_apply(
         };
         let content = match sley_diff_merge::apply_file_patch(&base, patch) {
             sley_diff_merge::ApplyOutcome::Applied(content) => content,
-            sley_diff_merge::ApplyOutcome::Rejected => return Ok(None),
+            sley_diff_merge::ApplyOutcome::Rejected => {
+                // `git am --ignore-whitespace` (apply.c `ignore_ws_change`):
+                // when a hunk fails to match byte-for-byte, retry with a
+                // whitespace-collapsing line matcher, keeping the *target's*
+                // context lines so only the patch's real change lands.
+                if ignore_whitespace {
+                    match apply_file_patch_ignore_ws(&base, patch) {
+                        Some(content) => content,
+                        None => return Ok(None),
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
         };
         if patch.is_delete {
             if let Some(old) = &patch.old_path {
@@ -1409,6 +1669,160 @@ fn try_straight_apply(
         }
     }
     Ok(Some(actions))
+}
+
+/// Apply a file patch with `--ignore-whitespace` (apply.c `ignore_ws_change`):
+/// each hunk's preimage is matched against the base using a whitespace-collapsing
+/// line comparison, and on a match the matched base region is replaced by the
+/// hunk's *new* lines while context lines keep the base's existing whitespace.
+/// Returns `None` if any hunk cannot be located even with whitespace ignored.
+fn apply_file_patch_ignore_ws(
+    base: &[u8],
+    patch: &sley_diff_merge::FilePatch,
+) -> Option<Vec<u8>> {
+    use sley_diff_merge::HunkLine;
+
+    if patch.is_delete && patch.hunks.is_empty() {
+        return Some(Vec::new());
+    }
+    let base_for_match: &[u8] = if patch.is_new { b"" } else { base };
+    // Lines of the running image, each retaining its trailing `\n` (the last
+    // line keeps whatever terminator it had).
+    let mut image: Vec<Vec<u8>> = ws_split_lines(base_for_match);
+
+    for hunk in &patch.hunks {
+        // preimage = context + deletes (old side, matched fuzzily against image).
+        // postimage = context + inserts (new side). For ignore-ws, context lines
+        // in the result come from the *image* (target) so its whitespace wins.
+        let mut preimage: Vec<&[u8]> = Vec::new();
+        // postimage entries: either a literal line (Insert) or a marker pointing
+        // at the i-th matched image line (Context, kept verbatim from target).
+        enum Post<'a> {
+            Context(usize), // index into the matched preimage run
+            Insert(&'a [u8]),
+        }
+        let mut postimage: Vec<Post> = Vec::new();
+        let mut pre_idx = 0usize;
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(bytes) => {
+                    preimage.push(bytes.as_slice());
+                    postimage.push(Post::Context(pre_idx));
+                    pre_idx += 1;
+                }
+                HunkLine::Delete(bytes) => {
+                    preimage.push(bytes.as_slice());
+                    pre_idx += 1;
+                }
+                HunkLine::Insert(bytes) => {
+                    postimage.push(Post::Insert(bytes.as_slice()));
+                }
+            }
+        }
+
+        // Locate the preimage in the image with whitespace-fuzzy line matching.
+        let Some(pos) = ws_find_preimage(&image, &preimage) else {
+            return None;
+        };
+
+        // Build the replacement, taking context lines from the matched image
+        // region (so the result keeps the target's whitespace) and inserted
+        // lines verbatim from the patch.
+        let mut replacement: Vec<Vec<u8>> = Vec::new();
+        for post in &postimage {
+            match post {
+                Post::Context(i) => replacement.push(image[pos + i].clone()),
+                Post::Insert(bytes) => {
+                    let mut line = bytes.to_vec();
+                    line.push(b'\n');
+                    replacement.push(line);
+                }
+            }
+        }
+        // The hunk's final new line may lack a terminator; honour it.
+        if hunk.new_no_newline
+            && let Some(last) = replacement.last_mut()
+            && last.last() == Some(&b'\n')
+        {
+            last.pop();
+        }
+        image.splice(pos..pos + preimage.len(), replacement);
+    }
+
+    Some(image.concat())
+}
+
+/// Split a blob into lines, each keeping its trailing `\n`. The final line keeps
+/// whatever terminator it had (none if the file lacked a trailing newline).
+fn ws_split_lines(input: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (idx, byte) in input.iter().enumerate() {
+        if *byte == b'\n' {
+            lines.push(input[start..=idx].to_vec());
+            start = idx + 1;
+        }
+    }
+    if start < input.len() {
+        lines.push(input[start..].to_vec());
+    }
+    lines
+}
+
+/// Find a position in `image` where every preimage line whitespace-fuzzy-matches
+/// the corresponding image line (apply.c `line_by_line_fuzzy_match`). Returns the
+/// 0-based start index, or `None`.
+fn ws_find_preimage(image: &[Vec<u8>], preimage: &[&[u8]]) -> Option<usize> {
+    if preimage.is_empty() {
+        return Some(0);
+    }
+    if preimage.len() > image.len() {
+        return None;
+    }
+    'outer: for start in 0..=(image.len() - preimage.len()) {
+        for (i, pre) in preimage.iter().enumerate() {
+            if !ws_fuzzy_matchlines(&image[start + i], pre) {
+                continue 'outer;
+            }
+        }
+        return Some(start);
+    }
+    None
+}
+
+/// Port of apply.c `fuzzy_matchlines`: two lines match if, after ignoring line
+/// endings, they are equal once each run of whitespace is collapsed (whitespace
+/// must appear on both sides at the same logical position, so "a b" != "ab").
+fn ws_fuzzy_matchlines(a: &[u8], b: &[u8]) -> bool {
+    let trim_eol = |s: &[u8]| -> usize {
+        let mut end = s.len();
+        while end > 0 && (s[end - 1] == b'\r' || s[end - 1] == b'\n') {
+            end -= 1;
+        }
+        end
+    };
+    let a = &a[..trim_eol(a)];
+    let b = &b[..trim_eol(b)];
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_whitespace() {
+            if !b[j].is_ascii_whitespace() {
+                return false;
+            }
+            while i < a.len() && a[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+        } else if a[i] != b[j] {
+            return false;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+    i == a.len() && j == b.len()
 }
 
 fn apply_actions(worktree_root: &Path, actions: &[ApplyFileAction]) -> Result<()> {
@@ -1435,7 +1849,7 @@ fn stage_and_commit(
     patch: &AmPatch,
     actions: &[ApplyFileAction],
     commit_opts: AmCommitOpts,
-) -> Result<()> {
+) -> Result<ObjectId> {
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut index = read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
@@ -1506,7 +1920,7 @@ fn create_am_commit(
     format: ObjectFormat,
     patch: &AmPatch,
     commit_opts: AmCommitOpts,
-) -> Result<()> {
+) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
@@ -1547,6 +1961,15 @@ fn create_am_commit(
         Some(RefTarget::Symbolic(branch)) => branch,
         _ => "HEAD".to_string(),
     };
+    // Standalone `git am` writes `am: <subject>`; the rebase apply backend runs
+    // am with GIT_REFLOG_ACTION="<action> (pick)" so each commit lands a
+    // `<action> (pick): <subject>` entry (builtin/rebase.c run_am + am.c).
+    let reflog_message = if commit_opts.rebase_pick_reflog {
+        let action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
+        format!("{action} (pick): {}", patch.subject)
+    } else {
+        format!("am: {}", patch.subject)
+    };
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: target_ref,
@@ -1556,7 +1979,7 @@ fn create_am_commit(
             old_oid: head_oid,
             new_oid,
             committer,
-            message: format!("am: {}", patch.subject).into_bytes(),
+            message: reflog_message.into_bytes(),
         }),
     });
     tx.commit()?;
@@ -1565,7 +1988,7 @@ fn create_am_commit(
     // informational, run after the commit has already landed (builtin/am.c
     // calls `run_hooks` without checking the result). Swallow any failure.
     let _ = commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default());
-    Ok(())
+    Ok(new_oid)
 }
 
 /// Build the author and committer identity bytes for an am commit, honouring
@@ -1734,11 +2157,14 @@ fn is_trailer_line(line: &str) -> bool {
 /// Best-effort 3-way application: reconstruct the pre-image from the index's
 /// blobs, apply the patch to that to form "theirs", and 3-way merge against the
 /// worktree state ("ours"). Reuses the shared tree-merge engine.
+#[allow(clippy::too_many_arguments)]
 fn apply_three_way(
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    state_dir: &Path,
+    number: usize,
     patch: &AmPatch,
     file_patches: &[sley_diff_merge::FilePatch],
     commit_opts: AmCommitOpts,
@@ -1839,7 +2265,7 @@ fn apply_three_way(
     write_merge_index_and_worktree(git_dir, worktree_root, format, &db, &ours_map, &results)?;
 
     if conflicts.is_empty() {
-        create_am_commit(
+        let new_oid = create_am_commit(
             git_dir,
             common_git_dir,
             worktree_root,
@@ -1847,6 +2273,7 @@ fn apply_three_way(
             patch,
             commit_opts,
         )?;
+        record_rebase_rewrite(state_dir, format, number, &new_oid)?;
         Ok(ApplyResult::Committed)
     } else {
         for path in &conflicts {
@@ -2080,10 +2507,167 @@ fn display_state_dir(worktree_root: &Path, state_dir: &Path) -> String {
     }
 }
 
-/// Remove the state directory after the last patch lands successfully.
+/// Remove the state directory after the last patch lands successfully. When the
+/// state dir carries the rebase markers (`head-name`, `onto`, `orig-head`) this
+/// was a `git rebase --apply`, so we first return HEAD to the original branch and
+/// print the rebase success line before dropping state.
 fn finish_am(state_dir: &Path) -> Result<()> {
+    if state_dir.join("head-name").exists() {
+        finish_rebase_apply(state_dir)?;
+    }
     if state_dir.exists() {
         fs::remove_dir_all(state_dir)?;
+    }
+    Ok(())
+}
+
+/// Append `<orig> <new>` to `rebase-apply/rewritten` for the patch at index
+/// `number`, mirroring `do_commit` in builtin/am.c (which writes the pair off
+/// `state->orig_commit` whenever `state->rebasing`). The original commit is read
+/// from the parallel `orig-commits` file written at `start_rebase_apply`; a bare
+/// `git am` has no such file (and no `rebasing` marker), so this is a no-op there.
+fn record_rebase_rewrite(
+    state_dir: &Path,
+    format: ObjectFormat,
+    number: usize,
+    new_oid: &ObjectId,
+) -> Result<()> {
+    if !state_dir.join("rebasing").exists() {
+        return Ok(());
+    }
+    let orig_commits = match fs::read_to_string(state_dir.join("orig-commits")) {
+        Ok(text) => text,
+        Err(_) => return Ok(()),
+    };
+    // `number` is 1-based (the patch file is `{number:04}`); the orig-commits file
+    // lists one original sha per line in the same order.
+    let Some(line) = orig_commits.lines().nth(number.saturating_sub(1)) else {
+        return Ok(());
+    };
+    let Ok(orig) = ObjectId::from_hex(format, line.trim()) else {
+        return Ok(());
+    };
+    let mut rewritten = fs::read_to_string(state_dir.join("rewritten")).unwrap_or_default();
+    rewritten.push_str(&format!("{orig} {new_oid}\n"));
+    fs::write(state_dir.join("rewritten"), rewritten)?;
+    Ok(())
+}
+
+/// Run the `post-rewrite` hook with arg `rebase`, feeding the accumulated
+/// `rebase-apply/rewritten` (`<old> <new>` per rewritten commit) on stdin —
+/// git's `run_post_rewrite_hook` in builtin/am.c, fired once the series finishes.
+/// A no-op when nothing was rewritten (an all-skipped or noop run).
+fn run_apply_post_rewrite_hook(state_dir: &Path) {
+    let input = fs::read(state_dir.join("rewritten")).unwrap_or_default();
+    if input.is_empty() {
+        return;
+    }
+    let _ = commands::hooks::run_hook(
+        "post-rewrite",
+        commands::hooks::HookRun {
+            args: vec!["rebase".to_string()],
+            stdin: Some(input),
+            ..commands::hooks::HookRun::default()
+        },
+    );
+}
+
+/// Move HEAD back to the original branch at the rebased tip and print the rebase
+/// success line, mirroring `git-rebase--am`'s `move_to_original_branch` + the
+/// "Successfully rebased and updated <branch>." message.
+fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
+    // git fires the post-rewrite hook at the end of the am loop (am.c:1928),
+    // BEFORE the rebase caller moves HEAD back to the original branch. Match that
+    // order: feed the accumulated `<old> <new>` map while the state dir still
+    // exists (the caller removes it after this returns).
+    run_apply_post_rewrite_hook(state_dir);
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let refs = FileRefStore::new(&git_dir, format);
+    let head = head_commit_oid(&refs)?
+        .ok_or_else(|| GitError::Command("rebase --apply: cannot read HEAD".into()))?;
+    let head_name = fs::read_to_string(state_dir.join("head-name"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let orig_head = fs::read_to_string(state_dir.join("orig-head"))
+        .ok()
+        .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok())
+        .unwrap_or(head);
+    let onto = fs::read_to_string(state_dir.join("onto"))
+        .ok()
+        .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok())
+        .unwrap_or(head);
+    let quiet = read_state_bool(state_dir, "quiet");
+
+    let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
+    let head_display = if head_name.starts_with("refs/heads/") {
+        let committer = commit_identity_from_env("COMMITTER")?;
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: head_name.clone(),
+            expected: None,
+            new: RefTarget::Direct(head),
+            reflog: Some(ReflogEntry {
+                old_oid: orig_head,
+                new_oid: head,
+                committer: committer.clone(),
+                message: format!("{reflog_action} (finish): {head_name} onto {onto}").into_bytes(),
+            }),
+        });
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic(head_name.clone()),
+            reflog: Some(ReflogEntry {
+                old_oid: head,
+                new_oid: head,
+                committer,
+                message: format!("{reflog_action} (finish): returning to {head_name}").into_bytes(),
+            }),
+        });
+        tx.commit()?;
+        // git's apply backend reports the FULL ref name here
+        // (`refs/heads/<branch>`), not the short branch.
+        head_name.clone()
+    } else {
+        "detached HEAD".to_string()
+    };
+
+    // Restore any autostash before the "Successfully rebased" line — git applies
+    // it then prints "Applied autostash." ahead of the success message. The
+    // apply backend records its autostash in `rebase-apply/autostash`; the state
+    // dir is removed by the caller's finish, so consume the file before then.
+    apply_rebase_autostash(&common_git_dir, state_dir)?;
+
+    if !quiet {
+        eprintln!("Successfully rebased and updated {head_display}.");
+    }
+    Ok(())
+}
+
+/// Apply (or store) the autostash recorded in the apply backend's
+/// `rebase-apply/autostash`. Mirrors `apply_autostash` in the merge backend
+/// (rebase.rs) but reachable from the am finish path. Prints "Applied
+/// autostash." on a clean apply, or stores the stash on conflict.
+fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path) -> Result<()> {
+    let autostash_path = state_dir.join("autostash");
+    if let Ok(text) = fs::read_to_string(&autostash_path) {
+        let _ = fs::remove_file(&autostash_path);
+        let format = repository_object_format(common_git_dir)?;
+        if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
+            let applied =
+                commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
+            if applied {
+                eprintln!("Applied autostash.");
+            } else if commands::stash::store_stash_commit(&oid, "autostash").is_ok() {
+                eprintln!(
+                    "Applying autostash resulted in conflicts.\nYour changes are safe in the stash.\nYou can run \"git stash pop\" or \"git stash drop\" at any time."
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2109,33 +2693,96 @@ fn am_abort(
     state_dir: &Path,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
+    // The rebase apply backend records the branch to return to in `head-name`
+    // (a `refs/heads/...` ref when attached, the literal "detached HEAD"
+    // otherwise) plus the starting commit in `orig-head`. `git rebase --apply
+    // --abort` returns HEAD to where the rebase started; a bare `git am --abort`
+    // keeps the existing HEAD shape and restores `abort-safety`.
+    let head_name_raw = fs::read_to_string(state_dir.join("head-name"))
+        .ok()
+        .map(|raw| raw.trim().to_string());
+    let is_rebase = head_name_raw.is_some();
+    let rebase_branch = head_name_raw
+        .as_deref()
+        .filter(|name| name.starts_with("refs/heads/"))
+        .map(str::to_string);
+    let orig_head = fs::read_to_string(state_dir.join("orig-head"))
+        .ok()
+        .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok());
     let safety = fs::read_to_string(state_dir.join("abort-safety")).unwrap_or_default();
     let safety = safety.trim();
     if !safety.is_empty()
         && let Ok(oid) = ObjectId::from_hex(format, safety)
     {
         let refs = FileRefStore::new(git_dir, format);
-        let target_ref = match refs.read_ref("HEAD")? {
-            Some(RefTarget::Symbolic(branch)) => branch,
-            _ => "HEAD".to_string(),
-        };
         let current = head_commit_oid(&refs)?;
+        let committer = commit_identity_from_env("COMMITTER")?;
         let mut tx = refs.transaction();
-        tx.update(RefUpdate {
-            name: target_ref,
-            expected: None,
-            new: RefTarget::Direct(oid),
-            reflog: Some(ReflogEntry {
+        if is_rebase {
+            // git builtin/rebase.c abort: `<action> (abort): returning to
+            // <head_name OR orig_head_sha>` — the branch ref when attached, the
+            // starting commit's hex when the rebase was on a detached HEAD.
+            let action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
+            let returning_to = match &rebase_branch {
+                Some(branch) => branch.clone(),
+                None => orig_head.unwrap_or(oid).to_hex().to_string(),
+            };
+            let reflog = ReflogEntry {
                 old_oid: current.unwrap_or(zero_oid(format)?),
                 new_oid: oid,
-                committer: commit_identity_from_env("COMMITTER")?,
-                message: b"am --abort".to_vec(),
-            }),
-        });
+                committer: committer.clone(),
+                message: format!("{action} (abort): returning to {returning_to}").into_bytes(),
+            };
+            match &rebase_branch {
+                Some(branch) => {
+                    // The apply backend ran on a DETACHED HEAD (checkout_onto_for_apply
+                    // detaches), so the branch ref never moved off orig_head — abort
+                    // only re-attaches HEAD to it. Writing the branch ref here would
+                    // add a spurious branch-reflog entry; git leaves the branch
+                    // reflog untouched (t3406 #25).
+                    tx.update(RefUpdate {
+                        name: "HEAD".into(),
+                        expected: None,
+                        new: RefTarget::Symbolic(branch.clone()),
+                        reflog: Some(reflog),
+                    });
+                }
+                None => {
+                    // Detached rebase: HEAD itself moves back to orig_head.
+                    tx.update(RefUpdate {
+                        name: "HEAD".into(),
+                        expected: None,
+                        new: RefTarget::Direct(oid),
+                        reflog: Some(reflog),
+                    });
+                }
+            }
+        } else {
+            let target_ref = match refs.read_ref("HEAD")? {
+                Some(RefTarget::Symbolic(branch)) => branch,
+                _ => "HEAD".to_string(),
+            };
+            tx.update(RefUpdate {
+                name: target_ref,
+                expected: None,
+                new: RefTarget::Direct(oid),
+                reflog: Some(ReflogEntry {
+                    old_oid: current.unwrap_or(zero_oid(format)?),
+                    new_oid: oid,
+                    committer,
+                    message: b"am --abort".to_vec(),
+                }),
+            });
+        }
         tx.commit()?;
         sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;
     }
-    finish_am(state_dir)
+    // Drop state directly: `finish_am` would re-run the rebase finish (which moves
+    // to the rebased tip), but on abort we have already restored orig_head.
+    if state_dir.exists() {
+        fs::remove_dir_all(state_dir)?;
+    }
+    Ok(())
 }
 
 /// `git am --quit`: leave HEAD and the worktree as-is, only drop the state.
@@ -2157,6 +2804,10 @@ fn am_skip(
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head_oid)?;
     let next = read_state_usize(state_dir, "next")?;
+    // git's `am_skip` records the skipped commit in `rewritten` too: `<orig> <HEAD>`,
+    // where HEAD is the (cleaned) tip at skip time (am.c:2131). The post-rewrite
+    // hook then reports a skipped commit as rewritten to the commit it folded into.
+    record_rebase_rewrite(state_dir, format, next, &head_oid)?;
     run_am_series(
         git_dir,
         common_git_dir,
@@ -2229,7 +2880,7 @@ fn am_continue(
         return Err(GitError::Exit(128));
     }
 
-    create_am_commit(
+    let new_oid = create_am_commit(
         git_dir,
         common_git_dir,
         worktree_root,
@@ -2237,6 +2888,7 @@ fn am_continue(
         &patch,
         commit_opts,
     )?;
+    record_rebase_rewrite(state_dir, format, next, &new_oid)?;
     run_am_series(
         git_dir,
         common_git_dir,

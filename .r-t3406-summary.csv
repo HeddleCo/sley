@@ -1,0 +1,2 @@
+script,command,result,ok,notok,total,plan_total
+t3406-rebase-message.sh,t3406-rebase-message.sh,FAIL,22,10,32,32
