@@ -33,6 +33,25 @@ use crate::{
 
 /// git's default hunk context (`-U3`).
 pub const DEFAULT_CONTEXT: usize = 3;
+const FUNCTION_CONTEXT_FLAG: usize = 1usize << (usize::BITS - 1);
+const CONTEXT_VALUE_MASK: usize = !FUNCTION_CONTEXT_FLAG;
+
+/// Encode `-W` / `--function-context` into the context field without changing
+/// the option shape used by the existing renderer call sites.
+pub fn enable_function_context(context: usize) -> usize {
+    (context & CONTEXT_VALUE_MASK) | FUNCTION_CONTEXT_FLAG
+}
+
+fn decode_context(context: usize) -> (usize, bool) {
+    (
+        context & CONTEXT_VALUE_MASK,
+        context & FUNCTION_CONTEXT_FLAG != 0,
+    )
+}
+
+fn replace_context_value(encoded: usize, context: usize) -> usize {
+    (encoded & !CONTEXT_VALUE_MASK) | (context & CONTEXT_VALUE_MASK)
+}
 
 /// The per-line origin marker for an emitted diff line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -237,6 +256,7 @@ pub fn render_hunks(
     new_content: Option<&[u8]>,
     options: &mut HunkRenderOptions<'_, '_>,
 ) {
+    let (context, function_context) = decode_context(options.context);
     // `log -L` hunk restriction: render with inflated context into a scratch
     // buffer, then clip the emitted lines to the tracked ranges (diff.c's
     // `line_range_*` callbacks). The widest range span is the upper bound on
@@ -249,7 +269,7 @@ pub fn render_hunks(
             .unwrap_or(0)
             .max(0) as usize;
         let saved_context = options.context;
-        options.context = saved_context.max(max_span);
+        options.context = replace_context_value(saved_context, context.max(max_span));
         options.line_ranges = None;
         let mut full = Vec::new();
         render_hunks(&mut full, old_content, new_content, options);
@@ -332,11 +352,26 @@ pub fn render_hunks(
     // break plus leading/isolated-ignorable-change removal. Each hunk is a
     // tagged-stream `(first_change_pos, last_change_pos)` span of *real*
     // (emitted) changes.
-    let groups = group_changes_into_hunks(&changes, options.context, options.interhunk);
+    let mut groups = group_changes_into_hunks(&changes, context, options.interhunk);
+    if function_context {
+        groups = expand_hunks_to_function_context(
+            &groups,
+            &tagged,
+            &old,
+            &new,
+            options.heading.as_deref_mut(),
+        );
+    }
 
     for (first_change, last_change) in groups {
-        let hunk_start = first_change.saturating_sub(options.context);
-        let hunk_end = (last_change + options.context + 1).min(tagged.len());
+        let (hunk_start, hunk_end) = if function_context {
+            (first_change, (last_change + 1).min(tagged.len()))
+        } else {
+            (
+                first_change.saturating_sub(context),
+                (last_change + context + 1).min(tagged.len()),
+            )
+        };
         render_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
     }
 }
@@ -1301,6 +1336,169 @@ fn group_changes_into_hunks(
     }
 
     hunks
+}
+
+fn expand_hunks_to_function_context(
+    groups: &[(usize, usize)],
+    tagged: &[TaggedLine<'_>],
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    mut heading: Option<&mut HeadingFn<'_>>,
+) -> Vec<(usize, usize)> {
+    let Some(classifier) = heading.as_mut() else {
+        return groups.to_vec();
+    };
+    let mut expanded = Vec::with_capacity(groups.len());
+    for &(start, end) in groups {
+        let first = tagged[start];
+        let last = tagged[end];
+        let old_changed = tagged[start..=end]
+            .iter()
+            .any(|line| line.kind == LineKind::Delete);
+        let (side, range) = if old_changed {
+            (FunctionSide::Old, function_context_range(old, first.old_index, false, classifier))
+        } else {
+            (
+                FunctionSide::New,
+                function_context_range(new, first.new_index, true, classifier),
+            )
+        };
+        let Some((range_start, range_end)) = range else {
+            expanded.push((start, end));
+            continue;
+        };
+        let mut hunk_start = expand_tag_start(tagged, start, side, range_start);
+        let mut hunk_end = expand_tag_end(tagged, end, side, range_end);
+        if old_changed {
+            if last.old_index >= range_end {
+                hunk_end = end;
+            }
+        } else if last.new_index >= range_end {
+            hunk_end = end;
+        }
+        if hunk_start > start {
+            hunk_start = start;
+        }
+        if hunk_end < end {
+            hunk_end = end;
+        }
+        if let Some(prev) = expanded.last_mut()
+            && hunk_start <= prev.1 + 1
+        {
+            prev.1 = prev.1.max(hunk_end);
+            continue;
+        }
+        expanded.push((hunk_start, hunk_end));
+    }
+    expanded
+}
+
+#[derive(Clone, Copy)]
+enum FunctionSide {
+    Old,
+    New,
+}
+
+fn function_context_range(
+    lines: &[DiffLine<'_>],
+    anchor: usize,
+    prefer_forward: bool,
+    heading: &mut HeadingFn<'_>,
+) -> Option<(usize, usize)> {
+    if lines.is_empty() {
+        return None;
+    }
+    let anchor = anchor.min(lines.len() - 1);
+    let mut heading_idx = None;
+    for idx in (0..=anchor).rev() {
+        if heading(lines[idx].content).is_some() {
+            heading_idx = Some(idx);
+            break;
+        }
+    }
+    if heading_idx.is_none() && prefer_forward {
+        for (idx, line) in lines.iter().enumerate().skip(anchor) {
+            if heading(line.content).is_some() {
+                heading_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    let (mut start, mut end) = if let Some(idx) = heading_idx {
+        let mut start = idx;
+        while start > 0 && !line_is_blank(lines[start - 1].content, WsIgnore::default()) {
+            start -= 1;
+        }
+        let mut end = lines.len();
+        for (next, line) in lines.iter().enumerate().skip(idx + 1) {
+            if heading(line.content).is_some() {
+                end = next;
+                break;
+            }
+        }
+        (start, end)
+    } else {
+        let mut start = anchor;
+        while start > 0 && !line_is_blank(lines[start - 1].content, WsIgnore::default()) {
+            start -= 1;
+        }
+        let mut end = anchor + 1;
+        while end < lines.len() && !line_is_blank(lines[end].content, WsIgnore::default()) {
+            end += 1;
+        }
+        (start, end)
+    };
+
+    while start < end && line_is_blank(lines[start].content, WsIgnore::default()) {
+        start += 1;
+    }
+    while end > start && line_is_blank(lines[end - 1].content, WsIgnore::default()) {
+        end -= 1;
+    }
+    (start < end).then_some((start, end))
+}
+
+fn expand_tag_start(
+    tagged: &[TaggedLine<'_>],
+    current: usize,
+    side: FunctionSide,
+    range_start: usize,
+) -> usize {
+    let mut start = current;
+    while start > 0 {
+        let prev = tagged[start - 1];
+        let line_index = match side {
+            FunctionSide::Old => prev.old_index,
+            FunctionSide::New => prev.new_index,
+        };
+        if line_index < range_start {
+            break;
+        }
+        start -= 1;
+    }
+    start
+}
+
+fn expand_tag_end(
+    tagged: &[TaggedLine<'_>],
+    current: usize,
+    side: FunctionSide,
+    range_end: usize,
+) -> usize {
+    let mut end = current;
+    while end + 1 < tagged.len() {
+        let next = tagged[end + 1];
+        let line_index = match side {
+            FunctionSide::Old => next.old_index,
+            FunctionSide::New => next.new_index,
+        };
+        if line_index >= range_end {
+            break;
+        }
+        end += 1;
+    }
+    end
 }
 
 /// Emit a single hunk covering `tagged[start..end]`: the `@@ -os,oc +ns,nc @@
