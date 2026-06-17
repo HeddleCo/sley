@@ -331,6 +331,27 @@ fn log_unborn_head_branch(git_dir: &Path) -> Option<String> {
     target.strip_prefix("refs/heads/").map(str::to_string)
 }
 
+fn log_pathspec_magic(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix(":(")?;
+    let (magic, path) = rest.split_once(')')?;
+    Some((magic, path))
+}
+
+fn log_follow_unsupported_pathspec_magic(value: &str) -> Option<String> {
+    let (magic, _) = log_pathspec_magic(value)?;
+    let unsupported = magic
+        .split(',')
+        .filter(|part| matches!(*part, "glob" | "icase"))
+        .collect::<Vec<_>>();
+    (!unsupported.is_empty()).then(|| {
+        unsupported
+            .into_iter()
+            .map(|part| format!("'{part}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
 fn emit_plain_oneline_limited_commit(
     db: &FileObjectDatabase,
     record: &sley_rev::CommitMetadata,
@@ -1370,6 +1391,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
             "--follow" => saw_follow = true,
+            "--no-follow" => saw_follow = false,
             // `-L<range>:<file>` (attached) or `-L <range>:<file>` (separate).
             "-L" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1395,7 +1417,17 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 if ignored_missing_input {
                     revision_input_with_ignore_missing = true;
                 }
-                setup_args.push(value.to_string());
+                if saw_follow
+                    && let Some(unsupported) = log_follow_unsupported_pathspec_magic(value)
+                {
+                    eprintln!("fatal: pathspec magic not supported by --follow: {unsupported}");
+                    return Err(GitError::Exit(128));
+                }
+                if let Some((_, path)) = log_pathspec_magic(value) {
+                    setup_args.push(path.to_string());
+                } else {
+                    setup_args.push(value.to_string());
+                }
             }
         }
     }
@@ -1514,7 +1546,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     ) {
         Ok(setup) => setup,
         Err(err) if inserted_default_head => {
-            if let Some(branch) = log_unborn_head_branch(&git_dir) {
+            if resolve_revision(&git_dir, format, "HEAD").is_err()
+                && let Some(branch) = log_unborn_head_branch(&git_dir)
+            {
                 eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
                 return Err(GitError::Exit(128));
             }
