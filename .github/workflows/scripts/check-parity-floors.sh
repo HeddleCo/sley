@@ -439,6 +439,9 @@ declare -A FLOOR=(
     [t1014-read-tree-confusing.sh]=28
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
+    # codex-wave-6: rebase porcelain t3400@18 / incompatible-options t3422@52.
+    [t3400-rebase.sh]=18
+    [t3422-rebase-incompatible-options.sh]=52
     [t3403-rebase-skip.sh]=16
     [t3404-rebase-interactive.sh]=51
     [t3406-rebase-message.sh]=32
@@ -451,10 +454,13 @@ declare -A FLOOR=(
     [t4014-format-patch.sh]=164
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     [t4150-am.sh]=56
+    # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
+    [t4051-diff-function-context.sh]=32
+    [t4060-diff-submodule-option-diff-format.sh]=7
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
-    [t4015-diff-whitespace.sh]=101
+    [t4015-diff-whitespace.sh]=102
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=67
     [t4019-diff-wserror.sh]=19
