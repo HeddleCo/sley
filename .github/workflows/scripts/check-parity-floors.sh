@@ -394,6 +394,8 @@ declare -A FLOOR=(
     [t0020-crlf.sh]=29
     [t0021-conversion.sh]=21
     [t3920-crlf-messages.sh]=9
+    # codex-wave-5 (2026-06-17): lib new commands — repo-info t1900 full@38 / replay t3650@43.
+    [t1900-repo-info.sh]=38
     [t2107-update-index-basic.sh]=10
     [t7810-grep.sh]=230
     # codex-wave-4-recovery: notes merge t3309 enroll@31 / t3311 enroll@24 (full pass).
@@ -511,7 +513,8 @@ declare -A FLOOR=(
     [t7900-maintenance.sh]=12
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
-    [t3701-add-interactive.sh]=85
+    [t3650-replay-basics.sh]=43
+    [t3701-add-interactive.sh]=86
     [t4011-diff-symlink.sh]=1
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
     [t6402-merge-rename.sh]=34
