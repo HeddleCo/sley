@@ -228,6 +228,12 @@ jobs:
             t7407-submodule-foreach.sh
             t7406-submodule-update.sh
             t4203-mailmap.sh
+            t7700-repack.sh
+            t7703-repack-geometric.sh
+            t7704-repack-cruft.sh
+            t6500-gc.sh
+            t0610-reftable-basics.sh
+            t4061-diff-indent.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.

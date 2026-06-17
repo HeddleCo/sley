@@ -405,7 +405,7 @@ declare -A FLOOR=(
     [t6002-rev-list-bisect.sh]=53
     [t6030-bisect-porcelain.sh]=95
     [t5310-pack-bitmaps.sh]=221
-    [t5326-multi-pack-bitmaps.sh]=342
+    [t5326-multi-pack-bitmaps.sh]=344
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     [t2020-checkout-detach.sh]=16
@@ -460,10 +460,10 @@ declare -A FLOOR=(
     [t5300-pack-object.sh]=46
     [t5302-pack-index.sh]=31
     [t5303-pack-corruption-resilience.sh]=21
-    [t5304-prune.sh]=10
-    [t5319-multi-pack-index.sh]=74
+    [t5304-prune.sh]=13
+    [t5319-multi-pack-index.sh]=77
     [t5324-split-commit-graph.sh]=11
-    [t5329-pack-objects-cruft.sh]=16
+    [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
     [t5505-remote.sh]=90
     [t5511-refspec.sh]=47
@@ -516,6 +516,15 @@ declare -A FLOOR=(
     [t7407-submodule-foreach.sh]=21
     [t7406-submodule-update.sh]=54
     [t4203-mailmap.sh]=69
+    # wave-12 (2026-06-17): repack/gc engine (geometric + cruft repack + gc orchestration),
+    # diff indent-heuristic, reftable log-block engine. Incidental pack-floor gains bumped above
+    # (t5304 10->13, t5319 74->77, t5326 342->344, t5329 16->19). NEW floors locking the gains:
+    [t7700-repack.sh]=17
+    [t7703-repack-geometric.sh]=11
+    [t7704-repack-cruft.sh]=15
+    [t6500-gc.sh]=14
+    [t0610-reftable-basics.sh]=35
+    [t4061-diff-indent.sh]=21
 )
 
 fail=0
