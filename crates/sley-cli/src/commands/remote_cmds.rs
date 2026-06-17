@@ -4934,9 +4934,16 @@ pub(crate) fn cmd_remote(args: &[String]) -> Result<()> {
         "set-url" => cmd_remote_set_url(&args[idx + 1..]),
         "show" => cmd_remote_show(&args[idx + 1..]),
         "update" => cmd_remote_update(&args[idx + 1..], verbose),
-        other => Err(GitError::Command(format!(
-            "unsupported remote subcommand {other}"
-        ))),
+        other => {
+            // Upstream `builtin/remote.c`: an unknown subcommand emits
+            // `error("unknown subcommand: \`%s'")` then `usage_with_options`
+            // (exit 129). The conformance test only greps the `error:` prefix.
+            eprintln!("error: unknown subcommand: `{other}'");
+            Err(remote_usage_error(
+                "git remote [-v | --verbose]",
+                "",
+            ))
+        }
     }
 }
 /// Emit a `git remote <sub>` usage block to stderr and return git's usage exit
@@ -5120,10 +5127,35 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     if mirror == RemoteAddMirror::Both {
         entries.push(ConfigEntry::new("mirror", Some("true".into())));
     }
+    // Upstream `builtin/remote.c::check_remote_collision`: a new remote may not
+    // nest with an existing one. When the new name is `<existing>/…` it is a
+    // subset of that remote; when an existing name is `<new>/…` the new name is
+    // a superset. Either collision dies (exit 128).
+    for existing in remote_names(&config) {
+        if let Some(rest) = name.strip_prefix(&existing)
+            && rest.starts_with('/')
+        {
+            eprintln!("fatal: remote name '{name}' is a subset of existing remote '{existing}'");
+            return Err(GitError::Exit(128));
+        }
+        if let Some(rest) = existing.strip_prefix(name)
+            && rest.starts_with('/')
+        {
+            eprintln!(
+                "fatal: remote name '{name}' is a superset of existing remote '{existing}'"
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
     match sley_config::remotes::add_remote(&mut config, name, entries) {
         Ok(()) => {}
         Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
-            return Err(GitError::Command(format!("remote {name} already exists")));
+            // Upstream `builtin/remote.c::add`: `error("remote %s already
+            // exists.")` then `exit(3)`. A remote counts as existing when it has
+            // any config (e.g. a foreign-vcs `remote.<name>.vcs`), which the
+            // `[remote "<name>"]` section presence already captures.
+            eprintln!("error: remote {name} already exists.");
+            return Err(GitError::Exit(3));
         }
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
             return Err(GitError::remote_not_found(name));
