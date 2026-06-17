@@ -679,20 +679,38 @@ impl Mailmap {
         format: ObjectFormat,
         source_specs: &[MailmapSourceSpec],
     ) -> Result<Self> {
+        // git's `read_mailmap` order (mailmap.c): `.mailmap` (worktree only) →
+        // `mailmap.blob` → `mailmap.file` (last, so it overrides). A bare repo
+        // skips `.mailmap` and defaults the blob to `HEAD:.mailmap`.
         let mut mailmap = Self::default();
         let worktree_root = worktree_root_for_git_dir(git_dir).ok();
+        let is_bare = worktree_root.is_none();
+        let config = identity_effective_config();
+        let mailmap_file = config
+            .as_ref()
+            .and_then(|c| c.get("mailmap", None, "file").map(str::to_owned));
+        let mut mailmap_blob = config
+            .as_ref()
+            .and_then(|c| c.get("mailmap", None, "blob").map(str::to_owned));
+        if mailmap_blob.is_none() && is_bare {
+            mailmap_blob = Some("HEAD:.mailmap".to_string());
+        }
+
+        // `.mailmap` from the worktree (non-bare only).
         if let Some(root) = &worktree_root {
             mailmap.add_file(&root.join(".mailmap"))?;
         }
-        if let Some(config) = identity_effective_config() {
-            if let Some(path) = config.get("mailmap", None, "file") {
-                let path = mailmap_config_path(worktree_root.as_deref(), path);
-                mailmap.add_file(&path)?;
-            }
-            if let Some(blob) = config.get("mailmap", None, "blob") {
-                mailmap.add_blob(git_dir, format, blob)?;
-            }
+        // `mailmap.blob` (config value, or the bare-repo default).
+        if let Some(blob) = &mailmap_blob {
+            mailmap.add_blob(git_dir, format, blob)?;
         }
+        // `mailmap.file` last — overrides the blob/`.mailmap` for matching keys.
+        if let Some(path) = &mailmap_file {
+            let path = mailmap_config_path(worktree_root.as_deref(), path);
+            mailmap.add_file(&path)?;
+        }
+        // Explicit `--mailmap-file`/`--mailmap-blob` sources (check-mailmap) layer
+        // on top, in order.
         for source in source_specs {
             match source {
                 MailmapSourceSpec::File(path) => mailmap.add_file(path)?,
@@ -710,13 +728,26 @@ impl Mailmap {
         }
     }
 
+    /// git's `read_mailmap_blob`: a missing rev is silently skipped; an
+    /// unreadable object or a non-blob type prints an `error:` to stderr but does
+    /// NOT abort the command (git's `error()` returns nonzero, the caller
+    /// accumulates it and still runs).
     fn add_blob(&mut self, git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<()> {
-        let oid = resolve_revision(git_dir, format, rev)?;
+        // `repo_get_oid(...) < 0` → return 0 (silent skip of a missing blob/rev).
+        let Ok(oid) = resolve_revision(git_dir, format, rev) else {
+            return Ok(());
+        };
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        let object = db.read_object(&oid)?;
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => {
+                eprintln!("error: unable to read mailmap object at {rev}");
+                return Ok(());
+            }
+        };
         if object.object_type != ObjectType::Blob {
-            eprintln!("error: unable to read mailmap object at {rev}");
-            return Err(GitError::Exit(128));
+            eprintln!("error: mailmap is not a blob: {rev}");
+            return Ok(());
         }
         self.add_bytes(&object.body)
     }
