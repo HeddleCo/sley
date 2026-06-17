@@ -2550,6 +2550,22 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(original_path)
                 );
             }
+            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation {
+                old_path,
+                renamed_from,
+                added_in,
+                dir_renamed_in,
+            }) => match renamed_from {
+                Some(source) => println!(
+                    "CONFLICT (file location): {src} renamed to {old} in {added_in}, inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {path_str}.",
+                    src = String::from_utf8_lossy(source),
+                    old = String::from_utf8_lossy(old_path),
+                ),
+                None => println!(
+                    "CONFLICT (file location): {old} added in {added_in} inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {path_str}.",
+                    old = String::from_utf8_lossy(old_path),
+                ),
+            },
             None => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
             }

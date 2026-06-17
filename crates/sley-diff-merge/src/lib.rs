@@ -4909,6 +4909,24 @@ pub enum MergeConflictKind {
         /// The side label whose file was moved aside.
         moved_from: String,
     },
+    /// A path was added/renamed under a directory the other side renamed, so the
+    /// merge silently moved it into the renamed directory but, in
+    /// `merge.directoryRenames=conflict` mode, flags it for the user to confirm.
+    /// git emits `CONFLICT (file location): ... suggesting it should perhaps be
+    /// moved to <new_path>.` The tree still contains the re-homed content.
+    DirRenameLocation {
+        /// The pre-re-home path (`old_path` in git's message): where the side
+        /// placed the file before directory-rename detection moved it.
+        old_path: Vec<u8>,
+        /// `Some(source)` when the file was *renamed* into `old_path` by this
+        /// side (git's "renamed to" wording, naming the original `source`);
+        /// `None` when it was a fresh add (git's "added in" wording).
+        renamed_from: Option<Vec<u8>>,
+        /// The side label that added/renamed the file (`branch_with_new_path`).
+        added_in: String,
+        /// The side label that renamed the directory (`branch_with_dir_rename`).
+        dir_renamed_in: String,
+    },
 }
 
 /// One resolved/conflicted path in the merged tree.
@@ -5081,20 +5099,40 @@ pub fn merge_entry_maps(
         apply_merge_renames(base_map, ours_map, theirs_map, &renames);
 
     // Directory-rename detection: when one side renamed a whole directory and
-    // the other added files under the old directory, re-home those additions
-    // into the renamed directory (the merge.directoryRenames behaviour). This
-    // runs on top of the file-rename rewrite, using the *original* side maps to
-    // decide which paths were freshly added.
+    // the other side added a file under (or renamed a file into) the old
+    // directory, re-home that path into the renamed directory — including
+    // transitive renames (a file the other side renamed into a directory this
+    // side renamed follows on into the final directory). This is the
+    // merge.directoryRenames behaviour, applied as a rewrite of the rename/add
+    // destination paths so every merged path consults directory renames.
+    let mut dir_rename_dirty = false;
+    let mut rehomed_paths: BTreeMap<Vec<u8>, RehomeInfo> = BTreeMap::new();
     if options.directory_renames != DirectoryRenames::False
         && let Some((ours_side, theirs_side)) = &side_renames
     {
         let dir_renames =
             compute_directory_renames(base_map, ours_map, theirs_map, ours_side, theirs_side);
-        let (new_ours, new_theirs, _rehomed) =
-            apply_directory_renames(&eff_base, &eff_ours, &eff_theirs, &dir_renames);
-        eff_ours = new_ours;
-        eff_theirs = new_theirs;
+        let outcome = apply_directory_renames(
+            base_map,
+            &eff_ours,
+            &eff_theirs,
+            ours_side,
+            theirs_side,
+            &dir_renames,
+        );
+        eff_ours = outcome.ours;
+        eff_theirs = outcome.theirs;
+        rehomed_paths = outcome.rehomed;
+        dir_rename_dirty = outcome.dirty;
     }
+    // In =conflict mode, every re-homed path is reported as a location conflict
+    // (the tree still gets the re-homed content, but the merge is marked dirty).
+    let dir_rename_conflict_paths: BTreeMap<Vec<u8>, RehomeInfo> =
+        if options.directory_renames == DirectoryRenames::Conflict {
+            rehomed_paths
+        } else {
+            BTreeMap::new()
+        };
 
     let mut all_paths = BTreeSet::new();
     all_paths.extend(eff_base.keys().cloned());
@@ -5335,6 +5373,37 @@ pub fn merge_entry_maps(
                 deleted_in,
             });
             clean = false;
+        }
+    }
+
+    // Directory-rename outcomes that make the merge dirty. A collision/split
+    // detected while re-homing (two paths onto one destination, an ambiguous
+    // split source, or a file in the way) marks the merge unclean regardless of
+    // mode. In =conflict mode, every silently re-homed path is *also* reported
+    // as a location conflict: the tree keeps the re-homed content but git wants
+    // the user to confirm the suggested move.
+    if dir_rename_dirty {
+        clean = false;
+    }
+    if !dir_rename_conflict_paths.is_empty() {
+        clean = false;
+        for (dest, info) in &dir_rename_conflict_paths {
+            let (added_in, dir_renamed_in) = if info.added_on_ours {
+                // The path was added/renamed by ours, into a dir theirs renamed.
+                (options.ours_label.to_string(), options.theirs_label.to_string())
+            } else {
+                (options.theirs_label.to_string(), options.ours_label.to_string())
+            };
+            if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
+                && slot.conflict.is_none()
+            {
+                slot.conflict = Some(MergeConflictKind::DirRenameLocation {
+                    old_path: info.old_path.clone(),
+                    renamed_from: info.renamed_from.clone(),
+                    added_in,
+                    dir_renamed_in,
+                });
+            }
         }
     }
 
@@ -5869,7 +5938,8 @@ fn apply_dir_rename(old_dir: &[u8], new_dir: &[u8], path: &[u8]) -> Vec<u8> {
 }
 
 /// Find the longest renamed ancestor directory of `path`: walk parent dirs from
-/// the deepest up and return the first one present in `dir_renames`.
+/// the deepest up and return the first one present in `dir_renames`. Mirrors
+/// merge-ort's `check_dir_renamed`.
 fn check_dir_renamed<'a>(
     path: &[u8],
     dir_renames: &'a BTreeMap<Vec<u8>, Vec<u8>>,
@@ -5884,26 +5954,29 @@ fn check_dir_renamed<'a>(
     None
 }
 
-/// A computed directory rename `old_dir -> new_dir` on one side of the merge.
+/// The provisional directory renames computed for both sides, plus the source
+/// directories whose rename was ambiguous (a "split").
 struct DirectoryRenameMaps {
-    /// Renames detected on ours' side (so files theirs added under `old_dir`
-    /// re-home into `new_dir`).
+    /// `old_dir -> new_dir` directory renames detected on ours' side. A path
+    /// added/renamed by theirs under `old_dir` re-homes into `new_dir`.
     ours: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Renames detected on theirs' side.
+    /// Directory renames detected on theirs' side.
     theirs: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Source directories whose split was unclear (no unique majority target);
-    /// re-homing a file under one of these is a conflict, not silent.
+    /// re-homing a path out of one of these is a conflict, not silent. Also
+    /// holds source dirs that were renamed on BOTH sides (dropped from the maps
+    /// by `handle_directory_level_conflicts` but still conflict markers).
     split_dirs: BTreeSet<Vec<u8>>,
 }
 
 /// Infer directory renames from the complete per-side file-rename sets, mirroring
-/// merge-ort's `get_provisional_directory_renames`: for every file moved
-/// `old_dir/x -> new_dir/x`, tally `count[old_dir][new_dir]`, then collapse to
-/// `old_dir -> best_new_dir` where `best` is the unique highest count. A tie
-/// (no unique majority) marks the source directory as a "split" and is not
-/// applied silently. A directory rename is only kept if the source directory was
-/// *entirely removed* on that side (git's `dirs_removed` gate): if any file under
-/// `old_dir` survives on the renaming side, the directory was not really renamed.
+/// merge-ort's `get_provisional_directory_renames` + `handle_directory_level_conflicts`.
+/// For every file moved `.../old_dir/x -> .../new_dir/x`, the ancestor pairs are
+/// tallied (`dir_rename_count`) and collapsed to `old_dir -> best_new_dir` where
+/// `best` is the unique highest count. A tie marks the source directory as a
+/// "split". A rename is only kept if the source directory was *entirely removed*
+/// on that side (the `dirs_removed` gate). A directory renamed on BOTH sides is
+/// dropped from both maps (ambiguous).
 fn compute_directory_renames(
     base_map: &MergeEntryMap,
     ours_map: &MergeEntryMap,
@@ -5954,21 +6027,16 @@ fn compute_side_dir_renames(
     base_map: &MergeEntryMap,
     side_map: &MergeEntryMap,
 ) -> SideDirRenames {
-    // count[old_dir][new_dir] = number of files moved from old_dir to new_dir.
+    // dir_rename_count: count[old_dir][new_dir]. Built by walking every rename's
+    // ancestor directories while the *trailing* path components match, exactly
+    // as merge-ort's update_dir_rename_counts does. For
+    //   a/b/c/d/e/foo.c -> a/b/some/thing/else/e/foo.c
+    // this records both
+    //   a/b/c/d/e => a/b/some/thing/else/e   AND   a/b/c/d => a/b/some/thing/else
+    // but stops once the trailing components diverge.
     let mut counts: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, usize>> = BTreeMap::new();
     for (old, new) in pairs {
-        // Only count moves that actually cross directories (the per-file basename
-        // is preserved by the move; merge-ort tallies the *immediate* parent dir
-        // move). We consider every ancestor pairing so nested renames register on
-        // the directory that contains the file.
-        let old_dir = parent_dir(old);
-        let new_dir = parent_dir(new);
-        if old_dir == new_dir {
-            continue;
-        }
-        let od = old_dir.map(<[u8]>::to_vec).unwrap_or_default();
-        let nd = new_dir.map(<[u8]>::to_vec).unwrap_or_default();
-        *counts.entry(od).or_default().entry(nd).or_default() += 1;
+        update_dir_rename_counts(&mut counts, old, new);
     }
 
     let mut renames = BTreeMap::new();
@@ -6005,6 +6073,89 @@ fn compute_side_dir_renames(
     SideDirRenames { renames, split }
 }
 
+/// Tally the ancestor directory-rename pairs implied by a single file rename
+/// `old -> new`, mirroring merge-ort's `update_dir_rename_counts`. Starting from
+/// the immediate parent dirs, we strip one trailing component at a time and
+/// record `old_ancestor -> new_ancestor` as long as the *remaining* trailing
+/// suffix still matches between the two paths.
+fn update_dir_rename_counts(
+    counts: &mut BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, usize>>,
+    old: &[u8],
+    new: &[u8],
+) {
+    // Work on owned copies we progressively truncate at each '/'.
+    let mut old_dir = old.to_vec();
+    let mut new_dir = new.to_vec();
+    let mut first = true;
+    loop {
+        // Strip the trailing component (basename on the first pass, then a dir
+        // each pass) to ascend one level.
+        let old_has = dir_munge(&mut old_dir);
+        let new_has = dir_munge(&mut new_dir);
+
+        // On the first pass we only stripped the basename; the dirs need not
+        // match. On later passes the *trailing* components must agree, otherwise
+        // the rename no longer implies this ancestor pairing.
+        if !first {
+            let old_sub = trailing_component(old, &old_dir);
+            let new_sub = trailing_component(new, &new_dir);
+            if old_sub != new_sub {
+                break;
+            }
+        }
+
+        if old_dir == new_dir {
+            // Same directory at this level — no rename implied, and no deeper
+            // ancestor can differ usefully either.
+            break;
+        }
+        *counts
+            .entry(old_dir.clone())
+            .or_default()
+            .entry(new_dir.clone())
+            .or_default() += 1;
+
+        first = false;
+        // Hitting the toplevel ("") on either side ends the ascent.
+        if old_dir.is_empty() || new_dir.is_empty() {
+            break;
+        }
+        // If the two ancestors are identical from here up, stop (git stops once
+        // the suffix-equal walk reaches a common prefix).
+        if !old_has || !new_has {
+            break;
+        }
+    }
+}
+
+/// Truncate `buf` at its last '/', leaving the parent directory (or empty for a
+/// toplevel name). Returns whether a '/' was present (i.e. there is a deeper
+/// ancestor to ascend into).
+fn dir_munge(buf: &mut Vec<u8>) -> bool {
+    match buf.iter().rposition(|b| *b == b'/') {
+        Some(i) => {
+            buf.truncate(i);
+            true
+        }
+        None => {
+            buf.clear();
+            false
+        }
+    }
+}
+
+/// The trailing path component that was stripped from `full` to reach `dir`
+/// (i.e. the suffix of `full` after `dir/`). Used to compare whether the two
+/// sides of a rename share the same trailing directory chain.
+fn trailing_component<'a>(full: &'a [u8], dir: &[u8]) -> &'a [u8] {
+    if dir.is_empty() {
+        full
+    } else {
+        // full = dir + "/" + suffix
+        &full[dir.len() + 1..]
+    }
+}
+
 /// True when every base path under `dir/` is absent on `side` (the directory was
 /// entirely removed there). Mirrors merge-ort's `dirs_removed` precondition.
 fn directory_fully_removed(dir: &[u8], base_map: &MergeEntryMap, side_map: &MergeEntryMap) -> bool {
@@ -6018,82 +6169,217 @@ fn directory_fully_removed(dir: &[u8], base_map: &MergeEntryMap, side_map: &Merg
     true
 }
 
-/// Re-home files added on one side under a directory the OTHER side renamed.
+/// A path on one side whose location is rewritten by a directory rename the
+/// *other* side performed. The rewrite applies equally to a freshly added file
+/// and to a file the side itself renamed (a transitive rename).
+struct DirRenameMove {
+    /// The path as it currently sits in the side's effective map (the side's own
+    /// rename, if any, already applied).
+    from: Vec<u8>,
+    /// The re-homed destination, after applying the other side's directory rename.
+    to: Vec<u8>,
+    /// `Some(source)` when `from` is a rename destination produced by this side
+    /// (transitive rename); `None` for a fresh add. Drives git's
+    /// "renamed to"/"added in" message wording.
+    renamed_from: Option<Vec<u8>>,
+}
+
+/// Provenance of a re-homed path, for `=conflict`-mode `CONFLICT (file location)`
+/// reporting.
+struct RehomeInfo {
+    /// The pre-re-home path on the adding/renaming side.
+    old_path: Vec<u8>,
+    /// `Some(source)` for a transitive rename, `None` for a fresh add.
+    renamed_from: Option<Vec<u8>>,
+    /// Whether the *adding/renaming* side was ours (true) or theirs (false). The
+    /// caller resolves this to a branch label.
+    added_on_ours: bool,
+}
+
+/// Outcome of applying directory renames to both sides.
+struct DirRenameOutcome {
+    /// Rewritten ours/theirs maps with re-homed paths moved to their destinations.
+    ours: MergeEntryMap,
+    theirs: MergeEntryMap,
+    /// Re-homed destination path -> provenance (for `=conflict`-mode reporting).
+    rehomed: BTreeMap<Vec<u8>, RehomeInfo>,
+    /// True if a directory-level collision or split made the merge dirty even in
+    /// `=true` mode (e.g. two paths re-homed onto one destination).
+    dirty: bool,
+}
+
+/// Apply directory renames to both sides' effective maps.
 ///
-/// For each path that is newly added on a side (present there, absent in base)
-/// and absent on the other side, if it lives under a directory the *other* side
-/// renamed `old_dir -> new_dir`, move it to `new_dir/...`. Returns the rewritten
-/// ours/theirs maps plus the set of re-homed destination paths (for `=conflict`
-/// reporting) and any path that landed under a split directory.
+/// This mirrors merge-ort's `collect_renames` + `check_for_directory_rename` +
+/// `apply_directory_rename_modifications`: every path a side *added* or *renamed*
+/// that lives under a directory the OTHER side renamed has its destination
+/// rewritten to follow that rename — making the directory rename a property of
+/// the rename-detection pass that every path consults, not a per-file special
+/// case. Handles:
+///   - transitive renames (a file the side renamed into a dir the other side
+///     renamed follows on into the final directory),
+///   - `dir_rename_exclusions` (never re-home into a directory THIS side itself
+///     renamed — that would create a spurious rename/rename(1to2)),
+///   - collisions (N paths mapping to one destination -> conflict),
+///   - splits (a source dir with no majority target -> conflict, leave in place).
 fn apply_directory_renames(
     base_map: &MergeEntryMap,
     ours_map: &MergeEntryMap,
     theirs_map: &MergeEntryMap,
+    ours_side: &SideRenames,
+    theirs_side: &SideRenames,
     dir_renames: &DirectoryRenameMaps,
-) -> (MergeEntryMap, MergeEntryMap, BTreeSet<Vec<u8>>) {
+) -> DirRenameOutcome {
     let mut ours = ours_map.clone();
     let mut theirs = theirs_map.clone();
-    let mut rehomed = BTreeSet::new();
+    let mut rehomed = BTreeMap::new();
+    let mut dirty = false;
 
-    // Files added on theirs follow OURS' directory renames (ours renamed the
-    // directory, so theirs' additions under the old directory re-home into the
-    // new one) — and symmetrically for ours' additions following theirs' renames.
-    rehome_side(
-        base_map,
-        &mut theirs,
-        &dir_renames.ours,
-        &dir_renames.split_dirs,
-        &mut rehomed,
-    );
+    // Ours' paths follow THEIRS' directory renames; exclusions are OURS' own
+    // renamed-into dirs. Symmetrically for theirs.
+    let ours_excl = exclusion_dirs(&dir_renames.ours);
+    let theirs_excl = exclusion_dirs(&dir_renames.theirs);
+
+    // Ours' paths follow THEIRS' directory renames; the exclusions are OURS' own
+    // renamed-into dirs (never re-home a path into a directory this same side
+    // renamed). Symmetrically for theirs.
     rehome_side(
         base_map,
         &mut ours,
+        ours_side,
         &dir_renames.theirs,
+        &ours_excl,
         &dir_renames.split_dirs,
+        true, // these are ours' paths
         &mut rehomed,
+        &mut dirty,
+    );
+    rehome_side(
+        base_map,
+        &mut theirs,
+        theirs_side,
+        &dir_renames.ours,
+        &theirs_excl,
+        &dir_renames.split_dirs,
+        false, // these are theirs' paths
+        &mut rehomed,
+        &mut dirty,
     );
 
-    (ours, theirs, rehomed)
+    DirRenameOutcome {
+        ours,
+        theirs,
+        rehomed,
+        dirty,
+    }
 }
 
-/// Re-home freshly-added paths in `target` that live under a directory the OTHER
-/// side renamed (`renamer_dirs`: `old_dir -> new_dir`). "Added" means present in
-/// `target` but absent in `base_map`. Paths under a "split" directory (no clear
-/// destination) are left in place. Re-homed destinations are recorded in
-/// `rehomed`.
+/// The set of *destination* directories a side renamed into. A directory rename
+/// the other side wants to apply into one of these dirs is skipped (it would
+/// produce a spurious rename/rename(1to2)); git's `dir_rename_exclusions`.
+fn exclusion_dirs(side_dir_renames: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeSet<Vec<u8>> {
+    side_dir_renames.values().cloned().collect()
+}
+
+/// Re-home `target`'s added/renamed paths that fall under a directory the other
+/// side renamed (`renamer_dirs`: `old_dir -> new_dir`).
+///
+/// Candidates are paths present on this side and absent in base — i.e. both
+/// freshly added files AND this side's own rename destinations (the latter give
+/// the transitive-rename behaviour). A candidate whose nearest renamed ancestor
+/// maps into `exclusions` (a dir this side renamed) is left alone. Collisions
+/// (two candidates landing on one destination) and splits mark the merge dirty
+/// and the colliding/split paths are left in place.
+#[allow(clippy::too_many_arguments)]
 fn rehome_side(
     base_map: &MergeEntryMap,
     target: &mut MergeEntryMap,
+    side_renames: &SideRenames,
     renamer_dirs: &BTreeMap<Vec<u8>, Vec<u8>>,
+    exclusions: &BTreeSet<Vec<u8>>,
     split_dirs: &BTreeSet<Vec<u8>>,
-    rehomed: &mut BTreeSet<Vec<u8>>,
+    side_is_ours: bool,
+    rehomed: &mut BTreeMap<Vec<u8>, RehomeInfo>,
+    dirty: &mut bool,
 ) {
     if renamer_dirs.is_empty() {
         return;
     }
-    // Snapshot the added paths first; we mutate `target` while iterating.
+
+    // The rename destinations this side produced, mapped back to their sources;
+    // these are eligible for a transitive rewrite even though they look like
+    // ordinary entries (and carry the original source for message wording).
+    let side_rename_src: BTreeMap<&[u8], &[u8]> = side_renames
+        .pairs
+        .iter()
+        .map(|(o, n)| (n.as_slice(), o.as_slice()))
+        .collect();
+
+    // Compute the planned moves first, detecting collisions onto a single
+    // destination, before mutating `target`.
     let candidates: Vec<Vec<u8>> = target
         .keys()
-        .filter(|p| !base_map.contains_key(*p))
+        .filter(|p| !base_map.contains_key(*p) || side_rename_src.contains_key(p.as_slice()))
         .cloned()
         .collect();
+
+    // dest -> list of source paths that want to land there (collision detection).
+    let mut planned: BTreeMap<Vec<u8>, Vec<DirRenameMove>> = BTreeMap::new();
     for path in candidates {
-        // A file under a "split" directory has no clear destination; leave it.
-        if let Some(dir) = parent_dir(&path)
-            && split_dirs.contains(dir)
-        {
-            continue;
-        }
         let Some((old_dir, new_dir)) = check_dir_renamed(&path, renamer_dirs) else {
             continue;
         };
-        let dest = apply_dir_rename(old_dir, new_dir, &path);
-        if dest == path {
+        // A path whose source directory split ambiguously stays put (conflict).
+        if split_dirs.contains(old_dir) {
+            *dirty = true;
             continue;
         }
-        if let Some(entry) = target.remove(&path) {
-            target.entry(dest.clone()).or_insert(entry);
-            rehomed.insert(dest);
+        // dir_rename_exclusions: don't apply a rename INTO a directory this side
+        // itself renamed; that would cause a spurious rename/rename(1to2). The
+        // file instead follows this side's own rename (already reflected in
+        // `target`), so leave it.
+        if exclusions.contains(new_dir) {
+            continue;
+        }
+        let dest = apply_dir_rename(old_dir, new_dir, &path);
+        if dest == path {
+            // Directory rename causes a rename-to-self: the path is already where
+            // the directory rename would put it. Nothing to move.
+            continue;
+        }
+        let renamed_from = side_rename_src.get(path.as_slice()).map(|s| s.to_vec());
+        planned.entry(dest.clone()).or_default().push(DirRenameMove {
+            from: path,
+            to: dest,
+            renamed_from,
+        });
+    }
+
+    for (_dest, moves) in planned {
+        if moves.len() > 1 {
+            // Multiple paths map to one destination: an implicit-dir-rename
+            // collision. git leaves all of them in place and conflicts.
+            *dirty = true;
+            continue;
+        }
+        let mv = moves.into_iter().next().expect("non-empty");
+        // A single re-home. If the destination is already occupied on this side
+        // by an unrelated entry (file in the way), that's a collision; conflict
+        // and leave the source in place.
+        if target.contains_key(&mv.to) && mv.to != mv.from {
+            *dirty = true;
+            continue;
+        }
+        if let Some(entry) = target.remove(&mv.from) {
+            target.insert(mv.to.clone(), entry);
+            rehomed.insert(
+                mv.to,
+                RehomeInfo {
+                    old_path: mv.from,
+                    renamed_from: mv.renamed_from,
+                    added_on_ours: side_is_ours,
+                },
+            );
         }
     }
 }
