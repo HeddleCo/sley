@@ -214,6 +214,10 @@ jobs:
             t5329-pack-objects-cruft.sh
             t5504-fetch-receive-strict.sh
             t5505-remote.sh
+            t5810-proto-disable-local.sh
+            t5811-proto-disable-git.sh
+            t5813-proto-disable-ssh.sh
+            t5814-proto-disable-ext.sh
             t5511-refspec.sh
             t5515-fetch-merge-logic.sh
             t5516-fetch-push.sh

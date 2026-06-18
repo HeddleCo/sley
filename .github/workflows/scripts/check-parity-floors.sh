@@ -557,6 +557,16 @@ declare -A FLOOR=(
     # set-url/get-url/set-branches/set-head, show -n report formatting, update
     # group. t5505 93->126. branch.rs blast-radius held: t3200=134 t6040=9.
     [t5505-remote.sh]=126
+    # codex-wave-11 (protocol allowlist): ONE scheme-gating chokepoint (file/local/
+    # git/ssh/ext/<helper>:: classifier + protocol.<name>.allow + GIT_ALLOW_PROTOCOL
+    # + GIT_PROTOCOL_FROM_USER demotion + fatal-not-allowed errors) closes all FOUR
+    # proto suites FULL: t5810 28->54, t5811 10->26, t5813 33->81, t5814 11->27.
+    # Wide transport blast-radius held (15 files touched): t5601=72 t5516=72 t5520=38
+    # t5505=126 t5528=31 t5500=359 t5510=7 t6040=44.
+    [t5810-proto-disable-local.sh]=54
+    [t5811-proto-disable-git.sh]=26
+    [t5813-proto-disable-ssh.sh]=81
+    [t5814-proto-disable-ext.sh]=27
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
     # codex-wave-11 (push.default resolution): nothing/current/upstream/simple/
