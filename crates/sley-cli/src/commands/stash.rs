@@ -1784,9 +1784,15 @@ fn create_stash_commit(
     } else {
         Some(LsFilesPathspec::new(&cwd, &worktree_root, true, pathspecs)?)
     };
+    let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
     let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
-    let worktree_entries =
-        stash_worktree_entries(&worktree_root, &mut db, &index_entries, pathspec.as_ref())?;
+    let worktree_entries = stash_worktree_entries(
+        &worktree_root,
+        &mut db,
+        &index_entries,
+        &head_entries,
+        pathspec.as_ref(),
+    )?;
     let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
     let mut untracked_paths = if include_untracked {
         sley_worktree::untracked_paths_with_options(
@@ -1819,7 +1825,6 @@ fn create_stash_commit(
     let mut pathspec_paths = Vec::new();
     let mut staged_worktree_conflicts = Vec::new();
     if let Some(pathspec) = pathspec.as_ref() {
-        let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
         let index_entry_map = stash_index_entry_map(&index_entries);
         let worktree_entry_map = stash_index_entry_map(&worktree_entries);
         let tracked_change_paths = stash_pathspec_tracked_change_paths(
@@ -1848,7 +1853,6 @@ fn create_stash_commit(
             }
             return Ok(None);
         }
-        let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
         let index_entry_map = stash_index_entry_map(&index_entries);
         let worktree_entry_map = stash_index_entry_map(&worktree_entries);
         let staged_change_paths = stash_tree_changed_paths(&head_entries, &index_entry_map);
@@ -2128,10 +2132,13 @@ fn stash_worktree_entries(
     worktree_root: &Path,
     db: &mut FileObjectDatabase,
     index_entries: &[IndexEntry],
+    head_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
     pathspec: Option<&LsFilesPathspec>,
 ) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
     for entry in index_entries {
+        seen.insert(entry.path.as_bytes().to_vec());
         if pathspec.is_some_and(|pathspec| !pathspec.matches(&entry.path)) {
             entries.push(entry.clone());
             continue;
@@ -2150,6 +2157,25 @@ fn stash_worktree_entries(
             entries.push(stashed);
         } else {
             entries.push(entry.clone());
+        }
+    }
+    for (path, (mode, oid)) in head_entries {
+        if seen.contains(path) {
+            continue;
+        }
+        if pathspec.is_some_and(|pathspec| !pathspec.matches(path)) {
+            entries.push(merge_index_entry(path, *mode, *oid, 0));
+            continue;
+        }
+        let os_path = stash_repo_path_to_os_path(path)?;
+        let absolute = worktree_root.join(os_path);
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
+            continue;
+        };
+        if let Some(stashed) =
+            stash_capture_worktree_entry(db, &absolute, &metadata, BString::from(path.as_slice()))?
+        {
+            entries.push(stashed);
         }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
