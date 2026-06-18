@@ -385,7 +385,7 @@ declare -A FLOOR=(
     [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
     [t7004-tag.sh]=228
-    [t3200-branch.sh]=122
+    [t3200-branch.sh]=134
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
     # readdir + checkout-- stat-refresh SCOPED to the call site (R4: reset's tree-sourced entries
