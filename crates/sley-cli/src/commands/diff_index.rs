@@ -143,6 +143,17 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             "--no-indent-heuristic" => indent_heuristic = Some(false),
             "-B" | "--break-rewrites" => {}
             "--full-index" => patch_full_index = true,
+            "--submodule" => {}
+            value if let Some(value) = value.strip_prefix("--submodule=") => {
+                log_validate_submodule_format(value)?;
+            }
+            "--ignore-submodules" => {}
+            value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
+                if !matches!(value, "none" | "untracked" | "dirty" | "all") {
+                    eprintln!("fatal: bad --ignore-submodules argument: {value}");
+                    return Err(GitError::Exit(128));
+                }
+            }
             "--abbrev" => abbrev = AbbrevRequest::Auto,
             "--no-abbrev" => abbrev = AbbrevRequest::None,
             "--no-prefix" => {

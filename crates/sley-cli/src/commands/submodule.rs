@@ -20,6 +20,9 @@ pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
                 leading.push("--cached".to_string());
                 index += 1;
             }
+            Some("--recursive") => {
+                return submodule_usage();
+            }
             Some("-h") => {
                 // `git submodule -h` prints the usage to stdout and succeeds.
                 println!("{}", submodule_usage_text());

@@ -92,7 +92,7 @@ pub(crate) struct DiffOptions {
     pub(crate) diff_patch_context_control: bool,
     pub(crate) diff_patch_output_control: bool,
     pub(crate) diff_rewrite_control: bool,
-    pub(crate) diff_submodule_output_control: bool,
+    pub(crate) diff_submodule_format: Option<SubmoduleDiffFormat>,
     pub(crate) word_diff_mode: Option<commands::diff_words::WordDiffMode>,
     pub(crate) word_diff_regex: Option<String>,
     pub(crate) no_index: bool,
@@ -161,7 +161,7 @@ impl Default for DiffOptions {
             diff_patch_context_control: false,
             diff_patch_output_control: false,
             diff_rewrite_control: false,
-            diff_submodule_output_control: false,
+            diff_submodule_format: None,
             word_diff_mode: None,
             word_diff_regex: None,
             no_index: false,
@@ -214,6 +214,23 @@ pub(crate) enum DiffRelativeMode {
     Off,
     Cwd,
     Prefix(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmoduleDiffFormat {
+    Short,
+    Log,
+    Diff,
+}
+
+impl SubmoduleDiffFormat {
+    fn parse(value: &str) -> Self {
+        match value {
+            "short" => Self::Short,
+            "diff" => Self::Diff,
+            _ => Self::Log,
+        }
+    }
 }
 
 pub(crate) fn setup_diff_options(args: &[String]) -> Result<DiffOptions> {
@@ -1005,10 +1022,9 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             options.ignore_regexes.push(str_value(option).to_string());
         }
         (_, Some("submodule")) => {
-            if let Some(value) = optional_arg(option) {
-                log_validate_submodule_format(value)?;
-            }
-            options.diff_submodule_output_control = true;
+            let format = optional_arg(option).unwrap_or("log");
+            log_validate_submodule_format(format)?;
+            options.diff_submodule_format = Some(SubmoduleDiffFormat::parse(format));
         }
         (_, Some("word-diff")) => {
             if let Some(value) = optional_arg(option) {

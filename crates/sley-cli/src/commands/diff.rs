@@ -300,7 +300,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         diff_patch_context_control,
         diff_patch_output_control,
         diff_rewrite_control,
-        diff_submodule_output_control,
+        diff_submodule_format,
         word_diff_mode,
         word_diff_regex,
         no_index,
@@ -374,7 +374,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff rewrite controls are not supported for this output mode".into(),
         ));
     }
-    if diff_submodule_output_control && !name_status && !name_only {
+    if diff_submodule_format.is_some_and(|format| {
+        format != commands::diff_options::SubmoduleDiffFormat::Short
+    }) && !name_status
+        && !name_only
+    {
         return Err(GitError::Unsupported(
             "diff submodule output controls are not supported for this output mode".into(),
         ));
