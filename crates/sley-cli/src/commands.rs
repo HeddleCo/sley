@@ -42,6 +42,7 @@ pub(crate) mod line_log;
 pub(crate) mod log;
 pub(crate) mod merge_file;
 pub(crate) mod merge_rebase;
+pub(crate) mod mergetool;
 pub(crate) mod merge_tree;
 pub(crate) mod mktag;
 pub(crate) mod name_rev;

@@ -266,6 +266,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "whatchanged" => commands::log::cmd_whatchanged(&args[1..]),
         "merge" => commands::merge_rebase::cmd_merge(&args[1..]),
         "merge-base" => commands::merge_rebase::cmd_merge_base(&args[1..]),
+        "mergetool" => commands::mergetool::cmd_mergetool(&args[1..]),
         "pull" => {
             // `-s`/`--strategy` pulls take a narrow dedicated path; the general
             // pull implementation rejects the option.
