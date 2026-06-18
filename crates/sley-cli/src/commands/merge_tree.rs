@@ -720,6 +720,25 @@ fn render_merge_outcome(
                     ),
                 });
             }
+            sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo {
+                old_path,
+                ours_path,
+                theirs_path,
+                ours_label,
+                theirs_label,
+            } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![old_path.clone(), ours_path.clone(), theirs_path.clone()],
+                    stable_type: "CONFLICT (rename/rename)".to_string(),
+                    message: format!(
+                        "CONFLICT (rename/rename): {old} renamed to {ours} in {ours_label} and to {theirs} in {theirs_label}.",
+                        old = String::from_utf8_lossy(old_path),
+                        ours = String::from_utf8_lossy(ours_path),
+                        theirs = String::from_utf8_lossy(theirs_path),
+                    ),
+                });
+            }
+            sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage => {}
             sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir } => {
                 conflict_messages.push(InfoMessage {
                     paths: vec![source_dir.clone()],

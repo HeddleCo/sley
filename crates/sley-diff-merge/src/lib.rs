@@ -4905,6 +4905,23 @@ pub enum MergeConflictKind {
         /// Theirs' pre-destination path.
         theirs_path: Vec<u8>,
     },
+    /// One source path was renamed to different destinations on each side,
+    /// producing a rename/rename(1to2) conflict.
+    RenameRenameOneToTwo {
+        /// The pre-rename source path.
+        old_path: Vec<u8>,
+        /// Ours' destination path.
+        ours_path: Vec<u8>,
+        /// Theirs' destination path.
+        theirs_path: Vec<u8>,
+        /// The label for our side.
+        ours_label: String,
+        /// The label for their side.
+        theirs_label: String,
+    },
+    /// An auxiliary higher-stage entry for a rename/rename(1to2) conflict. The
+    /// user-facing message is emitted by [`RenameRenameOneToTwo`].
+    RenameRenameOneToTwoStage,
     /// A directory was split evenly across multiple destinations, so no
     /// directory rename could be applied for paths the other side left there.
     DirRenameSplit {
@@ -5122,7 +5139,7 @@ pub fn merge_entry_maps(
     // one-sided rename old->new, presents the *other* side's `old` content at
     // `new` (and drops `old`), letting the path-keyed core below do the 3-way
     // content merge at the destination.
-    let (renames, side_renames) = if options.detect_renames {
+    let (mut renames, side_renames) = if options.detect_renames {
         let (renames, ours_side, theirs_side) =
             detect_merge_renames(db, format, base_map, ours_map, theirs_map, options)?;
         (renames, Some((ours_side, theirs_side)))
@@ -5153,8 +5170,7 @@ pub fn merge_entry_maps(
     if options.directory_renames != DirectoryRenames::False
         && let Some((ours_side, theirs_side)) = &side_renames
     {
-        let dir_renames =
-            compute_directory_renames(base_map, ours_map, theirs_map, ours_side, theirs_side);
+        let dir_renames = compute_directory_renames(ours_map, theirs_map, ours_side, theirs_side);
         let outcome = apply_directory_renames(
             base_map,
             &eff_base,
@@ -5171,6 +5187,7 @@ pub fn merge_entry_maps(
         dir_rename_collisions = outcome.collisions;
         dir_rename_splits = outcome.splits;
         dir_rename_dirty = outcome.dirty;
+        remap_rename_destinations(&mut renames, &rehomed_paths);
     }
     for info in rehomed_paths
         .values()
@@ -5404,6 +5421,20 @@ pub fn merge_entry_maps(
                 auto_merged: false,
             });
         }
+    }
+
+    if !renames.rename_rename_one_to_two.is_empty() {
+        apply_rename_rename_one_to_two_conflicts(
+            db,
+            base_map,
+            &eff_ours,
+            &eff_theirs,
+            &renames.rename_rename_one_to_two,
+            &mut paths,
+            &mut leaves,
+            options,
+        )?;
+        clean = false;
     }
 
     // Rename/delete conflicts: a file renamed on one side whose source the other
@@ -5854,6 +5885,14 @@ struct MergeRenames {
     /// Rename/delete conflicts: a file renamed on one side whose source the
     /// other side deleted. Keyed by destination path.
     rename_deletes: BTreeMap<Vec<u8>, RenameDelete>,
+    /// Rename/rename(1to2) conflicts keyed by source path.
+    rename_rename_one_to_two: BTreeMap<Vec<u8>, RenameRenameOneToTwo>,
+}
+
+#[derive(Clone)]
+struct RenameRenameOneToTwo {
+    ours_dest: Vec<u8>,
+    theirs_dest: Vec<u8>,
 }
 
 /// Every file rename observed on one side (base->side), as `(old, new)` pairs.
@@ -5906,7 +5945,40 @@ fn detect_merge_renames(
         &mut renames,
     )?;
 
+    collect_rename_rename_one_to_two(&mut renames, &ours_side, &theirs_side);
+
     Ok((renames, ours_side, theirs_side))
+}
+
+fn collect_rename_rename_one_to_two(
+    renames: &mut MergeRenames,
+    ours_side: &SideRenames,
+    theirs_side: &SideRenames,
+) {
+    let ours_by_source: BTreeMap<&[u8], &[u8]> = ours_side
+        .pairs
+        .iter()
+        .map(|(old, new)| (old.as_slice(), new.as_slice()))
+        .collect();
+    for (old, theirs_new) in &theirs_side.pairs {
+        let Some(ours_new) = ours_by_source.get(old.as_slice()) else {
+            continue;
+        };
+        if *ours_new == theirs_new.as_slice() {
+            continue;
+        }
+        renames.rename_deletes.remove(*ours_new);
+        renames.rename_deletes.remove(theirs_new);
+        renames.dest_to_source.remove(*ours_new);
+        renames.dest_to_source.remove(theirs_new);
+        renames.rename_rename_one_to_two.insert(
+            old.clone(),
+            RenameRenameOneToTwo {
+                ours_dest: (*ours_new).to_vec(),
+                theirs_dest: theirs_new.clone(),
+            },
+        );
+    }
 }
 
 /// Collect renames that occurred on `side` (relative to `base`). Records the
@@ -6096,14 +6168,13 @@ struct DirectoryRenameMaps {
 /// on that side (the `dirs_removed` gate). A directory renamed on BOTH sides is
 /// dropped from both maps (ambiguous).
 fn compute_directory_renames(
-    base_map: &MergeEntryMap,
     ours_map: &MergeEntryMap,
     theirs_map: &MergeEntryMap,
     ours_side: &SideRenames,
     theirs_side: &SideRenames,
 ) -> DirectoryRenameMaps {
-    let ours = compute_side_dir_renames(&ours_side.pairs, base_map, ours_map);
-    let theirs = compute_side_dir_renames(&theirs_side.pairs, base_map, theirs_map);
+    let ours = compute_side_dir_renames(&ours_side.pairs, ours_map);
+    let theirs = compute_side_dir_renames(&theirs_side.pairs, theirs_map);
 
     // Collect split dirs from both sides.
     let mut split_dirs = BTreeSet::new();
@@ -6142,7 +6213,6 @@ struct SideDirRenames {
 /// the source directory being fully removed on that side.
 fn compute_side_dir_renames(
     pairs: &[(Vec<u8>, Vec<u8>)],
-    base_map: &MergeEntryMap,
     side_map: &MergeEntryMap,
 ) -> SideDirRenames {
     // dir_rename_count: count[old_dir][new_dir]. Built by walking every rename's
@@ -6179,10 +6249,11 @@ fn compute_side_dir_renames(
             continue;
         }
         // dirs_removed gate: the source directory must be entirely gone on this
-        // side. If any base path under old_dir/ still exists on the side, the
-        // directory was not renamed wholesale and we must not re-home into it.
+        // side. New files that recreate the old directory count too; otherwise
+        // cases like "both sides renamed z/ -> y/, but one side added z/d"
+        // incorrectly look like both sides performed a whole-directory rename.
         if let Some(best) = best
-            && directory_fully_removed(&old_dir, base_map, side_map)
+            && directory_fully_removed(&old_dir, side_map)
         {
             renames.insert(old_dir, best);
         }
@@ -6274,13 +6345,13 @@ fn trailing_component<'a>(full: &'a [u8], dir: &[u8]) -> &'a [u8] {
     }
 }
 
-/// True when every base path under `dir/` is absent on `side` (the directory was
-/// entirely removed there). Mirrors merge-ort's `dirs_removed` precondition.
-fn directory_fully_removed(dir: &[u8], base_map: &MergeEntryMap, side_map: &MergeEntryMap) -> bool {
+/// True when no path under `dir/` exists on `side` (the directory was entirely
+/// removed there). Mirrors merge-ort's `dirs_removed` precondition.
+fn directory_fully_removed(dir: &[u8], side_map: &MergeEntryMap) -> bool {
     let mut prefix = dir.to_vec();
     prefix.push(b'/');
-    for path in base_map.keys() {
-        if path.starts_with(&prefix) && side_map.contains_key(path) {
+    for path in side_map.keys() {
+        if path.starts_with(&prefix) {
             return false;
         }
     }
@@ -6618,6 +6689,131 @@ fn apply_rehome_moves(
             }
         }
     }
+}
+
+fn remap_rename_destinations(renames: &mut MergeRenames, rehomed: &BTreeMap<Vec<u8>, RehomeSides>) {
+    if rehomed.is_empty() {
+        return;
+    }
+    let mut remapped_deletes = BTreeMap::new();
+    for (dest, rd) in std::mem::take(&mut renames.rename_deletes) {
+        let new_dest = rehomed
+            .iter()
+            .find_map(|(new_dest, sides)| {
+                let moved = sides
+                    .ours
+                    .as_ref()
+                    .is_some_and(|info| info.old_path == dest)
+                    || sides
+                        .theirs
+                        .as_ref()
+                        .is_some_and(|info| info.old_path == dest);
+                moved.then(|| new_dest.clone())
+            })
+            .unwrap_or(dest);
+        remapped_deletes.insert(new_dest, rd);
+    }
+    renames.rename_deletes = remapped_deletes;
+
+    for rename in renames.rename_rename_one_to_two.values_mut() {
+        for (dest, sides) in rehomed {
+            if sides
+                .ours
+                .as_ref()
+                .is_some_and(|info| info.old_path == rename.ours_dest)
+            {
+                rename.ours_dest = dest.clone();
+            }
+            if sides
+                .theirs
+                .as_ref()
+                .is_some_and(|info| info.old_path == rename.theirs_dest)
+            {
+                rename.theirs_dest = dest.clone();
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rename_rename_one_to_two_conflicts(
+    db: &FileObjectDatabase,
+    base_map: &MergeEntryMap,
+    eff_ours: &MergeEntryMap,
+    eff_theirs: &MergeEntryMap,
+    conflicts: &BTreeMap<Vec<u8>, RenameRenameOneToTwo>,
+    paths: &mut Vec<MergedPath>,
+    leaves: &mut MergeEntryMap,
+    options: &MergeTreesOptions<'_>,
+) -> Result<()> {
+    for (old_path, conflict) in conflicts {
+        let base_entry = base_map.get(old_path).copied();
+        let ours_entry = eff_ours.get(&conflict.ours_dest).copied();
+        let theirs_entry = eff_theirs.get(&conflict.theirs_dest).copied();
+
+        leaves.remove(old_path);
+        leaves.remove(&conflict.ours_dest);
+        leaves.remove(&conflict.theirs_dest);
+        paths.retain(|path| {
+            path.path != *old_path
+                && path.path != conflict.ours_dest
+                && path.path != conflict.theirs_dest
+        });
+
+        paths.push(MergedPath {
+            path: old_path.clone(),
+            stages: MergeStages {
+                base: base_entry,
+                ours: None,
+                theirs: None,
+            },
+            result: None,
+            worktree: None,
+            conflict: Some(MergeConflictKind::RenameRenameOneToTwo {
+                old_path: old_path.clone(),
+                ours_path: conflict.ours_dest.clone(),
+                theirs_path: conflict.theirs_dest.clone(),
+                ours_label: options.ours_label.to_string(),
+                theirs_label: options.theirs_label.to_string(),
+            }),
+            auto_merged: false,
+        });
+
+        let ours_worktree = match ours_entry {
+            Some((mode, oid)) => Some((mode, merge_blob_bytes(db, &oid)?)),
+            None => None,
+        };
+        paths.push(MergedPath {
+            path: conflict.ours_dest.clone(),
+            stages: MergeStages {
+                base: None,
+                ours: ours_entry,
+                theirs: None,
+            },
+            result: None,
+            worktree: ours_worktree,
+            conflict: Some(MergeConflictKind::RenameRenameOneToTwoStage),
+            auto_merged: false,
+        });
+
+        let theirs_worktree = match theirs_entry {
+            Some((mode, oid)) => Some((mode, merge_blob_bytes(db, &oid)?)),
+            None => None,
+        };
+        paths.push(MergedPath {
+            path: conflict.theirs_dest.clone(),
+            stages: MergeStages {
+                base: None,
+                ours: None,
+                theirs: theirs_entry,
+            },
+            result: None,
+            worktree: theirs_worktree,
+            conflict: Some(MergeConflictKind::RenameRenameOneToTwoStage),
+            auto_merged: false,
+        });
+    }
+    Ok(())
 }
 
 /// Build a path-qualified conflict-marker label `"<label>:<path>"`, as git does
