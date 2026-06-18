@@ -1158,6 +1158,7 @@ impl FileRefStore {
     pub fn delete_tag(&self, tag: &str) -> Result<TagDelete> {
         let name = TagRefNameBuf::from_tag_name_unrestricted(tag)?.into_string();
         let oid = self.delete_direct_ref(&name, "tag", tag)?;
+        self.remove_reflog_file(&name);
         Ok(TagDelete { name, oid })
     }
 
@@ -2013,7 +2014,7 @@ impl FileRefStore {
     }
 
     fn ref_base_dir(&self, name: &str) -> &Path {
-        if name == "HEAD" {
+        if name == "HEAD" || name.starts_with("refs/worktree/") {
             &self.git_dir
         } else {
             &self.common_dir

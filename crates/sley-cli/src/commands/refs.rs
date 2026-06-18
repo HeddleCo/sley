@@ -16,6 +16,7 @@ struct ReflogShowOptions {
     format: ReflogFormat,
     max_count: Option<usize>,
     abbrev_commit: Option<bool>,
+    pathspecs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -26,6 +27,26 @@ enum ReflogFormat {
 }
 
 pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "-h" || arg == "--help") {
+        print_reflog_usage_stdout();
+        return Err(GitError::Exit(129));
+    }
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
+    {
+        match args.first().map(String::as_str) {
+            Some("show") => print_reflog_show_usage_stdout(),
+            Some("list") => print_reflog_list_usage_stdout(),
+            Some("exists") => print_reflog_exists_usage_stdout(),
+            Some("write") => print_reflog_write_usage_stdout(),
+            Some("delete") => print_reflog_delete_usage_stdout(),
+            Some("drop") => print_reflog_drop_usage_stdout(),
+            Some("expire") => print_reflog_expire_usage_stdout(),
+            _ => print_reflog_usage_stdout(),
+        }
+        return Err(GitError::Exit(129));
+    }
     if args.first().is_some_and(|arg| arg == "exists") {
         return cmd_reflog_exists(&args[1..]);
     }
@@ -56,6 +77,9 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     };
     let store = FileRefStore::new(&git_dir, format);
     let mut entries = store.read_reflog(&options.reference)?;
+    if !options.pathspecs.is_empty() && !reflog_show_pathspecs_match(&cwd, &options.pathspecs) {
+        return Ok(());
+    }
     entries.reverse();
     // `git reflog show` (== `git log -g`) walks the reflog newest-to-oldest and
     // prints EVERY entry verbatim: HEAD@{N} is just the entry's position. There
@@ -103,6 +127,50 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_reflog_usage_stdout() {
+    println!("usage: git reflog [show] [<log-options>] [<ref>]");
+    println!("   or: git reflog list");
+    println!("   or: git reflog exists <ref>");
+    println!("   or: git reflog write <ref> <old-oid> <new-oid> <message>");
+    println!("   or: git reflog delete [--rewrite] [--updateref]");
+    println!("                         [--dry-run | -n] [--verbose] <ref>@{{<specifier>}}...");
+    println!("   or: git reflog drop [--all [--single-worktree] | <refs>...]");
+    println!("   or: git reflog expire [--expire=<time>] [--expire-unreachable=<time>]");
+    println!("                         [--rewrite] [--updateref] [--stale-fix]");
+    println!("                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]");
+}
+
+fn print_reflog_show_usage_stdout() {
+    println!("usage: git reflog [show] [<log-options>] [<ref>]");
+}
+
+fn print_reflog_list_usage_stdout() {
+    println!("usage: git reflog list");
+}
+
+fn print_reflog_exists_usage_stdout() {
+    println!("usage: git reflog exists <ref>");
+}
+
+fn print_reflog_write_usage_stdout() {
+    println!("usage: git reflog write <ref> <old-oid> <new-oid> <message>");
+}
+
+fn print_reflog_delete_usage_stdout() {
+    println!("usage: git reflog delete [--rewrite] [--updateref]");
+    println!("                         [--dry-run | -n] [--verbose] <ref>@{{<specifier>}}...");
+}
+
+fn print_reflog_drop_usage_stdout() {
+    println!("usage: git reflog drop [--all [--single-worktree] | <refs>...]");
+}
+
+fn print_reflog_expire_usage_stdout() {
+    println!("usage: git reflog expire [--expire=<time>] [--expire-unreachable=<time>]");
+    println!("                         [--rewrite] [--updateref] [--stale-fix]");
+    println!("                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]");
 }
 
 fn cmd_reflog_exists(args: &[String]) -> Result<()> {
@@ -180,11 +248,55 @@ fn collect_reflog_names(path: &Path, base: &Path, names: &mut BTreeSet<String>) 
 fn collect_repository_reflog_names(git_dir: &Path, names: &mut BTreeSet<String>) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let common_logs = common_git_dir.join("logs");
-    collect_reflog_names(&common_logs, &common_logs, names)?;
-
     let worktree_logs = git_dir.join("logs");
     if worktree_logs != common_logs {
+        let mut common_names = BTreeSet::new();
+        collect_reflog_names(&common_logs, &common_logs, &mut common_names)?;
+        names.extend(
+            common_names
+                .into_iter()
+                .filter(|name| !name.starts_with("refs/worktree/")),
+        );
         collect_reflog_names(&worktree_logs, &worktree_logs, names)?;
+    } else {
+        collect_reflog_names(&common_logs, &common_logs, names)?;
+    }
+    Ok(())
+}
+
+fn collect_repository_reflog_targets(
+    git_dir: &Path,
+    targets: &mut BTreeSet<(PathBuf, String)>,
+) -> Result<()> {
+    let mut names = BTreeSet::new();
+    collect_repository_reflog_names(git_dir, &mut names)?;
+    targets.extend(names.into_iter().map(|name| (git_dir.to_path_buf(), name)));
+    Ok(())
+}
+
+fn collect_current_worktree_reflog_targets(
+    git_dir: &Path,
+    targets: &mut BTreeSet<(PathBuf, String)>,
+) -> Result<()> {
+    collect_repository_reflog_targets(git_dir, targets)
+}
+
+fn collect_all_worktree_reflog_targets(
+    git_dir: &Path,
+    targets: &mut BTreeSet<(PathBuf, String)>,
+) -> Result<()> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    collect_repository_reflog_targets(&common_git_dir, targets)?;
+    let worktrees_dir = common_git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        collect_repository_reflog_targets(&entry.path(), targets)?;
     }
     Ok(())
 }
@@ -194,7 +306,7 @@ fn reflog_path_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
 }
 
 fn loose_ref_path_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
-    if name == "HEAD" {
+    if name == "HEAD" || name.starts_with("refs/worktree/") {
         Ok(git_dir.join(name))
     } else {
         Ok(common_git_dir_for_git_dir(git_dir)?.join(name))
@@ -211,7 +323,7 @@ fn lock_path_for_loose_ref_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn reflog_logs_dir_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
-    if name == "HEAD" {
+    if name == "HEAD" || name.starts_with("refs/worktree/") {
         Ok(git_dir.join("logs"))
     } else {
         Ok(common_git_dir_for_git_dir(git_dir)?.join("logs"))
@@ -222,6 +334,7 @@ fn reflog_logs_dir_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
 struct ReflogDeleteOptions {
     dry_run: bool,
     verbose: bool,
+    rewrite: bool,
     update_ref: bool,
 }
 
@@ -232,8 +345,12 @@ struct ReflogExpireOptions {
     rewrite: bool,
     update_ref: bool,
     all: bool,
+    single_worktree: bool,
+    stale_fix: bool,
     expire: i64,
     expire_unreachable: i64,
+    explicit_expire: bool,
+    explicit_expire_unreachable: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,6 +362,7 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
     let mut options = ReflogDeleteOptions {
         dry_run: false,
         verbose: false,
+        rewrite: false,
         update_ref: false,
     };
     let mut specs = Vec::new();
@@ -262,7 +380,8 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
             "--no-verbose" => options.verbose = false,
             "--updateref" => options.update_ref = true,
             "--no-updateref" => options.update_ref = false,
-            "--rewrite" | "--no-rewrite" => {}
+            "--rewrite" => options.rewrite = true,
+            "--no-rewrite" => options.rewrite = false,
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 return reflog_delete_usage();
@@ -282,7 +401,7 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
     for spec in specs {
-        if let Err(GitError::Exit(code)) = delete_reflog_entry(&store, &spec, options) {
+        if let Err(GitError::Exit(code)) = delete_reflog_entry(&store, format, &spec, options) {
             exit_code = code;
         }
     }
@@ -311,10 +430,11 @@ fn reflog_delete_usage<T>() -> Result<T> {
 
 fn delete_reflog_entry(
     store: &FileRefStore,
+    format: ObjectFormat,
     spec: &str,
     options: ReflogDeleteOptions,
 ) -> Result<()> {
-    let Some((reference, selector)) = parse_reflog_delete_spec(spec) else {
+    let Some((reference, selector)) = parse_reflog_delete_spec(store, spec) else {
         eprintln!("error: not a reflog: {spec}");
         return Err(GitError::Exit(255));
     };
@@ -329,7 +449,11 @@ fn delete_reflog_entry(
     if options.verbose {
         for (index, entry) in entries.iter().enumerate() {
             let action = if index == delete_index {
-                "prune"
+                if options.dry_run {
+                    "would prune"
+                } else {
+                    "prune"
+                }
             } else {
                 "keep"
             };
@@ -339,6 +463,9 @@ fn delete_reflog_entry(
     if !options.dry_run {
         let old_tip = entries.last().map(|entry| entry.new_oid);
         entries.remove(delete_index);
+        if options.rewrite {
+            rewrite_reflog_old_oids(&mut entries, zero_oid(format)?);
+        }
         let new_tip = entries.last().map(|entry| entry.new_oid);
         store.write_reflog(&reference, &entries)?;
         if options.update_ref
@@ -358,12 +485,40 @@ fn delete_reflog_entry(
     Ok(())
 }
 
-fn parse_reflog_delete_spec(spec: &str) -> Option<(String, usize)> {
+fn parse_reflog_delete_spec(store: &FileRefStore, spec: &str) -> Option<(String, usize)> {
     let spec = spec.strip_suffix('}')?;
     let (reference, selector) = spec.rsplit_once("@{")?;
-    let selector = selector.parse::<usize>().ok()?;
-    let reference = reflog_reference_name(Some(reference)).ok()?;
+    let reference = resolve_reflog_name(store, reference).ok()?;
+    let selector = selector
+        .parse::<usize>()
+        .ok()
+        .or_else(|| reflog_selector_by_date(store, &reference, selector).ok().flatten())?;
     Some((reference, selector))
+}
+
+fn reflog_selector_by_date(
+    store: &FileRefStore,
+    reference: &str,
+    selector: &str,
+) -> Result<Option<usize>> {
+    let Some(cutoff) = crate::commands::approxidate::parse_approxidate(selector)
+        .or_else(|| parse_reflog_expire_date(selector))
+    else {
+        return Ok(None);
+    };
+    let entries = store.read_reflog(reference)?;
+    Ok(entries
+        .iter()
+        .rev()
+        .position(|entry| entry.timestamp_seconds().is_ok_and(|ts| ts <= cutoff)))
+}
+
+fn rewrite_reflog_old_oids(entries: &mut [ReflogEntry], zero: ObjectId) {
+    let mut previous = zero;
+    for entry in entries {
+        entry.old_oid = previous;
+        previous = entry.new_oid;
+    }
 }
 
 fn cmd_reflog_drop(args: &[String]) -> Result<()> {
@@ -514,8 +669,12 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
         rewrite: false,
         update_ref: false,
         all: false,
+        single_worktree: false,
+        stale_fix: false,
         expire: current_unix_seconds().saturating_sub(90 * 24 * 60 * 60),
         expire_unreachable: current_unix_seconds().saturating_sub(30 * 24 * 60 * 60),
+        explicit_expire: false,
+        explicit_expire_unreachable: false,
     };
     let mut refs = Vec::new();
     let mut args = GitArgCursor::new(args);
@@ -533,10 +692,12 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
             "--no-rewrite" => options.rewrite = false,
             "--updateref" => options.update_ref = true,
             "--no-updateref" => options.update_ref = false,
-            "--stale-fix" | "--no-stale-fix" => {}
+            "--stale-fix" => options.stale_fix = true,
+            "--no-stale-fix" => options.stale_fix = false,
             "--all" => options.all = true,
             "--no-all" => options.all = false,
-            "--single-worktree" | "--no-single-worktree" => {}
+            "--single-worktree" => options.single_worktree = true,
+            "--no-single-worktree" => options.single_worktree = false,
             "--expire" | "--expire-unreachable" => {
                 let Some(value) = args.next_value() else {
                     return reflog_expire_option_requires_value(arg.trim_start_matches("--"));
@@ -544,16 +705,20 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
                 let cutoff = parse_reflog_expire_time(value, arg)?;
                 if arg == "--expire" {
                     options.expire = cutoff;
+                    options.explicit_expire = true;
                 } else {
                     options.expire_unreachable = cutoff;
+                    options.explicit_expire_unreachable = true;
                 }
             }
             value if let Some(time) = long_option_value(value, "expire") => {
                 options.expire = parse_reflog_expire_time(time, "--expire")?;
+                options.explicit_expire = true;
             }
             value if let Some(time) = long_option_value(value, "expire-unreachable") => {
                 options.expire_unreachable =
                     parse_reflog_expire_time(time, "--expire-unreachable")?;
+                options.explicit_expire_unreachable = true;
             }
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
@@ -567,27 +732,55 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
-    let mut targets = BTreeSet::new();
+    apply_reflog_expire_config(&git_dir, &mut options)?;
+    let mut targets: BTreeSet<(PathBuf, String)> = BTreeSet::new();
     // References discovered via `--all` silently skip an empty/missing reflog
     // (git's `reflog expire --all` only walks reflogs that exist); explicit
     // references still error on a missing reflog.
-    let mut all_discovered: BTreeSet<String> = BTreeSet::new();
+    let mut all_discovered: BTreeSet<(PathBuf, String)> = BTreeSet::new();
     if options.all {
-        collect_repository_reflog_names(&git_dir, &mut all_discovered)?;
+        if options.single_worktree {
+            collect_current_worktree_reflog_targets(&git_dir, &mut all_discovered)?;
+        } else {
+            collect_all_worktree_reflog_targets(&git_dir, &mut all_discovered)?;
+        }
         targets.extend(all_discovered.iter().cloned());
     }
-    for reference in refs {
-        targets.insert(reflog_reference_name(Some(&reference))?);
+    for original in refs {
+        let reference = resolve_reflog_name(&store, &original).map_err(|_| {
+            eprintln!("error: reflog could not be found: '{original}'");
+            GitError::Exit(255)
+        })?;
+        if store.read_reflog(&reference)?.is_empty() {
+            eprintln!("error: reflog could not be found: '{original}'");
+            return Err(GitError::Exit(255));
+        }
+        targets.insert((git_dir.clone(), reference));
     }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut exit_code = 0;
-    for reference in targets {
+    for (target_git_dir, reference) in targets {
+        let target_store = if target_git_dir == git_dir {
+            store.clone()
+        } else {
+            FileRefStore::new(&target_git_dir, format)
+        };
         // A `--all`-discovered reflog that is empty is not an error.
-        if all_discovered.contains(&reference) && store.read_reflog(&reference)?.is_empty() {
+        let target = (target_git_dir.clone(), reference.clone());
+        if all_discovered.contains(&target) && target_store.read_reflog(&reference)?.is_empty() {
             continue;
         }
+        let mut target_options = options;
+        apply_reflog_expire_pattern_config(&git_dir, &reference, &mut target_options)?;
         if let Err(GitError::Exit(code)) =
-            expire_reflog_entries(&store, &db, &git_dir, format, &reference, options)
+            expire_reflog_entries(
+                &target_store,
+                &db,
+                &target_git_dir,
+                format,
+                &reference,
+                target_options,
+            )
         {
             exit_code = code;
         }
@@ -612,38 +805,47 @@ fn expire_reflog_entries(
         eprintln!("error: reflog could not be found: '{reference}'");
         return Err(GitError::Exit(255));
     }
-    let reachable = resolve_revision(git_dir, format, reference)
-        .ok()
-        .and_then(|tip| ancestor_depths(db, format, &tip).ok());
+    let reachable = reflog_reachable_oids(store, db, git_dir, format, reference, options)?;
     let zero = zero_oid(format)?;
     let mut retained = Vec::new();
+    let mut last_kept = zero.clone();
     for entry in &entries {
+        let mut entry = entry.clone();
+        if options.rewrite {
+            entry.old_oid = last_kept;
+        }
         let timestamp = entry.timestamp_seconds()?;
-        let reachable_from_tip = reachable.as_ref().is_some_and(|commits| {
-            commits.contains_key(&entry.new_oid)
-                && (entry.old_oid == zero || commits.contains_key(&entry.old_oid))
+        let reachable_from_tip = reachable.as_ref().is_none_or(|commits| {
+            reflog_oid_is_reachable_or_non_commit(db, &entry.old_oid, &zero, commits)
+                && reflog_oid_is_reachable_or_non_commit(db, &entry.new_oid, &zero, commits)
         });
+        let stale = options.stale_fix
+            && (!reflog_oid_has_complete_commit(db, format, &entry.old_oid, &zero)
+                || !reflog_oid_has_complete_commit(db, format, &entry.new_oid, &zero));
         let prune = timestamp < options.expire
+            || stale
             || (!reachable_from_tip && timestamp < options.expire_unreachable);
         if options.verbose {
-            let action = if prune { "prune" } else { "keep" };
+            let action = if prune {
+                if options.dry_run {
+                    "would prune"
+                } else {
+                    "prune"
+                }
+            } else {
+                "keep"
+            };
             println!("{action} {}", String::from_utf8_lossy(&entry.message));
         }
         if !prune {
-            retained.push(entry.clone());
+            last_kept = entry.new_oid;
+            retained.push(entry);
         }
     }
     if options.dry_run {
         return Ok(());
     }
     let old_tip = entries.last().map(|entry| entry.new_oid);
-    if options.rewrite {
-        let mut previous = None;
-        for entry in &mut retained {
-            entry.old_oid = previous.unwrap_or_else(|| zero.clone());
-            previous = Some(entry.new_oid);
-        }
-    }
     entries = retained;
     let new_tip = entries.last().map(|entry| entry.new_oid);
     store.write_reflog(reference, &entries)?;
@@ -662,6 +864,223 @@ fn expire_reflog_entries(
         tx.commit()?;
     }
     Ok(())
+}
+
+fn resolve_reflog_name(store: &FileRefStore, name: &str) -> Result<String> {
+    let direct = reflog_reference_name(Some(name))?;
+    if !store.read_reflog(&direct)?.is_empty() {
+        return Ok(direct);
+    }
+    if !name.starts_with("refs/") && name != "HEAD" {
+        let branch = format!("refs/heads/{name}");
+        if !store.read_reflog(&branch)?.is_empty() {
+            return Ok(branch);
+        }
+    }
+    Ok(direct)
+}
+
+fn apply_reflog_expire_config(git_dir: &Path, options: &mut ReflogExpireOptions) -> Result<()> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.clone()),
+        repo_current_branch_name(git_dir),
+    );
+    let config = sley_config::load_effective_config(&common_git_dir, &context)?;
+    if !options.explicit_expire
+        && let Some(value) = config.get("gc", None, "reflogExpire")
+    {
+        options.expire = parse_reflog_expire_time(value, "gc.reflogExpire")?;
+    }
+    if !options.explicit_expire_unreachable
+        && let Some(value) = config.get("gc", None, "reflogExpireUnreachable")
+    {
+        options.expire_unreachable =
+            parse_reflog_expire_time(value, "gc.reflogExpireUnreachable")?;
+    }
+    Ok(())
+}
+
+fn apply_reflog_expire_pattern_config(
+    git_dir: &Path,
+    reference: &str,
+    options: &mut ReflogExpireOptions,
+) -> Result<()> {
+    if options.explicit_expire && options.explicit_expire_unreachable {
+        return Ok(());
+    }
+    if reference == "refs/stash" {
+        if !options.explicit_expire {
+            options.expire = i64::MIN;
+        }
+        if !options.explicit_expire_unreachable {
+            options.expire_unreachable = i64::MIN;
+        }
+    }
+
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.clone()),
+        repo_current_branch_name(git_dir),
+    );
+    let config = sley_config::load_effective_config(&common_git_dir, &context)?;
+    for section in config.sections.iter().rev() {
+        if !section.name.eq_ignore_ascii_case("gc") {
+            continue;
+        }
+        let Some(pattern) = section.subsection.as_deref() else {
+            continue;
+        };
+        if !reflog_expire_pattern_matches(pattern, reference) {
+            continue;
+        }
+        for entry in section.entries.iter().rev() {
+            if !options.explicit_expire && entry.key.eq_ignore_ascii_case("reflogExpire") {
+                if let Some(value) = entry.value.as_deref() {
+                    options.expire = parse_reflog_expire_time(value, "gc.*.reflogExpire")?;
+                }
+            } else if !options.explicit_expire_unreachable
+                && entry.key.eq_ignore_ascii_case("reflogExpireUnreachable")
+                && let Some(value) = entry.value.as_deref()
+            {
+                options.expire_unreachable =
+                    parse_reflog_expire_time(value, "gc.*.reflogExpireUnreachable")?;
+            }
+        }
+        break;
+    }
+    Ok(())
+}
+
+fn reflog_expire_pattern_matches(pattern: &str, reference: &str) -> bool {
+    if pattern == reference {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return reference.starts_with(prefix);
+    }
+    false
+}
+
+fn reflog_reachable_oids(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    git_dir: &Path,
+    format: ObjectFormat,
+    reference: &str,
+    options: ReflogExpireOptions,
+) -> Result<Option<HashSet<ObjectId>>> {
+    if options.expire_unreachable <= options.expire {
+        return Ok(Some(HashSet::new()));
+    }
+    let mut starts = Vec::new();
+    if reference == "HEAD" {
+        for reference in store.list_refs()? {
+            if let Some(oid) = resolve_ref_to_oid(store, &reference.name)? {
+                starts.push(oid);
+            }
+        }
+    } else if let Ok(tip) = resolve_revision(git_dir, format, reference) {
+        starts.push(tip);
+    } else {
+        return Ok(Some(HashSet::new()));
+    }
+    let mut reachable = HashSet::new();
+    for start in starts {
+        if let Ok(depths) = ancestor_depths(db, format, &start) {
+            reachable.extend(depths.into_keys());
+        }
+    }
+    Ok(Some(reachable))
+}
+
+fn reflog_oid_is_reachable_or_non_commit(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    zero: &ObjectId,
+    reachable: &HashSet<ObjectId>,
+) -> bool {
+    if oid == zero {
+        return true;
+    }
+    match db.read_object(oid) {
+        Ok(object) if object.object_type == ObjectType::Commit => reachable.contains(oid),
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+fn reflog_oid_has_complete_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    zero: &ObjectId,
+) -> bool {
+    if oid == zero {
+        return true;
+    }
+    let mut seen = HashSet::new();
+    reflog_oid_has_complete_commit_inner(db, format, oid, &mut seen)
+}
+
+fn reflog_oid_has_complete_commit_inner(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    seen: &mut HashSet<ObjectId>,
+) -> bool {
+    if !seen.insert(*oid) {
+        return true;
+    }
+    let Ok(object) = db.read_object(oid) else {
+        return false;
+    };
+    if object.object_type != ObjectType::Commit {
+        return true;
+    }
+    let Ok(commit) = Commit::parse_ref(format, &object.body) else {
+        return false;
+    };
+    reflog_tree_is_complete(db, format, &commit.tree, seen)
+        && commit
+            .parents
+            .iter()
+            .all(|parent| reflog_oid_has_complete_commit_inner(db, format, parent, seen))
+}
+
+fn reflog_tree_is_complete(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    seen: &mut HashSet<ObjectId>,
+) -> bool {
+    if !seen.insert(*oid) {
+        return true;
+    }
+    let Ok(object) = db.read_object(oid) else {
+        return false;
+    };
+    if object.object_type != ObjectType::Tree {
+        return true;
+    }
+    let entries = TreeEntries::new(format, &object.body);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry.is_gitlink() {
+            continue;
+        }
+        let Ok(child) = db.read_object(&entry.oid) else {
+            return false;
+        };
+        if child.object_type == ObjectType::Tree
+            && !reflog_tree_is_complete(db, format, &entry.oid, seen)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn reflog_expire_option_requires_value<T>(option: &str) -> Result<T> {
@@ -708,12 +1127,13 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
     let mut max_count = None;
     let mut abbrev_commit = None;
     let mut refs = Vec::new();
+    let mut pathspecs = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         match arg.as_str() {
             "--" => {
-                refs.extend(args[index + 1..].iter().cloned());
+                pathspecs.extend(args[index + 1..].iter().cloned());
                 break;
             }
             "--oneline" => format = ReflogFormat::Default,
@@ -814,7 +1234,12 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
         format,
         max_count,
         abbrev_commit,
+        pathspecs,
     })
+}
+
+fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
+    pathspecs.iter().any(|pathspec| cwd.join(pathspec).exists())
 }
 
 pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
