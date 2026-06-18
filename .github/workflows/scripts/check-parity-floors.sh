@@ -374,7 +374,7 @@ declare -A FLOOR=(
     [t1300-config.sh]=497
     [t1400-update-ref.sh]=275
     [t1401-symbolic-ref.sh]=25
-    [t1450-fsck.sh]=82
+    [t1450-fsck.sh]=96
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
@@ -508,8 +508,8 @@ declare -A FLOOR=(
     [t5505-remote.sh]=93
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
-    [t5516-fetch-push.sh]=57
-    [t5520-pull.sh]=23
+    [t5516-fetch-push.sh]=63
+    [t5520-pull.sh]=32
     [t5601-clone.sh]=72
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
