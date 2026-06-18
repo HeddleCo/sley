@@ -436,13 +436,15 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
         "HEAD".to_string()
     } else if rev.starts_with("refs/") {
         rev.to_string()
-    } else if refs.read_ref(&format!("refs/heads/{rev}"))?.is_some() {
-        format!("refs/heads/{rev}")
+    } else if refs.read_ref(&format!("refs/{rev}"))?.is_some() {
+        // git's ref_rev_parse_rules try "refs/%s" before tags/heads. This
+        // matters for pseudo-names such as "stash" (refs/stash), not just names
+        // containing a slash.
+        format!("refs/{rev}")
     } else if refs.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
         format!("refs/tags/{rev}")
-    } else if rev.contains('/') && refs.read_ref(&format!("refs/{rev}"))?.is_some() {
-        // git's lookup rule #2 ("refs/%s") — e.g. `bisect/bad`, `notes/commits`.
-        format!("refs/{rev}")
+    } else if refs.read_ref(&format!("refs/heads/{rev}"))?.is_some() {
+        format!("refs/heads/{rev}")
     } else if refs.read_ref(&format!("refs/remotes/{rev}"))?.is_some() {
         format!("refs/remotes/{rev}")
     } else if refs

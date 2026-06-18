@@ -41,6 +41,15 @@ enum StashListFormat {
 
 pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            stash_usage_stdout();
+            Err(GitError::Exit(129))
+        }
+        Some(value) if value.starts_with('-') && !stash_can_start_assumed_push(value) => {
+            eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+            stash_usage_stderr();
+            Err(GitError::Exit(129))
+        }
         Some("apply") => cmd_stash_apply(&args[1..]),
         Some("branch") => cmd_stash_branch(&args[1..]),
         Some("clear") => cmd_stash_clear(&args[1..]),
@@ -62,6 +71,85 @@ pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
         }
         None => cmd_stash_push(&[]),
     }
+}
+
+fn stash_can_start_assumed_push(value: &str) -> bool {
+    matches!(
+        value,
+        "-q" | "--quiet"
+            | "--no-quiet"
+            | "-u"
+            | "--include-untracked"
+            | "--no-include-untracked"
+            | "-a"
+            | "--all"
+            | "--no-all"
+            | "-k"
+            | "--keep-index"
+            | "--no-keep-index"
+            | "-S"
+            | "--staged"
+            | "--no-staged"
+            | "-p"
+            | "--patch"
+            | "--no-patch"
+            | "--auto-advance"
+            | "--no-auto-advance"
+            | "-U"
+            | "--unified"
+            | "--inter-hunk-context"
+            | "-m"
+            | "--message"
+            | "--no-message"
+            | "--pathspec-from-file"
+            | "--no-pathspec-from-file"
+            | "--pathspec-file-nul"
+            | "--no-pathspec-file-nul"
+    ) || value.starts_with("-q")
+        || value.starts_with("-p")
+        || value.starts_with("-U")
+        || value.starts_with("-m")
+        || value.starts_with("--patch=")
+        || value.starts_with("--no-patch=")
+        || value.starts_with("--auto-advance=")
+        || value.starts_with("--no-auto-advance=")
+        || value.starts_with("--unified=")
+        || value.starts_with("--inter-hunk-context=")
+        || value.starts_with("--message=")
+        || value.starts_with("--no-message=")
+        || value.starts_with("--pathspec-from-file=")
+}
+
+fn stash_usage_stdout() {
+    println!("usage: git stash list [<log-options>]");
+    println!("   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]");
+    println!("   or: git stash drop [-q | --quiet] [<stash>]");
+    println!("   or: git stash pop [--index] [-q | --quiet] [<stash>]");
+    println!("   or: git stash apply [--index] [-q | --quiet] [<stash>]");
+    println!("   or: git stash branch <branchname> [<stash>]");
+    println!("   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    println!("   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    println!("   or: git stash clear");
+    println!("   or: git stash create [<message>]");
+    println!("   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>");
+}
+
+fn stash_usage_stderr() {
+    eprintln!("usage: git stash list [<log-options>]");
+    eprintln!("   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]");
+    eprintln!("   or: git stash drop [-q | --quiet] [<stash>]");
+    eprintln!("   or: git stash pop [--index] [-q | --quiet] [<stash>]");
+    eprintln!("   or: git stash apply [--index] [-q | --quiet] [<stash>]");
+    eprintln!("   or: git stash branch <branchname> [<stash>]");
+    eprintln!("   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    eprintln!("   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    eprintln!("   or: git stash clear");
+    eprintln!("   or: git stash create [<message>]");
+    eprintln!("   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>");
+}
+
+fn stash_push_usage_stdout() {
+    println!("usage: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
 }
 
 /// git's assumed-`push` guard: with no explicit subcommand, options are parsed up
@@ -119,10 +207,11 @@ fn stash_assumed_push_unexpected_token(token: &str) -> GitError {
 
 struct StashApplyOptions {
     quiet: bool,
-    reinstate_index: bool,
+    reinstate_index: Option<bool>,
     explicit_selector: bool,
     selector: usize,
     display: String,
+    direct_oid: Option<ObjectId>,
 }
 
 struct AppliedStash {
@@ -133,13 +222,23 @@ struct AppliedStash {
 }
 
 fn cmd_stash_apply(args: &[String]) -> Result<()> {
-    let options = parse_stash_apply_options(args, "apply")?;
+    let mut options = parse_stash_apply_options(args, "apply")?;
+    options.reinstate_index = Some(
+        options
+            .reinstate_index
+            .unwrap_or(stash_index_config_default()?),
+    );
     apply_stash_entry(options)?;
     Ok(())
 }
 
 fn cmd_stash_pop(args: &[String]) -> Result<()> {
-    let options = parse_stash_apply_options(args, "pop")?;
+    let mut options = parse_stash_apply_options(args, "pop")?;
+    options.reinstate_index = Some(
+        options
+            .reinstate_index
+            .unwrap_or(stash_index_config_default()?),
+    );
     let quiet = options.quiet;
     let applied = apply_stash_entry(options)?;
     drop_stash_entry(
@@ -152,7 +251,11 @@ fn cmd_stash_pop(args: &[String]) -> Result<()> {
 }
 
 fn cmd_stash_branch(args: &[String]) -> Result<()> {
-    if args.is_empty() || args.len() > 2 || args[0].starts_with('-') {
+    if args.is_empty() {
+        eprintln!("No branch name specified");
+        return Err(GitError::Exit(1));
+    }
+    if args.len() > 2 || args[0].starts_with('-') {
         eprintln!("usage: git stash branch <branchname> [<stash>]");
         return Err(GitError::Exit(129));
     }
@@ -161,28 +264,19 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "refs/stash@{0}".to_string());
-    let selector = match args.get(1) {
-        Some(spec) => parse_stash_drop_selector(spec)?,
-        None => 0,
-    };
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
-    let entries = store.read_reflog("refs/stash")?;
-    if entries.is_empty() {
-        eprintln!("No stash entries found.");
-        return Err(GitError::Exit(1));
-    }
-    if selector >= entries.len() {
-        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
-        return Err(GitError::Exit(128));
-    }
-    let entry_index = entries.len() - 1 - selector;
-    let stash_oid = entries[entry_index].new_oid;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    validate_stash_like_commit(&db, format, &stash_oid)?;
+    let stash_oid = resolve_stash_argument(
+        &common_git_dir,
+        format,
+        &store,
+        &db,
+        args.get(1).map(String::as_str),
+    )?;
     let stash_object = db.read_object(&stash_oid)?;
     let stash_commit = Commit::parse(format, &stash_object.body)?;
     let base_oid = stash_commit
@@ -192,23 +286,30 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
     cmd_checkout(&["-b".to_string(), branch.clone(), base_oid.to_hex()])?;
     let applied = apply_stash_entry(StashApplyOptions {
         quiet: false,
-        reinstate_index: true,
+        reinstate_index: Some(true),
         explicit_selector: true,
-        selector,
+        selector: match args.get(1) {
+            Some(spec) => parse_stash_drop_selector(spec).unwrap_or(0),
+            None => 0,
+        },
         display,
+        direct_oid: Some(stash_oid),
     })?;
-    drop_stash_entry(
-        &applied.common_git_dir,
-        applied.format,
-        applied.selector,
-        &applied.display,
-        false,
-    )
+    if args.get(1).is_none_or(|spec| stash_argument_names_stash_ref(spec)) {
+        drop_stash_entry(
+            &applied.common_git_dir,
+            applied.format,
+            applied.selector,
+            &applied.display,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashApplyOptions> {
     let mut quiet = false;
-    let mut reinstate_index = false;
+    let mut reinstate_index = None;
     let mut specs = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -216,12 +317,16 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "-h" | "--help" => {
+                stash_push_usage_stdout();
+                return Err(GitError::Exit(129));
+            }
             value if value.starts_with("-q") && value.len() > 2 => {
                 stash_apply_parse_combined_quiet(value, command)?;
                 quiet = true;
             }
-            "--index" => reinstate_index = true,
-            "--no-index" => reinstate_index = false,
+            "--index" => reinstate_index = Some(true),
+            "--no-index" => reinstate_index = Some(false),
             value if value.starts_with("--quiet=") => {
                 return stash_option_takes_no_value_error("quiet");
             }
@@ -266,6 +371,7 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
         explicit_selector: !specs.is_empty(),
         selector,
         display,
+        direct_oid: None,
     })
 }
 
@@ -305,21 +411,25 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
-    let entries = store.read_reflog("refs/stash")?;
-    if entries.is_empty() {
-        if options.explicit_selector {
-            eprintln!("error: {} is not a valid reference", options.display);
+    let stash_oid = if let Some(oid) = options.direct_oid {
+        oid
+    } else {
+        let entries = store.read_reflog("refs/stash")?;
+        if entries.is_empty() {
+            if options.explicit_selector {
+                eprintln!("error: {} is not a valid reference", options.display);
+                return Err(GitError::Exit(1));
+            }
+            eprintln!("No stash entries found.");
             return Err(GitError::Exit(1));
         }
-        eprintln!("No stash entries found.");
-        return Err(GitError::Exit(1));
-    }
-    if options.selector >= entries.len() {
-        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
-        return Err(GitError::Exit(128));
-    }
-    let entry_index = entries.len() - 1 - options.selector;
-    let stash_oid = entries[entry_index].new_oid;
+        if options.selector >= entries.len() {
+            eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+            return Err(GitError::Exit(128));
+        }
+        let entry_index = entries.len() - 1 - options.selector;
+        entries[entry_index].new_oid
+    };
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     validate_stash_like_commit(&db, format, &stash_oid)?;
     let stash_object = db.read_object(&stash_oid)?;
@@ -369,7 +479,8 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         stash_tree: &stash_commit.tree,
         index_tree: &index_commit.tree,
     };
-    let outcome = apply_stash_via_merge(&db, format, &stash_state, options.reinstate_index)?;
+    let reinstate_index = options.reinstate_index.unwrap_or(false);
+    let outcome = apply_stash_via_merge(&db, format, &stash_state, reinstate_index)?;
 
     if let Some(untracked_oid) = stash_commit.parents.get(2) {
         let untracked_object = db.read_object(untracked_oid)?;
@@ -390,7 +501,7 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     if let StashApplyOutcome::Conflict = outcome {
         // git leaves the conflict in the worktree/index and exits nonzero so the
         // user resolves it; pop must NOT drop the entry on conflict.
-        if options.reinstate_index {
+        if reinstate_index {
             eprintln!("Index was not unstashed.");
         }
         return Err(GitError::Exit(1));
@@ -426,6 +537,7 @@ fn apply_stash_via_merge(
     state: &StashApplyState<'_>,
     reinstate_index: bool,
 ) -> Result<StashApplyOutcome> {
+    stash_check_index_lock(state.git_dir)?;
     // `ours` (git's `c_tree`) is the current index written as a tree. Reject a
     // half-finished merge — git refuses "cannot apply a stash in the middle of a
     // merge" when the index has unmerged (stage>0) entries.
@@ -1061,7 +1173,8 @@ fn stash_drop_usage() {
 }
 
 fn cmd_stash_create(args: &[String]) -> Result<()> {
-    if let Some(created) = create_stash_commit(args, false, false, StashCreateMode::Worktree, &[])?
+    if let Some(created) =
+        create_stash_commit(args, false, false, StashCreateMode::Worktree, &[], false)?
     {
         println!("{}", created.oid);
     }
@@ -1228,9 +1341,9 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 return stash_option_takes_no_value_error("no-pathspec-file-nul");
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Unsupported(format!(
-                    "unsupported stash push option {value}"
-                )));
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                stash_push_usage_stdout();
+                return Err(GitError::Exit(129));
             }
             value => {
                 if pathspec_from_file.is_some() {
@@ -1276,6 +1389,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         include_ignored,
         create_mode,
         &pathspecs,
+        quiet,
     )?
     else {
         if !quiet {
@@ -1325,6 +1439,10 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "-h" | "--help" => {
+                stash_push_usage_stdout();
+                return Err(GitError::Exit(129));
+            }
             "-u" | "--include-untracked" => include_untracked = true,
             "--no-include-untracked" => {
                 include_untracked = false;
@@ -1428,9 +1546,9 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
                 break;
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Unsupported(format!(
-                    "unsupported stash save option {value}"
-                )));
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                stash_push_usage_stdout();
+                return Err(GitError::Exit(129));
             }
             value => positional_message.push(value.to_string()),
         }
@@ -1465,6 +1583,7 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
         include_ignored,
         create_mode,
         &[],
+        quiet,
     )?
     else {
         if !quiet {
@@ -1571,16 +1690,20 @@ fn create_stash_commit(
     include_ignored: bool,
     mode: StashCreateMode,
     pathspecs: &[String],
+    quiet: bool,
 ) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    stash_check_index_lock_quiet(&git_dir, quiet)?;
     let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let store = FileRefStore::new(&git_dir, format);
     let Some((head_oid, head_commit)) = stash_head_commit(&store, &db, format)? else {
-        eprintln!("You do not have the initial commit yet");
+        if !quiet {
+            eprintln!("You do not have the initial commit yet");
+        }
         return Err(GitError::Exit(1));
     };
     let index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
@@ -1682,8 +1805,8 @@ fn create_stash_commit(
         .unwrap_or_else(|| "(no branch)".to_string());
     let head_name = format_log_oid(&head_oid, Some(7));
     let head_subject = commit_subject(&head_commit.message);
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = stash_identity_from_env("AUTHOR")?;
+    let committer = stash_identity_from_env("COMMITTER")?;
     let index_commit = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
@@ -1731,7 +1854,7 @@ fn create_stash_commit(
             parents,
             author,
             committer: committer.clone(),
-            message: message.as_bytes().to_vec(),
+            message: format!("{message}\n").into_bytes(),
             encoding: None,
         },
     )?;
@@ -1749,6 +1872,78 @@ fn create_stash_commit(
         staged_worktree_conflicts,
         format,
     }))
+}
+
+fn stash_check_index_lock(git_dir: &Path) -> Result<()> {
+    stash_check_index_lock_quiet(git_dir, false)
+}
+
+fn stash_check_index_lock_quiet(git_dir: &Path, quiet: bool) -> Result<()> {
+    let lock_path = sley_worktree::repository_index_path(git_dir).with_file_name("index.lock");
+    if lock_path.exists() {
+        if !quiet {
+            eprintln!("error: could not write index");
+            eprintln!(
+                "error: Unable to create '{}': File exists.",
+                lock_path.display()
+            );
+        }
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn stash_identity_from_env(role: &str) -> Result<Vec<u8>> {
+    let env_name = env::var(format!("GIT_{role}_NAME")).ok();
+    let env_email = env::var(format!("GIT_{role}_EMAIL")).ok();
+    let mut config = if env_name.is_none() || env_email.is_none() {
+        IdentityConfig::Lazy(None)
+    } else {
+        IdentityConfig::Skip
+    };
+    let name = env_name
+        .or_else(|| identity_config_value("user.name", &mut config))
+        .unwrap_or_else(|| "git stash".into());
+    let email = env_email
+        .or_else(|| identity_config_value("user.email", &mut config))
+        .unwrap_or_else(|| "git@stash".into());
+    let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
+    let date = canonicalize_commit_date(&date);
+    sley_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+fn stash_index_config_default() -> Result<bool> {
+    if let Some(value) = global_config_value("stash.index")? {
+        return Ok(sley_config::parse_config_bool(&value).unwrap_or(false));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.clone()),
+        repo_current_branch_name(&git_dir),
+    );
+    let Ok(mut config) = sley_config::load_effective_config(&common_git_dir, &context) else {
+        return Ok(false);
+    };
+    let parameters_env = effective_config_parameters_env();
+    if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env.as_deref()) {
+        let _ = sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            &cwd,
+        );
+    }
+    Ok(config.get_bool("stash", None, "index").unwrap_or(false))
+}
+
+fn stash_argument_names_stash_ref(spec: &str) -> bool {
+    spec.bytes().all(|byte| byte.is_ascii_digit())
+        || spec.starts_with("stash@{")
+        || spec.starts_with("refs/stash@{")
+        || spec == "stash"
+        || spec == "refs/stash"
 }
 
 fn stash_head_commit(
@@ -2491,6 +2686,22 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     show_patch = true;
                 }
             }
+            "--patience" | "--histogram" | "--minimal" => {
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
             value if value.starts_with("--ext-diff=") => {
                 stash_option_takes_no_value_error("ext-diff")?
             }
@@ -2554,9 +2765,9 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 diff_filter_seen = true;
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Unsupported(format!(
-                    "unsupported stash show option {value}"
-                )));
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                stash_show_usage();
+                return Err(GitError::Exit(129));
             }
             value => specs.push(value.to_string()),
         }
@@ -3793,6 +4004,7 @@ pub(crate) fn create_stash_for_autostash() -> Result<Option<ObjectId>> {
         false,
         StashCreateMode::Worktree,
         &[],
+        false,
     )?
     .map(|created| created.oid))
 }
