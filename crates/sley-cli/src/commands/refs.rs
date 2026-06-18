@@ -1055,7 +1055,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         update_ref_should_write_reflog(&git_dir, &name, create_reflog)?.then(|| ReflogEntry {
             old_oid,
             new_oid,
-            committer: default_committer(),
+            committer: ref_reflog_committer(),
             message,
         });
     let tx_name = name.clone();
@@ -1152,6 +1152,39 @@ struct UpdateRefStdinWriteRequest<'a> {
     expected_oid: Option<&'a ObjectId>,
 }
 
+struct UpdateRefStdinStagedWrite {
+    name: String,
+    requested: String,
+    new_oid: ObjectId,
+    expected_oid: Option<ObjectId>,
+}
+
+struct UpdateRefStdinStagedDelete {
+    name: String,
+    requested: String,
+    expected_oid: Option<ObjectId>,
+}
+
+struct UpdateRefStdinStagedVerify {
+    name: String,
+    requested: String,
+    expected_oid: ObjectId,
+}
+
+struct UpdateRefStdinStagedSymrefUpdate {
+    requested: String,
+    name: String,
+    target: String,
+    expected: Option<UpdateRefStdinSymrefExpected>,
+}
+
+enum UpdateRefStdinStagedChange {
+    Write(UpdateRefStdinStagedWrite),
+    Delete(UpdateRefStdinStagedDelete),
+    Verify(UpdateRefStdinStagedVerify),
+    SymrefUpdate(UpdateRefStdinStagedSymrefUpdate),
+}
+
 /// The three states git distinguishes for an old-value (`<old-oid>`) field
 /// parsed with PARSE_SHA1_OLD (no ALLOW_EMPTY): absent (no check), present but
 /// empty — which git treats as the all-zeros OID (`have_old = 1`), or a
@@ -1239,7 +1272,7 @@ fn update_ref_stdin(context: UpdateRefStdinContext<'_>, deref: bool, nul: bool) 
         }
         stdout.flush()?;
     }
-    transaction.finish_implicit(context.store)
+    transaction.finish_implicit(&context)
 }
 
 fn update_ref_stdin_line(
@@ -1314,7 +1347,7 @@ fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Resul
         }
         stdout.flush()?;
     }
-    transaction.finish_implicit(context.store)
+    transaction.finish_implicit(context)
 }
 
 /// Shared dispatch for both the `\n` and `-z` paths, mirroring git's
@@ -1425,13 +1458,23 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
             let requested = effective.requested.clone();
             if let Some(err) = transaction.check_batch_df_against_queued(&requested, &name) {
                 return Err(err);
             }
+            if transaction.is_implicit() {
+                transaction.stage_write(UpdateRefStdinStagedWrite {
+                    name,
+                    requested,
+                    new_oid,
+                    expected_oid: expected,
+                });
+                return Ok(());
+            }
+            transaction.mark_applied();
             update_ref_stdin_write(
                 context,
                 UpdateRefStdinWriteRequest {
@@ -1492,13 +1535,23 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
             let requested = effective.requested.clone();
             if let Some(err) = transaction.check_batch_df_against_queued(&requested, &name) {
                 return Err(err);
             }
+            if transaction.is_implicit() {
+                transaction.stage_write(UpdateRefStdinStagedWrite {
+                    name,
+                    requested,
+                    new_oid,
+                    expected_oid: Some(zero),
+                });
+                return Ok(());
+            }
+            transaction.mark_applied();
             update_ref_stdin_write(
                 context,
                 UpdateRefStdinWriteRequest {
@@ -1557,9 +1610,18 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
+            if transaction.is_implicit() {
+                transaction.stage_delete(UpdateRefStdinStagedDelete {
+                    name,
+                    requested: effective.requested,
+                    expected_oid: expected,
+                });
+                return Ok(());
+            }
+            transaction.mark_applied();
             update_ref_delete_stdin_named(
                 context.store,
                 context.format,
@@ -1607,6 +1669,14 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
+            if transaction.is_implicit() {
+                transaction.stage_verify(UpdateRefStdinStagedVerify {
+                    name,
+                    requested: effective.requested,
+                    expected_oid: expected,
+                });
+                return Ok(());
+            }
             check_update_ref_stdin_expected_named(
                 context.store,
                 context.format,
@@ -1626,10 +1696,11 @@ fn dispatch_ref_stdin_command(
             cursor.finish("symref-create", &raw_name)?;
 
             let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &raw_name, &name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_create(context.store, &name, &target)
+            transaction.mark_applied();
+            update_ref_stdin_symref_create(context, &name, &target)
         }
         "symref-update" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1673,11 +1744,28 @@ fn dispatch_ref_stdin_command(
             };
             cursor.finish("symref-update", &raw_name)?;
 
-            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
-            if transaction.capture(context.store, &name)? {
+            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let name = effective.effective.clone();
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_update(context.store, context.format, &name, &target, expected)
+            if transaction.is_implicit() {
+                transaction.stage_symref_update(UpdateRefStdinStagedSymrefUpdate {
+                    requested: effective.requested,
+                    name,
+                    target,
+                    expected,
+                });
+                return Ok(());
+            }
+            transaction.mark_applied();
+            update_ref_stdin_symref_update(
+                context,
+                &effective.requested,
+                &name,
+                &target,
+                expected,
+            )
         }
         "symref-verify" => {
             if *deref {
@@ -1699,9 +1787,10 @@ fn dispatch_ref_stdin_command(
             };
             let expected = cursor.parse_next_refname()?;
             cursor.finish("symref-delete", &raw_name)?;
-            if transaction.capture(context.store, &raw_name)? {
+            if transaction.capture(context.store, &raw_name, &raw_name)? {
                 return Ok(());
             }
+            transaction.mark_applied();
             update_ref_stdin_symref_delete(context.store, &raw_name, expected.as_deref())
         }
         "start" => {
@@ -1751,9 +1840,12 @@ struct UpdateRefStdinTransaction {
     explicit: bool,
     prepared: bool,
     closed: bool,
+    applied: bool,
     originals: BTreeMap<String, Option<RefTarget>>,
     duplicate: Option<String>,
+    duplicate_message: Option<String>,
     locks: Vec<PathBuf>,
+    staged: Vec<UpdateRefStdinStagedChange>,
 }
 
 impl Default for UpdateRefStdinTransaction {
@@ -1763,9 +1855,12 @@ impl Default for UpdateRefStdinTransaction {
             explicit: false,
             prepared: false,
             closed: false,
+            applied: false,
             originals: BTreeMap::new(),
             duplicate: None,
+            duplicate_message: None,
             locks: Vec::new(),
+            staged: Vec::new(),
         }
     }
 }
@@ -1861,17 +1956,34 @@ impl UpdateRefStdinTransaction {
         GitError::Exit(128)
     }
 
-    fn capture(&mut self, store: &FileRefStore, name: &str) -> Result<bool> {
+    fn capture(&mut self, store: &FileRefStore, requested: &str, name: &str) -> Result<bool> {
         if self.active {
             if self.originals.contains_key(name) {
                 if self.duplicate.is_none() {
                     self.duplicate = Some(name.to_string());
+                    if requested != name {
+                        self.duplicate_message = Some(format!(
+                            "multiple updates for '{name}' (including one via symref '{requested}') are not allowed"
+                        ));
+                    }
                 }
                 return Ok(true);
-            } else {
-                self.originals
-                    .insert(name.to_string(), store.read_ref(name)?);
             }
+            if requested == "HEAD"
+                && name == "HEAD"
+                && let Some(RefTarget::Symbolic(head_target)) = store.read_ref("HEAD")?
+                && self.originals.contains_key(&head_target)
+            {
+                if self.duplicate.is_none() {
+                    self.duplicate = Some("HEAD".to_string());
+                    self.duplicate_message = Some(format!(
+                        "multiple updates for 'HEAD' (including one via its referent '{head_target}') are not allowed"
+                    ));
+                }
+                return Ok(true);
+            }
+            self.originals
+                .insert(name.to_string(), store.read_ref(name)?);
         }
         Ok(false)
     }
@@ -1884,6 +1996,31 @@ impl UpdateRefStdinTransaction {
         self.closed
     }
 
+    fn is_implicit(&self) -> bool {
+        self.active && !self.explicit && !self.prepared
+    }
+
+    fn mark_applied(&mut self) {
+        self.applied = true;
+    }
+
+    fn stage_write(&mut self, write: UpdateRefStdinStagedWrite) {
+        self.staged.push(UpdateRefStdinStagedChange::Write(write));
+    }
+
+    fn stage_delete(&mut self, delete: UpdateRefStdinStagedDelete) {
+        self.staged.push(UpdateRefStdinStagedChange::Delete(delete));
+    }
+
+    fn stage_verify(&mut self, verify: UpdateRefStdinStagedVerify) {
+        self.staged.push(UpdateRefStdinStagedChange::Verify(verify));
+    }
+
+    fn stage_symref_update(&mut self, update: UpdateRefStdinStagedSymrefUpdate) {
+        self.staged
+            .push(UpdateRefStdinStagedChange::SymrefUpdate(update));
+    }
+
     fn start(&mut self, stdout: &mut dyn Write) -> Result<()> {
         if self.explicit {
             return update_ref_stdin_restart_transaction();
@@ -1892,6 +2029,8 @@ impl UpdateRefStdinTransaction {
         self.explicit = true;
         self.prepared = false;
         self.closed = false;
+        self.applied = false;
+        self.staged.clear();
         writeln!(stdout, "start: ok")?;
         Ok(())
     }
@@ -1903,8 +2042,12 @@ impl UpdateRefStdinTransaction {
         stdout: &mut dyn Write,
     ) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
+            let message = self
+                .duplicate_message
+                .clone()
+                .or_else(|| self.infer_duplicate_message(store, &name).ok().flatten());
             self.restore(store)?;
-            eprintln!("fatal: prepare: multiple updates for ref '{name}' not allowed");
+            update_ref_stdin_duplicate_failure("prepare", &name, message.as_deref());
             return Err(GitError::Exit(128));
         }
         self.acquire_locks(git_dir)?;
@@ -1915,8 +2058,12 @@ impl UpdateRefStdinTransaction {
 
     fn commit(&mut self, store: &FileRefStore, stdout: &mut dyn Write) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
+            let message = self
+                .duplicate_message
+                .clone()
+                .or_else(|| self.infer_duplicate_message(store, &name).ok().flatten());
             self.restore(store)?;
-            eprintln!("fatal: commit: multiple updates for ref '{name}' not allowed");
+            update_ref_stdin_duplicate_failure("commit", &name, message.as_deref());
             return Err(GitError::Exit(128));
         }
         self.active = false;
@@ -1925,24 +2072,35 @@ impl UpdateRefStdinTransaction {
         self.closed = true;
         self.release_locks();
         self.originals.clear();
+        self.duplicate_message = None;
         self.duplicate = None;
         writeln!(stdout, "commit: ok")?;
         Ok(())
     }
 
-    fn finish_implicit(&mut self, store: &FileRefStore) -> Result<()> {
+    fn finish_implicit(&mut self, context: &UpdateRefStdinContext<'_>) -> Result<()> {
         if self.explicit || self.prepared {
-            return self.restore(store);
+            return self.restore(context.store);
         }
         if let Some(name) = self.duplicate.clone() {
-            self.restore(store)?;
-            eprintln!("fatal: multiple updates for ref '{name}' not allowed");
+            let message = self
+                .duplicate_message
+                .clone()
+                .or_else(|| self.infer_duplicate_message(context.store, &name).ok().flatten());
+            self.restore(context.store)?;
+            update_ref_stdin_duplicate_failure("", &name, message.as_deref());
             return Err(GitError::Exit(128));
+        }
+        if !self.staged.is_empty() {
+            let staged = mem::take(&mut self.staged);
+            update_ref_stdin_commit_staged(context, staged)?;
         }
         self.active = false;
         self.prepared = false;
         self.originals.clear();
+        self.duplicate_message = None;
         self.closed = false;
+        self.applied = false;
         Ok(())
     }
 
@@ -1954,17 +2112,45 @@ impl UpdateRefStdinTransaction {
 
     fn restore(&mut self, store: &FileRefStore) -> Result<()> {
         self.release_locks();
-        if self.active {
+        if self.active && self.applied {
             for (name, original) in mem::take(&mut self.originals) {
                 update_ref_stdin_restore_ref(store, &name, original)?;
             }
             self.active = false;
         }
+        if !self.applied {
+            self.originals.clear();
+        }
+        self.staged.clear();
         self.explicit = false;
         self.prepared = false;
         self.closed = true;
         self.duplicate = None;
+        self.duplicate_message = None;
+        self.applied = false;
         Ok(())
+    }
+
+    fn infer_duplicate_message(&self, store: &FileRefStore, name: &str) -> Result<Option<String>> {
+        if name == "HEAD"
+            && let Some(RefTarget::Symbolic(head_target)) = store.read_ref("HEAD")?
+            && self.originals.contains_key(&head_target)
+        {
+            return Ok(Some(format!(
+                "multiple updates for 'HEAD' (including one via its referent '{head_target}') are not allowed"
+            )));
+        }
+        for reference in store.list_refs()? {
+            if let RefTarget::Symbolic(target) = reference.target
+                && target == name
+            {
+                return Ok(Some(format!(
+                    "multiple updates for '{name}' (including one via symref '{}') are not allowed",
+                    reference.name
+                )));
+            }
+        }
+        Ok(None)
     }
 
     fn acquire_locks(&mut self, git_dir: &Path) -> Result<()> {
@@ -2017,6 +2203,17 @@ fn update_ref_stdin_closed_transaction() -> Result<()> {
     Err(GitError::Exit(128))
 }
 
+fn update_ref_stdin_duplicate_failure(phase: &str, name: &str, message: Option<&str>) {
+    match (phase.is_empty(), message) {
+        (true, Some(message)) => eprintln!("fatal: {message}"),
+        (false, Some(message)) => eprintln!("fatal: {phase}: {message}"),
+        (true, None) => eprintln!("fatal: multiple updates for ref '{name}' not allowed"),
+        (false, None) => {
+            eprintln!("fatal: {phase}: multiple updates for ref '{name}' not allowed")
+        }
+    }
+}
+
 fn update_ref_stdin_restore_ref(
     store: &FileRefStore,
     name: &str,
@@ -2047,6 +2244,132 @@ fn update_ref_stdin_remove_ref(store: &FileRefStore, name: &str) -> Result<()> {
         None => {}
     }
     Ok(())
+}
+
+fn update_ref_stdin_commit_staged(
+    context: &UpdateRefStdinContext<'_>,
+    staged: Vec<UpdateRefStdinStagedChange>,
+) -> Result<()> {
+    let zero = zero_oid(context.format)?;
+    let hook = ReferenceTransactionHookRunner::new(context.git_dir);
+    let mut tx = context.store.transaction().with_hook(&hook);
+    let mut requested_by_name = BTreeMap::new();
+    for change in staged {
+        match change {
+            UpdateRefStdinStagedChange::Write(write) => {
+                requested_by_name.insert(write.name.clone(), write.requested.clone());
+                let current = context.store.read_ref(&write.name)?;
+                if let Some(expected_oid) = write.expected_oid.as_ref() {
+                    check_update_ref_stdin_expected_named(
+                        context.store,
+                        context.format,
+                        &write.requested,
+                        &write.name,
+                        current.as_ref(),
+                        expected_oid,
+                    )?;
+                }
+                if write.new_oid == zero {
+                    if current.is_some() {
+                        tx.delete_with_precondition(
+                            write.name,
+                            sley_refs::RefDeletePrecondition::Any,
+                            None,
+                        );
+                    }
+                    continue;
+                }
+                check_update_ref_new_value(
+                    context.git_dir,
+                    context.format,
+                    &write.name,
+                    &write.new_oid,
+                )
+                .map_err(|reason| {
+                    eprintln!("fatal: cannot update ref '{}': {reason}", write.name);
+                    GitError::Exit(128)
+                })?;
+                let old_oid = match current {
+                    Some(RefTarget::Direct(oid)) => oid,
+                    _ => zero,
+                };
+                let reflog =
+                    update_ref_should_write_reflog(context.git_dir, &write.name, context.create_reflog)?
+                        .then(|| ReflogEntry {
+                            old_oid,
+                            new_oid: write.new_oid,
+                            committer: ref_reflog_committer(),
+                            message: context.message.clone(),
+                        });
+                tx.update(RefUpdate {
+                    name: write.name,
+                    expected: None,
+                    new: RefTarget::Direct(write.new_oid),
+                    reflog,
+                });
+            }
+            UpdateRefStdinStagedChange::Delete(delete) => {
+                requested_by_name.insert(delete.name.clone(), delete.requested.clone());
+                let current = context.store.read_ref(&delete.name)?;
+                if let Some(expected_oid) = delete.expected_oid.as_ref() {
+                    check_update_ref_stdin_expected_named(
+                        context.store,
+                        context.format,
+                        &delete.requested,
+                        &delete.name,
+                        current.as_ref(),
+                        expected_oid,
+                    )?;
+                }
+                if current.is_some() {
+                    tx.delete_with_precondition(
+                        delete.name,
+                        sley_refs::RefDeletePrecondition::Any,
+                        None,
+                    );
+                }
+            }
+            UpdateRefStdinStagedChange::Verify(verify) => {
+                requested_by_name.insert(verify.name.clone(), verify.requested.clone());
+                let current = context.store.read_ref(&verify.name)?;
+                check_update_ref_stdin_expected_named(
+                    context.store,
+                    context.format,
+                    &verify.requested,
+                    &verify.name,
+                    current.as_ref(),
+                    &verify.expected_oid,
+                )?;
+            }
+            UpdateRefStdinStagedChange::SymrefUpdate(update) => {
+                requested_by_name.insert(update.name.clone(), update.requested.clone());
+                update_ref_stdin_symref_update(
+                    context,
+                    &update.requested,
+                    &update.name,
+                    &update.target,
+                    update.expected,
+                )?;
+            }
+        }
+    }
+    match tx.commit() {
+        Err(GitError::Transaction(message)) => {
+            if let Some((new_ref, existing_ref)) = parse_df_conflict_message(&message) {
+                let requested = requested_by_name
+                    .get(&new_ref)
+                    .map(String::as_str)
+                    .unwrap_or(new_ref.as_str());
+                eprintln!(
+                    "fatal: cannot lock ref '{requested}': '{existing_ref}' exists; cannot create '{new_ref}'"
+                );
+            } else {
+                eprintln!("fatal: {message}");
+            }
+            Err(GitError::Exit(128))
+        }
+        result => result,
+    }
 }
 
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
@@ -2105,32 +2428,38 @@ fn update_ref_stdin_delete_zero(name: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-fn update_ref_stdin_symref_create(store: &FileRefStore, name: &str, target: &str) -> Result<()> {
+fn update_ref_stdin_symref_create(
+    context: &UpdateRefStdinContext<'_>,
+    name: &str,
+    target: &str,
+) -> Result<()> {
     validate_ref_name(name)?;
-    if let Some(current) = store.read_ref(name)? {
+    if let Some(current) = context.store.read_ref(name)? {
         return match current {
             RefTarget::Symbolic(_) => update_ref_stdin_symref_exists(name, true),
             RefTarget::Direct(_) => update_ref_stdin_symref_exists(name, false),
         };
     }
-    let mut tx = store.transaction();
+    let reflog = update_ref_stdin_symref_reflog(context, name, target)?;
+    let mut tx = context.store.transaction();
     tx.update(RefUpdate {
         name: name.to_string(),
         expected: None,
         new: RefTarget::Symbolic(target.to_string()),
-        reflog: None,
+        reflog,
     });
     tx.commit()
 }
 
+#[derive(Clone)]
 enum UpdateRefStdinSymrefExpected {
     Target(String),
     Oid(ObjectId),
 }
 
 fn update_ref_stdin_symref_update(
-    store: &FileRefStore,
-    format: ObjectFormat,
+    context: &UpdateRefStdinContext<'_>,
+    requested: &str,
     name: &str,
     target: &str,
     expected: Option<UpdateRefStdinSymrefExpected>,
@@ -2138,22 +2467,55 @@ fn update_ref_stdin_symref_update(
     validate_ref_name(name)?;
     match expected {
         Some(UpdateRefStdinSymrefExpected::Target(expected)) => {
-            update_ref_stdin_symref_verify(store, name, Some(&expected))?;
+            update_ref_stdin_symref_verify(context.store, name, Some(&expected))?;
         }
         Some(UpdateRefStdinSymrefExpected::Oid(expected)) => {
-            let current = store.read_ref(name)?;
-            update_ref_stdin_symref_verify_oid(store, format, name, current.as_ref(), &expected)?;
+            let current = context.store.read_ref(name)?;
+            update_ref_stdin_symref_verify_oid(
+                context.store,
+                context.format,
+                requested,
+                name,
+                current.as_ref(),
+                &expected,
+            )?;
         }
         None => {}
     }
-    let mut tx = store.transaction();
+    let reflog = update_ref_stdin_symref_reflog(context, name, target)?;
+    let mut tx = context.store.transaction();
     tx.update(RefUpdate {
         name: name.to_string(),
         expected: None,
         new: RefTarget::Symbolic(target.to_string()),
-        reflog: None,
+        reflog,
     });
-    tx.commit()
+    tx.commit()?;
+    if requested != name {
+        if let Some(reflog) = update_ref_stdin_symref_reflog(context, name, target)? {
+            context.store.append_reflog(requested, &reflog)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_ref_stdin_symref_reflog(
+    context: &UpdateRefStdinContext<'_>,
+    name: &str,
+    target: &str,
+) -> Result<Option<ReflogEntry>> {
+    if !update_ref_should_write_reflog(context.git_dir, name, context.create_reflog)? {
+        return Ok(None);
+    }
+    let zero = zero_oid(context.format)?;
+    let old_oid = resolve_ref_peeled(context.store, name)?.unwrap_or(zero);
+    let new_oid = resolve_ref_peeled(context.store, target)?.unwrap_or(zero);
+    Ok(Some(ReflogEntry {
+        old_oid,
+        new_oid,
+        committer: ref_reflog_committer(),
+        message: context.message.clone(),
+    }))
 }
 
 fn update_ref_stdin_symref_verify(
@@ -2164,8 +2526,12 @@ fn update_ref_stdin_symref_verify(
     validate_ref_name(name)?;
     match (store.read_ref(name)?, expected) {
         (None, None) => Ok(()),
-        (None, Some(_)) | (Some(RefTarget::Direct(_)), Some(_)) => {
-            update_ref_stdin_symref_unresolved(name)
+        (None, Some(_)) => update_ref_stdin_symref_unresolved(name),
+        (Some(RefTarget::Direct(_)), Some(expected)) => {
+            eprintln!(
+                "fatal: cannot lock ref '{name}': expected symref with target '{expected}': but is a regular ref"
+            );
+            Err(GitError::Exit(128))
         }
         (Some(RefTarget::Direct(_)), None) => update_ref_stdin_symref_exists(name, false),
         (Some(RefTarget::Symbolic(_)), None) => update_ref_stdin_symref_exists(name, true),
@@ -2182,16 +2548,19 @@ fn update_ref_stdin_symref_verify(
 fn update_ref_stdin_symref_verify_oid(
     store: &FileRefStore,
     format: ObjectFormat,
+    requested: &str,
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
     let zero = zero_oid(format)?;
     if matches!(current, Some(RefTarget::Symbolic(_))) && expected != &zero {
-        eprintln!("fatal: cannot lock ref '{name}': reference is missing but expected {expected}");
+        eprintln!(
+            "fatal: cannot lock ref '{requested}': reference is missing but expected {expected}"
+        );
         return Err(GitError::Exit(128));
     }
-    check_update_ref_stdin_expected(store, format, name, current, expected)
+    check_update_ref_stdin_expected_named(store, format, requested, name, current, expected)
 }
 
 fn update_ref_stdin_symref_delete(
@@ -2199,9 +2568,19 @@ fn update_ref_stdin_symref_delete(
     name: &str,
     expected: Option<&str>,
 ) -> Result<()> {
-    update_ref_stdin_symref_verify(store, name, expected)?;
-    if store.read_ref(name)?.is_some() {
-        let _ = store.delete_symbolic_ref(name)?;
+    validate_ref_name(name)?;
+    if let Some(expected) = expected {
+        update_ref_stdin_symref_verify(store, name, Some(expected))?;
+    }
+    match store.read_ref(name)? {
+        Some(RefTarget::Symbolic(_)) => {
+            let _ = store.delete_symbolic_ref(name)?;
+        }
+        Some(RefTarget::Direct(_)) if expected.is_none() => {
+            let _ = store.delete_ref(name)?;
+        }
+        Some(RefTarget::Direct(_)) => {}
+        None => {}
     }
     Ok(())
 }
@@ -2469,7 +2848,7 @@ fn update_ref_stdin_write(
             .then(|| ReflogEntry {
                 old_oid,
                 new_oid: request.new_oid,
-                committer: default_committer(),
+                committer: ref_reflog_committer(),
                 message: context.message.clone(),
             });
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
@@ -2650,9 +3029,24 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
     let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
         return Ok(false);
     };
-    Ok(config
-        .get("core", None, "logAllRefUpdates")
-        .is_some_and(|value| update_ref_log_all_ref_updates_matches(name, value)))
+    if let Some(value) = config.get("core", None, "logAllRefUpdates") {
+        return Ok(update_ref_log_all_ref_updates_matches(name, value));
+    }
+    if config.get_bool("core", None, "bare").unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(update_ref_log_all_ref_updates_matches(name, "true"))
+}
+
+fn ref_reflog_committer() -> Vec<u8> {
+    let date = match env::var("GIT_COMMITTER_DATE") {
+        Ok(date) if !date.is_empty() => date,
+        _ => format!("@{} +0000", current_unix_seconds().max(1)),
+    };
+    commit_identity_from_env_with_date("COMMITTER", &date).unwrap_or_else(|_| {
+        let timestamp = current_unix_seconds().max(1);
+        format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes()
+    })
 }
 
 fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
@@ -2774,21 +3168,11 @@ fn check_update_ref_expected(
     }
 }
 
-fn check_update_ref_stdin_expected(
-    store: &FileRefStore,
-    format: ObjectFormat,
-    name: &str,
-    current: Option<&RefTarget>,
-    expected: &ObjectId,
-) -> Result<()> {
-    check_update_ref_stdin_expected_named(store, format, name, name, current, expected)
-}
-
-/// As [`check_update_ref_stdin_expected`] but with the requested name
-/// (`cannot lock ref '<requested>'`) distinguished from the effective,
-/// dereferenced name (`unable to resolve reference '<effective>'`). git uses the
-/// requested ref in the lock-failure prefix and the final dangling target in the
-/// resolve-failure reason; a non-symbolic update has them equal.
+/// Check a stdin old-OID precondition with the requested name (`cannot lock ref
+/// '<requested>'`) distinguished from the effective, dereferenced name (`unable
+/// to resolve reference '<effective>'`). git uses the requested ref in the
+/// lock-failure prefix and the final dangling target in the resolve-failure
+/// reason; a non-symbolic update has them equal.
 ///
 /// A `Symbolic` current arises only under `no-deref`: git still resolves the
 /// symref one level to compare the OID (`refs_read_ref_full`), so a `no-deref`
@@ -2805,6 +3189,11 @@ fn check_update_ref_stdin_expected_named(
 ) -> Result<()> {
     let zero = zero_oid(format)?;
     if expected == &zero {
+        if matches!(current, Some(RefTarget::Symbolic(_)))
+            && resolve_ref_peeled(store, effective)?.is_none()
+        {
+            return update_ref_stdin_lock_failure(requested, "dangling symref already exists");
+        }
         if current.is_some() {
             return update_ref_stdin_lock_failure(requested, "reference already exists");
         }
@@ -3218,7 +3607,7 @@ fn update_symbolic_ref(
     let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
         old_oid,
         new_oid,
-        committer: default_committer(),
+        committer: ref_reflog_committer(),
         message,
     });
     let hook = ReferenceTransactionHookRunner::new(git_dir);
