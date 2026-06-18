@@ -512,7 +512,11 @@ declare -A FLOOR=(
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=398
     # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
-    [t7400-submodule-basic.sh]=88
+    # codex-wave-11 (submodule verbs): add/init/status/sync/deinit/update/foreach/
+    # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
+    # 88->113; side gain t7406 54->57. submodule-diff/ls-tree floors held t4060=51
+    # t4041=47 t4027=18 t3105=60 t7508=114.
+    [t7400-submodule-basic.sh]=113
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=114
     [t4027-diff-submodule.sh]=18
@@ -635,7 +639,7 @@ declare -A FLOOR=(
     # wave-2 submodule (2026-06-18, integ/submodule): t7401 22->25 (submodule-summary porcelain).
     [t7401-submodule-summary.sh]=25
     [t7407-submodule-foreach.sh]=21
-    [t7406-submodule-update.sh]=54
+    [t7406-submodule-update.sh]=57
     [t4203-mailmap.sh]=69
     # wave-12 (2026-06-17): repack/gc engine (geometric + cruft repack + gc orchestration),
     # diff indent-heuristic, reftable log-block engine. Incidental pack-floor gains bumped above
