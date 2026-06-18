@@ -28,7 +28,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, St
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
-use sley_odb::{FileObjectDatabase, build_reachable_pack, collect_reachable_object_ids};
+use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
@@ -58,8 +58,49 @@ fn ssh_process_command_for_remote(
     remote: &RemoteUrl,
     service: GitService,
 ) -> Result<SshProcessCommand> {
+    if remote.transport == RemoteTransport::Ext {
+        return ext_process_command_for_remote(remote, service);
+    }
     validate_git_ssh_command()?;
     ssh_process_command(remote, service, ssh_program(), ssh_command_variant())
+}
+
+fn ext_process_command_for_remote(
+    remote: &RemoteUrl,
+    service: GitService,
+) -> Result<SshProcessCommand> {
+    let words = split_shell_words(&remote.path)?;
+    let Some((program, args)) = words.split_first() else {
+        return Err(GitError::InvalidFormat("ext remote command is empty".into()));
+    };
+    Ok(SshProcessCommand {
+        program: expand_ext_service_placeholders(program, service),
+        args: args
+            .iter()
+            .map(|arg| expand_ext_service_placeholders(arg, service))
+            .collect(),
+    })
+}
+
+fn expand_ext_service_placeholders(value: &str, service: GitService) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('S') => out.push_str(service.as_str()),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 fn ssh_command_variant() -> SshCommandVariant {
@@ -181,7 +222,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         refspecs,
         force,
     } = request;
-    if remote.transport != RemoteTransport::Ssh {
+    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Err(GitError::InvalidFormat(
             "SSH receive-pack requires an SSH remote".into(),
         ));
@@ -281,7 +322,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         command_forces,
         pack_objects,
     } = request;
-    if remote.transport != RemoteTransport::Ssh {
+    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Err(GitError::InvalidFormat(
             "SSH receive-pack requires an SSH remote".into(),
         ));
@@ -370,14 +411,19 @@ pub(crate) fn execute_push_ssh_plan(
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let remote_excluded_tips =
-        crate::remote_advertisement_tips_known_to_local(&local_db, &plan.advertisements)?;
-    let remote_excluded =
-        collect_reachable_object_ids(&local_db, request.format, remote_excluded_tips)?;
-    let starts = crate::pack::push_pack_roots(&commands, &plan.pack_objects);
-    let packfile = build_reachable_pack(&local_db, request.format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
+    let packfile = crate::pack::build_push_packfile(&crate::pack::PushPackRequest {
+        local_db: &local_db,
+        format: request.format,
+        commands: &commands,
+        pack_objects: &plan.pack_objects,
+        remote_advertisements: &plan.advertisements,
+        features: &plan.features,
+        options: ReceivePackPushRequestOptions {
+            ofs_delta: plan.features.ofs_delta,
+            ..ReceivePackPushRequestOptions::default()
+        },
+        thin: false,
+    })?;
     let request = build_receive_pack_push_request(
         &plan.features,
         commands.clone(),
@@ -427,7 +473,7 @@ pub(crate) fn ls_remote_ssh(
     filter: &crate::ls_remote::LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
 ) -> Result<(Vec<crate::ls_remote::LsRemoteRecord>, ObjectFormat)> {
-    if remote.transport != RemoteTransport::Ssh {
+    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
@@ -602,7 +648,7 @@ pub fn ssh_upload_pack_advertisements(
     remote: &RemoteUrl,
     format: ObjectFormat,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    if remote.transport != RemoteTransport::Ssh {
+    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
@@ -681,7 +727,7 @@ fn ssh_upload_pack_fetch_response_inner(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
 )> {
-    if remote.transport != RemoteTransport::Ssh {
+    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
@@ -734,6 +780,9 @@ fn ssh_upload_pack_fetch_response_inner(
 /// [`RemoteUrl`], so reconstruct the `user@host[:port]/path` (or `host:path` SCP)
 /// form for the diagnostic text.
 fn ssh_remote_display(remote: &RemoteUrl) -> String {
+    if remote.transport == RemoteTransport::Ext {
+        return format!("ext::{}", remote.path);
+    }
     let host = remote.host.as_deref().unwrap_or("");
     let mut out = String::new();
     if let Some(user) = &remote.user {

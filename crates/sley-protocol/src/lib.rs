@@ -5671,11 +5671,6 @@ pub fn validate_receive_pack_push_request_features(
         .commands
         .iter()
         .any(|command| !is_receive_pack_delete_command(command));
-    if has_update_or_create && request.packfile.is_empty() {
-        return Err(GitError::InvalidFormat(
-            "receive-pack request with create/update commands is missing packfile".into(),
-        ));
-    }
     if !has_update_or_create && !request.packfile.is_empty() {
         return Err(GitError::InvalidFormat(
             "receive-pack delete-only request must not include packfile".into(),
@@ -5724,7 +5719,9 @@ where
         .cloned()
         .collect::<Vec<_>>();
     if !updates.is_empty() {
-        install_pack(&request.packfile)?;
+        if !request.packfile.is_empty() {
+            install_pack(&request.packfile)?;
+        }
         for command in &updates {
             if !contains_object(&command.new_id)? {
                 return Err(GitError::InvalidObject(format!(
@@ -11762,20 +11759,18 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            validate_receive_pack_push_request_features(
-                &features,
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![update.clone()],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: None,
-                    packfile: Vec::new(),
+        validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update.clone()],
+                    ..ReceivePackRequest::default()
                 },
-            )
-            .is_err()
-        );
+                push_options: None,
+                packfile: Vec::new(),
+            },
+        )
+        .expect("updates to already-present objects may omit a packfile");
         assert!(
             validate_receive_pack_push_request_features(
                 &ReceivePackFeatures {
@@ -11895,6 +11890,54 @@ mod tests {
                 name: "refs/heads/main".into(),
             }]
         );
+    }
+
+    #[test]
+    fn receive_pack_apply_helper_allows_update_without_pack_when_object_exists() {
+        let old_id = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test operation should succeed");
+        let new_id = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("test operation should succeed");
+        let request = ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                commands: vec![ReceivePackCommand {
+                    old_id: old_id.clone(),
+                    new_id: new_id.clone(),
+                    name: "refs/heads/main".into(),
+                }],
+                ..ReceivePackRequest::default()
+            },
+            ..ReceivePackPushRequest::default()
+        };
+        let installed = std::cell::Cell::new(false);
+        let applied = std::cell::RefCell::new(Vec::new());
+
+        let report = apply_receive_pack_push_request(
+            &ReceivePackFeatures::default(),
+            &request,
+            |_| unreachable!("update stale-old checks belong to the ref transaction callback"),
+            |_| {
+                installed.set(true);
+                Ok(())
+            },
+            |oid| Ok(oid == &new_id),
+            |commands| {
+                applied.borrow_mut().extend_from_slice(commands);
+                Ok(())
+            },
+            |_| unreachable!("no delete command should be applied"),
+        )
+        .expect("test operation should succeed");
+
+        assert!(!installed.get());
+        assert_eq!(applied.into_inner(), request.commands.commands);
+        assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
     }
 
     #[test]

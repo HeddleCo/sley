@@ -488,6 +488,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         repository
     };
+    let transport_config = transport_policy_config_for_cwd()?;
+    let resolved_repository = ls_remote_resolved_url(&repository)?;
+    check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
     // An empty `--template=` (or `--template ""`) disables templating entirely,
     // matching upstream git's `copy_templates()`, which returns immediately when
     // the template directory is the empty string. Resolving "" against the cwd
@@ -918,7 +921,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             },
             configure_branch: &mut |git_dir, branch| {
                 configure_clone_branch(git_dir, branch, &origin)?;
-                read_repo_config(git_dir)
+                repo_config_with_transport_policy(git_dir)
             },
             credentials: &mut credentials,
             progress: &mut progress,
@@ -1129,7 +1132,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
                 )?;
                 apply_clone_config_overrides(git_dir, config_overrides)?;
                 apply_clone_submodule_active(git_dir, submodule_active)?;
-                read_repo_config(git_dir)
+                repo_config_with_transport_policy(git_dir)
             },
             configure_branch: &mut |git_dir, branch| {
                 configure_clone_branch(git_dir, branch, origin)?;
@@ -1191,12 +1194,6 @@ fn clone_network_repository(
     options: CloneHttpOptions<'_>,
     transport: CloneNetworkTransport,
 ) -> Result<()> {
-    if options.bare {
-        return Err(GitError::Unsupported(format!(
-            "cloning bare/mirror repositories over {} is not supported yet",
-            transport.name()
-        )));
-    }
     if options.revision.is_some() {
         return Err(GitError::Unsupported(format!(
             "clone --revision over {} is not supported yet",
@@ -1241,6 +1238,22 @@ fn clone_network_repository(
         .branch
         .clone()
         .unwrap_or_else(|| remote_head_branch.clone());
+
+    if options.bare {
+        if !options.quiet {
+            eprintln!(
+                "Cloning into bare repository '{}'...",
+                options.destination_display.display()
+            );
+        }
+        return clone_bare_network_repository(
+            &options,
+            transport,
+            remote,
+            format,
+            &checkout_branch,
+        );
+    }
 
     if !options.quiet {
         eprintln!(
@@ -1335,6 +1348,88 @@ fn clone_network_repository(
         eprintln!("done.");
     }
     Ok(())
+}
+
+fn clone_bare_network_repository(
+    options: &CloneHttpOptions<'_>,
+    transport: CloneNetworkTransport,
+    remote: RemoteUrl,
+    format: ObjectFormat,
+    checkout_branch: &str,
+) -> Result<()> {
+    let layout = RepositoryBootstrap::init(InitOptions {
+        git_dir_override: None,
+        core_worktree: None,
+        worktree: options.destination.to_path_buf(),
+        object_format: format,
+        object_format_explicit: false,
+        bare: true,
+        initial_branch: checkout_branch.into(),
+        template_dir: None,
+        copy_template_config: false,
+        separate_git_dir: None,
+        shared_repository: None,
+        ref_storage: options.ref_storage,
+        ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
+    })?;
+    let git_dir = layout.git_dir;
+    apply_clone_template(&git_dir, options.template, options.template_config)?;
+    configure_clone_remote(
+        &git_dir,
+        options.origin,
+        options.repository,
+        None,
+        false,
+        options.tag_opt,
+        options.partial_clone_filter,
+    )?;
+    apply_clone_config_overrides(&git_dir, options.config_overrides)?;
+    apply_clone_submodule_active(&git_dir, options.submodule_active)?;
+    if let Some(bundle_uri) = options.bundle_uri {
+        apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
+    }
+
+    let config = repo_config_with_transport_policy(&git_dir)?;
+    let source = match transport {
+        CloneNetworkTransport::Ssh => sley_remote::FetchSource::Ssh(remote),
+        CloneNetworkTransport::Git => sley_remote::FetchSource::Git(remote),
+    };
+    let mut refspecs = if options.single_branch {
+        vec![format!("+refs/heads/{checkout_branch}:refs/heads/{checkout_branch}")]
+    } else {
+        vec!["+refs/heads/*:refs/heads/*".to_string()]
+    };
+    if options.tag_opt != Some("--no-tags") {
+        refspecs.push("+refs/tags/*:refs/tags/*".to_string());
+    }
+    run_fetch(
+        &git_dir,
+        format,
+        &config,
+        options.origin,
+        &source,
+        &refspecs,
+        FetchOptions {
+            quiet: true,
+            auto_follow_tags: options.tag_opt != Some("--no-tags") || options.branch.is_some(),
+            fetch_all_tags: options.tag_opt == Some("--tags"),
+            prune: false,
+            dry_run: false,
+            append: false,
+            write_fetch_head: false,
+            tag_option_explicit: options.tag_opt.is_some(),
+            prune_option_explicit: false,
+            depth: options.depth,
+            merge_srcs: Vec::new(),
+            filter: None,
+            cloning: true,
+            update_shallow: false,
+            deepen_relative: false,
+            update_head_ok: true,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+        },
+    )
 }
 
 /// Map a [`sley_remote::clone`] result that failed because the requested branch
@@ -2589,6 +2684,9 @@ fn fetch_one_source(
         }
         return fetch_bundle(git_dir, format, source, refspecs, &bundle, options);
     }
+    let config = transport_policy_config_for_cwd()?;
+    let resolved = ls_remote_resolved_url(source)?;
+    check_transport_allowed_url(&resolved, Some(&config))?;
     if fetch_source_is_http(source)? {
         return fetch_http_repository(git_dir, format, source, refspecs, options);
     }
@@ -3060,25 +3158,29 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         no_verify,
         dry_run,
     };
+    let config = transport_policy_config_for_cwd()?;
+    let resolved_remote = push_resolved_url(&remote)?;
+    check_transport_allowed_url(&resolved_remote, Some(&config))?;
+    let parsed_remote = parse_remote_url(&resolved_remote)?;
     // All transports delegate the git work to `sley_remote::push`, picked purely
     // by the resolved `PushDestination`; this command keeps owning URL/repo
     // resolution, set-upstream config, and the "To <remote>" summary so the
     // user-visible output stays byte-for-byte identical.
-    let destination = if push_remote_is_ssh(&remote)? {
-        let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
-        sley_remote::PushDestination::Ssh(remote_url)
-    } else if push_remote_is_git(&remote)? {
-        let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
-        sley_remote::PushDestination::Git(remote_url)
-    } else if push_remote_is_http(&remote)? {
-        let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
-        sley_remote::PushDestination::Http(remote_url)
-    } else {
-        let remote_git_dir = ls_remote_git_dir(&remote)?;
+    let destination = match parsed_remote.transport {
+        RemoteTransport::Ssh | RemoteTransport::Ext => {
+            sley_remote::PushDestination::Ssh(parsed_remote)
+        }
+        RemoteTransport::Git => sley_remote::PushDestination::Git(parsed_remote),
+        RemoteTransport::Http | RemoteTransport::Https => {
+            sley_remote::PushDestination::Http(parsed_remote)
+        }
+        RemoteTransport::Local | RemoteTransport::File => {
+            let remote_git_dir = ls_remote_git_dir(&resolved_remote)?;
         let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-        sley_remote::PushDestination::Local {
-            git_dir: remote_git_dir,
-            common_git_dir: remote_common_git_dir,
+            sley_remote::PushDestination::Local {
+                git_dir: remote_git_dir,
+                common_git_dir: remote_common_git_dir,
+            }
         }
     };
 
@@ -3229,7 +3331,7 @@ fn run_push(
     refspecs: &[String],
     options: PushOptions,
 ) -> Result<()> {
-    let config = read_repo_config(git_dir).unwrap_or_default();
+    let config = repo_config_with_transport_policy(git_dir).unwrap_or_default();
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
     let mut progress = StdoutProgress;
     let remote_options = sley_remote::PushOptions {
@@ -3906,16 +4008,6 @@ fn pre_push_local_ref(
     Some(src.to_string())
 }
 
-fn push_remote_is_ssh(remote: &str) -> Result<bool> {
-    let resolved = push_resolved_url(remote)?;
-    Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Ssh)
-}
-
-fn push_remote_is_git(remote: &str) -> Result<bool> {
-    let resolved = push_resolved_url(remote)?;
-    Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Git)
-}
-
 fn push_resolved_url(remote: &str) -> Result<String> {
     if let Ok(git_dir) = discover_git_dir(&env::current_dir()?) {
         let config = read_repo_config(&git_dir)?;
@@ -4038,7 +4130,7 @@ pub(crate) fn fetch_local_repository(
 ) -> Result<()> {
     let remote_git_dir = ls_remote_git_dir(source)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-    let config = read_repo_config(git_dir)?;
+    let config = repo_config_with_transport_policy(git_dir)?;
     let fetch_source = sley_remote::FetchSource::Local {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
@@ -4158,7 +4250,10 @@ fn maybe_set_remote_head_on_fetch(
 
 pub(crate) fn fetch_source_is_ssh(source: &str) -> Result<bool> {
     let resolved = ls_remote_resolved_url(source)?;
-    Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Ssh)
+    Ok(matches!(
+        parse_remote_url(&resolved)?.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ))
 }
 
 pub(crate) fn fetch_source_is_git(source: &str) -> Result<bool> {
@@ -4178,7 +4273,7 @@ pub(crate) fn fetch_ssh_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    let config = read_repo_config(git_dir)?;
+    let config = repo_config_with_transport_policy(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Ssh(remote);
     run_fetch(
@@ -4223,10 +4318,6 @@ pub(crate) fn fetch_git_repository(
 
 fn fetch_source_is_http(source: &str) -> Result<bool> {
     sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
-}
-
-fn push_remote_is_http(remote: &str) -> Result<bool> {
-    sley_remote::remote_url_is_http(&push_resolved_url(remote)?)
 }
 
 /// Resolve the repository context and delegate a smart-HTTP(S) fetch to
@@ -4517,6 +4608,9 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         .as_deref()
         .map(repository_object_format)
         .transpose()?;
+    let transport_config = transport_policy_config_for_cwd()?;
+    let resolved_repository = ls_remote_resolved_url(repository)?;
+    check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
 
     if let Some((mut records, format)) = ls_remote_ssh_records(repository, &options)? {
         if options.exit_code && records.is_empty() {
@@ -4778,6 +4872,61 @@ fn ls_remote_resolved_url(repository: &str) -> Result<String> {
     Ok(repository.to_string())
 }
 
+fn check_transport_allowed_url(url: &str, config: Option<&GitConfig>) -> Result<()> {
+    let scheme = sley_remote::transport_scheme_for_url(url);
+    match sley_remote::check_transport_allowed(&scheme, config, None) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            eprintln!("fatal: {err}");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn transport_policy_config_for_cwd() -> Result<GitConfig> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd).ok();
+    let common_git_dir = git_dir
+        .as_deref()
+        .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
+    let context = match (&common_git_dir, &git_dir) {
+        (Some(common_git_dir), Some(git_dir)) => {
+            sley_config::ConfigIncludeContext::new(
+                Some(common_git_dir.clone()),
+                repo_current_branch_name(git_dir),
+            )
+        }
+        _ => sley_config::ConfigIncludeContext::new(None, None),
+    };
+    let mut config =
+        sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
+            .map_err(report_config_setup_error)?;
+    let parameters = injected_config_parameters()?;
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        &cwd,
+    )
+    .map_err(report_config_setup_error)?;
+    Ok(config)
+}
+
+fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
+    let mut config = transport_policy_config_for_cwd()?;
+    let cwd = env::current_dir()?;
+    if let Ok(current_git_dir) = discover_git_dir(&cwd) {
+        let current_common = common_git_dir_for_git_dir(&current_git_dir)?;
+        let requested_common = common_git_dir_for_git_dir(git_dir)?;
+        if current_common == requested_common {
+            return Ok(config);
+        }
+    }
+    let repo_config = read_repo_config(git_dir)?;
+    config.sections.extend(repo_config.sections);
+    Ok(config)
+}
+
 pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let cwd = env::current_dir()?;
     if let Ok(path) = ls_remote_repository_path(repository, &cwd)
@@ -4812,6 +4961,7 @@ fn ls_remote_repository_path(repository: &str, cwd: &Path) -> Result<PathBuf> {
         }
         RemoteTransport::File => Ok(PathBuf::from(percent_decode_url_path(&parsed.path)?)),
         RemoteTransport::Ssh
+        | RemoteTransport::Ext
         | RemoteTransport::Git
         | RemoteTransport::Http
         | RemoteTransport::Https => Err(GitError::Unsupported(
@@ -6275,6 +6425,7 @@ fn local_remote_git_dir(config: &GitConfig, name: &str, git_dir: &Path) -> Resul
         }
         RemoteTransport::File => PathBuf::from(percent_decode_url_path(&parsed.path)?),
         RemoteTransport::Ssh
+        | RemoteTransport::Ext
         | RemoteTransport::Git
         | RemoteTransport::Http
         | RemoteTransport::Https => {

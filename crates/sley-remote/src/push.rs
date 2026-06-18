@@ -402,9 +402,14 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
     // `config` and `progress` are part of the seam (mirroring `fetch`) but the
     // current push flow drives credentials from the caller-built provider and
     // returns its summary in `PushOutcome` rather than streaming progress, so
-    // neither is consumed yet. Kept named for the public API and future use.
-    let _ = request.config;
+    // progress is not consumed yet. Kept named for the public API and future use.
     let _ = &mut services.progress;
+    crate::protocol::check_transport_allowed(
+        scheme_for_push_destination(request.destination),
+        Some(request.config),
+        None,
+    )
+    .map_err(crate::protocol::transport_policy_git_error)?;
     match request.destination {
         #[cfg(feature = "http")]
         PushDestination::Http(remote_url) => plan_push_http(PushHttpRequest {
@@ -482,8 +487,13 @@ pub fn plan_push_actions(
     request: PushActionRequest<'_>,
     services: &mut PushServices<'_>,
 ) -> Result<PushPlan> {
-    let _ = request.config;
     let _ = &mut services.progress;
+    crate::protocol::check_transport_allowed(
+        scheme_for_push_destination(request.destination),
+        Some(request.config),
+        None,
+    )
+    .map_err(crate::protocol::transport_policy_git_error)?;
     let commands = receive_pack_commands_from_action_plan(request.format, request.plan)?;
     let command_forces = commands
         .iter()
@@ -596,6 +606,15 @@ pub fn plan_push_actions(
                 execution,
             })
         }
+    }
+}
+
+fn scheme_for_push_destination(destination: &PushDestination) -> &'static str {
+    match destination {
+        PushDestination::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        PushDestination::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        PushDestination::Git(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        PushDestination::Local { .. } => "file",
     }
 }
 

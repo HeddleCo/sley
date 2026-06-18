@@ -203,6 +203,12 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     let git_dir = layout.git_dir;
 
     let config = (services.configure)(&git_dir)?;
+    crate::protocol::check_transport_allowed(
+        scheme_for_clone_source(request.source),
+        Some(&config),
+        None,
+    )
+    .map_err(crate::protocol::transport_policy_git_error)?;
     let fetch_source = match request.source {
         #[cfg(feature = "http")]
         CloneSource::Http(remote) => FetchSource::Http(remote.clone()),
@@ -353,6 +359,15 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         branch_oid: Some(branch_oid),
         empty: false,
     })
+}
+
+fn scheme_for_clone_source(source: &CloneSource) -> &'static str {
+    match source {
+        CloneSource::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        CloneSource::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        CloneSource::Git(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        CloneSource::Local { .. } => "file",
+    }
 }
 
 fn fetch_local_partial_clone_checkout_blobs(

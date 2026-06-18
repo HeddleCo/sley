@@ -31,7 +31,7 @@ use sley_refs::{
     validate_ref_name, validate_symref_name, validate_symref_target,
 };
 use sley_remote::FetchOutcome;
-use sley_transport::{RemoteTransport, parse_remote_url};
+use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Reverse;
