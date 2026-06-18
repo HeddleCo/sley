@@ -1171,10 +1171,18 @@ struct UpdateRefStdinStagedVerify {
     expected_oid: ObjectId,
 }
 
+struct UpdateRefStdinStagedSymrefUpdate {
+    requested: String,
+    name: String,
+    target: String,
+    expected: Option<UpdateRefStdinSymrefExpected>,
+}
+
 enum UpdateRefStdinStagedChange {
     Write(UpdateRefStdinStagedWrite),
     Delete(UpdateRefStdinStagedDelete),
     Verify(UpdateRefStdinStagedVerify),
+    SymrefUpdate(UpdateRefStdinStagedSymrefUpdate),
 }
 
 /// The three states git distinguishes for an old-value (`<old-oid>`) field
@@ -1741,6 +1749,15 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
+            if transaction.is_implicit() {
+                transaction.stage_symref_update(UpdateRefStdinStagedSymrefUpdate {
+                    requested: effective.requested,
+                    name,
+                    target,
+                    expected,
+                });
+                return Ok(());
+            }
             transaction.mark_applied();
             update_ref_stdin_symref_update(
                 context,
@@ -1997,6 +2014,11 @@ impl UpdateRefStdinTransaction {
 
     fn stage_verify(&mut self, verify: UpdateRefStdinStagedVerify) {
         self.staged.push(UpdateRefStdinStagedChange::Verify(verify));
+    }
+
+    fn stage_symref_update(&mut self, update: UpdateRefStdinStagedSymrefUpdate) {
+        self.staged
+            .push(UpdateRefStdinStagedChange::SymrefUpdate(update));
     }
 
     fn start(&mut self, stdout: &mut dyn Write) -> Result<()> {
@@ -2315,6 +2337,15 @@ fn update_ref_stdin_commit_staged(
                     &verify.expected_oid,
                 )?;
             }
+            UpdateRefStdinStagedChange::SymrefUpdate(update) => {
+                update_ref_stdin_symref_update(
+                    context,
+                    &update.requested,
+                    &update.name,
+                    &update.target,
+                    update.expected,
+                )?;
+            }
         }
     }
     tx.commit()
@@ -2399,6 +2430,7 @@ fn update_ref_stdin_symref_create(
     tx.commit()
 }
 
+#[derive(Clone)]
 enum UpdateRefStdinSymrefExpected {
     Target(String),
     Oid(ObjectId),
@@ -3136,6 +3168,11 @@ fn check_update_ref_stdin_expected_named(
 ) -> Result<()> {
     let zero = zero_oid(format)?;
     if expected == &zero {
+        if matches!(current, Some(RefTarget::Symbolic(_)))
+            && resolve_ref_peeled(store, effective)?.is_none()
+        {
+            return update_ref_stdin_lock_failure(requested, "dangling symref already exists");
+        }
         if current.is_some() {
             return update_ref_stdin_lock_failure(requested, "reference already exists");
         }
