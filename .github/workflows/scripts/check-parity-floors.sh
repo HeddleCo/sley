@@ -455,8 +455,9 @@ declare -A FLOOR=(
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     [t4150-am.sh]=56
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
+    # wave-2 submodule (2026-06-18, integ/submodule): t4060 7->15 (diff porcelain options).
     [t4051-diff-function-context.sh]=32
-    [t4060-diff-submodule-option-diff-format.sh]=7
+    [t4060-diff-submodule-option-diff-format.sh]=15
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
@@ -470,7 +471,8 @@ declare -A FLOOR=(
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=307
-    [t7400-submodule-basic.sh]=87
+    # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
+    [t7400-submodule-basic.sh]=88
     [t7506-status-submodule.sh]=28
     [t7508-status.sh]=114
     [t4027-diff-submodule.sh]=18
@@ -567,7 +569,8 @@ declare -A FLOOR=(
     [t7604-merge-custom-message.sh]=8
     [t7607-merge-state.sh]=1
     [t7611-merge-abort.sh]=19
-    [t7401-submodule-summary.sh]=22
+    # wave-2 submodule (2026-06-18, integ/submodule): t7401 22->25 (submodule-summary porcelain).
+    [t7401-submodule-summary.sh]=25
     [t7407-submodule-foreach.sh]=21
     [t7406-submodule-update.sh]=54
     [t4203-mailmap.sh]=69
