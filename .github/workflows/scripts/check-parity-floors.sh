@@ -397,7 +397,7 @@ declare -A FLOOR=(
     # codex-wave-5 (2026-06-17): lib new commands — repo-info t1900 full@38 / replay t3650@43.
     [t1900-repo-info.sh]=38
     [t2107-update-index-basic.sh]=10
-    [t7810-grep.sh]=230
+    [t7810-grep.sh]=235
     # codex-wave-4-recovery: notes merge t3309 enroll@31 / t3311 enroll@24 (full pass).
     [t3309-notes-merge-auto-resolve.sh]=31
     [t3311-notes-merge-fanout.sh]=24
@@ -516,7 +516,22 @@ declare -A FLOOR=(
     # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
     [t7600-merge.sh]=50
     [t6120-describe.sh]=84
-    [t7900-maintenance.sh]=12
+    # wave-1 integration (2026-06-18, integ/wave1): codex/parity-maintenance lifted
+    # t7900-maintenance 12->37 (cmd_maintenance gain in pack.rs). Stable 37x3 on the
+    # integrated binary.
+    [t7900-maintenance.sh]=37
+    # wave-1 integration (2026-06-18, integ/wave1): NEW floors for the difftool epic
+    # (codex/parity-difftool: difftool.rs/mergetool.rs/tool_launch.rs) + status-cache
+    # (codex/parity-status-cache: workspace.rs/index.rs). All measured on the integrated
+    # binary; small bumps t7610 and t7063 re-measured 3x (stable LOW value banked).
+    # t7800-difftool 12->69 (+57), t7610-mergetool 1->5 (+4, stable 5x3), t7063-status-
+    # untracked-cache 14->15 (+1, stable 15x3). codex/parity-grep raised t7810 230->235.
+    # Neighbor watch-set measured base-2730844 vs integrated, ALL identical (zero
+    # interaction regression): t4015=102, t4013=172, t7600=50, t5304=13, t6500-gc=14,
+    # t7700-repack=17, t5319=77, t5324=11, t7508=114, t2107=10, t7008=5.
+    [t7800-difftool.sh]=69
+    [t7610-mergetool.sh]=5
+    [t7063-status-untracked-cache.sh]=15
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
     [t3650-replay-basics.sh]=43

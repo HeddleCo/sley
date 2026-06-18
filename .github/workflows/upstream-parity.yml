@@ -189,6 +189,7 @@ jobs:
             t7400-submodule-basic.sh
             t7506-status-submodule.sh
             t7508-status.sh
+            t7063-status-untracked-cache.sh
             t7810-grep.sh
             t8001-annotate.sh
             t8002-blame.sh
@@ -213,6 +214,8 @@ jobs:
             t5611-clone-config.sh
             t7502-commit-porcelain.sh
             t7600-merge.sh
+            t7610-mergetool.sh
+            t7800-difftool.sh
             t7900-maintenance.sh
             t1060-object-corruption.sh
             t2203-add-intent.sh
