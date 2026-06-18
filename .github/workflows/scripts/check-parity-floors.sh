@@ -406,7 +406,12 @@ declare -A FLOOR=(
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
     # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).
-    [t6423-merge-rename-directories.sh]=34
+    # codex-wave-9 (dir-rename engine): dirs_removed parity (recreated old dirs block
+    # false dir-renames), rename/rename(1to2) split higher-stages, transitive dest
+    # remapping for rename/delete. t6423 34->41 (raw 41/82, 2 known breakages).
+    # Side gains banked: t6402 34->35, t6422 NEW@6.
+    [t6423-merge-rename-directories.sh]=41
+    [t6422-merge-rename-corner-cases.sh]=6
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
@@ -550,7 +555,8 @@ declare -A FLOOR=(
     [t3701-add-interactive.sh]=98
     [t4011-diff-symlink.sh]=1
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
-    [t6402-merge-rename.sh]=34
+    # codex-wave-9 dir-rename engine side-gain: 34->35.
+    [t6402-merge-rename.sh]=35
     [t5400-send-pack.sh]=12
     [t5404-tracking-branches.sh]=6
     [t5543-atomic-push.sh]=7

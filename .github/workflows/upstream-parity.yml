@@ -184,6 +184,7 @@ jobs:
             t6120-describe.sh
             t6300-for-each-ref.sh
             t6302-for-each-ref-filter.sh
+            t6422-merge-rename-corner-cases.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
             t7102-reset.sh
