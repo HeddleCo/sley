@@ -749,16 +749,17 @@ pub fn install_fetch_pack_via_local_upload_pack(
         return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    // A deepen request must always run: even when every want is already present
-    // the shallow boundary may move (mirrors the SSH path).
-    if deepen.is_none()
-        && wants
-            .iter()
-            .map(|want| local_db.contains(want))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .all(|contains| contains)
-    {
+    let all_wants_present = wants
+        .iter()
+        .map(|want| local_db.contains(want))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .all(|contains| contains);
+    let deepen_noop = match deepen {
+        Some(plan) => plan.shallow_info.is_empty() && plan.extra_wants.is_empty(),
+        None => true,
+    };
+    if all_wants_present && deepen_noop {
         return Ok(Vec::new());
     }
 

@@ -1493,6 +1493,75 @@ mod tests {
         );
     }
 
+    fn pack_file_count(git_dir: &Path) -> usize {
+        fs::read_dir(git_dir.join("objects/pack"))
+            .expect("pack directory should read")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+            .count()
+    }
+
+    #[test]
+    fn same_depth_shallow_local_fetch_does_not_install_pack() {
+        let remote = temp_repo("remote-shallow-noop");
+        let local = temp_repo("local-shallow-noop");
+        let tip = commit_on(&remote, "main", "tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let mut options = default_options();
+        options.depth = Some(1);
+        let refspecs = ["refs/heads/main:refs/remotes/origin/main".to_string()];
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &refspecs,
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("initial shallow fetch should succeed");
+        let pack_count = pack_file_count(&local);
+        let shallow = crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+            .expect("shallow file should read");
+
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &refspecs,
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+        .expect("same-depth shallow fetch should succeed");
+
+        assert_eq!(pack_file_count(&local), pack_count);
+        assert_eq!(
+            crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+                .expect("shallow file should read"),
+            shallow
+        );
+        assert_eq!(shallow, vec![tip]);
+    }
+
     #[test]
     fn failed_local_fetch_does_not_partially_mutate_refs_or_fetch_head() {
         let remote = temp_repo("remote-missing");
