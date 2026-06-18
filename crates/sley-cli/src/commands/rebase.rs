@@ -80,6 +80,11 @@ fn rebase_usage_error() -> GitError {
     GitError::Exit(129)
 }
 
+fn option_requires_value(name: &str) -> GitError {
+    eprintln!("error: option `{name}' requires a value");
+    rebase_usage_error()
+}
+
 fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
     let mut out = RebaseArgs {
         action: RebaseAction::None,
@@ -132,6 +137,15 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             "--keep-base" => out.keep_base = true,
             "-i" | "--interactive" => out.interactive = true,
+            "-ix" | "-xi" => {
+                out.interactive = true;
+                index += 1;
+                let value = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| option_requires_value("exec"))?;
+                out.exec.push(value);
+            }
             "-m" | "--merge" => out.merge_backend = true,
             "--apply" => out.apply_backend = true,
             "--continue" => out.action = RebaseAction::Continue,
@@ -177,7 +191,10 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--ff" => out.force = false,
             "-x" | "--exec" => {
                 index += 1;
-                let value = args.get(index).cloned().ok_or_else(rebase_usage_error)?;
+                let value = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| option_requires_value("exec"))?;
                 out.exec.push(value);
             }
             _ if arg.starts_with("--exec=") => {
