@@ -517,7 +517,12 @@ fn count_commands(items: &[RebaseTodoItem]) -> usize {
         .count()
 }
 
-fn serialize_item(item: &RebaseTodoItem, short: bool, db: &FileObjectDatabase) -> String {
+fn serialize_item(
+    item: &RebaseTodoItem,
+    short: bool,
+    abbreviate: bool,
+    db: &FileObjectDatabase,
+) -> String {
     let oid_text = item.oid.as_ref().map(|oid| {
         if short {
             find_unique_abbrev_hex(db, oid)
@@ -525,7 +530,15 @@ fn serialize_item(item: &RebaseTodoItem, short: bool, db: &FileObjectDatabase) -
             oid.to_hex()
         }
     });
-    seq::todo_item_to_string(item, oid_text.as_deref())
+    let mut text = seq::todo_item_to_string(item, oid_text.as_deref());
+    if abbreviate
+        && item.command != TodoCommand::Comment
+        && let Some(nick) = item.command.nick()
+        && let Some(rest) = text.strip_prefix(item.command.as_str())
+    {
+        text = format!("{nick}{rest}");
+    }
+    text
 }
 
 fn find_unique_abbrev_hex(db: &FileObjectDatabase, oid: &ObjectId) -> String {
@@ -540,10 +553,15 @@ fn find_unique_abbrev_hex(db: &FileObjectDatabase, oid: &ObjectId) -> String {
     hex[..width].to_string()
 }
 
-fn todo_to_text(items: &[RebaseTodoItem], short: bool, db: &FileObjectDatabase) -> String {
+fn todo_to_text(
+    items: &[RebaseTodoItem],
+    short: bool,
+    abbreviate: bool,
+    db: &FileObjectDatabase,
+) -> String {
     let mut out = String::new();
     for item in items {
-        out.push_str(&serialize_item(item, short, db));
+        out.push_str(&serialize_item(item, short, abbreviate, db));
         out.push('\n');
     }
     out
@@ -560,7 +578,9 @@ fn write_todo_file(
     shortonto: Option<&str>,
     db: &FileObjectDatabase,
 ) -> Result<()> {
-    let mut buf = todo_to_text(items, short, db);
+    let abbreviate =
+        help && rebase_config_bool(ctx, "rebase", "abbreviateCommands").unwrap_or(false);
+    let mut buf = todo_to_text(items, short, abbreviate, db);
     if help {
         let comment = comment_char(&ctx.git_dir) as char;
         let check_error = missing_commit_check_level(ctx) == MissingCommitCheck::Error;
@@ -592,10 +612,10 @@ fn save_todo(ctx: &Ctx, todo: &TodoList, db: &FileObjectDatabase, reschedule: bo
     };
     fs::write(
         ctx.state_path("git-rebase-todo"),
-        todo_to_text(tail, false, db),
+        todo_to_text(tail, false, false, db),
     )?;
     if !reschedule && next > 0 {
-        let line = serialize_item(&todo.items[next - 1], false, db);
+        let line = serialize_item(&todo.items[next - 1], false, false, db);
         let done_path = ctx.state_path("done");
         let mut existing = fs::read(&done_path).unwrap_or_default();
         existing.extend_from_slice(line.as_bytes());
@@ -2067,7 +2087,7 @@ fn complete_action(
             skipped += 1;
         }
         if skipped > 0 {
-            let done_text = todo_to_text(&todo.items[..skipped], false, db);
+            let done_text = todo_to_text(&todo.items[..skipped], false, false, db);
             fs::write(ctx.state_path("done"), done_text)?;
             todo.items.drain(..skipped);
             todo.done_nr = skipped;
@@ -2400,7 +2420,7 @@ fn reschedule_current(
 ) -> Result<()> {
     eprintln!("hint: Could not execute the todo command");
     eprintln!("hint: ");
-    eprintln!("hint:     {}", serialize_item(item, false, db));
+    eprintln!("hint:     {}", serialize_item(item, false, false, db));
     eprintln!("hint: ");
     eprintln!("hint: It has been rescheduled; To edit the command before continuing, please");
     eprintln!("hint: edit the todo list first:");
@@ -2416,7 +2436,7 @@ fn reschedule_current(
 
 fn reread_todo_if_changed(ctx: &Ctx, db: &FileObjectDatabase, todo: &mut TodoList) -> Result<()> {
     let on_disk = fs::read_to_string(ctx.state_path("git-rebase-todo")).unwrap_or_default();
-    let expected = todo_to_text(&todo.items[todo.current + 1..], false, db);
+    let expected = todo_to_text(&todo.items[todo.current + 1..], false, false, db);
     if on_disk != expected {
         let mut reloaded = read_populate_todo(ctx, db)?;
         reloaded.done_nr = todo.done_nr;

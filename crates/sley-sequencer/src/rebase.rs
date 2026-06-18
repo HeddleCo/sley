@@ -77,7 +77,7 @@ impl TodoCommand {
         }
     }
 
-    fn nick(self) -> Option<char> {
+    pub fn nick(self) -> Option<char> {
         match self {
             TodoCommand::Pick => Some('p'),
             TodoCommand::Edit => Some('e'),
