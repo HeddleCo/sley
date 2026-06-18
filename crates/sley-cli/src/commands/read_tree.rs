@@ -52,6 +52,7 @@ enum ReadTreeMode {
 struct ReadTreeArgs {
     mode: ReadTreeMode,
     update_worktree: bool,
+    sparse_checkout: bool,
     empty: bool,
     /// git's `-n` / `--dry-run`: compute (and validate) the merge without
     /// writing the index or touching the worktree. Used by the upstream test
@@ -107,6 +108,9 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
+                if parsed.update_worktree && parsed.sparse_checkout {
+                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                }
             }
         }
         ReadTreeMode::Reset => {
@@ -127,6 +131,9 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             }
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
+                if parsed.update_worktree && parsed.sparse_checkout {
+                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                }
             }
         }
         ReadTreeMode::Prefix(prefix) => {
@@ -145,6 +152,9 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             }
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
+                if parsed.update_worktree && parsed.sparse_checkout {
+                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                }
             }
         }
         ReadTreeMode::Merge => {
@@ -162,10 +172,58 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             )?;
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
+                if parsed.update_worktree && parsed.sparse_checkout {
+                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                }
             }
         }
     }
 
+    Ok(())
+}
+
+fn apply_read_tree_sparse_checkout(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let sparse_enabled = worktree_config
+        .get_bool("core", None, "sparseCheckout")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return Ok(());
+    }
+    let sparse_file = git_dir.join("info").join("sparse-checkout");
+    if !sparse_file.exists() {
+        return Ok(());
+    }
+    let cone = worktree_config
+        .get_bool("core", None, "sparseCheckoutCone")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
+        .unwrap_or(false);
+    let sparse_index = cone
+        && worktree_config
+            .get_bool("index", None, "sparse")
+            .or_else(|| repo_config.get_bool("index", None, "sparse"))
+            .unwrap_or(false);
+    let bytes = fs::read(sparse_file)?;
+    let mut patterns: Vec<Vec<u8>> = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    if patterns.last().map(Vec::is_empty) == Some(true) {
+        patterns.pop();
+    }
+    let sparse = sley_worktree::SparseCheckout {
+        patterns,
+        sparse_index,
+    };
+    let mode = if cone {
+        sley_worktree::SparseCheckoutMode::Cone
+    } else {
+        sley_worktree::SparseCheckoutMode::Full
+    };
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    sley_worktree::apply_sparse_checkout_with_mode(&worktree_root, git_dir, format, &sparse, mode)?;
     Ok(())
 }
 
@@ -174,6 +232,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
 fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     let mut mode: Option<ReadTreeMode> = None;
     let mut update_worktree = false;
+    let mut sparse_checkout = true;
     let mut empty = false;
     let mut dry_run = false;
     let mut trees = Vec::new();
@@ -211,10 +270,10 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             | "--no-trivial"
             | "--aggressive"
             | "--no-aggressive"
-            | "--no-sparse-checkout"
-            | "--sparse-checkout"
             | "--debug-unpack"
             | "--no-debug-unpack" => {}
+            "--no-sparse-checkout" => sparse_checkout = false,
+            "--sparse-checkout" => sparse_checkout = true,
             "-n" | "--dry-run" => dry_run = true,
             "--no-dry-run" => dry_run = false,
             value => {
@@ -242,6 +301,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
         return Ok(ReadTreeArgs {
             mode,
             update_worktree,
+            sparse_checkout,
             empty,
             dry_run,
             trees,
@@ -253,6 +313,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     Ok(ReadTreeArgs {
         mode,
         update_worktree,
+        sparse_checkout,
         empty,
         dry_run,
         trees,

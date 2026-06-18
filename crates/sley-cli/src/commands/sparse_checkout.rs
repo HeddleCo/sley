@@ -711,6 +711,8 @@ fn build_pattern_content(
             dirs.push(validate_cone_dir(pattern, skip_checks)?);
         }
         Ok(build_cone_file(&dirs))
+    } else if patterns.is_empty() {
+        Ok(b"/*\n!/*/\n".to_vec())
     } else {
         Ok(serialize_noncone_lines(patterns))
     }
@@ -819,6 +821,18 @@ fn validate_cone_dir(arg: &[u8], skip_checks: bool) -> Result<Vec<u8>> {
         eprintln!("fatal: specify directories rather than patterns (no leading slash)");
         return Err(GitError::Exit(128));
     }
+    if !skip_checks && arg.starts_with(b"!") {
+        eprintln!(
+            "fatal: specify directories rather than patterns.  If your directory starts with a '!', pass --skip-checks"
+        );
+        return Err(GitError::Exit(128));
+    }
+    if !skip_checks && arg.iter().any(|byte| matches!(*byte, b'*' | b'?' | b'[' | b']')) {
+        eprintln!(
+            "fatal: specify directories rather than patterns.  If your directory really has any of '*?[]\\' in it, pass --skip-checks"
+        );
+        return Err(GitError::Exit(128));
+    }
     Ok(normalize_cone_dir(arg))
 }
 
@@ -903,16 +917,40 @@ fn build_cone_file(dirs: &[Vec<u8>]) -> Vec<u8> {
     out.extend_from_slice(b"/*\n!/*/\n");
     for parent in &parents {
         out.push(b'/');
-        out.extend_from_slice(parent);
+        write_escaped_cone_component(&mut out, parent);
         out.extend_from_slice(b"/\n");
         out.extend_from_slice(b"!/");
-        out.extend_from_slice(parent);
+        write_escaped_cone_component(&mut out, parent);
         out.extend_from_slice(b"/*/\n");
     }
     for dir in &recursive {
         out.push(b'/');
-        out.extend_from_slice(dir);
+        write_escaped_cone_component(&mut out, dir);
         out.extend_from_slice(b"/\n");
+    }
+    out
+}
+
+fn write_escaped_cone_component(out: &mut Vec<u8>, path: &[u8]) {
+    for byte in path {
+        if matches!(*byte, b'*' | b'?' | b'[' | b'\\') {
+            out.push(b'\\');
+        }
+        out.push(*byte);
+    }
+}
+
+fn unescape_cone_component(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut iter = path.iter().copied();
+    while let Some(byte) = iter.next() {
+        if byte == b'\\'
+            && let Some(next @ (b'*' | b'?' | b'[' | b'\\')) = iter.next()
+        {
+            out.push(next);
+            continue;
+        }
+        out.push(byte);
     }
     out
 }
@@ -1087,7 +1125,7 @@ fn cone_list_entries(patterns: &[Vec<u8>]) -> Vec<Vec<u8>> {
             // leaf, so it does not appear in `list`.
             continue;
         }
-        let dir = dir.to_vec();
+        let dir = unescape_cone_component(dir);
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }

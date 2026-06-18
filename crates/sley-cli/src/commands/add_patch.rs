@@ -21,6 +21,7 @@ use sley_core::{GitError, Result};
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum PatchMode {
     Add,
+    Reset,
 }
 
 /// Per-session config knobs (context, inter-hunk-context, auto-advance).
@@ -565,7 +566,7 @@ const NAV_HELP: &str = "j - go to the next undecided hunk, roll over at the bott
 
 /// Run the `add -p` REPL over the given paths. Reads decisions from `stdin`.
 pub(crate) fn run_add_patch(
-    _mode: PatchMode,
+    mode: PatchMode,
     paths: &[String],
     stdin: &mut impl BufRead,
     cfg: PatchConfig,
@@ -574,7 +575,10 @@ pub(crate) fn run_add_patch(
     // `parse_diff` command build: `diff-files [--unified=<n>]
     // [--inter-hunk-context=<n>] [--diff-algorithm=<algo>] --no-color
     // --ignore-submodules=dirty -p -- <pathspec>...`.
-    let mut owned: Vec<String> = vec!["diff-files".to_string()];
+    let mut owned: Vec<String> = match mode {
+        PatchMode::Add => vec!["diff-files".to_string()],
+        PatchMode::Reset => vec!["diff".to_string(), "--cached".to_string()],
+    };
     if let Some(context) = cfg.context {
         owned.push(format!("--unified={context}"));
     }
@@ -652,11 +656,15 @@ pub(crate) fn run_add_patch(
     }
 
     // Apply: for each file, reconstruct the index blob with USE_HUNK hunks and
-    // stage it.
+    // stage it. Reset mode applies the selected cached-diff hunks in reverse,
+    // which unstages them back to HEAD.
     let mut applied_any = false;
     for fd in &files {
         if fd.hunks.iter().any(|h| h.use_hunk == HunkUse::Use) {
-            apply_file_to_index(fd)?;
+            match mode {
+                PatchMode::Add => apply_file_to_index(fd)?,
+                PatchMode::Reset => apply_file_to_index_reverse(fd)?,
+            }
             applied_any = true;
         }
     }
@@ -1749,6 +1757,28 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
     Ok(())
 }
 
+fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
+    let content_used = any_content_hunk_used(fd);
+    if !content_used {
+        return Ok(());
+    }
+
+    let spec = format!(":{}", fd.path);
+    let base = run_capture(&["cat-file", "blob", &spec], None).unwrap_or_default();
+    let base_text = String::from_utf8_lossy(&base).into_owned();
+    let new_content = apply_hunks_reverse(&base_text, fd);
+    let oid = run_capture(&["hash-object", "-w", "--stdin"], Some(new_content.as_bytes()))
+        .map_err(|e| GitError::Io(e.to_string()))?;
+    let oid = String::from_utf8_lossy(&oid).trim().to_string();
+    let mode = format!("{:o}", fd.mode);
+    let args = ["update-index", "--cacheinfo", &mode, &oid, &fd.path];
+    let (_out, ok) = run_capture_status(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+    if !ok {
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
 /// After staging hunks, refresh the index stat cache so `git diff-files` stays
 /// clean for paths whose worktree now matches the freshly-staged blob (t3701
 /// "index is refreshed after applying patch").
@@ -1820,4 +1850,52 @@ fn apply_hunks(base: &str, fd: &FileDiff) -> String {
         // keep empty
     }
     result
+}
+
+fn apply_hunks_reverse(base: &str, fd: &FileDiff) -> String {
+    let had_final_nl = base.ends_with('\n');
+    let mut base_lines: Vec<&str> = base.split('\n').collect();
+    if had_final_nl {
+        base_lines.pop();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+
+    for h in &fd.hunks {
+        if h.use_hunk != HunkUse::Use || h.is_mode_change {
+            continue;
+        }
+        let start = (h.new_offset - 1).max(0) as usize;
+        while cursor < start && cursor < base_lines.len() {
+            out.push(base_lines[cursor].to_string());
+            cursor += 1;
+        }
+        for line in &h.body {
+            let marker = line.as_bytes().first().copied().unwrap_or(b' ');
+            let rest = &line[1.min(line.len())..];
+            match marker {
+                b' ' => {
+                    out.push(rest.to_string());
+                    cursor += 1;
+                }
+                b'+' => {
+                    cursor += 1;
+                }
+                b'-' => {
+                    out.push(rest.to_string());
+                }
+                b'\\' => {}
+                _ => {}
+            }
+        }
+    }
+    while cursor < base_lines.len() {
+        out.push(base_lines[cursor].to_string());
+        cursor += 1;
+    }
+    let mut s = out.join("\n");
+    if had_final_nl {
+        s.push('\n');
+    }
+    s
 }

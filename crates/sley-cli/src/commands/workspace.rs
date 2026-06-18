@@ -169,9 +169,28 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if patch {
-        return Err(GitError::Unsupported(
-            "reset patch selection is not implemented".into(),
-        ));
+        let mut stdin = io::stdin().lock();
+        let mut cfg = commands::add_patch::PatchConfig {
+            auto_advance: !no_auto_advance,
+            ..commands::add_patch::PatchConfig::default()
+        };
+        cfg.reset_interactive = sley_config::read_repo_config(
+            &discover_git_dir(&env::current_dir()?)?,
+            None,
+        )
+        .ok()
+        .and_then(|config| {
+            config
+                .get("interactive", None, "reset")
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default();
+        return commands::add_patch::run_add_patch(
+            commands::add_patch::PatchMode::Reset,
+            &positionals,
+            &mut stdin,
+            cfg,
+        );
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -3665,6 +3684,7 @@ fn cmd_commit_long_status_preview(
         untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
         comment_prefix: status_comment_prefix(&config),
         submodule_summary,
+        sparse_footer: None,
     };
     print_status_long(&git_dir, format, entries, &display)?;
     if committable {
@@ -4370,6 +4390,7 @@ fn render_commit_template_status(
         // status.displayCommentPrefix.
         comment_prefix: Some(comment_char.to_string()),
         submodule_summary,
+        sparse_footer: None,
     };
     let sink = build_status_long_sink(git_dir, format, entries, &display)?;
     let mut buf: Vec<u8> = Vec::new();
@@ -4816,6 +4837,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
             comment_prefix,
             submodule_summary,
+            sparse_footer: status_sparse_footer(&git_dir, format)?,
         };
         print_status_long(&git_dir, format, entries, &display)?;
         // `git status -v` appends the staged diff (HEAD vs index). `-vv` instead
@@ -4867,6 +4889,16 @@ struct StatusLongDisplay {
     /// Rendered `Submodule changes to be committed:` /
     /// `Submodules changed but not updated:` sections (status.submodulesummary).
     submodule_summary: SubmoduleSummarySections,
+    /// Long-status sparse-checkout trailer, omitted from porcelain and short
+    /// formats. A sparse index uses Git's terse wording; a full sparse checkout
+    /// reports the tracked-file percentage present in the worktree.
+    sparse_footer: Option<StatusSparseFooter>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StatusSparseFooter {
+    SparseIndex,
+    Percentage(u8),
 }
 
 /// Upstream wt-status.c short_submodule_status(): in `--short` output a
@@ -6076,6 +6108,7 @@ fn build_status_long_sink(
         untracked_suppressed,
         comment_prefix,
         submodule_summary,
+        sparse_footer,
     } = display;
     let commit_preview = *commit_preview;
     let show_stash = *show_stash;
@@ -6314,7 +6347,67 @@ fn build_status_long_sink(
             sink.line(format!("Your stash currently has {stash_count} entries"));
         }
     }
+    if let Some(footer) = sparse_footer {
+        match footer {
+            StatusSparseFooter::SparseIndex => {
+                sink.line("You are in a sparse checkout.");
+            }
+            StatusSparseFooter::Percentage(percent) => {
+                sink.line(format!(
+                    "You are in a sparse checkout with {percent}% of tracked files present."
+                ));
+            }
+        }
+        sink.blank();
+    }
     Ok(sink)
+}
+
+fn status_sparse_footer(git_dir: &Path, format: ObjectFormat) -> Result<Option<StatusSparseFooter>> {
+    let sparse_enabled = GitConfig::read(git_dir.join("config.worktree"))
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
+        == Some(true)
+        || read_repo_config(git_dir)
+            .ok()
+            .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
+            == Some(true);
+    if !sparse_enabled {
+        return Ok(None);
+    }
+    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    if worktree_config
+        .get_bool("index", None, "sparse")
+        .unwrap_or(false)
+    {
+        return Ok(Some(StatusSparseFooter::SparseIndex));
+    }
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(None);
+    };
+    if index.is_sparse()
+        || index
+            .entries
+            .iter()
+            .any(|entry| entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        return Ok(Some(StatusSparseFooter::SparseIndex));
+    }
+    let total = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+        .count();
+    if total == 0 {
+        return Ok(None);
+    }
+    let present = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal && !entry.is_skip_worktree())
+        .count();
+    let percent = ((present * 100) / total).min(100) as u8;
+    Ok(Some(StatusSparseFooter::Percentage(percent)))
 }
 
 fn status_suppress_staged_unstage_hint(git_dir: &Path) -> bool {
