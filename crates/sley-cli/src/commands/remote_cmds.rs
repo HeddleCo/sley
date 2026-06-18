@@ -2517,6 +2517,12 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    if read_repo_config(&git_dir)?
+        .get_bool("core", None, "bare")
+        .unwrap_or(false)
+    {
+        options.update_head_ok = true;
+    }
     // `git fetch --all`: iterate every configured remote, fetching each with its
     // own configured refspecs. An explicit `<remote>` is incompatible.
     if fetch_all_remotes {
@@ -5271,7 +5277,16 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     match mirror {
         RemoteAddMirror::Fetch | RemoteAddMirror::Both => {
-            entries.push(ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())));
+            if branches.is_empty() {
+                entries.push(ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())));
+            } else {
+                for branch in &branches {
+                    entries.push(ConfigEntry::new(
+                        "fetch",
+                        Some(remote_add_fetch_refspec(name, branch, mirror)),
+                    ));
+                }
+            }
         }
         RemoteAddMirror::Push => {
             entries.push(ConfigEntry::new("mirror", Some("true".into())));
@@ -5293,7 +5308,7 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
         }
     }
     if let Some(tag_opt) = tag_opt {
-        entries.push(ConfigEntry::new("tagopt", Some(tag_opt)));
+        entries.push(ConfigEntry::new("tagOpt", Some(tag_opt)));
     }
     if mirror == RemoteAddMirror::Both {
         entries.push(ConfigEntry::new("mirror", Some("true".into())));
@@ -5520,6 +5535,15 @@ pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
             if let Some(list) = config.get("remotes", None, group) {
                 for name in list.split_whitespace() {
                     push_unique(name.to_string(), &mut remotes);
+                }
+            } else if group == "default" {
+                for name in remote_names(&config) {
+                    let skip = config
+                        .get_bool("remote", Some(&name), "skipdefaultupdate")
+                        .unwrap_or(false);
+                    if !skip {
+                        push_unique(name, &mut remotes);
+                    }
                 }
             } else {
                 push_unique(group.clone(), &mut remotes);
@@ -6349,8 +6373,13 @@ fn write_remote_show_query(
     }
     writeln!(stdout, "  HEAD branch: {remote_head_branch}")?;
 
+    let fetch_refspecs = remote_config_values(config, name, "fetch");
     let skipped_branches = remote_negative_fetch_branches(config, name);
-    let remote_branches = branch_names_with_prefix(&remote_refs, "refs/heads/");
+    let remote_branches = if fetch_refspecs.is_empty() {
+        Vec::new()
+    } else {
+        branch_names_with_prefix(&remote_refs, "refs/heads/")
+    };
     let local_branches = remote_tracking_branch_names(refs, name);
     let local_branch_set = local_branches.iter().cloned().collect::<BTreeSet<_>>();
     let remote_branch_set = remote_branches.iter().cloned().collect::<BTreeSet<_>>();
@@ -6392,8 +6421,10 @@ fn write_remote_show_query(
     let pull_branches = remote_pull_branch_configs(config, name);
     if !pull_branches.is_empty() {
         write_remote_show_pull_config(stdout, &pull_branches)?;
+    }
+    let push_rows = remote_show_query_push_rows(config, name, refs, &remote_refs);
+    if !push_rows.is_empty() {
         let local_db = FileObjectDatabase::from_git_dir(git_dir, remote_format);
-        let push_rows = remote_show_query_push_rows(config, name, refs, &remote_refs);
         write_remote_show_push_config(
             stdout,
             &push_rows,
@@ -6432,14 +6463,21 @@ fn write_remote_show_no_query(
         }
     }
     writeln!(stdout, "  HEAD branch: (not queried)")?;
-    let remote_branches = remote_tracking_branch_names(refs, name);
+    let pull_branches = remote_pull_branch_configs(config, name);
+    let mut remote_branches = remote_tracking_branch_names(refs, name)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for pull in &pull_branches {
+        for merge in &pull.merges {
+            remote_branches.insert(merge.clone());
+        }
+    }
     if !remote_branches.is_empty() {
         writeln!(stdout, "  Remote branches: (status not queried)")?;
         for branch in remote_branches {
             writeln!(stdout, "    {branch}")?;
         }
     }
-    let pull_branches = remote_pull_branch_configs(config, name);
     if !pull_branches.is_empty() {
         write_remote_show_pull_config(stdout, &pull_branches)?;
     }
