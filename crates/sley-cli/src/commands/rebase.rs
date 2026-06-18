@@ -2345,6 +2345,7 @@ fn checkout_onto_base(
         ctx.git_dir.join("ORIG_HEAD"),
         format!("{}\n", opts.orig_head),
     )?;
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
     Ok(())
 }
 
@@ -3556,6 +3557,7 @@ fn machine_commit(
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(ctx.git_dir.join("AUTO_MERGE"));
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
 
     if let Some(old_tree) = old_tree_for_summary {
         print_branch_commit_summary(db, &ctx.git_dir, ctx.format, &new_oid, &message)?;

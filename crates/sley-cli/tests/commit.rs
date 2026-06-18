@@ -114,6 +114,67 @@ fn create_initial_commit(program: &str, root: &Path) {
     );
 }
 
+#[test]
+fn commit_pathspec_pre_commit_sees_selected_worktree_content() {
+    let root = unique_temp_dir("commit-pathspec-pre-commit");
+    let result = std::panic::catch_unwind(|| {
+        fs::create_dir_all(&root).expect("create repo dir");
+        let sley = env!("CARGO_BIN_EXE_sley");
+        run_success(sley, &root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked file");
+        run_success(sley, &root, &["add", "tracked.txt"]);
+        let initial = run_output_with_identity(sley, &root, &["commit", "-m", "initial"]);
+        assert!(
+            initial.status.success(),
+            "initial commit failed: {}",
+            String::from_utf8_lossy(&initial.stderr)
+        );
+
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).expect("create hooks dir");
+        let hook = hooks.join("pre-commit");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\n\"{sley}\" diff --cached --check\n").as_bytes(),
+        )
+        .expect("write pre-commit hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook).expect("hook metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook, permissions).expect("chmod hook");
+        }
+
+        fs::write(root.join("tracked.txt"), b"bad \n").expect("write bad whitespace");
+        let rejected =
+            run_output_with_identity(sley, &root, &["commit", "-m", "bad", "tracked.txt"]);
+        assert!(
+            !rejected.status.success(),
+            "pathspec commit should have failed pre-commit\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        let status = run_output(sley, &root, &["status", "--short"]);
+        assert_eq!(status.stdout, b" M tracked.txt\n");
+
+        let accepted = run_output_with_identity(
+            sley,
+            &root,
+            &["commit", "--no-verify", "-m", "bad", "tracked.txt"],
+        );
+        assert!(
+            accepted.status.success(),
+            "--no-verify pathspec commit failed: {}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+    });
+    let _ = fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn remove_message_fixtures(root: &Path) {
     for name in [
         "message-empty.txt",

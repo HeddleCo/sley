@@ -2586,7 +2586,12 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let in_merge = git_dir.join("MERGE_HEAD").is_file();
     let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
     let in_revert = git_dir.join("REVERT_HEAD").is_file();
+    let in_rebase = rebase_in_progress(&git_dir);
     if !pathspec_args.is_empty() {
+        if in_rebase {
+            eprintln!("fatal: cannot do a partial commit during a rebase.");
+            return Err(GitError::Exit(128));
+        }
         if in_merge {
             eprintln!("fatal: cannot do a partial commit during a merge.");
             return Err(GitError::Exit(128));
@@ -2597,6 +2602,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         }
     }
     if amend {
+        if in_rebase {
+            eprintln!("fatal: You are in the middle of a rebase -- cannot amend.");
+            return Err(GitError::Exit(128));
+        }
         if in_merge {
             eprintln!("fatal: You are in the middle of a merge -- cannot amend.");
             return Err(GitError::Exit(128));
@@ -2771,12 +2780,30 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         || reuse_message.is_some()
         || fixup_commit.is_some()
         || squash_commit.is_some();
-    let in_rebase = rebase_in_progress(&git_dir);
     let use_editor = !in_rebase
         && !in_merge
         && (edit_flag == Some(true) || (edit_flag != Some(false) && !had_message_source));
-    if !no_verify {
-        commands::hooks::run_hook("pre-commit", commands::hooks::HookRun::default())?;
+    let partial_index_snapshot = if !pathspec_args.is_empty() {
+        Some(read_index_snapshot(&git_dir)?)
+    } else {
+        None
+    };
+    if partial_index_snapshot.is_some()
+        && let Err(err) = stage_partial_commit_paths(&git_dir, format, &pathspec_args)
+    {
+        if let Some(snapshot) = &partial_index_snapshot {
+            let _ = restore_index_snapshot(&git_dir, snapshot);
+        }
+        return Err(err);
+    }
+    if !no_verify
+        && let Err(err) =
+            commands::hooks::run_hook("pre-commit", commands::hooks::HookRun::default())
+    {
+        if let Some(snapshot) = &partial_index_snapshot {
+            let _ = restore_index_snapshot(&git_dir, snapshot);
+        }
+        return Err(err);
     }
     // Resolve the cleanup mode now that `use_editor` is known. An explicit
     // `--cleanup`/`--no-cleanup` wins; otherwise `commit.cleanup` config; absent
@@ -3247,12 +3274,86 @@ fn commit_partial_paths(
     message: Vec<u8>,
     quiet: bool,
 ) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let refs = FileRefStore::new(git_dir, format);
+    let head = commands::merge_rebase::head_commit_oid(&refs)?;
+    let mut tree_map = match &head {
+        Some(oid) => {
+            let tree = commands::merge_rebase::commit_tree_oid(&db, format, oid)?;
+            stash_tree_entry_map(&db, format, &tree)?
+        }
+        None => BTreeMap::new(),
+    };
+    let rel_paths = stage_partial_commit_paths(git_dir, format, paths)?;
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    // Overlay the staged state of the matched paths onto HEAD's tree.
+    let updated_index = Index::parse(&fs::read(&index_path)?, format)?;
+    let staged: BTreeMap<Vec<u8>, (u32, ObjectId)> = updated_index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .map(|entry| (entry.path.clone().into_bytes(), (entry.mode, entry.oid)))
+        .collect();
+    for rel in &rel_paths {
+        match staged.get(rel) {
+            Some(entry) => {
+                tree_map.insert(rel.clone(), *entry);
+            }
+            None => {
+                tree_map.remove(rel);
+            }
+        }
+    }
+    let tree = write_tree_from_entry_map(&db, format, &tree_map)?;
+    let new_oid = sley_sequencer::create_commit(
+        &mut FileObjectDatabase::from_git_dir(git_dir, format),
+        sley_sequencer::CommitCreate {
+            tree,
+            parents: head.iter().copied().collect(),
+            author,
+            committer: committer.clone(),
+            message: message.clone(),
+            encoding: None,
+        },
+    )?;
+    let target_ref = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => branch,
+        _ => "HEAD".to_string(),
+    };
+    let old_oid = head.unwrap_or_else(|| ObjectId::null(format));
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: target_ref,
+        expected: head.map(RefTarget::Direct),
+        new: RefTarget::Direct(new_oid),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid,
+            committer,
+            message: commit_reflog_message(&message, false),
+        }),
+    });
+    tx.commit()?;
+    sley_sequencer::replay::post_commit_cleanup(git_dir);
+    remove_commit_state_files(git_dir);
+    if !quiet {
+        println!("{new_oid}");
+    }
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    Ok(())
+}
+
+fn stage_partial_commit_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[String],
+) -> Result<Vec<Vec<u8>>> {
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let cwd = env::current_dir()?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
     let head = commands::merge_rebase::head_commit_oid(&refs)?;
-    let mut tree_map = match &head {
+    let tree_map = match &head {
         Some(oid) => {
             let tree = commands::merge_rebase::commit_tree_oid(&db, format, oid)?;
             stash_tree_entry_map(&db, format, &tree)?
@@ -3362,61 +3463,28 @@ fn commit_partial_paths(
         &config,
         false,
     )?;
+    Ok(rel_paths)
+}
 
-    // Overlay the staged state of the matched paths onto HEAD's tree.
-    let updated_index = Index::parse(&fs::read(&index_path)?, format)?;
-    let staged: BTreeMap<Vec<u8>, (u32, ObjectId)> = updated_index
-        .entries
-        .iter()
-        .filter(|entry| index_entry_stage(entry) == 0)
-        .map(|entry| (entry.path.clone().into_bytes(), (entry.mode, entry.oid)))
-        .collect();
-    for rel in &rel_paths {
-        match staged.get(rel) {
-            Some(entry) => {
-                tree_map.insert(rel.clone(), *entry);
-            }
-            None => {
-                tree_map.remove(rel);
-            }
-        }
+fn read_index_snapshot(git_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    match fs::read(&index_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
-    let tree = write_tree_from_entry_map(&db, format, &tree_map)?;
-    let new_oid = sley_sequencer::create_commit(
-        &mut FileObjectDatabase::from_git_dir(git_dir, format),
-        sley_sequencer::CommitCreate {
-            tree,
-            parents: head.iter().copied().collect(),
-            author,
-            committer: committer.clone(),
-            message: message.clone(),
-            encoding: None,
+}
+
+fn restore_index_snapshot(git_dir: &Path, snapshot: &Option<Vec<u8>>) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    match snapshot {
+        Some(bytes) => fs::write(index_path, bytes)?,
+        None => match fs::remove_file(index_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         },
-    )?;
-    let target_ref = match refs.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(branch)) => branch,
-        _ => "HEAD".to_string(),
-    };
-    let old_oid = head.unwrap_or_else(|| ObjectId::null(format));
-    let mut tx = refs.transaction();
-    tx.update(RefUpdate {
-        name: target_ref,
-        expected: head.map(RefTarget::Direct),
-        new: RefTarget::Direct(new_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid,
-            committer,
-            message: commit_reflog_message(&message, false),
-        }),
-    });
-    tx.commit()?;
-    sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir);
-    if !quiet {
-        println!("{new_oid}");
     }
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
     Ok(())
 }
 
