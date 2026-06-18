@@ -3942,16 +3942,37 @@ fn push_remote_and_refspecs(
             {
                 return Ok((remote, vec![format!("refs/heads/{branch}:{merge}")]));
             }
+            if let Some(refspec) = configured_push_refspec_for_branch(&config, "origin", &branch) {
+                return Ok(("origin".into(), vec![refspec]));
+            }
             Ok(("origin".into(), vec![branch]))
         }
         [remote] => {
             let branch = store.current_branch()?.ok_or_else(|| {
                 GitError::Command("push requires a refspec when HEAD is detached".into())
             })?;
+            let config = read_repo_config(git_dir).unwrap_or_default();
+            if let Some(refspec) = configured_push_refspec_for_branch(&config, remote, &branch) {
+                return Ok((remote.clone(), vec![refspec]));
+            }
             Ok((remote.clone(), vec![branch]))
         }
         [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
     }
+}
+
+fn configured_push_refspec_for_branch(
+    config: &GitConfig,
+    remote: &str,
+    branch: &str,
+) -> Option<String> {
+    let local_ref = format!("refs/heads/{branch}");
+    for push in config.get_all("remote", Some(remote), "push").into_iter().flatten() {
+        if let Some(dst) = map_remote_push_refspec(push, &local_ref) {
+            return Some(format!("{local_ref}:{dst}"));
+        }
+    }
+    None
 }
 
 fn push_upstream_for_branch(config: &GitConfig, branch: &str) -> Option<(String, String)> {

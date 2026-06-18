@@ -6729,6 +6729,7 @@ fn run_branch_upstream_options(
                 eprintln!("fatal: too many arguments to set new upstream");
                 return Err(GitError::Exit(128));
             }
+            let upstream = branch_upstream_resolve_previous_checkout(git_dir, &upstream)?;
             let branch =
                 branch_upstream_target_branch(store, options.branches.first(), true, &upstream)?;
             set_branch_upstream(git_dir, store, &branch, &upstream)
@@ -6742,6 +6743,21 @@ fn run_branch_upstream_options(
             unset_branch_upstream(git_dir, &branch)
         }
     }
+}
+
+fn branch_upstream_resolve_previous_checkout(git_dir: &Path, upstream: &str) -> Result<String> {
+    let Some(inner) = upstream
+        .strip_prefix("@{-")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Ok(upstream.to_string());
+    };
+    let n = inner
+        .parse::<usize>()
+        .map_err(|_| GitError::InvalidFormat(format!("invalid branch name: '{upstream}'")))?;
+    let format = repository_object_format(git_dir)?;
+    Ok(sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?
+        .unwrap_or_else(|| upstream.to_string()))
 }
 
 fn branch_upstream_target_branch(
@@ -7065,7 +7081,14 @@ fn run_branch_create_options(
                 None,
                 options.create_reflog,
             )?;
-            branch_create_set_tracking(git_dir, store, branch, None, options.track, options.quiet)
+            branch_create_set_tracking_or_rollback(
+                git_dir,
+                store,
+                branch,
+                None,
+                options.track,
+                options.quiet,
+            )
         }
         [branch, start] if options.force => {
             force_update_branch(git_dir, format, store, branch, Some(start))?;
@@ -7087,7 +7110,7 @@ fn run_branch_create_options(
                 Some(start),
                 options.create_reflog,
             )?;
-            branch_create_set_tracking(
+            branch_create_set_tracking_or_rollback(
                 git_dir,
                 store,
                 branch,
@@ -7100,6 +7123,23 @@ fn run_branch_create_options(
             "branch currently supports: branch [--list [<pattern>...]] [<name> [<start>]] or branch -d|-D <name>... or branch --force <name> [<start>]"
                 .into(),
         )),
+    }
+}
+
+fn branch_create_set_tracking_or_rollback(
+    git_dir: &Path,
+    store: &FileRefStore,
+    branch: &str,
+    start: Option<&String>,
+    track: Option<BranchTrackMode>,
+    quiet: bool,
+) -> Result<()> {
+    match branch_create_set_tracking(git_dir, store, branch, start, track, quiet) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = store.delete_branch(branch);
+            Err(err)
+        }
     }
 }
 
@@ -9452,13 +9492,13 @@ fn branch_verbose_tracking(
 ) -> String {
     match (verbosity, upstream, track) {
         (0, _, _) => String::new(),
-        (1, _, Some(track)) if track.ahead > 0 || track.behind > 0 => {
+        (1, _, Some(track)) if track.gone || track.ahead > 0 || track.behind > 0 => {
             let mut out = Vec::new();
             write_for_each_ref_track(&mut out, track, true).expect("write to vec");
             format!(" {}", String::from_utf8_lossy(&out))
         }
         (1, _, _) => String::new(),
-        (_, Some(upstream), Some(track)) if track.ahead > 0 || track.behind > 0 => {
+        (_, Some(upstream), Some(track)) if track.gone || track.ahead > 0 || track.behind > 0 => {
             let mut out = Vec::new();
             write_for_each_ref_track(&mut out, track, false).expect("write to vec");
             format!(
