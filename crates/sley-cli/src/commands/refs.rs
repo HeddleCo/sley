@@ -1450,7 +1450,7 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
             let requested = effective.requested.clone();
@@ -1527,7 +1527,7 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
             let requested = effective.requested.clone();
@@ -1602,7 +1602,7 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
             if transaction.is_implicit() {
@@ -1688,7 +1688,7 @@ fn dispatch_ref_stdin_command(
             cursor.finish("symref-create", &raw_name)?;
 
             let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &raw_name, &name)? {
                 return Ok(());
             }
             transaction.mark_applied();
@@ -1737,7 +1737,7 @@ fn dispatch_ref_stdin_command(
             cursor.finish("symref-update", &raw_name)?;
 
             let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
-            if transaction.capture(context.store, &name)? {
+            if transaction.capture(context.store, &raw_name, &name)? {
                 return Ok(());
             }
             transaction.mark_applied();
@@ -1763,7 +1763,7 @@ fn dispatch_ref_stdin_command(
             };
             let expected = cursor.parse_next_refname()?;
             cursor.finish("symref-delete", &raw_name)?;
-            if transaction.capture(context.store, &raw_name)? {
+            if transaction.capture(context.store, &raw_name, &raw_name)? {
                 return Ok(());
             }
             transaction.mark_applied();
@@ -1819,6 +1819,7 @@ struct UpdateRefStdinTransaction {
     applied: bool,
     originals: BTreeMap<String, Option<RefTarget>>,
     duplicate: Option<String>,
+    duplicate_message: Option<String>,
     locks: Vec<PathBuf>,
     staged: Vec<UpdateRefStdinStagedChange>,
 }
@@ -1833,6 +1834,7 @@ impl Default for UpdateRefStdinTransaction {
             applied: false,
             originals: BTreeMap::new(),
             duplicate: None,
+            duplicate_message: None,
             locks: Vec::new(),
             staged: Vec::new(),
         }
@@ -1930,17 +1932,34 @@ impl UpdateRefStdinTransaction {
         GitError::Exit(128)
     }
 
-    fn capture(&mut self, store: &FileRefStore, name: &str) -> Result<bool> {
+    fn capture(&mut self, store: &FileRefStore, requested: &str, name: &str) -> Result<bool> {
         if self.active {
             if self.originals.contains_key(name) {
                 if self.duplicate.is_none() {
                     self.duplicate = Some(name.to_string());
+                    if requested != name {
+                        self.duplicate_message = Some(format!(
+                            "multiple updates for '{name}' (including one via symref '{requested}') are not allowed"
+                        ));
+                    }
                 }
                 return Ok(true);
-            } else {
-                self.originals
-                    .insert(name.to_string(), store.read_ref(name)?);
             }
+            if requested == "HEAD"
+                && name == "HEAD"
+                && let Some(RefTarget::Symbolic(head_target)) = store.read_ref("HEAD")?
+                && self.originals.contains_key(&head_target)
+            {
+                if self.duplicate.is_none() {
+                    self.duplicate = Some("HEAD".to_string());
+                    self.duplicate_message = Some(format!(
+                        "multiple updates for 'HEAD' (including one via its referent '{head_target}') are not allowed"
+                    ));
+                }
+                return Ok(true);
+            }
+            self.originals
+                .insert(name.to_string(), store.read_ref(name)?);
         }
         Ok(false)
     }
@@ -1994,8 +2013,12 @@ impl UpdateRefStdinTransaction {
         stdout: &mut dyn Write,
     ) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
+            let message = self
+                .duplicate_message
+                .clone()
+                .or_else(|| self.infer_duplicate_message(store, &name).ok().flatten());
             self.restore(store)?;
-            eprintln!("fatal: prepare: multiple updates for ref '{name}' not allowed");
+            update_ref_stdin_duplicate_failure("prepare", &name, message.as_deref());
             return Err(GitError::Exit(128));
         }
         self.acquire_locks(git_dir)?;
@@ -2006,8 +2029,12 @@ impl UpdateRefStdinTransaction {
 
     fn commit(&mut self, store: &FileRefStore, stdout: &mut dyn Write) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
+            let message = self
+                .duplicate_message
+                .clone()
+                .or_else(|| self.infer_duplicate_message(store, &name).ok().flatten());
             self.restore(store)?;
-            eprintln!("fatal: commit: multiple updates for ref '{name}' not allowed");
+            update_ref_stdin_duplicate_failure("commit", &name, message.as_deref());
             return Err(GitError::Exit(128));
         }
         self.active = false;
@@ -2016,6 +2043,7 @@ impl UpdateRefStdinTransaction {
         self.closed = true;
         self.release_locks();
         self.originals.clear();
+        self.duplicate_message = None;
         self.duplicate = None;
         writeln!(stdout, "commit: ok")?;
         Ok(())
@@ -2026,8 +2054,12 @@ impl UpdateRefStdinTransaction {
             return self.restore(context.store);
         }
         if let Some(name) = self.duplicate.clone() {
+            let message = self
+                .duplicate_message
+                .clone()
+                .or_else(|| self.infer_duplicate_message(context.store, &name).ok().flatten());
             self.restore(context.store)?;
-            eprintln!("fatal: multiple updates for ref '{name}' not allowed");
+            update_ref_stdin_duplicate_failure("", &name, message.as_deref());
             return Err(GitError::Exit(128));
         }
         if !self.staged.is_empty() {
@@ -2037,6 +2069,7 @@ impl UpdateRefStdinTransaction {
         self.active = false;
         self.prepared = false;
         self.originals.clear();
+        self.duplicate_message = None;
         self.closed = false;
         self.applied = false;
         Ok(())
@@ -2064,8 +2097,31 @@ impl UpdateRefStdinTransaction {
         self.prepared = false;
         self.closed = true;
         self.duplicate = None;
+        self.duplicate_message = None;
         self.applied = false;
         Ok(())
+    }
+
+    fn infer_duplicate_message(&self, store: &FileRefStore, name: &str) -> Result<Option<String>> {
+        if name == "HEAD"
+            && let Some(RefTarget::Symbolic(head_target)) = store.read_ref("HEAD")?
+            && self.originals.contains_key(&head_target)
+        {
+            return Ok(Some(format!(
+                "multiple updates for 'HEAD' (including one via its referent '{head_target}') are not allowed"
+            )));
+        }
+        for reference in store.list_refs()? {
+            if let RefTarget::Symbolic(target) = reference.target
+                && target == name
+            {
+                return Ok(Some(format!(
+                    "multiple updates for '{name}' (including one via symref '{}') are not allowed",
+                    reference.name
+                )));
+            }
+        }
+        Ok(None)
     }
 
     fn acquire_locks(&mut self, git_dir: &Path) -> Result<()> {
@@ -2116,6 +2172,17 @@ fn update_ref_stdin_restart_transaction() -> Result<()> {
 fn update_ref_stdin_closed_transaction() -> Result<()> {
     eprintln!("fatal: transaction is closed");
     Err(GitError::Exit(128))
+}
+
+fn update_ref_stdin_duplicate_failure(phase: &str, name: &str, message: Option<&str>) {
+    match (phase.is_empty(), message) {
+        (true, Some(message)) => eprintln!("fatal: {message}"),
+        (false, Some(message)) => eprintln!("fatal: {phase}: {message}"),
+        (true, None) => eprintln!("fatal: multiple updates for ref '{name}' not allowed"),
+        (false, None) => {
+            eprintln!("fatal: {phase}: multiple updates for ref '{name}' not allowed")
+        }
+    }
 }
 
 fn update_ref_stdin_restore_ref(
