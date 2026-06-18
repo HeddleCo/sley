@@ -2414,6 +2414,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_not: Vec::new(),
     };
     let mut unshallow = false;
+    let mut filter_option_explicit = false;
     // `git fetch --all`: fetch from every configured remote in turn.
     let mut fetch_all_remotes = false;
     let mut iter = args.iter();
@@ -2458,6 +2459,26 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 options.auto_follow_tags = false;
                 options.fetch_all_tags = false;
                 options.tag_option_explicit = true;
+            }
+            "--filter" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
+                validate_clone_filter(value)?;
+                options.filter = fetch_pack_filter_from_spec(value);
+                filter_option_explicit = true;
+            }
+            value if value.starts_with("--filter=") => {
+                let value = value
+                    .strip_prefix("--filter=")
+                    .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
+                validate_clone_filter(value)?;
+                options.filter = fetch_pack_filter_from_spec(value);
+                filter_option_explicit = true;
+            }
+            "--no-filter" => {
+                options.filter = None;
+                filter_option_explicit = true;
             }
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
@@ -2540,6 +2561,9 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         for remote in remote_names(&config) {
             let mut remote_options = options.clone();
+            if !filter_option_explicit {
+                apply_configured_partial_clone_filter(&config, &remote, &mut remote_options);
+            }
             if refspecs.is_empty() {
                 remote_options.merge_srcs =
                     current_branch_merge_for_remote(&git_dir, format, &remote);
@@ -2574,7 +2598,32 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         }
         options.depth = Some(sley_remote::INFINITE_DEPTH);
     }
+    if !filter_option_explicit {
+        let config = read_repo_config(&git_dir)?;
+        apply_configured_partial_clone_filter(&config, &source, &mut options);
+    }
     fetch_one_source(&git_dir, format, &source, &refspecs, options)
+}
+
+fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+    match spec {
+        "blob:none" => Some(sley_odb::PackObjectFilter::BlobNone),
+        _ => None,
+    }
+}
+
+fn apply_configured_partial_clone_filter(
+    config: &GitConfig,
+    remote: &str,
+    options: &mut FetchOptions,
+) {
+    if config
+        .get_bool("remote", Some(remote), "promisor")
+        .unwrap_or(false)
+        && let Some(filter) = config.get("remote", Some(remote), "partialclonefilter")
+    {
+        options.filter = fetch_pack_filter_from_spec(filter);
+    }
 }
 
 /// Dispatch a single fetch source (bundle / http / ssh / git / local) — shared
