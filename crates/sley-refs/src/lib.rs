@@ -93,6 +93,16 @@ pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u
     let value = std::str::from_utf8(bytes)
         .map_err(|err| GitError::InvalidFormat(err.to_string()))?
         .trim_end_matches('\n');
+    if name == "FETCH_HEAD" {
+        let oid = value
+            .lines()
+            .find_map(|line| line.split_whitespace().next())
+            .ok_or_else(|| GitError::InvalidFormat("FETCH_HEAD is empty".into()))?;
+        return Ok(Ref {
+            name,
+            target: RefTarget::Direct(ObjectId::from_hex(format, oid)?),
+        });
+    }
     let target = if let Some(symbolic) = value.strip_prefix("ref: ") {
         RefTarget::Symbolic(symbolic.to_string())
     } else {
@@ -496,6 +506,7 @@ pub struct FileRefStore {
     git_dir: PathBuf,
     common_dir: PathBuf,
     format: ObjectFormat,
+    reftable_lock_timeout_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,7 +560,13 @@ impl FileRefStore {
             git_dir,
             common_dir,
             format,
+            reftable_lock_timeout_millis: None,
         }
+    }
+
+    pub fn with_reftable_lock_timeout_millis(mut self, timeout_millis: Option<u64>) -> Self {
+        self.reftable_lock_timeout_millis = timeout_millis;
+        self
     }
 
     pub fn read_ref(&self, name: &str) -> Result<Option<RefTarget>> {
@@ -559,7 +576,13 @@ impl FileRefStore {
 
     fn read_ref_unchecked(&self, name: &str) -> Result<Option<RefTarget>> {
         if self.uses_reftable()? {
-            return self.read_reftable_ref(name);
+            if let Some(target) = self.read_reftable_ref(name)? {
+                return Ok(Some(target));
+            }
+            if name != "HEAD" && is_root_ref_syntax(name) {
+                return Ok(self.read_loose_ref(name)?.map(|reference| reference.target));
+            }
+            return Ok(None);
         }
         if let Some(reference) = self.read_loose_ref(name)? {
             return Ok(Some(reference.target));
@@ -581,7 +604,13 @@ impl FileRefStore {
     ///     live and no packed entry); git maps both to exit code 2.
     pub fn raw_ref_exists(&self, name: &str) -> Result<bool> {
         if self.uses_reftable()? {
-            return Ok(self.read_reftable_ref(name)?.is_some());
+            if self.read_reftable_ref(name)?.is_some() {
+                return Ok(true);
+            }
+            if name != "HEAD" && is_root_ref_syntax(name) {
+                return Ok(self.read_loose_ref(name)?.is_some());
+            }
+            return Ok(false);
         }
         // git routes root-ref-syntax names (HEAD, FETCH_HEAD, MERGE_HEAD, …) to
         // the per-worktree gitdir and everything else to the common dir; mirror
@@ -621,7 +650,7 @@ impl FileRefStore {
     pub fn write_reflog(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
-            return self.rewrite_reftable_logs(name, entries);
+            return self.rewrite_reftable_logs(name, entries, true);
         }
         let path = self.reflog_path(name);
         let parent = path
@@ -648,7 +677,7 @@ impl FileRefStore {
             }
             let removed = original_len - retained.len();
             if removed > 0 {
-                self.rewrite_reftable_logs(name, &retained)?;
+                self.rewrite_reftable_logs(name, &retained, true)?;
             }
             return Ok(removed);
         }
@@ -702,7 +731,7 @@ impl FileRefStore {
             )?;
             let removed = original_len - retained.len();
             if write && removed > 0 {
-                self.rewrite_reftable_logs(name, &retained)?;
+                self.rewrite_reftable_logs(name, &retained, true)?;
             }
             return Ok(removed);
         }
@@ -1481,6 +1510,10 @@ impl FileRefStore {
         ))
     }
 
+    pub fn reftable_table_count(&self) -> Result<usize> {
+        Ok(self.reftable_table_names()?.len())
+    }
+
     fn append_reftable_records(&self, records: Vec<ReftableRefRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -1503,16 +1536,39 @@ impl FileRefStore {
 
     /// Read the table list (file names) backing the reftable stack, oldest first.
     fn reftable_table_names(&self) -> Result<Vec<String>> {
-        let tables_list = self.common_dir.join("reftable").join("tables.list");
+        self.reftable_table_names_from(&self.common_dir.join("reftable").join("tables.list"))
+    }
+
+    fn reftable_table_names_from(&self, tables_list: &Path) -> Result<Vec<String>> {
         if !tables_list.exists() {
             return Ok(Vec::new());
         }
-        Ok(fs::read_to_string(&tables_list)?
+        Ok(fs::read_to_string(tables_list)?
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect())
+    }
+
+    fn reftable_lock_timeout_millis(&self) -> Result<u64> {
+        if let Some(timeout_millis) = self.reftable_lock_timeout_millis {
+            return Ok(timeout_millis);
+        }
+        let config_path = self.common_dir.join("config");
+        let Ok(config) = GitConfig::read(config_path) else {
+            return Ok(0);
+        };
+        Ok(config
+            .get("reftable", None, "lockTimeout")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    fn acquire_reftable_list_lock(&self, list_path: PathBuf) -> Result<ReftableListLock> {
+        let lock_path = lock_path_for(&list_path)?;
+        let timeout_millis = self.reftable_lock_timeout_millis()?;
+        ReftableListLock::acquire(list_path, lock_path, timeout_millis)
     }
 
     /// Append a single combined ref+log table to the stack, allocating the next
@@ -1526,7 +1582,9 @@ impl FileRefStore {
     ) -> Result<u64> {
         let reftable_dir = self.common_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
-        let mut table_names = self.reftable_table_names()?;
+        let list_path = reftable_dir.join("tables.list");
+        let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
+        let mut table_names = self.reftable_table_names_from(&list_path)?;
         let update_index = self.next_reftable_update_index(&table_names)?;
         for record in &mut refs {
             record.update_index = update_index;
@@ -1545,8 +1603,7 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        let list_path = reftable_dir.join("tables.list");
-        write_locked(&list_path, &list)?;
+        list_lock.commit(&list)?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         if logs.is_empty() && table_names.len() > 6 {
             self.auto_compact_reftable_stack()?;
@@ -1555,20 +1612,48 @@ impl FileRefStore {
     }
 
     pub fn compact_reftable_stack(&self) -> Result<()> {
-        let reftable_dir = self.common_dir.join("reftable");
         let old_names = self.reftable_table_names()?;
-        if old_names.is_empty() {
+        self.compact_reftable_stack_range(0, old_names.len(), true)
+    }
+
+    fn compact_reftable_stack_range(
+        &self,
+        start: usize,
+        end: usize,
+        fail_on_locked_table: bool,
+    ) -> Result<()> {
+        let reftable_dir = self.common_dir.join("reftable");
+        let list_path = reftable_dir.join("tables.list");
+        let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
+        let old_names = self.reftable_table_names_from(&list_path)?;
+        if start >= end || end > old_names.len() {
             return Ok(());
+        }
+        let compact_names = old_names[start..end].to_vec();
+        if compact_names.is_empty() {
+            return Ok(());
+        }
+        if fail_on_locked_table {
+            for name in &compact_names {
+                if reftable_dir.join(format!("{name}.lock")).exists() {
+                    return Err(GitError::Io(format!(
+                        "cannot lock references: {}: File exists",
+                        reftable_dir.join(format!("{name}.lock")).display()
+                    )));
+                }
+            }
         }
 
         let mut refs: BTreeMap<String, ReftableRefRecord> = BTreeMap::new();
         let mut logs: BTreeMap<(String, u64), ReftableLogRecord> = BTreeMap::new();
         let mut min_index = u64::MAX;
         let mut max_index = 0u64;
-        for table in self.reftables()? {
+        let drop_tombstones = start == 0;
+        for name in &compact_names {
+            let table = Reftable::parse(&fs::read(reftable_dir.join(name))?)?;
             for record in table.refs {
                 match record.value {
-                    ReftableRefValue::Deletion => {
+                    ReftableRefValue::Deletion if drop_tombstones => {
                         refs.remove(&record.name);
                     }
                     _ => {
@@ -1581,7 +1666,7 @@ impl FileRefStore {
             for record in table.logs {
                 let key = (record.refname.clone(), record.update_index);
                 match record.value {
-                    ReftableLogValue::Deletion => {
+                    ReftableLogValue::Deletion if drop_tombstones => {
                         logs.remove(&key);
                     }
                     _ => {
@@ -1594,7 +1679,7 @@ impl FileRefStore {
         }
 
         if refs.is_empty() && logs.is_empty() {
-            min_index = old_names
+            min_index = compact_names
                 .iter()
                 .filter_map(|name| Reftable::parse(&fs::read(reftable_dir.join(name)).ok()?).ok())
                 .map(|table| table.header.min_update_index)
@@ -1610,10 +1695,20 @@ impl FileRefStore {
         let table_path = reftable_dir.join(&table_name);
         write_locked(&table_path, &bytes)?;
         self.apply_reftable_shared_file_mode(&table_path)?;
-        let list_path = reftable_dir.join("tables.list");
-        write_locked(&list_path, format!("{table_name}\n").as_bytes())?;
+        let mut list = Vec::new();
+        for name in &old_names[..start] {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        list.extend_from_slice(table_name.as_bytes());
+        list.push(b'\n');
+        for name in &old_names[end..] {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        list_lock.commit(&list)?;
         self.apply_reftable_shared_file_mode(&list_path)?;
-        for name in old_names {
+        for name in compact_names {
             if name != table_name {
                 let _ = fs::remove_file(reftable_dir.join(name));
             }
@@ -1655,8 +1750,17 @@ impl FileRefStore {
         if reftable_autocompaction_disabled() {
             return Ok(());
         }
-        if self.reftable_table_names()?.len() > 1 {
-            self.compact_reftable_stack()?;
+        let names = self.reftable_table_names()?;
+        if names.len() <= 1 {
+            return Ok(());
+        }
+        let reftable_dir = self.common_dir.join("reftable");
+        let start = names
+            .iter()
+            .rposition(|name| reftable_dir.join(format!("{name}.lock")).exists())
+            .map_or(0, |index| index + 1);
+        if names.len().saturating_sub(start) > 1 {
+            self.compact_reftable_stack_range(start, names.len(), false)?;
         }
         Ok(())
     }
@@ -1820,7 +1924,7 @@ impl FileRefStore {
     /// reflog reads as absent. Mirrors git unlinking `logs/<name>` on the loose
     /// backend; the reftable analogue is an all-tombstone table.
     fn tombstone_reftable_logs(&self, name: &str) -> Result<()> {
-        self.rewrite_reftable_logs(name, &[])
+        self.rewrite_reftable_logs(name, &[], false)
     }
 
     /// Mirror git's `files_log_ref_write`: when a transaction updates a branch
@@ -1899,7 +2003,12 @@ impl FileRefStore {
     /// stack-friendly analogue of rewriting a loose `logs/<name>` file — used by
     /// `write_reflog` / reflog expiry. An empty `entries` slice clears the
     /// reflog (an empty `git reflog`).
-    fn rewrite_reftable_logs(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
+    fn rewrite_reftable_logs(
+        &self,
+        name: &str,
+        entries: &[ReflogEntry],
+        preserve_empty: bool,
+    ) -> Result<()> {
         // Gather every update index that currently carries a live log record for
         // `name`, so we can mask them with deletion tombstones.
         let mut live_indexes: BTreeSet<u64> = BTreeSet::new();
@@ -1945,6 +2054,22 @@ impl FileRefStore {
                 value: ReftableLogValue::Update(reftable_update_from_reflog(entry)?),
             });
         }
+        if entries.is_empty() && preserve_empty {
+            let null = ObjectId::null(self.format);
+            logs.push(ReftableLogRecord {
+                refname: name.to_string(),
+                update_index: base,
+                value: ReftableLogValue::Update(ReftableLogUpdate {
+                    old_oid: null,
+                    new_oid: null,
+                    name: String::new(),
+                    email: String::new(),
+                    time: 0,
+                    tz_offset: 0,
+                    message: String::new(),
+                }),
+            });
+        }
         if logs.is_empty() {
             return Ok(());
         }
@@ -1973,7 +2098,9 @@ impl FileRefStore {
     ) -> Result<u64> {
         let reftable_dir = self.common_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
-        let mut table_names = self.reftable_table_names()?;
+        let list_path = reftable_dir.join("tables.list");
+        let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
+        let mut table_names = self.reftable_table_names_from(&list_path)?;
         let alloc_index = self.next_reftable_update_index(&table_names)?;
         for record in &mut refs {
             record.update_index = alloc_index;
@@ -1999,8 +2126,7 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        let list_path = reftable_dir.join("tables.list");
-        write_locked(&list_path, &list)?;
+        list_lock.commit(&list)?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         Ok(max_index)
     }
@@ -2014,7 +2140,7 @@ impl FileRefStore {
     }
 
     fn ref_base_dir(&self, name: &str) -> &Path {
-        if name == "HEAD" || name.starts_with("refs/worktree/") {
+        if is_root_ref_syntax(name) || name.starts_with("refs/worktree/") {
             &self.git_dir
         } else {
             &self.common_dir
@@ -3103,6 +3229,78 @@ impl Drop for DeleteLock {
         if self.active {
             let _ = self.file.take();
             let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct ReftableListLock {
+    list_path: PathBuf,
+    lock_path: PathBuf,
+    file: Option<fs::File>,
+    active: bool,
+}
+
+impl ReftableListLock {
+    fn acquire(list_path: PathBuf, lock_path: PathBuf, timeout_millis: u64) -> Result<Self> {
+        let start = SystemTime::now();
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        list_path,
+                        lock_path,
+                        file: Some(file),
+                        active: true,
+                    });
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 =>
+                {
+                    let elapsed = start
+                        .elapsed()
+                        .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
+                    if elapsed.as_millis() as u64 >= timeout_millis {
+                        return Err(GitError::Io(format!(
+                            "cannot lock references: {}: File exists",
+                            lock_path.display()
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(GitError::Io(format!(
+                        "cannot lock references: {}: File exists",
+                        lock_path.display()
+                    )));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn commit(mut self, bytes: &[u8]) -> Result<()> {
+        let Some(mut file) = self.file.take() else {
+            return Err(GitError::Io("reftable list lock is already closed".into()));
+        };
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.lock_path, &self.list_path).map_err(|err| GitError::Io(err.to_string()))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReftableListLock {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.file.take();
+            let _ = fs::remove_file(&self.lock_path);
         }
     }
 }
@@ -4218,6 +4416,19 @@ mod tests {
         let reference = parse_loose_ref(ObjectFormat::Sha1, "refs/heads/main", oid.as_bytes())
             .expect("test operation should succeed");
         assert_eq!(write_loose_ref(&reference), format!("{oid}\n").into_bytes());
+    }
+
+    #[test]
+    fn loose_fetch_head_reads_first_object_id() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let bytes = b"ce013625030ba8dba906f756967f9e9ca394464a\t\tbranch 'main' of ../sub\n";
+        let reference = parse_loose_ref(ObjectFormat::Sha1, "FETCH_HEAD", bytes)
+            .expect("test operation should succeed");
+        assert_eq!(reference.target, RefTarget::Direct(oid));
     }
 
     #[test]
@@ -5413,7 +5624,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         write_reftable_stack(
             &git_dir,
             &[(
-                "000000000001-000000000001-rust.ref",
+                "0x000000000001-0x000000000001-00000000.ref",
                 vec![
                     sley_formats::ReftableRefRecord {
                         name: "HEAD".into(),
@@ -5475,6 +5686,77 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
+    fn file_ref_store_reads_loose_fetch_head_in_reftable_repo() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")
+            .expect("test operation should succeed");
+        fs::create_dir_all(git_dir.join("reftable")).expect("test operation should succeed");
+        fs::write(git_dir.join("reftable").join("tables.list"), b"")
+            .expect("test operation should succeed");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            git_dir.join("FETCH_HEAD"),
+            b"ce013625030ba8dba906f756967f9e9ca394464a\t\tbranch 'main' of ../sub\n",
+        )
+        .expect("test operation should succeed");
+
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert_eq!(
+            store
+                .read_ref("FETCH_HEAD")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(oid))
+        );
+        assert!(
+            store
+                .raw_ref_exists("FETCH_HEAD")
+                .expect("test operation should succeed")
+        );
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_empty_reftable_reflog_rewrite_keeps_marker() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        fs::create_dir_all(git_dir.join("reftable")).expect("test operation should succeed");
+        fs::write(git_dir.join("reftable").join("tables.list"), b"")
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+
+        store
+            .write_reflog("refs/heads/main", &[])
+            .expect("test operation should succeed");
+
+        assert!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("test operation should succeed")
+                .is_empty()
+        );
+        let tables = store.reftables().expect("test operation should succeed");
+        let marker = tables
+            .iter()
+            .flat_map(|table| table.logs.iter())
+            .find(|record| record.refname == "refs/heads/main")
+            .expect("empty reflog marker should exist");
+        let ReftableLogValue::Update(update) = &marker.value else {
+            panic!("empty reflog marker should be an update");
+        };
+        let null = ObjectId::null(ObjectFormat::Sha1);
+        assert_eq!(update.old_oid, null);
+        assert_eq!(update.new_oid, null);
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_ref_store_applies_reftable_stack_overrides_and_deletions() {
         let git_dir = temp_git_dir();
         write_reftable_config(&git_dir);
@@ -5492,7 +5774,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             &git_dir,
             &[
                 (
-                    "000000000001-000000000001-base.ref",
+                    "0x000000000001-0x000000000001-00000000.ref",
                     vec![
                         sley_formats::ReftableRefRecord {
                             name: "refs/heads/main".into(),
@@ -5565,7 +5847,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         write_reftable_stack(
             &git_dir,
             &[(
-                "000000000001-000000000001-base.ref",
+                "0x000000000001-0x000000000001-00000000.ref",
                 vec![sley_formats::ReftableRefRecord {
                     name: "refs/heads/main".into(),
                     update_index: 1,
@@ -5644,7 +5926,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         write_reftable_stack(
             &git_dir,
             &[(
-                "000000000001-000000000001-base.ref",
+                "0x000000000001-0x000000000001-00000000.ref",
                 vec![
                     sley_formats::ReftableRefRecord {
                         name: "refs/heads/main".into(),
