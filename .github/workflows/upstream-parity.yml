@@ -123,6 +123,7 @@ jobs:
             t3000-ls-files-others.sh
             t3070-wildmatch.sh
             t3103-ls-tree-misc.sh
+            t3105-ls-tree-output.sh
             t3200-branch.sh
             t3301-notes.sh
             t3309-notes-merge-auto-resolve.sh

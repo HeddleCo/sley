@@ -439,6 +439,12 @@ declare -A FLOOR=(
     [t1014-read-tree-confusing.sh]=28
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
+    # codex-wave-9 (ls-tree output): gitlink mode 160000 classified as commit
+    # object type; -d shows gitlinks (skip only blobs); subdir ../ pathspec norm
+    # + above-root --full-tree rejection. t3105-ls-tree-output 13->60 FULL PASS.
+    # Gitlink blast-radius held: t1006=290 t4027/t4060/t4041 submodule-diff,
+    # t7400=88 t7508=114 unchanged.
+    [t3105-ls-tree-output.sh]=60
     # codex-wave-6: rebase porcelain t3400@18 / incompatible-options t3422@52.
     [t3400-rebase.sh]=19
     [t3422-rebase-incompatible-options.sh]=52
