@@ -1709,8 +1709,10 @@ fn parse_maybe_bool(value: &str) -> Option<bool> {
 /// equivalent to git's `ort` (the modern default, byte-compatible with the older
 /// `recursive` on the cases we model), so both names are accepted. `ours` selects
 /// the trivial strategy that keeps HEAD's tree (recorded in `ours_strategy`); any
-/// other named strategy is rejected. The last `-s` wins (git replaces the
-/// strategy list), so re-selecting `recursive`/`ort` clears a prior `ours`.
+/// other named strategy is rejected. When multiple two-head strategies are named,
+/// git tries them and keeps the best result; for the cases sley models, `ort` /
+/// `recursive` is strictly better than `resolve`, so the recursive selection
+/// sticks even if `resolve` appears later.
 fn accept_merge_strategy(value: &str, options: &mut MergeOptions) -> Result<()> {
     match value {
         "recursive" | "ort" => {
@@ -1721,8 +1723,10 @@ fn accept_merge_strategy(value: &str, options: &mut MergeOptions) -> Result<()> 
         }
         "resolve" => {
             options.ours_strategy = false;
+            if !options.explicit_twohead_strategy {
+                options.resolve_strategy = true;
+            }
             options.explicit_twohead_strategy = true;
-            options.resolve_strategy = true;
             Ok(())
         }
         "ours" => {
@@ -1735,6 +1739,33 @@ fn accept_merge_strategy(value: &str, options: &mut MergeOptions) -> Result<()> 
             "merge strategy '{other}' is not supported"
         ))),
     }
+}
+
+fn apply_default_merge_strategies(options: &mut MergeOptions, octopus: bool) -> Result<()> {
+    if options.ours_strategy || options.explicit_twohead_strategy {
+        return Ok(());
+    }
+    let Some(config) = effective_config_with_overrides() else {
+        return Ok(());
+    };
+    let key = if octopus { "octopus" } else { "twohead" };
+    let Some(raw) = config.get("pull", None, key) else {
+        return Ok(());
+    };
+    let mut saw_octopus = false;
+    for strategy in raw.split_whitespace() {
+        if octopus && strategy == "octopus" {
+            saw_octopus = true;
+            continue;
+        }
+        accept_merge_strategy(strategy, options)?;
+    }
+    if octopus && saw_octopus {
+        options.ours_strategy = false;
+        options.explicit_twohead_strategy = false;
+        options.resolve_strategy = false;
+    }
+    Ok(())
 }
 
 /// Apply a `-X <option>` strategy option, recognising the conflict-favouring
@@ -2228,7 +2259,10 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // remaining head flows through the normal path below (t7602 "reduces
     // irrelevant remote heads").
     let target = match positional.as_slice() {
-        [target] => target.clone(),
+        [target] => {
+            apply_default_merge_strategies(&mut options, false)?;
+            target.clone()
+        }
         [] => {
             return Err(GitError::Command("merge requires a commit argument".into()));
         }
@@ -2245,8 +2279,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                     }
                     return Ok(());
                 }
-                [single] => single.0.clone(),
+                [single] => {
+                    apply_default_merge_strategies(&mut options, false)?;
+                    single.0.clone()
+                }
                 _ => {
+                    apply_default_merge_strategies(&mut options, true)?;
                     if options.explicit_twohead_strategy {
                         eprintln!("fatal: merge program failed");
                         if merge_autostash {
@@ -2750,6 +2788,19 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 if let Some((mode, oid)) = theirs {
                     entries.push(merge_index_entry(path, *mode, *oid, 3));
                 }
+            }
+        }
+    }
+    if options.resolve_strategy {
+        for (path, (base_mode, base_oid)) in &base_map {
+            if ours_map.contains_key(path)
+                || entries.iter().any(|entry| entry.path.as_ref() == path)
+            {
+                continue;
+            }
+            if let Some((theirs_mode, theirs_oid)) = theirs_map.get(path) {
+                entries.push(merge_index_entry(path, *base_mode, *base_oid, 1));
+                entries.push(merge_index_entry(path, *theirs_mode, *theirs_oid, 3));
             }
         }
     }
@@ -3317,9 +3368,12 @@ fn rebase_onto_upstream(
     let upstream_commit = sley_rev::peel_to_commit(&db, format, &upstream_oid)?;
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
-    if !status.is_empty() {
-        let has_staged = status.iter().any(|entry| entry.index != b' ');
-        let has_unstaged = status.iter().any(|entry| entry.worktree != b' ');
+    let tracked_status = status
+        .iter()
+        .filter(|entry| entry.index != b'?' && entry.index != b'!');
+    if tracked_status.clone().next().is_some() {
+        let has_staged = tracked_status.clone().any(|entry| entry.index != b' ');
+        let has_unstaged = tracked_status.clone().any(|entry| entry.worktree != b' ');
         if has_unstaged && has_staged {
             eprintln!("error: cannot rebase: You have unstaged changes.");
             eprintln!("error: additionally, your index contains uncommitted changes.");
@@ -4405,18 +4459,28 @@ fn worktree_blob_identity(format: ObjectFormat, path: &Path) -> Result<Option<(u
 }
 
 fn ensure_pull_can_merge() -> Result<()> {
-    eprintln!("hint: You have divergent branches and need to specify how to reconcile them.");
-    eprintln!("hint: You can do so by running one of the following commands sometime before");
-    eprintln!("hint: your next pull:");
-    eprintln!("hint:");
-    eprintln!("hint:   git config pull.rebase false  # merge");
-    eprintln!("hint:   git config pull.rebase true   # rebase");
-    eprintln!("hint:   git config pull.ff only       # fast-forward only");
-    eprintln!("hint:");
-    eprintln!("hint: You can replace \"git config\" with \"git config --global\" to set a default");
-    eprintln!("hint: preference for all repositories. You can also pass --rebase, --no-rebase,");
-    eprintln!("hint: or --ff-only on the command line to override the configured default per");
-    eprintln!("hint: invocation.");
+    let color_advice = effective_config_with_overrides()
+        .and_then(|config| config.get("color", None, "advice").map(str::to_string))
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("always"));
+    let print_hint = |line: &str| {
+        if color_advice {
+            eprintln!("\x1b[33m{line}\x1b[m");
+        } else {
+            eprintln!("{line}");
+        }
+    };
+    print_hint("hint: You have divergent branches and need to specify how to reconcile them.");
+    print_hint("hint: You can do so by running one of the following commands sometime before");
+    print_hint("hint: your next pull:");
+    print_hint("hint:");
+    print_hint("hint:   git config pull.rebase false  # merge");
+    print_hint("hint:   git config pull.rebase true   # rebase");
+    print_hint("hint:   git config pull.ff only       # fast-forward only");
+    print_hint("hint:");
+    print_hint("hint: You can replace \"git config\" with \"git config --global\" to set a default");
+    print_hint("hint: preference for all repositories. You can also pass --rebase, --no-rebase,");
+    print_hint("hint: or --ff-only on the command line to override the configured default per");
+    print_hint("hint: invocation.");
     eprintln!("fatal: Need to specify how to reconcile divergent branches.");
     Err(GitError::Exit(128))
 }
