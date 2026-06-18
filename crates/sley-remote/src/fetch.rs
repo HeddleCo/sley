@@ -20,6 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
@@ -35,7 +36,7 @@ use sley_protocol::{
     fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refname_matches,
     refspec_map_source,
 };
-use sley_refs::{BundleRefUpdate, FileRefStore, Ref, RefTarget};
+use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
 use sley_transport::RemoteUrl;
 
 use crate::{CredentialProvider, ProgressSink};
@@ -340,6 +341,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options: &options,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
+                    log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                 },
                 &mut updates,
                 &mut outcome,
@@ -393,6 +395,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options: &options,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
+                    log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                 },
                 &mut updates,
                 &mut outcome,
@@ -441,6 +444,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options: &options,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
+                    log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                 },
                 &mut updates,
                 &mut outcome,
@@ -647,6 +651,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options: &options,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
+                    log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                 },
                 &mut updates,
                 &mut outcome,
@@ -822,6 +827,7 @@ struct FetchFinalize<'a> {
     options: &'a FetchOptions,
     fetch_head_source: &'a str,
     default_head_fetch: bool,
+    log_all_ref_updates: bool,
 }
 
 /// git's `store_updated_refs` (builtin/fetch.c) downgrades any for-merge
@@ -857,6 +863,7 @@ fn finalize_fetch(
         options,
         fetch_head_source,
         default_head_fetch,
+        log_all_ref_updates,
     } = finalize;
     if options.dry_run {
         outcome.ref_updates = std::mem::take(updates);
@@ -876,18 +883,113 @@ fn finalize_fetch(
         }
         outcome.wrote_fetch_head = true;
     }
-    let ref_updates = updates
-        .iter()
-        .filter_map(|update| {
-            update.dst.as_ref().map(|dst| BundleRefUpdate {
-                name: dst.clone(),
-                oid: update.oid,
-            })
-        })
-        .collect::<Vec<_>>();
-    store.apply_bundle_ref_updates(&ref_updates, None)?;
+    apply_fetch_ref_updates(store, format, fetch_head_source, log_all_ref_updates, updates)?;
     outcome.ref_updates = std::mem::take(updates);
     Ok(())
+}
+
+fn apply_fetch_ref_updates(
+    store: &FileRefStore,
+    format: ObjectFormat,
+    fetch_head_source: &str,
+    log_all_ref_updates: bool,
+    updates: &[FetchRefUpdate],
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut tx = store.transaction();
+    for update in updates {
+        let Some(dst) = update.dst.as_deref() else {
+            continue;
+        };
+        if !seen.insert(dst.to_string()) {
+            return Err(GitError::Transaction(format!("duplicate fetch ref {dst}")));
+        }
+        let old_oid = match store.read_ref(dst)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            Some(RefTarget::Symbolic(target)) => {
+                return Err(GitError::Transaction(format!(
+                    "fetch ref {dst} would overwrite symbolic ref {target}"
+                )));
+            }
+            None => None,
+        };
+        let reflog = if log_all_ref_updates && fetch_should_write_reflog(dst) {
+            Some(ReflogEntry {
+                old_oid: old_oid.unwrap_or_else(|| ObjectId::null(format)),
+                new_oid: update.oid,
+                committer: fetch_reflog_committer(),
+                message: fetch_reflog_message(fetch_head_source, update, old_oid.is_some()),
+            })
+        } else {
+            None
+        };
+        tx.update(RefUpdate {
+            name: dst.to_string(),
+            expected: old_oid.map(RefTarget::Direct),
+            new: RefTarget::Direct(update.oid),
+            reflog,
+        });
+    }
+    tx.commit()
+}
+
+fn fetch_log_all_ref_updates(config: &GitConfig) -> bool {
+    match config.get("core", None, "logallrefupdates") {
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            matches!(value.as_str(), "true" | "yes" | "on" | "1" | "always")
+        }
+        None => false,
+    }
+}
+
+fn fetch_should_write_reflog(refname: &str) -> bool {
+    refname == "HEAD"
+        || refname.starts_with("refs/heads/")
+        || refname.starts_with("refs/remotes/")
+        || refname.starts_with("refs/notes/")
+}
+
+fn fetch_reflog_committer() -> Vec<u8> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("Git Rs <sley@example.invalid> {seconds} +0000").into_bytes()
+}
+
+fn fetch_reflog_message(source: &str, update: &FetchRefUpdate, old_exists: bool) -> Vec<u8> {
+    let src = fetch_reflog_short_ref(&update.src);
+    let dst = update
+        .dst
+        .as_deref()
+        .map(fetch_reflog_short_ref)
+        .unwrap_or_else(|| update.src.clone());
+    let action = if !old_exists {
+        if update.src.starts_with("refs/tags/") {
+            "storing tag"
+        } else if update.src.starts_with("refs/heads/") {
+            "storing head"
+        } else {
+            "storing ref"
+        }
+    } else if update.force {
+        "forced-update"
+    } else if update.src.starts_with("refs/tags/") {
+        "updating tag"
+    } else {
+        "fast-forward"
+    };
+    format!("fetch {source} {src}:{dst}: {action}").into_bytes()
+}
+
+fn fetch_reflog_short_ref(refname: &str) -> String {
+    for prefix in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
+        if let Some(short) = refname.strip_prefix(prefix) {
+            return short.to_string();
+        }
+    }
+    refname.to_string()
 }
 
 fn validate_fetch_ref_updates(
