@@ -2933,6 +2933,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let mut report_dangling = true;
     let mut report_unreachable = false;
     let mut strict = false;
+    let mut connectivity_only = false;
     // `--tags` restricts the root set to tags; `--root` additionally pins the
     // root tree(s). Both default off (a bare `git fsck` walks all refs).
     let mut only_tags = false;
@@ -2950,13 +2951,14 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             "--no-unreachable" => report_unreachable = false,
             "--strict" => strict = true,
             "--no-strict" => strict = false,
+            "--connectivity-only" => connectivity_only = true,
             "--tags" => only_tags = true,
             "--name-objects" => name_objects = true,
             "--no-name-objects" => name_objects = false,
             // These affect output/perf only; object-content checks are
             // unconditional in this implementation, so accept and ignore them.
-            "--full" | "--no-full" | "--connectivity-only" | "--root" | "--cache"
-            | "--no-cache" | "--lost-found" | "--references" | "--no-references" => {}
+            "--full" | "--no-full" | "--root" | "--cache" | "--no-cache" | "--lost-found"
+            | "--references" | "--no-references" => {}
             value if value.starts_with("--") => {
                 return Err(GitError::Command(format!(
                     "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
@@ -2994,6 +2996,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // We collect named roots, run those checks, and pass only the valid tip
     // oids to the connectivity walk.
     let mut ref_error_bits = 0i32;
+    let mut object_names = std::collections::HashMap::new();
     let named_roots: Vec<(String, ObjectId)> = if !explicit_oids.is_empty() {
         let mut resolved = Vec::new();
         for spec in &explicit_oids {
@@ -3021,12 +3024,26 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
                     ref_error_bits |= sley_fsck::ERROR_REFS;
                 }
                 roots.push(*oid);
+                if name_objects {
+                    object_names.entry(*oid).or_insert_with(|| name.clone());
+                }
             }
             Err(_) => {
                 eprintln!("error: {name}: invalid sha1 pointer {oid}");
                 ref_error_bits |= sley_fsck::ERROR_REACHABLE;
             }
         }
+    }
+
+    if explicit_oids.is_empty() && !only_tags {
+        ref_error_bits |= fsck_worktree_head_refs(
+            &db,
+            format,
+            &git_dir,
+            name_objects,
+            &mut roots,
+            &mut object_names,
+        )?;
     }
 
     // With explicit object-id roots, git checks only what is reachable from
@@ -3099,6 +3116,8 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         sley_fsck::FsckOptions {
             report_dangling,
             report_unreachable,
+            connectivity_only,
+            object_names,
             severity,
         },
     );
@@ -3189,6 +3208,92 @@ fn fsck_objects_dir_display(git_dir: &Path, cwd: &Path) -> String {
 /// git's `is_branch`: a ref whose tip must be a commit (`HEAD` or `refs/heads/*`).
 fn is_branch_ref(name: &str) -> bool {
     name == "HEAD" || name.starts_with("refs/heads/")
+}
+
+fn fsck_worktree_head_refs(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    git_dir: &Path,
+    name_objects: bool,
+    roots: &mut Vec<ObjectId>,
+    object_names: &mut std::collections::HashMap<ObjectId, String>,
+) -> Result<i32> {
+    let mut bits = 0i32;
+    let common = common_git_dir_for_git_dir(git_dir)?;
+    let mut heads: Vec<(PathBuf, String)> = Vec::new();
+    heads.push((git_dir.to_path_buf(), "HEAD".to_string()));
+    if common != git_dir {
+        heads.push((common.clone(), "HEAD".to_string()));
+    }
+    let worktrees_dir = common.join("worktrees");
+    if let Ok(entries) = fs::read_dir(&worktrees_dir) {
+        let mut linked: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect();
+        linked.sort();
+        for path in linked {
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            heads.push((path, format!("worktrees/{name}/HEAD")));
+        }
+    }
+
+    heads.sort_by(|left, right| left.1.cmp(&right.1));
+    heads.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+
+    for (head_git_dir, display) in heads {
+        let store = FileRefStore::new(&head_git_dir, format);
+        let Some(target) = store.read_ref("HEAD")? else {
+            continue;
+        };
+        match target {
+            RefTarget::Direct(oid) if oid.is_null() => {
+                eprintln!(
+                    "error: {display}: badRefOid: points to invalid object ID '{oid}'"
+                );
+                bits |= sley_fsck::ERROR_REFS;
+            }
+            RefTarget::Direct(oid) => {
+                if db.contains(&oid).unwrap_or(false) {
+                    roots.push(oid);
+                    if name_objects {
+                        object_names.entry(oid).or_insert(display);
+                    }
+                } else {
+                    eprintln!("error: {display}: invalid sha1 pointer {oid}");
+                    bits |= sley_fsck::ERROR_REACHABLE;
+                }
+            }
+            RefTarget::Symbolic(target) => {
+                if !target.starts_with("refs/heads/") {
+                    eprintln!(
+                        "error: {display}: badHeadTarget: HEAD points to non-branch '{target}'"
+                    );
+                    bits |= sley_fsck::ERROR_REFS;
+                    continue;
+                }
+                let reference = sley_refs::Ref {
+                    name: "HEAD".to_string(),
+                    target: RefTarget::Symbolic(target),
+                };
+                if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+                    && db.contains(&oid).unwrap_or(false)
+                {
+                    roots.push(oid);
+                    if name_objects {
+                        object_names.entry(oid).or_insert(display);
+                    }
+                }
+            }
+        }
+    }
+    Ok(bits)
 }
 
 /// git's `fsck_index` for every worktree index: mark each entry's blob
