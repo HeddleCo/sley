@@ -5440,7 +5440,7 @@ pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
     // Resolve the requested groups/remotes into a de-duplicated, order-preserving
     // list of concrete remote names.
     let mut remotes: Vec<String> = Vec::new();
-    let mut push_unique = |name: String, into: &mut Vec<String>| {
+    let push_unique = |name: String, into: &mut Vec<String>| {
         if !into.contains(&name) {
             into.push(name);
         }
