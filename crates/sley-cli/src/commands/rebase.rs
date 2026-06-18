@@ -462,11 +462,9 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
     let orig_head = ObjectId::from_hex(ctx.format, orig_raw.trim())
         .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
     let squash_onto = match seq::read_state_line(&ctx.git_dir, "squash-onto") {
-        Some(raw) => Some(
-            ObjectId::from_hex(ctx.format, raw.trim()).map_err(|_| {
-                GitError::InvalidObject("invalid squash-onto value during rebase".into())
-            })?,
-        ),
+        Some(raw) => Some(ObjectId::from_hex(ctx.format, raw.trim()).map_err(|_| {
+            GitError::InvalidObject("invalid squash-onto value during rebase".into())
+        })?),
         None => None,
     };
     let exists = |name: &str| ctx.state_path(name).exists();
@@ -767,11 +765,8 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
                 return result;
             }
             RebaseAction::Abort => {
-                let result = commands::am::rebase_apply_abort(
-                    &ctx.git_dir,
-                    &ctx.worktree_root,
-                    ctx.format,
-                );
+                let result =
+                    commands::am::rebase_apply_abort(&ctx.git_dir, &ctx.worktree_root, ctx.format);
                 // Abort always ends the rebase; restore the autostash on top of
                 // the restored orig_head (git applies it after reset).
                 finish_apply_autostash(&ctx);
@@ -791,13 +786,13 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(128));
             }
             RebaseAction::EditTodo => {
-                eprintln!("error: The --edit-todo action can only be used during interactive rebase.");
+                eprintln!(
+                    "error: The --edit-todo action can only be used during interactive rebase."
+                );
                 return Err(GitError::Exit(1));
             }
             RebaseAction::None => {
-                eprintln!(
-                    "fatal: It looks like 'git am' is in progress. Cannot rebase."
-                );
+                eprintln!("fatal: It looks like 'git am' is in progress. Cannot rebase.");
                 return Err(GitError::Exit(128));
             }
         }
@@ -879,11 +874,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         args.apply_backend || args.whitespace.is_some() || args.context_lines.is_some();
     if use_apply_backend && implied_merge {
         if args.rebase_merges.is_none() && config_rebase_merges {
-            eprintln!("fatal: apply options are incompatible with rebase.rebaseMerges; use --no-rebase-merges");
+            eprintln!(
+                "fatal: apply options are incompatible with rebase.rebaseMerges; use --no-rebase-merges"
+            );
             return Err(GitError::Exit(128));
         }
         if args.update_refs.is_none() && config_update_refs {
-            eprintln!("fatal: apply options are incompatible with rebase.updateRefs; use --no-update-refs");
+            eprintln!(
+                "fatal: apply options are incompatible with rebase.updateRefs; use --no-update-refs"
+            );
             return Err(GitError::Exit(128));
         }
         eprintln!("fatal: apply options and merge options cannot be used together");
@@ -1861,9 +1860,11 @@ fn rearrange_squash(
     // Per-item subject (from the commit), or None for drop/comment/no-commit.
     let mut subjects: Vec<Option<String>> = vec![None; n];
     // Title -> first item index with that exact subject.
-    let mut subject2item: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut subject2item: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     // Resolved commit oid -> item index (for the commit-name match tier).
-    let mut commit2item: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
+    let mut commit2item: std::collections::HashMap<ObjectId, usize> =
+        std::collections::HashMap::new();
     let mut next = vec![-1i64; n];
     let mut tail = vec![-1i64; n];
     let mut rewritten: Vec<Option<(TodoCommand, u8)>> = vec![None; n];
@@ -2662,6 +2663,7 @@ fn pick_one_commit(
                     MachineCommit {
                         amend: true,
                         edit: true,
+                        cleanup_message: true,
                         allow_empty: true,
                         create_root: false,
                         message_file: None,
@@ -2857,6 +2859,7 @@ fn pick_one_commit(
         MachineCommit {
             amend,
             edit: edit || item.command == TodoCommand::Reword,
+            cleanup_message: !(is_fixup && !final_fixup),
             allow_empty,
             create_root,
             message_file: commit_message_file,
@@ -3077,10 +3080,7 @@ fn stop_with_patch(
         });
         eprintln!("You can amend the commit now, with");
         eprintln!();
-        eprintln!(
-            "  git commit --amend{} ",
-            sign_opt.as_deref().unwrap_or("")
-        );
+        eprintln!("  git commit --amend{} ", sign_opt.as_deref().unwrap_or(""));
         eprintln!();
         eprintln!("Once you are satisfied with your changes, run");
         eprintln!();
@@ -3100,7 +3100,6 @@ fn stop_with_patch(
     }
     Ok(PickOutcome::EditStop)
 }
-
 
 // ---------------------------------------------------------------------------
 // fixup / squash message machinery
@@ -3174,9 +3173,7 @@ fn skip_blank_lines(buf: &[u8]) -> usize {
 /// `seen_squash`: the current fixup chain contains a `squash` command.
 fn seen_squash(ctx: &Ctx) -> bool {
     fs::read_to_string(ctx.state_path("current-fixups"))
-        .map(|text| {
-            text.starts_with("squash") || text.contains("\nsquash")
-        })
+        .map(|text| text.starts_with("squash") || text.contains("\nsquash"))
         .unwrap_or(false)
 }
 
@@ -3202,10 +3199,8 @@ fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
     let mut idx = 1usize;
     // Build the "This is the commit message #N:" / "...#N will be skipped:"
     // markers lazily as we walk.
-    let kept_nth =
-        |n: usize| format!("{comment_str} This is the commit message #{n}:");
-    let skip_nth =
-        |n: usize| format!("{comment_str} The commit message #{n} will be skipped:");
+    let kept_nth = |n: usize| format!("{comment_str} This is the commit message #{n}:");
+    let skip_nth = |n: usize| format!("{comment_str} The commit message #{n} will be skipped:");
     for line in msg.split_inclusive(|&b| b == b'\n') {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         let text = String::from_utf8_lossy(body);
@@ -3274,7 +3269,11 @@ fn append_squash_message(
     };
     buf.push(b'\n');
     buf.extend_from_slice(
-        format!("{comment_str} This is the commit message #{}:\n\n", count + 2).as_bytes(),
+        format!(
+            "{comment_str} This is the commit message #{}:\n\n",
+            count + 2
+        )
+        .as_bytes(),
     );
     buf.extend_from_slice(&commented_lines(&body[..commented_len], comment));
     let fixup_off = buf.len();
@@ -3356,7 +3355,15 @@ fn update_squash_messages(
 
     let body = &record.commit.message;
     if item.command == TodoCommand::Squash || flagged {
-        append_squash_message(ctx, &mut buf, body, item.command, item.flags, comment, count)?;
+        append_squash_message(
+            ctx,
+            &mut buf,
+            body,
+            item.command,
+            item.flags,
+            comment,
+            count,
+        )?;
     } else {
         // Plain fixup: the message is skipped.
         buf.push(b'\n');
@@ -3394,6 +3401,7 @@ fn update_squash_messages(
 struct MachineCommit<'a> {
     amend: bool,
     edit: bool,
+    cleanup_message: bool,
     allow_empty: bool,
     create_root: bool,
     /// Seed message file (MERGE_MSG / message-squash / message-fixup); `None`
@@ -3454,7 +3462,7 @@ fn machine_commit(
             eprintln!("Aborting commit due to empty commit message.");
             return Ok(CommitOutcome::Failed(1));
         }
-    } else {
+    } else if commit.cleanup_message {
         // verbatim, but the seed files for non-edit commits never carry
         // comments except the conflicts block which only exists when editing.
         message = strip_comment_lines(&message, comment_char(&ctx.git_dir));
@@ -3620,17 +3628,20 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     if let Some(head_name) = &opts.head_name {
         let committer = commit_identity_from_env("COMMITTER")?;
         let mut tx = refs.transaction();
-        tx.update(RefUpdate {
-            name: head_name.clone(),
-            expected: None,
-            new: RefTarget::Direct(head),
-            reflog: Some(ReflogEntry {
-                old_oid: opts.orig_head,
-                new_oid: head,
-                committer: committer.clone(),
-                message: ctx.reflog("finish", Some(&format!("{head_name} onto {}", opts.onto))),
-            }),
-        });
+        let branch_already_at_head = matches!(refs.read_ref(head_name)?, Some(RefTarget::Direct(current)) if current == head);
+        if !branch_already_at_head {
+            tx.update(RefUpdate {
+                name: head_name.clone(),
+                expected: None,
+                new: RefTarget::Direct(head),
+                reflog: Some(ReflogEntry {
+                    old_oid: opts.orig_head,
+                    new_oid: head,
+                    committer: committer.clone(),
+                    message: ctx.reflog("finish", Some(&format!("{head_name} onto {}", opts.onto))),
+                }),
+            });
+        }
         tx.update(RefUpdate {
             name: "HEAD".into(),
             expected: None,
@@ -3883,6 +3894,7 @@ fn commit_staged_changes(
         MachineCommit {
             amend,
             edit: edit && !cleanup_only,
+            cleanup_message: true,
             allow_empty: true,
             create_root: false,
             message_file,
@@ -3902,7 +3914,7 @@ fn commit_staged_changes(
         let _ = fs::remove_file(ctx.state_path("message-fixup"));
         let _ = fs::remove_file(ctx.state_path("message-squash"));
     }
-    if current_fixup_count(ctx) > 0 && (final_fixup || is_clean) {
+    if current_fixup_count(ctx) > 0 {
         let _ = fs::remove_file(ctx.state_path("current-fixups"));
     }
     Ok(false)

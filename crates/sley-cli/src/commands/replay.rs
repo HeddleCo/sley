@@ -181,8 +181,8 @@ fn run_git_replay(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
-        .unwrap_or_else(|| cwd.clone());
+    let worktree_root =
+        sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| cwd.clone());
     let ctx = ReplayCtx {
         action: if parsed.revert.is_some() {
             ReplayAction::Revert
@@ -518,7 +518,9 @@ fn replay_one_commit_to(
     let (base_map, theirs_map) = match action {
         ReplayAction::Pick => {
             let base = match parent {
-                Some(parent) => tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?,
+                Some(parent) => {
+                    tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?
+                }
                 None => MergeTreeMap::new(),
             };
             let theirs = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
@@ -527,7 +529,9 @@ fn replay_one_commit_to(
         ReplayAction::Revert => {
             let base = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
             let theirs = match parent {
-                Some(parent) => tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?,
+                Some(parent) => {
+                    tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?
+                }
                 None => MergeTreeMap::new(),
             };
             (base, theirs)
@@ -672,10 +676,12 @@ fn write_tree_map_level(
     ))
 }
 
-fn emit_or_update_replay_ref(ctx: &ReplayCtx, plan: &GitReplayPlan, new_oid: &ObjectId) -> Result<()> {
-    let old_oid = plan
-        .old_oid
-        .unwrap_or_else(|| ObjectId::null(ctx.format));
+fn emit_or_update_replay_ref(
+    ctx: &ReplayCtx,
+    plan: &GitReplayPlan,
+    new_oid: &ObjectId,
+) -> Result<()> {
+    let old_oid = plan.old_oid.unwrap_or_else(|| ObjectId::null(ctx.format));
     if plan.ref_action == ReplayRefAction::Print {
         println!("update {} {} {}", plan.target_ref, new_oid, old_oid);
         return Ok(());
@@ -1140,13 +1146,7 @@ fn select_revisions(
             sley_rev::RevisionOrder::Topo => sley_rev::RevWalkOrder::Topo,
             sley_rev::RevisionOrder::AuthorDate => sley_rev::RevWalkOrder::AuthorDate,
         };
-        let mut walk =
-            sley_rev::RevWalk::new(
-                &ctx.git_dir,
-                ctx.format,
-                &db,
-                starts,
-            )
+        let mut walk = sley_rev::RevWalk::new(&ctx.git_dir, ctx.format, &db, starts)
             .order(order)
             .first_parent(options.first_parent)
             .date_window(options.date_window);
@@ -1168,10 +1168,9 @@ fn select_revisions(
 
     if !options.author_patterns.is_empty() {
         commits.retain(|oid| {
-            options
-                .author_patterns
-                .iter()
-                .all(|pattern| commit_author_matches(&db, ctx.format, oid, pattern).unwrap_or(false))
+            options.author_patterns.iter().all(|pattern| {
+                commit_author_matches(&db, ctx.format, oid, pattern).unwrap_or(false)
+            })
         });
     }
     if options.skip > 0 {
@@ -1786,14 +1785,24 @@ pub(crate) fn comment_char(git_dir: &Path) -> u8 {
 
 pub(crate) fn strip_comment_lines(message: &[u8], comment: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(message.len());
+    let mut blank_pending = false;
     for line in message.split_inclusive(|&b| b == b'\n') {
         if line.first() == Some(&comment) {
             continue;
         }
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if body.iter().all(|b| b.is_ascii_whitespace()) {
+            blank_pending = !out.is_empty();
+            continue;
+        }
+        if blank_pending {
+            out.push(b'\n');
+            blank_pending = false;
+        }
         out.extend_from_slice(line);
     }
-    // stripspace: collapse trailing blank lines to a single newline and trim
-    // leading blank lines.
+    // stripspace: trim leading/trailing blank lines and collapse internal
+    // blank runs to a single empty line.
     let text = out;
     let mut start = 0;
     while start < text.len() && text[start] == b'\n' {
