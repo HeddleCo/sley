@@ -2997,6 +2997,31 @@ where
             )));
         }
 
+        if entry.write_tree_mode() == SPARSE_DIR_MODE
+            && let Some(name) = remainder.strip_suffix(b"/")
+            && !name.is_empty()
+            && !name.contains(&b'/')
+        {
+            let oid = entry.write_tree_oid();
+            if !missing_ok && !checker.contains(&oid)? {
+                eprintln!(
+                    "error: invalid object {:o} {} for '{}'",
+                    SPARSE_DIR_MODE,
+                    oid,
+                    String::from_utf8_lossy(path)
+                );
+                eprintln!("fatal: git-write-tree: error building trees");
+                return Err(GitError::Exit(128));
+            }
+            tree_entries.push(TreeEntry {
+                mode: SPARSE_DIR_MODE,
+                name: BString::from(name),
+                oid,
+            });
+            index += 1;
+            continue;
+        }
+
         if let Some(slash) = remainder.iter().position(|byte| *byte == b'/') {
             let name = &remainder[..slash];
             if name.is_empty() {
@@ -7451,13 +7476,26 @@ impl SparseMatcher {
     fn includes_file(&self, path: &[u8]) -> bool {
         match self {
             SparseMatcher::Full { patterns } => {
-                let mut included = false;
-                for pattern in patterns {
-                    if pattern.matches(path, false) {
-                        included = !pattern.negated;
+                let mut end = path.len();
+                let mut is_dir = false;
+                while end > 0 {
+                    let candidate = &path[..end];
+                    let mut matched = None;
+                    for pattern in patterns {
+                        if pattern.matches(candidate, is_dir) {
+                            matched = Some(!pattern.negated);
+                        }
                     }
+                    if let Some(included) = matched {
+                        return included;
+                    }
+                    let Some(slash) = candidate.iter().rposition(|byte| *byte == b'/') else {
+                        break;
+                    };
+                    end = slash;
+                    is_dir = true;
                 }
-                included
+                false
             }
             SparseMatcher::Cone(cone) => cone.includes_file(path),
         }
@@ -7479,7 +7517,7 @@ impl ConeMatcher {
                     && let Some(dir) = rest.strip_suffix(b"/*/")
                     && !dir.is_empty()
                 {
-                    guarded_parent_dirs.insert(dir.to_vec());
+                    guarded_parent_dirs.insert(unescape_sparse_cone_dir(dir));
                 }
                 continue;
             }
@@ -7492,7 +7530,7 @@ impl ConeMatcher {
                 && let Some(dir) = rest.strip_suffix(b"/")
                 && !dir.is_empty()
             {
-                positive_dirs.push(dir.to_vec());
+                positive_dirs.push(unescape_sparse_cone_dir(dir));
                 continue;
             }
             // `/dir/*` -> direct files of `dir` only (parent guard).
@@ -7500,7 +7538,7 @@ impl ConeMatcher {
                 && let Some(dir) = rest.strip_suffix(b"/*")
                 && !dir.is_empty()
             {
-                matcher.parent_dirs.push(dir.to_vec());
+                matcher.parent_dirs.push(unescape_sparse_cone_dir(dir));
                 continue;
             }
         }
@@ -7566,7 +7604,7 @@ fn patterns_are_cone(patterns: &[Vec<u8>]) -> bool {
             || body == b"/*/"
             || (body.starts_with(b"/")
                 && (body.ends_with(b"/") || body.ends_with(b"/*"))
-                && !sparse_has_glob_meta(body));
+                && !sparse_has_unescaped_glob_meta(body));
         if !is_cone_shaped {
             return false;
         }
@@ -7576,11 +7614,38 @@ fn patterns_are_cone(patterns: &[Vec<u8>]) -> bool {
 
 /// Detects glob metacharacters that disqualify a line from cone interpretation.
 /// A single trailing `/*` is allowed by the caller and handled separately.
-fn sparse_has_glob_meta(body: &[u8]) -> bool {
+fn sparse_has_unescaped_glob_meta(body: &[u8]) -> bool {
     let trimmed = body.strip_suffix(b"/*").unwrap_or(body);
-    trimmed
-        .iter()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+    for (index, byte) in trimmed.iter().enumerate() {
+        if !matches!(*byte, b'*' | b'?' | b'[' | b']' | b'\\') {
+            continue;
+        }
+        let prev = index.checked_sub(1).and_then(|i| trimmed.get(i)).copied();
+        let next = trimmed.get(index + 1).copied();
+        if prev == Some(b'\\') {
+            continue;
+        }
+        if *byte == b'\\' && matches!(next, Some(b'*' | b'?' | b'[' | b'\\')) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn unescape_sparse_cone_dir(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut iter = path.iter().copied();
+    while let Some(byte) = iter.next() {
+        if byte == b'\\'
+            && let Some(next @ (b'*' | b'?' | b'[' | b'\\')) = iter.next()
+        {
+            out.push(next);
+            continue;
+        }
+        out.push(byte);
+    }
+    out
 }
 
 fn read_core_excludes_file(root: &Path, patterns: &mut Vec<IgnorePattern>) -> bool {

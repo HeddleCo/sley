@@ -1813,7 +1813,9 @@ fn diff_name_status_index_worktree_changes(
         Err(err) => return Err(err.into()),
     };
     let index_bytes = fs::read(&index_path)?;
-    if let Ok(index) = BorrowedIndex::parse(&index_bytes, format) {
+    if let Ok(index) = BorrowedIndex::parse(&index_bytes, format)
+        && !index.entries.iter().any(borrowed_entry_is_sparse_dir)
+    {
         let (has_non_normal_stage, staged_gitlinks) =
             index_worktree_metadata_for_entries(&index.entries);
         if has_non_normal_stage {
@@ -1836,7 +1838,7 @@ fn diff_name_status_index_worktree_changes(
             staged_gitlinks,
         });
     }
-    let index = Index::parse(&index_bytes, format)?;
+    let index = expand_sparse_index_for_worktree_diff(Index::parse(&index_bytes, format)?, git_dir, format)?;
     let (has_non_normal_stage, staged_gitlinks) =
         index_worktree_metadata_for_entries(&index.entries);
     if has_non_normal_stage {
@@ -1858,6 +1860,59 @@ fn diff_name_status_index_worktree_changes(
         entries,
         staged_gitlinks,
     })
+}
+
+fn borrowed_entry_is_sparse_dir(entry: &sley_index::IndexEntryRef<'_>) -> bool {
+    entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree()
+}
+
+fn expand_sparse_index_for_worktree_diff(
+    mut index: Index,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Index> {
+    if !index.entries.iter().any(sley_index::IndexEntry::is_sparse_dir) {
+        return Ok(index);
+    }
+
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut expanded = Vec::with_capacity(index.entries.len());
+    for entry in std::mem::take(&mut index.entries) {
+        if !entry.is_sparse_dir() {
+            expanded.push(entry);
+            continue;
+        }
+
+        let dir_prefix = entry.path.as_bytes();
+        for (rel_path, (mode, oid)) in flatten_tree(&db, format, &entry.oid)? {
+            let mut path = dir_prefix.to_vec();
+            path.extend_from_slice(&rel_path);
+            let mut expanded_entry = sley_index::IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid,
+                flags: 0,
+                flags_extended: 0,
+                path: BString::from(path),
+            };
+            expanded_entry.set_skip_worktree(true);
+            expanded_entry.refresh_name_length();
+            expanded.push(expanded_entry);
+        }
+    }
+
+    expanded.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    index.entries = expanded;
+    index.clear_sparse_extension()?;
+    Ok(index)
 }
 
 fn diff_name_status_index_worktree_changes_for_borrowed_entries(
@@ -3178,7 +3233,11 @@ fn read_intent_to_add_paths(
     if !index_path.exists() {
         return Ok(std::collections::HashSet::new());
     }
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let index = expand_sparse_index_for_worktree_diff(
+        Index::parse(&fs::read(&index_path)?, format)?,
+        git_dir,
+        format,
+    )?;
     Ok(index
         .entries
         .iter()
@@ -3199,7 +3258,11 @@ fn read_index_snapshot(git_dir: &Path, format: ObjectFormat) -> Result<IndexSnap
         }
         Err(err) => return Err(err.into()),
     };
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let index = expand_sparse_index_for_worktree_diff(
+        Index::parse(&fs::read(&index_path)?, format)?,
+        git_dir,
+        format,
+    )?;
     let stat_cache =
         IndexStatCache::from_index_mtime(&index, sley_index::file_mtime_parts(&index_metadata));
     let entries = index
@@ -3227,6 +3290,7 @@ trait WorktreeIndexEntry {
     fn mode(&self) -> u32;
     fn oid(&self) -> ObjectId;
     fn is_intent_to_add(&self) -> bool;
+    fn is_skip_worktree(&self) -> bool;
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool;
 }
 
@@ -3249,6 +3313,10 @@ impl WorktreeIndexEntry for sley_index::IndexEntry {
 
     fn is_intent_to_add(&self) -> bool {
         sley_index::IndexEntry::is_intent_to_add(self)
+    }
+
+    fn is_skip_worktree(&self) -> bool {
+        sley_index::IndexEntry::is_skip_worktree(self)
     }
 
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool {
@@ -3275,6 +3343,10 @@ impl WorktreeIndexEntry for sley_index::IndexEntryRef<'_> {
 
     fn is_intent_to_add(&self) -> bool {
         sley_index::IndexEntryRef::is_intent_to_add(self)
+    }
+
+    fn is_skip_worktree(&self) -> bool {
+        sley_index::IndexEntryRef::is_skip_worktree(self)
     }
 
     fn reusable_with(&self, stat_cache: &IndexStatCache, metadata: &fs::Metadata) -> bool {
@@ -3689,6 +3761,12 @@ fn index_worktree_change_for_entry(
     let git_path = index_entry.git_path();
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && index_entry.is_skip_worktree() =>
+        {
+            return Ok(None);
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Some(index_worktree_deleted_entry(index_entry)));
         }
