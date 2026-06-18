@@ -30,6 +30,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut boundary = false;
     let mut disk_usage = None;
     let mut object_names = true;
+    let mut verify_objects = false;
     let mut read_stdin = false;
     let mut header = false;
     // `--no-commit-header` / `--commit-header`: override whether `--format=` /
@@ -204,6 +205,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--use-bitmap-index" => use_bitmap_index = true,
             "--test-bitmap" => test_bitmap = true,
             "--objects" => objects = true,
+            "--verify-objects" => verify_objects = true,
             "--objects-edge" => {
                 objects = true;
                 objects_edge = true;
@@ -489,6 +491,17 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         HashSet::new()
     };
     let exclude_tip_oids: Vec<ObjectId> = revision_options.negatives.clone();
+
+    if verify_objects {
+        let mut verify_roots = Vec::new();
+        verify_roots.extend(include_commits.iter().copied());
+        verify_roots.extend(start_tag_objects.iter().map(|tag| tag.object.oid));
+        verify_roots.extend(provided_objects.iter().map(|object| object.oid));
+        verify_roots.extend(bitmap_object_tips.iter().copied());
+        if rev_list_verify_objects(&db, format, verify_roots) {
+            return Err(GitError::Exit(1));
+        }
+    }
 
     if test_bitmap {
         return rev_list_test_bitmap(&git_dir, &db, format, &include_commits, &exclude_tip_oids);
@@ -1176,6 +1189,55 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     io::stdout().flush()?;
     Ok(())
+}
+
+fn rev_list_verify_objects(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    roots: Vec<ObjectId>,
+) -> bool {
+    let mut failed = false;
+    let mut seen = HashSet::new();
+    let mut pending = std::collections::VecDeque::from(roots);
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(err) => {
+                eprintln!("error: {oid}: object corrupt or missing: {err}");
+                failed = true;
+                continue;
+            }
+        };
+        if object.object_id(format).is_ok_and(|actual| actual != oid) {
+            eprintln!("error: hash mismatch {oid}");
+            failed = true;
+        }
+        match object.object_type {
+            ObjectType::Commit => {
+                if let Ok(commit) = sley_object::Commit::parse_ref(format, &object.body) {
+                    pending.push_back(commit.tree);
+                    pending.extend(commit.parents);
+                }
+            }
+            ObjectType::Tree => {
+                if let Ok(entries) = sley_object::TreeEntries::new(format, &object.body)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    pending.extend(entries.into_iter().map(|entry| entry.oid));
+                }
+            }
+            ObjectType::Tag => {
+                if let Ok(tag) = sley_object::Tag::parse_ref(format, &object.body) {
+                    pending.push_back(tag.object);
+                }
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    failed
 }
 
 /// The default bisect revisions injected by `--bisect`: the `refs/bisect/<bad>`

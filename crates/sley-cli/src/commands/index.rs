@@ -550,8 +550,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     for path in &exclude_from {
         let absolute = if Path::new(path).is_absolute() {
             PathBuf::from(path)
@@ -1604,8 +1604,19 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let worktree_required = refresh
+        || again
+        || fsmonitor_valid.is_some()
+        || skip_worktree.is_some()
+        || assume_unchanged.is_some()
+        || !paths.is_empty()
+        || test_untracked_cache;
+    let worktree_root = match worktree_root_for_git_dir(&git_dir) {
+        Ok(root) => root,
+        Err(_) if !worktree_required => cwd.clone(),
+        Err(err) => return Err(err),
+    };
     let resolved_paths = paths
         .iter()
         .map(|path| {

@@ -1,7 +1,7 @@
 use sley_core::{ObjectFormat, ObjectId};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 mod connectivity;
 pub mod content;
@@ -118,6 +118,8 @@ impl FsckReport {
 pub struct FsckOptions {
     pub report_dangling: bool,
     pub report_unreachable: bool,
+    pub connectivity_only: bool,
+    pub object_names: HashMap<ObjectId, String>,
     /// `fsck.<msgid>` severity overrides plus `--strict`, applied to
     /// object-content findings.
     pub severity: SeverityConfig,
@@ -161,6 +163,8 @@ where
         checked: HashSet::new(),
         issues: Vec::new(),
         severity: options.severity.clone(),
+        connectivity_only: options.connectivity_only,
+        object_names: options.object_names.clone(),
         error_bits: 0,
         gitattributes_found: HashSet::new(),
     };
@@ -195,6 +199,8 @@ struct FsckChecker<'a, R> {
     checked: HashSet<ObjectId>,
     issues: Vec<FsckIssue>,
     severity: SeverityConfig,
+    connectivity_only: bool,
+    object_names: HashMap<ObjectId, String>,
     /// Accumulated git exit-code bits (`ERROR_REACHABLE`).
     error_bits: i32,
     /// Blob oids that some tree entry named `.gitattributes`, mirroring git's
@@ -258,25 +264,32 @@ where
         match object.object_id(self.format) {
             Ok(actual) if actual == oid => {}
             Ok(actual) => {
-                self.error_bits |= ERROR_OBJECT;
-                self.issues.push(FsckIssue::error(format!(
-                    "object id mismatch: expected {oid}, got {actual}"
-                )));
-                return;
+                if !self.connectivity_only {
+                    self.error_bits |= ERROR_OBJECT;
+                    self.issues.push(FsckIssue::error(format!(
+                        "object id mismatch: expected {oid}, got {actual}"
+                    )));
+                    return;
+                }
             }
             Err(err) => {
-                self.error_bits |= ERROR_OBJECT;
-                self.issues
-                    .push(FsckIssue::error(format!("invalid object {oid}: {err}")));
-                return;
+                if !self.connectivity_only {
+                    self.error_bits |= ERROR_OBJECT;
+                    self.issues
+                        .push(FsckIssue::error(format!("invalid object {oid}: {err}")));
+                    return;
+                }
             }
         }
 
         // Run git's content checker (commit/tree/tag buffer validation). It
         // emits the exact `error in <type> <oid>: <msgid>: <detail>` /
         // `warning in ...` lines on stderr, with `fsck.<id>` severity applied.
-        let content_findings =
-            content::check_object_content(object.object_type, &object.body, &self.severity);
+        let content_findings = if self.connectivity_only {
+            Vec::new()
+        } else {
+            content::check_object_content(object.object_type, &object.body, &self.severity)
+        };
         let had_fatal = content_findings.iter().any(|f| f.fatal);
         for f in &content_findings {
             let prefix = match f.severity {
@@ -320,12 +333,23 @@ where
         // Content checks already ran; for the link walk we tolerate a strict
         // parse failure (the content checker reported the specifics).
         let Ok(commit) = Commit::parse_ref(self.format, body) else {
+            if self.connectivity_only {
+                self.error_bits |= ERROR_OBJECT;
+                self.issues
+                    .push(FsckIssue::error(format!("{oid}: object corrupt or missing")));
+            }
             return;
         };
+        let source_name = self.object_names.get(&oid).cloned();
         let source = ObjectLink {
             object_type: ObjectType::Commit,
             oid,
         };
+        if let Some(name) = &source_name {
+            self.object_names
+                .entry(commit.tree)
+                .or_insert_with(|| format!("{name}:"));
+        }
         self.check_object_link(
             Some(source.clone()),
             ObjectLink {
@@ -333,7 +357,20 @@ where
                 oid: commit.tree,
             },
         );
-        for parent in sley_odb::grafted_parents(self.reader, &oid, commit.parents) {
+        for (idx, parent) in sley_odb::grafted_parents(self.reader, &oid, commit.parents)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(name) = &source_name {
+                let suffix = if idx == 0 {
+                    "^".to_string()
+                } else {
+                    format!("^{}", idx + 1)
+                };
+                self.object_names
+                    .entry(parent)
+                    .or_insert_with(|| format!("{name}{suffix}"));
+            }
             self.check_object_link(
                 Some(source.clone()),
                 ObjectLink {
@@ -349,8 +386,14 @@ where
             TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>()
         else {
             // The content checker already reported `badTree`/`nullSha1`/etc.
+            if self.connectivity_only {
+                self.error_bits |= ERROR_OBJECT;
+                self.issues
+                    .push(FsckIssue::error(format!("{oid}: object corrupt or missing")));
+            }
             return;
         };
+        let source_name = self.object_names.get(&oid).cloned();
         let source = ObjectLink {
             object_type: ObjectType::Tree,
             oid,
@@ -372,6 +415,12 @@ where
             if entry.oid.is_null() {
                 continue;
             }
+            if let Some(name) = &source_name {
+                let entry_name = String::from_utf8_lossy(entry.name);
+                self.object_names
+                    .entry(entry.oid)
+                    .or_insert_with(|| format!("{name}{entry_name}"));
+            }
             self.check_object_link(
                 Some(source.clone()),
                 ObjectLink {
@@ -385,8 +434,16 @@ where
     fn check_tag(&mut self, oid: ObjectId, body: &[u8]) {
         // Content checks already ran; tolerate a strict parse failure here.
         let Ok(tag) = Tag::parse_ref(self.format, body) else {
+            if self.connectivity_only {
+                self.error_bits |= ERROR_OBJECT;
+                self.issues
+                    .push(FsckIssue::error(format!("{oid}: object corrupt or missing")));
+            }
             return;
         };
+        if let Some(name) = self.object_names.get(&oid).cloned() {
+            self.object_names.entry(tag.object).or_insert(name);
+        }
         self.check_object_link(
             Some(ObjectLink {
                 object_type: ObjectType::Tag,
@@ -449,16 +506,23 @@ where
             self.issues.push(FsckIssue::error(format!(
                 "broken link from {:>7} {}\n              to {:>7} {}",
                 source.object_type.as_str(),
-                source.oid,
+                self.describe_oid(&source.oid),
                 link.object_type.as_str(),
-                link.oid
+                self.describe_oid(&link.oid)
             )));
         }
         self.issues.push(FsckIssue::error(format!(
             "missing {} {}",
             link.object_type.as_str(),
-            link.oid
+            self.describe_oid(&link.oid)
         )));
+    }
+
+    fn describe_oid(&self, oid: &ObjectId) -> String {
+        match self.object_names.get(oid) {
+            Some(name) => format!("{oid} ({name})"),
+            None => oid.to_string(),
+        }
     }
 }
 
