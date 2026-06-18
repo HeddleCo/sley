@@ -4136,61 +4136,45 @@ fn resolve_pull_remote_and_refspecs(
             Ok((remote, vec![branch.clone()], vec![branch]))
         }
         (Some(remote), None) => {
-            let merge_srcs = store
-                .current_branch()
-                .ok()
-                .flatten()
-                .map(|current| branch_merge_values(config, &current))
-                .unwrap_or_default();
+            let Some(current) = store.current_branch()? else {
+                print_pull_no_merge_candidates_detached(false);
+                return Err(GitError::Exit(1));
+            };
+            let merge_srcs = if remote_exists(config, &remote) {
+                if let Some(default_remote) = config.get("branch", Some(&current), "remote")
+                    && default_remote != remote
+                {
+                    eprintln!("You asked to pull from the remote '{remote}', but did not specify");
+                    eprintln!("a branch. Because this is not the default configured remote");
+                    eprintln!(
+                        "for your current branch, you must specify a branch on the command line."
+                    );
+                    return Err(GitError::Exit(1));
+                }
+                let merge_srcs = branch_merge_values(config, &current);
+                if merge_srcs.is_empty() {
+                    print_pull_no_tracking(&current, false);
+                    return Err(GitError::Exit(1));
+                }
+                merge_srcs
+            } else {
+                Vec::new()
+            };
             Ok((remote, Vec::new(), merge_srcs))
         }
         (None, None) => {
             let Some(current) = store.current_branch()? else {
-                eprintln!("There is no tracking information for the current branch.");
-                eprintln!("Please specify which branch you want to merge with.");
-                eprintln!("See git-pull(1) for details.");
-                eprintln!();
-                eprintln!("    git pull <remote> <branch>");
-                eprintln!();
-                eprintln!(
-                    "If you wish to set tracking information for this branch you can do so with:"
-                );
-                eprintln!();
-                eprintln!("    git branch --set-upstream-to=<remote>/<branch> HEAD");
-                eprintln!();
+                print_pull_no_merge_candidates_detached(false);
                 return Err(GitError::Exit(1));
             };
             let Some(remote) = config.get("branch", Some(&current), "remote") else {
-                eprintln!("There is no tracking information for the current branch.");
-                eprintln!("Please specify which branch you want to merge with.");
-                eprintln!("See git-pull(1) for details.");
-                eprintln!();
-                eprintln!("    git pull <remote> <branch>");
-                eprintln!();
-                eprintln!(
-                    "If you wish to set tracking information for this branch you can do so with:"
-                );
-                eprintln!();
-                eprintln!("    git branch --set-upstream-to=<remote>/<branch> {current}");
-                eprintln!();
+                print_pull_no_tracking(&current, false);
                 return Err(GitError::Exit(1));
             };
-            let Some(merge) = config.get("branch", Some(&current), "merge") else {
-                eprintln!("There is no tracking information for the current branch.");
-                eprintln!("Please specify which branch you want to merge with.");
-                eprintln!("See git-pull(1) for details.");
-                eprintln!();
-                eprintln!("    git pull <remote> <branch>");
-                eprintln!();
-                eprintln!(
-                    "If you wish to set tracking information for this branch you can do so with:"
-                );
-                eprintln!();
-                eprintln!("    git branch --set-upstream-to=<remote>/<branch> {current}");
-                eprintln!();
+            if config.get("branch", Some(&current), "merge").is_none() {
+                print_pull_no_tracking(&current, false);
                 return Err(GitError::Exit(1));
             };
-            let _ = merge;
             Ok((
                 remote.to_string(),
                 Vec::new(),
@@ -4201,6 +4185,56 @@ fn resolve_pull_remote_and_refspecs(
             "pull currently requires a remote when a branch is specified".into(),
         )),
     }
+}
+
+fn print_pull_no_merge_candidates_for_refspecs(rebase: bool) {
+    if rebase {
+        eprintln!(
+            "There is no candidate for rebasing against among the refs that you just fetched."
+        );
+    } else {
+        eprintln!("There are no candidates for merging among the refs that you just fetched.");
+    }
+    eprintln!(
+        "Generally this means that you provided a wildcard refspec which had no\nmatches on the remote end."
+    );
+}
+
+fn print_pull_no_merge_candidates_detached(rebase: bool) {
+    eprintln!("You are not currently on a branch.");
+    if rebase {
+        eprintln!("Please specify which branch you want to rebase against.");
+    } else {
+        eprintln!("Please specify which branch you want to merge with.");
+    }
+    eprintln!("See git-pull(1) for details.");
+    eprintln!();
+    eprintln!("    git pull <remote> <branch>");
+    eprintln!();
+}
+
+fn print_pull_no_tracking(current: &str, rebase: bool) {
+    eprintln!("There is no tracking information for the current branch.");
+    if rebase {
+        eprintln!("Please specify which branch you want to rebase against.");
+    } else {
+        eprintln!("Please specify which branch you want to merge with.");
+    }
+    eprintln!("See git-pull(1) for details.");
+    eprintln!();
+    eprintln!("    git pull <remote> <branch>");
+    eprintln!();
+    eprintln!("If you wish to set tracking information for this branch you can do so with:");
+    eprintln!();
+    eprintln!("    git branch --set-upstream-to=<remote>/<branch> {current}");
+    eprintln!();
+}
+
+fn print_pull_no_such_ref_fetched(merge_srcs: &[String]) {
+    let src = merge_srcs.first().map(String::as_str).unwrap_or("HEAD");
+    eprintln!(
+        "Your configuration specifies to merge with the ref '{src}'\nfrom the remote, but no such ref was fetched."
+    );
 }
 
 /// All `branch.<name>.merge` values configured for `branch`, in config order
@@ -4227,6 +4261,148 @@ fn fetch_head_merge_record(git_dir: &Path, format: ObjectFormat) -> Result<Fetch
 
 fn resolve_fetch_head_revision(git_dir: &Path, format: ObjectFormat) -> Result<ObjectId> {
     Ok(fetch_head_merge_record(git_dir, format)?.oid)
+}
+
+fn resolve_pull_merge_head(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refspecs: &[String],
+    merge_srcs: &[String],
+    rebase: bool,
+) -> Result<ObjectId> {
+    match fetch_head_merge_record(git_dir, format) {
+        Ok(record) => Ok(record.oid),
+        Err(_) if !refspecs.is_empty() => {
+            print_pull_no_merge_candidates_for_refspecs(rebase);
+            Err(GitError::Exit(1))
+        }
+        Err(_) if !merge_srcs.is_empty() => {
+            print_pull_no_such_ref_fetched(merge_srcs);
+            Err(GitError::Exit(1))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn ensure_pull_not_in_merge(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    if let Ok(index) = read_worktree_index(git_dir, format)
+        && !index_unmerged_paths(&index).is_empty()
+    {
+        eprintln!("error: Pulling is not possible because you have unmerged files.");
+        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        eprintln!("fatal: Exiting because of an unresolved conflict.");
+        return Err(GitError::Exit(128));
+    }
+    if git_dir.join("MERGE_HEAD").is_file() {
+        eprintln!("fatal: You have not concluded your merge (MERGE_HEAD exists).");
+        eprintln!("Please, commit your changes before merging.");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn update_worktree_after_fetch_moved_head(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    orig_head: Option<ObjectId>,
+    curr_head: Option<ObjectId>,
+) -> Result<()> {
+    let (Some(orig_head), Some(curr_head)) = (orig_head, curr_head) else {
+        return Ok(());
+    };
+    if orig_head == curr_head {
+        return Ok(());
+    }
+    eprintln!(
+        "warning: fetch updated the current branch head.\nfast-forwarding your working tree from\ncommit {orig_head}."
+    );
+    let orig_tree = commit_tree_oid(db, format, &orig_head)?;
+    let curr_tree = commit_tree_oid(db, format, &curr_head)?;
+    if fetch_moved_head_would_clobber_worktree(worktree_root, db, format, &orig_tree, &curr_tree)?
+    {
+        eprintln!(
+            "fatal: Cannot fast-forward your working tree.\nAfter making sure that you saved anything precious from\n$ git diff {orig_head}\noutput, run\n$ git reset --hard\nto recover."
+        );
+        return Err(GitError::Exit(128));
+    }
+    verify_fast_forward_untracked_safe(worktree_root, db, format, &orig_tree, &curr_tree)?;
+    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &curr_head)?;
+    Ok(())
+}
+
+fn fetch_moved_head_would_clobber_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    orig_tree: &ObjectId,
+    curr_tree: &ObjectId,
+) -> Result<bool> {
+    let orig_map = stash_tree_entry_map(db, format, orig_tree)?;
+    let curr_map = stash_tree_entry_map(db, format, curr_tree)?;
+    let changed = orig_map
+        .keys()
+        .chain(curr_map.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in changed {
+        if orig_map.get(&path) == curr_map.get(&path) {
+            continue;
+        }
+        let Some((old_mode, old_oid)) = orig_map.get(&path) else {
+            continue;
+        };
+        let rel = std::str::from_utf8(&path)
+            .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+        if worktree_blob_identity(format, &worktree_root.join(rel))? != Some((*old_mode, *old_oid))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn worktree_blob_identity(format: ObjectFormat, path: &Path) -> Result<Option<(u32, ObjectId)>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() {
+        return Ok(None);
+    }
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let target = fs::read_link(path)?;
+            let body = target.as_os_str().as_bytes().to_vec();
+            return Ok(Some((
+                0o120000,
+                sley_core::object_id_for_bytes(format, "blob", &body)?,
+            )));
+        }
+        #[cfg(not(unix))]
+        return Ok(None);
+    }
+    let body = fs::read(path)?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            0o100755
+        } else {
+            0o100644
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = 0o100644;
+    Ok(Some((
+        mode,
+        sley_core::object_id_for_bytes(format, "blob", &body)?,
+    )))
 }
 
 fn ensure_pull_can_merge() -> Result<()> {
@@ -4365,6 +4541,88 @@ fn run_fetch_with_outcome(
     )
 }
 
+fn pull_checkout_into_void(
+    git_dir: &Path,
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<()> {
+    let object = db.read_object(commit_oid)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
+    let target_map = stash_tree_entry_map(db, format, &commit.tree)?;
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let mut index_entries = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?.entries
+    } else {
+        Vec::new()
+    };
+    let existing_paths = index_entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .map(|entry| entry.path.clone().into_bytes())
+        .collect::<HashSet<_>>();
+
+    let mut local_changes = Vec::new();
+    let mut untracked = Vec::new();
+    for path in target_map.keys() {
+        if existing_paths.contains(path) {
+            local_changes.push(path.clone());
+            continue;
+        }
+        let rel = std::str::from_utf8(path)
+            .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+        if fs::symlink_metadata(worktree_root.join(rel)).is_ok() {
+            untracked.push(path.clone());
+        }
+    }
+    if !local_changes.is_empty() {
+        eprintln!(
+            "error: Your local changes to the following files would be overwritten by merge:"
+        );
+        for path in &local_changes {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please commit your changes or stash them before you merge.");
+        eprintln!("Aborting");
+        return Err(GitError::Exit(1));
+    }
+    if !untracked.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by merge:"
+        );
+        for path in &untracked {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you merge.");
+        eprintln!("Aborting");
+        return Err(GitError::Exit(1));
+    }
+
+    index_entries.retain(|entry| !target_map.contains_key(entry.path.as_ref()));
+    for (path, (mode, oid)) in &target_map {
+        let content = if sley_index::is_gitlink(*mode) {
+            Vec::new()
+        } else {
+            merge_read_blob(db, oid)?
+        };
+        merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+        index_entries.push(merge_index_entry(path, *mode, *oid, 0));
+    }
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        index_path,
+        Index {
+            version: 2,
+            entries: index_entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // git's `set_reflog_message`: record the pull invocation (`pull …`) as the
     // reflog action so a fast-forward merge writes `pull …: Fast-forward`. The
@@ -4388,6 +4646,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let mut branch = None::<String>;
     let mut depth = None::<u32>;
     let mut expect_depth_value = false;
+    let mut _all = false;
     for arg in args {
         if expect_depth_value {
             expect_depth_value = false;
@@ -4401,6 +4660,8 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--no-rebase" => rebase_flag = Some(false),
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "--all" => _all = true,
+            "--no-all" => _all = false,
             "--depth" => expect_depth_value = true,
             value if value.starts_with("--depth=") => {
                 depth = Some(crate::commands::remote_cmds::parse_clone_depth(
@@ -4437,6 +4698,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&git_dir, format);
     let (remote, refspecs, merge_srcs) =
         resolve_pull_remote_and_refspecs(&config, &store, remote, branch)?;
+    ensure_pull_not_in_merge(&git_dir, format)?;
     let config_ff_only = config
         .get("pull", None, "ff")
         .is_some_and(|value| value == "only");
@@ -4476,7 +4738,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         tag_option_explicit: false,
         prune_option_explicit: false,
         depth,
-        merge_srcs,
+        merge_srcs: merge_srcs.clone(),
         filter: None,
         cloning: false,
         update_shallow: false,
@@ -4487,17 +4749,36 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // git captures `orig_head` (HEAD before the fetch). A refspec like
     // `main:main` can create the current branch during the fetch, but the
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
-    let orig_head_unborn = head_commit_oid(&store)?.is_none();
-    pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options)?;
+    let orig_head = head_commit_oid(&store)?;
+    let orig_head_unborn = orig_head.is_none();
+    if let Err(err) = pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options) {
+        if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
+            print_pull_no_such_ref_fetched(&merge_srcs);
+            return Err(GitError::Exit(1));
+        }
+        return Err(err);
+    }
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let curr_head = head_commit_oid(&store)?;
+    update_worktree_after_fetch_moved_head(
+        &git_dir,
+        &worktree_root,
+        format,
+        &db,
+        orig_head,
+        curr_head,
+    )?;
     // Pulling into an unborn branch (git's `pull_into_void`): there is no HEAD to
     // merge against, so we fast-forward to FETCH_HEAD's merge target by pointing
     // HEAD at it (unless a refspec already moved the current branch there) and
     // checking out its tree. Keyed off the *pre-fetch* state so a `main:main`
     // refspec that created the branch still triggers the void checkout.
     if orig_head_unborn {
-        let merge_oid = resolve_fetch_head_revision(&git_dir, format)?;
+        let merge_oid =
+            resolve_pull_merge_head(&git_dir, format, &refspecs, &merge_srcs, effective_rebase)?;
+        pull_checkout_into_void(&git_dir, &worktree_root, &db, format, &merge_oid)?;
         let target_ref = match store.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),
@@ -4519,17 +4800,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             });
             tx.commit()?;
         }
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &worktree_root,
-            &git_dir,
-            format,
-            &merge_oid,
-        )?;
         return Ok(());
     }
     let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;
-    let theirs_oid = resolve_fetch_head_revision(&git_dir, format)?;
+    let theirs_oid =
+        resolve_pull_merge_head(&git_dir, format, &refspecs, &merge_srcs, effective_rebase)?;
     let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;
     let theirs_commit = sley_rev::peel_to_commit(&db, format, &theirs_oid)?;
     if ours_commit == theirs_commit {
