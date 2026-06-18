@@ -2713,6 +2713,14 @@ pub(crate) fn write_diff_patch_entry(
             diff_patch_mode_suffix(entry)
         ),
     )?;
+    let empty_add_or_delete = matches!(
+        entry.status,
+        sley_diff_merge::NameStatus::Added | sley_diff_merge::NameStatus::Deleted
+    ) && old_content.as_deref().unwrap_or_default().is_empty()
+        && new_content.as_deref().unwrap_or_default().is_empty();
+    if empty_add_or_delete {
+        return Ok(());
+    }
     match entry.status {
         sley_diff_merge::NameStatus::Added => {
             write_diff_meta_line(stdout, colors, "--- /dev/null")?;
