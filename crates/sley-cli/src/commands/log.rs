@@ -3733,7 +3733,7 @@ fn resolve_pretty_spec(
         if let Some(rest) = current.strip_prefix("format:") {
             return Ok(ResolvedPretty::Compiled {
                 compiled: CompiledLogFormat::compile(rest, LogFormatDialect::Log)?,
-                final_newline: terminate,
+                final_newline: false,
             });
         }
         if let Some(rest) = current.strip_prefix("tformat:") {

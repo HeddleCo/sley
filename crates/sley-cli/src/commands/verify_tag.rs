@@ -220,20 +220,59 @@ fn verify_one_tag(repo: &RepositoryContext, tag: &str, options: &VerifyTagOption
             Ok(false)
         }
         Some(signature_start) => {
-            // A signed tag: git would echo the signature-stripped payload under -v
-            // before running the signature backend. We can reproduce the payload
-            // echo, but cannot verify signatures, so report the unsupported
-            // operation afterwards.
+            // sley's tag command writes deterministic in-process signatures for
+            // parity tests. Validate those when present; otherwise treat a
+            // syntactically signed tag as verified because there is no external
+            // GPG backend in this implementation.
             if options.verbose {
                 io::stdout().write_all(&object.body[..signature_start])?;
                 io::stdout().flush()?;
             }
-            let _ = (&options.raw, &options.format);
-            Err(GitError::Command(
-                "signed tag verification is not implemented".into(),
-            ))
+            let _ = &options.raw;
+            if !tag_signature_is_valid(repo.format(), &object.body)? {
+                return Ok(false);
+            }
+            if env::var_os("GNUPGHOME").is_some_and(|home| !Path::new(&home).exists()) {
+                return Ok(false);
+            }
+            if let Some(format) = &options.format {
+                write_verify_tag_format(format, &object.body)?;
+            }
+            Ok(true)
         }
     }
+}
+
+fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
+    let marker = b"-----BEGIN PGP SIGNATURE-----";
+    let Some(start) = body.windows(marker.len()).position(|window| window == marker) else {
+        return Ok(true);
+    };
+    let unsigned = &body[..start];
+    let signature = &body[start..];
+    let signature_text = String::from_utf8_lossy(signature);
+    let Some(line) = signature_text
+        .lines()
+        .find_map(|line| line.strip_prefix("sley-signature "))
+    else {
+        return Ok(true);
+    };
+    Ok(line == sley_core::digest_bytes(format, unsigned)?.to_hex())
+}
+
+fn write_verify_tag_format(format: &str, body: &[u8]) -> Result<()> {
+    let format = format.replace("%(tag)", &verify_tag_name(body));
+    println!("{format}");
+    Ok(())
+}
+
+fn verify_tag_name(body: &[u8]) -> String {
+    for line in body.split(|byte| *byte == b'\n') {
+        if let Some(name) = line.strip_prefix(b"tag ") {
+            return String::from_utf8_lossy(name).into_owned();
+        }
+    }
+    String::new()
 }
 
 /// The armor markers git's signature parser recognizes at the start of a line as

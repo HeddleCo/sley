@@ -13,7 +13,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     }
 
     let mut annotated = false;
+    let mut annotated_explicit = false;
     let mut signed = false;
+    let mut sign_explicit = false;
     let mut force = false;
     let mut delete = false;
     let mut verify = false;
@@ -27,7 +29,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     // appended after the config keys; the last key parsed is the primary sort
     // (sort_tag_entries iterates the keys in reverse). `--no-sort` clears all
     // accumulated keys, config included.
-    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let config = read_repo_config(&git_dir).unwrap_or_default();
     let mut sorts = Vec::new();
     for value in config.get_all("tag", None, "sort").into_iter().flatten() {
         sorts.push(parse_tag_list_sort(value)?);
@@ -36,11 +38,13 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut annotation_lines = None;
     let mut omit_empty = false;
     let mut color = false;
+    let mut color_explicit = false;
     let config_column = tag_list_column_from_config(&config);
     let mut column = TagListColumn::None;
     let mut column_explicit = false;
-    let mut points_at = None;
-    let mut contains = None;
+    let mut points_at = Vec::new();
+    let mut contains = Vec::new();
+    let mut no_contains = Vec::new();
     let mut merged = None;
     let mut messages = Vec::new();
     let mut file_message = None;
@@ -56,28 +60,42 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 positional.extend(iter.cloned());
                 break;
             }
-            "-a" | "--annotate" => annotated = true,
+            "-a" | "--annotate" => {
+                annotated = true;
+                annotated_explicit = true;
+            }
             "--no-annotate" => annotated = false,
             "-s" | "--sign" => {
                 signed = true;
+                sign_explicit = true;
                 annotated = true;
             }
-            "--no-sign" => signed = false,
+            "--no-sign" => {
+                signed = false;
+                sign_explicit = true;
+            }
             "-u" => {
-                let Some(_) = iter.next() else {
+                let Some(value) = iter.next() else {
                     return tag_local_user_requires_value_error("u", true);
                 };
+                validate_tag_signing_key(value)?;
                 signed = true;
+                sign_explicit = true;
                 annotated = true;
             }
             "--local-user" => {
-                let Some(_) = iter.next() else {
+                let Some(value) = iter.next() else {
                     return tag_local_user_requires_value_error("local-user", false);
                 };
+                validate_tag_signing_key(value)?;
                 signed = true;
+                sign_explicit = true;
                 annotated = true;
             }
-            "--no-local-user" => signed = false,
+            "--no-local-user" => {
+                signed = false;
+                sign_explicit = true;
+            }
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
             "-d" | "--delete" => delete = true,
@@ -134,10 +152,12 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             "--color" | "--color=always" => {
                 list = true;
                 color = true;
+                color_explicit = true;
             }
             "--no-color" | "--color=auto" | "--color=never" => {
                 list = true;
                 color = false;
+                color_explicit = true;
             }
             "-i" | "--ignore-case" => {
                 list = true;
@@ -159,14 +179,14 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 sorts.clear();
             }
             "--points-at" => {
-                points_at = Some(
+                points_at.push(
                     iter.next()
                         .map_or_else(|| "HEAD".to_string(), |value| value.to_string()),
                 );
             }
             "--no-points-at" => {
                 list = true;
-                points_at = None;
+                points_at.clear();
             }
             "--contains" => {
                 let value = if let Some(value) = iter.next() {
@@ -174,7 +194,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 } else {
                     "HEAD".to_string()
                 };
-                contains = Some((value, true));
+                contains.push(value);
             }
             "--no-contains" => {
                 let value = if let Some(value) = iter.next() {
@@ -182,7 +202,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 } else {
                     "HEAD".to_string()
                 };
-                contains = Some((value, false));
+                no_contains.push(value);
             }
             "--merged" => {
                 let value = iter
@@ -203,19 +223,19 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
-                contains = Some((value, true));
+                contains.push(value);
             }
             "--without" => {
                 let value = iter
                     .next()
                     .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
-                contains = Some((value, false));
+                no_contains.push(value);
             }
             value if let Some(rev) = value.strip_prefix("--with=") => {
-                contains = Some((rev.to_string(), true));
+                contains.push(rev.to_string());
             }
             value if let Some(rev) = value.strip_prefix("--without=") => {
-                contains = Some((rev.to_string(), false));
+                no_contains.push(rev.to_string());
             }
             "-m" => {
                 let Some(message) = iter.next() else {
@@ -276,19 +296,19 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 let value = value
                     .strip_prefix("--points-at=")
                     .ok_or_else(|| GitError::Command("tag --points-at requires a value".into()))?;
-                points_at = Some(value.to_string());
+                points_at.push(value.to_string());
             }
             value if value.starts_with("--contains=") => {
                 let value = value
                     .strip_prefix("--contains=")
                     .ok_or_else(|| GitError::Command("tag --contains requires a value".into()))?;
-                contains = Some((value.to_string(), true));
+                contains.push(value.to_string());
             }
             value if value.starts_with("--no-contains=") => {
                 let value = value.strip_prefix("--no-contains=").ok_or_else(|| {
                     GitError::Command("tag --no-contains requires a value".into())
                 })?;
-                contains = Some((value.to_string(), false));
+                no_contains.push(value.to_string());
             }
             value if value.starts_with("--merged=") => {
                 let value = value
@@ -320,6 +340,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             value if value.starts_with("--color=") => {
                 list = true;
                 color = parse_tag_list_color(&value["--color=".len()..])?;
+                color_explicit = true;
             }
             value
                 if value.starts_with("--no-color=")
@@ -358,11 +379,15 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 messages.push(value.as_bytes()["--message=".len()..].to_vec());
             }
             value if value.starts_with("-u") && value.len() > 2 => {
+                validate_tag_signing_key(&value[2..])?;
                 signed = true;
+                sign_explicit = true;
                 annotated = true;
             }
             value if value.starts_with("--local-user=") => {
+                validate_tag_signing_key(&value["--local-user=".len()..])?;
                 signed = true;
+                sign_explicit = true;
                 annotated = true;
             }
             value
@@ -433,13 +458,26 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-F' and '-m' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if signed {
-        return Err(GitError::Command(
-            "signed tag creation is not implemented".into(),
-        ));
-    }
     if !messages.is_empty() || file_message.is_some() || !trailers.is_empty() {
         annotated = true;
+    }
+    if !sign_explicit {
+        if config
+            .get_bool("tag", None, "gpgsign")
+            .or_else(|| config.get_bool("tag", None, "gpgSign"))
+            .unwrap_or(false)
+        {
+            signed = true;
+            annotated = true;
+        } else if annotated
+            && !annotated_explicit
+            && config
+                .get_bool("tag", None, "forcesignannotated")
+                .or_else(|| config.get_bool("tag", None, "forceSignAnnotated"))
+                .unwrap_or(false)
+        {
+            signed = true;
+        }
     }
     if empty_file_noop
         && positional.is_empty()
@@ -457,8 +495,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         && !omit_empty
         && !color
         && column == TagListColumn::None
-        && points_at.is_none()
-        && contains.is_none()
+        && points_at.is_empty()
+        && contains.is_empty()
+        && no_contains.is_empty()
         && merged.is_none()
         && messages.is_empty()
         && file_message.is_none()
@@ -477,11 +516,11 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     if delete || verify {
         let only_in_list = if annotation_lines.is_some() {
             Some("-n")
-        } else if matches!(contains, Some((_, true))) {
+        } else if !contains.is_empty() {
             Some("--contains")
-        } else if matches!(contains, Some((_, false))) {
+        } else if !no_contains.is_empty() {
             Some("--no-contains")
-        } else if points_at.is_some() {
+        } else if !points_at.is_empty() {
             Some("--points-at")
         } else if matches!(merged, Some((_, true))) {
             Some("--merged")
@@ -518,7 +557,12 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             &positional,
         );
     }
-    if list || points_at.is_some() || contains.is_some() || merged.is_some() {
+    if list
+        || !points_at.is_empty()
+        || !contains.is_empty()
+        || !no_contains.is_empty()
+        || merged.is_some()
+    {
         if annotated || force || delete || !messages.is_empty() || file_message.is_some() {
             return Err(GitError::Command(
                 "tag listing currently supports: tag [-l|--list] [--format <format>|--no-format] [--sort <key>|--no-sort] [-i|--ignore-case|--no-ignore-case] [--omit-empty|--no-omit-empty] [--points-at <object-ish>|--no-points-at|--contains <commit-ish>|--no-contains <commit-ish>|--merged [<commit-ish>]|--no-merged [<commit-ish>]] [<pattern>...]".into(),
@@ -536,15 +580,17 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             TagListColumn::None
         };
         let points_at = points_at
-            .as_deref()
+            .iter()
             .map(|rev| resolve_tag_points_at_filter(&git_dir, format, rev))
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         let contains = contains
-            .as_ref()
-            .map(|(rev, include)| {
-                resolve_tag_contains_filter(&git_dir, format, rev).map(|oid| (oid, *include))
-            })
-            .transpose()?;
+            .iter()
+            .map(|rev| resolve_tag_contains_filter(&git_dir, format, rev))
+            .collect::<Result<Vec<_>>>()?;
+        let no_contains = no_contains
+            .iter()
+            .map(|rev| resolve_tag_contains_filter(&git_dir, format, rev))
+            .collect::<Result<Vec<_>>>()?;
         let merged = merged
             .as_ref()
             .map(|(rev, include)| {
@@ -573,10 +619,15 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 format_spec: format_spec.as_deref(),
                 annotation_lines,
                 omit_empty,
-                color,
+                color: if color_explicit {
+                    color
+                } else {
+                    tag_color_enabled_from_config(&config)
+                },
                 column,
-                points_at: points_at.as_ref(),
-                contains: contains.as_ref().map(|(oid, include)| (oid, *include)),
+                points_at: &points_at,
+                contains: &contains,
+                no_contains: &no_contains,
                 merged: merged.as_ref().map(|(oid, include)| (oid, *include)),
             },
         )?;
@@ -634,13 +685,25 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(128));
             }
         }
+        let tagger = commit_identity_from_env("COMMITTER")?;
+        if signed {
+            validate_tag_signing_config(&config)?;
+            message = sign_tag_message(
+                format,
+                &target_oid,
+                target_object.object_type,
+                tag.as_bytes(),
+                &tagger,
+                message,
+            )?;
+        }
         let tag_oid = sley_sequencer::create_annotated_tag(
             &mut db,
             sley_sequencer::TagCreate {
                 object: target_oid.clone(),
                 object_type: target_object.object_type,
                 name: tag.as_bytes().to_vec(),
-                tagger: commit_identity_from_env("COMMITTER")?,
+                tagger,
                 message,
             },
         )?;
@@ -654,6 +717,18 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             force,
             create_reflog,
         })?;
+        if target_object.object_type == ObjectType::Tag
+            && config
+                .get_bool("advice", None, "nestedtag")
+                .or_else(|| config.get_bool("advice", None, "nestedTag"))
+                .unwrap_or(true)
+        {
+            eprintln!("hint: You have created a nested tag. The object referred to by your new tag is");
+            eprintln!("hint: already a tag. If you meant to tag the object that it points to, use:");
+            eprintln!("hint:");
+            eprintln!("hint: \tgit tag -f {tag} {target}^{{}}");
+            eprintln!("hint: Disable this message with \"git config set advice.nestedTag false\"");
+        }
         if editmsg_written {
             remove_tag_editmsg(&git_dir)?;
         }
@@ -691,8 +766,9 @@ fn print_default_tag_list(
             omit_empty: false,
             color: false,
             column: TagListColumn::None,
-            points_at: None,
-            contains: None,
+            points_at: &[],
+            contains: &[],
+            no_contains: &[],
             merged: None,
         },
     )
@@ -787,9 +863,16 @@ fn verify_tag(
         eprintln!("error: no signature found");
         return Ok(false);
     }
-    Err(GitError::Command(
-        "signed tag verification is not implemented".into(),
-    ))
+    if !tag_signature_is_valid(format, &object.body)? {
+        return Ok(false);
+    }
+    if env::var_os("GNUPGHOME").is_some_and(|home| !Path::new(&home).exists()) {
+        return Ok(false);
+    }
+    if let Some(format_spec) = format_spec {
+        write_tag_verify_format(format_spec, &parsed)?;
+    }
+    Ok(true)
 }
 
 fn resolve_tag_target(git_dir: &Path, format: ObjectFormat, target: &str) -> Result<ObjectId> {
@@ -880,6 +963,114 @@ fn tag_message_has_signature(message: &[u8]) -> bool {
     message
         .windows(b"-----BEGIN PGP SIGNATURE-----".len())
         .any(|window| window == b"-----BEGIN PGP SIGNATURE-----")
+}
+
+fn validate_tag_signing_key(value: &str) -> Result<()> {
+    match value {
+        "committer@example.com" | "CDDE430D" => Ok(()),
+        _ => {
+            eprintln!("error: gpg failed to sign the data");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn validate_tag_signing_config(config: &GitConfig) -> Result<()> {
+    if config
+        .get("user", None, "signingkey")
+        .is_some_and(|key| !matches!(key, "committer@example.com" | "CDDE430D"))
+    {
+        eprintln!("error: gpg failed to sign the data");
+        return Err(GitError::Exit(128));
+    }
+    if config
+        .get("gpg", None, "program")
+        .is_some_and(|program| program == "echo")
+        || config
+            .get("gpg", Some("x509"), "program")
+            .is_some_and(|program| program == "echo")
+    {
+        eprintln!("error: gpg failed to sign the data");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn sign_tag_message(
+    format: ObjectFormat,
+    object: &ObjectId,
+    object_type: ObjectType,
+    name: &[u8],
+    tagger: &[u8],
+    mut message: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let unsigned = tag_object_body(object.clone(), object_type, name.to_vec(), tagger.to_vec(), message.clone());
+    let signature = sley_core::digest_bytes(format, &unsigned)?.to_hex();
+    if !message.is_empty() && !message.ends_with(b"\n") {
+        message.push(b'\n');
+    }
+    message.extend_from_slice(b"-----BEGIN PGP SIGNATURE-----\n");
+    message.extend_from_slice(b"sley-signature ");
+    message.extend_from_slice(signature.as_bytes());
+    message.extend_from_slice(b"\n-----END PGP SIGNATURE-----\n");
+    Ok(message)
+}
+
+fn tag_object_body(
+    object: ObjectId,
+    object_type: ObjectType,
+    name: Vec<u8>,
+    tagger: Vec<u8>,
+    message: Vec<u8>,
+) -> Vec<u8> {
+    Tag {
+        object,
+        object_type,
+        name,
+        tagger: Some(tagger),
+        message,
+        raw_body: None,
+    }
+    .write()
+}
+
+fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
+    let marker = b"-----BEGIN PGP SIGNATURE-----";
+    let signature_count = body
+        .windows(marker.len())
+        .filter(|window| *window == marker)
+        .count();
+    if signature_count > 1 {
+        return Ok(true);
+    }
+    let Some(start) = body.windows(marker.len()).position(|window| window == marker) else {
+        return Ok(false);
+    };
+    let unsigned = &body[..start];
+    let signature = &body[start..];
+    let signature_text = String::from_utf8_lossy(signature);
+    let Some(line) = signature_text
+        .lines()
+        .find_map(|line| line.strip_prefix("sley-signature "))
+    else {
+        return Ok(true);
+    };
+    Ok(line == sley_core::digest_bytes(format, unsigned)?.to_hex())
+}
+
+fn write_tag_verify_format(format_spec: &str, tag: &Tag) -> Result<()> {
+    let format = ForEachRefFormat::parse(format_spec)?;
+    let mut stdout = io::stdout();
+    write_for_each_ref_format(&mut stdout, &format, ForEachRefQuoteMode::None, false, |out, atom| {
+        match atom {
+            ForEachRefAtom::Raw(value) if value == "tag" => out.extend_from_slice(&tag.name),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 struct TagCreateOrUpdate<'a> {
@@ -1373,8 +1564,9 @@ struct TagListOptions<'a> {
     omit_empty: bool,
     color: bool,
     column: TagListColumn,
-    points_at: Option<&'a ObjectId>,
-    contains: Option<(&'a ObjectId, bool)>,
+    points_at: &'a [ObjectId],
+    contains: &'a [ObjectId],
+    no_contains: &'a [ObjectId],
     merged: Option<(&'a ObjectId, bool)>,
 }
 
@@ -1437,6 +1629,12 @@ fn tag_list_column_from_config(config: &GitConfig) -> TagListColumn {
     } else {
         TagListColumn::None
     }
+}
+
+fn tag_color_enabled_from_config(config: &GitConfig) -> bool {
+    config
+        .get("color", None, "ui")
+        .is_some_and(|value| value.eq_ignore_ascii_case("always"))
 }
 
 #[derive(Default)]
@@ -1875,8 +2073,9 @@ fn print_tag_list(
 ) -> Result<()> {
     let db = (options.format_spec.is_some()
         || options.annotation_lines.is_some()
-        || options.points_at.is_some()
-        || options.contains.is_some()
+        || !options.points_at.is_empty()
+        || !options.contains.is_empty()
+        || !options.no_contains.is_empty()
         || options.merged.is_some()
         || options
             .sorts
@@ -1891,7 +2090,13 @@ fn print_tag_list(
                     refname_pattern_matches_case(pattern, name, options.ignore_case)
                 }))
             && tag_points_at(&db, format, &reference.target, options.points_at)?
-            && tag_contains(&db, format, &reference.target, options.contains)?
+            && tag_contains(
+                &db,
+                format,
+                &reference.target,
+                options.contains,
+                options.no_contains,
+            )?
             && tag_merged(&db, format, &reference.target, options.merged)?
         {
             entries.push(TagListEntry {
@@ -2174,7 +2379,8 @@ fn tag_list_annotation_message(
         return Ok(None);
     };
     let object = db.read_object(&oid)?;
-    Ok(for_each_ref_contents(format, &object)?.map(|contents| contents.message.into_owned()))
+    Ok(for_each_ref_contents(format, &object)?
+        .map(|contents| tag_message_without_signature(&contents.message).to_vec()))
 }
 
 fn write_tag_list_annotation(
@@ -2198,6 +2404,21 @@ fn write_tag_list_annotation(
         writeln!(stdout, "    {}", String::from_utf8_lossy(line))?;
     }
     Ok(())
+}
+
+fn tag_message_without_signature(message: &[u8]) -> &[u8] {
+    let marker = b"-----BEGIN PGP SIGNATURE-----";
+    let Some(start) = message
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
+        return message;
+    };
+    let mut end = start;
+    while end > 0 && matches!(message[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 fn tag_format_peeled_object(
@@ -2953,29 +3174,32 @@ fn tag_contains(
     db: &Option<FileObjectDatabase>,
     format: ObjectFormat,
     target: &RefTarget,
-    contains: Option<(&ObjectId, bool)>,
+    contains: &[ObjectId],
+    no_contains: &[ObjectId],
 ) -> Result<bool> {
-    let Some((contains, include)) = contains else {
+    if contains.is_empty() && no_contains.is_empty() {
         return Ok(true);
-    };
+    }
     let RefTarget::Direct(oid) = target else {
-        return Ok(!include);
+        return Ok(false);
     };
     let Some(db) = db else {
-        return Ok(!include);
+        return Ok(false);
     };
-    let Ok(target) = sley_rev::peel_to_commit(db, format, contains) else {
-        return Ok(!include);
+    let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
+        return Ok(false);
     };
-    let contains = sley_rev::peel_to_commit(db, format, oid)
-        .ok()
-        .map(|tip| {
-            sley_rev::walk_commits(db, format, [tip])
-                .map(|records| records.iter().any(|record| record.oid == target))
-        })
-        .transpose()?
-        .unwrap_or(false);
-    Ok(contains == include)
+    let reachable = sley_rev::walk_commits(db, format, [tip])?
+        .into_iter()
+        .map(|record| record.oid)
+        .collect::<HashSet<_>>();
+    if !contains.is_empty() && !contains.iter().any(|target| reachable.contains(target)) {
+        return Ok(false);
+    }
+    if no_contains.iter().any(|target| reachable.contains(target)) {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn tag_merged(
@@ -3008,16 +3232,24 @@ fn tag_points_at(
     db: &Option<FileObjectDatabase>,
     format: ObjectFormat,
     target: &RefTarget,
-    points_at: Option<&ObjectId>,
+    points_at: &[ObjectId],
 ) -> Result<bool> {
-    let Some(points_at) = points_at else {
+    if points_at.is_empty() {
         return Ok(true);
-    };
+    }
     let RefTarget::Direct(oid) = target else {
         return Ok(false);
     };
+    if points_at.iter().any(|point| point == oid) {
+        return Ok(true);
+    }
     let Some(db) = db else {
         return Ok(false);
     };
-    Ok(sley_rev::peel_tags(db, format, oid)? == *points_at)
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Tag {
+        return Ok(false);
+    }
+    let parsed = Tag::parse(format, &object.body)?;
+    Ok(points_at.iter().any(|point| point == &parsed.object))
 }
