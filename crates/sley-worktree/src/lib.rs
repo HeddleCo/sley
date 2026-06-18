@@ -5487,6 +5487,7 @@ pub fn untracked_paths_with_options(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let (index, stat_cache, _) = read_index_entries_with_stat_cache(git_dir, format, &db)?;
+    let all_index_paths = read_all_index_paths(git_dir, format)?;
     let ignores = IgnoreMatcher::from_sources(
         worktree_root,
         options.exclude_standard,
@@ -5524,7 +5525,10 @@ pub fn untracked_paths_with_options(
         None,
     )?;
     Ok(ls_files_untracked_paths_from_worktree(
-        &worktree, &index, &ignores,
+        &worktree,
+        &index,
+        &all_index_paths,
+        &ignores,
     ))
 }
 
@@ -5534,11 +5538,15 @@ pub fn untracked_paths_with_options(
 fn ls_files_untracked_paths_from_worktree(
     worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
     index: &BTreeMap<Vec<u8>, TrackedEntry>,
+    all_index_paths: &BTreeSet<Vec<u8>>,
     ignores: &IgnoreMatcher,
 ) -> Vec<Vec<u8>> {
     let mut paths = BTreeSet::new();
     for (path, entry) in worktree {
-        if index.contains_key(path) || ignores.is_ignored(path, false) {
+        if index.contains_key(path)
+            || all_index_paths.contains(path)
+            || ignores.is_ignored(path, false)
+        {
             continue;
         }
         if entry.mode == 0o040000 && entry.oid.is_null() {
@@ -5977,9 +5985,10 @@ struct IndexStatusLookup<'a> {
 
 impl StatusTrackedLookup for IndexStatusLookup<'_> {
     fn tracked_kind(&self, git_path: &[u8]) -> Option<StatusTrackedKind> {
-        self.stat_cache.entries.get(git_path).map(|entry| {
-            StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree())
-        })
+        self.stat_cache
+            .entries
+            .get(git_path)
+            .map(|entry| StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree()))
     }
 
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind> {
@@ -12584,11 +12593,10 @@ pub fn move_index_and_worktree_path(
         return Err(GitError::Exit(128));
     }
     fs::rename(&source_absolute, &destination_absolute)?;
-    let metadata = fs::metadata(&destination_absolute)?;
     let source_entry = index.entries.remove(position);
-    let mut destination_entry =
-        index_entry_from_metadata(destination_path.clone(), source_entry.oid, &metadata);
-    destination_entry.mode = source_entry.mode;
+    let mut destination_entry = source_entry;
+    destination_entry.path = destination_path.clone().into();
+    destination_entry.refresh_name_length();
     index.entries.retain(|entry| entry.path != destination_path);
     index.entries.push(destination_entry);
     index
@@ -13040,6 +13048,21 @@ fn read_index_entries(
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     Ok(read_index_entries_with_stat_cache(git_dir, format, &db)?.0)
+}
+
+fn read_all_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
+    let index_path = repository_index_path(git_dir);
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let index = Index::parse(&bytes, format)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .map(|entry| entry.path.into_bytes())
+        .collect())
 }
 
 fn resolve_head_tree_oid(

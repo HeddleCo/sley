@@ -705,6 +705,31 @@ fn render_merge_outcome(
                     ),
                 });
             }
+            sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne {
+                ours_path,
+                theirs_path,
+            } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![ours_path.clone(), theirs_path.clone(), path.clone()],
+                    stable_type: "CONFLICT (rename/rename)".to_string(),
+                    message: format!(
+                        "CONFLICT (rename/rename): {ours} and {theirs} renamed to {path}, respectively.",
+                        ours = String::from_utf8_lossy(ours_path),
+                        theirs = String::from_utf8_lossy(theirs_path),
+                        path = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
+            sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![source_dir.clone()],
+                    stable_type: "CONFLICT (directory rename split)".to_string(),
+                    message: format!(
+                        "CONFLICT (directory rename split): Unclear where to rename {source} to; it was renamed to multiple other directories, with no destination getting a majority of the files.",
+                        source = String::from_utf8_lossy(source_dir),
+                    ),
+                });
+            }
             sley_diff_merge::MergeConflictKind::ModifyDelete {
                 deleted_in,
                 modified_in,
