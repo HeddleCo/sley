@@ -224,14 +224,14 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                     .next()
                     .ok_or_else(|| GitError::Command("clone --filter requires a value".into()))?;
                 validate_clone_filter(value)?;
-                partial_clone_filter = Some(value.to_string());
+                add_clone_filter(&mut partial_clone_filter, value);
             }
             value if value.starts_with("--filter=") => {
                 let value = value
                     .strip_prefix("--filter=")
                     .ok_or_else(|| GitError::Command("clone --filter requires a value".into()))?;
                 validate_clone_filter(value)?;
-                partial_clone_filter = Some(value.to_string());
+                add_clone_filter(&mut partial_clone_filter, value);
             }
             "--no-filter" => partial_clone_filter = None,
             "--template" => {
@@ -462,6 +462,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     trace_index_pack_fsck_objects_if_configured();
+    trace_pack_objects_filter(partial_clone_filter.as_deref());
     let repository = positional[0].clone();
     let destination = positional
         .get(1)
@@ -1452,6 +1453,16 @@ fn validate_clone_filter(value: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
+fn add_clone_filter(current: &mut Option<String>, value: &str) {
+    *current = Some(match current.take() {
+        Some(existing) => {
+            let existing = existing.strip_prefix("combine:").unwrap_or(&existing);
+            format!("combine:{existing}+{value}")
+        }
+        None => value.to_string(),
+    });
+}
+
 fn trace_index_pack_fsck_objects_if_configured() {
     let Ok(Some(value)) = global_config_value("transfer.fsckobjects") else {
         return;
@@ -1462,6 +1473,16 @@ fn trace_index_pack_fsck_objects_if_configured() {
             "trace: run_command: git index-pack --fsck-objects",
         );
     }
+}
+
+fn trace_pack_objects_filter(filter: Option<&str>) {
+    let Some(filter) = filter else {
+        return;
+    };
+    setup::git_trace_line(
+        "run-command.c:667",
+        &format!("trace: run_command: git pack-objects --filter={filter}"),
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -2633,17 +2654,46 @@ fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter>
 }
 
 fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+    if let Some(parts) = spec.strip_prefix("combine:") {
+        return parts
+            .split('+')
+            .filter_map(pack_filter_from_spec)
+            .reduce(combine_pack_filters);
+    }
     if spec == "blob:none" {
         return Some(sley_odb::PackObjectFilter::BlobNone);
     }
     if let Some(depth) = spec.strip_prefix("tree:") {
         return parse_rev_list_tree_depth(depth)
             .ok()
-            .map(|depth| sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32));
+            .map(|depth| {
+                sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32)
+            });
     }
     spec.strip_prefix("blob:limit=")
         .and_then(git_parse_blob_limit)
         .map(sley_odb::PackObjectFilter::BlobLimit)
+}
+
+fn combine_pack_filters(
+    left: sley_odb::PackObjectFilter,
+    right: sley_odb::PackObjectFilter,
+) -> sley_odb::PackObjectFilter {
+    use sley_odb::PackObjectFilter;
+    match (left, right) {
+        (PackObjectFilter::TreeDepth(a), PackObjectFilter::TreeDepth(b)) => {
+            PackObjectFilter::TreeDepth(a.min(b))
+        }
+        (PackObjectFilter::TreeDepth(depth), _) | (_, PackObjectFilter::TreeDepth(depth)) => {
+            PackObjectFilter::TreeDepth(depth)
+        }
+        (PackObjectFilter::BlobLimit(a), PackObjectFilter::BlobLimit(b)) => {
+            PackObjectFilter::BlobLimit(a.min(b))
+        }
+        (PackObjectFilter::BlobNone, _) | (_, PackObjectFilter::BlobNone) => {
+            PackObjectFilter::BlobNone
+        }
+    }
 }
 
 fn apply_configured_partial_clone_filter(
