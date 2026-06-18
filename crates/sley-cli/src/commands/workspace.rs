@@ -5644,6 +5644,153 @@ fn print_status_long(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct StatusUnmergedPath {
+    path: Vec<u8>,
+    label: &'static str,
+    stages: BTreeSet<u16>,
+}
+
+impl StatusUnmergedPath {
+    fn has_index_side(&self) -> bool {
+        self.stages.contains(&2)
+    }
+}
+
+fn status_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<StatusUnmergedPath>> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(Vec::new());
+    };
+    let mut by_path: BTreeMap<Vec<u8>, BTreeSet<u16>> = BTreeMap::new();
+    for entry in index.entries {
+        let stage = index_entry_stage(&entry);
+        if stage > 0 {
+            by_path
+                .entry(entry.path.into_bytes())
+                .or_default()
+                .insert(stage);
+        }
+    }
+    Ok(by_path
+        .into_iter()
+        .map(|(path, stages)| StatusUnmergedPath {
+            label: status_unmerged_label(&stages),
+            path,
+            stages,
+        })
+        .collect())
+}
+
+fn status_unmerged_label(stages: &BTreeSet<u16>) -> &'static str {
+    match (
+        stages.contains(&1),
+        stages.contains(&2),
+        stages.contains(&3),
+    ) {
+        (true, true, true) => "both modified:",
+        (true, true, false) => "deleted by them:",
+        (true, false, true) => "deleted by us:",
+        (false, true, true) => "both added:",
+        (false, true, false) => "added by us:",
+        (false, false, true) => "added by them:",
+        _ => "unmerged:",
+    }
+}
+
+fn status_long_operation_lines(
+    git_dir: &Path,
+    format: ObjectFormat,
+    has_unmerged: bool,
+    has_staged: bool,
+    sink: &mut StatusLineSink,
+) -> Result<bool> {
+    if git_dir.join("MERGE_HEAD").is_file() {
+        if has_unmerged {
+            sink.line("You have unmerged paths.");
+            sink.hint("  (fix conflicts and run \"git commit\")");
+            sink.hint("  (use \"git merge --abort\" to abort the merge)");
+        } else {
+            sink.line("All conflicts fixed but you are still merging.");
+            sink.hint("  (use \"git commit\" to conclude merge)");
+        }
+        return Ok(true);
+    }
+    if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+        let oid = status_state_oid(git_dir, format, "CHERRY_PICK_HEAD")?;
+        sink.line(format!("You are currently cherry-picking commit {oid}."));
+        if has_unmerged {
+            sink.hint("  (fix conflicts and run \"git cherry-pick --continue\")");
+        } else if has_staged {
+            sink.hint("  (all conflicts fixed: run \"git cherry-pick --continue\")");
+        } else {
+            sink.hint("  (run \"git cherry-pick --continue\" to continue)");
+        }
+        sink.hint("  (use \"git cherry-pick --skip\" to skip this patch)");
+        sink.hint("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)");
+        return Ok(true);
+    }
+    if git_dir.join("REVERT_HEAD").is_file() {
+        let oid = status_state_oid(git_dir, format, "REVERT_HEAD")?;
+        sink.line(format!("You are currently reverting commit {oid}."));
+        if has_unmerged {
+            sink.hint("  (fix conflicts and run \"git revert --continue\")");
+        } else if has_staged {
+            sink.hint("  (all conflicts fixed: run \"git revert --continue\")");
+        } else {
+            sink.hint("  (run \"git revert --continue\" to continue)");
+        }
+        sink.hint("  (use \"git revert --skip\" to skip this patch)");
+        sink.hint("  (use \"git revert --abort\" to cancel the revert operation)");
+        return Ok(true);
+    }
+    match status_sequencer_action(git_dir) {
+        Some(SequencerAction::Pick) => {
+            sink.line("Cherry-pick currently in progress.");
+            sink.hint("  (run \"git cherry-pick --continue\" to continue)");
+            sink.hint("  (use \"git cherry-pick --skip\" to skip this patch)");
+            sink.hint("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)");
+            Ok(true)
+        }
+        Some(SequencerAction::Revert) => {
+            sink.line("Revert currently in progress.");
+            sink.hint("  (run \"git revert --continue\" to continue)");
+            sink.hint("  (use \"git revert --skip\" to skip this patch)");
+            sink.hint("  (use \"git revert --abort\" to cancel the revert operation)");
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+fn status_state_oid(git_dir: &Path, format: ObjectFormat, name: &str) -> Result<String> {
+    let text = fs::read_to_string(git_dir.join(name))?;
+    let oid = ObjectId::from_hex(format, text.trim())?;
+    Ok(format_log_abbrev_oid(&oid))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequencerAction {
+    Pick,
+    Revert,
+}
+
+fn status_sequencer_action(git_dir: &Path) -> Option<SequencerAction> {
+    let todo = fs::read_to_string(git_dir.join("sequencer").join("todo")).ok()?;
+    for line in todo.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with("pick ") {
+            return Some(SequencerAction::Pick);
+        }
+        if line.starts_with("revert ") {
+            return Some(SequencerAction::Revert);
+        }
+    }
+    None
+}
+
 /// Build (but do not emit) the buffered long-status output. Shared by the
 /// `git status` stdout path and the COMMIT_EDITMSG template builder.
 fn build_status_long_sink(
@@ -5686,7 +5833,12 @@ fn build_status_long_sink(
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();
     let mut ignored = Vec::new();
+    let unmerged = status_unmerged_paths(git_dir, format)?;
+    let unmerged_paths: BTreeSet<Vec<u8>> = unmerged.iter().map(|entry| entry.path.clone()).collect();
     for entry in entries {
+        if unmerged_paths.contains(&entry.path) {
+            continue;
+        }
         if entry.index == b'?' && entry.worktree == b'?' {
             untracked.push(entry.path);
             continue;
@@ -5731,13 +5883,19 @@ fn build_status_long_sink(
     let has_unstaged = !unstaged.is_empty();
     let has_untracked = !untracked.is_empty();
     let has_ignored = !ignored.is_empty();
+    let has_unmerged = !unmerged.is_empty();
+
+    if status_long_operation_lines(git_dir, format, has_unmerged, has_staged, &mut sink)? {
+        sink.blank();
+    }
 
     if has_staged {
         if head_initial {
             sink.blank();
         }
         sink.line("Changes to be committed:");
-        if head_initial {
+        if status_suppress_staged_unstage_hint(git_dir) {
+        } else if head_initial {
             sink.hint("  (use \"git rm --cached <file>...\" to unstage)");
         } else {
             sink.hint("  (use \"git restore --staged <file>...\" to unstage)");
@@ -5769,12 +5927,32 @@ fn build_status_long_sink(
         }
     }
 
+    if has_unmerged {
+        if head_initial || has_staged || has_unstaged {
+            sink.blank();
+        }
+        sink.line("Unmerged paths:");
+        if status_unmerged_needs_unstage_hint(git_dir)
+            && unmerged.iter().any(|entry| entry.has_index_side())
+        {
+            sink.hint("  (use \"git restore --staged <file>...\" to unstage)");
+        }
+        sink.hint("  (use \"git add <file>...\" to mark resolution)");
+        for entry in unmerged {
+            sink.line(format!(
+                "\t{:<17}{}",
+                entry.label,
+                status_quote_path(&entry.path, false)
+            ));
+        }
+    }
+
     // `Submodule changes to be committed:` then `Submodules changed but not
     // updated:` (wt-status.c calls both summaries right after print_changed).
     // Each non-empty section is separated from what precedes it by one blank
     // line; the trailing blank before "Untracked files" is supplied by that
     // section's own leading-blank logic (see `has_summary` below).
-    let mut printed_anything = head_initial || has_staged || has_unstaged;
+    let mut printed_anything = head_initial || has_staged || has_unstaged || has_unmerged;
     for section in [&submodule_summary.staged, &submodule_summary.unstaged] {
         if section.is_empty() {
             continue;
@@ -5790,7 +5968,7 @@ fn build_status_long_sink(
     let has_summary = !submodule_summary.staged.is_empty() || !submodule_summary.unstaged.is_empty();
 
     if has_untracked {
-        if head_initial || has_staged || has_unstaged || has_summary {
+        if head_initial || has_staged || has_unstaged || has_unmerged || has_summary {
             sink.blank();
         }
         sink.line("Untracked files:");
@@ -5801,7 +5979,7 @@ fn build_status_long_sink(
     }
 
     if has_ignored {
-        if head_initial || has_staged || has_unstaged || has_summary || has_untracked {
+        if head_initial || has_staged || has_unstaged || has_unmerged || has_summary || has_untracked {
             sink.blank();
         }
         sink.line("Ignored files:");
@@ -5819,7 +5997,7 @@ fn build_status_long_sink(
     // The "(use -u option ...)" suffix is itself a hint, gated separately.
     let printed_not_listed = untracked_suppressed && has_staged;
     if printed_not_listed {
-        if head_initial || has_staged || has_unstaged || has_summary {
+        if head_initial || has_staged || has_unstaged || has_unmerged || has_summary {
             sink.blank();
         }
         if *hints {
@@ -5829,14 +6007,16 @@ fn build_status_long_sink(
         }
     }
 
-    if !has_staged && !has_unstaged && !has_untracked && !has_ignored {
+    if !has_staged && !has_unstaged && !has_unmerged && !has_untracked && !has_ignored {
         if head_initial {
             sink.blank();
             sink.line("nothing to commit (create/copy files and use \"git add\" to track)");
+        } else if untracked_suppressed {
+            sink.line("nothing to commit (use -u to show untracked files)");
         } else {
             sink.line("nothing to commit, working tree clean");
         }
-    } else if !has_staged && has_unstaged {
+    } else if !has_staged && (has_unstaged || has_unmerged) {
         sink.blank();
         if *hints {
             sink.line("no changes added to commit (use \"git add\" and/or \"git commit -a\")");
@@ -5866,6 +6046,16 @@ fn build_status_long_sink(
         }
     }
     Ok(sink)
+}
+
+fn status_suppress_staged_unstage_hint(git_dir: &Path) -> bool {
+    git_dir.join("MERGE_HEAD").is_file() || git_dir.join("CHERRY_PICK_HEAD").is_file()
+}
+
+fn status_unmerged_needs_unstage_hint(git_dir: &Path) -> bool {
+    git_dir.join("REVERT_HEAD").is_file()
+        || git_dir.join("rebase-apply").is_dir()
+        || git_dir.join("rebase-merge").is_dir()
 }
 
 fn status_stash_count(git_dir: &Path, format: ObjectFormat) -> Result<usize> {
@@ -5906,7 +6096,13 @@ fn status_long_branch_lines(
             }
         }
         Some(RefTarget::Direct(oid)) => {
-            sink.line(format!("HEAD detached at {}", format_log_abbrev_oid(&oid)));
+            if let Some(tag) = status_detached_at_tag(git_dir, format, &oid)? {
+                sink.line(format!("HEAD detached at {tag}"));
+            } else if let Some(tag) = status_detached_from_tag(git_dir, format, &oid)? {
+                sink.line(format!("HEAD detached from {tag}"));
+            } else {
+                sink.line(format!("HEAD detached at {}", format_log_abbrev_oid(&oid)));
+            }
             Ok(false)
         }
         None => {
@@ -5914,6 +6110,83 @@ fn status_long_branch_lines(
             Ok(true)
         }
     }
+}
+
+fn status_detached_at_tag(
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<String>> {
+    for (name, target) in status_loose_tag_oids(git_dir, format)? {
+        if target == *oid {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+fn status_detached_from_tag(
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<String>> {
+    let reflog = fs::read_to_string(git_dir.join("logs").join("HEAD")).unwrap_or_default();
+    for line in reflog.lines().rev() {
+        let Some((_, message)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(tag) = message.strip_prefix("checkout: moving from ").and_then(|text| {
+            text.rsplit_once(" to ")
+                .map(|(_, target)| target.trim())
+                .filter(|target| !target.is_empty())
+        }) else {
+            continue;
+        };
+        for (name, target) in status_loose_tag_oids(git_dir, format)? {
+            if name == tag && target != *oid {
+                return Ok(Some(name));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn status_loose_tag_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<(String, ObjectId)>> {
+    let tags_dir = git_dir.join("refs").join("tags");
+    let mut tags = Vec::new();
+    status_collect_loose_tag_oids(format, &tags_dir, "", &mut tags)?;
+    tags.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(tags)
+}
+
+fn status_collect_loose_tag_oids(
+    format: ObjectFormat,
+    dir: &Path,
+    prefix: &str,
+    tags: &mut Vec<(String, ObjectId)>,
+) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let full_name = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            status_collect_loose_tag_oids(format, &path, &full_name, tags)?;
+        } else if path.is_file()
+            && let Ok(text) = fs::read_to_string(&path)
+            && let Ok(oid) = ObjectId::from_hex(format, text.trim())
+        {
+            tags.push((full_name, oid));
+        }
+    }
+    Ok(())
 }
 
 fn status_long_tracking_lines(

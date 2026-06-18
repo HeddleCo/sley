@@ -1392,7 +1392,9 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             | "--unmerged"
             | "--no-unmerged"
             | "--no-split-index"
+            | "--untracked-cache"
             | "--no-untracked-cache"
+            | "--force-untracked-cache"
             | "--no-force-untracked-cache" => allow_no_input = true,
             "--unresolve" => {
                 suppress_after_unresolve = true;
