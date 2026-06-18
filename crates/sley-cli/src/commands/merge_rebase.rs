@@ -2880,6 +2880,21 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(theirs_path),
                 );
             }
+            Some(sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo {
+                old_path,
+                ours_path,
+                theirs_path,
+                ours_label,
+                theirs_label,
+            }) => {
+                println!(
+                    "CONFLICT (rename/rename): {} renamed to {} in {ours_label} and to {} in {theirs_label}.",
+                    String::from_utf8_lossy(old_path),
+                    String::from_utf8_lossy(ours_path),
+                    String::from_utf8_lossy(theirs_path),
+                );
+            }
+            Some(sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage) => {}
             Some(sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir }) => {
                 println!(
                     "CONFLICT (directory rename split): Unclear where to rename {} to; it was renamed to multiple other directories, with no destination getting a majority of the files.",
