@@ -184,6 +184,7 @@ jobs:
             t6112-rev-list-filters-objects.sh
             t6113-rev-list-bitmap-filters.sh
             t6120-describe.sh
+            t6040-tracking-info.sh
             t6300-for-each-ref.sh
             t6302-for-each-ref-filter.sh
             t6422-merge-rename-corner-cases.sh

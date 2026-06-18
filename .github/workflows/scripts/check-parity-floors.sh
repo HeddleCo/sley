@@ -385,6 +385,11 @@ declare -A FLOOR=(
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=410
+    # codex-wave-10 (branch tracking-info): branch -vv ahead/behind+gone column,
+    # status -sb branch header, upstream:track/trackshort atoms, @{u} resolution,
+    # left-right ahead/behind count. t6040 9->44 FULL. Auto-merged w/ remote verbs:
+    # t5505=126 t3200=134 held.
+    [t6040-tracking-info.sh]=44
     # codex-wave-4 (2026-06-17): for-each-ref atoms (sley-ref-filter) t6302 enroll@17.
     [t6302-for-each-ref-filter.sh]=55
     # codex-wave-4: merge-tree --write-tree t4301 enroll@18; blame siblings t8001 99->110/t8002 117->128/t8012 98->109; sparse t1091 40->45.
