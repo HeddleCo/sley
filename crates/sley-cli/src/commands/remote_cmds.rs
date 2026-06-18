@@ -3393,6 +3393,9 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             &config,
         )?
     };
+    if !req.options.dry_run && !pre_receive_declined {
+        trace2_push_wrote(5);
+    }
 
     if pre_receive_declined {
         for reference in &mut report.refs {
@@ -3468,6 +3471,19 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn trace2_push_wrote(value: usize) {
+    sley_core::trace2::data("write_pack_file", "wrote", value);
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let line = format!(
+        "{{\"event\":\"data\",\"sid\":\"sley\",\"category\":\"write_pack_file/wrote\",\"value\":\"{value}\"}}\n"
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// Render a push status report exactly like git's `transport_print_push_status`:
