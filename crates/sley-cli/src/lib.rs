@@ -1570,7 +1570,7 @@ fn print_tree_with_prefix(
     let mut path = prefix.to_vec();
     for entry in TreeEntries::new(format, body) {
         let entry = entry?;
-        if options.tree_only && entry.mode != 0o040000 {
+        if options.tree_only && tree_entry_object_type(entry.mode()) == ObjectType::Blob {
             continue;
         }
         let path_len = path.len();

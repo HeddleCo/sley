@@ -229,6 +229,7 @@ fn parse_tree_entry_ref<'a>(
 pub fn tree_entry_object_type(mode: u32) -> ObjectType {
     match mode {
         0o040000 => ObjectType::Tree,
+        0o160000 => ObjectType::Commit,
         _ => ObjectType::Blob,
     }
 }

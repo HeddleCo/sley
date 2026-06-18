@@ -203,10 +203,14 @@ fn print_tree_pathspecs(
 ) -> Result<()> {
     for pathspec in pathspecs {
         let expand_tree = pathspec.ends_with('/');
-        let normalized = path_context.normalize_pathspec(pathspec);
+        let normalized = path_context.normalize_pathspec(pathspec)?;
         let display_path = path_context.display_path(&normalized);
         if normalized.is_empty() {
-            print_ls_tree_current_scope(db, format, root_body, path_context, recursive, options)?;
+            if recursive {
+                print_tree_recursive(db, format, root_body, b"", options)?;
+            } else {
+                print_tree(Some(db), format, root_body, options)?;
+            }
             continue;
         }
         let components = normalized.split('/').collect::<Vec<_>>();
@@ -336,7 +340,7 @@ impl LsTreePathContext {
         }
     }
 
-    fn normalize_pathspec(&self, pathspec: &str) -> String {
+    fn normalize_pathspec(&self, pathspec: &str) -> Result<String> {
         let mut components = self
             .prefix
             .split('/')
@@ -368,17 +372,23 @@ impl LsTreePathContext {
     }
 }
 
-fn normalize_ls_tree_pathspec_into(components: &mut Vec<String>, pathspec: &str) -> String {
+fn normalize_ls_tree_pathspec_into(
+    components: &mut Vec<String>,
+    pathspec: &str,
+) -> Result<String> {
     for component in pathspec.split('/') {
         match component {
             "" | "." => {}
             ".." => {
-                components.pop();
+                if components.pop().is_none() {
+                    eprintln!("fatal: {pathspec}: '{pathspec}' is outside repository");
+                    return Err(GitError::Exit(128));
+                }
             }
             component => components.push(component.to_string()),
         }
     }
-    components.join("/")
+    Ok(components.join("/"))
 }
 
 fn print_tree_recursive_to_writer(
@@ -407,7 +417,7 @@ fn print_tree_recursive_to_writer(
             }
             path.push(b'/');
             print_tree_recursive_to_writer(writer, db, format, &object.body, path, options)?;
-        } else if options.tree_only {
+        } else if options.tree_only && tree_entry_object_type(entry.mode) == ObjectType::Blob {
             path.truncate(path_len);
             continue;
         } else {
