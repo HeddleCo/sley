@@ -4307,6 +4307,7 @@ fn cmd_stash_export(args: &[String]) -> Result<()> {
             };
             stash_oids.push(oid);
         }
+        stash_oids.reverse();
     }
     for oid in &stash_oids {
         validate_stash_like_commit(&db, format, oid)?;
