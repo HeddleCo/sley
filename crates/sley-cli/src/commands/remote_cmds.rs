@@ -714,12 +714,16 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         if local_mechanism {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
         } else {
-            let remote_allows_filter = read_repo_config(&remote_common_git_dir)
-                .ok()
+            let remote_config = read_repo_config(&remote_common_git_dir).ok();
+            let remote_allows_filter = remote_config
+                .as_ref()
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
-            match (remote_allows_filter, pack_filter_from_spec(filter)) {
-                (true, Some(parsed)) => fetch_filter = Some(parsed),
+            match (remote_allows_filter, remote_config.as_ref(), pack_filter_from_spec(filter)) {
+                (true, Some(config), Some(parsed)) => {
+                    validate_server_filter_policy(config, filter)?;
+                    fetch_filter = Some(parsed);
+                }
                 _ => eprintln!("warning: filtering not recognized by server, ignoring"),
             }
         }
@@ -1461,6 +1465,65 @@ fn add_clone_filter(current: &mut Option<String>, value: &str) {
         }
         None => value.to_string(),
     });
+}
+
+fn validate_upload_pack_filter_config() -> Result<()> {
+    if let Ok(Some(value)) = global_config_value("uploadpackfilter.tree.maxdepth")
+        && value.parse::<u32>().is_err()
+    {
+        eprintln!("fatal: unable to parse uploadpackfilter.tree.maxdepth");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn validate_server_filter_policy(config: &GitConfig, filter: &str) -> Result<()> {
+    if let Some(parts) = filter.strip_prefix("combine:") {
+        if !upload_pack_filter_allowed(config, "combine") {
+            return filter_not_supported("combine");
+        }
+        for part in parts.split('+') {
+            validate_server_filter_policy(config, part)?;
+        }
+        return Ok(());
+    }
+    if filter == "blob:none" {
+        if upload_pack_filter_allowed(config, "blob:none") {
+            return Ok(());
+        }
+        return filter_not_supported(filter);
+    }
+    if let Some(depth) = filter.strip_prefix("tree:") {
+        if !upload_pack_filter_allowed(config, "tree") {
+            return filter_not_supported(filter);
+        }
+        let depth = parse_rev_list_tree_depth(depth)? as u32;
+        if let Some(max_depth) = config
+            .get("uploadpackfilter", Some("tree"), "maxdepth")
+            .and_then(|value| value.parse::<u32>().ok())
+            && depth > max_depth
+        {
+            eprintln!("fatal: tree filter allows max depth {max_depth}, but got {depth}");
+            return Err(GitError::Exit(128));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn upload_pack_filter_allowed(config: &GitConfig, name: &str) -> bool {
+    config
+        .get_bool("uploadpackfilter", Some(name), "allow")
+        .unwrap_or_else(|| {
+            config
+                .get_bool("uploadpackfilter", None, "allow")
+                .unwrap_or(true)
+        })
+}
+
+fn filter_not_supported(filter: &str) -> Result<()> {
+    eprintln!("fatal: filter '{filter}' not supported");
+    Err(GitError::Exit(128))
 }
 
 fn trace_index_pack_fsck_objects_if_configured() {
@@ -2880,6 +2943,7 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    validate_upload_pack_filter_config()?;
 
     // Protocol v2: the client requests version 2 via the `GIT_PROTOCOL`
     // environment variable (the daemon/file:// transport propagates it from the
