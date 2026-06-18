@@ -424,6 +424,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             DiffNoIndexParams {
                 context: patch_context,
                 color: color_always,
+                output_format,
+                raw_abbrev,
+                z,
                 word_diff_mode,
                 word_diff_regex: word_diff_regex.as_deref(),
                 src_prefix: &src_prefix,
@@ -841,16 +844,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .filter(|entry| diff_filter.matches_status(entry.status.code()))
             .collect()
     };
-    // `--exit-code`/`--quiet` reflect whether any *visible* diff remains. With
-    // `-w`/`-b`/eol or `--ignore-blank-lines`/`-I<regex>`, a content change can
-    // reduce to nothing; git then reports "no changes" (exit 0). Probe each
-    // entry under the ignore flags (git's DIFF_OPT_HAS_CHANGES).
+    // `--exit-code`/`--quiet` and raw/name/stat output reflect whether any
+    // *visible* diff remains. With `-w`/`-b`/eol or `--ignore-blank-lines` /
+    // `-I<regex>`, a content change can reduce to nothing; git then drops the
+    // pair before formatting.
     let ignore_active = !ws_ignore.is_empty() || ignore_blank_lines || !ignore_regexes.is_empty();
-    let has_differences = if ignore_active && (quiet || exit_code) {
-        let mut any = false;
-        for entry in &entries {
-            if crate::diff_entry_produces_output(
-                entry,
+    let entries = if ignore_active {
+        let mut visible = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if diff_entry_produces_output(
+                &entry,
                 &db,
                 worktree_root.as_deref(),
                 use_worktree_new,
@@ -860,14 +863,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 ignore_blank_lines,
                 &ignore_regexes,
             )? {
-                any = true;
-                break;
+                visible.push(entry);
             }
         }
-        any
+        visible
     } else {
-        !entries.is_empty()
+        entries
     };
+    let has_differences = !entries.is_empty();
     // `--check`: report whitespace errors introduced by the new side, in place
     // of the normal patch body (git's DIFF_FORMAT_CHECKDIFF). It exits 2 on a
     // whitespace error; combined with `--exit-code`/`--quiet` (not exclusive)
@@ -902,12 +905,28 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
         let stat_entries = if show_numstat || show_stat || show_shortstat {
-            Some(collect_diff_stat_entries(
-                &entries,
-                &db,
-                worktree_root.as_deref(),
-                use_worktree_new,
-            )?)
+            Some(if ignore_active {
+                collect_diff_stat_entries_with_ignore(
+                    &entries,
+                    &db,
+                    worktree_root.as_deref(),
+                    use_worktree_new,
+                    DiffStatIgnoreOptions {
+                        ws_ignore,
+                        ignore_blank_lines,
+                        ignore_regexes: &ignore_regexes,
+                        diff_algorithm,
+                        indent_heuristic,
+                    },
+                )?
+            } else {
+                collect_diff_stat_entries(
+                    &entries,
+                    &db,
+                    worktree_root.as_deref(),
+                    use_worktree_new,
+                )?
+            })
         } else {
             None
         };
@@ -1331,6 +1350,14 @@ fn apply_diff_relative(
     filtered
 }
 
+struct DiffStatIgnoreOptions<'a> {
+    ws_ignore: sley_diff_merge::WsIgnore,
+    ignore_blank_lines: bool,
+    ignore_regexes: &'a [grep_source::Regex],
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    indent_heuristic: bool,
+}
+
 fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
     if prefix.is_empty() {
         return Some(path.to_vec());
@@ -1345,10 +1372,94 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
         .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
 }
 
+fn collect_diff_stat_entries_with_ignore<'a>(
+    entries: &'a [sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    ignore: DiffStatIgnoreOptions<'_>,
+) -> Result<Vec<DiffStatEntryData<'a>>> {
+    let mut stat_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let old_content = diff_entry_old_content(entry, db)?;
+        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+        let stats = if old_content.as_deref().is_some_and(is_binary_content)
+            || new_content.as_deref().is_some_and(is_binary_content)
+        {
+            diff_line_stats(old_content.as_deref(), new_content.as_deref())
+        } else {
+            diff_line_stats_from_ignored_hunks(
+                old_content.as_deref(),
+                new_content.as_deref(),
+                ignore.ws_ignore,
+                ignore.ignore_blank_lines,
+                ignore.ignore_regexes,
+                ignore.diff_algorithm,
+                ignore.indent_heuristic,
+            )
+        };
+        stat_entries.push(DiffStatEntryData { entry, stats });
+    }
+    Ok(stat_entries)
+}
+
+fn diff_line_stats_from_ignored_hunks(
+    old_content: Option<&[u8]>,
+    new_content: Option<&[u8]>,
+    ws_ignore: sley_diff_merge::WsIgnore,
+    ignore_blank_lines: bool,
+    ignore_regexes: &[grep_source::Regex],
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    indent_heuristic: bool,
+) -> DiffLineStats {
+    let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
+        ignore_regexes
+            .iter()
+            .any(|re| re.is_match_with_case(line, false))
+    });
+    let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
+        sley_diff_merge::render::ChangeIgnore {
+            ignore_blank_lines,
+            regex_match: regex_match
+                .as_ref()
+                .map(|f| f as &dyn Fn(&[u8]) -> bool),
+        }
+    });
+    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
+        context: 0,
+        interhunk: 0,
+        ws_ignore,
+        algorithm: diff_algorithm,
+        indent_heuristic,
+        change_ignore: change_ignore.as_ref(),
+        ..Default::default()
+    };
+    let mut hunks = Vec::new();
+    sley_diff_merge::render::render_hunks(
+        &mut hunks,
+        old_content,
+        new_content,
+        &mut render_options,
+    );
+    let mut inserted = 0;
+    let mut deleted = 0;
+    for line in hunks.split_inclusive(|byte| *byte == b'\n') {
+        match line.first() {
+            Some(b'+') => inserted += 1,
+            Some(b'-') => deleted += 1,
+            _ => {}
+        }
+    }
+    DiffLineStats::Text { inserted, deleted }
+}
+
 /// Parameters for `git diff --no-index`.
 struct DiffNoIndexParams<'a> {
     context: usize,
     color: bool,
+    output_format: commands::diff_options::DiffOutputFormat,
+    raw_abbrev: Option<Option<usize>>,
+    z: bool,
     word_diff_mode: Option<commands::diff_words::WordDiffMode>,
     word_diff_regex: Option<&'a str>,
     src_prefix: &'a str,
@@ -1362,6 +1473,18 @@ struct DiffNoIndexParams<'a> {
     indent_heuristic: bool,
 }
 
+struct NoIndexSide {
+    path: Vec<u8>,
+    content: Vec<u8>,
+    mode: u32,
+}
+
+struct NoIndexEntry {
+    entry: sley_diff_merge::NameStatusEntry,
+    old_content: Option<Vec<u8>>,
+    new_content: Option<Vec<u8>>,
+}
+
 /// `git diff --no-index <path> <path>`: compare two files outside (or beside)
 /// the object database. Attributes and `diff.*` config still apply when the
 /// command runs inside a repository. Exits 1 when the files differ.
@@ -1370,33 +1493,8 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
         return Err(GitError::Exit(129));
     }
-    let read_side = |spec: &str| -> Result<(Vec<u8>, u32)> {
-        let path = Path::new(spec);
-        let content = fs::read(path).map_err(|_| {
-            eprintln!("error: Could not access '{spec}'");
-            GitError::Exit(1)
-        })?;
-        let mode = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = fs::metadata(path).map(|meta| meta.permissions().mode());
-                if permissions.is_ok_and(|bits| bits & 0o111 != 0) {
-                    0o100755
-                } else {
-                    0o100644
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                0o100644
-            }
-        };
-        Ok((content, mode))
-    };
-    let (old_content, old_mode) = read_side(&paths[0])?;
-    let (new_content, new_mode) = read_side(&paths[1])?;
-    if old_content == new_content && old_mode == new_mode {
+    let entries = no_index_entries(&paths[0], &paths[1])?;
+    if entries.is_empty() {
         return Ok(());
     }
     // Repository context is optional: when present, .gitattributes drivers,
@@ -1415,21 +1513,77 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         mode,
         cli_regex: params.word_diff_regex,
     });
-    let entry = sley_diff_merge::NameStatusEntry {
-        status: sley_diff_merge::NameStatus::Modified,
-        path: BString::from(paths[1].as_bytes()),
-        old_path: Some(BString::from(paths[0].as_bytes())),
-        old_mode: Some(old_mode),
-        new_mode: Some(new_mode),
-        old_oid: None,
-        new_oid: None,
-    };
     // A throwaway object database handle: content reads are overridden, so it
     // is never consulted.
     let scratch_git_dir = git_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
     let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, ObjectFormat::Sha1);
     if !params.quiet {
         let mut stdout = io::stdout();
+        let raw = params
+            .output_format
+            .contains(commands::diff_options::DiffOutputFormat::RAW);
+        let name_status = params
+            .output_format
+            .contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
+        let name_only = params
+            .output_format
+            .contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
+        let patch = params
+            .output_format
+            .contains(commands::diff_options::DiffOutputFormat::PATCH);
+        let no_output = params
+            .output_format
+            .contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
+        let raw_abbrev = match params.raw_abbrev {
+            Some(width) => width.map(|width| width.min(ObjectFormat::Sha1.hex_len())),
+            None => Some(7),
+        };
+        if raw && !name_status && !name_only {
+            for entry in &entries {
+                write_diff_raw_entry(
+                    &mut stdout,
+                    &entry.entry,
+                    params.z,
+                    true,
+                    raw_abbrev,
+                    ObjectFormat::Sha1,
+                )?;
+            }
+        }
+        if name_status {
+            for entry in &entries {
+                if params.z {
+                    stdout.write_all(entry.entry.status.label().as_bytes())?;
+                    stdout.write_all(b"\0")?;
+                    stdout.write_all(&entry.entry.path)?;
+                    stdout.write_all(b"\0")?;
+                } else {
+                    writeln!(
+                        stdout,
+                        "{}\t{}",
+                        entry.entry.status.label(),
+                        status_quote_path(&entry.entry.path, false)
+                    )?;
+                }
+            }
+        }
+        if name_only {
+            for entry in &entries {
+                if params.z {
+                    stdout.write_all(&entry.entry.path)?;
+                    stdout.write_all(b"\0")?;
+                } else {
+                    writeln!(stdout, "{}", status_quote_path(&entry.entry.path, false))?;
+                }
+            }
+        }
+        if raw || name_status || name_only || no_output {
+            return Err(GitError::Exit(1));
+        }
+        let show_patch = patch || params.output_format == commands::diff_options::DiffOutputFormat::empty();
+        if !show_patch {
+            return Err(GitError::Exit(1));
+        }
         let userdiff_attributes = worktree_root
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
@@ -1437,38 +1591,178 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             userdiff_attributes,
             config.clone(),
         );
-        let options = DiffPatchOptions {
-            db: &db,
-            worktree_root: None,
-            use_worktree_new: false,
-            format: ObjectFormat::Sha1,
-            abbrev: 7,
-            src_prefix: params.src_prefix,
-            dst_prefix: params.dst_prefix,
-            context: params.context,
-            userdiff: Some(&userdiff),
-            colors: colors.as_ref(),
-            word_diff: word_request.as_ref(),
-            no_index_contents: Some((Some(&old_content), Some(&new_content))),
-            dirty_submodules: None,
-            // No-index has no attributes; the rule is core.whitespace (or the
-            // default), used only when color is on.
-            ws_error_rule: (colors.is_some() && word_request.is_none()).then(|| {
-                config
-                    .as_ref()
-                    .and_then(|cfg| cfg.get("core", None, "whitespace"))
-                    .and_then(sley_diff_merge::ws::parse_whitespace_rule)
-                    .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE)
-            }),
-            interhunk: params.interhunk,
-            ws_ignore: params.ws_ignore,
-            diff_algorithm: params.diff_algorithm,
-            ignore_blank_lines: params.ignore_blank_lines,
-            ignore_regexes: params.ignore_regexes,
-            line_ranges: None,
-            indent_heuristic: params.indent_heuristic,
-        };
-        write_diff_patch_entry(&mut stdout, &entry, options)?;
+        for entry in &entries {
+            let options = DiffPatchOptions {
+                db: &db,
+                worktree_root: None,
+                use_worktree_new: false,
+                format: ObjectFormat::Sha1,
+                abbrev: 7,
+                src_prefix: params.src_prefix,
+                dst_prefix: params.dst_prefix,
+                context: params.context,
+                userdiff: Some(&userdiff),
+                colors: colors.as_ref(),
+                word_diff: word_request.as_ref(),
+                no_index_contents: Some((
+                    entry.old_content.as_deref(),
+                    entry.new_content.as_deref(),
+                )),
+                dirty_submodules: None,
+                // No-index has no attributes; the rule is core.whitespace (or the
+                // default), used only when color is on.
+                ws_error_rule: (colors.is_some() && word_request.is_none()).then(|| {
+                    config
+                        .as_ref()
+                        .and_then(|cfg| cfg.get("core", None, "whitespace"))
+                        .and_then(sley_diff_merge::ws::parse_whitespace_rule)
+                        .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE)
+                }),
+                interhunk: params.interhunk,
+                ws_ignore: params.ws_ignore,
+                diff_algorithm: params.diff_algorithm,
+                ignore_blank_lines: params.ignore_blank_lines,
+                ignore_regexes: params.ignore_regexes,
+                line_ranges: None,
+                indent_heuristic: params.indent_heuristic,
+            };
+            write_diff_patch_entry(&mut stdout, &entry.entry, options)?;
+        }
     }
     Err(GitError::Exit(1))
+}
+
+fn no_index_entries(old_spec: &str, new_spec: &str) -> Result<Vec<NoIndexEntry>> {
+    let old_path = Path::new(old_spec);
+    let new_path = Path::new(new_spec);
+    let old_is_dir = old_path.is_dir();
+    let new_is_dir = new_path.is_dir();
+    if old_is_dir || new_is_dir {
+        let old_files = no_index_collect_path(old_spec, old_path, old_is_dir)?;
+        let new_files = no_index_collect_path(new_spec, new_path, new_is_dir)?;
+        let mut keys = old_files.keys().cloned().collect::<Vec<_>>();
+        for key in new_files.keys() {
+            if !old_files.contains_key(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys.sort();
+        let mut entries = Vec::new();
+        for key in keys {
+            let old = old_files.get(&key);
+            let new = new_files.get(&key);
+            if old.map(|side| (&side.content, side.mode))
+                == new.map(|side| (&side.content, side.mode))
+            {
+                continue;
+            }
+            entries.push(no_index_entry_from_sides(old, new));
+        }
+        return Ok(entries);
+    }
+    let old = no_index_read_file(old_spec, old_path)?;
+    let new = no_index_read_file(new_spec, new_path)?;
+    if old.content == new.content && old.mode == new.mode {
+        return Ok(Vec::new());
+    }
+    Ok(vec![no_index_entry_from_sides(Some(&old), Some(&new))])
+}
+
+fn no_index_collect_path(
+    spec: &str,
+    path: &Path,
+    is_dir: bool,
+) -> Result<std::collections::BTreeMap<Vec<u8>, NoIndexSide>> {
+    let mut files = std::collections::BTreeMap::new();
+    if is_dir {
+        no_index_collect_dir(spec, path, path, &mut files)?;
+    } else {
+        files.insert(Vec::new(), no_index_read_file(spec, path)?);
+    }
+    Ok(files)
+}
+
+fn no_index_collect_dir(
+    spec: &str,
+    root: &Path,
+    dir: &Path,
+    files: &mut std::collections::BTreeMap<Vec<u8>, NoIndexSide>,
+) -> Result<()> {
+    let mut children = fs::read_dir(dir)
+        .map_err(|_| no_index_access_error(spec))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        if path.is_dir() {
+            no_index_collect_dir(spec, root, &path, files)?;
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/")
+                .into_bytes();
+            let display = format!("{spec}/{}", String::from_utf8_lossy(&rel));
+            files.insert(rel, no_index_read_file(&display, &path)?);
+        }
+    }
+    Ok(())
+}
+
+fn no_index_read_file(spec: &str, path: &Path) -> Result<NoIndexSide> {
+    let content = fs::read(path).map_err(|_| no_index_access_error(spec))?;
+    let mode = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::metadata(path).map(|meta| meta.permissions().mode());
+            if permissions.is_ok_and(|bits| bits & 0o111 != 0) {
+                0o100755
+            } else {
+                0o100644
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            0o100644
+        }
+    };
+    Ok(NoIndexSide {
+        path: spec.as_bytes().to_vec(),
+        content,
+        mode,
+    })
+}
+
+fn no_index_access_error(spec: &str) -> GitError {
+    eprintln!("error: Could not access '{spec}'");
+    GitError::Exit(1)
+}
+
+fn no_index_entry_from_sides(old: Option<&NoIndexSide>, new: Option<&NoIndexSide>) -> NoIndexEntry {
+    let status = match (old, new) {
+        (None, Some(_)) => sley_diff_merge::NameStatus::Added,
+        (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
+        _ => sley_diff_merge::NameStatus::Modified,
+    };
+    let path = new.or(old).map(|side| side.path.clone()).unwrap_or_default();
+    NoIndexEntry {
+        entry: sley_diff_merge::NameStatusEntry {
+            status,
+            path: BString::from(path),
+            old_path: match (old, new) {
+                (Some(old), Some(new)) if old.path != new.path => {
+                    Some(BString::from(old.path.clone()))
+                }
+                _ => None,
+            },
+            old_mode: old.map(|side| side.mode),
+            new_mode: new.map(|side| side.mode),
+            old_oid: None,
+            new_oid: None,
+        },
+        old_content: old.map(|side| side.content.clone()),
+        new_content: new.map(|side| side.content.clone()),
+    }
 }

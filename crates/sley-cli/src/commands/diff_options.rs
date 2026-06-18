@@ -383,7 +383,7 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
         ),
         opt_bool(Some('p'), Some("patch"), OptFlags::NONE, "generate patch"),
         opt_bool(Some('u'), None, OptFlags::NONE, "generate patch"),
-        opt_str(
+        opt_optarg(
             Some('U'),
             Some("unified"),
             "<n>",
@@ -938,7 +938,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             .output_format
             .bitop(DiffOutputFormat::PATCH, DiffOutputFormat::NO_OUTPUT),
         (Some('U'), Some("unified")) => {
-            let value = str_value(option);
+            let value = optional_arg(option).unwrap_or("3");
             commit_validate_unified_context(value, true)?;
             options.context = Some(parse_unified_count(value));
             options

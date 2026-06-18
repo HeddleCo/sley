@@ -45,6 +45,7 @@ struct DiffIndexOutput {
 pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut output = DiffIndexOutput::default();
     let mut cached = false;
+    let mut match_missing = false;
     let mut quiet = false;
     let mut exit_code = false;
     let mut check = false;
@@ -88,10 +89,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             "--check" => check = true,
             "-z" => z = true,
             "-R" => reverse = true,
-            // `-m`/`--merge-base` only matter for diffs against merge commits and
-            // the merge base; with a plain tree-ish they are accepted no-ops so
-            // scripts that pass them keep working.
-            "-m" | "--merge-base" => {}
+            // In diff-index, `-m` is "match missing": missing worktree files
+            // are treated as matching the index/tree side and omitted.
+            "-m" => match_missing = true,
+            "--merge-base" => {}
             "-p" | "-u" | "--patch" => output.patch = true,
             "--raw" => output.raw = true,
             "--name-status" => output.name_status = true,
@@ -337,6 +338,14 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     };
 
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = if match_missing && !cached {
+        entries
+            .into_iter()
+            .filter(|entry| entry.status != sley_diff_merge::NameStatus::Deleted)
+            .collect()
+    } else {
+        entries
+    };
     let entries = if reverse {
         reverse_diff_entries(entries)
     } else {
