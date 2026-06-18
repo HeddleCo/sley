@@ -522,7 +522,11 @@ declare -A FLOOR=(
     [t5324-split-commit-graph.sh]=11
     [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
-    [t5505-remote.sh]=93
+    # codex-wave-10 (remote verbs): add (config forms/mirror/tags/fetch-on-add),
+    # rename (config rewrite + tracking-ref moves + nested refs), remove/prune,
+    # set-url/get-url/set-branches/set-head, show -n report formatting, update
+    # group. t5505 93->126. branch.rs blast-radius held: t3200=134 t6040=9.
+    [t5505-remote.sh]=126
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
     [t5516-fetch-push.sh]=63
