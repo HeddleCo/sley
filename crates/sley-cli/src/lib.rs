@@ -5122,7 +5122,15 @@ fn for_each_ref_push(config: &GitConfig, refname: &str) -> Option<ForEachRefPush
             remote_ref: None,
         });
     }
-    let merge = config.get("branch", Some(branch), "merge")?;
+    let push_default = config.get("push", None, "default").unwrap_or("simple");
+    let merge_owned;
+    let merge = match push_default {
+        "current" => {
+            merge_owned = format!("refs/heads/{branch}");
+            merge_owned.as_str()
+        }
+        _ => config.get("branch", Some(branch), "merge")?,
+    };
     let refname = map_remote_tracking_ref(config, &remote.name, merge);
     let remote = remote_display_name(remote);
     Some(ForEachRefPush {

@@ -1165,6 +1165,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 checkout_show_local_changes(&target_oid, quiet, force)?;
                 return Ok(());
             }
+            if !is_branch {
+                eprintln!("error: pathspec '{branch}' did not match any file(s) known to git");
+                return Err(GitError::Exit(1));
+            }
             CheckoutMessage::Existing {
                 branch: branch.clone(),
             }
@@ -1203,11 +1207,14 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 force,
                 commit_identity_from_env("COMMITTER")?,
             )?;
+            let tracking_start = positional
+                .first()
+                .map(|start| checkout_tracking_start_ref(&store, start).unwrap_or_else(|| start.clone()));
             crate::commands::branch::branch_create_set_tracking(
                 &git_dir,
                 &store,
                 &branch,
-                positional.first(),
+                tracking_start.as_ref(),
                 track,
                 quiet,
             )?;
@@ -1248,6 +1255,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     if !quiet {
         checkout_message.print();
     }
+    checkout_show_branch_tracking(&git_dir, format, branch, quiet)?;
     // git's `show_local_changes`: report carried-forward worktree modifications
     // relative to the newly checked-out commit (`M\t<path>`, etc.).
     checkout_show_local_changes(&checkout_new_head, quiet, force)?;
@@ -1292,6 +1300,45 @@ fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<St
         return Ok(branch.to_string());
     }
     Ok(upstream.rsplit('/').next().unwrap_or(upstream).to_string())
+}
+
+fn checkout_tracking_start_ref(store: &FileRefStore, start: &str) -> Option<String> {
+    let candidates = if start == "HEAD" {
+        vec!["HEAD".to_string()]
+    } else if start.starts_with("refs/") {
+        vec![start.to_string()]
+    } else {
+        vec![
+            format!("refs/{start}"),
+            format!("refs/tags/{start}"),
+            format!("refs/heads/{start}"),
+            format!("refs/remotes/{start}"),
+            format!("refs/remotes/{start}/HEAD"),
+        ]
+    };
+    candidates.into_iter().find_map(|candidate| {
+        checkout_tracking_direct_ref(store, &candidate).or_else(|| {
+            store
+                .read_ref(&candidate)
+                .ok()
+                .flatten()
+                .map(|_| candidate)
+        })
+    })
+}
+
+fn checkout_tracking_direct_ref(store: &FileRefStore, name: &str) -> Option<String> {
+    let mut current = name.to_string();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return None;
+        }
+        match store.read_ref(&current).ok().flatten()? {
+            RefTarget::Direct(_) => return Some(current),
+            RefTarget::Symbolic(next) => current = next,
+        }
+    }
 }
 
 pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
@@ -1656,6 +1703,31 @@ fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) 
         "--name-status".to_string(),
         new_commit.to_hex(),
     ])
+}
+
+fn checkout_show_branch_tracking(
+    git_dir: &Path,
+    format: ObjectFormat,
+    branch: &str,
+    quiet: bool,
+) -> Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    let store = FileRefStore::new(git_dir, format);
+    let branch_ref = branch_ref_name(branch)?;
+    let Some(RefTarget::Direct(oid)) = store.read_ref(&branch_ref)? else {
+        return Ok(());
+    };
+    let mut sink = StatusLineSink::new(true, None);
+    status_long_tracking_lines(git_dir, format, &store, &branch_ref, &oid, true, false, &mut sink)?;
+    let mut buf = Vec::new();
+    sink.write_to(&mut buf);
+    if buf.ends_with(b"\n\n") {
+        buf.pop();
+    }
+    io::stdout().lock().write_all(&buf)?;
+    Ok(())
 }
 
 fn checkout_twoway_dirty(
@@ -4432,6 +4504,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
     let mut show_stash = false;
     let mut ahead_behind = true;
+    let mut explicit_ahead_behind = false;
     // `git status -v` verbosity: 0 (none), 1 (append the staged HEAD-vs-index
     // diff), 2+ (also append the index-vs-worktree diff). `-vv` and repeated
     // `-v` accumulate; `--no-verbose` resets to 0 (wt-status verbose level).
@@ -4586,8 +4659,14 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             "--no-ignore-submodules" => {
                 ignore_submodules_arg = None;
             }
-            "--ahead-behind" => ahead_behind = true,
-            "--no-ahead-behind" => ahead_behind = false,
+            "--ahead-behind" => {
+                ahead_behind = true;
+                explicit_ahead_behind = true;
+            }
+            "--no-ahead-behind" => {
+                ahead_behind = false;
+                explicit_ahead_behind = true;
+            }
             "--show-stash" => show_stash = true,
             "--no-show-stash" => show_stash = false,
             "-M" => {}
@@ -4718,6 +4797,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             // "normal"/"true"/unset keep the Normal default.
             _ => {}
         }
+    }
+    if !explicit_ahead_behind && config.get_bool("status", None, "aheadbehind") == Some(false) {
+        ahead_behind = false;
     }
     // advice.statusHints defaults to true; `relativePaths` to true; comment
     // prefix is off unless status.displayCommentPrefix is set.
@@ -6561,11 +6643,96 @@ fn status_long_tracking_lines(
     suppress_divergence_advice: bool,
     sink: &mut StatusLineSink,
 ) -> Result<()> {
-    let Some(tracking) =
+    let config = read_repo_config(git_dir)?;
+    let mut seen = HashSet::new();
+    if let Some(compare_branches) = config.get("status", None, "compareBranches") {
+        for spec in compare_branches.split_whitespace() {
+            let Some((refname, advice_mode)) = status_compare_branch_ref(&config, branch_ref, spec)
+            else {
+                continue;
+            };
+            if !seen.insert(refname.clone()) {
+                continue;
+            }
+            let tracking =
+                status_branch_tracking_for_ref(store, git_dir, format, oid, &refname, ahead_behind)?;
+            status_long_tracking_state_lines(
+                &tracking,
+                suppress_divergence_advice,
+                advice_mode,
+                sink,
+            );
+            sink.blank();
+        }
+    } else if let Some(tracking) =
         status_branch_tracking(git_dir, format, store, branch_ref, oid, ahead_behind)?
-    else {
-        return Ok(());
+    {
+        status_long_tracking_state_lines(
+            &tracking,
+            suppress_divergence_advice,
+            StatusTrackingAdvice::Default,
+            sink,
+        );
+        sink.blank();
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StatusTrackingAdvice {
+    Default,
+    UpstreamCompare,
+    PushCompare,
+}
+
+fn status_compare_branch_ref(
+    config: &GitConfig,
+    branch_ref: &str,
+    spec: &str,
+) -> Option<(String, StatusTrackingAdvice)> {
+    if spec.eq_ignore_ascii_case("@{upstream}") {
+        return for_each_ref_upstream(config, branch_ref)
+            .map(|upstream| (upstream.refname, StatusTrackingAdvice::UpstreamCompare));
+    }
+    if spec.eq_ignore_ascii_case("@{push}") {
+        return for_each_ref_push(config, branch_ref)
+            .and_then(|push| push.refname)
+            .map(|refname| (refname, StatusTrackingAdvice::PushCompare));
+    }
+    None
+}
+
+fn status_branch_tracking_for_ref(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    refname: &str,
+    ahead_behind: bool,
+) -> Result<StatusBranchTracking> {
+    let db = FileObjectDatabase::new(repository_objects_dir(git_dir), format);
+    let state = if ahead_behind {
+        match store.read_ref(refname)? {
+            None => StatusBranchTrackingState::Gone,
+            Some(_) => for_each_ref_upstream_track(store, &db, format, oid, refname)?
+                .map(StatusBranchTrackingState::Counts)
+                .unwrap_or(StatusBranchTrackingState::Different),
+        }
+    } else {
+        status_branch_tracking_without_ahead_behind(store, oid, refname)?
     };
+    Ok(StatusBranchTracking {
+        upstream: for_each_ref_short_name(refname).to_string(),
+        state,
+    })
+}
+
+fn status_long_tracking_state_lines(
+    tracking: &StatusBranchTracking,
+    suppress_divergence_advice: bool,
+    advice_mode: StatusTrackingAdvice,
+    sink: &mut StatusLineSink,
+) {
     // git's format_tracking_info gates the ahead/behind/diverged *advice* hints on
     // `show_divergence_advice` (false for commit-template previews); the state
     // lines always print. Route the advice hints through this so a dry-run drops
@@ -6594,7 +6761,12 @@ fn status_long_tracking_lines(
                 tracking.upstream,
                 status_commit_word(ahead)
             ));
-            advice(sink, "  (use \"git push\" to publish your local commits)");
+            if matches!(
+                advice_mode,
+                StatusTrackingAdvice::Default | StatusTrackingAdvice::PushCompare
+            ) {
+                advice(sink, "  (use \"git push\" to publish your local commits)");
+            }
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0, behind, ..
@@ -6604,24 +6776,33 @@ fn status_long_tracking_lines(
                 tracking.upstream,
                 status_commit_word(behind)
             ));
-            advice(sink, "  (use \"git pull\" to update your local branch)");
+            if !matches!(advice_mode, StatusTrackingAdvice::PushCompare) {
+                advice(sink, "  (use \"git pull\" to update your local branch)");
+            }
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind, .. }) => {
             sink.line(format!("Your branch and '{}' have diverged,", tracking.upstream));
             sink.line(format!(
                 "and have {ahead} and {behind} different commits each, respectively."
             ));
-            advice(
-                sink,
-                "  (use \"git pull\" if you want to integrate the remote branch with yours)",
-            );
+            if !matches!(advice_mode, StatusTrackingAdvice::PushCompare) {
+                advice(
+                    sink,
+                    "  (use \"git pull\" if you want to integrate the remote branch with yours)",
+                );
+            }
         }
         StatusBranchTrackingState::Different => {
             sink.line(format!(
                 "Your branch and '{}' refer to different commits.",
                 tracking.upstream
             ));
-            advice(sink, "  (use \"git status --ahead-behind\" for details)");
+            if matches!(
+                advice_mode,
+                StatusTrackingAdvice::Default | StatusTrackingAdvice::PushCompare
+            ) {
+                advice(sink, "  (use \"git status --ahead-behind\" for details)");
+            }
         }
         StatusBranchTrackingState::Gone => {
             sink.line(format!(
@@ -6631,8 +6812,6 @@ fn status_long_tracking_lines(
             advice(sink, "  (use \"git branch --unset-upstream\" to fixup)");
         }
     }
-    sink.blank();
-    Ok(())
 }
 
 fn status_commit_word(count: usize) -> &'static str {
