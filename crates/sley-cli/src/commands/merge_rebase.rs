@@ -470,6 +470,7 @@ fn three_way_merge_trees_inner(
 
     let mut results = BTreeMap::new();
     let mut conflicts = Vec::new();
+    let cleanup_paths = merge.cleanup_paths;
     for entry in merge.paths {
         // A directory-rename location "conflict" (=conflict mode) is purely
         // advisory: git stages the re-homed content cleanly at stage 0 and only
@@ -515,6 +516,11 @@ fn three_way_merge_trees_inner(
         } else {
             results.insert(entry.path, MergePathResult::Resolved(entry.result));
         }
+    }
+    for path in cleanup_paths {
+        results
+            .entry(path)
+            .or_insert(MergePathResult::Resolved(None));
     }
     Ok((results, conflicts))
 }
@@ -2564,6 +2570,13 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 Some((mode, content)) => {
                     merge_write_worktree_file(&worktree_root, path, content, *mode)?
                 }
+                None if matches!(
+                    result,
+                    MergePathResult::Conflict {
+                        kind: Some(sley_diff_merge::MergeConflictKind::DirRenameSplit { .. }),
+                        ..
+                    }
+                ) => {}
                 None => {
                     if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
                         merge_remove_worktree_file(&worktree_root, path)?;
@@ -2625,6 +2638,22 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
             }
             Some(sley_diff_merge::MergeConflictKind::RenameContent { .. }) => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
+            }
+            Some(sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne {
+                ours_path,
+                theirs_path,
+            }) => {
+                println!(
+                    "CONFLICT (rename/rename): {} and {} renamed to {path_str}, respectively.",
+                    String::from_utf8_lossy(ours_path),
+                    String::from_utf8_lossy(theirs_path),
+                );
+            }
+            Some(sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir }) => {
+                println!(
+                    "CONFLICT (directory rename split): Unclear where to rename {} to; it was renamed to multiple other directories, with no destination getting a majority of the files.",
+                    String::from_utf8_lossy(source_dir),
+                );
             }
             Some(sley_diff_merge::MergeConflictKind::ModifyDelete {
                 deleted_in,
