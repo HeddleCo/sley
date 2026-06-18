@@ -440,10 +440,10 @@ declare -A FLOOR=(
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
     # codex-wave-6: rebase porcelain t3400@18 / incompatible-options t3422@52.
-    [t3400-rebase.sh]=18
+    [t3400-rebase.sh]=19
     [t3422-rebase-incompatible-options.sh]=52
     [t3403-rebase-skip.sh]=16
-    [t3404-rebase-interactive.sh]=51
+    [t3404-rebase-interactive.sh]=63
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=11
     [t3420-rebase-autostash.sh]=40
