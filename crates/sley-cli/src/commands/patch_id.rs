@@ -150,8 +150,16 @@ pub(crate) fn cmd_patch_id(args: &[String]) -> Result<()> {
 /// this hashes with `stable: false`. The same mode is used for both sides of
 /// the comparison, which is all the dedup requires.
 pub(crate) fn patch_id_for_diff(diff: &[u8], format: ObjectFormat) -> Option<Vec<u8>> {
+    patch_id_for_diff_with_mode(diff, format, false)
+}
+
+pub(crate) fn stable_patch_id_for_diff(diff: &[u8], format: ObjectFormat) -> Option<Vec<u8>> {
+    patch_id_for_diff_with_mode(diff, format, true)
+}
+
+fn patch_id_for_diff_with_mode(diff: &[u8], format: ObjectFormat, stable: bool) -> Option<Vec<u8>> {
     let options = PatchIdOptions {
-        stable: false,
+        stable,
         verbatim: false,
     };
     let lines = split_keep_newlines(diff);

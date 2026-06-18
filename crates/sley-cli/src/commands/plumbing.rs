@@ -2557,6 +2557,7 @@ enum WsAction {
 
 pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut check = false;
+    let mut update_index = false;
     let mut files = Vec::new();
     // git's default when applying is `warn`; the value is overridden by the
     // last `--whitespace=` seen.
@@ -2573,7 +2574,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     "apply --reverse is not supported yet".into(),
                 ));
             }
-            "-3" | "--3way" | "--index" | "--cached" => {
+            "--index" => update_index = true,
+            "-3" | "--3way" | "--cached" => {
                 return Err(GitError::Unsupported(format!(
                     "apply {arg} is not supported yet"
                 )));
@@ -2608,6 +2610,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&git_dir)?;
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     let mut input = Vec::new();
     if files.is_empty() {
@@ -2728,17 +2731,48 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         return Ok(());
     }
     // Phase 2: materialize.
-    for action in actions {
+    let mut index_paths = Vec::new();
+    for action in &actions {
         match action {
             ApplyAction::Write {
                 path,
                 mode,
                 content,
-            } => merge_write_worktree_file(&worktree_root, &path, &content, mode)?,
-            ApplyAction::Remove { path } => merge_remove_worktree_file(&worktree_root, &path)?,
+            } => merge_write_worktree_file(&worktree_root, path, content, *mode)?,
+            ApplyAction::Remove { path } => merge_remove_worktree_file(&worktree_root, path)?,
         }
+        index_paths.push(PathBuf::from(
+            std::str::from_utf8(action.path())
+                .map_err(|err| GitError::InvalidPath(err.to_string()))?,
+        ));
+    }
+    if update_index && !index_paths.is_empty() {
+        let config = read_repo_config(&git_dir)?;
+        sley_worktree::update_index_paths_filtered(
+            &worktree_root,
+            &git_dir,
+            format,
+            &index_paths,
+            sley_worktree::UpdateIndexOptions {
+                add: true,
+                remove: true,
+                force_remove: false,
+                chmod: None,
+                info_only: false,
+                ignore_skip_worktree_entries: false,
+            },
+            &config,
+        )?;
     }
     Ok(())
+}
+
+impl ApplyAction {
+    fn path(&self) -> &[u8] {
+        match self {
+            ApplyAction::Write { path, .. } | ApplyAction::Remove { path } => path,
+        }
+    }
 }
 
 /// Read the worktree base content a patch applies against (empty for a new

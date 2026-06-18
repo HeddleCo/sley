@@ -88,6 +88,21 @@ enum NumberMode {
     Unnumbered,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelativeMode {
+    Config,
+    Off,
+    On(Option<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BaseMode {
+    Config,
+    None,
+    Commit(String),
+    Auto,
+}
+
 /// Parsed `git format-patch` invocation.
 struct FormatPatchOptions {
     /// Stream all patches to stdout instead of writing files (`--stdout`).
@@ -113,6 +128,8 @@ struct FormatPatchOptions {
     stat_widths: DiffStatWidths,
     /// `--stat=,,<count>` / `--stat-count=<count>` display truncation.
     stat_count: Option<usize>,
+    /// Unified-diff context lines (`-U<n>` / `--unified=<n>`), default 3.
+    context_lines: usize,
     /// Custom subject prefix replacing `PATCH` (`--subject-prefix=<p>`), if the
     /// user gave one explicitly on the command line (overrides
     /// `format.subjectPrefix`). `None` means "use the configured/default value".
@@ -219,6 +236,16 @@ struct FormatPatchOptions {
     /// Notes display state for `--notes[=<ref>]`, `--no-notes`, and
     /// `format.notes`.
     notes: FormatPatchNotes,
+    /// Mboxrd message body escaping (`--pretty=mboxrd` or `format.mboxrd`).
+    mboxrd: bool,
+    /// `--base=<commit>`, `--base=auto`, `--no-base`, or config fallback.
+    base: BaseMode,
+    /// Drop commits whose patch-id already appears on the upstream side.
+    ignore_if_in_upstream: bool,
+    /// `--relative[=<path>]`, `--no-relative`, or config-driven default.
+    relative_mode: RelativeMode,
+    /// Resolved repository-relative path prefix to strip from diff output.
+    relative_prefix: Option<Vec<u8>>,
     /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
     setup_args: Vec<String>,
 }
@@ -226,6 +253,12 @@ struct FormatPatchOptions {
 struct FormatPatchSelection {
     commits: Vec<sley_rev::CommitRecord>,
     pathspecs: Vec<String>,
+}
+
+#[derive(Clone)]
+struct BaseInfo {
+    base: ObjectId,
+    prerequisites: Vec<Vec<u8>>,
 }
 
 /// Tracks `format-patch` notes display state. This is deliberately local rather
@@ -274,6 +307,7 @@ impl Default for FormatPatchOptions {
             stat: true,
             stat_widths: DiffStatWidths::plumbing(),
             stat_count: None,
+            context_lines: HUNK_CONTEXT,
             subject_prefix: None,
             rfc: RfcMode::Unset,
             reroll_count: None,
@@ -310,6 +344,11 @@ impl Default for FormatPatchOptions {
             thread: None,
             in_reply_to: None,
             notes: FormatPatchNotes::default(),
+            mboxrd: false,
+            base: BaseMode::Config,
+            ignore_if_in_upstream: false,
+            relative_mode: RelativeMode::Config,
+            relative_prefix: None,
             setup_args: Vec::new(),
         }
     }
@@ -378,6 +417,8 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         options.src_prefix.clear();
         options.dst_prefix.clear();
     }
+    options.mboxrd |= config.get_bool("format", None, "mboxrd").unwrap_or(false);
+    options.relative_prefix = resolve_format_patch_relative_prefix(&repo, &options, config)?;
     let options = options;
 
     let resolved = resolve_format(&options, config)?;
@@ -419,6 +460,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     };
     let abbrev = patch_index_abbrev(git_dir, format, &options)?;
     let notes_refs = resolve_format_patch_notes(git_dir, format, &options, config)?;
+    let base_info = resolve_base_info(&repo, &options, config, &commits)?;
 
     // Resolve message threading: the `--thread`/`format.thread` level plus any
     // `--in-reply-to` seed determine the Message-ID / In-Reply-To / References on
@@ -508,6 +550,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
+                base_info: base_info.as_ref(),
             })?;
             stdout.write_all(&buffer)?;
         }
@@ -542,6 +585,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
+                base_info: base_info.as_ref(),
             })?;
             stream.extend_from_slice(&buffer);
         }
@@ -580,7 +624,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         };
         let file_path = out_dir_path.join(&file_name);
         fs::write(&file_path, cover)?;
-        let display = Path::new(out_dir).join(&file_name);
+        let display = format_patch_display_path(out_dir, &file_name);
         writeln!(stdout, "{}", display.display())?;
     }
     for (idx, record) in commits.iter().enumerate() {
@@ -602,6 +646,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             config,
             git_dir,
             notes_refs: &notes_refs,
+            base_info: base_info.as_ref(),
         })?;
         let file_name = if options.numbered_files {
             seq.to_string()
@@ -613,7 +658,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         fs::write(&file_path, &buffer)?;
         // git prints the path as joined with the user-provided directory string
         // (so a relative `-o build` yields `build/0001-...patch`).
-        let display = Path::new(out_dir).join(&file_name);
+        let display = format_patch_display_path(out_dir, &file_name);
         writeln!(stdout, "{}", display.display())?;
     }
     stdout.flush()?;
@@ -1505,10 +1550,11 @@ fn cover_diff_entries(
         head_tree,
         rename_options,
     )?;
-    Ok(match diff_pathspec {
+    let entries = match diff_pathspec {
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
-    })
+    };
+    Ok(apply_format_patch_relative(entries, options))
 }
 
 /// Resolve the notes refs that `format-patch` appends after the `---` separator.
@@ -1949,6 +1995,8 @@ struct RenderContext<'a> {
     git_dir: &'a Path,
     /// Ordered notes refs to append after the `---` separator.
     notes_refs: &'a [String],
+    /// Optional base/prerequisite metadata block.
+    base_info: Option<&'a BaseInfo>,
 }
 
 /// Render one commit into a complete mbox patch byte buffer.
@@ -1970,6 +2018,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         config,
         git_dir,
         notes_refs,
+        base_info,
     } = ctx;
 
     let commit = &record.commit;
@@ -2062,7 +2111,11 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         out.push(b'\n');
     }
     let body = format_patch_body(&commit.message, &subject_bytes, signoff_line);
-    out.extend_from_slice(&body);
+    if options.mboxrd {
+        write_mboxrd_escaped_body(&mut out, &body);
+    } else {
+        out.extend_from_slice(&body);
+    }
 
     // Diff entries against the first parent (or the empty tree for a root).
     let entries = first_parent_diff_entries(db, format, options, diff_pathspec, commit)?;
@@ -2091,6 +2144,10 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         }
     }
 
+    if let Some(base) = base_info {
+        write_base_info(&mut out, base, format);
+    }
+
     // Signature trailer. The preceding content already ends in a newline, so
     // the `-- ` separator follows directly (no intervening blank line). When a
     // signature is present every patch ends `-- \n<sig>\n\n` (the trailing blank
@@ -2104,6 +2161,29 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         out.extend_from_slice(b"\n\n");
     }
     Ok(out)
+}
+
+fn write_base_info(out: &mut Vec<u8>, base: &BaseInfo, format: ObjectFormat) {
+    out.push(b'\n');
+    writeln_buf(out, &format!("base-commit: {}", base.base.to_hex()));
+    for prereq in &base.prerequisites {
+        writeln_buf(
+            out,
+            &format!(
+                "prerequisite-patch-id: {}",
+                hex_bytes(&prereq[..format.raw_len().min(prereq.len())])
+            ),
+        );
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Build the `[PATCH n/m]` / `[PATCH]` prefix string (without the trailing
@@ -2470,6 +2550,53 @@ fn format_patch_body(message: &[u8], subject: &[u8], signoff_line: Option<&[u8]>
     framed.split_off(frame_len)
 }
 
+fn write_mboxrd_escaped_body(out: &mut Vec<u8>, body: &[u8]) {
+    let mut start = 0usize;
+    while start < body.len() {
+        let end = body[start..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|pos| start + pos + 1)
+            .unwrap_or(body.len());
+        let line = &body[start..end];
+        if mboxrd_trim_from_line(out, line) {
+            start = end;
+            continue;
+        }
+        if mboxrd_needs_escape(line) {
+            out.push(b'>');
+        }
+        out.extend_from_slice(line);
+        start = end;
+    }
+}
+
+fn mboxrd_trim_from_line(out: &mut Vec<u8>, line: &[u8]) -> bool {
+    let content = line.strip_suffix(b"\n").unwrap_or(line);
+    if content.len() <= 4 || !content.starts_with(b"From") {
+        return false;
+    }
+    if content[4..]
+        .iter()
+        .all(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        out.extend_from_slice(b"From");
+        if line.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        return true;
+    }
+    false
+}
+
+fn mboxrd_needs_escape(line: &[u8]) -> bool {
+    let mut rest = line;
+    while rest.first() == Some(&b'>') {
+        rest = &rest[1..];
+    }
+    rest.starts_with(b"From ")
+}
+
 /// Append a `Signed-off-by:` trailer to `body` following git's `append_signoff`
 /// (sequencer.c) with `APPEND_SIGNOFF_DEDUP`. `body` is expected to already end
 /// in a single `\n` (or be empty). The new sob is `<signoff_line>\n`.
@@ -2781,10 +2908,11 @@ fn first_parent_diff_entries(
             rename_options,
         ),
     }?;
-    Ok(match diff_pathspec {
+    let entries = match diff_pathspec {
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
-    })
+    };
+    Ok(apply_format_patch_relative(entries, options))
 }
 
 /// Select the commits to format, newest-to-oldest from the walk then reversed to
@@ -2828,13 +2956,37 @@ fn select_commits(
         .collect::<Result<Vec<_>>>()?;
 
     let mut excluded = HashSet::new();
+    let mut excluded_records = Vec::new();
     for oid in revision_options.negatives {
         for record in rev_list_walk_commits(db, format, [oid], false)? {
             excluded.insert(record.oid);
+            excluded_records.push(record);
         }
     }
 
     let walked = rev_list_walk_commits(db, format, starts, false)?;
+    let upstream_patch_ids = if options.ignore_if_in_upstream {
+        let mut ids = HashSet::new();
+        for record in &excluded_records {
+            if record.parents.len() > 1 {
+                continue;
+            }
+            let parent_tree = match record.parents.first() {
+                Some(parent) => commit_tree_oid(db, format, parent)?,
+                None => ObjectId::empty_tree(format),
+            };
+            if record.commit.tree == parent_tree {
+                continue;
+            }
+            if let Some(id) = format_patch_commit_patch_id(db, format, record)? {
+                ids.insert(id);
+            }
+        }
+        ids
+    } else {
+        HashSet::new()
+    };
+
     // Keep non-excluded, non-merge commits (newest-first from the walk).
     let mut selected: Vec<sley_rev::CommitRecord> = walked
         .into_iter()
@@ -2862,6 +3014,23 @@ fn select_commits(
     // `-<n>` keeps the n newest of those before reversing to oldest-first.
     if let Some(count) = options.count {
         selected.truncate(count);
+    }
+    if !upstream_patch_ids.is_empty() {
+        let mut kept = Vec::with_capacity(selected.len());
+        for record in selected {
+            let parent_tree = match record.parents.first() {
+                Some(parent) => commit_tree_oid(db, format, parent)?,
+                None => ObjectId::empty_tree(format),
+            };
+            if record.commit.tree != parent_tree
+                && let Some(id) = format_patch_commit_patch_id(db, format, &record)?
+                && upstream_patch_ids.contains(&id)
+            {
+                continue;
+            }
+            kept.push(record);
+        }
+        selected = kept;
     }
     selected.reverse();
     Ok(FormatPatchSelection {
@@ -2897,6 +3066,249 @@ fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
     }
     let rev = args[0].as_str();
     (!rev.starts_with('^') && !rev.contains("..")).then_some(rev)
+}
+
+fn format_patch_commit_patch_id(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+) -> Result<Option<Vec<u8>>> {
+    if record.parents.len() > 1 {
+        return Ok(None);
+    }
+    let parent_tree = match record.parents.first() {
+        Some(parent) => commit_tree_oid(db, format, parent)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+        .unwrap_or_default();
+    Ok(commands::patch_id::patch_id_for_diff(&diff, format))
+}
+
+fn resolve_base_info(
+    repo: &RepositoryContext,
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+    commits: &[sley_rev::CommitRecord],
+) -> Result<Option<BaseInfo>> {
+    if commits.is_empty() {
+        return Ok(None);
+    }
+    let format = repo.format();
+    let db = repo.objects();
+    let base_oid = match &options.base {
+        BaseMode::None => return Ok(None),
+        BaseMode::Commit(rev) => Some(resolve_base_commit(repo, rev)?),
+        BaseMode::Auto => resolve_upstream_base(repo, config)?,
+        BaseMode::Config => match config.get("format", None, "useAutoBase") {
+            Some(value) if value.eq_ignore_ascii_case("true") => resolve_upstream_base(repo, config)?,
+            Some(value) if value.eq_ignore_ascii_case("whenAble") => resolve_upstream_base(repo, config)?,
+            _ => None,
+        },
+    };
+    let Some(base_oid) = base_oid else {
+        return Ok(None);
+    };
+    validate_base_commit(db, format, &base_oid, commits)?;
+    let prerequisites = prerequisite_patch_ids(db, format, &base_oid, commits)?;
+    Ok(Some(BaseInfo {
+        base: base_oid,
+        prerequisites,
+    }))
+}
+
+fn resolve_base_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
+    let oid = repo
+        .resolve_revision(rev)
+        .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
+    sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
+        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
+}
+
+fn resolve_upstream_base(repo: &RepositoryContext, config: &GitConfig) -> Result<Option<ObjectId>> {
+    let Some(branch) = current_branch_name(repo)? else {
+        return Ok(None);
+    };
+    let Some(merge) = config.get("branch", Some(&branch), "merge") else {
+        return Ok(None);
+    };
+    let remote = config
+        .get("branch", Some(&branch), "remote")
+        .unwrap_or(".");
+    let rev = if remote == "." {
+        merge.to_string()
+    } else {
+        let short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+        format!("refs/remotes/{remote}/{short}")
+    };
+    resolve_base_commit(repo, &rev).map(Some)
+}
+
+fn current_branch_name(repo: &RepositoryContext) -> Result<Option<String>> {
+    match repo.refs().read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => {
+            Ok(name.strip_prefix("refs/heads/").map(str::to_string))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn validate_base_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &ObjectId,
+    commits: &[sley_rev::CommitRecord],
+) -> Result<()> {
+    if commits.iter().any(|record| &record.oid == base) {
+        eprintln!("fatal: base commit should be the ancestor of revision list");
+        return Err(GitError::Exit(128));
+    }
+    let tips = commits.iter().map(|record| record.oid).collect::<Vec<_>>();
+    let reachable = rev_list_walk_commits(db, format, tips, false)?;
+    if !reachable.iter().any(|record| &record.oid == base) {
+        eprintln!("fatal: base commit should be the ancestor of revision list");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn prerequisite_patch_ids(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &ObjectId,
+    commits: &[sley_rev::CommitRecord],
+) -> Result<Vec<Vec<u8>>> {
+    let Some(oldest_parent) = commits[0].parents.first() else {
+        return Ok(Vec::new());
+    };
+    let selected: HashSet<ObjectId> = commits.iter().map(|record| record.oid).collect();
+    let mut chain = Vec::new();
+    let mut cursor = *oldest_parent;
+    while &cursor != base {
+        if selected.contains(&cursor) {
+            break;
+        }
+        let record = read_commit_record_for_format_patch(db, format, cursor)?;
+        let Some(parent) = record.parents.first().copied() else {
+            break;
+        };
+        chain.push(record);
+        cursor = parent;
+    }
+    chain.reverse();
+    let mut ids = Vec::new();
+    for record in &chain {
+        let parent_tree = match record.parents.first() {
+            Some(parent) => commit_tree_oid(db, format, parent)?,
+            None => ObjectId::empty_tree(format),
+        };
+        let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+            .unwrap_or_default();
+        if let Some(id) = commands::patch_id::stable_patch_id_for_diff(&diff, format) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn read_commit_record_for_format_patch(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: ObjectId,
+) -> Result<sley_rev::CommitRecord> {
+    let object = db.read_object(&oid)?;
+    let commit: Commit = Commit::parse_ref(format, &object.body)?.into();
+    Ok(sley_rev::CommitRecord {
+        oid,
+        parents: commit.parents.clone(),
+        commit,
+    })
+}
+
+fn resolve_format_patch_relative_prefix(
+    repo: &RepositoryContext,
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+) -> Result<Option<Vec<u8>>> {
+    match &options.relative_mode {
+        RelativeMode::Off => Ok(None),
+        RelativeMode::On(Some(path)) => Ok(normalize_relative_prefix(path)),
+        RelativeMode::On(None) => cwd_relative_prefix(repo),
+        RelativeMode::Config => {
+            if config
+                .get_bool("diff", None, "relative")
+                .unwrap_or(false)
+            {
+                cwd_relative_prefix(repo)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn cwd_relative_prefix(repo: &RepositoryContext) -> Result<Option<Vec<u8>>> {
+    let root = repo.worktree_root()?;
+    let cwd = repo.cwd();
+    let Ok(relative) = cwd.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let text = relative.to_string_lossy().replace('\\', "/");
+    Ok(normalize_relative_prefix(&text))
+}
+
+fn normalize_relative_prefix(path: &str) -> Option<Vec<u8>> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        return None;
+    }
+    let mut bytes = trimmed.as_bytes().to_vec();
+    bytes.push(b'/');
+    Some(bytes)
+}
+
+fn apply_format_patch_relative(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    options: &FormatPatchOptions,
+) -> Vec<sley_diff_merge::NameStatusEntry> {
+    let Some(prefix) = options.relative_prefix.as_deref() else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            let new_path = strip_relative_prefix(&entry.path, prefix);
+            let old_path = entry
+                .old_path
+                .as_ref()
+                .and_then(|path| strip_relative_prefix(path, prefix));
+            match (new_path, old_path) {
+                (Some(path), old) => {
+                    entry.path = path.into();
+                    entry.old_path = old.map(Into::into);
+                    Some(entry)
+                }
+                (None, Some(path)) => {
+                    entry.path = path.into();
+                    entry.old_path = None;
+                    Some(entry)
+                }
+                (None, None) => None,
+            }
+        })
+        .collect()
+}
+
+fn strip_relative_prefix(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+    path.strip_prefix(prefix).map(|stripped| stripped.to_vec())
+}
+
+fn format_patch_display_path(out_dir: &str, file_name: &str) -> PathBuf {
+    if out_dir.is_empty() || out_dir == "." {
+        PathBuf::from(file_name)
+    } else {
+        Path::new(out_dir).join(file_name)
+    }
 }
 
 /// Parse a `format.noprefix` config value as a strict boolean. git tightened
@@ -3125,7 +3537,19 @@ fn write_patch_diff_entry(
             &format!("+++ {}", patch_header_path(&options.dst_prefix, &entry.path)),
         ),
     }
-    write_patch_hunks(out, old_content.as_deref(), new_content.as_deref());
+    if options.context_lines == HUNK_CONTEXT {
+        write_patch_hunks(out, old_content.as_deref(), new_content.as_deref());
+    } else {
+        write_patch_hunks_with(
+            out,
+            old_content.as_deref(),
+            new_content.as_deref(),
+            &PatchHunkOptions {
+                context: options.context_lines,
+                ..Default::default()
+            },
+        );
+    }
     Ok(())
 }
 
@@ -3579,6 +4003,18 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 }
             }
             "--no-stat" => options.stat = false,
+            "-U" | "--unified" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?;
+                options.context_lines = parse_unified_context_count(value);
+            }
+            value if let Some(n) = value.strip_prefix("-U") => {
+                options.context_lines = parse_unified_context_count(n);
+            }
+            value if let Some(n) = value.strip_prefix("--unified=") => {
+                options.context_lines = parse_unified_context_count(n);
+            }
             // git's `format-patch -p` drops the leading diffstat (like
             // `--no-stat`). The long `--patch` is the diff-machinery flag and,
             // quirkily, does *not* disable the stat — so it is a no-op here.
@@ -3663,6 +4099,15 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.filename_max_length = Some(parse_filename_max_length(n)?);
             }
             "-k" | "--keep-subject" => options.keep_subject = true,
+            "--pretty=mboxrd" | "--format=mboxrd" => options.mboxrd = true,
+            "--pretty" | "--format" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?;
+                if value == "mboxrd" {
+                    options.mboxrd = true;
+                }
+            }
             // Recipient / extra-header injection.
             "--to" => {
                 let value = iter
@@ -3735,6 +4180,25 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.signature_file = Some(path.to_string());
             }
             "--zero-commit" => options.zero_commit = true,
+            "--ignore-if-in-upstream" => options.ignore_if_in_upstream = true,
+            "--base" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--base requires a value".into()))?;
+                options.base = if value == "auto" {
+                    BaseMode::Auto
+                } else {
+                    BaseMode::Commit(value.clone())
+                };
+            }
+            value if let Some(base) = value.strip_prefix("--base=") => {
+                options.base = if base == "auto" {
+                    BaseMode::Auto
+                } else {
+                    BaseMode::Commit(base.to_string())
+                };
+            }
+            "--no-base" => options.base = BaseMode::None,
             // Accepted-but-inert formatting knobs that do not change the bytes
             // sley emits for the common path.
             "--no-color"
@@ -3751,6 +4215,11 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--ita-invisible-in-index" => {}
             "--no-prefix" => options.prefix_mode = Some(false),
             "--default-prefix" => options.prefix_mode = Some(true),
+            "--relative" => options.relative_mode = RelativeMode::On(None),
+            value if let Some(path) = value.strip_prefix("--relative=") => {
+                options.relative_mode = RelativeMode::On(Some(path.to_string()));
+            }
+            "--no-relative" => options.relative_mode = RelativeMode::Off,
             value if value.starts_with("--color=") => {}
             // Message threading: bare `--thread` is shallow; `--thread=deep` /
             // `--thread=shallow` pick the style; `--no-thread` clears it.
@@ -3896,6 +4365,24 @@ fn parse_format_patch_number(value: &str, what: &str) -> Result<usize> {
     value
         .parse::<usize>()
         .map_err(|_| GitError::Command(format!("invalid {what} value '{value}'")))
+}
+
+fn parse_unified_context_count(value: &str) -> usize {
+    let (number, multiplier) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    if number.starts_with('-') {
+        return 0;
+    }
+    number
+        .strip_prefix('+')
+        .unwrap_or(number)
+        .parse::<usize>()
+        .unwrap_or(0)
+        .saturating_mul(multiplier)
 }
 
 /// Parse an `-M`/`-C`/`--find-renames=`/`--find-copies=` similarity into a
