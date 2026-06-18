@@ -6900,15 +6900,19 @@ fn branch_upstream_remote_ref(
     remote: &str,
     upstream: &str,
 ) -> Option<(String, String)> {
-    let remote_ref = upstream
-        .strip_prefix("refs/remotes/")
-        .map(str::to_string)
-        .or_else(|| {
-            upstream
-                .strip_prefix(&format!("{remote}/"))
-                .map(|branch| format!("{remote}/{branch}"))
-        })
-        .map(|name| format!("refs/remotes/{name}"))?;
+    let remote_ref = if upstream.starts_with("refs/") {
+        upstream.to_string()
+    } else {
+        upstream
+            .strip_prefix("refs/remotes/")
+            .map(str::to_string)
+            .or_else(|| {
+                upstream
+                    .strip_prefix(&format!("{remote}/"))
+                    .map(|branch| format!("{remote}/{branch}"))
+            })
+            .map(|name| format!("refs/remotes/{name}"))?
+    };
     for fetch in config
         .get_all("remote", Some(remote), "fetch")
         .into_iter()

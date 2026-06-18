@@ -20,6 +20,7 @@ use crate::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckoutIndexStage {
     Single(u16),
+    All,
 }
 
 /// Parsed command-line state for `git checkout-index`.
@@ -32,6 +33,7 @@ struct CheckoutIndexOptions {
     update_stat: bool,
     nul: bool,
     stdin: bool,
+    temp: Option<bool>,
     ignore_skip_worktree_bits: bool,
     prefix: String,
     stage: CheckoutIndexStage,
@@ -48,6 +50,7 @@ impl Default for CheckoutIndexOptions {
             update_stat: false,
             nul: false,
             stdin: false,
+            temp: None,
             ignore_skip_worktree_bits: false,
             prefix: String::new(),
             stage: CheckoutIndexStage::Single(0),
@@ -108,11 +111,8 @@ fn parse_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions>
                     .ok_or_else(|| checkout_index_option_requires_value("prefix"))?;
                 options.prefix = value.clone();
             }
-            "--temp" | "--no-temp" => {
-                return Err(GitError::Unsupported(
-                    "checkout-index --temp is not supported".into(),
-                ));
-            }
+            "--temp" => options.temp = Some(true),
+            "--no-temp" => options.temp = Some(false),
             "--stage" => {
                 let value = iter
                     .next()
@@ -160,9 +160,7 @@ fn parse_checkout_index_stage(value: &str) -> Result<CheckoutIndexStage> {
         "1" => Ok(CheckoutIndexStage::Single(1)),
         "2" => Ok(CheckoutIndexStage::Single(2)),
         "3" => Ok(CheckoutIndexStage::Single(3)),
-        "all" => Err(GitError::Unsupported(
-            "checkout-index --stage=all is not supported".into(),
-        )),
+        "all" => Ok(CheckoutIndexStage::All),
         _ => {
             eprintln!("fatal: stage should be between 1 and 3 or all");
             Err(GitError::Exit(128))
@@ -181,6 +179,13 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
     }
     if options.all && options.stdin {
         eprintln!("fatal: git checkout-index: don't mix '--all' and '--stdin'");
+        return Err(GitError::Exit(128));
+    }
+    let temp = options
+        .temp
+        .unwrap_or(matches!(options.stage, CheckoutIndexStage::All));
+    if matches!(options.stage, CheckoutIndexStage::All) && !temp {
+        eprintln!("fatal: options '--stage=all' and '--no-temp' cannot be used together");
         return Err(GitError::Exit(128));
     }
 
@@ -231,8 +236,6 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         options: &options,
     };
 
-    let CheckoutIndexStage::Single(stage) = options.stage;
-
     if options.all {
         // Snapshot the entries we intend to write so we can mutate the index in
         // place for `-u` without iterator aliasing.
@@ -240,18 +243,28 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| checkout_index_entry_stage(entry) == stage)
+            .filter(|(_, entry)| checkout_index_stage_matches(&options.stage, entry))
             .filter(|(_, entry)| {
                 options.ignore_skip_worktree_bits || !checkout_index_entry_skip_worktree(entry)
             })
             .filter(|(_, entry)| checkout_index_path_in_dir(&entry.path, &dir_prefix))
             .map(|(idx, _)| idx)
             .collect();
-        for idx in targets {
-            match checkout_one_index_entry(&checkout_context, idx, &mut index)? {
-                CheckoutOutcome::Wrote => wrote_index |= options.update_stat,
-                CheckoutOutcome::Skipped => {}
-                CheckoutOutcome::Warned => had_error = true,
+        if temp {
+            for group in checkout_index_group_targets(&targets, &index) {
+                if checkout_temp_index_entries(&checkout_context, &dir_prefix, &group, &index)? {
+                    had_error = true;
+                }
+            }
+        } else {
+            for idx in targets {
+                match checkout_one_index_entry(&checkout_context, idx, &mut index)? {
+                    CheckoutOutcome::Wrote => {
+                        wrote_index |= options.update_stat && options.prefix.is_empty()
+                    }
+                    CheckoutOutcome::Skipped => {}
+                    CheckoutOutcome::Warned => had_error = true,
+                }
             }
         }
     } else {
@@ -262,10 +275,20 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         };
         for spec in &requested {
             let lookup = checkout_index_join_prefix(&dir_prefix, spec);
-            let position = index.entries.iter().position(|entry| {
-                entry.path == lookup && checkout_index_entry_stage(entry) == stage
-            });
-            let Some(idx) = position else {
+            let positions: Vec<usize> = index
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.path == lookup)
+                .filter(|(_, entry)| checkout_index_stage_matches(&options.stage, entry))
+                .map(|(idx, _)| idx)
+                .collect();
+            if positions.is_empty() {
+                if matches!(options.stage, CheckoutIndexStage::All)
+                    && index.entries.iter().any(|entry| entry.path == lookup)
+                {
+                    continue;
+                }
                 if !options.quiet {
                     eprintln!(
                         "git checkout-index: {} is not in the cache",
@@ -275,15 +298,28 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
                 had_error = true;
                 continue;
             };
-            if !options.ignore_skip_worktree_bits
-                && checkout_index_entry_skip_worktree(&index.entries[idx])
-            {
-                continue;
-            }
-            match checkout_one_index_entry(&checkout_context, idx, &mut index)? {
-                CheckoutOutcome::Wrote => wrote_index |= options.update_stat,
-                CheckoutOutcome::Skipped => {}
-                CheckoutOutcome::Warned => had_error = true,
+            let positions: Vec<usize> = positions
+                .into_iter()
+                .filter(|idx| {
+                    options.ignore_skip_worktree_bits
+                        || !checkout_index_entry_skip_worktree(&index.entries[*idx])
+                })
+                .collect();
+            if temp {
+                if checkout_temp_index_entries(&checkout_context, &dir_prefix, &positions, &index)?
+                {
+                    had_error = true;
+                }
+            } else {
+                for idx in positions {
+                    match checkout_one_index_entry(&checkout_context, idx, &mut index)? {
+                        CheckoutOutcome::Wrote => {
+                            wrote_index |= options.update_stat && options.prefix.is_empty()
+                        }
+                        CheckoutOutcome::Skipped => {}
+                        CheckoutOutcome::Warned => had_error = true,
+                    }
+                }
             }
         }
     }
@@ -319,6 +355,165 @@ struct CheckoutIndexContext<'a> {
     git_dir: &'a Path,
     format: ObjectFormat,
     options: &'a CheckoutIndexOptions,
+}
+
+fn checkout_index_stage_matches(stage: &CheckoutIndexStage, entry: &IndexEntry) -> bool {
+    match stage {
+        CheckoutIndexStage::Single(stage) => checkout_index_entry_stage(entry) == *stage,
+        CheckoutIndexStage::All => checkout_index_entry_stage(entry) != 0,
+    }
+}
+
+fn checkout_index_group_targets(targets: &[usize], index: &Index) -> Vec<Vec<usize>> {
+    let mut groups = Vec::<Vec<usize>>::new();
+    for idx in targets {
+        let entry = &index.entries[*idx];
+        match groups.last_mut() {
+            Some(group) if index.entries[group[0]].path == entry.path => group.push(*idx),
+            _ => groups.push(vec![*idx]),
+        }
+    }
+    groups
+}
+
+fn checkout_temp_index_entries(
+    context: &CheckoutIndexContext<'_>,
+    dir_prefix: &[u8],
+    positions: &[usize],
+    index_data: &Index,
+) -> Result<bool> {
+    if positions.is_empty() {
+        return Ok(false);
+    }
+    match context.options.stage {
+        CheckoutIndexStage::Single(_) => {
+            let entry = &index_data.entries[positions[0]];
+            let temp = checkout_temp_write_entry(context, entry)?;
+            checkout_index_print_temp_record(
+                context,
+                &[Some(temp)],
+                &checkout_index_relative_display(&entry.path, dir_prefix),
+            )?;
+        }
+        CheckoutIndexStage::All => {
+            let mut temps: [Option<String>; 3] = [None, None, None];
+            for idx in positions {
+                let entry = &index_data.entries[*idx];
+                let stage = checkout_index_entry_stage(entry);
+                if (1..=3).contains(&stage) {
+                    temps[(stage - 1) as usize] = Some(checkout_temp_write_entry(context, entry)?);
+                }
+            }
+            if temps.iter().any(Option::is_some) {
+                let entry = &index_data.entries[positions[0]];
+                checkout_index_print_temp_record(
+                    context,
+                    &temps,
+                    &checkout_index_relative_display(&entry.path, dir_prefix),
+                )?;
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn checkout_temp_write_entry(
+    context: &CheckoutIndexContext<'_>,
+    entry: &IndexEntry,
+) -> Result<String> {
+    let object = context.db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let body = if entry.mode == 0o120000 {
+        object.body.clone()
+    } else {
+        sley_worktree::apply_smudge_filter(
+            context.worktree_root,
+            context.git_dir,
+            context.format,
+            context.config,
+            &entry.path,
+            &object.body,
+        )?
+    };
+    let (name, path) = checkout_temp_create_path(context.worktree_root)?;
+    fs::write(&path, body)?;
+    apply_checkout_file_mode(&path, entry.mode)?;
+    Ok(name)
+}
+
+fn checkout_temp_create_path(worktree_root: &Path) -> Result<(String, PathBuf)> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let pid = std::process::id() as u64;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    for attempt in 0..4096_u64 {
+        let mut value = nanos ^ pid.rotate_left(17) ^ attempt.wrapping_mul(0x9e3779b97f4a7c15);
+        let mut suffix = [b'A'; 6];
+        for slot in &mut suffix {
+            *slot = alphabet[(value % alphabet.len() as u64) as usize];
+            value /= alphabet.len() as u64;
+        }
+        let suffix = std::str::from_utf8(&suffix).expect("temporary suffix is ASCII");
+        let name = format!(".merge_file_{suffix}");
+        let path = worktree_root.join(&name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok((name, path)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(GitError::Io(
+        "unable to create temporary checkout file".into(),
+    ))
+}
+
+fn checkout_index_print_temp_record(
+    context: &CheckoutIndexContext<'_>,
+    temps: &[Option<String>],
+    path: &str,
+) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    for (idx, temp) in temps.iter().enumerate() {
+        if idx > 0 {
+            stdout.write_all(b" ")?;
+        }
+        match temp {
+            Some(temp) => stdout.write_all(temp.as_bytes())?,
+            None => stdout.write_all(b".")?,
+        }
+    }
+    stdout.write_all(b"\t")?;
+    stdout.write_all(path.as_bytes())?;
+    stdout.write_all(if context.options.nul { b"\0" } else { b"\n" })?;
+    Ok(())
+}
+
+fn checkout_index_relative_display(path: &[u8], dir_prefix: &[u8]) -> String {
+    if dir_prefix.is_empty() {
+        return String::from_utf8_lossy(path).into_owned();
+    }
+    if let Some(rest) = path.strip_prefix(dir_prefix) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    let depth = dir_prefix.iter().filter(|byte| **byte == b'/').count();
+    let mut display = Vec::new();
+    for _ in 0..depth {
+        display.extend_from_slice(b"../");
+    }
+    display.extend_from_slice(path);
+    String::from_utf8_lossy(&display).into_owned()
 }
 
 fn checkout_one_index_entry(
@@ -566,12 +761,24 @@ fn checkout_index_output_path(
 /// lookup. With an empty prefix (invoked from the worktree root) the pathspec is
 /// used verbatim.
 fn checkout_index_join_prefix(dir_prefix: &[u8], spec: &[u8]) -> Vec<u8> {
-    if dir_prefix.is_empty() {
-        return spec.to_vec();
-    }
     let mut joined = dir_prefix.to_vec();
     joined.extend_from_slice(spec);
-    joined
+    checkout_index_normalize_cache_path(&joined)
+}
+
+fn checkout_index_normalize_cache_path(path: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(path);
+    let mut parts = Vec::<&str>::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/").into_bytes()
 }
 
 /// `-a` from a subdirectory only checks out entries living under that directory.
