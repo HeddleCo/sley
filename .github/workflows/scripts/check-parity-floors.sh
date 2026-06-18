@@ -488,7 +488,7 @@ declare -A FLOOR=(
     # (symlink<->file type-change race, independent of any wave — flips on a pristine
     # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
     # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
-    [t3903-stash.sh]=82
+    [t3903-stash.sh]=133
     [t4209-log-pickaxe.sh]=45
     # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
     # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
