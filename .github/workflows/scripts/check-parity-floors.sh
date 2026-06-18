@@ -449,7 +449,7 @@ declare -A FLOOR=(
     [t3420-rebase-autostash.sh]=40
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
-    [t4013-diff-various.sh]=172
+    [t4013-diff-various.sh]=191
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
     [t4014-format-patch.sh]=202
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
@@ -461,7 +461,7 @@ declare -A FLOOR=(
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
-    [t4015-diff-whitespace.sh]=102
+    [t4015-diff-whitespace.sh]=105
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=67
     [t4019-diff-wserror.sh]=19
