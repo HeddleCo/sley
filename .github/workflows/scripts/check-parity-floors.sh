@@ -470,7 +470,7 @@ declare -A FLOOR=(
     [t5500-fetch-pack.sh]=359
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
-    [t0008-ignores.sh]=307
+    [t0008-ignores.sh]=398
     # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
     [t7400-submodule-basic.sh]=88
     [t7506-status-submodule.sh]=28
