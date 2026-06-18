@@ -2704,6 +2704,9 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         apply_configured_partial_clone_filter(&config, &source, &mut options);
     }
+    if fetch_raw_oid_refspecs(&git_dir, format, &source, &refspecs, &options)? {
+        return Ok(());
+    }
     let refetch = options.refetch;
     let result = fetch_one_source(&git_dir, format, &source, &refspecs, options);
     if result.is_ok() && refetch {
@@ -2771,6 +2774,44 @@ fn apply_configured_partial_clone_filter(
     {
         options.filter = fetch_pack_filter_from_spec(filter);
     }
+}
+
+fn fetch_raw_oid_refspecs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: &FetchOptions,
+) -> Result<bool> {
+    if refspecs.is_empty() || refspecs.iter().any(|refspec| refspec.contains(':')) {
+        return Ok(false);
+    }
+    let mut wants = Vec::new();
+    for refspec in refspecs {
+        let Ok(oid) = ObjectId::from_hex(format, refspec) else {
+            return Ok(false);
+        };
+        wants.push(oid);
+    }
+    let Ok(remote_git_dir) = ls_remote_git_dir(source) else {
+        return Ok(false);
+    };
+    let config = read_repo_config(git_dir)?;
+    let promisor = config
+        .get_bool("remote", Some(source), "promisor")
+        .unwrap_or(false);
+    sley_remote::install_fetch_pack_via_local_upload_pack(
+        git_dir,
+        &remote_git_dir,
+        format,
+        wants,
+        None,
+        promisor,
+        options.filter,
+        false,
+        None,
+    )?;
+    Ok(true)
 }
 
 fn trace2_fetch_refetch_maintenance() {
