@@ -1055,7 +1055,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         update_ref_should_write_reflog(&git_dir, &name, create_reflog)?.then(|| ReflogEntry {
             old_oid,
             new_oid,
-            committer: default_committer(),
+            committer: ref_reflog_committer(),
             message,
         });
     let tx_name = name.clone();
@@ -1736,12 +1736,19 @@ fn dispatch_ref_stdin_command(
             };
             cursor.finish("symref-update", &raw_name)?;
 
-            let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
-            if transaction.capture(context.store, &raw_name, &name)? {
+            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let name = effective.effective.clone();
+            if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
             transaction.mark_applied();
-            update_ref_stdin_symref_update(context, &name, &target, expected)
+            update_ref_stdin_symref_update(
+                context,
+                &effective.requested,
+                &name,
+                &target,
+                expected,
+            )
         }
         "symref-verify" => {
             if *deref {
@@ -2267,7 +2274,7 @@ fn update_ref_stdin_commit_staged(
                         .then(|| ReflogEntry {
                             old_oid,
                             new_oid: write.new_oid,
-                            committer: default_committer(),
+                            committer: ref_reflog_committer(),
                             message: context.message.clone(),
                         });
                 tx.update(RefUpdate {
@@ -2399,6 +2406,7 @@ enum UpdateRefStdinSymrefExpected {
 
 fn update_ref_stdin_symref_update(
     context: &UpdateRefStdinContext<'_>,
+    requested: &str,
     name: &str,
     target: &str,
     expected: Option<UpdateRefStdinSymrefExpected>,
@@ -2413,6 +2421,7 @@ fn update_ref_stdin_symref_update(
             update_ref_stdin_symref_verify_oid(
                 context.store,
                 context.format,
+                requested,
                 name,
                 current.as_ref(),
                 &expected,
@@ -2428,7 +2437,13 @@ fn update_ref_stdin_symref_update(
         new: RefTarget::Symbolic(target.to_string()),
         reflog,
     });
-    tx.commit()
+    tx.commit()?;
+    if requested != name {
+        if let Some(reflog) = update_ref_stdin_symref_reflog(context, name, target)? {
+            context.store.append_reflog(requested, &reflog)?;
+        }
+    }
+    Ok(())
 }
 
 fn update_ref_stdin_symref_reflog(
@@ -2445,7 +2460,7 @@ fn update_ref_stdin_symref_reflog(
     Ok(Some(ReflogEntry {
         old_oid,
         new_oid,
-        committer: default_committer(),
+        committer: ref_reflog_committer(),
         message: context.message.clone(),
     }))
 }
@@ -2480,16 +2495,19 @@ fn update_ref_stdin_symref_verify(
 fn update_ref_stdin_symref_verify_oid(
     store: &FileRefStore,
     format: ObjectFormat,
+    requested: &str,
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
     let zero = zero_oid(format)?;
     if matches!(current, Some(RefTarget::Symbolic(_))) && expected != &zero {
-        eprintln!("fatal: cannot lock ref '{name}': reference is missing but expected {expected}");
+        eprintln!(
+            "fatal: cannot lock ref '{requested}': reference is missing but expected {expected}"
+        );
         return Err(GitError::Exit(128));
     }
-    check_update_ref_stdin_expected(store, format, name, current, expected)
+    check_update_ref_stdin_expected_named(store, format, requested, name, current, expected)
 }
 
 fn update_ref_stdin_symref_delete(
@@ -2777,7 +2795,7 @@ fn update_ref_stdin_write(
             .then(|| ReflogEntry {
                 old_oid,
                 new_oid: request.new_oid,
-                committer: default_committer(),
+                committer: ref_reflog_committer(),
                 message: context.message.clone(),
             });
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
@@ -2967,6 +2985,17 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
     Ok(update_ref_log_all_ref_updates_matches(name, "true"))
 }
 
+fn ref_reflog_committer() -> Vec<u8> {
+    let date = match env::var("GIT_COMMITTER_DATE") {
+        Ok(date) if !date.is_empty() => date,
+        _ => format!("@{} +0000", current_unix_seconds().max(1)),
+    };
+    commit_identity_from_env_with_date("COMMITTER", &date).unwrap_or_else(|_| {
+        let timestamp = current_unix_seconds().max(1);
+        format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes()
+    })
+}
+
 fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
     if value.eq_ignore_ascii_case("always") {
         return true;
@@ -3086,21 +3115,11 @@ fn check_update_ref_expected(
     }
 }
 
-fn check_update_ref_stdin_expected(
-    store: &FileRefStore,
-    format: ObjectFormat,
-    name: &str,
-    current: Option<&RefTarget>,
-    expected: &ObjectId,
-) -> Result<()> {
-    check_update_ref_stdin_expected_named(store, format, name, name, current, expected)
-}
-
-/// As [`check_update_ref_stdin_expected`] but with the requested name
-/// (`cannot lock ref '<requested>'`) distinguished from the effective,
-/// dereferenced name (`unable to resolve reference '<effective>'`). git uses the
-/// requested ref in the lock-failure prefix and the final dangling target in the
-/// resolve-failure reason; a non-symbolic update has them equal.
+/// Check a stdin old-OID precondition with the requested name (`cannot lock ref
+/// '<requested>'`) distinguished from the effective, dereferenced name (`unable
+/// to resolve reference '<effective>'`). git uses the requested ref in the
+/// lock-failure prefix and the final dangling target in the resolve-failure
+/// reason; a non-symbolic update has them equal.
 ///
 /// A `Symbolic` current arises only under `no-deref`: git still resolves the
 /// symref one level to compare the OID (`refs_read_ref_full`), so a `no-deref`
@@ -3530,7 +3549,7 @@ fn update_symbolic_ref(
     let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
         old_oid,
         new_oid,
-        committer: default_committer(),
+        committer: ref_reflog_committer(),
         message,
     });
     let hook = ReferenceTransactionHookRunner::new(git_dir);
