@@ -1,6 +1,6 @@
 [package]
 name = "sley-pack"
-version = "0.0.3"
+version.workspace = true
 description = "Native-Rust packfile reader, writer, and delta encoder for the sley object database."
 repository.workspace = true
 edition.workspace = true
@@ -16,9 +16,9 @@ crc32fast = "1"
 # `--no-default-features` swap to `pure-rust`, which is the only way Cargo's
 # additive features express mutual exclusion.
 flate2 = { version = "1", default-features = false }
-sley-core = { path = "../sley-core", version = "0.0.3" }
-sley-formats = { path = "../sley-formats", version = "0.0.3" }
-sley-object = { path = "../sley-object", version = "0.0.3" }
+sley-core = { path = "../sley-core", version = "0.1.0" }
+sley-formats = { path = "../sley-formats", version = "0.1.0" }
+sley-object = { path = "../sley-object", version = "0.1.0" }
 
 [features]
 default = ["zlib-rs"]

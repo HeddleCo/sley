@@ -1,6 +1,6 @@
 [package]
 name = "sley"
-version = "0.0.3"
+version.workspace = true
 description = "Ergonomic facade over the sley engine, a native-Rust reimplementation of Git's plumbing."
 repository.workspace = true
 edition.workspace = true
@@ -8,19 +8,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.0.3" }
-sley-object = { path = "../sley-object", version = "0.0.3" }
-sley-config = { path = "../sley-config", version = "0.0.3" }
-sley-diff-merge = { path = "../sley-diff-merge", version = "0.0.3" }
-sley-formats = { path = "../sley-formats", version = "0.0.3" }
-sley-index = { path = "../sley-index", version = "0.0.3" }
-sley-notes = { path = "../sley-notes", version = "0.0.3" }
-sley-odb = { path = "../sley-odb", version = "0.0.3" }
-sley-refs = { path = "../sley-refs", version = "0.0.3" }
-sley-rev = { path = "../sley-rev", version = "0.0.3" }
-sley-sequencer = { path = "../sley-sequencer", version = "0.0.3" }
-sley-worktree = { path = "../sley-worktree", version = "0.0.3" }
-sley-remote = { path = "../sley-remote", version = "0.0.3", optional = true }
+sley-core = { path = "../sley-core", version = "0.1.0" }
+sley-object = { path = "../sley-object", version = "0.1.0" }
+sley-config = { path = "../sley-config", version = "0.1.0" }
+sley-diff-merge = { path = "../sley-diff-merge", version = "0.1.0" }
+sley-formats = { path = "../sley-formats", version = "0.1.0" }
+sley-index = { path = "../sley-index", version = "0.1.0" }
+sley-notes = { path = "../sley-notes", version = "0.1.0" }
+sley-odb = { path = "../sley-odb", version = "0.1.0" }
+sley-refs = { path = "../sley-refs", version = "0.1.0" }
+sley-rev = { path = "../sley-rev", version = "0.1.0" }
+sley-sequencer = { path = "../sley-sequencer", version = "0.1.0" }
+sley-worktree = { path = "../sley-worktree", version = "0.1.0" }
+sley-remote = { path = "../sley-remote", version = "0.1.0", optional = true }
 
 [features]
 default = ["remote", "mmap", "fast-sha1"]

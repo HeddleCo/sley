@@ -1,6 +1,6 @@
 [package]
 name = "sley-index"
-version = "0.0.3"
+version.workspace = true
 description = "Native-Rust reader and writer for Git's index (staging area) file format, versions 2 through 4 plus the cache-tree extension."
 repository.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.0.3" }
+sley-core = { path = "../sley-core", version = "0.1.0" }
 
 [lints]
 workspace = true

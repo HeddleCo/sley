@@ -1,6 +1,6 @@
 [package]
 name = "sley-protocol"
-version = "0.0.3"
+version.workspace = true
 description = "Native-Rust implementation of Git's wire protocol: pkt-line framing and protocol v0/v1/v2 codecs."
 repository.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.0.3" }
+sley-core = { path = "../sley-core", version = "0.1.0" }
 
 [lints]
 workspace = true

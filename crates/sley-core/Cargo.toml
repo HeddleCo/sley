@@ -1,6 +1,6 @@
 [package]
 name = "sley-core"
-version = "0.0.3"
+version.workspace = true
 description = "Core Git primitives for the sley engine: object ids, errors, repo paths, and shared value types."
 repository.workspace = true
 edition.workspace = true

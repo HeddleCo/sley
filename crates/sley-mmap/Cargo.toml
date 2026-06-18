@@ -1,6 +1,6 @@
 [package]
 name = "sley-mmap"
-version = "0.0.3"
+version.workspace = true
 description = "Audited, safe read-only memory maps of immutable git files — the single home for sley's only unsafe code."
 repository.workspace = true
 edition.workspace = true

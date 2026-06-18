@@ -1,6 +1,6 @@
 [package]
 name = "sley-sequencer"
-version = "0.0.3"
+version.workspace = true
 description = "Native-Rust Git sequencer for the sley engine: rebase and commit-replay orchestration."
 repository.workspace = true
 edition.workspace = true
@@ -8,12 +8,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.0.3" }
-sley-formats = { path = "../sley-formats", version = "0.0.3" }
-sley-object = { path = "../sley-object", version = "0.0.3" }
-sley-odb = { path = "../sley-odb", version = "0.0.3" }
-sley-refs = { path = "../sley-refs", version = "0.0.3" }
-sley-worktree = { path = "../sley-worktree", version = "0.0.3" }
+sley-core = { path = "../sley-core", version = "0.1.0" }
+sley-formats = { path = "../sley-formats", version = "0.1.0" }
+sley-object = { path = "../sley-object", version = "0.1.0" }
+sley-odb = { path = "../sley-odb", version = "0.1.0" }
+sley-refs = { path = "../sley-refs", version = "0.1.0" }
+sley-worktree = { path = "../sley-worktree", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"
