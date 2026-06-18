@@ -2759,7 +2759,8 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
+    let store = FileRefStore::new(&common_git_dir, format)
+        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if store.uses_reftable()? {
         return store.compact_reftable_stack().map_err(|err| {
             if matches!(err, GitError::Io(ref message) if message.contains("File exists")) {
@@ -2898,6 +2899,10 @@ fn pack_refs_timeout_millis(common_git_dir: &Path) -> Result<u64> {
         .get("core", None, "packedRefsTimeout")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1000))
+}
+
+fn reftable_lock_timeout_override() -> Result<Option<u64>> {
+    Ok(global_config_value("reftable.lockTimeout")?.and_then(|value| value.parse::<u64>().ok()))
 }
 
 #[derive(Debug, Clone, Default)]

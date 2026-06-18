@@ -1419,7 +1419,8 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
+    let store = FileRefStore::new(&git_dir, format)
+        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if stdin {
         if delete || !positional.is_empty() {
             return Err(GitError::Command(
@@ -1524,6 +1525,10 @@ fn update_ref_usage() -> Result<()> {
         "usage: git update-ref [<options>] -d <refname> [<old-oid>]\n   or: git update-ref [<options>]    <refname> <new-oid> [<old-oid>]\n   or: git update-ref [<options>] --stdin [-z] [--batch-updates]\n\n    -m <reason>           reason of the update\n    -d                    delete the reference\n    --no-deref            update <refname> not the one it points to\n    --deref               opposite of --no-deref\n    -z                    stdin has NUL-terminated arguments\n    --[no-]stdin          read updates from stdin\n    --[no-]create-reflog  create a reflog\n    -0, --[no-]batch-updates\n                          batch reference updates"
     );
     Err(GitError::Exit(129))
+}
+
+fn reftable_lock_timeout_override() -> Result<Option<u64>> {
+    Ok(global_config_value("reftable.lockTimeout")?.and_then(|value| value.parse::<u64>().ok()))
 }
 
 /// The `reference-transaction` hook runner the file backend fires at each
@@ -3846,7 +3851,7 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
             print_show_ref_deref(&db, format, &oid, &reference.name, dereference, abbrev)?;
         }
     }
-    if !filters.is_empty() && !matched {
+    if !matched {
         return Err(GitError::Exit(1));
     }
     Ok(())

@@ -496,6 +496,7 @@ pub struct FileRefStore {
     git_dir: PathBuf,
     common_dir: PathBuf,
     format: ObjectFormat,
+    reftable_lock_timeout_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,7 +550,13 @@ impl FileRefStore {
             git_dir,
             common_dir,
             format,
+            reftable_lock_timeout_millis: None,
         }
+    }
+
+    pub fn with_reftable_lock_timeout_millis(mut self, timeout_millis: Option<u64>) -> Self {
+        self.reftable_lock_timeout_millis = timeout_millis;
+        self
     }
 
     pub fn read_ref(&self, name: &str) -> Result<Option<RefTarget>> {
@@ -1503,16 +1510,39 @@ impl FileRefStore {
 
     /// Read the table list (file names) backing the reftable stack, oldest first.
     fn reftable_table_names(&self) -> Result<Vec<String>> {
-        let tables_list = self.common_dir.join("reftable").join("tables.list");
+        self.reftable_table_names_from(&self.common_dir.join("reftable").join("tables.list"))
+    }
+
+    fn reftable_table_names_from(&self, tables_list: &Path) -> Result<Vec<String>> {
         if !tables_list.exists() {
             return Ok(Vec::new());
         }
-        Ok(fs::read_to_string(&tables_list)?
+        Ok(fs::read_to_string(tables_list)?
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect())
+    }
+
+    fn reftable_lock_timeout_millis(&self) -> Result<u64> {
+        if let Some(timeout_millis) = self.reftable_lock_timeout_millis {
+            return Ok(timeout_millis);
+        }
+        let config_path = self.common_dir.join("config");
+        let Ok(config) = GitConfig::read(config_path) else {
+            return Ok(0);
+        };
+        Ok(config
+            .get("reftable", None, "lockTimeout")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    fn acquire_reftable_list_lock(&self, list_path: PathBuf) -> Result<ReftableListLock> {
+        let lock_path = lock_path_for(&list_path)?;
+        let timeout_millis = self.reftable_lock_timeout_millis()?;
+        ReftableListLock::acquire(list_path, lock_path, timeout_millis)
     }
 
     /// Append a single combined ref+log table to the stack, allocating the next
@@ -1526,7 +1556,9 @@ impl FileRefStore {
     ) -> Result<u64> {
         let reftable_dir = self.common_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
-        let mut table_names = self.reftable_table_names()?;
+        let list_path = reftable_dir.join("tables.list");
+        let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
+        let mut table_names = self.reftable_table_names_from(&list_path)?;
         let update_index = self.next_reftable_update_index(&table_names)?;
         for record in &mut refs {
             record.update_index = update_index;
@@ -1545,8 +1577,7 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        let list_path = reftable_dir.join("tables.list");
-        write_locked(&list_path, &list)?;
+        list_lock.commit(&list)?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         if logs.is_empty() && table_names.len() > 6 {
             self.auto_compact_reftable_stack()?;
@@ -1556,7 +1587,9 @@ impl FileRefStore {
 
     pub fn compact_reftable_stack(&self) -> Result<()> {
         let reftable_dir = self.common_dir.join("reftable");
-        let old_names = self.reftable_table_names()?;
+        let list_path = reftable_dir.join("tables.list");
+        let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
+        let old_names = self.reftable_table_names_from(&list_path)?;
         if old_names.is_empty() {
             return Ok(());
         }
@@ -1610,8 +1643,7 @@ impl FileRefStore {
         let table_path = reftable_dir.join(&table_name);
         write_locked(&table_path, &bytes)?;
         self.apply_reftable_shared_file_mode(&table_path)?;
-        let list_path = reftable_dir.join("tables.list");
-        write_locked(&list_path, format!("{table_name}\n").as_bytes())?;
+        list_lock.commit(format!("{table_name}\n").as_bytes())?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         for name in old_names {
             if name != table_name {
@@ -1973,7 +2005,9 @@ impl FileRefStore {
     ) -> Result<u64> {
         let reftable_dir = self.common_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
-        let mut table_names = self.reftable_table_names()?;
+        let list_path = reftable_dir.join("tables.list");
+        let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
+        let mut table_names = self.reftable_table_names_from(&list_path)?;
         let alloc_index = self.next_reftable_update_index(&table_names)?;
         for record in &mut refs {
             record.update_index = alloc_index;
@@ -1999,8 +2033,7 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        let list_path = reftable_dir.join("tables.list");
-        write_locked(&list_path, &list)?;
+        list_lock.commit(&list)?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         Ok(max_index)
     }
@@ -3103,6 +3136,78 @@ impl Drop for DeleteLock {
         if self.active {
             let _ = self.file.take();
             let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct ReftableListLock {
+    list_path: PathBuf,
+    lock_path: PathBuf,
+    file: Option<fs::File>,
+    active: bool,
+}
+
+impl ReftableListLock {
+    fn acquire(list_path: PathBuf, lock_path: PathBuf, timeout_millis: u64) -> Result<Self> {
+        let start = SystemTime::now();
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        list_path,
+                        lock_path,
+                        file: Some(file),
+                        active: true,
+                    });
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 =>
+                {
+                    let elapsed = start
+                        .elapsed()
+                        .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
+                    if elapsed.as_millis() as u64 >= timeout_millis {
+                        return Err(GitError::Io(format!(
+                            "cannot lock references: {}: File exists",
+                            lock_path.display()
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(GitError::Io(format!(
+                        "cannot lock references: {}: File exists",
+                        lock_path.display()
+                    )));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn commit(mut self, bytes: &[u8]) -> Result<()> {
+        let Some(mut file) = self.file.take() else {
+            return Err(GitError::Io("reftable list lock is already closed".into()));
+        };
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.lock_path, &self.list_path).map_err(|err| GitError::Io(err.to_string()))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReftableListLock {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.file.take();
+            let _ = fs::remove_file(&self.lock_path);
         }
     }
 }
