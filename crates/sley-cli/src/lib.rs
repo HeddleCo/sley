@@ -2275,10 +2275,13 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// Preloaded file contents for `diff --no-index` (old, new), bypassing
     /// the object database / worktree reads.
     pub(crate) no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
-    /// Gitlink paths whose worktree-side synthesized content carries the
-    /// `-dirty` suffix (the submodule's own tree has modified/untracked
-    /// content the effective ignore mode does not suppress).
-    pub(crate) dirty_submodules: Option<&'a HashSet<Vec<u8>>>,
+    /// Requested gitlink renderer. `Short` is the synthetic one-line patch;
+    /// `Log` and `Diff` use submodule-native history and tree diff rendering.
+    pub(crate) submodule_format: commands::diff_options::SubmoduleDiffFormat,
+    /// Gitlink paths whose worktree-side submodule dirt is visible after
+    /// `--ignore-submodules` filtering. The bitmask uses
+    /// `sley_worktree::DIRTY_SUBMODULE_*`.
+    pub(crate) submodule_dirt: Option<&'a HashMap<Vec<u8>, u8>>,
     /// The whitespace rule used to highlight whitespace errors on new lines
     /// (`--ws-error-highlight`, default new-only) when color is enabled.
     /// `None` disables whitespace-error highlighting.
@@ -2447,12 +2450,12 @@ fn collect_dirty_submodules(
     worktree_root: &Path,
     config: &SubmoduleDiffConfig,
     precomputed_gitlinks: Option<&[sley_diff_merge::IndexGitlinkEntry]>,
-) -> Result<HashSet<Vec<u8>>> {
+) -> Result<HashMap<Vec<u8>, u8>> {
     if let Some(gitlinks) = precomputed_gitlinks {
         return collect_dirty_submodules_from_gitlinks(entries, worktree_root, config, gitlinks);
     }
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     };
     let gitlinks = index
         .entries
@@ -2471,8 +2474,8 @@ fn collect_dirty_submodules_from_gitlinks(
     worktree_root: &Path,
     config: &SubmoduleDiffConfig,
     gitlinks: &[sley_diff_merge::IndexGitlinkEntry],
-) -> Result<HashSet<Vec<u8>>> {
-    let mut dirty = HashSet::new();
+) -> Result<HashMap<Vec<u8>, u8>> {
+    let mut dirty = HashMap::new();
     let mut injected = false;
     for entry in gitlinks {
         let path = entry.path.as_bytes();
@@ -2488,7 +2491,15 @@ fn collect_dirty_submodules_from_gitlinks(
         if !counts {
             continue;
         }
-        dirty.insert(path.to_vec());
+        let visible_dirt = match mode {
+            SubmoduleIgnoreMode::None => dirt,
+            SubmoduleIgnoreMode::Untracked => dirt & !sley_worktree::DIRTY_SUBMODULE_UNTRACKED,
+            SubmoduleIgnoreMode::Dirty | SubmoduleIgnoreMode::All => 0,
+        };
+        if visible_dirt == 0 {
+            continue;
+        }
+        dirty.insert(path.to_vec(), visible_dirt);
         if !entries.iter().any(|existing| existing.path[..] == *path) {
             entries.push(sley_diff_merge::NameStatusEntry {
                 status: sley_diff_merge::NameStatus::Modified,
@@ -2549,7 +2560,8 @@ pub(crate) fn render_tree_to_tree_patch(
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
-                dirty_submodules: None,
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
                 ws_error_rule: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
@@ -2588,6 +2600,12 @@ pub(crate) fn write_diff_patch_entry(
     entry: &sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
 ) -> Result<()> {
+    if is_gitlink_pair(entry)
+        && options.submodule_format != commands::diff_options::SubmoduleDiffFormat::Short
+        && options.no_index_contents.is_none()
+    {
+        return write_submodule_patch_entry(stdout, entry, options);
+    }
     let (old_content, mut new_content) = match options.no_index_contents {
         Some((old, new)) => (old.map(<[u8]>::to_vec), new.map(<[u8]>::to_vec)),
         None => (
@@ -2606,8 +2624,8 @@ pub(crate) fn write_diff_patch_entry(
     if entry.new_mode == Some(0o160000)
         && options.use_worktree_new
         && options
-            .dirty_submodules
-            .is_some_and(|dirty| dirty.contains(&entry.path[..]))
+            .submodule_dirt
+            .is_some_and(|dirty| dirty.contains_key(&entry.path[..]))
         && let Some(content) = new_content.as_mut()
         && content.ends_with(b"\n")
     {
@@ -4005,6 +4023,462 @@ fn gitlink_diff_content(oid: &ObjectId, dirty: bool) -> Vec<u8> {
     format!("Subproject commit {oid}{suffix}\n").into_bytes()
 }
 
+fn is_gitlink_pair(entry: &sley_diff_merge::NameStatusEntry) -> bool {
+    entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000)
+}
+
+fn visible_submodule_dirt(
+    entry: &sley_diff_merge::NameStatusEntry,
+    options: &DiffPatchOptions<'_>,
+) -> u8 {
+    options
+        .submodule_dirt
+        .and_then(|dirty| dirty.get(&entry.path[..]).copied())
+        .unwrap_or(0)
+}
+
+fn database_git_dir(db: &FileObjectDatabase) -> Option<PathBuf> {
+    let objects = db.objects_dir();
+    (objects.file_name()? == "objects").then(|| objects.parent().map(Path::to_path_buf))?
+}
+
+fn submodule_git_dir_for_path(
+    parent_db: &FileObjectDatabase,
+    sub_root: &Path,
+    path: &[u8],
+) -> Option<PathBuf> {
+    sley_diff_merge::gitlink_git_dir(sub_root).or_else(|| {
+        let git_dir = database_git_dir(parent_db)?;
+        let modules_dir = git_dir.join("modules").join(repo_path_to_path(path));
+        modules_dir.is_dir().then_some(modules_dir)
+    })
+}
+
+fn write_submodule_patch_entry(
+    stdout: &mut dyn Write,
+    entry: &sley_diff_merge::NameStatusEntry,
+    options: DiffPatchOptions<'_>,
+) -> Result<()> {
+    let old_is_gitlink = entry.old_mode == Some(0o160000);
+    let new_is_gitlink = entry.new_mode == Some(0o160000);
+    if old_is_gitlink && entry.new_mode.is_some() && !new_is_gitlink {
+        let sub_entry = sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Deleted,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: entry.old_mode,
+            new_mode: None,
+            old_oid: entry.old_oid,
+            new_oid: None,
+        };
+        write_submodule_patch_entry(stdout, &sub_entry, options)?;
+        let blob_entry = sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Added,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: None,
+            new_mode: entry.new_mode,
+            old_oid: None,
+            new_oid: entry.new_oid,
+        };
+        return write_diff_patch_entry(
+            stdout,
+            &blob_entry,
+            DiffPatchOptions {
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                ..options
+            },
+        );
+    }
+    if !old_is_gitlink && entry.old_mode.is_some() && new_is_gitlink {
+        let blob_entry = sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Deleted,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: entry.old_mode,
+            new_mode: None,
+            old_oid: entry.old_oid,
+            new_oid: None,
+        };
+        write_diff_patch_entry(
+            stdout,
+            &blob_entry,
+            DiffPatchOptions {
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                ..options
+            },
+        )?;
+        let sub_entry = sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Added,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: None,
+            new_mode: entry.new_mode,
+            old_oid: None,
+            new_oid: entry.new_oid,
+        };
+        return write_submodule_patch_entry(stdout, &sub_entry, options);
+    }
+
+    let dirt = visible_submodule_dirt(entry, &options);
+    let path = String::from_utf8_lossy(&entry.path);
+    if dirt & sley_worktree::DIRTY_SUBMODULE_UNTRACKED != 0 {
+        writeln!(stdout, "Submodule {path} contains untracked content")?;
+    }
+    if dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0 {
+        writeln!(stdout, "Submodule {path} contains modified content")?;
+    }
+
+    let old_oid = entry
+        .old_oid
+        .filter(|_| entry.old_mode == Some(0o160000))
+        .unwrap_or_else(|| ObjectId::null(options.format));
+    let new_oid = diff_entry_new_gitlink_oid(
+        entry,
+        options.db,
+        options.worktree_root,
+        options.use_worktree_new,
+    )?
+    .filter(|_| entry.new_mode == Some(0o160000))
+    .unwrap_or_else(|| ObjectId::null(options.format));
+
+    let diff_dirty_only = options.submodule_format == commands::diff_options::SubmoduleDiffFormat::Diff
+        && dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0;
+    if old_oid == new_oid && !diff_dirty_only {
+        return Ok(());
+    }
+
+    let sub_root = options
+        .worktree_root
+        .map(|root| root.join(repo_path_to_path(&entry.path)));
+    let sub_git_dir = sub_root
+        .as_deref()
+        .and_then(|root| submodule_git_dir_for_path(options.db, root, &entry.path));
+    let (sub_format, sub_db) = match sub_git_dir.as_deref() {
+        Some(git_dir) => match repository_object_format(git_dir) {
+            Ok(format) => (Some(format), Some(FileObjectDatabase::from_git_dir(git_dir, format))),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    let old_present = sub_db
+        .as_ref()
+        .is_some_and(|db| old_oid.is_null() || submodule_commit_tree(db, &old_oid).is_ok());
+    let new_present = sub_db
+        .as_ref()
+        .is_some_and(|db| new_oid.is_null() || submodule_commit_tree(db, &new_oid).is_ok());
+    if old_oid == new_oid && diff_dirty_only {
+        if let (Some(sub_db), Some(sub_format)) = (sub_db.as_ref(), sub_format) {
+            write_submodule_inline_diff(
+                stdout, entry, options, sub_db, sub_format, &old_oid, &new_oid, dirt,
+            )?;
+        }
+        return Ok(());
+    }
+    let message = if old_oid.is_null() {
+        Some("(new submodule)")
+    } else if new_oid.is_null() {
+        Some("(submodule deleted)")
+    } else if sub_db.is_none() || !old_present || !new_present {
+        Some("(commits not present)")
+    } else {
+        None
+    };
+    let (range, rewind) = if message == Some("(commits not present)") {
+        ("...", false)
+    } else {
+        submodule_range_marker(
+            sub_git_dir.as_deref(),
+            sub_db.as_ref(),
+            sub_format,
+            &old_oid,
+            &new_oid,
+        )?
+    };
+    let old_abbrev = submodule_abbrev(&old_oid);
+    let new_abbrev = submodule_abbrev(&new_oid);
+    match message {
+        Some(message) => {
+            writeln!(stdout, "Submodule {path} {old_abbrev}{range}{new_abbrev} {message}")?;
+        }
+        None if rewind => {
+            writeln!(stdout, "Submodule {path} {old_abbrev}{range}{new_abbrev} (rewind):")?;
+        }
+        None => {
+            writeln!(stdout, "Submodule {path} {old_abbrev}{range}{new_abbrev}:")?;
+        }
+    }
+
+    let Some(sub_db) = sub_db.as_ref() else {
+        return Ok(());
+    };
+    let Some(sub_format) = sub_format else {
+        return Ok(());
+    };
+    if message == Some("(commits not present)") || !old_present || !new_present {
+        return Ok(());
+    }
+
+    match options.submodule_format {
+        commands::diff_options::SubmoduleDiffFormat::Log => {
+            write_submodule_log(
+                stdout,
+                sub_git_dir.as_deref(),
+                sub_db,
+                sub_format,
+                &old_oid,
+                &new_oid,
+            )?;
+        }
+        commands::diff_options::SubmoduleDiffFormat::Diff => {
+            write_submodule_inline_diff(
+                stdout, entry, options, sub_db, sub_format, &old_oid, &new_oid, dirt,
+            )?;
+        }
+        commands::diff_options::SubmoduleDiffFormat::Short => {}
+    }
+    Ok(())
+}
+
+fn submodule_abbrev(oid: &ObjectId) -> String {
+    oid.to_hex()[..oid.abbrev_hex_len(7)].to_string()
+}
+
+fn submodule_commit_tree(db: &FileObjectDatabase, oid: &ObjectId) -> Result<ObjectId> {
+    if oid.is_null() {
+        return Ok(ObjectId::empty_tree(db.object_format()));
+    }
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!("expected commit {oid}")));
+    }
+    Ok(Commit::parse(db.object_format(), &object.body)?.tree)
+}
+
+fn submodule_range_marker(
+    git_dir: Option<&Path>,
+    db: Option<&FileObjectDatabase>,
+    format: Option<ObjectFormat>,
+    old_oid: &ObjectId,
+    new_oid: &ObjectId,
+) -> Result<(&'static str, bool)> {
+    let (Some(git_dir), Some(db), Some(format)) = (git_dir, db, format) else {
+        return Ok(("...", false));
+    };
+    if old_oid.is_null() || new_oid.is_null() {
+        return Ok(("...", false));
+    }
+    let bases = sley_rev::merge_bases(git_dir, format, db, old_oid, new_oid)?;
+    let fast_forward = bases.iter().any(|base| base == old_oid);
+    let rewind = bases.iter().any(|base| base == new_oid);
+    Ok((if fast_forward || rewind { ".." } else { "..." }, rewind))
+}
+
+fn submodule_symmetric_records(
+    db: &FileObjectDatabase,
+    old_oid: &ObjectId,
+    new_oid: &ObjectId,
+) -> Result<Vec<(char, sley_rev::CommitRecord)>> {
+    if old_oid.is_null() || new_oid.is_null() {
+        return Ok(Vec::new());
+    }
+    let left = sley_rev::walk_commits(db, db.object_format(), [*old_oid])?;
+    let right = sley_rev::walk_commits(db, db.object_format(), [*new_oid])?;
+    let left_set = left.iter().map(|record| record.oid).collect::<HashSet<_>>();
+    let right_set = right.iter().map(|record| record.oid).collect::<HashSet<_>>();
+    let mut marked = Vec::new();
+    marked.extend(
+        right
+            .into_iter()
+            .filter(|record| !left_set.contains(&record.oid))
+            .map(|record| ('>', record)),
+    );
+    marked.extend(
+        left.into_iter()
+            .filter(|record| !right_set.contains(&record.oid))
+            .map(|record| ('<', record)),
+    );
+    Ok(marked)
+}
+
+fn write_submodule_log(
+    stdout: &mut dyn Write,
+    git_dir: Option<&Path>,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old_oid: &ObjectId,
+    new_oid: &ObjectId,
+) -> Result<()> {
+    let Some(git_dir) = git_dir else {
+        return Ok(());
+    };
+    let bases = if old_oid.is_null() || new_oid.is_null() {
+        HashSet::new()
+    } else {
+        sley_rev::merge_bases(git_dir, format, db, old_oid, new_oid)?
+            .into_iter()
+            .collect()
+    };
+    for (marker, record) in submodule_symmetric_records(db, old_oid, new_oid)? {
+        if bases.contains(&record.oid) {
+            continue;
+        }
+        let subject = submodule_commit_subject(&record.commit);
+        writeln!(stdout, "  {marker} {subject}")?;
+    }
+    Ok(())
+}
+
+fn submodule_commit_subject(commit: &Commit) -> String {
+    let encoding = commit_encoding(commit);
+    let message = log_reencode_message(&commit.message, &encoding, "UTF-8");
+    commit_subject(&message)
+}
+
+fn write_submodule_inline_diff(
+    stdout: &mut dyn Write,
+    entry: &sley_diff_merge::NameStatusEntry,
+    options: DiffPatchOptions<'_>,
+    sub_db: &FileObjectDatabase,
+    sub_format: ObjectFormat,
+    old_oid: &ObjectId,
+    new_oid: &ObjectId,
+    dirt: u8,
+) -> Result<()> {
+    let old_tree = submodule_commit_tree(sub_db, old_oid)?;
+    let new_tree = submodule_commit_tree(sub_db, new_oid)?;
+    let entries = if old_oid.is_null() {
+        sley_diff_merge::diff_name_status_empty_tree_with_options(
+            sub_db,
+            sub_format,
+            &new_tree,
+            sley_diff_merge::DiffNameStatusOptions::default(),
+        )?
+    } else {
+        sley_diff_merge::diff_name_status_trees_with_options(
+            sub_db,
+            sub_format,
+            &old_tree,
+            &new_tree,
+            sley_diff_merge::DiffNameStatusOptions::default(),
+        )?
+    };
+    let sub_path = String::from_utf8_lossy(&entry.path);
+    let src_prefix = format!("{}{}{}", options.src_prefix, sub_path, "/");
+    let dst_prefix = format!("{}{}{}", options.dst_prefix, sub_path, "/");
+    let nested_worktree_root = options
+        .worktree_root
+        .map(|root| root.join(repo_path_to_path(&entry.path)));
+    if dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
+        && let Some(sub_root) = nested_worktree_root.as_deref()
+    {
+        let Some(sub_git_dir) = submodule_git_dir_for_path(options.db, sub_root, &entry.path) else {
+            return Ok(());
+        };
+        let submodule_dirt = submodule_collect_patch_dirt(sub_root, &sub_git_dir, sub_format)?;
+        let dirty_entries = sley_diff_merge::diff_name_status_tree_worktree_with_options(
+            sub_root,
+            &sub_git_dir,
+            sub_format,
+            &old_tree,
+            sley_diff_merge::DiffNameStatusOptions::default(),
+        )?;
+        for dirty_entry in &dirty_entries {
+            write_diff_patch_entry(
+                stdout,
+                dirty_entry,
+                DiffPatchOptions {
+                    db: sub_db,
+                    worktree_root: Some(sub_root),
+                    use_worktree_new: true,
+                    format: sub_format,
+                    abbrev: options.abbrev,
+                    src_prefix: &src_prefix,
+                    dst_prefix: &dst_prefix,
+                    context: options.context,
+                    userdiff: None,
+                    colors: options.colors,
+                    word_diff: None,
+                    no_index_contents: None,
+                    submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
+                    submodule_dirt: Some(&submodule_dirt),
+                    ws_error_rule: None,
+                    interhunk: options.interhunk,
+                    ws_ignore: sley_diff_merge::WsIgnore::default(),
+                    diff_algorithm: options.diff_algorithm,
+                    ignore_blank_lines: false,
+                    ignore_regexes: &[],
+                    line_ranges: None,
+                    indent_heuristic: options.indent_heuristic,
+                },
+            )?;
+        }
+        return Ok(());
+    }
+    let nested_dirt = match nested_worktree_root.as_deref() {
+        Some(root) => {
+            let git_dir = submodule_git_dir_for_path(options.db, root, &entry.path);
+            match git_dir.as_deref() {
+                Some(git_dir) => submodule_collect_patch_dirt(root, git_dir, sub_format)?,
+                None => HashMap::new(),
+            }
+        }
+        None => HashMap::new(),
+    };
+    for sub_entry in &entries {
+        write_diff_patch_entry(
+            stdout,
+            sub_entry,
+            DiffPatchOptions {
+                db: sub_db,
+                worktree_root: nested_worktree_root.as_deref(),
+                use_worktree_new: false,
+                format: sub_format,
+                abbrev: options.abbrev,
+                src_prefix: &src_prefix,
+                dst_prefix: &dst_prefix,
+                context: options.context,
+                userdiff: None,
+                colors: options.colors,
+                word_diff: None,
+                no_index_contents: None,
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
+                submodule_dirt: Some(&nested_dirt),
+                ws_error_rule: None,
+                interhunk: options.interhunk,
+                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: options.diff_algorithm,
+                ignore_blank_lines: false,
+                ignore_regexes: &[],
+                line_ranges: None,
+                indent_heuristic: options.indent_heuristic,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn submodule_collect_patch_dirt(
+    sub_root: &Path,
+    sub_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashMap<Vec<u8>, u8>> {
+    let Some(index) = sley_worktree::read_repository_index(sub_git_dir, format)? else {
+        return Ok(HashMap::new());
+    };
+    let mut dirt = HashMap::new();
+    for entry in index.entries.iter().filter(|entry| entry.mode == 0o160000) {
+        let path = entry.path.as_bytes();
+        let submodule_root = sub_root.join(repo_path_to_path(path));
+        let bits = sley_worktree::submodule_dirt(&submodule_root);
+        if bits != 0 {
+            dirt.insert(path.to_vec(), bits);
+        }
+    }
+    Ok(dirt)
+}
+
 /// Whether a name-status entry produces any visible diff output once the
 /// whitespace-ignore (`-w`/`-b`/eol) and change-group-ignore
 /// (`--ignore-blank-lines` / `-I<regex>`) flags are applied — git's
@@ -4189,6 +4663,27 @@ fn diff_entry_new_content(
         .as_ref()
         .map(|oid| read_blob(db, oid))
         .transpose()
+}
+
+fn diff_entry_new_gitlink_oid(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree: bool,
+) -> Result<Option<ObjectId>> {
+    if entry.new_mode != Some(0o160000) {
+        return Ok(None);
+    }
+    Ok(match entry.new_oid {
+        Some(oid) => Some(oid),
+        None => match (use_worktree, worktree_root) {
+            (true, Some(root)) => {
+                let sub_root = root.join(repo_path_to_path(&entry.path));
+                sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format()).or(entry.old_oid)
+            }
+            _ => entry.old_oid,
+        },
+    })
 }
 
 fn validate_diff_rename_limit(value: &str) -> Result<()> {
