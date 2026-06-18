@@ -38,6 +38,7 @@ struct DiffTreeOutput {
     raw: bool,
     patch: bool,
     stat: bool,
+    compact_summary: bool,
     numstat: bool,
     shortstat: bool,
     summary: bool,
@@ -82,6 +83,8 @@ struct DiffTreeOptions {
     recursive: bool,
     /// `-t`: when recursing, also emit the intermediate tree (`040000`) entries.
     show_trees: bool,
+    /// `-R`: swap old and new sides before rendering.
+    reverse: bool,
     /// `--root`: for a single commit with no parent, diff against the empty tree
     /// instead of producing nothing.
     root: bool,
@@ -142,6 +145,7 @@ impl Default for DiffTreeOptions {
             output: DiffTreeOutput::default(),
             recursive: false,
             show_trees: false,
+            reverse: false,
             root: false,
             no_commit_id: false,
             pretty: None,
@@ -244,6 +248,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 options.recursive = true;
                 options.show_trees = true;
             }
+            "-R" => options.reverse = true,
             "--root" => options.root = true,
             "--check" => options.check = true,
             "--no-commit-id" => options.no_commit_id = true,
@@ -260,6 +265,10 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 options.output.raw = true;
             }
             "--stat" => options.output.stat = true,
+            "--compact-summary" => {
+                options.output.stat = true;
+                options.output.compact_summary = true;
+            }
             "--numstat" => options.output.numstat = true,
             "--shortstat" => options.output.shortstat = true,
             "--summary" => options.output.summary = true,
@@ -896,7 +905,14 @@ fn run_diff_request(
     if let Some(header) = &request.header
         && !(header.suppressible && context.options.no_commit_id)
     {
-        writeln!(stdout, "{}", header.text)?;
+        if context.options.pretty == Some(DiffTreePretty::Medium)
+            && context.options.output.patch
+            && context.options.output.stat
+        {
+            write!(stdout, "{}", header.text)?;
+        } else {
+            writeln!(stdout, "{}", header.text)?;
+        }
     }
 
     // git silently skips some requests (a root commit diffed without --root, an
@@ -974,6 +990,13 @@ fn run_diff_request(
         }
         wrote_block = true;
     }
+    if output.patch
+        && output.stat
+        && context.options.pretty == Some(DiffTreePretty::Medium)
+        && !entries.is_empty()
+    {
+        writeln!(stdout, "---")?;
+    }
     if output.raw {
         for entry in &entries {
             write_diff_raw_entry(
@@ -1001,7 +1024,7 @@ fn run_diff_request(
             None,
             false,
             DiffStatOptions {
-                compact_summary: false,
+                compact_summary: output.compact_summary,
                 stat_count: None,
                 color: false,
             },
@@ -1140,7 +1163,11 @@ fn run_combined_request(
                 db,
                 None,
                 false,
-                DiffStatOptions { compact_summary: false, stat_count: None, color: false },
+                DiffStatOptions {
+                    compact_summary: output.compact_summary,
+                    stat_count: None,
+                    color: false,
+                },
                 DiffStatWidths::plumbing(),
             )?;
         }
@@ -1217,7 +1244,11 @@ fn compute_entries(
             entries.extend(tree_entries);
             sort_entries_by_path(&mut entries);
         }
-        Ok(entries)
+        if options.reverse {
+            Ok(reverse_diff_entries(entries))
+        } else {
+            Ok(entries)
+        }
     } else {
         let left_map = match left {
             Some(left) => top_level_entries(format, db, left)?,
@@ -1229,6 +1260,9 @@ fn compute_entries(
             entries = detect_top_level_renames(entries, db, options);
         }
         sort_entries_by_path(&mut entries);
+        if options.reverse {
+            entries = reverse_diff_entries(entries);
+        }
         Ok(entries)
     }
 }

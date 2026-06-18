@@ -176,14 +176,20 @@ pub(crate) fn write_combined_name_status(
 }
 
 fn combined_raw_oid(oid: Option<&ObjectId>, ctx: &CombinedRenderCtx<'_>) -> String {
-    match oid {
+    let mut hex = match oid {
         Some(oid) => {
             let hex = oid.to_hex();
             let width = ctx.raw_abbrev.unwrap_or(hex.len()).min(hex.len());
             hex[..width].to_string()
         }
         None => "0".repeat(ctx.raw_abbrev.unwrap_or(ctx.format.hex_len())),
+    };
+    if hex.len() < ctx.format.hex_len()
+        && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").is_ok_and(|value| value == "yes")
+    {
+        hex.push_str("...");
     }
+    hex
 }
 
 /// Emit one combined-patch file — git's `show_patch_diff`. Returns `true` when a
