@@ -10,7 +10,9 @@
 //! call them, and an embedder can drive them directly.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
@@ -34,7 +36,7 @@ use sley_protocol::{
     write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
     write_upload_pack_request,
 };
-use sley_refs::{DeleteRef, FileRefStore, Ref, RefPrecondition, RefTarget};
+use sley_refs::{DeleteRef, FileRefStore, Ref, RefPrecondition, RefTarget, ReflogEntry};
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
@@ -216,17 +218,23 @@ pub fn receive_pack_into_local_repository(
         |oid| remote_db.contains(oid),
         |commands| {
             let mut tx = remote_store.transaction();
+            let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
             for command in commands {
                 let precondition = if command.old_id.is_null() {
                     RefPrecondition::MustNotExist
                 } else {
                     RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
                 };
+                let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
+                    Some(receive_pack_reflog_entry(format, command.old_id, command.new_id))
+                } else {
+                    None
+                };
                 tx.update_to(
                     command.name.clone(),
                     RefTarget::Direct(command.new_id),
                     precondition,
-                    None,
+                    reflog,
                 );
             }
             tx.commit()
@@ -242,6 +250,66 @@ pub fn receive_pack_into_local_repository(
                 .map_err(|err| GitError::Transaction(err.to_string()))
         },
     )
+}
+
+fn receive_pack_log_all_ref_updates(git_dir: &Path) -> bool {
+    let Ok(config) = fs::read_to_string(git_dir.join("config")) else {
+        return false;
+    };
+    let mut in_core = false;
+    for raw_line in config.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+            continue;
+        }
+        if !in_core || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("logallrefupdates") {
+            return matches!(
+                value.trim().trim_matches('"').to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1" | "always"
+            );
+        }
+    }
+    false
+}
+
+fn receive_pack_should_write_reflog(refname: &str) -> bool {
+    refname == "HEAD"
+        || refname.starts_with("refs/heads/")
+        || refname.starts_with("refs/remotes/")
+        || refname.starts_with("refs/notes/")
+}
+
+fn receive_pack_reflog_entry(
+    format: ObjectFormat,
+    old_oid: ObjectId,
+    new_oid: ObjectId,
+) -> ReflogEntry {
+    let old_oid = if old_oid.is_null() {
+        ObjectId::null(format)
+    } else {
+        old_oid
+    };
+    ReflogEntry {
+        old_oid,
+        new_oid,
+        committer: receive_pack_reflog_committer(),
+        message: b"push".to_vec(),
+    }
+}
+
+fn receive_pack_reflog_committer() -> Vec<u8> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("Git Rs <sley@example.invalid> {seconds} +0000").into_bytes()
 }
 
 /// Apply a local receive-pack request whose pack can be built from `source_db`
@@ -285,17 +353,23 @@ pub fn receive_pack_reachable_pack_into_local_repository(
         |oid| remote_db.contains(oid),
         |commands| {
             let mut tx = remote_store.transaction();
+            let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
             for command in commands {
                 let precondition = if command.old_id.is_null() {
                     RefPrecondition::MustNotExist
                 } else {
                     RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
                 };
+                let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
+                    Some(receive_pack_reflog_entry(format, command.old_id, command.new_id))
+                } else {
+                    None
+                };
                 tx.update_to(
                     command.name.clone(),
                     RefTarget::Direct(command.new_id),
                     precondition,
-                    None,
+                    reflog,
                 );
             }
             tx.commit()

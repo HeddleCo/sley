@@ -3542,7 +3542,9 @@ fn log_walk_reflogs(
     output: &LogOutput,
     reverse: bool,
 ) -> Result<()> {
-    let reference = reflog_reference_name(revisions.first().map(String::as_str))?;
+    let requested = revisions.first().map(String::as_str);
+    let reference = reflog_reference_name(requested)?;
+    let display_reference = requested.unwrap_or(&reference);
     let store = FileRefStore::new(git_dir, format);
     let mut entries = store.read_reflog(&reference)?;
     entries.reverse();
@@ -3564,7 +3566,14 @@ fn log_walk_reflogs(
                 ..
             } => {
                 let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                emit_compiled_reflog_walk_format(compiled, entry, index, &reference, &mut line)?;
+                emit_compiled_reflog_walk_format(
+                    compiled,
+                    entry,
+                    index,
+                    display_reference,
+                    &reference,
+                    &mut line,
+                )?;
                 stdout.write_all(&line)?;
                 if *final_newline && !line.ends_with(b"\n") {
                     stdout.write_all(b"\n")?;
@@ -3671,7 +3680,8 @@ fn emit_compiled_reflog_walk_format(
     compiled: &CompiledLogFormat,
     entry: &ReflogEntry,
     index: usize,
-    reference: &str,
+    display_reference: &str,
+    full_reference: &str,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
@@ -3719,8 +3729,11 @@ fn emit_compiled_reflog_walk_format(
                 .map_err(io::Error::from)?
             }
             FormatToken::ReflogGs => out.extend_from_slice(&entry.message),
-            FormatToken::ReflogGd | FormatToken::ReflogGD => {
-                write!(out, "{reference}@{{{index}}}").map_err(io::Error::from)?;
+            FormatToken::ReflogGd => {
+                write!(out, "{display_reference}@{{{index}}}").map_err(io::Error::from)?;
+            }
+            FormatToken::ReflogGD => {
+                write!(out, "{full_reference}@{{{index}}}").map_err(io::Error::from)?;
             }
             FormatToken::ReflogGn => out.extend_from_slice(reflog_name.as_bytes()),
             FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),

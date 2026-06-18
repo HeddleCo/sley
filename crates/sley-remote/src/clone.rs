@@ -453,6 +453,7 @@ fn clone_fetch_options(
         cloning: true,
         update_shallow: false,
         deepen_relative: false,
+        update_head_ok: false,
         deepen_since,
         deepen_not,
     }

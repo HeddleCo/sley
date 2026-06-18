@@ -1613,6 +1613,7 @@ fn clone_bare_or_mirror_local_repository(
             cloning: false,
             update_shallow: false,
             deepen_relative: false,
+            update_head_ok: false,
             deepen_since: None,
             deepen_not: Vec::new(),
         },
@@ -2401,6 +2402,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         cloning: false,
         update_shallow: false,
         deepen_relative: false,
+        update_head_ok: false,
         deepen_since: None,
         deepen_not: Vec::new(),
     };
@@ -2451,6 +2453,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 options.tag_option_explicit = true;
             }
             "--unshallow" => unshallow = true,
+            "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
             "--deepen" => {
                 let value = iter
