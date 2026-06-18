@@ -195,6 +195,7 @@ jobs:
             t7506-status-submodule.sh
             t7508-status.sh
             t7063-status-untracked-cache.sh
+            t1410-reflog.sh
             t7810-grep.sh
             t8001-annotate.sh
             t8002-blame.sh

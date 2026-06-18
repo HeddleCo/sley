@@ -380,7 +380,12 @@ declare -A FLOOR=(
     # refs, packed-refs parse diagnostics, --auto heuristic, lock retry, packed
     # no-op update, verified tag peeling. t1463 11->43. Ref-store consumers held:
     # t1400=275 t6300=410 t7004=228 t3200=134 t1450=96 t5505=93 t1410=20 t5601=72.
-    [t1463-refs-optimize.sh]=43
+    [t1463-refs-optimize.sh]=45
+    # codex-wave-10 (reflog expire/delete): native expire (--expire/--expire-unreachable/
+    # --all/--updateref/--rewrite/--stale-fix), delete w/ entry-rewrite, exists, gc/prune
+    # reachability, worktree-local reflogs, branch/tag reflog cleanup. t1410 20->41 FULL;
+    # side gain t1463 43->45. Auto-merge w/ wave-10 (branch.rs/log.rs/pack.rs) held:
+    # t6040=44 t4205=110 t7700=29 t3404=80.
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
@@ -568,7 +573,13 @@ declare -A FLOOR=(
     # t7700-repack=17, t5319=77, t5324=11, t7508=114, t2107=10, t7008=5.
     [t7800-difftool.sh]=69
     [t7610-mergetool.sh]=5
-    [t7063-status-untracked-cache.sh]=15
+    # codex-wave-10 (untracked-cache UNTR extension): native read/write, update-index
+    # toggles, status create/remove/keep, -uall/-unormal bypass, exclude-OID hashing,
+    # mutation invalidation, trace2 perf, ident-mismatch, UNTR-preserve across rewrites.
+    # t7063 15->44. index/worktree blast-radius held: t7508=114 t2107=10 t2400=214
+    # t1092=29 t7102=37.
+    [t7063-status-untracked-cache.sh]=44
+    [t1410-reflog.sh]=41
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
     [t3650-replay-basics.sh]=43
