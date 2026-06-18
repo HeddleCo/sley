@@ -406,7 +406,7 @@ declare -A FLOOR=(
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
     # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).
-    [t6423-merge-rename-directories.sh]=27
+    [t6423-merge-rename-directories.sh]=34
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
