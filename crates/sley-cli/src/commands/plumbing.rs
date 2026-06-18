@@ -3085,6 +3085,16 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             }
         }
     }
+    let alternate_loose_errors = if explicit_oids.is_empty() {
+        fsck_alternate_loose_objects(&git_dir, format, &cwd)?
+    } else {
+        false
+    };
+    let pack_errors = if explicit_oids.is_empty() {
+        fsck_pack_files(&git_dir, format, &cwd)?
+    } else {
+        false
+    };
     let loose_errors = !bad_loose.is_empty();
     object_ids.retain(|oid| !bad_loose.contains(oid));
 
@@ -3140,6 +3150,9 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // bogus explicit head sets ERROR_OBJECT.
     let mut exit_bits = report.exit_code();
     if loose_errors {
+        exit_bits |= sley_fsck::ERROR_OBJECT;
+    }
+    if alternate_loose_errors || pack_errors {
         exit_bits |= sley_fsck::ERROR_OBJECT;
     }
     // git's `snapshot_ref` errors (invalid sha1 pointer / not a commit) set
@@ -3205,6 +3218,117 @@ fn fsck_objects_dir_display(git_dir: &Path, cwd: &Path) -> String {
         return format!("{}/objects", relative.display());
     }
     format!("{}/objects", git_dir.display())
+}
+
+fn fsck_display_path(path: &Path, cwd: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative.display().to_string()
+        }
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn fsck_alternate_loose_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+    cwd: &Path,
+) -> Result<bool> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let alternates = objects_dir.join("info").join("alternates");
+    let Ok(contents) = fs::read_to_string(&alternates) else {
+        return Ok(false);
+    };
+    let mut failed = false;
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let alternate = PathBuf::from(line);
+        let alternate = if alternate.is_absolute() {
+            alternate
+        } else {
+            objects_dir.join(alternate)
+        };
+        let store = sley_odb::LooseObjectStore::new(&alternate, format);
+        for oid in store.object_ids()? {
+            let hex = oid.to_hex();
+            let display_path = fsck_display_path(&alternate.join(&hex[..2]).join(&hex[2..]), cwd);
+            match store.verify_object(&oid, &display_path)? {
+                None | Some(LooseObjectIntegrity::Ok) => {}
+                Some(LooseObjectIntegrity::HashMismatch { actual }) => {
+                    eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
+                    failed = true;
+                }
+                Some(LooseObjectIntegrity::Corrupt) => {
+                    eprintln!("error: {oid}: object corrupt or missing: {display_path}");
+                    failed = true;
+                }
+            }
+        }
+    }
+    Ok(failed)
+}
+
+fn fsck_pack_files(git_dir: &Path, format: ObjectFormat, cwd: &Path) -> Result<bool> {
+    let pack_dir = repository_objects_dir(git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(false);
+    };
+    let mut packs = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pack"))
+        .collect::<Vec<_>>();
+    packs.sort();
+
+    let mut failed = false;
+    for pack_path in packs {
+        let bytes = fs::read(&pack_path)?;
+        let display_path = fsck_display_path(&pack_path, cwd);
+        let trailer_len = format.raw_len();
+        if bytes.len() >= 12 + trailer_len {
+            let trailer_offset = bytes.len() - trailer_len;
+            let actual = sley_core::digest_bytes(format, &bytes[..trailer_offset])?;
+            let expected = ObjectId::from_raw(format, &bytes[trailer_offset..])?;
+            if actual != expected {
+                eprintln!("error: checksum mismatch in {display_path}");
+                failed = true;
+            }
+        } else {
+            eprintln!("error: checksum mismatch in {display_path}");
+            failed = true;
+            continue;
+        }
+
+        let idx_path = pack_path.with_extension("idx");
+        let Ok(index_bytes) = fs::read(&idx_path) else {
+            continue;
+        };
+        let Ok(index) = sley_pack::PackIndex::parse(&index_bytes, format) else {
+            continue;
+        };
+        let trailer_offset = bytes.len() - trailer_len;
+        for entry in index.entries {
+            let Ok(offset) = usize::try_from(entry.offset) else {
+                continue;
+            };
+            if offset >= trailer_offset {
+                continue;
+            }
+            let object_type = (bytes[offset] >> 4) & 0x07;
+            if object_type == 0 {
+                eprintln!(
+                    "error: unknown object type 0 at offset {offset} in {display_path}"
+                );
+                failed = true;
+            }
+        }
+    }
+    Ok(failed)
 }
 
 /// git's `is_branch`: a ref whose tip must be a commit (`HEAD` or `refs/heads/*`).
