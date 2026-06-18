@@ -229,7 +229,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         request.options.depth,
         request.options.deepen_since,
         request.options.deepen_not.clone(),
-        request.options.filter,
+        request.options.filter.clone(),
     );
     fetch(
         crate::fetch::FetchRequest {

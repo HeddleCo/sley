@@ -899,7 +899,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         deepen.map(|plan| plan.client_shallow.len()).unwrap_or(0),
         deepen.is_some_and(|plan| plan.deepen_since),
         deepen.map(|plan| plan.deepen_not).unwrap_or(0),
-        filter,
+        filter.as_ref(),
     );
     // With a deepen plan the haves walk is cut at the client's existing
     // boundary: having a commit inside the old shallow window must not imply
@@ -930,7 +930,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         starts,
         &excluded,
         RawPackInstallOptions { promisor },
-        filter,
+        filter.clone(),
         unpack_limit,
     )?;
     if promisor
@@ -998,7 +998,7 @@ fn trace2_fetch_info(
     shallows: usize,
     deepen_since: bool,
     deepen_not: usize,
-    filter: Option<sley_odb::PackObjectFilter>,
+    filter: Option<&sley_odb::PackObjectFilter>,
 ) {
     let Some(path) = std::env::var_os("GIT_TRACE2_EVENT") else {
         return;
@@ -1014,6 +1014,7 @@ fn trace2_fetch_info(
         Some(sley_odb::PackObjectFilter::TreeDepth(depth)) => {
             format!("\"tree:{depth}\"")
         }
+        Some(sley_odb::PackObjectFilter::SparsePathSet(_)) => "\"sparse:oid\"".to_string(),
         None => "null".to_string(),
     };
     let line = format!(

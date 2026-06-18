@@ -719,7 +719,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 .as_ref()
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
-            match (remote_allows_filter, remote_config.as_ref(), pack_filter_from_spec(filter)) {
+            let parsed_filter =
+                pack_filter_from_spec_for_clone(filter, &remote_common_git_dir, format)?;
+            match (remote_allows_filter, remote_config.as_ref(), parsed_filter) {
                 (true, Some(config), Some(parsed)) => {
                     validate_server_filter_policy(config, filter)?;
                     fetch_filter = Some(parsed);
@@ -1451,6 +1453,9 @@ fn validate_clone_filter(value: &str) -> Result<()> {
     }
     if let Some(object_type) = value.strip_prefix("object:type=") {
         parse_rev_list_object_type_filter(object_type)?;
+        return Ok(());
+    }
+    if value.starts_with("sparse:oid=") {
         return Ok(());
     }
     eprintln!("fatal: invalid filter-spec '{value}'");
@@ -2741,6 +2746,55 @@ fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
         .map(sley_odb::PackObjectFilter::BlobLimit)
 }
 
+fn pack_filter_from_spec_for_clone(
+    spec: &str,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<sley_odb::PackObjectFilter>> {
+    if let Some(body) = spec.strip_prefix("sparse:oid=") {
+        return sparse_filter_from_remote(body, remote_git_dir, format).map(Some);
+    }
+    Ok(pack_filter_from_spec(spec))
+}
+
+fn sparse_filter_from_remote(
+    body: &str,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<sley_odb::PackObjectFilter> {
+    let Some((rev, path)) = body.split_once(':') else {
+        eprintln!("fatal: unable to parse sparse filter data in .{body}");
+        return Err(GitError::Exit(128));
+    };
+    let db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let oid = match sley_rev::resolve_rev_path(remote_git_dir, format, &db, rev, path) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("fatal: unable to access sparse blob in .{body}");
+            return Err(GitError::Exit(128));
+        }
+    };
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Blob {
+        eprintln!("fatal: unable to parse sparse filter data in .{body}");
+        return Err(GitError::Exit(128));
+    }
+    let contents = String::from_utf8_lossy(&object.body);
+    let paths = contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix('/').unwrap_or(line);
+            (!line.is_empty()).then(|| line.to_string())
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        eprintln!("fatal: unable to parse sparse filter data in .{body}");
+        return Err(GitError::Exit(128));
+    }
+    Ok(sley_odb::PackObjectFilter::SparsePathSet(paths))
+}
+
 fn combine_pack_filters(
     left: sley_odb::PackObjectFilter,
     right: sley_odb::PackObjectFilter,
@@ -2752,6 +2806,9 @@ fn combine_pack_filters(
         }
         (PackObjectFilter::TreeDepth(depth), _) | (_, PackObjectFilter::TreeDepth(depth)) => {
             PackObjectFilter::TreeDepth(depth)
+        }
+        (PackObjectFilter::SparsePathSet(paths), _) | (_, PackObjectFilter::SparsePathSet(paths)) => {
+            PackObjectFilter::SparsePathSet(paths)
         }
         (PackObjectFilter::BlobLimit(a), PackObjectFilter::BlobLimit(b)) => {
             PackObjectFilter::BlobLimit(a.min(b))
@@ -2807,7 +2864,7 @@ fn fetch_raw_oid_refspecs(
         wants,
         None,
         promisor,
-        options.filter,
+        options.filter.clone(),
         false,
         None,
     )?;

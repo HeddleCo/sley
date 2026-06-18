@@ -649,7 +649,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     starts,
                     deepen_plan.as_ref(),
                     promisor_remote,
-                    options.filter,
+                    options.filter.clone(),
                     options.refetch,
                     None,
                 )?
