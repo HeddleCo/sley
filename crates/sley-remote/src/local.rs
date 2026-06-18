@@ -1099,14 +1099,13 @@ fn local_fetch_v2_sections(
 
     // Resolve want-refs into concrete wants for the pack walk.
     let mut wants: Vec<ObjectId> = request.wants.clone();
-    if !request.want_refs.is_empty() {
-        if let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
+    if !request.want_refs.is_empty()
+        && let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
             .iter()
             .find(|s| matches!(s, ProtocolV2FetchResponseSection::WantedRefs(_)))
-        {
-            for w in wanted {
-                wants.push(w.oid);
-            }
+    {
+        for w in wanted {
+            wants.push(w.oid);
         }
     }
 
@@ -1146,13 +1145,9 @@ pub fn serve_upload_pack_v2(
     write_protocol_v2_advertisement(writer, &handshake)?;
     writer.flush()?;
 
-    loop {
-        let request = match read_protocol_v2_command_request(reader) {
-            Ok(request) => request,
-            // EOF / a lone flush after the advertisement ends the session: the
-            // client disconnected (e.g. `ls-remote` reads the refs and leaves).
-            Err(_) => break,
-        };
+    // EOF / a lone flush after the advertisement ends the session: the client
+    // disconnected (e.g. `ls-remote` reads the refs and leaves).
+    while let Ok(request) = read_protocol_v2_command_request(reader) {
         match request.command.as_str() {
             "ls-refs" => {
                 let ls_refs = ProtocolV2LsRefsRequest::from_command_request(&request)?;

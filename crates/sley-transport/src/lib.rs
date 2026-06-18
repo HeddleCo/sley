@@ -1120,10 +1120,9 @@ fn scp_like_separator(value: &str) -> Option<usize> {
             .as_bytes()
             .first()
             .is_some_and(|byte| byte.is_ascii_alphabetic())
+        && (value.as_bytes().get(2) == Some(&b'/') || cfg!(windows))
     {
-        if value.as_bytes().get(2) == Some(&b'/') || cfg!(windows) {
-            return None;
-        }
+        return None;
     }
     Some(colon)
 }
