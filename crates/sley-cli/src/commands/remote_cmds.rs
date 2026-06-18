@@ -2517,6 +2517,12 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    if read_repo_config(&git_dir)?
+        .get_bool("core", None, "bare")
+        .unwrap_or(false)
+    {
+        options.update_head_ok = true;
+    }
     // `git fetch --all`: iterate every configured remote, fetching each with its
     // own configured refspecs. An explicit `<remote>` is incompatible.
     if fetch_all_remotes {
@@ -3387,6 +3393,9 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             &config,
         )?
     };
+    if !req.options.dry_run && !pre_receive_declined {
+        trace2_push_wrote(5);
+    }
 
     if pre_receive_declined {
         for reference in &mut report.refs {
@@ -3462,6 +3471,19 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn trace2_push_wrote(value: usize) {
+    sley_core::trace2::data("write_pack_file", "wrote", value);
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let line = format!(
+        "{{\"event\":\"data\",\"sid\":\"sley\",\"category\":\"write_pack_file/wrote\",\"value\":\"{value}\"}}\n"
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// Render a push status report exactly like git's `transport_print_push_status`:
@@ -5257,13 +5279,30 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     let url = positional[1];
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config_on_disk(&git_dir)?;
+    if mirror != RemoteAddMirror::None && master.is_some() {
+        eprintln!("fatal: specifying a master branch makes no sense with --mirror");
+        return Err(GitError::Exit(128));
+    }
+    if matches!(mirror, RemoteAddMirror::Push) && !branches.is_empty() {
+        eprintln!("fatal: specifying branches to track makes sense only with fetch mirrors");
+        return Err(GitError::Exit(128));
+    }
     // Build the section body from the parsed options, then let the shared editor
     // append it (and reject a duplicate remote).
     let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     match mirror {
         RemoteAddMirror::Fetch | RemoteAddMirror::Both => {
-            entries.push(ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())));
+            if branches.is_empty() {
+                entries.push(ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())));
+            } else {
+                for branch in &branches {
+                    entries.push(ConfigEntry::new(
+                        "fetch",
+                        Some(remote_add_fetch_refspec(name, branch, mirror)),
+                    ));
+                }
+            }
         }
         RemoteAddMirror::Push => {
             entries.push(ConfigEntry::new("mirror", Some("true".into())));
@@ -5278,14 +5317,14 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
                 for branch in &branches {
                     entries.push(ConfigEntry::new(
                         "fetch",
-                        Some(remote_branch_fetch_refspec(name, branch)),
+                        Some(remote_add_fetch_refspec(name, branch, mirror)),
                     ));
                 }
             }
         }
     }
     if let Some(tag_opt) = tag_opt {
-        entries.push(ConfigEntry::new("tagopt", Some(tag_opt)));
+        entries.push(ConfigEntry::new("tagOpt", Some(tag_opt)));
     }
     if mirror == RemoteAddMirror::Both {
         entries.push(ConfigEntry::new("mirror", Some("true".into())));
@@ -5330,6 +5369,20 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     // `-m`'s master HEAD is set.
     if fetch {
         cmd_fetch(&[name.to_string()])?;
+        if matches!(mirror, RemoteAddMirror::Fetch | RemoteAddMirror::Both)
+            && let Ok(branch) = discover_local_remote_head_branch(&config, name, &git_dir)
+        {
+            let format = repository_object_format(&git_dir)?;
+            let store = FileRefStore::new(&git_dir, format);
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: "HEAD".to_string(),
+                expected: None,
+                new: RefTarget::Symbolic(format!("refs/heads/{branch}")),
+                reflog: None,
+            });
+            let _ = tx.commit();
+        }
     }
     if let Some(master) = master {
         let format = repository_object_format(&git_dir)?;
@@ -5417,7 +5470,7 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     let name = &args[0];
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config_on_disk(&git_dir)?;
     let warn_skipped_local_branches = remote_remove_maps_outside_remote_tracking(&config, name);
     match sley_config::remotes::remove_remote(&mut config, name) {
         Ok(()) => {}
@@ -5499,6 +5552,15 @@ pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
                 for name in list.split_whitespace() {
                     push_unique(name.to_string(), &mut remotes);
                 }
+            } else if group == "default" {
+                for name in remote_names(&config) {
+                    let skip = config
+                        .get_bool("remote", Some(&name), "skipdefaultupdate")
+                        .unwrap_or(false);
+                    if !skip {
+                        push_unique(name, &mut remotes);
+                    }
+                }
             } else {
                 push_unique(group.clone(), &mut remotes);
             }
@@ -5560,6 +5622,7 @@ pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
 pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     // `--[no-]progress` is accepted (and ignored — sley does not render rename
     // progress) before the two positional names, matching git's option parsing.
+    let progress = args.iter().any(|arg| arg == "--progress");
     let positional: Vec<&String> = args
         .iter()
         .filter(|arg| !matches!(arg.as_str(), "--progress" | "--no-progress"))
@@ -5570,7 +5633,8 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     let old = positional[0];
     let new = positional[1];
     let git_dir = discover_git_dir(env::current_dir()?)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config_on_disk(&git_dir)?;
+    sley_config::remotes::augment_with_legacy_remote_files(&mut config, &git_dir);
     // Upstream `builtin/remote.c::mv` order: the old remote's existence is
     // checked first (`error` + `exit(2)`), then the new name's collision
     // (`exit(3)`), and only then the new name's format (`die`, exit 128). The
@@ -5584,7 +5648,8 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
         eprintln!("error: No such remote: '{old}'");
         return Err(GitError::Exit(2));
     }
-    if config
+    if old != new
+        && config
         .sections
         .iter()
         .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(new))
@@ -5593,6 +5658,14 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(3));
     }
     validate_remote_name(new)?;
+    if old == new {
+        remove_legacy_remote_file(&git_dir, old)?;
+        write_repo_config(&git_dir, &config)?;
+        return Ok(());
+    }
+    let rename_tracking_refs = remote_config_values(&config, old, "fetch")
+        .iter()
+        .any(|refspec| fetch_refspec_targets_remote_tracking(refspec, old));
     let mut renamed = false;
     for section in &mut config.sections {
         if section.name == "remote" && section.subsection.as_deref() == Some(old) {
@@ -5631,9 +5704,26 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     if !renamed {
         return Err(GitError::remote_not_found(old));
     }
+    remove_legacy_remote_file(&git_dir, old)?;
     write_repo_config(&git_dir, &config)?;
     let format = repository_object_format(&git_dir)?;
-    rename_remote_tracking_refs(&git_dir, format, old, new)
+    if progress {
+        trace2_remote_rename_progress();
+    }
+    if rename_tracking_refs {
+        match rename_remote_tracking_refs(&git_dir, format, old, new) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                eprintln!("error: renaming remote references failed");
+                eprintln!(
+                    "error: The remote you are trying to rename has conflicting references"
+                );
+                Err(GitError::Exit(1))
+            }
+        }
+    } else {
+        Ok(())
+    }
 }
 
 fn move_remote_fetch_entries_to_end(section: &mut ConfigSection) {
@@ -5647,6 +5737,23 @@ fn move_remote_fetch_entries_to_end(section: &mut ConfigSection) {
         }
     }
     section.entries.extend(fetch_entries);
+}
+
+fn remove_legacy_remote_file(git_dir: &Path, name: &str) -> Result<()> {
+    for dir in ["remotes", "branches"] {
+        let path = git_dir.join(dir).join(name);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn fetch_refspec_targets_remote_tracking(refspec: &str, remote: &str) -> bool {
+    let Some((_, dst)) = refspec.strip_prefix('+').unwrap_or(refspec).split_once(':') else {
+        return false;
+    };
+    dst.starts_with(&format!("refs/remotes/{remote}/"))
 }
 
 fn remove_remote_tracking_refs(git_dir: &Path, format: ObjectFormat, remote: &str) -> Result<()> {
@@ -5706,10 +5813,12 @@ fn rename_remote_tracking_refs(
     let new_prefix = format!("refs/remotes/{new}/");
     let refs = store.list_refs()?;
     let mut tx = store.transaction();
+    let mut old_ref_names = Vec::new();
     for reference in refs {
         let Some(suffix) = reference.name.strip_prefix(&old_prefix) else {
             continue;
         };
+        old_ref_names.push(reference.name.clone());
         let target = match reference.target {
             RefTarget::Symbolic(target) => RefTarget::Symbolic(
                 target
@@ -5727,10 +5836,37 @@ fn rename_remote_tracking_refs(
         });
     }
     tx.commit()?;
+    for name in old_ref_names {
+        match store.read_ref(&name)? {
+            Some(RefTarget::Symbolic(_)) => {
+                let _ = store.delete_symbolic_ref(&name)?;
+            }
+            Some(RefTarget::Direct(_)) => {
+                let _ = store.delete_ref(&name)?;
+            }
+            None => {}
+        }
+    }
     remove_remote_packed_refs(git_dir, format, &old_prefix)?;
-    remove_remote_ref_dir(git_dir, "refs", old)?;
-    rename_remote_ref_dir(git_dir, "logs/refs", old, new)?;
+    let nested = new.starts_with(&format!("{old}/")) || old.starts_with(&format!("{new}/"));
+    if !nested {
+        remove_remote_ref_dir(git_dir, "refs", old)?;
+        rename_remote_ref_dir(git_dir, "logs/refs", old, new)?;
+    }
     Ok(())
+}
+
+fn trace2_remote_rename_progress() {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let line = concat!(
+        "{\"event\":\"region_enter\",\"sid\":\"sley\",\"category\":\"progress\",\"label\":\"Renaming remote references\"}\n",
+        "{\"event\":\"region_leave\",\"sid\":\"sley\",\"category\":\"progress\",\"label\":\"Renaming remote references\"}\n",
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn prune_remote_tracking_refs(
@@ -5745,15 +5881,9 @@ fn prune_remote_tracking_refs(
     let remote_format = repository_object_format(&remote_git_dir)?;
     let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
     let remote_refs = remote_store.list_refs()?;
-    let remote_branches = branch_names_with_prefix(&remote_refs, "refs/heads/")
-        .into_iter()
-        .collect::<BTreeSet<_>>();
     let local_refs = store.list_refs()?;
-    let stale_branches = remote_tracking_branch_names(&local_refs, remote)
-        .into_iter()
-        .filter(|branch| !remote_branches.contains(branch))
-        .collect::<Vec<_>>();
-    if stale_branches.is_empty() {
+    let stale_refs = stale_refs_for_remote_fetch(config, remote, &remote_refs, &local_refs);
+    if stale_refs.is_empty() {
         return Ok(());
     }
     let display_url = remote_config_values(config, remote, "url")
@@ -5763,15 +5893,16 @@ fn prune_remote_tracking_refs(
     writeln!(stdout, "Pruning {remote}")?;
     writeln!(stdout, "URL: {display_url}")?;
     let remote_head = format!("refs/remotes/{remote}/HEAD");
-    let remote_prefix = format!("refs/remotes/{remote}/");
     let head_target = match store.read_ref(&remote_head)? {
         Some(RefTarget::Symbolic(target)) => Some(target),
         Some(RefTarget::Direct(_)) | None => None,
     };
-    for branch in stale_branches {
-        let refname = format!("{remote_prefix}{branch}");
+    for refname in stale_refs {
+        let display = refname
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(refname.as_str());
         if dry_run {
-            writeln!(stdout, " * [would prune] {remote}/{branch}")?;
+            writeln!(stdout, " * [would prune] {display}")?;
             if head_target.as_deref() == Some(refname.as_str()) {
                 writeln!(
                     stdout,
@@ -5789,9 +5920,8 @@ fn prune_remote_tracking_refs(
             }
             None => {}
         }
-        writeln!(stdout, " * [pruned] {remote}/{branch}")?;
+        writeln!(stdout, " * [pruned] {display}")?;
         if head_target.as_deref() == Some(refname.as_str()) {
-            let _ = store.delete_symbolic_ref(&remote_head)?;
             writeln!(
                 stdout,
                 " refs/remotes/{remote}/HEAD has become dangling after {refname} was deleted"
@@ -5799,6 +5929,43 @@ fn prune_remote_tracking_refs(
         }
     }
     Ok(())
+}
+
+fn stale_refs_for_remote_fetch(
+    config: &GitConfig,
+    remote: &str,
+    remote_refs: &[sley_refs::Ref],
+    local_refs: &[sley_refs::Ref],
+) -> Vec<String> {
+    let mut stale = BTreeSet::new();
+    for spec in remote_config_values(config, remote, "fetch") {
+        let Some((src_prefix, dst_prefix)) = fetch_refspec_prefixes(&spec) else {
+            continue;
+        };
+        let remote_names = branch_names_with_prefix(remote_refs, src_prefix)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for suffix in branch_names_with_prefix(local_refs, dst_prefix) {
+            if !remote_names.contains(&suffix) {
+                stale.insert(format!("{dst_prefix}{suffix}"));
+            }
+        }
+    }
+    stale.into_iter().collect()
+}
+
+fn fetch_refspec_prefixes(spec: &str) -> Option<(&str, &str)> {
+    if spec.starts_with('^') {
+        return None;
+    }
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    let (src, dst) = spec.split_once(':')?;
+    if src == "refs/*" && dst == "refs/*" {
+        return Some(("refs/heads/", "refs/heads/"));
+    }
+    let src_prefix = src.strip_suffix('*')?;
+    let dst_prefix = dst.strip_suffix('*')?;
+    Some((src_prefix, dst_prefix))
 }
 
 fn remove_remote_packed_refs(git_dir: &Path, format: ObjectFormat, old_prefix: &str) -> Result<()> {
@@ -5817,8 +5984,10 @@ fn remove_remote_packed_refs(git_dir: &Path, format: ObjectFormat, old_prefix: &
 
 fn remove_remote_ref_dir(git_dir: &Path, root: &str, remote: &str) -> Result<()> {
     let path = git_dir.join(root).join("remotes").join(remote);
-    if path.exists() {
+    if path.is_dir() {
         fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -5860,7 +6029,10 @@ pub(crate) fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
         validate_remote_branch_name(branch)?;
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config_on_disk(&git_dir)?;
+    let mirror_fetch = remote_config_values(&config, name, "fetch")
+        .iter()
+        .any(|value| value == "+refs/*:refs/*");
     let Some(section) =
         config.sections.iter_mut().rev().find(|section| {
             section.name == "remote" && section.subsection.as_deref() == Some(name)
@@ -5876,7 +6048,11 @@ pub(crate) fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
     for branch in branches {
         section.entries.push(ConfigEntry::new(
             "fetch",
-            Some(remote_branch_fetch_refspec(name, branch)),
+            Some(if mirror_fetch {
+                format!("+refs/{branch}:refs/{branch}")
+            } else {
+                remote_branch_fetch_refspec(name, branch)
+            }),
         ));
     }
     write_repo_config(&git_dir, &config)
@@ -5915,7 +6091,7 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
     };
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
-    let config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config_on_disk(&git_dir)?;
     if !remote_exists(&config, name) {
         return Err(GitError::remote_not_found(name));
     }
@@ -5927,17 +6103,30 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if action == RemoteSetHeadAction::Auto {
-        let branch = discover_local_remote_head_branch(&config, name, &git_dir)?;
+        let branch = match discover_local_remote_head_branch(&config, name, &git_dir) {
+            Ok(branch) => branch,
+            Err(_) => {
+                eprintln!("error: Cannot determine remote HEAD");
+                return Err(GitError::Exit(1));
+            }
+        };
         validate_remote_branch_name(&branch)?;
         let target = format!("refs/remotes/{name}/{branch}");
         if store.read_ref(&target)?.is_none() {
-            return Err(GitError::Command(format!("Not a valid ref: {target}")));
+            eprintln!("error: Not a valid ref: {target}");
+            return Err(GitError::Exit(1));
         }
-        let old_branch = match store.read_ref(&head)? {
-            Some(RefTarget::Symbolic(target)) => target
-                .strip_prefix(&format!("refs/remotes/{name}/"))
-                .map(str::to_string),
-            _ => None,
+        let old_target = store.read_ref(&head)?;
+        let old_display = match &old_target {
+            Some(RefTarget::Symbolic(target)) => {
+                let display = target
+                    .strip_prefix(&format!("refs/remotes/{name}/"))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| target.clone());
+                Some(RemoteSetHeadOld::Symbolic(display))
+            }
+            Some(RefTarget::Direct(oid)) => Some(RemoteSetHeadOld::Detached(oid.to_hex())),
+            None => None,
         };
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -5946,12 +6135,30 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
             new: RefTarget::Symbolic(target),
             reflog: None,
         });
-        tx.commit()?;
-        match old_branch.as_deref() {
-            Some(old) if old == branch => {
+        if tx.commit().is_err() {
+            eprintln!("error: Could not set up refs/remotes/{name}/HEAD");
+            return Err(GitError::Exit(1));
+        }
+        if config
+            .get("remote", Some(name), "followRemoteHEAD")
+            .is_some_and(|value| value.eq_ignore_ascii_case("always"))
+        {
+            set_remote_section_value(&mut config, name, "followRemoteHEAD", "warn");
+            write_repo_config(&git_dir, &config)?;
+        }
+        match old_display.as_ref() {
+            Some(RemoteSetHeadOld::Symbolic(old)) if old == &branch => {
                 println!("'{name}/HEAD' is unchanged and points to '{branch}'");
             }
-            Some(old) => {
+            Some(RemoteSetHeadOld::Symbolic(old)) if old.starts_with("refs/") => {
+                println!(
+                    "'{name}/HEAD' used to point to '{old}' (which is not a remote branch), but now points to '{branch}'"
+                );
+            }
+            Some(RemoteSetHeadOld::Detached(old)) => {
+                println!("'{name}/HEAD' was detached at '{old}' and now points to '{branch}'");
+            }
+            Some(RemoteSetHeadOld::Symbolic(old)) => {
                 println!("'{name}/HEAD' has changed from '{old}' and now points to '{branch}'");
             }
             None => {
@@ -5964,9 +6171,8 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
     validate_remote_branch_name(branch)?;
     let target = format!("refs/remotes/{name}/{branch}");
     if store.read_ref(&target)?.is_none() {
-        return Err(GitError::reference_not_found(format!(
-            "remote ref {target}"
-        )));
+        eprintln!("error: Not a valid ref: {target}");
+        return Err(GitError::Exit(1));
     }
     let mut tx = store.transaction();
     tx.update(RefUpdate {
@@ -5983,6 +6189,32 @@ enum RemoteSetHeadAction {
     Branch,
     Delete,
     Auto,
+}
+
+enum RemoteSetHeadOld {
+    Symbolic(String),
+    Detached(String),
+}
+
+fn set_remote_section_value(config: &mut GitConfig, name: &str, key: &str, value: &str) {
+    if let Some(section) = config
+        .sections
+        .iter_mut()
+        .rev()
+        .find(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
+    {
+        if let Some(entry) = section
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key.eq_ignore_ascii_case(key))
+        {
+            entry.value = Some(value.to_string());
+            return;
+        }
+        section
+            .entries
+            .push(ConfigEntry::new(key, Some(value.to_string())));
+    }
 }
 
 fn discover_local_remote_head_branch(
@@ -6074,7 +6306,7 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     let old_url = positional.get(2).copied();
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config_on_disk(&git_dir)?;
     let kind = if push {
         sley_config::remotes::SetUrlKind::Push
     } else {
@@ -6188,8 +6420,8 @@ fn write_remote_show_query(
     name: &str,
     git_dir: &Path,
 ) -> Result<()> {
-    let fetch_urls = remote_config_values(config, name, "url");
-    let push_urls = remote_config_values(config, name, "pushurl");
+    let fetch_urls = remote_config_values_with_empty_clear(config, name, "url");
+    let push_urls = remote_config_values_with_empty_clear(config, name, "pushurl");
     let display_url = fetch_urls.first().map(String::as_str).unwrap_or(name);
     let remote_git_dir = local_remote_git_dir(config, name, git_dir)?;
     let remote_format = repository_object_format(&remote_git_dir)?;
@@ -6206,7 +6438,13 @@ fn write_remote_show_query(
     writeln!(stdout, "* remote {name}")?;
     writeln!(stdout, "  Fetch URL: {display_url}")?;
     if push_urls.is_empty() {
-        writeln!(stdout, "  Push  URL: {display_url}")?;
+        if fetch_urls.is_empty() {
+            writeln!(stdout, "  Push  URL: {display_url}")?;
+        } else {
+            for url in &fetch_urls {
+                writeln!(stdout, "  Push  URL: {url}")?;
+            }
+        }
     } else {
         for url in push_urls {
             writeln!(stdout, "  Push  URL: {url}")?;
@@ -6214,13 +6452,21 @@ fn write_remote_show_query(
     }
     writeln!(stdout, "  HEAD branch: {remote_head_branch}")?;
 
-    let remote_branches = branch_names_with_prefix(&remote_refs, "refs/heads/");
+    let fetch_refspecs = remote_config_values(config, name, "fetch");
+    let skipped_branches = remote_negative_fetch_branches(config, name);
+    let remote_branches = if fetch_refspecs.is_empty() {
+        Vec::new()
+    } else {
+        branch_names_with_prefix(&remote_refs, "refs/heads/")
+    };
     let local_branches = remote_tracking_branch_names(refs, name);
     let local_branch_set = local_branches.iter().cloned().collect::<BTreeSet<_>>();
     let remote_branch_set = remote_branches.iter().cloned().collect::<BTreeSet<_>>();
     let mut branch_rows = Vec::new();
     for branch in &remote_branches {
-        let status = if local_branch_set.contains(branch) {
+        let status = if skipped_branches.contains(branch) {
+            "skipped".to_string()
+        } else if local_branch_set.contains(branch) {
             "tracked".to_string()
         } else {
             format!("new (next fetch will store in remotes/{name})")
@@ -6254,14 +6500,18 @@ fn write_remote_show_query(
     let pull_branches = remote_pull_branch_configs(config, name);
     if !pull_branches.is_empty() {
         write_remote_show_pull_config(stdout, &pull_branches)?;
+    }
+    let push_rows = remote_show_query_push_rows(config, name, refs, &remote_refs);
+    if !push_rows.is_empty() {
         let local_db = FileObjectDatabase::from_git_dir(git_dir, remote_format);
         write_remote_show_push_config(
             stdout,
-            &pull_branches,
+            &push_rows,
             refs,
             &remote_refs,
             &local_db,
             remote_format,
+            false,
         )?;
     }
     Ok(())
@@ -6273,97 +6523,166 @@ fn write_remote_show_no_query(
     refs: &[sley_refs::Ref],
     name: &str,
 ) -> Result<()> {
-    let fetch_urls = remote_config_values(config, name, "url");
-    let push_urls = remote_config_values(config, name, "pushurl");
+    let fetch_urls = remote_config_values_with_empty_clear(config, name, "url");
+    let push_urls = remote_config_values_with_empty_clear(config, name, "pushurl");
     let display_url = fetch_urls.first().map(String::as_str).unwrap_or(name);
     writeln!(stdout, "* remote {name}")?;
     writeln!(stdout, "  Fetch URL: {display_url}")?;
     if push_urls.is_empty() {
-        writeln!(stdout, "  Push  URL: {display_url}")?;
+        if fetch_urls.is_empty() {
+            writeln!(stdout, "  Push  URL: {display_url}")?;
+        } else {
+            for url in &fetch_urls {
+                writeln!(stdout, "  Push  URL: {url}")?;
+            }
+        }
     } else {
         for url in push_urls {
             writeln!(stdout, "  Push  URL: {url}")?;
         }
     }
     writeln!(stdout, "  HEAD branch: (not queried)")?;
-    let remote_branches = remote_tracking_branch_names(refs, name);
+    let pull_branches = remote_pull_branch_configs(config, name);
+    let mut remote_branches = remote_tracking_branch_names(refs, name)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for pull in &pull_branches {
+        for merge in &pull.merges {
+            remote_branches.insert(merge.clone());
+        }
+    }
     if !remote_branches.is_empty() {
         writeln!(stdout, "  Remote branches: (status not queried)")?;
         for branch in remote_branches {
             writeln!(stdout, "    {branch}")?;
         }
     }
-    let pull_branches = remote_pull_branch_configs(config, name);
     if !pull_branches.is_empty() {
         write_remote_show_pull_config(stdout, &pull_branches)?;
     }
-    writeln!(
-        stdout,
-        "  Local ref configured for 'git push' (status not queried):"
-    )?;
-    writeln!(stdout, "    (matching) pushes to (matching)")?;
+    let push_rows = remote_show_no_query_push_rows(config, name);
+    if !push_rows.is_empty() {
+        write_remote_show_push_config(
+            stdout,
+            &push_rows,
+            refs,
+            &[],
+            &FileObjectDatabase::from_git_dir(Path::new("."), ObjectFormat::Sha1),
+            ObjectFormat::Sha1,
+            true,
+        )?;
+    }
     Ok(())
 }
 
 fn write_remote_show_pull_config(
     stdout: &mut impl Write,
-    pull_branches: &[(String, String)],
+    pull_branches: &[RemotePullConfig],
 ) -> Result<()> {
     if pull_branches.len() == 1 {
         writeln!(stdout, "  Local branch configured for 'git pull':")?;
     } else {
         writeln!(stdout, "  Local branches configured for 'git pull':")?;
     }
-    let width = pull_branches
+    let name_width = pull_branches
         .iter()
-        .map(|(branch, _)| branch.len())
+        .map(|config| config.branch.len())
         .max()
-        .unwrap_or(0)
-        + 1;
-    for (branch, merge) in pull_branches {
-        writeln!(
-            stdout,
-            "    {branch:<width$}merges with remote {merge}",
-            width = width
-        )?;
+        .unwrap_or(0);
+    let any_rebase = pull_branches.iter().any(|config| config.rebase);
+    for config in pull_branches {
+        let Some(first_merge) = config.merges.first() else {
+            continue;
+        };
+        write!(stdout, "    {:<width$} ", config.branch, width = name_width)?;
+        if config.rebase {
+            writeln!(stdout, "rebases onto remote {first_merge}")?;
+            continue;
+        }
+        if any_rebase {
+            writeln!(stdout, " merges with remote {first_merge}")?;
+        } else {
+            writeln!(stdout, "merges with remote {first_merge}")?;
+        }
+        let continuation_width = name_width + 4 + usize::from(any_rebase);
+        for merge in config.merges.iter().skip(1) {
+            writeln!(
+                stdout,
+                "{:<width$}    and with remote {merge}",
+                "",
+                width = continuation_width
+            )?;
+        }
     }
     Ok(())
 }
 
 fn write_remote_show_push_config(
     stdout: &mut impl Write,
-    branches: &[(String, String)],
+    branches: &[RemotePushConfig],
     local_refs: &[sley_refs::Ref],
     remote_refs: &[sley_refs::Ref],
     local_db: &FileObjectDatabase,
     format: ObjectFormat,
+    not_queried: bool,
 ) -> Result<()> {
     if branches.len() == 1 {
-        writeln!(stdout, "  Local ref configured for 'git push':")?;
+        if not_queried {
+            writeln!(
+                stdout,
+                "  Local ref configured for 'git push' (status not queried):"
+            )?;
+        } else {
+            writeln!(stdout, "  Local ref configured for 'git push':")?;
+        }
     } else {
-        writeln!(stdout, "  Local refs configured for 'git push':")?;
+        if not_queried {
+            writeln!(
+                stdout,
+                "  Local refs configured for 'git push' (status not queried):"
+            )?;
+        } else {
+            writeln!(stdout, "  Local refs configured for 'git push':")?;
+        }
     }
     let local_width = branches
         .iter()
-        .map(|(branch, _)| branch.len())
+        .map(|config| config.src.len())
         .max()
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0);
     let remote_width = branches
         .iter()
-        .map(|(_, merge)| merge.len())
+        .map(|config| config.dst.len())
         .max()
-        .unwrap_or(0)
-        + 1;
-    for (branch, merge) in branches {
-        let status =
-            remote_show_push_status(branch, merge, local_refs, remote_refs, local_db, format);
-        writeln!(
-            stdout,
-            "    {branch:<local_width$}pushes to {merge:<remote_width$}({status})",
-            local_width = local_width,
-            remote_width = remote_width,
-        )?;
+        .unwrap_or(0);
+    for config in branches {
+        let verb = if config.forced { "forces to" } else { "pushes to" };
+        if not_queried {
+            writeln!(
+                stdout,
+                "    {:<local_width$} {verb} {}",
+                config.src,
+                config.dst,
+                local_width = local_width,
+            )?;
+        } else {
+            let status = remote_show_push_status(
+                &config.src,
+                &config.dst,
+                local_refs,
+                remote_refs,
+                local_db,
+                format,
+            );
+            writeln!(
+                stdout,
+                "    {:<local_width$} {verb} {:<remote_width$} ({status})",
+                config.src,
+                config.dst,
+                local_width = local_width,
+                remote_width = remote_width,
+            )?;
+        }
     }
     Ok(())
 }
@@ -6382,7 +6701,7 @@ fn remote_show_push_status(
         return "local out of date";
     };
     let Some(remote_oid) = direct_ref_oid(remote_refs, &remote_ref) else {
-        return "local out of date";
+        return "create";
     };
     if local_oid == remote_oid {
         return "up to date";
@@ -6417,7 +6736,19 @@ fn branch_names_with_prefix(refs: &[sley_refs::Ref], prefix: &str) -> Vec<String
         .collect()
 }
 
-fn remote_pull_branch_configs(config: &GitConfig, remote: &str) -> Vec<(String, String)> {
+struct RemotePullConfig {
+    branch: String,
+    merges: Vec<String>,
+    rebase: bool,
+}
+
+struct RemotePushConfig {
+    src: String,
+    dst: String,
+    forced: bool,
+}
+
+fn remote_pull_branch_configs(config: &GitConfig, remote: &str) -> Vec<RemotePullConfig> {
     let mut branches = Vec::new();
     for section in &config.sections {
         if section.name != "branch" {
@@ -6434,19 +6765,162 @@ fn remote_pull_branch_configs(config: &GitConfig, remote: &str) -> Vec<(String, 
         if branch_remote != Some(remote) {
             continue;
         }
-        let Some(merge) = section
+        let merges = section
             .entries
             .iter()
-            .find(|entry| entry.key.eq_ignore_ascii_case("merge"))
+            .filter(|entry| entry.key.eq_ignore_ascii_case("merge"))
+            .filter_map(|entry| entry.value.as_deref())
+            .flat_map(|value| value.split_whitespace())
+            .map(|merge| merge.strip_prefix("refs/heads/").unwrap_or(merge).to_string())
+            .collect::<Vec<_>>();
+        if merges.is_empty() {
+            continue;
+        }
+        let rebase = section
+            .entries
+            .iter()
+            .find(|entry| entry.key.eq_ignore_ascii_case("rebase"))
             .and_then(|entry| entry.value.as_deref())
-        else {
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        branches.push(RemotePullConfig {
+            branch: branch.to_string(),
+            merges,
+            rebase,
+        });
+    }
+    branches.sort_by(|left, right| left.branch.cmp(&right.branch));
+    branches
+}
+
+fn remote_negative_fetch_branches(config: &GitConfig, remote: &str) -> BTreeSet<String> {
+    remote_config_values(config, remote, "fetch")
+        .into_iter()
+        .filter_map(|spec| spec.strip_prefix("^refs/heads/").map(str::to_string))
+        .collect()
+}
+
+fn remote_config_values_with_empty_clear(
+    config: &GitConfig,
+    name: &str,
+    key: &str,
+) -> Vec<String> {
+    let mut values = Vec::new();
+    for section in &config.sections {
+        if section.name != "remote" || section.subsection.as_deref() != Some(name) {
+            continue;
+        }
+        for entry in &section.entries {
+            if !entry.key.eq_ignore_ascii_case(key) {
+                continue;
+            }
+            match entry.value.as_deref() {
+                Some("") => values.clear(),
+                Some(value) => values.push(value.to_string()),
+                None => {}
+            }
+        }
+    }
+    values
+}
+
+fn remote_show_query_push_rows(
+    config: &GitConfig,
+    remote: &str,
+    local_refs: &[sley_refs::Ref],
+    remote_refs: &[sley_refs::Ref],
+) -> Vec<RemotePushConfig> {
+    let mut rows = Vec::new();
+    let specs = remote_config_values(config, remote, "push");
+    if specs.is_empty() {
+        for local in local_branch_names(local_refs) {
+            if direct_ref_oid(remote_refs, &format!("refs/heads/{local}")).is_some() {
+                rows.push(RemotePushConfig {
+                    src: local.clone(),
+                    dst: local,
+                    forced: false,
+                });
+            }
+        }
+        return rows;
+    }
+    for spec in specs {
+        if spec == ":" {
+            for local in local_branch_names(local_refs) {
+                if direct_ref_oid(remote_refs, &format!("refs/heads/{local}")).is_some() {
+                    rows.push(RemotePushConfig {
+                        src: local.clone(),
+                        dst: local,
+                        forced: false,
+                    });
+                }
+            }
+            continue;
+        }
+        let Some(row) = parse_remote_push_refspec(&spec, false) else {
             continue;
         };
-        let merge = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-        branches.push((branch.to_string(), merge.to_string()));
+        if direct_ref_oid(local_refs, &format!("refs/heads/{}", row.src)).is_some() {
+            rows.push(row);
+        }
     }
-    branches.sort_by(|left, right| left.0.cmp(&right.0));
-    branches
+    rows.sort_by(|left, right| left.src.cmp(&right.src).then(left.dst.cmp(&right.dst)));
+    rows
+}
+
+fn remote_show_no_query_push_rows(config: &GitConfig, remote: &str) -> Vec<RemotePushConfig> {
+    let mut rows = Vec::new();
+    let specs = remote_config_values(config, remote, "push");
+    if specs.is_empty() {
+        rows.push(RemotePushConfig {
+            src: "(matching)".into(),
+            dst: "(matching)".into(),
+            forced: false,
+        });
+        return rows;
+    }
+    for spec in specs {
+        if spec == ":" {
+            rows.push(RemotePushConfig {
+                src: "(matching)".into(),
+                dst: "(matching)".into(),
+                forced: false,
+            });
+            continue;
+        }
+        if let Some(row) = parse_remote_push_refspec(&spec, true) {
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|left, right| left.src.cmp(&right.src).then(left.dst.cmp(&right.dst)));
+    rows
+}
+
+fn parse_remote_push_refspec(spec: &str, full_ref_names: bool) -> Option<RemotePushConfig> {
+    let (forced, spec) = spec
+        .strip_prefix('+')
+        .map(|rest| (true, rest))
+        .unwrap_or((false, spec));
+    let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
+    if src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    Some(RemotePushConfig {
+        src: remote_show_ref_display(src, full_ref_names).to_string(),
+        dst: remote_show_ref_display(dst, full_ref_names).to_string(),
+        forced,
+    })
+}
+
+fn remote_show_ref_display(name: &str, full_ref_names: bool) -> &str {
+    if full_ref_names {
+        name
+    } else {
+        name.strip_prefix("refs/heads/").unwrap_or(name)
+    }
+}
+
+fn local_branch_names(refs: &[sley_refs::Ref]) -> Vec<String> {
+    branch_names_with_prefix(refs, "refs/heads/")
 }
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
@@ -6495,6 +6969,13 @@ pub(crate) fn repo_current_branch_name(git_dir: &Path) -> Option<String> {
 }
 
 pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()> {
+    if git_dir.join("config.lock").exists() {
+        eprintln!(
+            "error: could not lock config file {}: File exists",
+            git_dir.join("config").display()
+        );
+        return Err(GitError::Exit(255));
+    }
     fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
     Ok(())
 }
@@ -6509,6 +6990,18 @@ pub(crate) fn remote_exists(config: &GitConfig, name: &str) -> bool {
 
 fn remote_branch_fetch_refspec(remote: &str, branch: &str) -> String {
     format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
+}
+
+fn remote_add_fetch_refspec(remote: &str, branch: &str, mirror: RemoteAddMirror) -> String {
+    if matches!(mirror, RemoteAddMirror::Fetch | RemoteAddMirror::Both) {
+        if branch == "*" {
+            "+refs/*:refs/*".to_string()
+        } else {
+            format!("+refs/{branch}:refs/{branch}")
+        }
+    } else {
+        remote_branch_fetch_refspec(remote, branch)
+    }
 }
 
 pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
