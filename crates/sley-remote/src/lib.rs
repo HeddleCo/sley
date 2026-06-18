@@ -547,6 +547,7 @@ mod tests {
             deepen_not: Vec::new(),
             committer: b"Sley Remote Live <sley@example.invalid> 1 +0000".to_vec(),
             detached_head: None,
+            checkout: true,
             filter: None,
             // The live test clones a specific branch via --single-branch, so the
             // branch was explicitly requested (a missing remote tip is a hard error).

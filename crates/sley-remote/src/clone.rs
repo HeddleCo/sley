@@ -106,6 +106,9 @@ pub struct CloneOptions<'a> {
     /// the fetch the destination checks out this commit detached instead of
     /// creating `checkout_branch`; `refs/remotes/<origin>/HEAD` is not written.
     pub detached_head: Option<ObjectId>,
+    /// Whether clone should populate the worktree. `--no-checkout` still writes
+    /// refs/config but must not hydrate filtered blobs solely for checkout.
+    pub checkout: bool,
     /// Partial-clone object filter (`--filter=blob:none`) to apply to the
     /// clone fetch. Only honored by the in-process local server.
     pub filter: Option<sley_odb::PackObjectFilter>,
@@ -246,15 +249,26 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 
     let store = FileRefStore::new(&git_dir, request.format);
     if let Some(detached) = &request.options.detached_head {
-        sley_worktree::checkout_detached_filtered(
-            request.destination,
-            &git_dir,
-            request.format,
-            detached,
-            request.options.committer.clone(),
-            b"clone: checkout".to_vec(),
-            &config,
-        )?;
+        if request.options.checkout {
+            sley_worktree::checkout_detached_filtered(
+                request.destination,
+                &git_dir,
+                request.format,
+                detached,
+                request.options.committer.clone(),
+                b"clone: checkout".to_vec(),
+                &config,
+            )?;
+        } else {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: "HEAD".to_string(),
+                expected: None,
+                new: RefTarget::Direct(*detached),
+                reflog: None,
+            });
+            tx.commit()?;
+        }
         return Ok(CloneOutcome {
             git_dir,
             branch_oid: Some(*detached),
@@ -322,7 +336,21 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     // smudge-side checkout filters. Pointing `HEAD` only updates refs, so it does
     // not change the config `configure_branch` returns.
     let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
-    fetch_local_partial_clone_checkout_blobs(&request, &git_dir, branch_oid)?;
+    if request.options.checkout {
+        fetch_local_partial_clone_checkout_blobs(&request, &git_dir, branch_oid)?;
+    } else {
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "HEAD".to_string(),
+            expected: None,
+            new: RefTarget::Symbolic(format!(
+                "refs/heads/{}",
+                request.options.checkout_branch
+            )),
+            reflog: None,
+        });
+        tx.commit()?;
+    }
     if !request.options.single_branch
         || request.options.checkout_branch == request.options.remote_head_branch
     {
@@ -339,14 +367,16 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         tx.commit()?;
     }
 
-    sley_worktree::checkout_branch_filtered(
-        request.destination,
-        &git_dir,
-        request.format,
-        request.options.checkout_branch,
-        request.options.committer.clone(),
-        &checkout_config,
-    )?;
+    if request.options.checkout {
+        sley_worktree::checkout_branch_filtered(
+            request.destination,
+            &git_dir,
+            request.format,
+            request.options.checkout_branch,
+            request.options.committer.clone(),
+            &checkout_config,
+        )?;
+    }
 
     Ok(CloneOutcome {
         git_dir,

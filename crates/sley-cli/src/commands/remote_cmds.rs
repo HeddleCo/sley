@@ -879,6 +879,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         } else {
             detached_remote_head
         },
+        checkout,
         filter: fetch_filter,
         // A `--branch=<tag>` is satisfied by the detached checkout, so the
         // remote-tracking-branch lookup (and its "Remote branch not found"
@@ -1096,6 +1097,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         deepen_not: Vec::new(),
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
+        checkout: options.checkout,
         filter: None,
         branch_explicit,
         ref_storage: options.ref_storage,
@@ -1271,6 +1273,7 @@ fn clone_network_repository(
         deepen_not: Vec::new(),
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
+        checkout: options.checkout,
         filter: None,
         branch_explicit,
         ref_storage: options.ref_storage,
@@ -2302,6 +2305,10 @@ fn configure_clone_remote(
         entries.push(ConfigEntry::new("tagopt", Some(tag_opt.to_string())));
     }
     if let Some(filter) = partial_clone_filter {
+        let repository_format = parse_config_key("core.repositoryformatversion")?;
+        config_set_value(&mut config, &repository_format, "1", false);
+        let partial_clone = parse_config_key("extensions.partialclone")?;
+        config_set_value(&mut config, &partial_clone, name, false);
         entries.push(ConfigEntry::new("promisor", Some("true".into())));
         entries.push(ConfigEntry::new(
             "partialclonefilter",

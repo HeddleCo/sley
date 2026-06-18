@@ -1228,6 +1228,27 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let branch = checkout_message.branch();
 
     let config = read_repo_config(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+    let branch_target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?;
+    if let Some(target) = branch_target {
+        let local_promisor = prefetch_local_promisor_checkout_blobs(
+            &git_dir,
+            format,
+            &config,
+            &target,
+        )?;
+        if local_promisor
+            && resolve_ref_peeled(&store, "HEAD")? == Some(target)
+            && checkout_index_empty(&git_dir, format)?
+        {
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &worktree_root,
+                &git_dir,
+                format,
+                &target,
+            )?;
+        }
+    }
     match sley_worktree::checkout_branch_filtered(
         &worktree_root,
         git_dir.clone(),
@@ -1703,6 +1724,96 @@ fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) 
         "--name-status".to_string(),
         new_commit.to_hex(),
     ])
+}
+
+fn prefetch_local_promisor_checkout_blobs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    commit_oid: &ObjectId,
+) -> Result<bool> {
+    let Some(remote_name) = config
+        .get("extensions", None, "partialclone")
+        .map(str::to_string)
+        .or_else(|| {
+            remote_names(config).into_iter().find(|name| {
+                config
+                    .get_bool("remote", Some(name), "promisor")
+                    == Some(true)
+            })
+        })
+    else {
+        return Ok(false);
+    };
+    let Some(url) = config.get("remote", Some(&remote_name), "url") else {
+        return Ok(false);
+    };
+    let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+        return Ok(false);
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut wants = Vec::new();
+    collect_missing_checkout_blob_wants(&db, format, *commit_oid, &mut wants)?;
+    if wants.is_empty() {
+        return Ok(true);
+    }
+    sley_remote::install_fetch_pack_via_local_upload_pack(
+        git_dir,
+        &remote_git_dir,
+        format,
+        wants,
+        None,
+        true,
+        None,
+        None,
+    )?;
+    Ok(true)
+}
+
+fn collect_missing_checkout_blob_wants(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: ObjectId,
+    wants: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let object = db.read_object(&commit_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {commit_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let commit = Commit::parse_ref(format, &object.body)?;
+    collect_missing_tree_blob_wants(db, format, commit.tree, wants)
+}
+
+fn collect_missing_tree_blob_wants(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: ObjectId,
+    wants: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let object = db.read_object(&tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    for entry in Tree::parse(format, &object.body)?.entries {
+        if entry.is_tree() {
+            collect_missing_tree_blob_wants(db, format, entry.oid, wants)?;
+        } else if !entry.is_gitlink() && !db.contains(&entry.oid)? {
+            wants.push(entry.oid);
+        }
+    }
+    Ok(())
+}
+
+fn checkout_index_empty(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    Ok(read_repository_index(git_dir, format)?
+        .map(|index| index.entries.is_empty())
+        .unwrap_or(true))
 }
 
 fn checkout_show_branch_tracking(

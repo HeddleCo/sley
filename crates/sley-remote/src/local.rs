@@ -908,6 +908,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         None => collect_reachable_object_ids(&remote_db, format, known_haves)?,
     };
     let mut starts = decoded_request.wants;
+    let promisor_ref_wants = starts.iter().copied().collect::<HashSet<_>>();
     for want in &starts {
         excluded.remove(want);
     }
@@ -917,7 +918,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         excluded.extend(plan.excluded.iter().copied());
         starts.extend(plan.extra_wants.iter().copied());
     }
-    build_and_install_reachable_pack_filtered(
+    let install = build_and_install_reachable_pack_filtered(
         &remote_db,
         &local_db,
         format,
@@ -927,9 +928,59 @@ pub fn install_fetch_pack_via_local_upload_pack(
         filter,
         unpack_limit,
     )?;
+    if promisor
+        && let Some(result) = install
+        && let Some(promisor_path) = result.promisor_path
+    {
+        append_promisor_ref_lines(&promisor_path, remote_git_dir, format, &promisor_ref_wants)?;
+    }
     Ok(deepen
         .map(|plan| plan.shallow_info.clone())
         .unwrap_or_default())
+}
+
+fn append_promisor_ref_lines(
+    promisor_path: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wanted: &HashSet<ObjectId>,
+) -> Result<()> {
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let store = FileRefStore::new(remote_git_dir, format);
+    let mut lines = Vec::new();
+    if let Some(head_target) = store.read_ref("HEAD")? {
+        let head = Ref {
+            name: "HEAD".into(),
+            target: head_target,
+        };
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &head)?
+            && wanted.contains(&oid)
+        {
+            lines.push(format!("{oid} HEAD\n"));
+        }
+    }
+    for reference in store.list_refs()? {
+        let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+            continue;
+        };
+        if wanted.contains(&oid) {
+            lines.push(format!("{oid} {}\n", reference.name));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    lines.sort();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(promisor_path)?;
+    use std::io::Write as _;
+    for line in lines {
+        file.write_all(line.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Append upstream upload-pack's `fetch-info` data_json event to the file
