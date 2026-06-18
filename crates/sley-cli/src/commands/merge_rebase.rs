@@ -4144,13 +4144,11 @@ fn resolve_pull_remote_and_refspecs(
     config: &GitConfig,
     store: &FileRefStore,
     remote: Option<String>,
-    branch: Option<String>,
+    branches: Vec<String>,
 ) -> Result<(String, Vec<String>, Vec<String>)> {
-    match (remote, branch) {
-        (Some(remote), Some(branch)) => {
-            Ok((remote, vec![branch.clone()], vec![branch]))
-        }
-        (Some(remote), None) => {
+    match (remote, branches.is_empty()) {
+        (Some(remote), false) => Ok((remote, branches.clone(), branches)),
+        (Some(remote), true) => {
             let Some(current) = store.current_branch()? else {
                 print_pull_no_merge_candidates_detached(false);
                 return Err(GitError::Exit(1));
@@ -4177,7 +4175,7 @@ fn resolve_pull_remote_and_refspecs(
             };
             Ok((remote, Vec::new(), merge_srcs))
         }
-        (None, None) => {
+        (None, true) => {
             let Some(current) = store.current_branch()? else {
                 print_pull_no_merge_candidates_detached(false);
                 return Err(GitError::Exit(1));
@@ -4196,7 +4194,7 @@ fn resolve_pull_remote_and_refspecs(
                 branch_merge_values(config, &current),
             ))
         }
-        (None, Some(_)) => Err(GitError::Command(
+        (None, false) => Err(GitError::Command(
             "pull currently requires a remote when a branch is specified".into(),
         )),
     }
@@ -4264,39 +4262,25 @@ fn branch_merge_values(config: &GitConfig, branch: &str) -> Vec<String> {
 }
 
 fn fetch_head_merge_record(git_dir: &Path, format: ObjectFormat) -> Result<FetchHeadRecord> {
+    fetch_head_merge_records(git_dir, format)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| GitError::reference_not_found("FETCH_HEAD"))
+}
+
+fn fetch_head_merge_records(git_dir: &Path, format: ObjectFormat) -> Result<Vec<FetchHeadRecord>> {
     let path = git_dir.join("FETCH_HEAD");
     let mut input =
         fs::File::open(path).map_err(|_| GitError::reference_not_found("FETCH_HEAD"))?;
     let records = read_fetch_head(format, &mut input)?;
-    records
+    Ok(records
         .into_iter()
-        .find(|record| !record.not_for_merge)
-        .ok_or_else(|| GitError::reference_not_found("FETCH_HEAD"))
+        .filter(|record| !record.not_for_merge)
+        .collect())
 }
 
 fn resolve_fetch_head_revision(git_dir: &Path, format: ObjectFormat) -> Result<ObjectId> {
     Ok(fetch_head_merge_record(git_dir, format)?.oid)
-}
-
-fn resolve_pull_merge_head(
-    git_dir: &Path,
-    format: ObjectFormat,
-    refspecs: &[String],
-    merge_srcs: &[String],
-    rebase: bool,
-) -> Result<ObjectId> {
-    match fetch_head_merge_record(git_dir, format) {
-        Ok(record) => Ok(record.oid),
-        Err(_) if !refspecs.is_empty() => {
-            print_pull_no_merge_candidates_for_refspecs(rebase);
-            Err(GitError::Exit(1))
-        }
-        Err(_) if !merge_srcs.is_empty() => {
-            print_pull_no_such_ref_fetched(merge_srcs);
-            Err(GitError::Exit(1))
-        }
-        Err(err) => Err(err),
-    }
 }
 
 fn ensure_pull_not_in_merge(git_dir: &Path, format: ObjectFormat) -> Result<()> {
@@ -4435,6 +4419,49 @@ fn ensure_pull_can_merge() -> Result<()> {
     eprintln!("hint: invocation.");
     eprintln!("fatal: Need to specify how to reconcile divergent branches.");
     Err(GitError::Exit(128))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullFastForward {
+    Allow,
+    No,
+    Only,
+}
+
+impl PullFastForward {
+    fn as_merge_arg(self) -> &'static str {
+        match self {
+            PullFastForward::Allow => "--ff",
+            PullFastForward::No => "--no-ff",
+            PullFastForward::Only => "--ff-only",
+        }
+    }
+}
+
+fn parse_pull_ff_config(config: &GitConfig) -> Result<Option<PullFastForward>> {
+    let Some(value) = config.get("pull", None, "ff") else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if let Some(parsed) = parse_maybe_bool(trimmed) {
+        return Ok(Some(if parsed {
+            PullFastForward::Allow
+        } else {
+            PullFastForward::No
+        }));
+    }
+    if trimmed.eq_ignore_ascii_case("only") {
+        return Ok(Some(PullFastForward::Only));
+    }
+    eprintln!("fatal: invalid value for 'pull.ff': '{trimmed}'");
+    Err(GitError::Exit(128))
+}
+
+fn parse_pull_rebase_config_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1" | "merges" | "interactive"
+    )
 }
 
 fn print_fetch_status(
@@ -4653,12 +4680,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         }
         set_reflog_action_override(action);
     }
-    let mut no_ff = false;
-    let mut ff_only = false;
+    let mut opt_ff = None::<PullFastForward>;
     let mut quiet = false;
     let mut rebase_flag = None::<bool>;
     let mut remote = None::<String>;
-    let mut branch = None::<String>;
+    let mut branches = Vec::<String>::new();
     let mut depth = None::<u32>;
     let mut expect_depth_value = false;
     let mut _all = false;
@@ -4669,8 +4695,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             continue;
         }
         match arg.as_str() {
-            "--no-ff" => no_ff = true,
-            "--ff-only" => ff_only = true,
+            "--ff" => opt_ff = Some(PullFastForward::Allow),
+            "--no-ff" => opt_ff = Some(PullFastForward::No),
+            "--ff-only" => opt_ff = Some(PullFastForward::Only),
             "--rebase" => rebase_flag = Some(true),
             "--no-rebase" => rebase_flag = Some(false),
             "-q" | "--quiet" => quiet = true,
@@ -4691,20 +4718,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             value => {
                 if remote.is_none() {
                     remote = Some(value.to_string());
-                } else if branch.is_none() {
-                    branch = Some(value.to_string());
                 } else {
-                    return Err(GitError::Command(
-                        "pull accepts at most one remote and one branch".into(),
-                    ));
+                    branches.push(value.to_string());
                 }
             }
         }
-    }
-    if ff_only && no_ff {
-        return Err(GitError::Command(
-            "pull cannot combine --ff-only and --no-ff".into(),
-        ));
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -4712,12 +4730,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let (remote, refspecs, merge_srcs) =
-        resolve_pull_remote_and_refspecs(&config, &store, remote, branch)?;
+        resolve_pull_remote_and_refspecs(&config, &store, remote, branches)?;
     ensure_pull_not_in_merge(&git_dir, format)?;
-    let config_ff_only = config
-        .get("pull", None, "ff")
-        .is_some_and(|value| value == "only");
-    let effective_ff_only = ff_only || config_ff_only;
+    if opt_ff.is_none() {
+        opt_ff = parse_pull_ff_config(&config)?;
+        if rebase_flag.is_some() && opt_ff == Some(PullFastForward::Only) {
+            opt_ff = Some(PullFastForward::Allow);
+        }
+    }
     // Mirror git's `config_get_rebase` (builtin/pull.c): an explicit
     // `--rebase`/`--no-rebase` wins; otherwise `branch.<name>.rebase` is
     // consulted before the global `pull.rebase`. `rebase_unspecified` stays true
@@ -4738,7 +4758,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let (effective_rebase, rebase_unspecified) = match rebase_flag {
         Some(value) => (value, false),
         None => match config_rebase {
-            Some(value) => (matches!(value, "true" | "interactive" | "merges"), false),
+            Some(value) => (parse_pull_rebase_config_value(value), false),
             None => (false, true),
         },
     };
@@ -4791,9 +4811,33 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // HEAD at it (unless a refspec already moved the current branch there) and
     // checking out its tree. Keyed off the *pre-fetch* state so a `main:main`
     // refspec that created the branch still triggers the void checkout.
+    let merge_records = match fetch_head_merge_records(&git_dir, format) {
+        Ok(records) if !records.is_empty() => records,
+        Ok(_) if !refspecs.is_empty() => {
+            print_pull_no_merge_candidates_for_refspecs(effective_rebase);
+            return Err(GitError::Exit(1));
+        }
+        Ok(_) if !merge_srcs.is_empty() => {
+            print_pull_no_such_ref_fetched(&merge_srcs);
+            return Err(GitError::Exit(1));
+        }
+        Ok(_) => return Err(GitError::reference_not_found("FETCH_HEAD")),
+        Err(_) if !refspecs.is_empty() => {
+            print_pull_no_merge_candidates_for_refspecs(effective_rebase);
+            return Err(GitError::Exit(1));
+        }
+        Err(_) if !merge_srcs.is_empty() => {
+            print_pull_no_such_ref_fetched(&merge_srcs);
+            return Err(GitError::Exit(1));
+        }
+        Err(err) => return Err(err),
+    };
     if orig_head_unborn {
-        let merge_oid =
-            resolve_pull_merge_head(&git_dir, format, &refspecs, &merge_srcs, effective_rebase)?;
+        if merge_records.len() > 1 {
+            eprintln!("fatal: Cannot merge multiple branches into empty head.");
+            return Err(GitError::Exit(128));
+        }
+        let merge_oid = merge_records[0].oid;
         pull_checkout_into_void(&git_dir, &worktree_root, &db, format, &merge_oid)?;
         let target_ref = match store.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
@@ -4819,42 +4863,61 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;
-    let theirs_oid =
-        resolve_pull_merge_head(&git_dir, format, &refspecs, &merge_srcs, effective_rebase)?;
+    let merge_oids = merge_records
+        .iter()
+        .map(|record| sley_rev::peel_to_commit(&db, format, &record.oid))
+        .collect::<Result<Vec<_>>>()?;
+    if merge_oids.len() > 1 {
+        if effective_rebase {
+            eprintln!("fatal: Cannot rebase onto multiple branches.");
+            return Err(GitError::Exit(128));
+        }
+        if opt_ff == Some(PullFastForward::Only) {
+            eprintln!("fatal: Cannot fast-forward to multiple branches.");
+            return Err(GitError::Exit(128));
+        }
+    }
+    let theirs_oid = merge_oids[0];
     let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;
-    let theirs_commit = sley_rev::peel_to_commit(&db, format, &theirs_oid)?;
-    if ours_commit == theirs_commit {
+    let already_up_to_date = merge_oids.iter().all(|theirs_commit| {
+        *theirs_commit == ours_commit
+            || ancestor_depths(&db, format, &ours_commit)
+                .is_ok_and(|ours_depths| ours_depths.contains_key(theirs_commit))
+    });
+    if already_up_to_date {
         if !quiet {
             println!("Already up to date.");
         }
         return Ok(());
     }
-    let ours_depths = ancestor_depths(&db, format, &ours_commit)?;
-    if ours_depths.contains_key(&theirs_commit) {
-        if !quiet {
-            println!("Already up to date.");
+    let fast_forward = if merge_oids.len() == 1 {
+        ancestor_depths(&db, format, &theirs_oid)?.contains_key(&ours_commit)
+    } else {
+        false
+    };
+    let mut effective_rebase = effective_rebase;
+    if opt_ff == Some(PullFastForward::Only) {
+        if !fast_forward {
+            eprintln!("fatal: Not possible to fast-forward, aborting.");
+            return Err(GitError::Exit(128));
         }
-        return Ok(());
+        effective_rebase = false;
     }
-    let theirs_depths = ancestor_depths(&db, format, &theirs_commit)?;
-    let fast_forward = theirs_depths.contains_key(&ours_commit);
+    if opt_ff.is_none() && rebase_unspecified && !fast_forward {
+        ensure_pull_can_merge()?;
+    }
     if fast_forward {
         let mut merge_args = Vec::new();
-        if no_ff {
-            merge_args.push("--no-ff".to_string());
-        }
-        if effective_ff_only {
+        if effective_rebase {
             merge_args.push("--ff-only".to_string());
+        } else if let Some(ff) = opt_ff {
+            merge_args.push(ff.as_merge_arg().to_string());
         }
         if quiet {
             merge_args.push("--quiet".to_string());
         }
         merge_args.push("FETCH_HEAD".to_string());
         return cmd_merge(&merge_args);
-    }
-    if effective_ff_only {
-        eprintln!("fatal: Not possible to fast-forward, aborting.");
-        return Err(GitError::Exit(128));
     }
     if effective_rebase {
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -4868,24 +4931,18 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
         }
     }
-    // git dies on divergence only when the rebase choice was entirely
-    // unspecified (no CLI flag, no branch/pull config) and `--ff-only` is not in
-    // play (builtin/pull.c: `if (!opt_ff && rebase_unspecified && divergent)`).
-    // `no_ff` corresponds to `opt_ff == "--no-ff"`, which also suppresses the die.
-    if !no_ff && !effective_ff_only && rebase_unspecified {
-        ensure_pull_can_merge()?;
-    }
     let mut merge_args = Vec::new();
-    if no_ff {
-        merge_args.push("--no-ff".to_string());
-    }
-    if effective_ff_only {
-        merge_args.push("--ff-only".to_string());
+    if let Some(ff) = opt_ff {
+        merge_args.push(ff.as_merge_arg().to_string());
     }
     if quiet {
         merge_args.push("--quiet".to_string());
     }
-    merge_args.push("FETCH_HEAD".to_string());
+    if merge_oids.len() == 1 {
+        merge_args.push("FETCH_HEAD".to_string());
+    } else {
+        merge_args.extend(merge_oids.iter().map(ToString::to_string));
+    }
     cmd_merge(&merge_args)
 }
 
