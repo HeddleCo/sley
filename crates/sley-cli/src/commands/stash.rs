@@ -1947,7 +1947,7 @@ fn create_stash_commit(
             parents,
             author,
             committer: committer.clone(),
-            message: format!("{message}\n").into_bytes(),
+            message: message.as_bytes().to_vec(),
             encoding: None,
         },
     )?;
