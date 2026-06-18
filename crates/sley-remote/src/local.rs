@@ -1011,6 +1011,9 @@ fn trace2_fetch_info(
         Some(sley_odb::PackObjectFilter::BlobLimit(limit)) => {
             format!("\"blob:limit={limit}\"")
         }
+        Some(sley_odb::PackObjectFilter::TreeDepth(depth)) => {
+            format!("\"tree:{depth}\"")
+        }
         None => "null".to_string(),
     };
     let line = format!(

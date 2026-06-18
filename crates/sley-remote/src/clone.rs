@@ -390,7 +390,7 @@ fn fetch_local_partial_clone_checkout_blobs(
     git_dir: &Path,
     commit_oid: ObjectId,
 ) -> Result<()> {
-    if request.options.filter != Some(sley_odb::PackObjectFilter::BlobNone) {
+    if request.options.filter.is_none() {
         return Ok(());
     }
     let CloneSource::Local {

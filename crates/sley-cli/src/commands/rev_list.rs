@@ -1936,6 +1936,16 @@ fn rev_list_collect_tree_objects(
     if !seen.insert(*tree_oid) {
         return Ok(());
     }
+    let object = match walk.db.read_object(tree_oid) {
+        Ok(object) => object,
+        Err(err) => return rev_list_handle_missing_object(walk, tree_oid, state, err),
+    };
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
     rev_list_record_filter_decision(
         walk,
         ObjectType::Tree,
@@ -1955,16 +1965,6 @@ fn rev_list_collect_tree_objects(
             );
         }
         return Ok(());
-    }
-    let object = match walk.db.read_object(tree_oid) {
-        Ok(object) => object,
-        Err(err) => return rev_list_handle_missing_object(walk, tree_oid, state, err),
-    };
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
     }
     for entry in TreeEntries::new(walk.format, &object.body) {
         let entry = entry?;

@@ -461,6 +461,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("error: failed to initialize sparse-checkout");
         return Err(GitError::Exit(128));
     }
+    trace_index_pack_fsck_objects_if_configured();
     let repository = positional[0].clone();
     let destination = positional
         .get(1)
@@ -716,10 +717,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 .ok()
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
-            match (remote_allows_filter, filter) {
-                (true, "blob:none") => {
-                    fetch_filter = Some(sley_odb::PackObjectFilter::BlobNone);
-                }
+            match (remote_allows_filter, pack_filter_from_spec(filter)) {
+                (true, Some(parsed)) => fetch_filter = Some(parsed),
                 _ => eprintln!("warning: filtering not recognized by server, ignoring"),
             }
         }
@@ -1451,6 +1450,18 @@ fn validate_clone_filter(value: &str) -> Result<()> {
     }
     eprintln!("fatal: invalid filter-spec '{value}'");
     Err(GitError::Exit(128))
+}
+
+fn trace_index_pack_fsck_objects_if_configured() {
+    let Ok(Some(value)) = global_config_value("transfer.fsckobjects") else {
+        return;
+    };
+    if parse_config_bool(&value) == Some(true) {
+        setup::git_trace_line(
+            "run-command.c:667",
+            "trace: run_command: git index-pack --fsck-objects",
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2618,8 +2629,17 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
 }
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+    pack_filter_from_spec(spec)
+}
+
+fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
     if spec == "blob:none" {
         return Some(sley_odb::PackObjectFilter::BlobNone);
+    }
+    if let Some(depth) = spec.strip_prefix("tree:") {
+        return parse_rev_list_tree_depth(depth)
+            .ok()
+            .map(|depth| sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32));
     }
     spec.strip_prefix("blob:limit=")
         .and_then(git_parse_blob_limit)
