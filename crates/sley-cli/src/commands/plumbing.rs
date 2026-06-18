@@ -3920,7 +3920,7 @@ fn rerere_status(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rerere_clear(git_dir: &Path) -> Result<()> {
+pub(crate) fn rerere_clear(git_dir: &Path) -> Result<()> {
     if !is_rerere_enabled(git_dir)? {
         return Ok(());
     }

@@ -373,6 +373,9 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if mode == ResetMode::Hard && !quiet {
             print_reset_hard_head(&git_dir, format, &target_commit)?;
         }
+        if mode == ResetMode::Hard {
+            commands::merge_rebase::save_merge_autostash(&git_dir, format);
+        }
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
@@ -977,14 +980,30 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         if let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, target)
             && head_commit == Some(target_oid)
         {
-            sley_worktree::reset_index_and_worktree_to_commit(
-                &worktree_root,
-                &git_dir,
-                format,
-                &target_oid,
-            )?;
-            sley_sequencer::replay::remove_branch_state(&git_dir);
-            return Ok(());
+            let switches_to_other_branch = branch_ref_name(target)
+                .ok()
+                .filter(|name| {
+                    sley_refs::resolve_ref_peeled(&store, name)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+                .is_some_and(|name| {
+                    !matches!(
+                        store.read_ref("HEAD"),
+                        Ok(Some(RefTarget::Symbolic(current))) if current == name
+                    )
+                });
+            if !switches_to_other_branch {
+                sley_worktree::reset_index_and_worktree_to_commit(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &target_oid,
+                )?;
+                sley_sequencer::replay::remove_branch_state(&git_dir);
+                return Ok(());
+            }
         }
     }
 
@@ -3402,6 +3421,10 @@ fn commit_partial_paths(
 }
 
 fn remove_commit_state_files(git_dir: &Path) {
+    let format = repository_object_format(git_dir).ok();
+    if let Some(format) = format {
+        commands::merge_rebase::apply_merge_autostash(git_dir, format);
+    }
     for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let _ = fs::remove_file(git_dir.join(name));
     }
