@@ -361,18 +361,13 @@ pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
         let (authority, path) = value.split_at(colon);
         let path = &path[1..];
         validate_remote_path("remote path", path)?;
-        let (user, _password, host, port) = parse_remote_authority(authority, false, false)?;
-        if port.is_some() {
-            return Err(GitError::InvalidFormat(
-                "scp-like SSH remote must not include a port".into(),
-            ));
-        }
+        let (user, host, port) = parse_scp_like_authority(authority)?;
         return Ok(RemoteUrl {
             transport: RemoteTransport::Ssh,
             user,
             password: None,
             host: Some(host),
-            port: None,
+            port,
             path: path.to_string(),
         });
     }
@@ -1038,6 +1033,49 @@ fn parse_remote_host_port(value: &str, allow_port: bool) -> Result<(String, Opti
     Ok((value.to_string(), None))
 }
 
+fn parse_scp_like_authority(value: &str) -> Result<(Option<String>, String, Option<u16>)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| GitError::InvalidFormat("remote URL IPv6 host is missing ]".into()))?;
+        if end + 1 != rest.len() {
+            return Err(GitError::InvalidFormat(
+                "remote URL has invalid bracketed host suffix".into(),
+            ));
+        }
+        let bracketed = &rest[..end];
+        let (user, host_port) = match bracketed.rsplit_once('@') {
+            Some((userinfo, host_port)) => {
+                if userinfo.is_empty() {
+                    return Err(GitError::InvalidFormat("remote URL user is empty".into()));
+                }
+                (Some(userinfo.to_string()), host_port)
+            }
+            None => (None, bracketed),
+        };
+        let (host, port) = split_scp_like_bracketed_host_port(host_port)?;
+        validate_remote_host(&host)?;
+        return Ok((user, host, port));
+    }
+    let (user, _password, host, port) = parse_remote_authority(value, false, false)?;
+    if port.is_some() {
+        return Err(GitError::InvalidFormat(
+            "scp-like SSH remote must not include a port".into(),
+        ));
+    }
+    Ok((user, host, None))
+}
+
+fn split_scp_like_bracketed_host_port(value: &str) -> Result<(String, Option<u16>)> {
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.contains(':')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok((host.to_string(), Some(parse_remote_port(port)?)));
+    }
+    Ok((value.to_string(), None))
+}
+
 fn parse_remote_port(value: &str) -> Result<u16> {
     if value.is_empty() {
         return Err(GitError::InvalidFormat("remote URL port is empty".into()));
@@ -1063,7 +1101,17 @@ fn validate_remote_host(value: &str) -> Result<()> {
 }
 
 fn scp_like_separator(value: &str) -> Option<usize> {
-    let colon = value.find(':')?;
+    let colon = if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let colon = close + 2;
+        if value.as_bytes().get(colon) == Some(&b':') {
+            colon
+        } else {
+            return None;
+        }
+    } else {
+        value.find(':')?
+    };
     if value[..colon].contains('/') {
         return None;
     }
@@ -1073,7 +1121,9 @@ fn scp_like_separator(value: &str) -> Option<usize> {
             .first()
             .is_some_and(|byte| byte.is_ascii_alphabetic())
     {
-        return None;
+        if value.as_bytes().get(2) == Some(&b'/') || cfg!(windows) {
+            return None;
+        }
     }
     Some(colon)
 }
@@ -2206,6 +2256,49 @@ mod tests {
                 "git-upload-pack 'team/project.git'".to_string(),
             ]
         );
+
+        let remote =
+            parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
+        assert_eq!(
+            remote,
+            RemoteUrl {
+                transport: RemoteTransport::Ssh,
+                user: None,
+                password: None,
+                host: Some("myhost".into()),
+                port: Some(123),
+                path: "src".into(),
+            }
+        );
+        assert_eq!(
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh)
+                .expect("test operation should succeed"),
+            vec![
+                "-p".to_string(),
+                "123".to_string(),
+                "myhost".to_string(),
+                "git-upload-pack 'src'".to_string(),
+            ]
+        );
+
+        let remote = parse_remote_url("[::1]:rep").expect("test operation should succeed");
+        assert_eq!(remote.host.as_deref(), Some("::1"));
+        assert_eq!(remote.port, None);
+        assert_eq!(remote.path, "rep");
+
+        let remote =
+            parse_remote_url("[user@::1]:repo").expect("test operation should succeed");
+        assert_eq!(remote.user.as_deref(), Some("user"));
+        assert_eq!(remote.host.as_deref(), Some("::1"));
+
+        let remote = parse_remote_url("c:temp").expect("test operation should succeed");
+        if cfg!(windows) {
+            assert_eq!(remote.transport, RemoteTransport::Local);
+        } else {
+            assert_eq!(remote.transport, RemoteTransport::Ssh);
+            assert_eq!(remote.host.as_deref(), Some("c"));
+            assert_eq!(remote.path, "temp");
+        }
 
         let remote = parse_remote_url("ssh://example.com:29418/team/project.git")
             .expect("test operation should succeed");

@@ -40,7 +40,9 @@ use sley_protocol::{
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
-use sley_transport::{RemoteTransport, RemoteUrl, SshCommandVariant, ssh_process_command};
+use sley_transport::{
+    RemoteTransport, RemoteUrl, SshCommandVariant, SshProcessCommand, ssh_process_command,
+};
 
 use crate::{PushOutcome, PushRequest};
 
@@ -50,6 +52,86 @@ use crate::{PushOutcome, PushRequest};
 /// handled, matching the CLI behavior being lifted).
 pub fn ssh_program() -> String {
     env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into())
+}
+
+fn ssh_process_command_for_remote(
+    remote: &RemoteUrl,
+    service: GitService,
+) -> Result<SshProcessCommand> {
+    validate_git_ssh_command()?;
+    ssh_process_command(remote, service, ssh_program(), ssh_command_variant())
+}
+
+fn ssh_command_variant() -> SshCommandVariant {
+    if let Ok(variant) = env::var("GIT_SSH_VARIANT") {
+        return match variant.as_str() {
+            "simple" => SshCommandVariant::Simple,
+            "plink" | "putty" => SshCommandVariant::Plink,
+            "tortoiseplink" => SshCommandVariant::TortoisePlink,
+            _ => SshCommandVariant::OpenSsh,
+        };
+    }
+    let program = ssh_program();
+    let basename = Path::new(&program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program.as_str())
+        .to_ascii_lowercase();
+    match basename.as_str() {
+        "simple" | "uplink" => SshCommandVariant::Simple,
+        _ => SshCommandVariant::OpenSsh,
+    }
+}
+
+fn validate_git_ssh_command() -> Result<()> {
+    let Ok(command) = env::var("GIT_SSH_COMMAND") else {
+        return Ok(());
+    };
+    split_shell_words(&command).map(|_| ())
+}
+
+fn split_shell_words(command: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote = None::<char>;
+    while let Some(ch) = chars.next() {
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                quote = None;
+            } else if ch == '\\' && quote_ch == '"' {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ch if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return Err(GitError::Command(
+            "unclosed quote in GIT_SSH_COMMAND".into(),
+        ));
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
 }
 
 /// Push to a resolved SSH `remote` from the repository at `git_dir`.
@@ -104,12 +186,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command(
-        remote,
-        GitService::ReceivePack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
+    let ssh = ssh_process_command_for_remote(remote, GitService::ReceivePack)?;
     let mut child = ProcessCommand::new(&ssh.program)
         .args(&ssh.args)
         .stdin(Stdio::piped())
@@ -209,12 +286,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command(
-        remote,
-        GitService::ReceivePack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
+    let ssh = ssh_process_command_for_remote(remote, GitService::ReceivePack)?;
     let mut child = ProcessCommand::new(&ssh.program)
         .args(&ssh.args)
         .stdin(Stdio::piped())
@@ -360,12 +432,7 @@ pub(crate) fn ls_remote_ssh(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command(
-        remote,
-        GitService::UploadPack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
+    let ssh = ssh_process_command_for_remote(remote, GitService::UploadPack)?;
     let output = ProcessCommand::new(&ssh.program)
         .args(&ssh.args)
         .stdin(Stdio::null())
@@ -540,12 +607,7 @@ pub fn ssh_upload_pack_advertisements(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command(
-        remote,
-        GitService::UploadPack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
+    let ssh = ssh_process_command_for_remote(remote, GitService::UploadPack)?;
     let output = ProcessCommand::new(&ssh.program)
         .args(&ssh.args)
         .stdin(Stdio::null())
@@ -624,12 +686,7 @@ fn ssh_upload_pack_fetch_response_inner(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command(
-        remote,
-        GitService::UploadPack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
+    let ssh = ssh_process_command_for_remote(remote, GitService::UploadPack)?;
     let mut child = ProcessCommand::new(&ssh.program)
         .args(&ssh.args)
         .stdin(Stdio::piped())
