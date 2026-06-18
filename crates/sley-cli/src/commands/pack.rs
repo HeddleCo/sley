@@ -898,6 +898,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     }
 
     if cruft {
+        validate_repack_cruft_numeric_config(&config)?;
         return cmd_repack_cruft(
             &git_dir,
             &common_git_dir,
@@ -959,6 +960,18 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         crate::commands::refs::cmd_update_server_info(&[])?;
     }
     let _ = quiet;
+    Ok(())
+}
+
+fn validate_repack_cruft_numeric_config(config: &GitConfig) -> Result<()> {
+    for key in ["cruftwindow", "cruftdepth", "cruftthreads"] {
+        if let Some(value) = config.get("repack", None, key)
+            && value.parse::<u64>().is_err()
+        {
+            eprintln!("fatal: bad numeric config value '{value}' for 'repack.{key}'");
+            return Err(GitError::Exit(128));
+        }
+    }
     Ok(())
 }
 
