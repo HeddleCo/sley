@@ -253,6 +253,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "commit-graph" => commands::plumbing::cmd_commit_graph(&args[1..]),
         "commit-tree" => commands::plumbing::cmd_commit_tree(&args[1..]),
         "diff" => commands::diff::cmd_diff(&args[1..]),
+        "difftool" => commands::difftool::cmd_difftool(&args[1..]),
         "fetch" => commands::remote_cmds::cmd_fetch(&args[1..]),
         "for-each-ref" => commands::for_each_ref::cmd_for_each_ref(&args[1..]),
         "refs" => commands::refs::cmd_refs(&args[1..]),
