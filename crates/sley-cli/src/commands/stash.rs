@@ -220,6 +220,7 @@ struct StashApplyOptions {
     reinstate_index: Option<bool>,
     explicit_selector: bool,
     selector: usize,
+    spec: Option<String>,
     display: String,
     direct_oid: Option<ObjectId>,
 }
@@ -309,6 +310,7 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
             Some(spec) => parse_stash_drop_selector(spec).unwrap_or(0),
             None => 0,
         },
+        spec: args.get(1).cloned(),
         display,
         direct_oid: Some(stash_oid),
     })?;
@@ -379,7 +381,9 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
         .cloned()
         .unwrap_or_else(|| "refs/stash@{0}".to_string());
     let selector = match specs.first() {
-        Some(spec) => parse_stash_drop_selector(spec)?,
+        Some(spec) if let Some(selector) = stash_numeric_selector(spec) => selector?,
+        Some(spec) if stash_argument_names_stash_ref(spec) => 0,
+        Some(spec) => return Err(stash_invalid_reference_error(spec)),
         None => 0,
     };
     Ok(StashApplyOptions {
@@ -387,6 +391,7 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
         reinstate_index,
         explicit_selector: !specs.is_empty(),
         selector,
+        spec: specs.first().cloned(),
         display,
         direct_oid: None,
     })
@@ -428,10 +433,23 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    let mut selector = options.selector;
     let stash_oid = if let Some(oid) = options.direct_oid {
         oid
+    } else if let Some(spec) = options.spec.as_deref().filter(|_| options.explicit_selector) {
+        let oid = resolve_stash_argument(&common_git_dir, format, &store, &db, Some(spec))?;
+        if let Some((index, _entry)) = entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_index, entry)| entry.new_oid == oid)
+        {
+            selector = entries.len() - 1 - index;
+        }
+        oid
     } else {
-        let entries = store.read_reflog("refs/stash")?;
         if entries.is_empty() {
             if options.explicit_selector {
                 eprintln!("error: {} is not a valid reference", options.display);
@@ -447,7 +465,6 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         let entry_index = entries.len() - 1 - options.selector;
         entries[entry_index].new_oid
     };
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     validate_stash_like_commit(&db, format, &stash_oid)?;
     let stash_object = db.read_object(&stash_oid)?;
     let stash_commit = Commit::parse(format, &stash_object.body)?;
@@ -526,7 +543,7 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     Ok(AppliedStash {
         common_git_dir,
         format,
-        selector: options.selector,
+        selector,
         display: options.display,
     })
 }
@@ -1167,19 +1184,30 @@ fn drop_stash_entry(
 fn parse_stash_drop_selector(spec: &str) -> Result<usize> {
     // git accepts `stash@{n}`, `refs/stash@{n}`, and the bare shorthand `n`
     // (`git stash drop 1`). A bare numeric token is treated as `stash@{n}`.
+    let Some(selector) = stash_numeric_selector(spec) else {
+        return Err(stash_invalid_reference_error(spec));
+    };
+    selector
+}
+
+fn stash_numeric_selector(spec: &str) -> Option<Result<usize>> {
     let selector = spec
         .strip_prefix("stash@{")
         .or_else(|| spec.strip_prefix("refs/stash@{"))
         .and_then(|rest| rest.strip_suffix('}'))
         .or_else(|| spec.chars().all(|c| c.is_ascii_digit()).then_some(spec));
-    let Some(selector) = selector.filter(|value| !value.is_empty()) else {
-        eprintln!("error: {spec} is not a valid reference");
-        return Err(GitError::Exit(1));
-    };
-    selector.parse::<usize>().map_err(|_| {
-        eprintln!("error: {spec} is not a valid reference");
-        GitError::Exit(1)
-    })
+    selector
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|selector| {
+        selector
+            .parse::<usize>()
+            .map_err(|_| stash_invalid_reference_error(spec))
+        })
+}
+
+fn stash_invalid_reference_error(spec: &str) -> GitError {
+    eprintln!("error: {spec} is not a valid reference");
+    GitError::Exit(1)
 }
 
 fn stash_drop_usage() {

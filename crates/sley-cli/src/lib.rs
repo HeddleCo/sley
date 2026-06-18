@@ -10611,10 +10611,13 @@ fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
     };
     let name = env_name
         .or_else(|| identity_config_value("user.name", &mut config))
-        .unwrap_or_else(|| "Git Rs".into());
+        .or_else(|| identity_default_value("Git Rs", &mut config));
     let email = env_email
         .or_else(|| identity_config_value("user.email", &mut config))
-        .unwrap_or_else(|| "sley@example.invalid".into());
+        .or_else(|| identity_default_value("sley@example.invalid", &mut config));
+    let (Some(name), Some(email)) = (name, email) else {
+        return identity_use_config_only_error();
+    };
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
     let date = canonicalize_commit_date(&date);
     sley_sequencer::format_commit_identity(&name, &email, &date)
@@ -10635,10 +10638,13 @@ fn commit_identity_from_env_with_date(role: &str, date_override: &str) -> Result
     };
     let name = env_name
         .or_else(|| identity_config_value("user.name", &mut config))
-        .unwrap_or_else(|| "Git Rs".into());
+        .or_else(|| identity_default_value("Git Rs", &mut config));
     let email = env_email
         .or_else(|| identity_config_value("user.email", &mut config))
-        .unwrap_or_else(|| "sley@example.invalid".into());
+        .or_else(|| identity_default_value("sley@example.invalid", &mut config));
+    let (Some(name), Some(email)) = (name, email) else {
+        return identity_use_config_only_error();
+    };
     let date = canonicalize_commit_date(date_override);
     sley_sequencer::format_commit_identity(&name, &email, &date)
 }
@@ -10684,6 +10690,26 @@ fn identity_config_value(key: &str, config: &mut IdentityConfig) -> Option<Strin
     loaded
         .as_ref()
         .and_then(|config| config.get(section, None, name).map(str::to_string))
+}
+
+fn identity_default_value(value: &str, config: &mut IdentityConfig) -> Option<String> {
+    if identity_use_config_only(config) {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn identity_use_config_only(config: &mut IdentityConfig) -> bool {
+    identity_config_value("user.useconfigonly", config)
+        .as_deref()
+        .and_then(sley_config::parse_config_bool)
+        .unwrap_or(false)
+}
+
+fn identity_use_config_only_error<T>() -> Result<T> {
+    eprintln!("fatal: no email was given and auto-detection is disabled");
+    Err(GitError::Exit(128))
 }
 
 /// Load the effective config (repository + global + system, with includes) for
