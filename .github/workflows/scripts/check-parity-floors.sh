@@ -581,7 +581,7 @@ declare -A FLOOR=(
     [t7703-repack-geometric.sh]=11
     [t7704-repack-cruft.sh]=15
     [t6500-gc.sh]=14
-    [t0610-reftable-basics.sh]=35
+    [t0610-reftable-basics.sh]=56
     [t4061-diff-indent.sh]=21
 )
 
