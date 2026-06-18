@@ -7491,7 +7491,16 @@ fn resolve_branch_start(
             let remote_ref = format!("refs/remotes/{start}");
             match store.read_ref(&remote_ref)? {
                 Some(RefTarget::Direct(oid)) => Ok(oid),
-                _ => Err(err),
+                _ => {
+                    let remote_head = format!("{remote_ref}/HEAD");
+                    if let Some(RefTarget::Symbolic(target)) = store.read_ref(&remote_head)?
+                        && store.read_ref(&target)?.is_none()
+                    {
+                        eprintln!("fatal: dangling symref {remote_head}");
+                        return Err(GitError::Exit(128));
+                    }
+                    Err(err)
+                }
             }
         }
     }
@@ -9149,6 +9158,10 @@ fn print_branch_refs(
             println!("* {line}");
         }
     }
+    let ref_names = refs
+        .iter()
+        .map(|reference| reference.name.clone())
+        .collect::<HashSet<_>>();
     for reference in refs {
         if matches!(mode, BranchListMode::Local | BranchListMode::All)
             && let Some(name) = reference.name.strip_prefix("refs/heads/")
@@ -9173,11 +9186,10 @@ fn print_branch_refs(
         if matches!(mode, BranchListMode::Remote | BranchListMode::All)
             && let Some(name) = reference.name.strip_prefix("refs/remotes/")
         {
-            let display = if matches!(mode, BranchListMode::All) {
-                format!("remotes/{name}")
-            } else {
-                name.to_string()
-            };
+            if remote_symbolic_ref_is_dangling(&reference, &ref_names) {
+                continue;
+            }
+            let display = remote_branch_display(&reference, name, mode);
             if !include(&reference, name) {
                 continue;
             }
@@ -9209,6 +9221,10 @@ fn collect_branch_rows(
             rows.push(format!("* {line}"));
         }
     }
+    let ref_names = refs
+        .iter()
+        .map(|reference| reference.name.clone())
+        .collect::<HashSet<_>>();
     for reference in refs {
         if matches!(mode, BranchListMode::Local | BranchListMode::All)
             && let Some(name) = reference.name.strip_prefix("refs/heads/")
@@ -9233,11 +9249,10 @@ fn collect_branch_rows(
         if matches!(mode, BranchListMode::Remote | BranchListMode::All)
             && let Some(name) = reference.name.strip_prefix("refs/remotes/")
         {
-            let display = if matches!(mode, BranchListMode::All) {
-                format!("remotes/{name}")
-            } else {
-                name.to_string()
-            };
+            if remote_symbolic_ref_is_dangling(&reference, &ref_names) {
+                continue;
+            }
+            let display = remote_branch_display(&reference, name, mode);
             if !include(&reference, name) {
                 continue;
             }
@@ -9249,6 +9264,36 @@ fn collect_branch_rows(
         }
     }
     Ok(rows)
+}
+
+fn remote_symbolic_ref_is_dangling(
+    reference: &sley_refs::Ref,
+    ref_names: &HashSet<String>,
+) -> bool {
+    match &reference.target {
+        RefTarget::Symbolic(target) => !ref_names.contains(target.as_str()),
+        RefTarget::Direct(_) => false,
+    }
+}
+
+fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchListMode) -> String {
+    let display = if matches!(mode, BranchListMode::All) {
+        format!("remotes/{name}")
+    } else {
+        name.to_string()
+    };
+    let RefTarget::Symbolic(target) = &reference.target else {
+        return display;
+    };
+    let Some(target_name) = target.strip_prefix("refs/remotes/") else {
+        return display;
+    };
+    let target_display = if matches!(mode, BranchListMode::All) {
+        format!("remotes/{target_name}")
+    } else {
+        target_name.to_string()
+    };
+    format!("{display} -> {target_display}")
 }
 
 fn print_branch_columns(rows: &[String], style: BranchColumnStyle) -> Result<()> {

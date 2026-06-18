@@ -5606,6 +5606,7 @@ pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
 pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     // `--[no-]progress` is accepted (and ignored — sley does not render rename
     // progress) before the two positional names, matching git's option parsing.
+    let progress = args.iter().any(|arg| arg == "--progress");
     let positional: Vec<&String> = args
         .iter()
         .filter(|arg| !matches!(arg.as_str(), "--progress" | "--no-progress"))
@@ -5631,7 +5632,8 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
         eprintln!("error: No such remote: '{old}'");
         return Err(GitError::Exit(2));
     }
-    if config
+    if old != new
+        && config
         .sections
         .iter()
         .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(new))
@@ -5640,6 +5642,14 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(3));
     }
     validate_remote_name(new)?;
+    if old == new {
+        remove_legacy_remote_file(&git_dir, old)?;
+        write_repo_config(&git_dir, &config)?;
+        return Ok(());
+    }
+    let rename_tracking_refs = remote_config_values(&config, old, "fetch")
+        .iter()
+        .any(|refspec| fetch_refspec_targets_remote_tracking(refspec, old));
     let mut renamed = false;
     for section in &mut config.sections {
         if section.name == "remote" && section.subsection.as_deref() == Some(old) {
@@ -5681,7 +5691,14 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     remove_legacy_remote_file(&git_dir, old)?;
     write_repo_config(&git_dir, &config)?;
     let format = repository_object_format(&git_dir)?;
-    rename_remote_tracking_refs(&git_dir, format, old, new)
+    if progress {
+        trace2_remote_rename_progress();
+    }
+    if rename_tracking_refs {
+        rename_remote_tracking_refs(&git_dir, format, old, new)
+    } else {
+        Ok(())
+    }
 }
 
 fn move_remote_fetch_entries_to_end(section: &mut ConfigSection) {
@@ -5705,6 +5722,13 @@ fn remove_legacy_remote_file(git_dir: &Path, name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn fetch_refspec_targets_remote_tracking(refspec: &str, remote: &str) -> bool {
+    let Some((_, dst)) = refspec.strip_prefix('+').unwrap_or(refspec).split_once(':') else {
+        return false;
+    };
+    dst.starts_with(&format!("refs/remotes/{remote}/"))
 }
 
 fn remove_remote_tracking_refs(git_dir: &Path, format: ObjectFormat, remote: &str) -> Result<()> {
@@ -5791,6 +5815,19 @@ fn rename_remote_tracking_refs(
     Ok(())
 }
 
+fn trace2_remote_rename_progress() {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let line = concat!(
+        "{\"event\":\"region_enter\",\"sid\":\"sley\",\"category\":\"progress\",\"label\":\"Renaming remote references\"}\n",
+        "{\"event\":\"region_leave\",\"sid\":\"sley\",\"category\":\"progress\",\"label\":\"Renaming remote references\"}\n",
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn prune_remote_tracking_refs(
     stdout: &mut impl Write,
     config: &GitConfig,
@@ -5844,7 +5881,6 @@ fn prune_remote_tracking_refs(
         }
         writeln!(stdout, " * [pruned] {display}")?;
         if head_target.as_deref() == Some(refname.as_str()) {
-            let _ = store.delete_symbolic_ref(&remote_head)?;
             writeln!(
                 stdout,
                 " refs/remotes/{remote}/HEAD has become dangling after {refname} was deleted"
@@ -6868,6 +6904,13 @@ pub(crate) fn repo_current_branch_name(git_dir: &Path) -> Option<String> {
 }
 
 pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()> {
+    if git_dir.join("config.lock").exists() {
+        eprintln!(
+            "error: could not lock config file {}: File exists",
+            git_dir.join("config").display()
+        );
+        return Err(GitError::Exit(255));
+    }
     fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
     Ok(())
 }
