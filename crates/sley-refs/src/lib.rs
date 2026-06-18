@@ -15,6 +15,8 @@ use std::fs;
 use std::io::Write;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +114,23 @@ pub struct PackedRef {
     pub peeled: Option<ObjectId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackRefDecision {
+    Pack { peeled: Option<ObjectId> },
+    Skip,
+}
+
 pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<PackedRef>> {
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line = String::from_utf8_lossy(&bytes[line_start..]);
+        return Err(GitError::InvalidFormat(format!(
+            "fatal: unterminated line in .git/packed-refs: {line}"
+        )));
+    }
     let text =
         std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     let mut refs: Vec<PackedRef> = Vec::new();
@@ -133,8 +151,13 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
         }
         let (oid, name) = line
             .split_once(' ')
-            .ok_or_else(|| GitError::InvalidFormat("invalid packed ref line".into()))?;
-        validate_ref_name(name)?;
+            .ok_or_else(|| packed_refs_unexpected_line(line))?;
+        if oid.len() != format.hex_len()
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || validate_ref_name(name).is_err()
+        {
+            return Err(packed_refs_unexpected_line(line));
+        }
         refs.push(PackedRef {
             reference: Ref {
                 name: name.into(),
@@ -146,7 +169,21 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
     Ok(refs)
 }
 
+fn packed_refs_unexpected_line(line: &str) -> GitError {
+    GitError::InvalidFormat(format!("fatal: unexpected line in .git/packed-refs: {line}"))
+}
+
 fn packed_refs_have_prefix(format: ObjectFormat, bytes: &[u8], prefix: &str) -> Result<bool> {
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line = String::from_utf8_lossy(&bytes[line_start..]);
+        return Err(GitError::InvalidFormat(format!(
+            "fatal: unterminated line in .git/packed-refs: {line}"
+        )));
+    }
     let text =
         std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     let mut found = false;
@@ -167,8 +204,13 @@ fn packed_refs_have_prefix(format: ObjectFormat, bytes: &[u8], prefix: &str) -> 
         }
         let (oid, name) = line
             .split_once(' ')
-            .ok_or_else(|| GitError::InvalidFormat("invalid packed ref line".into()))?;
-        validate_ref_name(name)?;
+            .ok_or_else(|| packed_refs_unexpected_line(line))?;
+        if oid.len() != format.hex_len()
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || validate_ref_name(name).is_err()
+        {
+            return Err(packed_refs_unexpected_line(line));
+        }
         ObjectId::from_hex(format, oid)?;
         saw_ref = true;
         found |= name.starts_with(prefix);
@@ -728,10 +770,16 @@ impl FileRefStore {
     }
 
     pub fn write_packed_refs(&self, refs: &[PackedRef]) -> Result<()> {
-        write_locked(
-            &self.common_dir.join("packed-refs"),
-            &write_packed_refs(refs)?,
-        )
+        self.write_packed_refs_with_timeout(refs, 0)
+    }
+
+    pub fn write_packed_refs_with_timeout(
+        &self,
+        refs: &[PackedRef],
+        timeout_millis: u64,
+    ) -> Result<()> {
+        let path = self.packed_refs_write_path()?;
+        write_locked_with_timeout(&path, &write_packed_refs(refs)?, timeout_millis)
     }
 
     pub fn pack_refs(&self, prune_loose: bool) -> Result<Vec<PackedRef>> {
@@ -741,6 +789,29 @@ impl FileRefStore {
     pub fn pack_refs_with_peeler<F>(&self, prune_loose: bool, mut peel: F) -> Result<Vec<PackedRef>>
     where
         F: FnMut(&str, &ObjectId) -> Result<Option<ObjectId>>,
+    {
+        self.pack_refs_selected_with_timeout(
+            prune_loose,
+            false,
+            0,
+            |_| true,
+            |name, oid| {
+                peel(name, oid).map(|peeled| PackRefDecision::Pack { peeled })
+            },
+        )
+    }
+
+    pub fn pack_refs_selected_with_timeout<F, S>(
+        &self,
+        prune_loose: bool,
+        auto: bool,
+        timeout_millis: u64,
+        mut should_pack: S,
+        mut decide: F,
+    ) -> Result<Vec<PackedRef>>
+    where
+        F: FnMut(&str, &ObjectId) -> Result<PackRefDecision>,
+        S: FnMut(&str) -> bool,
     {
         if self.uses_reftable()? {
             self.compact_reftable_stack()?;
@@ -759,12 +830,23 @@ impl FileRefStore {
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
         }
+        let loose_refs = loose_refs
+            .into_values()
+            .filter(|reference| packable_loose_ref_name(&reference.name))
+            .filter(|reference| should_pack(&reference.name))
+            .collect::<Vec<_>>();
+        if auto && !pack_refs_auto_required_for(&packed_path, loose_refs.len())? {
+            return Ok(packed_refs.into_values().collect());
+        }
         let mut packed_loose_names = Vec::new();
-        for reference in loose_refs.into_values() {
+        for reference in loose_refs {
             let RefTarget::Direct(oid) = reference.target else {
                 continue;
             };
-            let peeled = peel(&reference.name, &oid)?;
+            let peeled = match decide(&reference.name, &oid)? {
+                PackRefDecision::Pack { peeled } => peeled,
+                PackRefDecision::Skip => continue,
+            };
             packed_loose_names.push(reference.name.clone());
             packed_refs.insert(
                 reference.name.clone(),
@@ -779,13 +861,54 @@ impl FileRefStore {
         }
 
         let refs = packed_refs.into_values().collect::<Vec<_>>();
-        self.write_packed_refs(&refs)?;
+        self.write_packed_refs_with_timeout(&refs, timeout_millis)?;
         if prune_loose {
             for name in packed_loose_names {
                 self.delete_loose_ref(&name)?;
             }
         }
         Ok(refs)
+    }
+
+    pub fn pack_refs_auto_required<S>(&self, mut should_pack: S) -> Result<bool>
+    where
+        S: FnMut(&str) -> bool,
+    {
+        if self.uses_reftable()? {
+            return Ok(true);
+        }
+        let mut loose_refs = BTreeMap::new();
+        let refs_dir = self.common_dir.join("refs");
+        if refs_dir.exists() {
+            self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
+        }
+        let count = loose_refs
+            .values()
+            .filter(|reference| packable_loose_ref_name(&reference.name))
+            .filter(|reference| matches!(reference.target, RefTarget::Direct(_)))
+            .filter(|reference| should_pack(&reference.name))
+            .count();
+        pack_refs_auto_required_for(&self.common_dir.join("packed-refs"), count)
+    }
+
+    fn packed_refs_write_path(&self) -> Result<PathBuf> {
+        let path = self.common_dir.join("packed-refs");
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = fs::read_link(&path)?;
+                if target.is_absolute() {
+                    Ok(target)
+                } else {
+                    let parent = path.parent().ok_or_else(|| {
+                        GitError::InvalidPath("packed-refs path has no parent".into())
+                    })?;
+                    Ok(parent.join(target))
+                }
+            }
+            Ok(_) => Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(path),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn current_branch_ref(&self) -> Result<Option<String>> {
@@ -2592,24 +2715,24 @@ impl FileRefStore {
         for index in 0..changes.len() {
             match &changes[index] {
                 CoalescedRefChange::Update(update) => {
+                    let current = if has_delete {
+                        match self.read_ref_from_locked_packed(&update.name, &packed_refs) {
+                            Ok(current) => current,
+                            Err(err) => {
+                                release_pending_locks(&pending);
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        match self.read_ref(&update.name) {
+                            Ok(current) => current,
+                            Err(err) => {
+                                release_pending_locks(&pending);
+                                return Err(err);
+                            }
+                        }
+                    };
                     if !matches!(update.precondition, RefPrecondition::Any) {
-                        let current = if has_delete {
-                            match self.read_ref_from_locked_packed(&update.name, &packed_refs) {
-                                Ok(current) => current,
-                                Err(err) => {
-                                    release_pending_locks(&pending);
-                                    return Err(err);
-                                }
-                            }
-                        } else {
-                            match self.read_ref(&update.name) {
-                                Ok(current) => current,
-                                Err(err) => {
-                                    release_pending_locks(&pending);
-                                    return Err(err);
-                                }
-                            }
-                        };
                         if !update.precondition.is_satisfied_by(current.as_ref()) {
                             release_pending_locks(&pending);
                             return Err(GitError::Transaction(
@@ -2624,6 +2747,11 @@ impl FileRefStore {
                             return Err(err);
                         }
                     };
+                    if pending[index].original.is_none()
+                        && current.as_ref() == Some(&update.new)
+                    {
+                        pending[index].action = PendingPathAction::ReleaseLock;
+                    }
                     for entry in &update.reflog {
                         reflogs.push((update.name.clone(), entry.clone()));
                     }
@@ -3761,14 +3889,39 @@ pub fn tag_ref_name(tag: &str) -> Result<String> {
 }
 
 fn write_locked(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_locked_with_timeout(path, bytes, 0)
+}
+
+fn write_locked_with_timeout(path: &Path, bytes: &[u8], timeout_millis: u64) -> Result<()> {
     let lock_path = lock_path_for(path)?;
-    {
-        let mut file = fs::OpenOptions::new()
+    let start = SystemTime::now();
+    loop {
+        match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&lock_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                break;
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 =>
+            {
+                let elapsed = start
+                    .elapsed()
+                    .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
+                if elapsed.as_millis() as u64 >= timeout_millis {
+                    return Err(GitError::Io(format!(
+                        "could not lock {}: File exists",
+                        path.display()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
     match fs::rename(&lock_path, path) {
         Ok(()) => Ok(()),
@@ -3852,6 +4005,28 @@ fn prune_empty_dirs_up_to(start: &Path, boundary: &Path) {
             None => break,
         };
     }
+}
+
+fn packable_loose_ref_name(name: &str) -> bool {
+    name.starts_with("refs/")
+        && !name.starts_with("refs/bisect/")
+        && !name.starts_with("refs/worktree/")
+}
+
+fn pack_refs_auto_required_for(packed_path: &Path, loose_count: usize) -> Result<bool> {
+    let packed_size = match fs::metadata(packed_path) {
+        Ok(meta) => meta.len() as usize,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err.into()),
+    };
+    let estimated_packed_refs = packed_size / 100;
+    let log2 = if estimated_packed_refs == 0 {
+        0
+    } else {
+        usize::BITS as usize - estimated_packed_refs.leading_zeros() as usize - 1
+    };
+    let limit = (log2 * 5).max(16);
+    Ok(loose_count >= limit)
 }
 
 pub fn resolve_ref_peeled(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {

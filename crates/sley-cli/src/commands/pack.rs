@@ -1436,6 +1436,11 @@ fn validate_maintenance_schedule(value: &str) -> Result<String> {
 /// Append a `--task=<name>` selection, mirroring git's `task_option_parse`:
 /// reject an unknown task name, and reject a task already selected (both rc 129).
 fn push_maintenance_task(tasks: &mut Vec<String>, task: &str) -> Result<()> {
+    let task = if task.eq_ignore_ascii_case("refs optimize") {
+        "pack-refs"
+    } else {
+        task
+    };
     if !MAINTENANCE_TASKS
         .iter()
         .any(|known| known.eq_ignore_ascii_case(task))
@@ -1587,7 +1592,13 @@ fn maintenance_run_one(
                 progress.to_string(),
             ])
         }
-        "pack-refs" => run_sley_child(&["pack-refs", "--all", "--prune"], None),
+        "pack-refs" => {
+            if auto {
+                run_sley_child(&["pack-refs", "--all", "--prune", "--auto"], None)
+            } else {
+                run_sley_child(&["pack-refs", "--all", "--prune"], None)
+            }
+        }
         "reflog-expire" => run_sley_child(&["reflog", "expire", "--all"], None),
         "worktree-prune" => {
             let expire = config
@@ -1669,6 +1680,7 @@ fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: &str
             100,
             count_reflog_entries(&common_git_dir.join("logs"))?,
         )?,
+        "pack-refs" => true,
         _ => false,
     })
 }
@@ -2597,6 +2609,7 @@ pub(crate) fn cmd_count_objects(args: &[String]) -> Result<()> {
 struct PackRefsOptions {
     all: bool,
     prune: bool,
+    auto: bool,
     include: Vec<String>,
     exclude: Vec<String>,
 }
@@ -2619,50 +2632,25 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
         });
     }
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-
-    let mut packed = BTreeMap::new();
-    let packed_path = common_git_dir.join("packed-refs");
-    if packed_path.exists() {
-        for reference in parse_packed_refs(format, &fs::read(&packed_path)?)? {
-            packed.insert(reference.reference.name.clone(), reference);
-        }
-    }
-
-    let mut packed_loose_names = Vec::new();
-    for reference in store.list_refs()? {
-        let RefTarget::Direct(oid) = reference.target else {
-            continue;
-        };
-        if !pack_refs_should_include(&reference.name, &options) {
-            continue;
-        }
-        let peeled = pack_refs_peeled_oid(&db, format, &oid)?;
-        packed_loose_names.push(reference.name.clone());
-        packed.insert(
-            reference.name.clone(),
-            PackedRef {
-                reference: Ref {
-                    name: reference.name,
-                    target: RefTarget::Direct(oid),
-                },
-                peeled,
-            },
-        );
-    }
-
-    let refs = packed.into_values().collect::<Vec<_>>();
-    store.write_packed_refs(&refs)?;
-    if options.prune {
-        for name in packed_loose_names {
-            let _ = fs::remove_file(common_git_dir.join(&name));
-        }
-    }
+    let timeout_millis = pack_refs_timeout_millis(&common_git_dir)?;
+    store.pack_refs_selected_with_timeout(
+        options.prune,
+        options.auto,
+        timeout_millis,
+        |name| pack_refs_should_include(name, &options),
+        |_, oid| match pack_refs_peeled_oid(&db, format, oid) {
+            Ok(peeled) => Ok(PackRefDecision::Pack { peeled }),
+            Err(GitError::NotFound(_)) => Ok(PackRefDecision::Skip),
+            Err(err) => Err(err),
+        },
+    )?;
     Ok(())
 }
 
 fn parse_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
     let mut all = false;
     let mut prune = true;
+    let mut auto = false;
     let mut include = Vec::new();
     let mut exclude = Vec::new();
     let mut args = GitArgCursor::new(args);
@@ -2673,7 +2661,8 @@ fn parse_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
             "--no-all" => all = false,
             "--prune" => prune = true,
             "--no-prune" => prune = false,
-            "--auto" | "--no-auto" => {}
+            "--auto" => auto = true,
+            "--no-auto" => auto = false,
             "--include" | "--exclude" => {
                 let Some(pattern) = args.next_value() else {
                     return pack_refs_usage();
@@ -2710,6 +2699,7 @@ fn parse_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
     Ok(PackRefsOptions {
         all,
         prune,
+        auto,
         include,
         exclude,
     })
@@ -2761,6 +2751,14 @@ fn pack_refs_should_include(name: &str, options: &PackRefsOptions) -> bool {
             .iter()
             .any(|pattern| refname_pattern_matches(pattern, name))
         || (options.include.is_empty() && name.starts_with("refs/tags/"))
+}
+
+fn pack_refs_timeout_millis(common_git_dir: &Path) -> Result<u64> {
+    let config = read_repo_config(common_git_dir)?;
+    Ok(config
+        .get("core", None, "packedRefsTimeout")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1000))
 }
 
 #[derive(Debug, Clone, Default)]

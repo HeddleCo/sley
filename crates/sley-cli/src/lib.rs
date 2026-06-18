@@ -25,7 +25,7 @@ use sley_protocol::{
 };
 pub(crate) use sley_ref_filter::*;
 use sley_refs::{
-    BundleRefUpdate, FileRefStore, PackedRef, Ref, RefPrecondition, RefTarget,
+    BundleRefUpdate, FileRefStore, PackRefDecision, Ref, RefPrecondition, RefTarget,
     RefTransactionHookUpdate, RefTransactionPhase, RefUpdate, ReferenceTransactionHook, ReflogEntry,
     branch_ref_name, check_refname_format, parse_packed_refs, resolve_ref_peeled, tag_ref_name,
     validate_ref_name, validate_symref_name, validate_symref_target,
@@ -1088,8 +1088,22 @@ fn pack_refs_peeled_oid(
     format: ObjectFormat,
     oid: &ObjectId,
 ) -> Result<Option<ObjectId>> {
-    let peeled = sley_rev::peel_tags(db, format, oid)?;
-    Ok((peeled != *oid).then_some(peeled))
+    let mut current = *oid;
+    let mut peeled = false;
+    for _ in 0..16 {
+        let object = db.read_object(&current)?;
+        if object.object_type != ObjectType::Tag {
+            return Ok(peeled.then_some(current));
+        }
+        let tag = Tag::parse_ref(format, &object.body)?;
+        let target = db.read_object(&tag.object)?;
+        if target.object_type != tag.object_type {
+            return Ok(None);
+        }
+        current = tag.object;
+        peeled = true;
+    }
+    Ok(None)
 }
 
 fn current_unix_seconds() -> i64 {

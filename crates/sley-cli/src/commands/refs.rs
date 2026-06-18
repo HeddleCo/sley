@@ -3773,7 +3773,6 @@ fn symbolic_ref_usage_error(error: UsageError) -> GitError {
 /// `git refs` command group (builtin/refs.c, git 2.54). Dispatches to the ref
 /// plumbing subcommands. `list` is an exact clone of `for-each-ref` (it calls
 /// the same for_each_ref_core in git); `exists` is a raw ref-existence probe.
-/// migrate/verify/optimize are out of scope for the parity quick-win.
 pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         eprintln!("error: need a subcommand");
@@ -3783,6 +3782,7 @@ pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
     match subcommand {
         "list" => commands::for_each_ref::for_each_ref_core(&args[1..], "git refs list"),
         "exists" => cmd_refs_exists(&args[1..]),
+        "optimize" => commands::pack::cmd_pack_refs(&args[1..]),
         "-h" | "--help" => {
             print_refs_usage();
             Err(GitError::Exit(129))
