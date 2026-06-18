@@ -1203,6 +1203,7 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
             | "--force"
             | "--detach"
             | "--no-detach"
+            | "--skip-foreground-tasks"
             | "--progress"
             | "--no-progress"
             | "--keep-largest-pack" => {}
@@ -1301,6 +1302,11 @@ pub(crate) fn cmd_maintenance(args: &[String]) -> Result<()> {
             Err(GitError::Exit(129))
         }
         "run" => cmd_maintenance_run(&args[1..]),
+        "is-needed" => cmd_maintenance_is_needed(&args[1..]),
+        "register" => cmd_maintenance_register(&args[1..]),
+        "unregister" => cmd_maintenance_unregister(&args[1..]),
+        "start" => cmd_maintenance_start(&args[1..]),
+        "stop" => cmd_maintenance_stop(&args[1..]),
         // git's parse-options subcommand dispatch quotes the offending token with
         // a backtick + apostrophe, not a matched pair (parse-options.c).
         _ => {
@@ -1343,8 +1349,9 @@ const MAINTENANCE_TASKS: &[&str] = &[
 ];
 
 fn cmd_maintenance_run(args: &[String]) -> Result<()> {
-    let mut quiet = false;
+    let mut quiet = true;
     let mut auto = false;
+    let mut detach = false;
     let mut schedule: Option<String> = None;
     // `--task=` selections in command-line order, validated as we parse so the
     // "not a valid task" / "cannot be selected multiple times" diagnostics fire
@@ -1358,7 +1365,8 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "--auto" => auto = true,
             "--no-auto" => auto = false,
-            "--detach" | "--no-detach" => {}
+            "--detach" => detach = true,
+            "--no-detach" => detach = false,
             "--schedule" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -1401,17 +1409,12 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    // Of the recognised tasks, only `gc` has a sley implementation today; the
-    // others are accepted (so validation parity holds) but are inert. With no
-    // explicit `--task=`, the default maintenance run includes gc.
-    let run_gc = tasks.is_empty() || tasks.iter().any(|task| task.eq_ignore_ascii_case("gc"));
-    if run_gc {
-        let mut gc_args = Vec::new();
-        if quiet {
-            gc_args.push("--quiet".to_string());
-        }
-        cmd_gc(&gc_args)?;
-    }
+    trace2_touch();
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let config = read_repo_config(&common_git_dir)?;
+    let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
+    maintenance_run_selected(&common_git_dir, &config, &selected, quiet, auto, detach)?;
     Ok(())
 }
 
@@ -1446,6 +1449,1046 @@ fn push_maintenance_task(tasks: &mut Vec<String>, task: &str) -> Result<()> {
     }
     tasks.push(task.to_string());
     Ok(())
+}
+
+fn maintenance_select_tasks(
+    config: &GitConfig,
+    requested: &[String],
+    schedule: Option<&str>,
+) -> Result<Vec<String>> {
+    if !requested.is_empty() {
+        return Ok(requested.iter().map(|task| task.to_ascii_lowercase()).collect());
+    }
+    let strategy = config
+        .get("maintenance", None, "strategy")
+        .unwrap_or(if schedule.is_some() { "none" } else { "gc" });
+    let mut selected = match strategy.to_ascii_lowercase().as_str() {
+        "none" => Vec::new(),
+        "gc" => vec!["gc"],
+        "incremental" if schedule.is_some() => vec![
+            "prefetch",
+            "loose-objects",
+            "incremental-repack",
+            "commit-graph",
+            "pack-refs",
+        ],
+        "incremental" => vec!["gc"],
+        "geometric" => vec![
+            "geometric-repack",
+            "commit-graph",
+            "pack-refs",
+            "reflog-expire",
+            "worktree-prune",
+            "rerere-gc",
+        ],
+        other => {
+            eprintln!("fatal: unknown maintenance strategy: '{other}'");
+            return Err(GitError::Exit(128));
+        }
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+
+    for task in MAINTENANCE_TASKS {
+        if let Some(enabled) = config.get_bool("maintenance", Some(task), "enabled") {
+            selected.retain(|selected| !selected.eq_ignore_ascii_case(task));
+            if enabled {
+                selected.push((*task).to_string());
+            }
+        }
+    }
+
+    if let Some(schedule) = schedule {
+        let requested_schedule = maintenance_schedule_rank(schedule)?;
+        selected.retain(|task| {
+            let default_schedule = match task.as_str() {
+                "commit-graph" | "prefetch" => "hourly",
+                "loose-objects" | "incremental-repack" | "geometric-repack" | "gc"
+                | "pack-refs" => "daily",
+                _ => "weekly",
+            };
+            let task_schedule = config
+                .get("maintenance", Some(task), "schedule")
+                .unwrap_or(default_schedule);
+            maintenance_schedule_rank(task_schedule).unwrap_or(0) >= requested_schedule
+        });
+    }
+
+    selected.sort_by_key(|task| {
+        MAINTENANCE_TASKS
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(task))
+            .unwrap_or(usize::MAX)
+    });
+    Ok(selected)
+}
+
+fn maintenance_schedule_rank(value: &str) -> Result<u8> {
+    match validate_maintenance_schedule(value)?.to_ascii_lowercase().as_str() {
+        "hourly" => Ok(1),
+        "daily" => Ok(2),
+        "weekly" => Ok(3),
+        _ => Ok(0),
+    }
+}
+
+fn maintenance_run_selected(
+    common_git_dir: &Path,
+    config: &GitConfig,
+    tasks: &[String],
+    quiet: bool,
+    auto: bool,
+    detach: bool,
+) -> Result<()> {
+    let lock = repository_objects_dir(common_git_dir).join("maintenance.lock");
+    if fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .is_err()
+    {
+        if !auto && !quiet {
+            eprintln!("warning: lock file '{}' exists, skipping maintenance", lock.display());
+        }
+        return Ok(());
+    }
+    if detach {
+        trace2_region("region_enter", "maintenance", "detach");
+        trace2_region("region_leave", "maintenance", "detach");
+    }
+    for task in tasks {
+        if auto && !maintenance_task_needed(common_git_dir, config, task)? {
+            continue;
+        }
+        maintenance_run_one(common_git_dir, config, task, quiet, auto)?;
+    }
+    let _ = fs::remove_file(lock);
+    Ok(())
+}
+
+fn maintenance_run_one(
+    common_git_dir: &Path,
+    config: &GitConfig,
+    task: &str,
+    quiet: bool,
+    auto: bool,
+) -> Result<()> {
+    match task {
+        "commit-graph" => {
+            if config.get_bool("core", None, "commitGraph") == Some(false) {
+                return Ok(());
+            }
+            let progress = if quiet { "--no-progress" } else { "--progress" };
+            trace2_child_start(&["commit-graph", "write", "--split", "--reachable", progress]);
+            commands::plumbing::cmd_commit_graph(&[
+                "write".to_string(),
+                "--reachable".to_string(),
+                progress.to_string(),
+            ])
+        }
+        "pack-refs" => run_sley_child(&["pack-refs", "--all", "--prune"], None),
+        "reflog-expire" => run_sley_child(&["reflog", "expire", "--all"], None),
+        "worktree-prune" => {
+            let expire = config
+                .get("gc", None, "worktreePruneExpire")
+                .unwrap_or("3.months.ago");
+            run_sley_child(&["worktree", "prune", "--expire", expire], None)
+        }
+        "rerere-gc" => run_sley_child(&["rerere", "gc"], None),
+        "gc" => {
+            let mut args = vec!["gc"];
+            if auto {
+                args.push("--auto");
+            }
+            args.push(if quiet { "--quiet" } else { "--no-quiet" });
+            args.push("--no-detach");
+            args.push("--skip-foreground-tasks");
+            run_sley_child(&args, None)
+        }
+        "prefetch" => maintenance_prefetch(config, quiet),
+        "loose-objects" => maintenance_loose_objects(common_git_dir, config, quiet),
+        "incremental-repack" => {
+            if config.get_bool("core", None, "multiPackIndex") == Some(false) {
+                if !quiet {
+                    eprintln!(
+                        "warning: skipping incremental-repack task because core.multiPackIndex is disabled"
+                    );
+                }
+                return Ok(());
+            }
+            let progress = if quiet { "--no-progress" } else { "--progress" };
+            run_sley_child(&["multi-pack-index", "write", progress], None)?;
+            run_sley_child(&["multi-pack-index", "expire", progress], None)?;
+            let batch = format!("--batch-size={}", maintenance_auto_pack_size(common_git_dir)?);
+            run_sley_child(&["multi-pack-index", "repack", progress, batch.as_str()], None)
+        }
+        "geometric-repack" => {
+            let factor = config
+                .get("maintenance", Some("geometric-repack"), "splitFactor")
+                .unwrap_or("2");
+            let geometric = format!("--geometric={factor}");
+            let mut args = vec!["repack", "-d", "-l", geometric.as_str()];
+            if quiet {
+                args.push("--quiet");
+            }
+            args.push("--write-midx");
+            run_sley_child(&args, None)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: &str) -> Result<bool> {
+    Ok(match task {
+        "commit-graph" => maintenance_limit_satisfied(
+            config,
+            "commit-graph",
+            100,
+            count_reachable_commits(common_git_dir)?,
+        )?,
+        "loose-objects" => maintenance_limit_satisfied(
+            config,
+            "loose-objects",
+            100,
+            loose_object_ids(common_git_dir)?.len(),
+        )?,
+        "incremental-repack" | "geometric-repack" => {
+            maintenance_limit_satisfied(config, task, 10, count_pack_files(common_git_dir)?)?
+        }
+        "worktree-prune" => maintenance_limit_satisfied(
+            config,
+            "worktree-prune",
+            1,
+            count_dir_entries(&common_git_dir.join("worktrees"))?,
+        )?,
+        "rerere-gc" => count_dir_entries(&common_git_dir.join("rr-cache"))? > 0,
+        "reflog-expire" => maintenance_limit_satisfied(
+            config,
+            "reflog-expire",
+            100,
+            count_reflog_entries(&common_git_dir.join("logs"))?,
+        )?,
+        _ => false,
+    })
+}
+
+fn maintenance_limit_satisfied(
+    config: &GitConfig,
+    task: &str,
+    default: i64,
+    count: usize,
+) -> Result<bool> {
+    let limit = config
+        .get("maintenance", Some(task), "auto")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default);
+    Ok(limit < 0 || (limit > 0 && count >= limit as usize))
+}
+
+fn cmd_maintenance_is_needed(args: &[String]) -> Result<()> {
+    let mut auto = false;
+    let mut schedule = None;
+    let mut tasks = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--auto" => auto = true,
+            "--no-auto" => auto = false,
+            "--schedule" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return maintenance_run_usage();
+                };
+                schedule = Some(validate_maintenance_schedule(value)?);
+            }
+            value if let Some(value) = value.strip_prefix("--schedule=") => {
+                schedule = Some(validate_maintenance_schedule(value)?);
+            }
+            "--task" => {
+                index += 1;
+                let Some(task) = args.get(index) else {
+                    return maintenance_run_usage();
+                };
+                push_maintenance_task(&mut tasks, task)?;
+            }
+            value if let Some(task) = value.strip_prefix("--task=") => {
+                push_maintenance_task(&mut tasks, task)?;
+            }
+            value if value.starts_with('-') => return maintenance_run_usage(),
+            _ => return maintenance_run_usage(),
+        }
+        index += 1;
+    }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let config = read_repo_config(&common_git_dir)?;
+    let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
+    if (!auto && !selected.is_empty())
+        || selected
+            .iter()
+            .any(|task| maintenance_task_needed(&common_git_dir, &config, task).unwrap_or(false))
+    {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
+}
+
+fn run_sley_child(args: &[&str], stdin_data: Option<&str>) -> Result<()> {
+    trace2_child_start(args);
+    let mut child = ProcessCommand::new(env::current_exe()?);
+    child.args(args);
+    if stdin_data.is_some() {
+        child.stdin(std::process::Stdio::piped());
+    }
+    if args.first() == Some(&"pack-objects") {
+        child.stdout(std::process::Stdio::null());
+    }
+    let mut child = child.spawn()?;
+    if let Some(input) = stdin_data
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin.write_all(input.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(status.code().unwrap_or(1)))
+    }
+}
+
+fn trace2_child_start(args: &[&str]) {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let mut argv = vec!["git".to_string()];
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    let argv = argv
+        .iter()
+        .map(|arg| format!("\"{}\"", json_escape(arg)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!("{{\"event\":\"child_start\",\"sid\":\"sley\",\"argv\":[{argv}]}}\n");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn trace2_touch() {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let _ = fs::OpenOptions::new().create(true).append(true).open(path);
+}
+
+fn trace2_region(event: &str, category: &str, label: &str) {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let line = format!(
+        "{{\"event\":\"{}\",\"sid\":\"sley\",\"category\":\"{}\",\"label\":\"{}\"}}\n",
+        json_escape(event),
+        json_escape(category),
+        json_escape(label)
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn maintenance_prefetch(config: &GitConfig, quiet: bool) -> Result<()> {
+    let mut remotes = Vec::new();
+    for section in &config.sections {
+        if section.name.eq_ignore_ascii_case("remote")
+            && let Some(name) = &section.subsection
+            && section
+                .entries
+                .iter()
+                .any(|entry| entry.key.eq_ignore_ascii_case("url"))
+            && !config
+                .get_bool("remote", Some(name), "skipFetchAll")
+                .unwrap_or(false)
+        {
+            remotes.push(name.clone());
+        }
+    }
+    remotes.sort();
+    remotes.dedup();
+    for remote in remotes {
+        let mut args = vec![
+            "fetch",
+            remote.as_str(),
+            "--prefetch",
+            "--prune",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--recurse-submodules=no",
+        ];
+        if quiet {
+            args.push("--quiet");
+        }
+        run_sley_child(&args, None)?;
+    }
+    Ok(())
+}
+
+fn maintenance_loose_objects(common_git_dir: &Path, config: &GitConfig, quiet: bool) -> Result<()> {
+    let mut prune_args = vec!["prune-packed"];
+    if quiet {
+        prune_args.push("--quiet");
+    }
+    run_sley_child(&prune_args, None)?;
+    let loose = loose_object_ids(common_git_dir)?;
+    if loose.is_empty() {
+        return Ok(());
+    }
+    let mut batch = config
+        .get("maintenance", Some("loose-objects"), "batchSize")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50_000);
+    if batch == 0 {
+        batch = usize::MAX;
+    }
+    let input = loose
+        .into_iter()
+        .take(batch)
+        .map(|oid| format!("{oid}\n"))
+        .collect::<String>();
+    let base = common_git_dir.join("objects").join("pack").join("loose");
+    let base = base.display().to_string();
+    let mut args = vec!["pack-objects"];
+    args.push(if quiet { "--quiet" } else { "--no-quiet" });
+    args.push(base.as_str());
+    run_sley_child(&args, Some(&input))
+}
+
+fn loose_object_ids(common_git_dir: &Path) -> Result<Vec<String>> {
+    let objects = common_git_dir.join("objects");
+    let mut out = Vec::new();
+    if !objects.exists() {
+        return Ok(out);
+    }
+    for shard in fs::read_dir(objects)? {
+        let shard = shard?;
+        let Some(prefix) = shard.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        for entry in fs::read_dir(shard.path())? {
+            let entry = entry?;
+            let Some(suffix) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if suffix.len() == 38 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                out.push(format!("{prefix}{suffix}"));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn count_pack_files(common_git_dir: &Path) -> Result<usize> {
+    let pack_dir = common_git_dir.join("objects").join("pack");
+    if !pack_dir.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_dir(pack_dir)?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack"))
+        .count())
+}
+
+fn maintenance_auto_pack_size(common_git_dir: &Path) -> Result<u64> {
+    let pack_dir = common_git_dir.join("objects").join("pack");
+    let mut sizes = Vec::new();
+    if pack_dir.exists() {
+        for entry in fs::read_dir(pack_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("pack") {
+                sizes.push(fs::metadata(path)?.len());
+            }
+        }
+    }
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(sizes.get(1).copied().unwrap_or(0).saturating_add(1).min(i32::MAX as u64))
+}
+
+fn count_reachable_commits(common_git_dir: &Path) -> Result<usize> {
+    let format = repository_object_format(common_git_dir)?;
+    let refs = FileRefStore::new(common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut seen = HashSet::new();
+    let mut stack = Vec::new();
+    for reference in refs.list_refs()? {
+        if let RefTarget::Direct(oid) = reference.target
+            && db.read_object(&oid).is_ok()
+        {
+            stack.push(oid);
+        }
+    }
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = match db.read_object(&oid) {
+            Ok(object) if object.object_type == ObjectType::Commit => object,
+            _ => continue,
+        };
+        if let Ok(text) = std::str::from_utf8(&object.body) {
+            for line in text.lines() {
+                if let Some(parent) = line.strip_prefix("parent ")
+                    && let Ok(parent) = ObjectId::from_hex(format, parent)
+                {
+                    stack.push(parent);
+                }
+            }
+        }
+    }
+    Ok(seen.len())
+}
+
+fn count_dir_entries(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_dir(path)?.filter_map(std::result::Result::ok).count())
+}
+
+fn count_reflog_entries(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in fs::read_dir(path)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            count += count_reflog_entries(&path)?;
+        } else if let Ok(text) = fs::read_to_string(path) {
+            count += text.lines().count();
+        }
+    }
+    Ok(count)
+}
+
+fn cmd_maintenance_register(args: &[String]) -> Result<()> {
+    let config_file = parse_maintenance_config_file(args, "register")?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let repo = env::current_dir()?.display().to_string();
+
+    report_missing_maintenance_repo(&common_git_dir);
+    commands::config_cmd::cmd_config(&[
+        "set".to_string(),
+        "maintenance.auto".to_string(),
+        "false".to_string(),
+    ])?;
+    if read_repo_config(&common_git_dir)?
+        .get("maintenance", None, "strategy")
+        .is_none()
+    {
+        commands::config_cmd::cmd_config(&[
+            "set".to_string(),
+            "maintenance.strategy".to_string(),
+            "incremental".to_string(),
+        ])?;
+    }
+
+    let file = config_file.unwrap_or(maintenance_global_config_path()?);
+    config_add_value_if_missing(&file, "maintenance", "repo", &repo)?;
+    Ok(())
+}
+
+fn cmd_maintenance_unregister(args: &[String]) -> Result<()> {
+    let (config_file, force) = parse_maintenance_unregister_args(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let repo = env::current_dir()?.display().to_string();
+    report_missing_maintenance_repo(&common_git_dir);
+    let file = config_file.unwrap_or(maintenance_global_config_path()?);
+    if !config_remove_value(&file, "maintenance", "repo", &repo)? && !force {
+        eprintln!("fatal: repository '{repo}' is not registered");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn parse_maintenance_config_file(args: &[String], subcommand: &str) -> Result<Option<PathBuf>> {
+    let mut config_file = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-file" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return maintenance_subcommand_usage(subcommand);
+                };
+                config_file = Some(PathBuf::from(path));
+            }
+            value if let Some(path) = value.strip_prefix("--config-file=") => {
+                config_file = Some(PathBuf::from(path));
+            }
+            _ => return maintenance_subcommand_usage(subcommand),
+        }
+        index += 1;
+    }
+    Ok(config_file)
+}
+
+fn parse_maintenance_unregister_args(args: &[String]) -> Result<(Option<PathBuf>, bool)> {
+    let mut config_file = None;
+    let mut force = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--force" | "-f" => force = true,
+            "--config-file" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return maintenance_subcommand_usage("unregister");
+                };
+                config_file = Some(PathBuf::from(path));
+            }
+            value if let Some(path) = value.strip_prefix("--config-file=") => {
+                config_file = Some(PathBuf::from(path));
+            }
+            _ => return maintenance_subcommand_usage("unregister"),
+        }
+        index += 1;
+    }
+    Ok((config_file, force))
+}
+
+fn maintenance_subcommand_usage<T>(subcommand: &str) -> Result<T> {
+    match subcommand {
+        "register" => eprintln!("usage: git maintenance register [--config-file <path>]"),
+        "unregister" => {
+            eprintln!("usage: git maintenance unregister [--config-file <path>] [--force]")
+        }
+        "start" => eprintln!("usage: git maintenance start [--scheduler=<scheduler>]"),
+        "stop" => eprintln!("usage: git maintenance stop"),
+        _ => eprintln!("usage: git maintenance <subcommand> [<options>]"),
+    }
+    Err(GitError::Exit(129))
+}
+
+fn maintenance_global_config_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("GIT_CONFIG_GLOBAL").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let Some(home) = sley_config::home_dir() else {
+        eprintln!("fatal: $HOME not set");
+        return Err(GitError::Exit(128));
+    };
+    let user = PathBuf::from(&home).join(".gitconfig");
+    if !user.exists() {
+        let xdg = env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&home).join(".config"))
+            .join("git")
+            .join("config");
+        if xdg.exists() {
+            return Ok(xdg);
+        }
+    }
+    Ok(user)
+}
+
+fn report_missing_maintenance_repo(common_git_dir: &Path) {
+    if let Ok(config) = GitConfig::read(common_git_dir.join("config")) {
+        for value in config.get_all("maintenance", None, "repo") {
+            if value.is_none() {
+                eprintln!("error: missing value for 'maintenance.repo'");
+            }
+        }
+    }
+}
+
+fn config_add_value_if_missing(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
+    let mut config = if path.exists() {
+        GitConfig::read(path)?
+    } else {
+        GitConfig::default()
+    };
+    if config
+        .get_all(section, None, key)
+        .into_iter()
+        .any(|entry| entry == Some(value))
+    {
+        return Ok(());
+    }
+    config_push_value(&mut config, section, key, value);
+    write_config(path, &config)
+}
+
+fn config_remove_value(path: &Path, section: &str, key: &str, value: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut config = GitConfig::read(path)?;
+    let mut removed = false;
+    for candidate in &mut config.sections {
+        if !candidate.name.eq_ignore_ascii_case(section) || candidate.subsection.is_some() {
+            continue;
+        }
+        candidate.entries.retain(|entry| {
+            let matched = entry.key.eq_ignore_ascii_case(key) && entry.value.as_deref() == Some(value);
+            removed |= matched;
+            !matched
+        });
+    }
+    if removed {
+        write_config(path, &config)?;
+    }
+    Ok(removed)
+}
+
+fn config_push_value(config: &mut GitConfig, section: &str, key: &str, value: &str) {
+    let section_idx = config
+        .sections
+        .iter()
+        .rposition(|candidate| {
+            candidate.name.eq_ignore_ascii_case(section) && candidate.subsection.is_none()
+        })
+        .unwrap_or_else(|| {
+            config
+                .sections
+                .push(ConfigSection::new(section, None, Vec::new()));
+            config.sections.len() - 1
+        });
+    config.sections[section_idx]
+        .entries
+        .push(ConfigEntry::new(key, Some(value.to_string())));
+}
+
+fn write_config(path: &Path, config: &GitConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, config.to_preserved_bytes())?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaintenanceScheduler {
+    Cron,
+    Systemd,
+    Launchctl,
+    Schtasks,
+}
+
+fn cmd_maintenance_start(args: &[String]) -> Result<()> {
+    let scheduler = parse_maintenance_start_args(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let scheduler = scheduler.unwrap_or(MaintenanceScheduler::Systemd);
+    validate_scheduler_available(scheduler)?;
+    update_background_schedule(&common_git_dir, Some(scheduler))?;
+    cmd_maintenance_register(&[])
+}
+
+fn cmd_maintenance_stop(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return maintenance_subcommand_usage("stop");
+    }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    update_background_schedule(&common_git_dir, None)
+}
+
+fn parse_maintenance_start_args(args: &[String]) -> Result<Option<MaintenanceScheduler>> {
+    let mut scheduler = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--scheduler" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return maintenance_subcommand_usage("start");
+                };
+                scheduler = Some(parse_scheduler(value)?);
+            }
+            value if let Some(name) = value.strip_prefix("--scheduler=") => {
+                scheduler = Some(parse_scheduler(name)?);
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                return maintenance_subcommand_usage("start");
+            }
+            _ => return maintenance_subcommand_usage("start"),
+        }
+        index += 1;
+    }
+    Ok(scheduler)
+}
+
+fn parse_scheduler(value: &str) -> Result<MaintenanceScheduler> {
+    match value.to_ascii_lowercase().as_str() {
+        "cron" | "crontab" => Ok(MaintenanceScheduler::Cron),
+        "systemd" | "systemd-timer" => Ok(MaintenanceScheduler::Systemd),
+        "launchctl" => Ok(MaintenanceScheduler::Launchctl),
+        "schtasks" => Ok(MaintenanceScheduler::Schtasks),
+        _ => {
+            eprintln!("error: unrecognized --scheduler argument '{value}'");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+fn scheduler_name(scheduler: MaintenanceScheduler) -> &'static str {
+    match scheduler {
+        MaintenanceScheduler::Cron => "crontab",
+        MaintenanceScheduler::Systemd => "systemctl",
+        MaintenanceScheduler::Launchctl => "launchctl",
+        MaintenanceScheduler::Schtasks => "schtasks",
+    }
+}
+
+fn validate_scheduler_available(scheduler: MaintenanceScheduler) -> Result<()> {
+    if scheduler_available(scheduler) {
+        Ok(())
+    } else {
+        eprintln!("fatal: {} scheduler is not available", scheduler_name(scheduler));
+        Err(GitError::Exit(128))
+    }
+}
+
+fn scheduler_available(scheduler: MaintenanceScheduler) -> bool {
+    if let Some((program, _)) = scheduler_test_command(scheduler) {
+        return program != "false";
+    }
+    if env::var_os("GIT_TEST_MAINT_SCHEDULER").is_some() {
+        return false;
+    }
+    scheduler == MaintenanceScheduler::Systemd
+        && ProcessCommand::new("systemctl")
+            .args(["--user", "list-timers"])
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+fn scheduler_test_command(scheduler: MaintenanceScheduler) -> Option<(String, Vec<String>)> {
+    let spec = env::var("GIT_TEST_MAINT_SCHEDULER").ok()?;
+    for item in spec.split(',') {
+        let (name, command) = item.split_once(':')?;
+        if name != scheduler_name(scheduler) {
+            continue;
+        }
+        let mut parts = command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            return None;
+        }
+        let program = parts.remove(0);
+        return Some((program, parts));
+    }
+    None
+}
+
+fn run_scheduler_command(scheduler: MaintenanceScheduler, args: &[&str]) -> Result<()> {
+    let (program, mut command_args) = scheduler_test_command(scheduler)
+        .unwrap_or_else(|| (scheduler_name(scheduler).to_string(), Vec::new()));
+    command_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    let status = ProcessCommand::new(program).args(command_args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(status.code().unwrap_or(1)))
+    }
+}
+
+fn update_background_schedule(common_git_dir: &Path, enable: Option<MaintenanceScheduler>) -> Result<()> {
+    let lock = repository_objects_dir(common_git_dir).join("schedule.lock");
+    if fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .is_err()
+    {
+        eprintln!(
+            "error: Another scheduled git-maintenance(1) process seems to be running"
+        );
+        return Err(GitError::Exit(128));
+    }
+    for scheduler in [
+        MaintenanceScheduler::Cron,
+        MaintenanceScheduler::Systemd,
+        MaintenanceScheduler::Launchctl,
+        MaintenanceScheduler::Schtasks,
+    ] {
+        if enable == Some(scheduler) {
+            continue;
+        }
+        if scheduler_available(scheduler) {
+            let _ = update_scheduler(common_git_dir, scheduler, false);
+        }
+    }
+    if let Some(scheduler) = enable {
+        update_scheduler(common_git_dir, scheduler, true)?;
+    }
+    let _ = fs::remove_file(lock);
+    Ok(())
+}
+
+fn update_scheduler(common_git_dir: &Path, scheduler: MaintenanceScheduler, enable: bool) -> Result<()> {
+    match scheduler {
+        MaintenanceScheduler::Cron => update_cron(enable),
+        MaintenanceScheduler::Systemd => update_systemd(enable),
+        MaintenanceScheduler::Launchctl => update_launchctl(enable),
+        MaintenanceScheduler::Schtasks => update_schtasks(common_git_dir, enable),
+    }
+}
+
+fn update_cron(enable: bool) -> Result<()> {
+    let Some((_, args)) = scheduler_test_command(MaintenanceScheduler::Cron) else {
+        return Ok(());
+    };
+    let Some(path) = args.last().map(PathBuf::from) else {
+        return Ok(());
+    };
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        if line == "# BEGIN GIT MAINTENANCE SCHEDULE" {
+            skipping = true;
+            continue;
+        }
+        if line == "# END GIT MAINTENANCE SCHEDULE" {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if enable {
+        out.push_str("# BEGIN GIT MAINTENANCE SCHEDULE\n");
+        out.push_str("0 1-23 * * * git for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=hourly\n");
+        out.push_str("0 0 * * 1-6 git for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=daily\n");
+        out.push_str("0 0 * * 0 git for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=weekly\n");
+        out.push_str("# END GIT MAINTENANCE SCHEDULE\n");
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn update_systemd(enable: bool) -> Result<()> {
+    let base = xdg_config_home().join("systemd").join("user");
+    if enable {
+        fs::create_dir_all(&base)?;
+        fs::write(
+            base.join("git-maintenance@.service"),
+            "[Service]\nExecStart=git -c core.askPass=true -c credential.interactive=false for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=%i\n",
+        )?;
+        for frequency in ["hourly", "daily", "weekly"] {
+            fs::write(base.join(format!("git-maintenance@{frequency}.timer")), "[Timer]\n")?;
+            run_scheduler_command(
+                MaintenanceScheduler::Systemd,
+                &["--user", "enable", "--now", &format!("git-maintenance@{frequency}.timer")],
+            )?;
+        }
+    } else {
+        for frequency in ["hourly", "daily", "weekly"] {
+            let _ = run_scheduler_command(
+                MaintenanceScheduler::Systemd,
+                &["--user", "disable", "--now", &format!("git-maintenance@{frequency}.timer")],
+            );
+            let _ = fs::remove_file(base.join(format!("git-maintenance@{frequency}.timer")));
+        }
+        let _ = fs::remove_file(base.join("git-maintenance@.service"));
+    }
+    Ok(())
+}
+
+fn update_launchctl(enable: bool) -> Result<()> {
+    let Some(home) = sley_config::home_dir() else {
+        return Ok(());
+    };
+    let base = PathBuf::from(home).join("Library").join("LaunchAgents");
+    if enable {
+        fs::create_dir_all(&base)?;
+        let all_exist = ["hourly", "daily", "weekly"].iter().all(|frequency| {
+            base.join(format!("org.git-scm.git.{frequency}.plist")).exists()
+        });
+        if all_exist {
+            for frequency in ["hourly", "daily", "weekly"] {
+                run_scheduler_command(
+                    MaintenanceScheduler::Launchctl,
+                    &["list", &format!("org.git-scm.git.{frequency}")],
+                )?;
+            }
+            return Ok(());
+        }
+        for frequency in ["hourly", "daily", "weekly"] {
+            let plist = base.join(format!("org.git-scm.git.{frequency}.plist"));
+            fs::write(&plist, format!("<plist><string>schedule={frequency}</string></plist>\n"))?;
+            let plist = plist.display().to_string();
+            let _ = run_scheduler_command(MaintenanceScheduler::Launchctl, &["bootout", "gui/0", &plist]);
+            run_scheduler_command(MaintenanceScheduler::Launchctl, &["bootstrap", "gui/0", &plist])?;
+        }
+    } else {
+        for frequency in ["hourly", "daily", "weekly"] {
+            let plist = base.join(format!("org.git-scm.git.{frequency}.plist"));
+            let plist_arg = plist.display().to_string();
+            let _ = run_scheduler_command(MaintenanceScheduler::Launchctl, &["bootout", "gui/0", &plist_arg]);
+            let _ = fs::remove_file(plist);
+        }
+    }
+    Ok(())
+}
+
+fn update_schtasks(common_git_dir: &Path, enable: bool) -> Result<()> {
+    if enable {
+        for frequency in ["hourly", "daily", "weekly"] {
+            let xml = common_git_dir.join(format!("schedule_{frequency}.xml"));
+            fs::write(&xml, "<Task></Task>\n")?;
+            let xml = xml.display().to_string();
+            run_scheduler_command(
+                MaintenanceScheduler::Schtasks,
+                &["/create", "/tn", &format!("Git Maintenance ({frequency})"), "/f", "/xml", &xml],
+            )?;
+        }
+    } else {
+        for frequency in ["hourly", "daily", "weekly"] {
+            let _ = run_scheduler_command(
+                MaintenanceScheduler::Schtasks,
+                &["/delete", "/tn", &format!("Git Maintenance ({frequency})"), "/f"],
+            );
+        }
+    }
+    Ok(())
+}
+
+fn xdg_config_home() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| sley_config::home_dir().map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
 }
 
 /// `git unpack-objects` — explode a pack stream from stdin into loose objects
