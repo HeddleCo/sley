@@ -438,6 +438,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut error_unmatch = false;
     let mut show_eol = false;
     let mut debug = false;
+    let mut sparse = false;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -502,10 +503,10 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-eol" => show_eol = false,
             "--debug" => debug = true,
             "--no-debug" => debug = false,
+            "--sparse" => sparse = true,
+            "--no-sparse" => sparse = false,
             "--recurse-submodules"
             | "--no-recurse-submodules"
-            | "--sparse"
-            | "--no-sparse"
             | "--no-killed"
             | "--no-resolve-undo" => {}
             "--abbrev" => oid_abbrev = Some(7),
@@ -595,6 +596,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         && exclude_patterns.is_empty()
         && exclude_from.is_empty()
         && exclude_per_directory.is_empty()
+        && sparse
         && cwd == worktree_root
     {
         let stdout = io::stdout();
@@ -662,6 +664,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         if (cached || deleted || modified)
             && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
         {
+            let index = ls_files_display_index(&git_dir, format, index, sparse)?;
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
                 let ignored_entries = sley_worktree::ignored_index_entries(
@@ -715,6 +718,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+        let index = ls_files_display_index(&git_dir, format, index, sparse)?;
         let oid_candidates = ls_files_oid_candidates(&index);
         if unmerged {
             write_ls_files_unmerged(
@@ -777,6 +781,19 @@ fn write_ls_files_index_root_fast(
         stdout.write_all(&[terminator])?;
         Ok(())
     })
+}
+
+fn ls_files_display_index(
+    git_dir: &Path,
+    format: ObjectFormat,
+    mut index: Index,
+    sparse: bool,
+) -> Result<Index> {
+    if !sparse && index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        sley_worktree::expand_sparse_index(&mut index, &db, format)?;
+    }
+    Ok(index)
 }
 
 #[allow(clippy::too_many_arguments)]

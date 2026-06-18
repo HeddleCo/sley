@@ -1006,7 +1006,8 @@ pub fn add_update_all_tracked_filtered(
         .ok()
         .and_then(|metadata| file_mtime_parts(&metadata));
     let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
-    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache)?;
+    let prechecks =
+        tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache, false)?;
     if prechecks.is_empty() {
         return Ok(Vec::new());
     }
@@ -1791,6 +1792,14 @@ fn update_index_paths_impl(
             return Err(GitError::Exit(128));
         }
         if metadata.is_dir() {
+            if path_mode.remove
+                && !existing_range.is_empty()
+                && sley_diff_merge::gitlink_head_oid(&absolute, format).is_none()
+            {
+                remove_index_entries_with_path(&mut index.entries, &git_path);
+                reports.push(format!("add '{}'", String::from_utf8_lossy(&git_path)));
+                continue;
+            }
             // A directory is stageable only as a gitlink: when it is an
             // embedded repository with a commit checked out, git records a
             // mode-160000 entry whose oid is that commit (no object is
@@ -2082,7 +2091,8 @@ fn refresh_all_index_paths_parallel(
     quiet: bool,
     ignore_missing: bool,
 ) -> Result<UpdateIndexResult> {
-    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache)?;
+    let prechecks =
+        tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache, false)?;
     let mut needs_update = false;
     let mut index_dirty = false;
     for precheck in prechecks {
@@ -3380,8 +3390,14 @@ fn collect_short_status_with_options(
     // (git's racy-git shortcut). When HEAD matches the index, the status
     // comparison can stream directly from the parsed index and avoid building a
     // second path-sorted copy of every tracked entry.
-    let (parsed_index, stat_cache, head_matches_index) =
+    let (mut parsed_index, mut stat_cache, mut head_matches_index) =
         read_index_with_stat_cache(git_dir, format, &db)?;
+    let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, &parsed_index);
+    if sparse_checkout_active && parsed_index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        expand_sparse_index(&mut parsed_index, &db, format)?;
+        stat_cache = IndexStatCache::from_index_mtime(&parsed_index, stat_cache.index_mtime);
+        head_matches_index = false;
+    }
     if head_matches_index && !options.include_ignored {
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
         let entries = short_status_tracked_only(
@@ -3392,6 +3408,7 @@ fn collect_short_status_with_options(
             &parsed_index,
             &stat_cache,
             true,
+            sparse_checkout_active,
             options.untracked_mode,
         );
         let mut entries = entries?;
@@ -3446,6 +3463,8 @@ fn collect_short_status_with_options(
             &index,
             &worktree,
             &tracked_presence,
+            &stat_cache,
+            sparse_checkout_active,
             &submodule_dirt_map,
             options.untracked_mode,
             &mut entries,
@@ -3457,6 +3476,8 @@ fn collect_short_status_with_options(
                 index: &index,
                 worktree: &worktree,
                 tracked_presence: &tracked_presence,
+                stat_cache: &stat_cache,
+                sparse_checkout_active,
                 submodule_dirt_map: &submodule_dirt_map,
                 ignores: &ignores,
             },
@@ -3533,10 +3554,37 @@ fn collect_short_status_with_options(
     Ok(entries)
 }
 
+fn sparse_checkout_active_for_status(git_dir: &Path, index: &Index) -> bool {
+    index.is_sparse()
+        || index.entries.iter().any(IndexEntry::is_sparse_dir)
+        || sparse_checkout_config_enabled(git_dir)
+}
+
+fn sparse_checkout_active_for_borrowed_status(git_dir: &Path, index: &BorrowedIndex<'_>) -> bool {
+    index
+        .entries
+        .iter()
+        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+        || sparse_checkout_config_enabled(git_dir)
+}
+
+fn sparse_checkout_config_enabled(git_dir: &Path) -> bool {
+    GitConfig::read(git_dir.join("config"))
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
+        == Some(true)
+        || GitConfig::read(git_dir.join("config.worktree"))
+            .ok()
+            .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
+            == Some(true)
+}
+
 fn collect_status_entries_head_matches_index(
     index: &BTreeMap<Vec<u8>, TrackedEntry>,
     worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
     tracked_presence: &HashSet<Vec<u8>>,
+    stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     submodule_dirt_map: &BTreeMap<Vec<u8>, u8>,
     untracked_mode: StatusUntrackedMode,
     entries: &mut Vec<ShortStatusEntry>,
@@ -3545,6 +3593,10 @@ fn collect_status_entries_head_matches_index(
         let worktree_entry = worktree.get(path);
         let worktree_present =
             worktree_entry.is_some() || tracked_presence.contains(path.as_slice());
+        let skip_worktree = sparse_checkout_active
+            && stat_cache
+                .index_entry(path)
+                .is_some_and(index_entry_skip_worktree);
         let submodule = status_submodule_from_entries(
             path,
             index_entry,
@@ -3553,6 +3605,7 @@ fn collect_status_entries_head_matches_index(
             untracked_mode,
         );
         let worktree_code = match worktree_entry {
+            None if !worktree_present && skip_worktree => b' ',
             None if !worktree_present => b'D',
             Some(worktree_entry) if worktree_entry != index_entry => b'M',
             _ if submodule.is_some_and(|sub| sub.any()) => b'M',
@@ -3583,6 +3636,8 @@ struct StatusComparisonInputs<'a> {
     index: &'a BTreeMap<Vec<u8>, TrackedEntry>,
     worktree: &'a BTreeMap<Vec<u8>, TrackedEntry>,
     tracked_presence: &'a HashSet<Vec<u8>>,
+    stat_cache: &'a IndexStatCache,
+    sparse_checkout_active: bool,
     submodule_dirt_map: &'a BTreeMap<Vec<u8>, u8>,
     ignores: &'a IgnoreMatcher,
 }
@@ -3626,6 +3681,13 @@ fn collect_status_entries_with_head(
             ),
             None => None,
         };
+        let skip_worktree = inputs.sparse_checkout_active
+            && index_entry.is_some_and(|_| {
+                inputs
+                    .stat_cache
+                    .index_entry(&path)
+                    .is_some_and(index_entry_skip_worktree)
+            });
         let (index_code, worktree_code) =
             if head_entry.is_none() && index_entry.is_none() && worktree_entry.is_some() {
                 (b'?', b'?')
@@ -3638,6 +3700,7 @@ fn collect_status_entries_with_head(
                 };
                 let worktree_code = match (index_entry, worktree_entry) {
                     (None, Some(_)) => b'?',
+                    (Some(_), None) if !worktree_present && skip_worktree => b' ',
                     (Some(_), None) if !worktree_present => b'D',
                     (Some(left), Some(right)) if left != right => b'M',
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
@@ -3701,6 +3764,7 @@ fn short_status_tracked_only(
     index: &Index,
     stat_cache: &IndexStatCache,
     head_matches_index: bool,
+    sparse_checkout_active: bool,
     untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
     let normal_entry_count = index
@@ -3715,6 +3779,7 @@ fn short_status_tracked_only(
             format,
             index,
             stat_cache,
+            sparse_checkout_active,
             untracked_mode,
         );
     }
@@ -3732,6 +3797,7 @@ fn short_status_tracked_only(
                 index,
                 stat_cache,
                 head,
+                sparse_checkout_active,
                 untracked_mode,
             );
         }
@@ -3774,6 +3840,7 @@ fn short_status_tracked_only(
             _ => b' ',
         };
         let worktree_code = match worktree_entry.as_ref() {
+            None if sparse_checkout_active && entry.is_skip_worktree() => b' ',
             None => b'D',
             Some(worktree_entry) if *worktree_entry != index_entry => b'M',
             _ if submodule.is_some_and(|sub| sub.any()) => b'M',
@@ -3850,6 +3917,14 @@ fn short_status_borrowed_head_matches_index_if_possible(
         Err(GitError::Unsupported(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
+    let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
+    if borrowed
+        .entries
+        .iter()
+        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        return Ok(None);
+    }
     let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
         return Ok(None);
     };
@@ -3883,6 +3958,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
             format,
             &borrowed,
             &stat_cache,
+            sparse_checkout_active,
             untracked_mode,
         )?;
         if let Some(profile) = profile.as_mut() {
@@ -3900,6 +3976,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
             format,
             &borrowed,
             &stat_cache,
+            sparse_checkout_active,
             untracked_mode,
         )?;
         if let Some(profile) = profile.as_mut() {
@@ -3942,6 +4019,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
                         format,
                         &borrowed,
                         &stat_cache,
+                        sparse_checkout_active,
                         untracked_mode,
                     )
                     .map(|entries| (entries, start.elapsed().as_micros()))
@@ -3994,6 +4072,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
                 format,
                 &borrowed,
                 &stat_cache,
+                sparse_checkout_active,
                 untracked_mode,
             )
         });
@@ -4054,6 +4133,14 @@ where
         Err(GitError::Unsupported(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
+    let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
+    if borrowed
+        .entries
+        .iter()
+        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        return Ok(None);
+    }
     let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
         return Ok(None);
     };
@@ -4088,6 +4175,7 @@ where
                 format,
                 &borrowed,
                 &stat_cache,
+                sparse_checkout_active,
                 untracked_mode,
                 emit,
             )?;
@@ -4112,6 +4200,7 @@ where
                 format,
                 &borrowed,
                 &stat_cache,
+                sparse_checkout_active,
                 untracked_mode,
                 emit,
             )?;
@@ -4171,6 +4260,7 @@ where
                     format,
                     &borrowed,
                     &stat_cache,
+                    sparse_checkout_active,
                     untracked_mode,
                     emit,
                 )?;
@@ -4240,6 +4330,14 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
         Err(GitError::Unsupported(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
+    let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
+    if borrowed
+        .entries
+        .iter()
+        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        return Ok(None);
+    }
     let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
         return Ok(None);
     };
@@ -4273,6 +4371,7 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
             format,
             &borrowed,
             &stat_cache,
+            sparse_checkout_active,
             untracked_mode,
         )?;
         if let Some(profile) = profile.as_mut() {
@@ -4290,6 +4389,7 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
             format,
             &borrowed,
             &stat_cache,
+            sparse_checkout_active,
             untracked_mode,
         )?;
         if let Some(profile) = profile.as_mut() {
@@ -4326,6 +4426,7 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
                     format,
                     &borrowed,
                     &stat_cache,
+                    sparse_checkout_active,
                     untracked_mode,
                 )
                 .map(|count| (count, start.elapsed().as_micros()))
@@ -4435,9 +4536,15 @@ fn short_status_tracked_only_head_matches_index_parallel(
     format: ObjectFormat,
     index: &Index,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
-    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let prechecks = tracked_only_non_clean_prechecks_parallel(
+        worktree_root,
+        index,
+        stat_cache,
+        sparse_checkout_active,
+    )?;
 
     let mut clean_filter = None;
     let mut entries = Vec::new();
@@ -4516,10 +4623,15 @@ fn short_status_borrowed_tracked_only_head_matches_index_parallel(
     format: ObjectFormat,
     index: &BorrowedIndex<'_>,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
-    let prechecks =
-        tracked_only_borrowed_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let prechecks = tracked_only_borrowed_non_clean_prechecks_parallel(
+        worktree_root,
+        index,
+        stat_cache,
+        sparse_checkout_active,
+    )?;
 
     let mut clean_filter = None;
     let mut entries = Vec::new();
@@ -4596,14 +4708,19 @@ fn stream_short_status_borrowed_tracked_only_head_matches_index_parallel<F>(
     format: ObjectFormat,
     index: &BorrowedIndex<'_>,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     untracked_mode: StatusUntrackedMode,
     emit: &mut F,
 ) -> Result<StreamControl>
 where
     F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
 {
-    let prechecks =
-        tracked_only_borrowed_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let prechecks = tracked_only_borrowed_non_clean_prechecks_parallel(
+        worktree_root,
+        index,
+        stat_cache,
+        sparse_checkout_active,
+    )?;
 
     let mut clean_filter = None;
     for precheck in prechecks {
@@ -4682,10 +4799,15 @@ fn short_status_borrowed_tracked_only_head_matches_index_count_parallel(
     format: ObjectFormat,
     index: &BorrowedIndex<'_>,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     untracked_mode: StatusUntrackedMode,
 ) -> Result<usize> {
-    let prechecks =
-        tracked_only_borrowed_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let prechecks = tracked_only_borrowed_non_clean_prechecks_parallel(
+        worktree_root,
+        index,
+        stat_cache,
+        sparse_checkout_active,
+    )?;
 
     let mut clean_filter = None;
     let mut count = 0usize;
@@ -4735,9 +4857,15 @@ fn short_status_tracked_only_with_head_parallel(
     index: &Index,
     stat_cache: &IndexStatCache,
     head: &BTreeMap<Vec<u8>, TrackedEntry>,
+    sparse_checkout_active: bool,
     untracked_mode: StatusUntrackedMode,
 ) -> Result<Vec<ShortStatusEntry>> {
-    let prechecks = tracked_only_non_clean_prechecks_parallel(worktree_root, index, stat_cache)?;
+    let prechecks = tracked_only_non_clean_prechecks_parallel(
+        worktree_root,
+        index,
+        stat_cache,
+        sparse_checkout_active,
+    )?;
     let mut precheck_cursor = 0usize;
     let mut clean_filter = None;
     let mut entries = Vec::new();
@@ -4855,6 +4983,7 @@ fn tracked_only_non_clean_prechecks_parallel(
     worktree_root: &Path,
     index: &Index,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
 ) -> Result<Vec<TrackedOnlyPrecheck>> {
     let normal_indices = index
         .entries
@@ -4875,7 +5004,13 @@ fn tracked_only_non_clean_prechecks_parallel(
         let mut absolute = PathBuf::new();
         for idx in normal_indices {
             let entry = &index.entries[idx];
-            match tracked_only_stat_precheck(worktree_root, entry, stat_cache, &mut absolute)? {
+            match tracked_only_stat_precheck(
+                worktree_root,
+                entry,
+                stat_cache,
+                sparse_checkout_active,
+                &mut absolute,
+            )? {
                 TrackedOnlyPrecheckOutcome::Clean => {}
                 TrackedOnlyPrecheckOutcome::Deleted => {
                     prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
@@ -4900,6 +5035,7 @@ fn tracked_only_non_clean_prechecks_parallel(
                         worktree_root,
                         entry,
                         stat_cache,
+                        sparse_checkout_active,
                         &mut absolute,
                     )? {
                         TrackedOnlyPrecheckOutcome::Clean => {}
@@ -4933,6 +5069,7 @@ fn tracked_only_borrowed_non_clean_prechecks_parallel(
     worktree_root: &Path,
     index: &BorrowedIndex<'_>,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
 ) -> Result<Vec<TrackedOnlyPrecheck>> {
     let normal_indices = index
         .entries
@@ -4957,6 +5094,7 @@ fn tracked_only_borrowed_non_clean_prechecks_parallel(
                 worktree_root,
                 entry,
                 stat_cache,
+                sparse_checkout_active,
                 &mut absolute,
             )? {
                 TrackedOnlyPrecheckOutcome::Clean => {}
@@ -4983,6 +5121,7 @@ fn tracked_only_borrowed_non_clean_prechecks_parallel(
                         worktree_root,
                         entry,
                         stat_cache,
+                        sparse_checkout_active,
                         &mut absolute,
                     )? {
                         TrackedOnlyPrecheckOutcome::Clean => {}
@@ -5016,6 +5155,7 @@ fn tracked_only_stat_precheck(
     worktree_root: &Path,
     index_entry: &IndexEntry,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     if sley_index::is_gitlink(index_entry.mode) {
@@ -5031,6 +5171,9 @@ fn tracked_only_stat_precheck(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
+            if sparse_checkout_active && index_entry.is_skip_worktree() {
+                return Ok(TrackedOnlyPrecheckOutcome::Clean);
+            }
             return Ok(TrackedOnlyPrecheckOutcome::Deleted);
         }
         Err(err) => return Err(err.into()),
@@ -5053,6 +5196,7 @@ fn tracked_only_borrowed_stat_precheck(
     worktree_root: &Path,
     index_entry: &IndexEntryRef<'_>,
     stat_cache: &IndexStatCache,
+    sparse_checkout_active: bool,
     absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     if sley_index::is_gitlink(index_entry.mode) {
@@ -5067,6 +5211,9 @@ fn tracked_only_borrowed_stat_precheck(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
+            if sparse_checkout_active && index_entry.is_skip_worktree() {
+                return Ok(TrackedOnlyPrecheckOutcome::Clean);
+            }
             return Ok(TrackedOnlyPrecheckOutcome::Deleted);
         }
         Err(err) => return Err(err.into()),
@@ -7312,15 +7459,20 @@ impl SparseMatcher {
 impl ConeMatcher {
     fn compile(patterns: &[Vec<u8>]) -> Self {
         let mut matcher = ConeMatcher::default();
+        let mut positive_dirs = Vec::new();
+        let mut guarded_parent_dirs = BTreeSet::new();
         for raw in patterns {
             let line = sparse_clean_line(raw);
             if line.is_empty() || line.starts_with(b"#") {
                 continue;
             }
-            // Negated guards such as `!/*/` and `!/dir/*/` only exist to stop a
-            // recursive match from pulling in nested directories; the positive
-            // patterns already capture the cone, so we ignore the negations.
             if line.starts_with(b"!") {
+                if let Some(rest) = line.strip_prefix(b"!/")
+                    && let Some(dir) = rest.strip_suffix(b"/*/")
+                    && !dir.is_empty()
+                {
+                    guarded_parent_dirs.insert(dir.to_vec());
+                }
                 continue;
             }
             if line == b"/*" {
@@ -7332,7 +7484,7 @@ impl ConeMatcher {
                 && let Some(dir) = rest.strip_suffix(b"/")
                 && !dir.is_empty()
             {
-                matcher.recursive_dirs.push(dir.to_vec());
+                positive_dirs.push(dir.to_vec());
                 continue;
             }
             // `/dir/*` -> direct files of `dir` only (parent guard).
@@ -7342,6 +7494,13 @@ impl ConeMatcher {
             {
                 matcher.parent_dirs.push(dir.to_vec());
                 continue;
+            }
+        }
+        for dir in positive_dirs {
+            if guarded_parent_dirs.contains(&dir) {
+                matcher.parent_dirs.push(dir);
+            } else {
+                matcher.recursive_dirs.push(dir);
             }
         }
         matcher
@@ -11202,6 +11361,8 @@ pub fn apply_sparse_checkout_with_mode(
             let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             if !file_path.exists() {
                 materialize_index_entry_file(&db, worktree_root, &file_path, entry)?;
+                let metadata = fs::symlink_metadata(&file_path)?;
+                *entry = index_entry_with_refreshed_stat(entry, &metadata);
             }
             materialized.push(entry.path.as_bytes().to_vec());
         } else {
@@ -11792,6 +11953,11 @@ pub fn remove_index_and_worktree_paths(
         .iter()
         .map(|entry| entry.path.as_bytes().to_vec())
         .collect();
+    let sparse_dir_paths: BTreeSet<Vec<u8>> = index_entry_list
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
     // Paths tracked as a gitlink (mode 160000) at stage 0. Removing one of these
     // from the worktree is a *submodule* removal: git's builtin/rm.c flags the
     // entry `is_submodule = S_ISGITLINK(ce->ce_mode)` and removes the populated
@@ -11856,7 +12022,9 @@ pub fn remove_index_and_worktree_paths(
         }
         let matched = index_paths
             .iter()
-            .filter(|entry| index_entry_is_under_path(entry, &git_path))
+            .filter(|entry| {
+                !sparse_dir_paths.contains(*entry) && index_entry_is_under_path(entry, &git_path)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if matched.is_empty() {
@@ -14855,6 +15023,36 @@ mod tests {
             b"other/c.txt"
         )));
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn apply_sparse_checkout_cone_parent_guards_keep_only_direct_files() {
+        let sparse = SparseCheckout {
+            patterns: vec![
+                b"/*".to_vec(),
+                b"!/*/".to_vec(),
+                b"/deep/".to_vec(),
+                b"!/deep/*/".to_vec(),
+                b"/deep/kept/".to_vec(),
+            ],
+            sparse_index: false,
+        };
+
+        assert!(path_in_sparse_checkout(
+            b"deep/file.txt",
+            &sparse,
+            SparseCheckoutMode::Cone
+        ));
+        assert!(path_in_sparse_checkout(
+            b"deep/kept/file.txt",
+            &sparse,
+            SparseCheckoutMode::Cone
+        ));
+        assert!(!path_in_sparse_checkout(
+            b"deep/dropped/file.txt",
+            &sparse,
+            SparseCheckoutMode::Cone
+        ));
     }
 
     #[test]
