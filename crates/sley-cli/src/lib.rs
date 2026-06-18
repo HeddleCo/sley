@@ -1055,6 +1055,15 @@ fn resolve_add_update_actions(
 }
 
 fn add_path_matches(path: &Path, pathspec: &Path) -> bool {
+    let pathspec_text = pathspec.to_string_lossy();
+    if sley_worktree::pathspec_is_glob(pathspec_text.as_bytes()) {
+        let path_text = path.to_string_lossy();
+        return sley_worktree::pathspec_item_matches(
+            pathspec_text.as_bytes(),
+            path_text.as_bytes(),
+            sley_worktree::PathspecMatchMagic::default(),
+        );
+    }
     path == pathspec || path.starts_with(pathspec)
 }
 
