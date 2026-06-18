@@ -749,16 +749,17 @@ pub fn install_fetch_pack_via_local_upload_pack(
         return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    // A deepen request must always run: even when every want is already present
-    // the shallow boundary may move (mirrors the SSH path).
-    if deepen.is_none()
-        && wants
-            .iter()
-            .map(|want| local_db.contains(want))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .all(|contains| contains)
-    {
+    let all_wants_present = wants
+        .iter()
+        .map(|want| local_db.contains(want))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .all(|contains| contains);
+    let deepen_noop = match deepen {
+        Some(plan) => plan.shallow_info.is_empty() && plan.extra_wants.is_empty(),
+        None => true,
+    };
+    if all_wants_present && deepen_noop {
         return Ok(Vec::new());
     }
 
@@ -833,6 +834,9 @@ pub fn install_fetch_pack_via_local_upload_pack(
         None => collect_reachable_object_ids(&remote_db, format, known_haves)?,
     };
     let mut starts = decoded_request.wants;
+    for want in &starts {
+        excluded.remove(want);
+    }
     if let Some(plan) = deepen {
         // Stop the pack walk at the shallow boundary and pack the history a
         // moved boundary newly exposes.
@@ -1096,14 +1100,13 @@ fn local_fetch_v2_sections(
 
     // Resolve want-refs into concrete wants for the pack walk.
     let mut wants: Vec<ObjectId> = request.wants.clone();
-    if !request.want_refs.is_empty() {
-        if let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
+    if !request.want_refs.is_empty()
+        && let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
             .iter()
             .find(|s| matches!(s, ProtocolV2FetchResponseSection::WantedRefs(_)))
-        {
-            for w in wanted {
-                wants.push(w.oid);
-            }
+    {
+        for w in wanted {
+            wants.push(w.oid);
         }
     }
 
@@ -1143,13 +1146,9 @@ pub fn serve_upload_pack_v2(
     write_protocol_v2_advertisement(writer, &handshake)?;
     writer.flush()?;
 
-    loop {
-        let request = match read_protocol_v2_command_request(reader) {
-            Ok(request) => request,
-            // EOF / a lone flush after the advertisement ends the session: the
-            // client disconnected (e.g. `ls-remote` reads the refs and leaves).
-            Err(_) => break,
-        };
+    // EOF / a lone flush after the advertisement ends the session: the client
+    // disconnected (e.g. `ls-remote` reads the refs and leaves).
+    while let Ok(request) = read_protocol_v2_command_request(reader) {
         match request.command.as_str() {
             "ls-refs" => {
                 let ls_refs = ProtocolV2LsRefsRequest::from_command_request(&request)?;

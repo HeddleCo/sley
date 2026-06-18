@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::RepositoryLayout;
+use sley_object::{Commit, ObjectType, Tree};
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 use sley_transport::RemoteUrl;
 
@@ -309,6 +311,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     // smudge-side checkout filters. Pointing `HEAD` only updates refs, so it does
     // not change the config `configure_branch` returns.
     let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
+    fetch_local_partial_clone_checkout_blobs(&request, &git_dir, branch_oid)?;
     if !request.options.single_branch
         || request.options.checkout_branch == request.options.remote_head_branch
     {
@@ -339,6 +342,78 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         branch_oid: Some(branch_oid),
         empty: false,
     })
+}
+
+fn fetch_local_partial_clone_checkout_blobs(
+    request: &CloneRequest<'_>,
+    git_dir: &Path,
+    commit_oid: ObjectId,
+) -> Result<()> {
+    if request.options.filter != Some(sley_odb::PackObjectFilter::BlobNone) {
+        return Ok(());
+    }
+    let CloneSource::Local {
+        git_dir: remote_git_dir,
+        common_git_dir: remote_common_git_dir,
+    } = request.source
+    else {
+        return Ok(());
+    };
+
+    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
+    let mut wants = Vec::new();
+    collect_checkout_blob_wants(&remote_db, request.format, commit_oid, &mut wants)?;
+    crate::local::install_fetch_pack_via_local_upload_pack(
+        git_dir,
+        remote_git_dir,
+        request.format,
+        wants,
+        None,
+        true,
+        Some(sley_odb::PackObjectFilter::BlobNone),
+        None,
+    )?;
+    Ok(())
+}
+
+fn collect_checkout_blob_wants(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: ObjectId,
+    wants: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let commit_object = db.read_object(&commit_oid)?;
+    if commit_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {commit_oid}, found {}",
+            commit_object.object_type.as_str()
+        )));
+    }
+    let commit = Commit::parse_ref(format, &commit_object.body)?;
+    collect_tree_blob_wants(db, format, commit.tree, wants)
+}
+
+fn collect_tree_blob_wants(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: ObjectId,
+    wants: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let tree_object = db.read_object(&tree_oid)?;
+    if tree_object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            tree_object.object_type.as_str()
+        )));
+    }
+    for entry in Tree::parse(format, &tree_object.body)?.entries {
+        if entry.is_tree() {
+            collect_tree_blob_wants(db, format, entry.oid, wants)?;
+        } else if !entry.is_gitlink() {
+            wants.push(entry.oid);
+        }
+    }
+    Ok(())
 }
 
 /// The fixed [`FetchOptions`] a clone fetch uses: quiet, auto-follow tags, write
