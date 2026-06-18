@@ -501,12 +501,12 @@ declare -A FLOOR=(
     [t5324-split-commit-graph.sh]=11
     [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
-    [t5505-remote.sh]=90
+    [t5505-remote.sh]=93
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
     [t5516-fetch-push.sh]=57
     [t5520-pull.sh]=23
-    [t5601-clone.sh]=62
+    [t5601-clone.sh]=72
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
