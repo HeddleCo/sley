@@ -425,6 +425,8 @@ where
 pub enum PackObjectFilter {
     /// `blob:none`: omit every blob reached through tree traversal.
     BlobNone,
+    /// `blob:limit=<n>`: omit traversed blobs whose body is at least `n` bytes.
+    BlobLimit(u64),
 }
 
 /// [`build_and_install_reachable_pack`] with an optional partial-clone
@@ -452,6 +454,13 @@ where
         Some(PackObjectFilter::BlobNone) => {
             objects.retain(|entry| {
                 entry.object.object_type != ObjectType::Blob || wanted.contains(&entry.oid)
+            });
+        }
+        Some(PackObjectFilter::BlobLimit(limit)) => {
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob
+                    || wanted.contains(&entry.oid)
+                    || (entry.object.body.len() as u64) < limit
             });
         }
         None => {}

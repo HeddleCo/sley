@@ -261,6 +261,7 @@ mod tests {
             depth,
             merge_srcs: Vec::new(),
             filter: None,
+            refetch: false,
             cloning: false,
             update_shallow: false,
             deepen_relative: false,

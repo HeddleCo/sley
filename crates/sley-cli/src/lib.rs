@@ -4770,6 +4770,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         None,
         true,
         None,
+        false,
         None,
     )?;
     Ok(true)

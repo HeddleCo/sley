@@ -817,6 +817,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     deepen: Option<&LocalDeepenPlan>,
     promisor: bool,
     filter: Option<sley_odb::PackObjectFilter>,
+    refetch: bool,
     unpack_limit: Option<usize>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
@@ -833,7 +834,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         Some(plan) => plan.shallow_info.is_empty() && plan.extra_wants.is_empty(),
         None => true,
     };
-    if all_wants_present && deepen_noop {
+    if all_wants_present && deepen_noop && !refetch {
         return Ok(Vec::new());
     }
 
@@ -860,7 +861,11 @@ pub fn install_fetch_pack_via_local_upload_pack(
     let decoded_request = read_upload_pack_request(format, &mut encoded_request.as_slice())?
         .ok_or_else(|| GitError::InvalidFormat("encoded upload-pack request was empty".into()))?;
 
-    let haves = local_have_oids(git_dir, format)?;
+    let haves = if refetch {
+        Vec::new()
+    } else {
+        local_have_oids(git_dir, format)?
+    };
     let negotiation = UploadPackNegotiationRequest { haves, done: true };
     let mut encoded_negotiation = Vec::new();
     write_upload_pack_negotiation_request(&mut encoded_negotiation, &negotiation)?;
@@ -1003,6 +1008,9 @@ fn trace2_fetch_info(
     }
     let filter_json = match filter {
         Some(sley_odb::PackObjectFilter::BlobNone) => "\"blob:none\"".to_string(),
+        Some(sley_odb::PackObjectFilter::BlobLimit(limit)) => {
+            format!("\"blob:limit={limit}\"")
+        }
         None => "null".to_string(),
     };
     let line = format!(

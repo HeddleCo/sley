@@ -104,6 +104,9 @@ pub struct FetchOptions {
     /// must gate that before calling [`fetch`]. Directly-wanted tips are always
     /// packed on the local path, mirroring upstream's filter traversal.
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// `--refetch`: ignore local haves so existing reachable commits can be
+    /// repacked under a newly requested partial-clone filter.
+    pub refetch: bool,
     /// This fetch is a clone (`fetch_pack_args.cloning`): shallow points sent
     /// by a shallow server are accepted into `$GIT_DIR/shallow` unconditionally.
     pub cloning: bool,
@@ -625,7 +628,17 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     };
                 }
             }
-            let starts: Vec<ObjectId> = updates.iter().map(|update| update.oid).collect();
+            let starts: Vec<ObjectId> = if options.refetch {
+                let mut seen = HashSet::new();
+                updates
+                    .iter()
+                    .map(|update| update.oid)
+                    .chain(primary_heads.iter().copied())
+                    .filter(|oid| seen.insert(*oid))
+                    .collect()
+            } else {
+                updates.iter().map(|update| update.oid).collect()
+            };
             let shallow_info = if starts.is_empty() && deepen_plan.is_none() {
                 Vec::new()
             } else {
@@ -637,6 +650,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     deepen_plan.as_ref(),
                     promisor_remote,
                     options.filter,
+                    options.refetch,
                     None,
                 )?
             };
@@ -1573,6 +1587,7 @@ mod tests {
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
+            refetch: false,
             cloning: false,
             update_shallow: false,
             deepen_relative: false,

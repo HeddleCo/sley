@@ -1765,6 +1765,7 @@ fn prefetch_local_promisor_checkout_blobs(
         None,
         true,
         None,
+        false,
         None,
     )?;
     Ok(true)

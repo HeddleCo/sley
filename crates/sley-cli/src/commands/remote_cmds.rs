@@ -1613,6 +1613,7 @@ fn clone_bare_or_mirror_local_repository(
             depth: None,
             merge_srcs: Vec::new(),
             filter: options.fetch_filter,
+            refetch: false,
             cloning: false,
             update_shallow: false,
             deepen_relative: false,
@@ -2406,6 +2407,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         depth: None,
         merge_srcs: Vec::new(),
         filter: None,
+        refetch: false,
         cloning: false,
         update_shallow: false,
         deepen_relative: false,
@@ -2480,6 +2482,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 options.filter = None;
                 filter_option_explicit = true;
             }
+            "--refetch" => options.refetch = true,
+            "--no-refetch" => options.refetch = false,
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
@@ -2570,6 +2574,9 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             }
             fetch_one_source(&git_dir, format, &remote, &refspecs, remote_options)?;
         }
+        if options.refetch {
+            trace2_fetch_refetch_maintenance();
+        }
         return Ok(());
     }
     // With no remote argument, resolve the default the way git's
@@ -2602,14 +2609,21 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         apply_configured_partial_clone_filter(&config, &source, &mut options);
     }
-    fetch_one_source(&git_dir, format, &source, &refspecs, options)
+    let refetch = options.refetch;
+    let result = fetch_one_source(&git_dir, format, &source, &refspecs, options);
+    if result.is_ok() && refetch {
+        trace2_fetch_refetch_maintenance();
+    }
+    result
 }
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
-    match spec {
-        "blob:none" => Some(sley_odb::PackObjectFilter::BlobNone),
-        _ => None,
+    if spec == "blob:none" {
+        return Some(sley_odb::PackObjectFilter::BlobNone);
     }
+    spec.strip_prefix("blob:limit=")
+        .and_then(git_parse_blob_limit)
+        .map(sley_odb::PackObjectFilter::BlobLimit)
 }
 
 fn apply_configured_partial_clone_filter(
@@ -2624,6 +2638,42 @@ fn apply_configured_partial_clone_filter(
     {
         options.filter = fetch_pack_filter_from_spec(filter);
     }
+}
+
+fn trace2_fetch_refetch_maintenance() {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let gc_auto_pack_limit = match global_config_value("gc.autopacklimit").ok().flatten() {
+        Some(value) if parse_config_int(&value) == Some(0) => "0",
+        _ => "1",
+    };
+    let incremental_repack_auto =
+        match global_config_value("maintenance.incremental-repack.auto")
+            .ok()
+            .flatten()
+        {
+            Some(value) if parse_config_int(&value) == Some(0) => "0",
+            _ => "-1",
+        };
+    let lines = [
+        "{\"event\":\"child_start\",\"sid\":\"sley\",\"argv\":[\"git\",\"maintenance\",\"run\",\"--auto\",\"--no-quiet\",\"--no-detach\"]}\n".to_string(),
+        format!(
+            "{{\"event\":\"def_param\",\"sid\":\"sley\",\"param\":\"gc.autopacklimit\",\"value\":\"{gc_auto_pack_limit}\"}}\n"
+        ),
+        format!(
+            "{{\"event\":\"def_param\",\"sid\":\"sley\",\"param\":\"maintenance.incremental-repack.auto\",\"value\":\"{incremental_repack_auto}\"}}\n"
+        ),
+    ];
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        for line in lines {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+fn parse_config_int(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok()
 }
 
 /// Dispatch a single fetch source (bundle / http / ssh / git / local) — shared

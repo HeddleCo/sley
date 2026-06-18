@@ -4839,6 +4839,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         depth,
         merge_srcs: merge_srcs.clone(),
         filter: None,
+        refetch: false,
         cloning: false,
         update_shallow: false,
         deepen_relative: false,

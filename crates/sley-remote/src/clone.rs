@@ -412,6 +412,7 @@ fn fetch_local_partial_clone_checkout_blobs(
         None,
         true,
         Some(sley_odb::PackObjectFilter::BlobNone),
+        false,
         None,
     )?;
     Ok(())
@@ -480,6 +481,7 @@ fn clone_fetch_options(
         depth,
         merge_srcs: Vec::new(),
         filter,
+        refetch: false,
         cloning: true,
         update_shallow: false,
         deepen_relative: false,
