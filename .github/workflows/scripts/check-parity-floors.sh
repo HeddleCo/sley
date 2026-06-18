@@ -443,7 +443,11 @@ declare -A FLOOR=(
     [t3400-rebase.sh]=19
     [t3422-rebase-incompatible-options.sh]=52
     [t3403-rebase-skip.sh]=16
-    [t3404-rebase-interactive.sh]=63
+    # codex-wave-8 (rebase-i r2): squash/fixup conflict-resume cleanup, partial
+    # pathspec staging before pre-commit, post-commit on replay/start, rebase-vs-
+    # cherry-pick error precedence. t3404 63->80. Neighbors held: t3400=19,
+    # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
+    [t3404-rebase-interactive.sh]=80
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=11
     [t3420-rebase-autostash.sh]=40
