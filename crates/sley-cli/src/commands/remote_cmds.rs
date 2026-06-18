@@ -5695,7 +5695,16 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
         trace2_remote_rename_progress();
     }
     if rename_tracking_refs {
-        rename_remote_tracking_refs(&git_dir, format, old, new)
+        match rename_remote_tracking_refs(&git_dir, format, old, new) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                eprintln!("error: renaming remote references failed");
+                eprintln!(
+                    "error: The remote you are trying to rename has conflicting references"
+                );
+                Err(GitError::Exit(1))
+            }
+        }
     } else {
         Ok(())
     }
@@ -5788,10 +5797,12 @@ fn rename_remote_tracking_refs(
     let new_prefix = format!("refs/remotes/{new}/");
     let refs = store.list_refs()?;
     let mut tx = store.transaction();
+    let mut old_ref_names = Vec::new();
     for reference in refs {
         let Some(suffix) = reference.name.strip_prefix(&old_prefix) else {
             continue;
         };
+        old_ref_names.push(reference.name.clone());
         let target = match reference.target {
             RefTarget::Symbolic(target) => RefTarget::Symbolic(
                 target
@@ -5809,9 +5820,23 @@ fn rename_remote_tracking_refs(
         });
     }
     tx.commit()?;
+    for name in old_ref_names {
+        match store.read_ref(&name)? {
+            Some(RefTarget::Symbolic(_)) => {
+                let _ = store.delete_symbolic_ref(&name)?;
+            }
+            Some(RefTarget::Direct(_)) => {
+                let _ = store.delete_ref(&name)?;
+            }
+            None => {}
+        }
+    }
     remove_remote_packed_refs(git_dir, format, &old_prefix)?;
-    remove_remote_ref_dir(git_dir, "refs", old)?;
-    rename_remote_ref_dir(git_dir, "logs/refs", old, new)?;
+    let nested = new.starts_with(&format!("{old}/")) || old.starts_with(&format!("{new}/"));
+    if !nested {
+        remove_remote_ref_dir(git_dir, "refs", old)?;
+        rename_remote_ref_dir(git_dir, "logs/refs", old, new)?;
+    }
     Ok(())
 }
 
@@ -5943,8 +5968,10 @@ fn remove_remote_packed_refs(git_dir: &Path, format: ObjectFormat, old_prefix: &
 
 fn remove_remote_ref_dir(git_dir: &Path, root: &str, remote: &str) -> Result<()> {
     let path = git_dir.join(root).join("remotes").join(remote);
-    if path.exists() {
+    if path.is_dir() {
         fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
