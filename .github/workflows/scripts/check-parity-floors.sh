@@ -578,6 +578,13 @@ declare -A FLOOR=(
     [t5516-fetch-push.sh]=72
     [t5520-pull.sh]=38
     [t5601-clone.sh]=72
+    # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
+    # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
+    # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's
+    # FetchOptions{record_promisor_refs,refetch} fields back-filled into protoallow's
+    # remote-add fetch constructor (E0063, both=false). proto suites stayed FULL
+    # (t5810=54 t5813=81 t5814=27); object-read held t6000=11 t8002=128 t7600=83.
+    [t5616-partial-clone.sh]=36
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
