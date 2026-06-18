@@ -98,6 +98,8 @@ pub fn ls_remote(
     #[cfg_attr(not(feature = "http"), allow(unused_variables))]
     credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
+    crate::protocol::check_transport_allowed(scheme_for_ls_remote_source(source), None, None)
+        .map_err(crate::protocol::transport_policy_git_error)?;
     match source {
         #[cfg(feature = "http")]
         LsRemoteSource::Http(remote) => {
@@ -110,6 +112,15 @@ pub fn ls_remote(
         LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
         LsRemoteSource::Git(remote) => crate::git::ls_remote_git(remote, filter, matches),
         LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
+    }
+}
+
+fn scheme_for_ls_remote_source(source: &LsRemoteSource) -> &'static str {
+    match source {
+        LsRemoteSource::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        LsRemoteSource::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        LsRemoteSource::Git(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        LsRemoteSource::Local { .. } => "file",
     }
 }
 

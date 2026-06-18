@@ -111,6 +111,12 @@ pub use capabilities::{
     THIN_PACK_PUSH_SUPPORTED, TransportCapabilities,
 };
 
+mod protocol;
+pub use protocol::{
+    TransportPolicyError, check_transport_allowed, is_transport_allowed,
+    transport_scheme_for_remote, transport_scheme_for_url,
+};
+
 mod resolve;
 pub use resolve::{
     fetch_source_for_url, fetch_url, push_destination_for_url, push_url, resolve_fetch_source,

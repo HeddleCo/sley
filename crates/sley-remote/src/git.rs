@@ -12,7 +12,7 @@ use std::path::Path;
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
-use sley_odb::{FileObjectDatabase, build_reachable_pack, collect_reachable_object_ids};
+use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
@@ -334,14 +334,19 @@ pub(crate) fn execute_push_git_plan(
         .ok_or_else(|| GitError::Command("git:// receive-pack stream was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let remote_excluded_tips =
-        crate::remote_advertisement_tips_known_to_local(&local_db, &plan.advertisements)?;
-    let remote_excluded =
-        collect_reachable_object_ids(&local_db, request.format, remote_excluded_tips)?;
-    let starts = crate::pack::push_pack_roots(&commands, &plan.pack_objects);
-    let packfile = build_reachable_pack(&local_db, request.format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
+    let packfile = crate::pack::build_push_packfile(&crate::pack::PushPackRequest {
+        local_db: &local_db,
+        format: request.format,
+        commands: &commands,
+        pack_objects: &plan.pack_objects,
+        remote_advertisements: &plan.advertisements,
+        features: &plan.features,
+        options: ReceivePackPushRequestOptions {
+            ofs_delta: plan.features.ofs_delta,
+            ..ReceivePackPushRequestOptions::default()
+        },
+        thin: false,
+    })?;
     let receive_request = build_receive_pack_push_request(
         &plan.features,
         commands.clone(),

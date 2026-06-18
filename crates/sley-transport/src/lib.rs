@@ -43,6 +43,7 @@ pub struct GitProtocolHeader {
 pub enum RemoteTransport {
     Local,
     File,
+    Ext,
     Ssh,
     Git,
     Http,
@@ -354,6 +355,22 @@ pub fn write_service_discovery_response(
 
 pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
     validate_remote_url_value(value)?;
+    if let Some(command) = value.strip_prefix("ext::") {
+        if command.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "ext remote command is empty".into(),
+            ));
+        }
+        validate_remote_path("ext remote command", command)?;
+        return Ok(RemoteUrl {
+            transport: RemoteTransport::Ext,
+            user: None,
+            password: None,
+            host: None,
+            port: None,
+            path: command.to_string(),
+        });
+    }
     if let Some((scheme, rest)) = value.split_once("://") {
         return parse_remote_url_with_scheme(scheme, rest);
     }
@@ -856,20 +873,20 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
                 path: rest.to_string(),
             })
         }
-        "ssh" | "git" | "http" | "https" => {
+        "ssh" | "git+ssh" | "ssh+git" | "git" | "http" | "https" => {
             let is_http = scheme == "http" || scheme == "https";
             let (authority, path) = split_remote_authority_and_path(rest)?;
             // Only http(s) userinfo may carry an embedded password; SSH/git keep
             // their authority verbatim so existing behavior does not regress.
             let (user, password, host, port) = parse_remote_authority(authority, true, is_http)?;
-            let path = if scheme == "ssh" {
+            let path = if matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git") {
                 percent_decode_remote_path(&path)?
             } else {
                 path
             };
             Ok(RemoteUrl {
                 transport: match scheme.as_str() {
-                    "ssh" => RemoteTransport::Ssh,
+                    "ssh" | "git+ssh" | "ssh+git" => RemoteTransport::Ssh,
                     "git" => RemoteTransport::Git,
                     "http" => RemoteTransport::Http,
                     "https" => RemoteTransport::Https,

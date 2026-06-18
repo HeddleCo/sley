@@ -166,15 +166,9 @@ fn handle_connection(opts: &DaemonOptions, mut stream: TcpStream) -> Result<()> 
 
     // Match `git-<service> <path>`.
     let (service, path) = parse_service_line(line)?;
-    let receive = match service {
+    let requested_receive_pack = match service {
         "upload-pack" => false,
-        "receive-pack" => {
-            if !opts.enable_receive_pack {
-                write_error(&mut stream, "service not enabled")?;
-                return Ok(());
-            }
-            true
-        }
+        "receive-pack" => true,
         other => {
             write_error(&mut stream, &format!("unknown service git-{other}"))?;
             return Ok(());
@@ -187,9 +181,14 @@ fn handle_connection(opts: &DaemonOptions, mut stream: TcpStream) -> Result<()> 
         return Ok(());
     };
 
+    if requested_receive_pack && !receive_pack_enabled(opts, &repo) {
+        write_error(&mut stream, "service not enabled")?;
+        return Ok(());
+    }
+
     loginfo(opts, &format!("Request {service} for '{}'", repo.display()));
 
-    run_service(&repo, receive, git_protocol.as_deref(), stream)
+    run_service(&repo, requested_receive_pack, git_protocol.as_deref(), stream)
 }
 
 /// Split `git-<service> <path>` into `(service, path)`.
@@ -262,6 +261,21 @@ fn resolve_repository(opts: &DaemonOptions, path: &str) -> Result<Option<PathBuf
         }
     }
     Ok(Some(repo))
+}
+
+fn receive_pack_enabled(opts: &DaemonOptions, repo: &Path) -> bool {
+    if opts.enable_receive_pack {
+        return true;
+    }
+    let git_dir = if repo.join("config").is_file() && repo.join("objects").is_dir() {
+        repo.to_path_buf()
+    } else {
+        repo.join(".git")
+    };
+    sley_config::read_repo_config(&git_dir, None)
+        .ok()
+        .and_then(|config| config.get_bool("daemon", None, "receivepack"))
+        .unwrap_or(false)
 }
 
 /// Run the resolved service against `repo` by re-executing this binary

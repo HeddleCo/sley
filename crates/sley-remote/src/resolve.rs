@@ -32,7 +32,7 @@ pub fn transport_kind_for_url(url: &str) -> Result<Option<RemoteTransportKind>> 
     }
     Ok(match parse_remote_url(url)?.transport {
         RemoteTransport::Http | RemoteTransport::Https => Some(RemoteTransportKind::Http),
-        RemoteTransport::Ssh => Some(RemoteTransportKind::Ssh),
+        RemoteTransport::Ssh | RemoteTransport::Ext => Some(RemoteTransportKind::Ssh),
         RemoteTransport::Git => Some(RemoteTransportKind::Git),
         RemoteTransport::Local | RemoteTransport::File => Some(RemoteTransportKind::Local),
     })
@@ -88,7 +88,7 @@ impl FetchSource {
         match source {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
-                RemoteTransport::Ssh => Self::Ssh(remote),
+                RemoteTransport::Ssh | RemoteTransport::Ext => Self::Ssh(remote),
                 RemoteTransport::Git => Self::Git(remote),
                 RemoteTransport::Local | RemoteTransport::File => {
                     unreachable!("local remotes use FetchSource::Local")
@@ -110,7 +110,7 @@ impl PushDestination {
         match source {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
-                RemoteTransport::Ssh => Self::Ssh(remote),
+                RemoteTransport::Ssh | RemoteTransport::Ext => Self::Ssh(remote),
                 RemoteTransport::Git => Self::Git(remote),
                 RemoteTransport::Local | RemoteTransport::File => {
                     unreachable!("local remotes use PushDestination::Local")
@@ -132,6 +132,7 @@ fn source_from_parsed(parsed: &RemoteUrl, relative_base: &Path) -> Result<Concre
         RemoteTransport::Http
         | RemoteTransport::Https
         | RemoteTransport::Ssh
+        | RemoteTransport::Ext
         | RemoteTransport::Git => Ok(ConcreteRemote::Network(parsed.clone())),
         RemoteTransport::Local | RemoteTransport::File => {
             let repo_path = local_repository_path(parsed, relative_base)?;

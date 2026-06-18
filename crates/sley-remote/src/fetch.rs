@@ -193,6 +193,12 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     let mut options = request.options.clone();
     apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
     apply_configured_fetch_prune_option(request.config, request.remote_name, &mut options);
+    crate::protocol::check_transport_allowed(
+        scheme_for_fetch_source(request.source),
+        Some(request.config),
+        None,
+    )
+    .map_err(crate::protocol::transport_policy_git_error)?;
     let promisor_remote = request
         .config
         .get_bool("remote", Some(request.remote_name), "promisor")
@@ -672,6 +678,15 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     }
 
     Ok(outcome)
+}
+
+fn scheme_for_fetch_source(source: &FetchSource) -> &'static str {
+    match source {
+        FetchSource::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        FetchSource::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        FetchSource::Git(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        FetchSource::Local { .. } => "file",
+    }
 }
 
 /// Does the (graft-aware) history of `tip` on the remote touch one of the

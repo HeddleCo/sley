@@ -75,12 +75,16 @@ pub fn build_push_packfile(req: &PushPackRequest<'_>) -> Result<Vec<u8>> {
     if req.thin && !req.features.no_thin {
         build_thin_push_packfile(req, starts, &remote_excluded)
     } else {
-        Ok(
-            build_reachable_pack(req.local_db, req.format, starts, &remote_excluded)?
-                .map(|pack| pack.pack)
-                .unwrap_or_default(),
-        )
+        match build_reachable_pack(req.local_db, req.format, starts, &remote_excluded)? {
+            Some(pack) => Ok(pack.pack),
+            None => empty_packfile(req.format),
+        }
     }
+}
+
+fn empty_packfile(format: ObjectFormat) -> Result<Vec<u8>> {
+    let inputs: Vec<PackInput<'_>> = Vec::new();
+    PackFile::write_packed_with_known_ids(&inputs, format).map(|pack| pack.pack)
 }
 
 pub(crate) fn push_pack_roots(
