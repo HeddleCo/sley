@@ -2164,8 +2164,12 @@ fn update_ref_stdin_symref_verify(
     validate_ref_name(name)?;
     match (store.read_ref(name)?, expected) {
         (None, None) => Ok(()),
-        (None, Some(_)) | (Some(RefTarget::Direct(_)), Some(_)) => {
-            update_ref_stdin_symref_unresolved(name)
+        (None, Some(_)) => update_ref_stdin_symref_unresolved(name),
+        (Some(RefTarget::Direct(_)), Some(expected)) => {
+            eprintln!(
+                "fatal: cannot lock ref '{name}': expected symref with target '{expected}': but is a regular ref"
+            );
+            Err(GitError::Exit(128))
         }
         (Some(RefTarget::Direct(_)), None) => update_ref_stdin_symref_exists(name, false),
         (Some(RefTarget::Symbolic(_)), None) => update_ref_stdin_symref_exists(name, true),
@@ -2199,9 +2203,19 @@ fn update_ref_stdin_symref_delete(
     name: &str,
     expected: Option<&str>,
 ) -> Result<()> {
-    update_ref_stdin_symref_verify(store, name, expected)?;
-    if store.read_ref(name)?.is_some() {
-        let _ = store.delete_symbolic_ref(name)?;
+    validate_ref_name(name)?;
+    if let Some(expected) = expected {
+        update_ref_stdin_symref_verify(store, name, Some(expected))?;
+    }
+    match store.read_ref(name)? {
+        Some(RefTarget::Symbolic(_)) => {
+            let _ = store.delete_symbolic_ref(name)?;
+        }
+        Some(RefTarget::Direct(_)) if expected.is_none() => {
+            let _ = store.delete_ref(name)?;
+        }
+        Some(RefTarget::Direct(_)) => {}
+        None => {}
     }
     Ok(())
 }
