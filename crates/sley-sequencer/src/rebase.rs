@@ -77,7 +77,7 @@ impl TodoCommand {
         }
     }
 
-    fn nick(self) -> Option<char> {
+    pub fn nick(self) -> Option<char> {
         match self {
             TodoCommand::Pick => Some('p'),
             TodoCommand::Edit => Some('e'),
@@ -277,10 +277,46 @@ fn parse_todo_line(
         return Err(());
     }
 
-    if matches!(
-        command,
-        TodoCommand::Exec | TodoCommand::Label | TodoCommand::Reset | TodoCommand::UpdateRef
-    ) {
+    if command == TodoCommand::Label {
+        if !valid_label(bol) {
+            messages.push(format!("error: '{}' is not a valid label", bol));
+            return Err(());
+        }
+        return Ok(RebaseTodoItem {
+            command,
+            flags: 0,
+            oid: None,
+            arg: bol.to_string(),
+            raw: line.to_string(),
+        });
+    }
+
+    if command == TodoCommand::UpdateRef {
+        if !bol.starts_with("refs/") {
+            if !valid_refname(bol, true) {
+                messages.push(format!("error: '{}' is not a valid refname", bol));
+            } else {
+                messages.push(
+                    "error: update-ref requires a fully qualified refname e.g. refs/heads/topic"
+                        .to_string(),
+                );
+            }
+            return Err(());
+        }
+        if !valid_refname(bol, false) {
+            messages.push(format!("error: '{}' is not a valid refname", bol));
+            return Err(());
+        }
+        return Ok(RebaseTodoItem {
+            command,
+            flags: 0,
+            oid: None,
+            arg: bol.to_string(),
+            raw: line.to_string(),
+        });
+    }
+
+    if matches!(command, TodoCommand::Exec | TodoCommand::Reset) {
         return Ok(RebaseTodoItem {
             command,
             flags: 0,
@@ -339,6 +375,49 @@ fn parse_todo_line(
             Err(())
         }
     }
+}
+
+fn valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label != "#"
+        && !label.starts_with(':')
+        && !label.contains('/')
+        && !label.contains("..")
+        && !label.contains("@{")
+        && !label.ends_with('.')
+        && !label.ends_with(".lock")
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_refname(refname: &str, allow_onelevel: bool) -> bool {
+    if refname.is_empty()
+        || refname.starts_with('/')
+        || refname.ends_with('/')
+        || refname.contains("..")
+        || refname.contains("@{")
+        || refname.ends_with('.')
+        || refname.ends_with(".lock")
+    {
+        return false;
+    }
+    let mut components = 0usize;
+    for component in refname.split('/') {
+        components += 1;
+        if component.is_empty()
+            || component.starts_with('.')
+            || component.ends_with(".lock")
+            || component.bytes().any(|b| {
+                b < 0x20
+                    || b == 0x7f
+                    || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+            })
+        {
+            return false;
+        }
+    }
+    allow_onelevel || components >= 2
 }
 
 /// `check_merge_commit_insn`: the error + advice when a pick-like command
@@ -703,6 +782,30 @@ mod tests {
         assert_eq!(
             todo_item_to_string(&items[1], Some("21b83cd")),
             "fixup -C 21b83cd # b"
+        );
+    }
+
+    #[test]
+    fn validates_labels_and_update_refs() {
+        let (_, messages) = parse_todo_buffer(
+            "label #\nlabel :invalid\nupdate-ref :bad\nupdate-ref topic\nupdate-ref refs/heads/topic\n",
+            false,
+            '#',
+            &mut resolver,
+        );
+        assert_eq!(
+            messages,
+            vec![
+                "error: '#' is not a valid label".to_string(),
+                "error: invalid line 1: label #".to_string(),
+                "error: ':invalid' is not a valid label".to_string(),
+                "error: invalid line 2: label :invalid".to_string(),
+                "error: ':bad' is not a valid refname".to_string(),
+                "error: invalid line 3: update-ref :bad".to_string(),
+                "error: update-ref requires a fully qualified refname e.g. refs/heads/topic"
+                    .to_string(),
+                "error: invalid line 4: update-ref topic".to_string(),
+            ]
         );
     }
 

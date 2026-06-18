@@ -70,6 +70,7 @@ struct RebaseArgs {
     rebase_merges: Option<bool>,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
+    gpg_sign: Option<String>,
     positional: Vec<String>,
     total_args: usize,
 }
@@ -77,6 +78,11 @@ struct RebaseArgs {
 fn rebase_usage_error() -> GitError {
     print_rebase_usage();
     GitError::Exit(129)
+}
+
+fn option_requires_value(name: &str) -> GitError {
+    eprintln!("error: option `{name}' requires a value");
+    rebase_usage_error()
 }
 
 fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
@@ -111,6 +117,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         rebase_merges: None,
         strategy: None,
         strategy_opts: Vec::new(),
+        gpg_sign: None,
         positional: Vec::new(),
         total_args: args.len(),
     };
@@ -125,11 +132,23 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             args.get(*index).cloned().ok_or_else(rebase_usage_error)
         };
         match arg {
-            "--onto" | _ if arg == "--onto" || arg.starts_with("--onto=") => {
+            "--onto" => {
+                out.onto_name = Some(take_value(&mut index)?);
+            }
+            _ if arg.starts_with("--onto=") => {
                 out.onto_name = Some(take_value(&mut index)?);
             }
             "--keep-base" => out.keep_base = true,
             "-i" | "--interactive" => out.interactive = true,
+            "-ix" | "-xi" => {
+                out.interactive = true;
+                index += 1;
+                let value = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| option_requires_value("exec"))?;
+                out.exec.push(value);
+            }
             "-m" | "--merge" => out.merge_backend = true,
             "--apply" => out.apply_backend = true,
             "--continue" => out.action = RebaseAction::Continue,
@@ -175,7 +194,10 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--ff" => out.force = false,
             "-x" | "--exec" => {
                 index += 1;
-                let value = args.get(index).cloned().ok_or_else(rebase_usage_error)?;
+                let value = args
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| option_requires_value("exec"))?;
                 out.exec.push(value);
             }
             _ if arg.starts_with("--exec=") => {
@@ -214,6 +236,14 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             "--no-verify" => out.no_verify = true,
             "--verify" => out.no_verify = false,
+            "-S" | "--gpg-sign" => out.gpg_sign = Some(String::new()),
+            _ if arg.starts_with("-S") && arg.len() > 2 => {
+                out.gpg_sign = Some(arg[2..].to_string());
+            }
+            _ if arg.starts_with("--gpg-sign=") => {
+                out.gpg_sign = Some(arg["--gpg-sign=".len()..].to_string());
+            }
+            "--no-gpg-sign" => out.gpg_sign = None,
             "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
             "--allow-empty-message" => {}
             "--committer-date-is-author-date" => {
@@ -362,9 +392,11 @@ struct MachineOpts {
     reschedule_failed_exec: bool,
     committer_date_is_author_date: bool,
     ignore_date: bool,
+    gpg_sign: Option<String>,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
+    squash_onto: Option<ObjectId>,
 }
 
 fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
@@ -378,6 +410,9 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     fs::write(dir.join("head-name"), format!("{head_name}\n"))?;
     fs::write(dir.join("onto"), format!("{}\n", opts.onto))?;
     fs::write(dir.join("orig-head"), format!("{}\n", opts.orig_head))?;
+    if let Some(squash_onto) = opts.squash_onto {
+        fs::write(dir.join("squash-onto"), format!("{squash_onto}\n"))?;
+    }
     if opts.quiet {
         fs::write(dir.join("quiet"), b"")?;
     }
@@ -404,6 +439,14 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     if opts.ignore_date {
         fs::write(dir.join("ignore_date"), b"")?;
     }
+    if let Some(key) = &opts.gpg_sign {
+        let opt = if key.is_empty() {
+            "-S".to_string()
+        } else {
+            format!("-S{key}")
+        };
+        fs::write(dir.join("gpg_sign_opt"), format!("{opt}\n"))?;
+    }
     Ok(())
 }
 
@@ -418,8 +461,18 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         .ok_or_else(|| GitError::not_found("rebase-merge/orig-head"))?;
     let orig_head = ObjectId::from_hex(ctx.format, orig_raw.trim())
         .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
+    let squash_onto = match seq::read_state_line(&ctx.git_dir, "squash-onto") {
+        Some(raw) => Some(
+            ObjectId::from_hex(ctx.format, raw.trim()).map_err(|_| {
+                GitError::InvalidObject("invalid squash-onto value during rebase".into())
+            })?,
+        ),
+        None => None,
+    };
     let exists = |name: &str| ctx.state_path(name).exists();
     let signoff = exists("signoff");
+    let gpg_sign = seq::read_state_line(&ctx.git_dir, "gpg_sign_opt")
+        .and_then(|value| value.strip_prefix("-S").map(str::to_string));
     Ok(MachineOpts {
         quiet: exists("quiet"),
         verbose: exists("verbose"),
@@ -430,6 +483,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         reschedule_failed_exec: exists("reschedule-failed-exec"),
         committer_date_is_author_date: exists("cdate_is_adate"),
         ignore_date: exists("ignore_date"),
+        gpg_sign,
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -437,6 +491,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         },
         onto,
         orig_head,
+        squash_onto,
     })
 }
 
@@ -482,7 +537,12 @@ fn count_commands(items: &[RebaseTodoItem]) -> usize {
         .count()
 }
 
-fn serialize_item(item: &RebaseTodoItem, short: bool, db: &FileObjectDatabase) -> String {
+fn serialize_item(
+    item: &RebaseTodoItem,
+    short: bool,
+    abbreviate: bool,
+    db: &FileObjectDatabase,
+) -> String {
     let oid_text = item.oid.as_ref().map(|oid| {
         if short {
             find_unique_abbrev_hex(db, oid)
@@ -490,7 +550,15 @@ fn serialize_item(item: &RebaseTodoItem, short: bool, db: &FileObjectDatabase) -
             oid.to_hex()
         }
     });
-    seq::todo_item_to_string(item, oid_text.as_deref())
+    let mut text = seq::todo_item_to_string(item, oid_text.as_deref());
+    if abbreviate
+        && item.command != TodoCommand::Comment
+        && let Some(nick) = item.command.nick()
+        && let Some(rest) = text.strip_prefix(item.command.as_str())
+    {
+        text = format!("{nick}{rest}");
+    }
+    text
 }
 
 fn find_unique_abbrev_hex(db: &FileObjectDatabase, oid: &ObjectId) -> String {
@@ -505,10 +573,15 @@ fn find_unique_abbrev_hex(db: &FileObjectDatabase, oid: &ObjectId) -> String {
     hex[..width].to_string()
 }
 
-fn todo_to_text(items: &[RebaseTodoItem], short: bool, db: &FileObjectDatabase) -> String {
+fn todo_to_text(
+    items: &[RebaseTodoItem],
+    short: bool,
+    abbreviate: bool,
+    db: &FileObjectDatabase,
+) -> String {
     let mut out = String::new();
     for item in items {
-        out.push_str(&serialize_item(item, short, db));
+        out.push_str(&serialize_item(item, short, abbreviate, db));
         out.push('\n');
     }
     out
@@ -525,7 +598,9 @@ fn write_todo_file(
     shortonto: Option<&str>,
     db: &FileObjectDatabase,
 ) -> Result<()> {
-    let mut buf = todo_to_text(items, short, db);
+    let abbreviate =
+        help && rebase_config_bool(ctx, "rebase", "abbreviateCommands").unwrap_or(false);
+    let mut buf = todo_to_text(items, short, abbreviate, db);
     if help {
         let comment = comment_char(&ctx.git_dir) as char;
         let check_error = missing_commit_check_level(ctx) == MissingCommitCheck::Error;
@@ -557,10 +632,10 @@ fn save_todo(ctx: &Ctx, todo: &TodoList, db: &FileObjectDatabase, reschedule: bo
     };
     fs::write(
         ctx.state_path("git-rebase-todo"),
-        todo_to_text(tail, false, db),
+        todo_to_text(tail, false, false, db),
     )?;
     if !reschedule && next > 0 {
-        let line = serialize_item(&todo.items[next - 1], false, db);
+        let line = serialize_item(&todo.items[next - 1], false, false, db);
         let done_path = ctx.state_path("done");
         let mut existing = fs::read(&done_path).unwrap_or_default();
         existing.extend_from_slice(line.as_bytes());
@@ -737,6 +812,9 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
         RebaseAction::ShowCurrentPatch => {
             let path = ctx.state_path("patch");
             if let Ok(patch) = fs::read(path) {
+                if env::var_os("GIT_TRACE").is_some() {
+                    eprintln!("trace: built-in: git show REBASE_HEAD");
+                }
                 io::stdout().write_all(&patch)?;
                 return Ok(());
             }
@@ -910,12 +988,20 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     // Onto.
+    let mut squash_onto = None;
     let onto_name = match &args.onto_name {
         Some(name) => name.clone(),
+        None if args.root => {
+            let oid = create_squash_onto(ctx)?;
+            squash_onto = Some(oid);
+            oid.to_hex()
+        }
         None if args.keep_base => format!("{upstream_name}...{branch_name}"),
         None => upstream_name.clone(),
     };
-    let onto = if onto_name.contains("...") {
+    let onto = if args.root && args.onto_name.is_none() {
+        squash_onto.expect("created squash-onto for --root")
+    } else if onto_name.contains("...") {
         let (left, right) = onto_name.split_once("...").expect("contains ...");
         let left_oid = resolve_revision(
             &ctx.git_dir,
@@ -1097,9 +1183,11 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         reschedule_failed_exec,
         committer_date_is_author_date: args.committer_date_is_author_date,
         ignore_date: args.ignore_date,
+        gpg_sign: args.gpg_sign.clone(),
         head_name: head_name.clone(),
         onto,
         orig_head,
+        squash_onto,
     };
 
     // Generate the todo list.
@@ -1548,6 +1636,22 @@ fn print_rebase_diffstat(
         }
     }
     Ok(())
+}
+
+fn create_squash_onto(ctx: &Ctx) -> Result<ObjectId> {
+    let ident = commit_identity_from_env("COMMITTER")?;
+    let mut writer = ctx.db();
+    sley_sequencer::create_commit(
+        &mut writer,
+        sley_sequencer::CommitCreate {
+            tree: ObjectId::empty_tree(ctx.format),
+            parents: Vec::new(),
+            author: ident.clone(),
+            committer: ident,
+            message: Vec::new(),
+            encoding: None,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2006,7 +2110,7 @@ fn complete_action(
             skipped += 1;
         }
         if skipped > 0 {
-            let done_text = todo_to_text(&todo.items[..skipped], false, db);
+            let done_text = todo_to_text(&todo.items[..skipped], false, false, db);
             fs::write(ctx.state_path("done"), done_text)?;
             todo.items.drain(..skipped);
             todo.done_nr = skipped;
@@ -2093,6 +2197,24 @@ fn check_todo_dropped_commits(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn check_todo_dropped_commits_against_backup(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    new_items: &[RebaseTodoItem],
+) -> Result<bool> {
+    let Ok(backup) = fs::read_to_string(ctx.state_path("git-rebase-todo.backup")) else {
+        return Ok(false);
+    };
+    let mut resolver = make_resolver(ctx, db);
+    let (backup_items, _) = seq::parse_todo_buffer(
+        &backup,
+        ctx.state_path("done").exists(),
+        comment_char(&ctx.git_dir) as char,
+        &mut resolver,
+    );
+    check_todo_dropped_commits(ctx, db, &backup_items, new_items)
 }
 
 fn launch_sequence_editor(ctx: &Ctx, path: &Path) -> Result<()> {
@@ -2339,7 +2461,7 @@ fn reschedule_current(
 ) -> Result<()> {
     eprintln!("hint: Could not execute the todo command");
     eprintln!("hint: ");
-    eprintln!("hint:     {}", serialize_item(item, false, db));
+    eprintln!("hint:     {}", serialize_item(item, false, false, db));
     eprintln!("hint: ");
     eprintln!("hint: It has been rescheduled; To edit the command before continuing, please");
     eprintln!("hint: edit the todo list first:");
@@ -2355,7 +2477,7 @@ fn reschedule_current(
 
 fn reread_todo_if_changed(ctx: &Ctx, db: &FileObjectDatabase, todo: &mut TodoList) -> Result<()> {
     let on_disk = fs::read_to_string(ctx.state_path("git-rebase-todo")).unwrap_or_default();
-    let expected = todo_to_text(&todo.items[todo.current + 1..], false, db);
+    let expected = todo_to_text(&todo.items[todo.current + 1..], false, false, db);
     if on_disk != expected {
         let mut reloaded = read_populate_todo(ctx, db)?;
         reloaded.done_nr = todo.done_nr;
@@ -2501,6 +2623,11 @@ fn pick_one_commit(
 
     let is_fixup = item.command.is_fixup();
     let final_fixup = is_fixup && !next_is_fixup(todo);
+    let create_root = opts.squash_onto == Some(head);
+    if create_root && is_fixup {
+        eprintln!("error: cannot fixup root commit");
+        return Ok(PickOutcome::Fail(1));
+    }
 
     // Write the author script for --continue / commit amending.
     if let Some(script) = seq::format_author_script(&record.commit.author) {
@@ -2510,7 +2637,7 @@ fn pick_one_commit(
     let parent = record.parents.first().copied();
 
     // Fast-forward when the pick's parent is exactly HEAD.
-    if opts.allow_ff && !is_fixup && parent == Some(head) {
+    if opts.allow_ff && !create_root && !is_fixup && parent == Some(head) {
         sley_worktree::reset_index_and_worktree_to_commit(
             &ctx.worktree_root,
             &ctx.git_dir,
@@ -2536,6 +2663,7 @@ fn pick_one_commit(
                         amend: true,
                         edit: true,
                         allow_empty: true,
+                        create_root: false,
                         message_file: None,
                         reflog_sub: "reword",
                         original: Some(&record),
@@ -2730,6 +2858,7 @@ fn pick_one_commit(
             amend,
             edit: edit || item.command == TodoCommand::Reword,
             allow_empty,
+            create_root,
             message_file: commit_message_file,
             reflog_sub: command_reflog_name(item.command),
             original: Some(&record),
@@ -2917,7 +3046,6 @@ fn stop_with_patch(
     exit_code: i32,
     to_amend: bool,
 ) -> Result<PickOutcome> {
-    let _ = opts;
     fs::write(ctx.state_path("stopped-sha"), format!("{}\n", record.oid))?;
     fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
 
@@ -2940,9 +3068,19 @@ fn stop_with_patch(
 
     if to_amend {
         intend_to_amend(ctx)?;
+        let sign_opt = opts.gpg_sign.as_ref().map(|key| {
+            if key.is_empty() {
+                " -S".to_string()
+            } else {
+                format!(" '-S{key}'")
+            }
+        });
         eprintln!("You can amend the commit now, with");
         eprintln!();
-        eprintln!("  git commit --amend ");
+        eprintln!(
+            "  git commit --amend{} ",
+            sign_opt.as_deref().unwrap_or("")
+        );
         eprintln!();
         eprintln!("Once you are satisfied with your changes, run");
         eprintln!();
@@ -3257,6 +3395,7 @@ struct MachineCommit<'a> {
     amend: bool,
     edit: bool,
     allow_empty: bool,
+    create_root: bool,
     /// Seed message file (MERGE_MSG / message-squash / message-fixup); `None`
     /// amends with HEAD's message.
     message_file: Option<PathBuf>,
@@ -3331,7 +3470,16 @@ fn machine_commit(
     } else {
         None
     };
-    let (parents, author) = if commit.amend {
+    let (parents, author) = if commit.create_root {
+        let author = match read_author_script_identity(ctx)? {
+            Some(identity) => identity,
+            None => match commit.original {
+                Some(record) => record.commit.author.clone(),
+                None => commit_identity_from_env("AUTHOR")?,
+            },
+        };
+        (Vec::new(), author)
+    } else if commit.amend {
         let author = head_record.commit.author.clone();
         (head_record.commit.parents.clone(), author)
     } else {
@@ -3345,7 +3493,7 @@ fn machine_commit(
         (vec![head], author)
     };
 
-    if !commit.amend && !commit.allow_empty {
+    if !commit.amend && !commit.create_root && !commit.allow_empty {
         let parent_tree = commit_tree_oid(db, ctx.format, &head)?;
         if tree == parent_tree {
             return Ok(CommitOutcome::Failed(1));
@@ -3613,6 +3761,12 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     }
 
     let mut todo = read_populate_todo(ctx, &db)?;
+    if ctx.state_path("dropped").exists() {
+        if check_todo_dropped_commits_against_backup(ctx, &db, &todo.items)? {
+            return Err(GitError::Exit(1));
+        }
+        let _ = fs::remove_file(ctx.state_path("dropped"));
+    }
 
     if commit_staged_changes(ctx, &db, &opts, &todo)? {
         return Err(GitError::Exit(1));
@@ -3730,6 +3884,7 @@ fn commit_staged_changes(
             amend,
             edit: edit && !cleanup_only,
             allow_empty: true,
+            create_root: false,
             message_file,
             reflog_sub: "continue",
             original: None,
@@ -3811,6 +3966,14 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
             // only re-attaches HEAD to it. Updating the branch ref here would
             // add a spurious branch-reflog entry; git leaves it untouched
             // (t3406 #15).
+            if refs.read_ref(head_name)?.is_none() {
+                tx.update(RefUpdate {
+                    name: head_name.clone(),
+                    expected: None,
+                    new: RefTarget::Direct(target),
+                    reflog: None,
+                });
+            }
             tx.update(RefUpdate {
                 name: "HEAD".into(),
                 expected: None,
@@ -3858,14 +4021,27 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
     let text = fs::read_to_string(&todo_path)?;
     let stripped = stripspace_drop_comments(&text, comment_char(&ctx.git_dir));
     let mut resolver = make_resolver(ctx, &db);
-    let (items, _messages) = seq::parse_todo_buffer(
+    let (items, old_messages) = seq::parse_todo_buffer(
         &stripped,
         ctx.state_path("done").exists(),
         comment_char(&ctx.git_dir) as char,
         &mut resolver,
     );
     drop(resolver);
+    let incorrect = !old_messages.is_empty() || ctx.state_path("dropped").exists();
     write_todo_file(ctx, &todo_path, &items, true, true, None, None, &db)?;
+    if !incorrect {
+        write_todo_file(
+            ctx,
+            &ctx.state_path("git-rebase-todo.backup"),
+            &items,
+            false,
+            true,
+            None,
+            None,
+            &db,
+        )?;
+    }
     launch_sequence_editor(ctx, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
     let stripped = stripspace_drop_comments(&edited, comment_char(&ctx.git_dir));
@@ -3881,6 +4057,17 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
         for message in messages {
             eprintln!("{message}");
         }
+        return Err(GitError::Exit(1));
+    }
+    if incorrect {
+        for message in old_messages {
+            eprintln!("{message}");
+        }
+        if check_todo_dropped_commits_against_backup(ctx, &db, &new_items)? {
+            return Err(GitError::Exit(1));
+        }
+        let _ = fs::remove_file(ctx.state_path("dropped"));
+    } else if check_todo_dropped_commits(ctx, &db, &items, &new_items)? {
         return Err(GitError::Exit(1));
     }
     write_todo_file(ctx, &todo_path, &new_items, false, false, None, None, &db)?;
