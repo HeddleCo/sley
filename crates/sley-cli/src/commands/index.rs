@@ -1279,6 +1279,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut ignore_paths_after_unresolve = false;
     let mut suppress_after_unresolve = false;
     let mut test_untracked_cache = false;
+    let mut untracked_cache = None;
     let mut fsmonitor = false;
     let mut verbose = false;
     let mut again = false;
@@ -1419,10 +1420,15 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             | "--unmerged"
             | "--no-unmerged"
             | "--no-split-index"
-            | "--untracked-cache"
-            | "--no-untracked-cache"
-            | "--force-untracked-cache"
             | "--no-force-untracked-cache" => allow_no_input = true,
+            "--untracked-cache" | "--force-untracked-cache" => {
+                untracked_cache = Some(true);
+                allow_no_input = true;
+            }
+            "--no-untracked-cache" => {
+                untracked_cache = Some(false);
+                allow_no_input = true;
+            }
             "--unresolve" => {
                 suppress_after_unresolve = true;
                 ignore_paths_after_unresolve = true;
@@ -1579,6 +1585,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         && !again
         && index_version.is_none()
         && !force_write_index
+        && untracked_cache.is_none()
     {
         if (stdin || allow_no_input) && !refresh {
             if unresolve_only {
@@ -1621,7 +1628,8 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         || skip_worktree.is_some()
         || assume_unchanged.is_some()
         || !paths.is_empty()
-        || test_untracked_cache;
+        || test_untracked_cache
+        || untracked_cache.is_some();
     let worktree_root = match worktree_root_for_git_dir(&git_dir) {
         Ok(root) => root,
         Err(_) if !worktree_required => cwd.clone(),
@@ -1718,6 +1726,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             &resolved_paths,
             assume_unchanged,
         )?;
+    } else if let Some(enabled) = untracked_cache {
+        if enabled {
+            sley_worktree::enable_untracked_cache(&worktree_root, &git_dir, format)?;
+        } else {
+            sley_worktree::disable_untracked_cache(&git_dir, format)?;
+        }
     } else if !ordered_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
         sley_worktree::update_index_ordered_paths_filtered(

@@ -5,6 +5,7 @@ use sley_core::{
 };
 use sley_index::{
     BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, SPARSE_DIR_MODE, Stage,
+    UntrackedCache, UntrackedCacheDir, UntrackedCacheOidStat, UntrackedCacheStatData,
 };
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectPresenceChecker, ObjectReader, ObjectWriter};
@@ -1714,6 +1715,7 @@ fn update_index_paths_impl(
     let requested_filter_attrs = filter_attribute_names();
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
+    let mut untracked_cache_invalidation_paths = Vec::new();
     for update_path in paths {
         let path = &update_path.path;
         // Each path carries the sticky mode that was in effect when it was
@@ -1733,6 +1735,7 @@ fn update_index_paths_impl(
         let git_path = git_path_bytes(relative)?;
         if path_mode.force_remove {
             remove_index_entries_with_path(&mut index.entries, &git_path);
+            untracked_cache_invalidation_paths.push(git_path.clone());
             // git's update_one() reports `remove` for a --force-remove path.
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
             continue;
@@ -1775,6 +1778,7 @@ fn update_index_paths_impl(
         let Some(metadata) = symlink_metadata else {
             if path_mode.remove {
                 remove_index_entries_with_path(&mut index.entries, &git_path);
+                untracked_cache_invalidation_paths.push(git_path.clone());
                 // git's update_one() unconditionally reports `add '<path>'`
                 // after process_path(), even when the missing file was removed
                 // from the index via the `--remove` (not --force-remove) path.
@@ -1797,6 +1801,7 @@ fn update_index_paths_impl(
                 && sley_diff_merge::gitlink_head_oid(&absolute, format).is_none()
             {
                 remove_index_entries_with_path(&mut index.entries, &git_path);
+                untracked_cache_invalidation_paths.push(git_path.clone());
                 reports.push(format!("add '{}'", String::from_utf8_lossy(&git_path)));
                 continue;
             }
@@ -1829,6 +1834,7 @@ fn update_index_paths_impl(
             entry.mode = sley_index::GITLINK_MODE;
             reports.push(format!("add '{display}'"));
             replace_index_entries_with_entry(&mut index.entries, entry);
+            untracked_cache_invalidation_paths.push(git_path.clone());
             updated.push(head_oid);
             continue;
         }
@@ -1904,10 +1910,16 @@ fn update_index_paths_impl(
             ));
         }
         replace_index_entries_with_entry(&mut index.entries, entry);
+        untracked_cache_invalidation_paths.push(git_path);
         updated.push(oid);
     }
     normalize_index_version_for_extended_flags(&mut index);
     index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    invalidate_untracked_cache_for_git_paths(
+        &mut index,
+        format,
+        &untracked_cache_invalidation_paths,
+    )?;
     fs::write(index_path, index.write(format)?)?;
     if verbose {
         let mut stdout = std::io::stdout().lock();
@@ -2461,6 +2473,93 @@ pub fn force_write_index(
     })
 }
 
+pub fn enable_untracked_cache(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<()> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+    } else {
+        empty_index()
+    };
+    let ident = untracked_cache_ident(worktree_root);
+    let dir_flags = untracked_cache_dir_flags(StatusUntrackedMode::Normal);
+    let cache = match index.untracked_cache(format)? {
+        Some(mut cache) if cache.ident == ident => {
+            cache.dir_flags = dir_flags;
+            cache
+        }
+        _ => UntrackedCache::new(format, ident, dir_flags),
+    };
+    index.set_untracked_cache(format, Some(&cache))?;
+    fs::write(index_path, index.write(format)?)?;
+    Ok(())
+}
+
+pub fn disable_untracked_cache(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<()> {
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    index.set_untracked_cache(format, None)?;
+    fs::write(index_path, index.write(format)?)?;
+    Ok(())
+}
+
+pub fn refresh_untracked_cache_after_status(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    config: &GitConfig,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<()> {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(());
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+    } else {
+        empty_index()
+    };
+    match config.get("core", None, "untrackedCache") {
+        Some("false") | Some("no") | Some("off") | Some("0") => {
+            index.set_untracked_cache(format, None)?;
+            fs::write(index_path, index.write(format)?)?;
+            return Ok(());
+        }
+        Some("true") | Some("yes") | Some("on") | Some("1") => {}
+        Some("keep") | None => {
+            if index.untracked_cache(format)?.is_none() {
+                return Ok(());
+            }
+        }
+        Some(_) => {
+            if index.untracked_cache(format)?.is_none() {
+                return Ok(());
+            }
+        }
+    }
+    let old_cache = index.untracked_cache(format).ok().flatten();
+    let cache = build_untracked_cache(worktree_root, git_dir, format, &index, untracked_mode)?;
+    emit_untracked_cache_trace(old_cache.as_ref(), &cache);
+    index.set_untracked_cache(format, Some(&cache))?;
+    fs::write(index_path, index.write(format)?)?;
+    Ok(())
+}
+
+pub fn emit_untracked_cache_bypass_trace() {
+    sley_core::trace2::perf_read_directory_data("path", "");
+}
+
 fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> {
     let mut offset = 0;
     let mut filtered = Vec::new();
@@ -2487,6 +2586,47 @@ fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> {
     filtered
 }
 
+fn invalidate_untracked_cache_for_git_paths(
+    index: &mut Index,
+    format: ObjectFormat,
+    paths: &[Vec<u8>],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let Some(mut cache) = index.untracked_cache(format)? else {
+        return Ok(());
+    };
+    let Some(root) = cache.root.as_mut() else {
+        return Ok(());
+    };
+    for path in paths {
+        invalidate_untracked_cache_dir_for_path(root, path);
+    }
+    index.set_untracked_cache(format, Some(&cache))
+}
+
+fn invalidate_untracked_cache_dir_for_path(root: &mut UntrackedCacheDir, path: &[u8]) {
+    invalidate_untracked_cache_node(root);
+    let mut current = root;
+    let mut components = path.split(|byte| *byte == b'/').peekable();
+    while let Some(component) = components.next() {
+        if component.is_empty() || components.peek().is_none() {
+            break;
+        }
+        let Some(child) = current.dirs.iter_mut().find(|dir| dir.name == component) else {
+            break;
+        };
+        invalidate_untracked_cache_node(child);
+        current = child;
+    }
+}
+
+fn invalidate_untracked_cache_node(node: &mut UntrackedCacheDir) {
+    node.valid = false;
+    node.untracked.clear();
+}
+
 pub fn update_index_cacheinfo(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -2508,6 +2648,7 @@ pub fn update_index_cacheinfo(
     };
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
+    let mut untracked_cache_invalidation_paths = Vec::new();
     for cacheinfo in entries {
         if !add
             && !index
@@ -2541,6 +2682,7 @@ pub fn update_index_cacheinfo(
             existing.path != cacheinfo.path || index_entry_stage(existing) != cacheinfo.stage
         });
         index.entries.push(entry);
+        untracked_cache_invalidation_paths.push(cacheinfo.path.clone());
         updated.push(cacheinfo.oid);
         // git's add_cacheinfo() calls report("add '%s'") *after* the entry is
         // staged, regardless of whether the subsequent index write succeeds.
@@ -2567,6 +2709,11 @@ pub fn update_index_cacheinfo(
         );
         return Err(GitError::Exit(128));
     }
+    invalidate_untracked_cache_for_git_paths(
+        &mut index,
+        format,
+        &untracked_cache_invalidation_paths,
+    )?;
     fs::write(index_path, index.write(format)?)?;
     if verbose {
         flush_update_index_reports(&reports)?;
@@ -2604,10 +2751,12 @@ pub fn update_index_index_info(
         }
     };
     let mut updated = Vec::new();
+    let mut untracked_cache_invalidation_paths = Vec::new();
     for record in records {
         match record {
             IndexInfoRecord::Remove { path } => {
                 index.entries.retain(|existing| existing.path != *path);
+                untracked_cache_invalidation_paths.push(path.clone());
             }
             IndexInfoRecord::Add(cacheinfo) => {
                 let flags = index_flags(cacheinfo.path.len(), cacheinfo.stage);
@@ -2638,6 +2787,7 @@ pub fn update_index_index_info(
                     });
                 }
                 index.entries.push(entry);
+                untracked_cache_invalidation_paths.push(cacheinfo.path.clone());
                 updated.push(cacheinfo.oid);
             }
         }
@@ -2647,6 +2797,11 @@ pub fn update_index_index_info(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
+    invalidate_untracked_cache_for_git_paths(
+        &mut index,
+        format,
+        &untracked_cache_invalidation_paths,
+    )?;
     fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -6584,6 +6739,336 @@ fn read_dir_entries_with_ignore_patterns(
         read_per_directory_ignore_patterns_into_matcher(path, matcher, base, &source)?;
     }
     Ok(entries)
+}
+
+fn build_untracked_cache(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+    untracked_mode: StatusUntrackedMode,
+) -> Result<UntrackedCache> {
+    let stat_cache = IndexStatCache::from_index(index, &repository_index_path(git_dir));
+    let tracked_dirs = stage0_tracked_directories(index);
+    let tracked = IndexStatusLookup {
+        stat_cache: &stat_cache,
+        tracked_dirs: &tracked_dirs,
+    };
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    let mut cache = UntrackedCache::new(
+        format,
+        untracked_cache_ident(worktree_root),
+        untracked_cache_dir_flags(untracked_mode),
+    );
+    cache.info_exclude = untracked_cache_oid_stat(&git_dir.join("info").join("exclude"), format)?;
+    cache.excludes_file = UntrackedCacheOidStat::new(format);
+    cache.root = Some(build_untracked_cache_dir(
+        worktree_root,
+        git_dir,
+        worktree_root,
+        &[],
+        b"",
+        &tracked,
+        &mut ignores,
+        untracked_mode,
+        format,
+        false,
+    )?);
+    Ok(cache)
+}
+
+fn emit_untracked_cache_trace(old: Option<&UntrackedCache>, new: &UntrackedCache) {
+    sley_core::trace2::perf_read_directory_data("path", "");
+    let dir_count = new.root.as_ref().map(count_untracked_cache_dirs).unwrap_or(0);
+    let Some(old) = old else {
+        sley_core::trace2::perf_read_directory_data("node-creation", dir_count.saturating_sub(1));
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+        return;
+    };
+    let Some(old_root) = old.root.as_ref() else {
+        sley_core::trace2::perf_read_directory_data("node-creation", dir_count.saturating_sub(1));
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+        return;
+    };
+    let Some(new_root) = new.root.as_ref() else {
+        return;
+    };
+    if old.ident != new.ident || old.dir_flags != new.dir_flags {
+        sley_core::trace2::perf_read_directory_data("node-creation", dir_count.saturating_sub(1));
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+        return;
+    }
+    if old.info_exclude.oid != new.info_exclude.oid || old.excludes_file.oid != new.excludes_file.oid
+    {
+        sley_core::trace2::perf_read_directory_data("node-creation", 0);
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+        return;
+    }
+    if old_root.exclude_oid != new_root.exclude_oid {
+        sley_core::trace2::perf_read_directory_data("node-creation", 0);
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+        return;
+    }
+    let invalid_dir_count = count_invalid_untracked_cache_dirs(old_root);
+    if invalid_dir_count > 0 {
+        sley_core::trace2::perf_read_directory_data("node-creation", 0);
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("opendir", invalid_dir_count);
+        return;
+    }
+    if old_root.stat != new_root.stat {
+        sley_core::trace2::perf_read_directory_data("node-creation", 0);
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 1);
+        sley_core::trace2::perf_read_directory_data("opendir", 1);
+        return;
+    }
+    if old.root == new.root {
+        sley_core::trace2::perf_read_directory_data("node-creation", 0);
+        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
+        sley_core::trace2::perf_read_directory_data("opendir", 0);
+        return;
+    }
+    sley_core::trace2::perf_read_directory_data("node-creation", 0);
+    sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
+    sley_core::trace2::perf_read_directory_data("directory-invalidation", 1);
+    sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+}
+
+fn count_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
+    1 + dir.dirs.iter().map(count_untracked_cache_dirs).sum::<usize>()
+}
+
+fn count_invalid_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
+    usize::from(!dir.valid)
+        + dir
+            .dirs
+            .iter()
+            .map(count_invalid_untracked_cache_dirs)
+            .sum::<usize>()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
+    worktree_root: &Path,
+    git_dir: &Path,
+    dir: &Path,
+    dir_git_path: &[u8],
+    name: &[u8],
+    tracked: &T,
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+    format: ObjectFormat,
+    check_only: bool,
+) -> Result<UntrackedCacheDir> {
+    let ignore_len = ignores.patterns.len();
+    let mut entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, ignores, None)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut node = UntrackedCacheDir {
+        name: name.to_vec(),
+        stat: fs::symlink_metadata(dir)
+            .map(|metadata| untracked_cache_stat_data(&metadata))
+            .unwrap_or_default(),
+        exclude_oid: per_directory_ignore_oid(dir, format)?,
+        valid: true,
+        check_only,
+        recurse: true,
+        ..UntrackedCacheDir::default()
+    };
+    let result = (|| -> Result<()> {
+        let mut git_path = dir_git_path.to_vec();
+        for entry in entries {
+            let file_name = entry.file_name();
+            if file_name == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let path_len = git_path_push_component(&mut git_path, &file_name);
+            let entry_result = (|| -> Result<()> {
+                if tracked.tracked_kind(&git_path).is_some() {
+                    return Ok(());
+                }
+                let file_type = entry.file_type()?;
+                let is_dir = file_type.is_dir();
+                if ignores.is_ignored(&git_path, is_dir) {
+                    return Ok(());
+                }
+                if file_type.is_file() || file_type.is_symlink() {
+                    node.untracked.push(component_name_bytes(&file_name));
+                    return Ok(());
+                }
+                if !is_dir {
+                    return Ok(());
+                }
+                let path = entry.path();
+                if is_same_path(&path, git_dir) {
+                    return Ok(());
+                }
+                let component = component_name_bytes(&file_name);
+                let tracked_directory = tracked.tracked_directory_kind(&git_path);
+                let child_check_only = matches!(untracked_mode, StatusUntrackedMode::Normal)
+                    && tracked_directory.is_none();
+                let child = build_untracked_cache_dir(
+                    worktree_root,
+                    git_dir,
+                    &path,
+                    &git_path,
+                    &component,
+                    tracked,
+                    ignores,
+                    untracked_mode,
+                    format,
+                    child_check_only,
+                )?;
+                let child_has_untracked = !child.untracked.is_empty()
+                    || child
+                        .dirs
+                        .iter()
+                        .any(|dir| !dir.untracked.is_empty() || !dir.dirs.is_empty());
+                match untracked_mode {
+                    StatusUntrackedMode::All => {
+                        node.dirs.push(child);
+                    }
+                    StatusUntrackedMode::Normal => {
+                        if tracked_directory.is_some() {
+                            node.dirs.push(child);
+                        } else {
+                            if child_has_untracked {
+                                let mut directory = component.clone();
+                                directory.push(b'/');
+                                node.untracked.push(directory);
+                            }
+                            node.dirs.push(child);
+                        }
+                    }
+                    StatusUntrackedMode::None => {}
+                }
+                Ok(())
+            })();
+            git_path.truncate(path_len);
+            entry_result?;
+        }
+        Ok(())
+    })();
+    ignores.truncate(ignore_len);
+    result?;
+    if worktree_root == dir {
+        node.name.clear();
+    }
+    Ok(node)
+}
+
+fn component_name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        name.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        name.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+fn per_directory_ignore_oid(dir: &Path, format: ObjectFormat) -> Result<Option<ObjectId>> {
+    let path = dir.join(".gitignore");
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(untracked_cache_exclude_oid(bytes, format)?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn untracked_cache_oid_stat(path: &Path, format: ObjectFormat) -> Result<UntrackedCacheOidStat> {
+    let stat = fs::symlink_metadata(path)
+        .map(|metadata| untracked_cache_stat_data(&metadata))
+        .unwrap_or_default();
+    let oid = match fs::read(path) {
+        Ok(bytes) => untracked_cache_exclude_oid(bytes, format)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ObjectId::null(format),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(UntrackedCacheOidStat { stat, oid })
+}
+
+fn untracked_cache_exclude_oid(mut bytes: Vec<u8>, format: ObjectFormat) -> Result<ObjectId> {
+    if !bytes.is_empty() {
+        bytes.push(b'\n');
+    }
+    EncodedObject::new(ObjectType::Blob, bytes).object_id(format)
+}
+
+#[cfg(unix)]
+fn untracked_cache_stat_data(metadata: &fs::Metadata) -> UntrackedCacheStatData {
+    use std::os::unix::fs::MetadataExt;
+    UntrackedCacheStatData {
+        ctime_seconds: metadata.ctime().min(u32::MAX as i64).max(0) as u32,
+        ctime_nanoseconds: metadata.ctime_nsec().min(u32::MAX as i64).max(0) as u32,
+        mtime_seconds: metadata.mtime().min(u32::MAX as i64).max(0) as u32,
+        mtime_nanoseconds: metadata.mtime_nsec().min(u32::MAX as i64).max(0) as u32,
+        dev: metadata.dev() as u32,
+        ino: metadata.ino() as u32,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        size: metadata.size().min(u32::MAX as u64) as u32,
+    }
+}
+
+#[cfg(not(unix))]
+fn untracked_cache_stat_data(metadata: &fs::Metadata) -> UntrackedCacheStatData {
+    let (mtime_seconds, mtime_nanoseconds) = file_mtime_parts(metadata).unwrap_or((0, 0));
+    UntrackedCacheStatData {
+        mtime_seconds: mtime_seconds.min(u64::from(u32::MAX)) as u32,
+        mtime_nanoseconds: mtime_nanoseconds.min(u64::from(u32::MAX)) as u32,
+        size: metadata.len().min(u64::from(u32::MAX)) as u32,
+        ..UntrackedCacheStatData::default()
+    }
+}
+
+fn untracked_cache_dir_flags(untracked_mode: StatusUntrackedMode) -> u32 {
+    match untracked_mode {
+        StatusUntrackedMode::All => 0,
+        StatusUntrackedMode::Normal | StatusUntrackedMode::None => {
+            sley_index::untracked_cache_normal_flags()
+        }
+    }
+}
+
+fn untracked_cache_ident(worktree_root: &Path) -> Vec<u8> {
+    let mut ident = format!(
+        "Location {}, system {}",
+        worktree_root.display(),
+        untracked_cache_system_name()
+    )
+    .into_bytes();
+    ident.push(0);
+    ident
+}
+
+fn untracked_cache_system_name() -> String {
+    fs::read_to_string("/proc/sys/kernel/ostype")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let os = std::env::consts::OS;
+            let mut chars = os.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => "Unknown".to_string(),
+            }
+        })
 }
 
 fn push_untracked_directory(paths: &mut Vec<Vec<u8>>, git_path: &[u8]) {
@@ -12307,15 +12792,17 @@ pub fn remove_index_and_worktree_paths(
     // on any index mutation; drop it so it is rebuilt on the next write, exactly
     // like the `add` path does above.
     let extensions = index_extensions_without_cache_tree(&index_extensions);
+    let selected_paths = selected.iter().cloned().collect::<Vec<_>>();
+    let mut index = Index {
+        version: index_version,
+        entries,
+        extensions,
+        checksum: None,
+    };
+    invalidate_untracked_cache_for_git_paths(&mut index, format, &selected_paths)?;
     fs::write(
         index_path,
-        Index {
-            version: index_version,
-            entries,
-            extensions,
-            checksum: None,
-        }
-        .write(format)?,
+        index.write(format)?,
     )?;
     Ok(RemoveResult {
         removed: selected.into_iter().collect(),
