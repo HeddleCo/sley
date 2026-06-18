@@ -388,6 +388,10 @@ declare -A FLOOR=(
     # t6040=44 t4205=110 t7700=29 t3404=80.
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
+    # codex-wave-11 (worktree repair): re-link .git file + worktrees/<id>/gitdir
+    # back-pointer after a move, broken-link detection + repair messages, repair
+    # both-moved + specific-path. t2406 7->24 FULL; side gain t2403 25->27.
+    [t2406-worktree-repair.sh]=24
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=410
     # codex-wave-10 (branch tracking-info): branch -vv ahead/behind+gone column,
