@@ -5947,6 +5947,12 @@ fn collect_untracked_directory_paths(
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
         let git_path = git_path_bytes(relative)?;
+        if index
+            .get(&git_path)
+            .is_some_and(|entry| sley_index::is_gitlink(entry.mode))
+        {
+            continue;
+        }
         if ignores.is_ignored(&git_path, metadata.is_dir()) {
             continue;
         }
