@@ -859,6 +859,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         && config_write_bitmaps.is_none()
         && all
         && !write_midx
+        && config.get("pack", None, "packSizeLimit").is_none()
         && sley_worktree::worktree_root_for_git_dir(&common_git_dir)?.is_none()
         && !pack_dir_has_kept_packs(&common_git_dir)?;
     let mut write_bitmaps = match write_bitmaps {
@@ -905,6 +906,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             cruft_expiration.flatten(),
             expire_to.as_deref(),
             write_midx,
+            &keep_packs,
+            include_kept_objects,
         );
     }
 
@@ -1075,20 +1078,40 @@ fn cmd_repack_cruft(
     cruft_expiration: Option<u32>,
     expire_to: Option<&str>,
     write_midx: bool,
+    keep_packs: &[String],
+    pack_kept_objects: bool,
 ) -> Result<()> {
     let roots = repack_traversal_roots(git_dir, common_git_dir, format)?;
+    let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
+    let options = sley_odb::RepackOptions {
+        local: false,
+        pack_kept_objects,
+        keep_pack_stems,
+    };
 
     // With `--expire-to` + `-d`, the main cruft pack expires (drops) objects
     // older than the cutoff; those expired objects are written into the
     // expire-to repo as a second cruft pack (with no expiration, so it keeps
     // them all). Compute the pre-expiry unreachable set first so we can diff.
     let pre_expiry = if expire_to.is_some() && prune {
-        Some(sley_odb::repack_cruft(common_git_dir, format, &roots, None)?)
+        Some(sley_odb::repack_cruft_with_options(
+            common_git_dir,
+            format,
+            &roots,
+            None,
+            &options,
+        )?)
     } else {
         None
     };
 
-    let result = sley_odb::repack_cruft(common_git_dir, format, &roots, cruft_expiration)?;
+    let result = sley_odb::repack_cruft_with_options(
+        common_git_dir,
+        format,
+        &roots,
+        cruft_expiration,
+        &options,
+    )?;
     sley_odb::install_cruft_repack_result(common_git_dir, format, &result, prune)?;
 
     // Move the expired objects into the --expire-to repository.

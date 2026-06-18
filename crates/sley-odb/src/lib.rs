@@ -733,6 +733,26 @@ pub fn repack_reachable_objects_with_options(
             objects.push(ReachablePackObject { oid, object });
         }
     }
+
+    // Non-local repacks borrow packed objects from alternates as complete pack
+    // sources, while still leaving loose-only alternate objects alone. This
+    // matches `pack-objects --all` without `--local`: packed alternate objects
+    // are copied into the local consolidated pack, but a loose object in an
+    // alternate ODB is not duplicated just because a local tree points at it.
+    if !options.local {
+        for (alternate, oid) in alternate_packed_object_ids(&objects_dir, format)? {
+            if excluded_oids.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            let alternate_db = FileObjectDatabase::without_alternates(alternate, format);
+            match alternate_db.read_object(&oid) {
+                Ok(object) => objects.push(ReachablePackObject { oid, object }),
+                Err(GitError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     if objects.is_empty() {
         return Ok(None);
     }
@@ -814,6 +834,24 @@ fn pack_oids_for_stems(
         let index = PackIndex::parse(&fs::read(index_path)?, format)?;
         oids.extend(index.entries.into_iter().map(|entry| entry.oid));
     }
+    Ok(oids)
+}
+
+fn alternate_packed_object_ids(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<(PathBuf, ObjectId)>> {
+    let mut oids = Vec::new();
+    for alternate in alternate_object_dirs(objects_dir) {
+        let mut alternate_oids = HashSet::new();
+        collect_packed_object_ids(&alternate.join("pack"), format, &mut alternate_oids)?;
+        oids.extend(alternate_oids.into_iter().map(|oid| (alternate.clone(), oid)));
+    }
+    oids.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
     Ok(oids)
 }
 
@@ -1414,6 +1452,7 @@ pub struct CruftRepackResult {
     /// Pre-existing cruft `.pack` paths whose objects are now in the new cruft
     /// pack (removed under `-d`).
     pub obsolete_cruft_packs: Vec<PathBuf>,
+    retained_pack_stems: Vec<String>,
 }
 
 /// Gather every object id on disk together with the best (max) mtime of any
@@ -1453,8 +1492,11 @@ fn object_mtimes_on_disk(
         }
         idx_paths.sort();
         for idx_path in idx_paths {
-            let index = PackIndex::parse(&fs::read(&idx_path)?, format)?;
             let pack_path = idx_path.with_extension("pack");
+            if !pack_path.exists() {
+                continue;
+            }
+            let index = PackIndex::parse(&fs::read(&idx_path)?, format)?;
             let mtimes_path = idx_path.with_extension("mtimes");
             let pack_object_mtimes: Option<Vec<u32>> =
                 fs::read(&mtimes_path).ok().and_then(|bytes| {
@@ -1569,11 +1611,39 @@ pub fn repack_cruft(
     roots: &[ObjectId],
     cruft_expiration: Option<u32>,
 ) -> Result<CruftRepackResult> {
+    repack_cruft_with_options(
+        git_dir,
+        format,
+        roots,
+        cruft_expiration,
+        &RepackOptions::default(),
+    )
+}
+
+pub fn repack_cruft_with_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    cruft_expiration: Option<u32>,
+    options: &RepackOptions,
+) -> Result<CruftRepackResult> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let pack_dir = objects_dir.join("pack");
+    let retained_pack_stems = repack_retained_pack_stems(
+        &pack_dir,
+        &options.keep_pack_stems,
+        !options.pack_kept_objects,
+    )?;
+    let excluded_oids = if options.pack_kept_objects {
+        HashSet::new()
+    } else {
+        pack_oids_for_stems(&pack_dir, format, &retained_pack_stems)?
+    };
 
     // Reachable closure → the new "reachable" pack.
-    let reachable_ids = collect_reachable_object_ids(&database, format, roots.iter().copied())?;
+    let mut reachable_ids = collect_reachable_object_ids(&database, format, roots.iter().copied())?;
+    reachable_ids.retain(|oid| !excluded_oids.contains(oid));
     let reachable_result = if reachable_ids.is_empty() {
         None
     } else {
@@ -1615,7 +1685,7 @@ pub fn repack_cruft(
     // with their best mtime.
     let mut survivors: HashMap<ObjectId, u32> = object_mtimes_on_disk(&objects_dir, format)?
         .into_iter()
-        .filter(|(oid, _)| !reachable_ids.contains(oid))
+        .filter(|(oid, _)| !reachable_ids.contains(oid) && !excluded_oids.contains(oid))
         .collect();
 
     // Expiration: rescue older objects reachable from a recent one, drop the rest.
@@ -1627,10 +1697,14 @@ pub fn repack_cruft(
 
     // The packs the reachable+cruft packs supersede: every pre-existing
     // non-kept pack. Cruft packs are tracked separately.
-    let pack_dir = objects_dir.join("pack");
     let mut obsolete_packs = Vec::new();
     let mut obsolete_cruft_packs = Vec::new();
     for pack_path in existing_pack_files(&pack_dir)? {
+        if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str())
+            && retained_pack_stems.iter().any(|retained| retained == stem)
+        {
+            continue;
+        }
         if pack_path.with_extension("keep").exists() {
             continue;
         }
@@ -1646,6 +1720,7 @@ pub fn repack_cruft(
         cruft,
         obsolete_packs,
         obsolete_cruft_packs,
+        retained_pack_stems,
     })
 }
 
@@ -1771,6 +1846,14 @@ pub fn install_cruft_repack_result(
     {
         let file_name = pack_path.file_name().and_then(|n| n.to_str());
         if file_name == new_reachable_name.as_deref() || file_name == new_cruft_name.as_deref() {
+            continue;
+        }
+        if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str())
+            && result
+                .retained_pack_stems
+                .iter()
+                .any(|retained| retained == stem)
+        {
             continue;
         }
         if pack_path.with_extension("keep").exists() {
@@ -4019,6 +4102,9 @@ fn collect_packed_object_ids(
     for entry in fs::read_dir(pack_dir)? {
         let path = entry?.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        if !path.with_extension("pack").exists() {
             continue;
         }
         let index = PackIndex::parse(&fs::read(path)?, format)?;
