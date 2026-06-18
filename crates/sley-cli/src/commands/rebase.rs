@@ -132,7 +132,10 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             args.get(*index).cloned().ok_or_else(rebase_usage_error)
         };
         match arg {
-            "--onto" | _ if arg == "--onto" || arg.starts_with("--onto=") => {
+            "--onto" => {
+                out.onto_name = Some(take_value(&mut index)?);
+            }
+            _ if arg.starts_with("--onto=") => {
                 out.onto_name = Some(take_value(&mut index)?);
             }
             "--keep-base" => out.keep_base = true,
