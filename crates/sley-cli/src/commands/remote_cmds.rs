@@ -40,6 +40,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // `option_reject_shallow = -1` when unspecified); the CLI flag overrides the
     // `clone.rejectshallow` config when present.
     let mut option_reject_shallow = None::<bool>;
+    let mut ref_storage = match env::var("GIT_DEFAULT_REF_FORMAT") {
+        Ok(value) if value == "reftable" => RefStorageFormat::Reftable,
+        _ => RefStorageFormat::Files,
+    };
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -259,18 +263,20 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             "-l" | "--local" => local = Some(true),
             "--no-local" => local = Some(false),
             "--hardlinks" | "--no-hardlinks" => {}
-            "--no-ref-format" => {}
+            "--no-ref-format" => ref_storage = RefStorageFormat::Files,
             "--ref-format" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --ref-format requires a value".into())
                 })?;
                 reject_unknown_clone_ref_format(value)?;
+                ref_storage = RefStorageFormat::parse(value)?;
             }
             value if value.starts_with("--ref-format=") => {
                 let value = value.strip_prefix("--ref-format=").ok_or_else(|| {
                     GitError::Command("clone --ref-format requires a value".into())
                 })?;
                 reject_unknown_clone_ref_format(value)?;
+                ref_storage = RefStorageFormat::parse(value)?;
             }
             "-c" | "--config" => {
                 let assignment = iter
@@ -529,6 +535,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
+            ref_storage,
         })?;
         return recurse_clone_submodules(
             &destination,
@@ -563,6 +570,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
+            ref_storage,
         })?;
         return recurse_clone_submodules(
             &destination,
@@ -597,6 +605,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
+            ref_storage,
         })?;
         return recurse_clone_submodules(
             &destination,
@@ -757,6 +766,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 dissociate,
                 config_overrides: &config_overrides,
                 submodule_active: &submodule_active,
+                ref_storage,
             },
         )?;
         if !quiet && local_source {
@@ -792,12 +802,21 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if let Some(revision_oid) = revision_oid.as_ref() {
         // `--revision` copies the object closure directly and checks out detached;
         // it never fetches or creates a branch, so it keeps its own init here.
-        let layout = RepositoryLayout::init_at_with_initial_branch(
-            &destination,
-            format,
-            false,
-            "__git_rs_clone_unborn__",
-        )?;
+        let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
+            worktree: destination.clone(),
+            object_format: format,
+            object_format_explicit: false,
+            bare: false,
+            initial_branch: "__git_rs_clone_unborn__".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: None,
+            ref_storage,
+            ref_storage_explicit: ref_storage != RefStorageFormat::Files,
+        })?;
         let git_dir = layout.git_dir;
         configure_local_clone(&git_dir, None)?;
         copy_local_revision_objects(&remote_common_git_dir, &git_dir, format, revision_oid)?;
@@ -865,6 +884,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         // remote-tracking-branch lookup (and its "Remote branch not found"
         // mapping) must be bypassed.
         branch_explicit: branch_explicit && branch_tag_oid.is_none(),
+        ref_storage,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -946,6 +966,7 @@ struct CloneHttpOptions<'a> {
     reference_alternates: &'a [CloneReferenceAlternate],
     bundle_uri: Option<&'a CloneBundleUri>,
     depth: Option<u32>,
+    ref_storage: RefStorageFormat,
 }
 
 /// Derive the remote default branch name from the upload-pack advertisement:
@@ -1077,6 +1098,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         detached_head: None,
         filter: None,
         branch_explicit,
+        ref_storage: options.ref_storage,
     };
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
@@ -1251,6 +1273,7 @@ fn clone_network_repository(
         detached_head: None,
         filter: None,
         branch_explicit,
+        ref_storage: options.ref_storage,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -1345,15 +1368,10 @@ fn clone_jobs_error() -> &'static str {
 /// Validate `git clone --ref-format=<name>`. Upstream resolves the name through
 /// `ref_storage_format_by_name`; an unknown name (e.g. `garbage`) dies with
 /// `fatal: unknown ref storage format '<name>'` (exit 128). sley implements only
-/// the `files` backend, so `reftable` — a name git *does* recognise — is reported
-/// as unsupported rather than unknown, keeping the unknown-format diagnostic
-/// exact for the names git would also reject.
+/// the `files` or `reftable` backend; unknown names keep git's exact diagnostic.
 fn reject_unknown_clone_ref_format(value: &str) -> Result<()> {
     match value {
-        "files" => Ok(()),
-        "reftable" => Err(GitError::Unsupported(
-            "the reftable ref storage backend is not implemented".into(),
-        )),
+        "files" | "reftable" => Ok(()),
         _ => {
             eprintln!("fatal: unknown ref storage format '{value}'");
             Err(GitError::Exit(128))
@@ -1458,6 +1476,7 @@ impl CloneBundleUri {
 
 struct CloneLocalOptions<'a> {
     format: ObjectFormat,
+    ref_storage: RefStorageFormat,
     origin: &'a str,
     repository: &'a str,
     tag_opt: Option<&'a str>,
@@ -1498,12 +1517,21 @@ fn clone_bare_or_mirror_local_repository(
     } else {
         options.head_branch
     };
-    let layout = RepositoryLayout::init_at_with_initial_branch(
-        destination,
-        options.format,
-        true,
-        initial_branch,
-    )?;
+    let layout = RepositoryBootstrap::init(InitOptions {
+        git_dir_override: None,
+        core_worktree: None,
+        worktree: destination.to_path_buf(),
+        object_format: options.format,
+        object_format_explicit: false,
+        bare: true,
+        initial_branch: initial_branch.into(),
+        template_dir: None,
+        copy_template_config: false,
+        separate_git_dir: None,
+        shared_repository: None,
+        ref_storage: options.ref_storage,
+        ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
+    })?;
     let git_dir = layout.git_dir;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     apply_clone_alternates(&git_dir, options.alternates, options.dissociate)?;

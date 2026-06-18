@@ -2659,7 +2659,12 @@ impl RepositoryBootstrap {
             }
         } else if !head_path.exists() {
             fs::write(&head_path, b"ref: refs/heads/.invalid\n")?;
-            write_initial_reftable(&git_dir, object_format, &options.initial_branch)?;
+            write_initial_reftable(
+                &git_dir,
+                object_format,
+                &options.initial_branch,
+                options.shared_repository.as_deref(),
+            )?;
         }
 
         let config_path = git_dir.join("config");
@@ -2809,6 +2814,7 @@ fn write_initial_reftable(
     git_dir: &Path,
     object_format: ObjectFormat,
     initial_branch: &str,
+    shared_repository: Option<&str>,
 ) -> Result<()> {
     let update_index = 1;
     let table_name = format!("{update_index:012}-{update_index:012}-init.ref");
@@ -2819,8 +2825,12 @@ fn write_initial_reftable(
     }];
     let bytes = Reftable::write_ref_only(object_format, update_index, update_index, &refs)?;
     let reftable_dir = git_dir.join("reftable");
-    fs::write(reftable_dir.join(&table_name), bytes)?;
-    fs::write(reftable_dir.join("tables.list"), format!("{table_name}\n"))?;
+    let table_path = reftable_dir.join(&table_name);
+    fs::write(&table_path, bytes)?;
+    apply_shared_file_mode(&table_path, shared_repository)?;
+    let list_path = reftable_dir.join("tables.list");
+    fs::write(&list_path, format!("{table_name}\n"))?;
+    apply_shared_file_mode(&list_path, shared_repository)?;
     Ok(())
 }
 

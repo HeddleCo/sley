@@ -2608,6 +2608,16 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
+    if store.uses_reftable()? {
+        return store.compact_reftable_stack().map_err(|err| {
+            if matches!(err, GitError::Io(ref message) if message.contains("File exists")) {
+                eprintln!("error: unable to compact stack: data is locked");
+                GitError::Exit(1)
+            } else {
+                err
+            }
+        });
+    }
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
 
     let mut packed = BTreeMap::new();
@@ -2658,6 +2668,7 @@ fn parse_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
     let mut args = GitArgCursor::new(args);
     while let Some(arg) = args.next() {
         match arg {
+            "-h" | "--help" => return pack_refs_help(),
             "--all" => all = true,
             "--no-all" => all = false,
             "--prune" => prune = true,
@@ -2717,6 +2728,22 @@ fn pack_refs_usage<T>() -> Result<T> {
     eprintln!("    --[no-]exclude <pattern>");
     eprintln!("                          references to exclude");
     eprintln!();
+    Err(GitError::Exit(129))
+}
+
+fn pack_refs_help<T>() -> Result<T> {
+    println!(
+        "usage: git pack-refs [--all] [--no-prune] [--auto] [--include <pattern>] [--exclude <pattern>]"
+    );
+    println!();
+    println!("    --[no-]all            pack everything");
+    println!("    --[no-]prune          prune loose refs (default)");
+    println!("    --[no-]auto           auto-pack refs as needed");
+    println!("    --[no-]include <pattern>");
+    println!("                          references to include");
+    println!("    --[no-]exclude <pattern>");
+    println!("                          references to exclude");
+    println!();
     Err(GitError::Exit(129))
 }
 
