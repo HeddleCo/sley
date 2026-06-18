@@ -5387,6 +5387,7 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config(&git_dir)?;
+    let warn_skipped_local_branches = remote_remove_maps_outside_remote_tracking(&config, name);
     match sley_config::remotes::remove_remote(&mut config, name) {
         Ok(()) => {}
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
@@ -5401,6 +5402,9 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     }
     write_repo_config(&git_dir, &config)?;
     let format = repository_object_format(&git_dir)?;
+    if warn_skipped_local_branches {
+        warn_remote_remove_skipped_local_branches(&git_dir, format)?;
+    }
     remove_remote_tracking_refs(&git_dir, format, name)
 }
 
@@ -5619,6 +5623,45 @@ fn remove_remote_tracking_refs(git_dir: &Path, format: ObjectFormat, remote: &st
     remove_remote_packed_refs(git_dir, format, &prefix)?;
     remove_remote_ref_dir(git_dir, "refs", remote)?;
     remove_remote_ref_dir(git_dir, "logs/refs", remote)
+}
+
+fn remote_remove_maps_outside_remote_tracking(config: &GitConfig, remote: &str) -> bool {
+    remote_config_values(config, remote, "fetch")
+        .iter()
+        .filter_map(|refspec| refspec.rsplit_once(':').map(|(_, dst)| dst))
+        .any(|dst| dst == "refs/*" || dst == "+refs/*")
+}
+
+fn warn_remote_remove_skipped_local_branches(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut branches = store
+        .list_refs()?
+        .into_iter()
+        .filter_map(|reference| {
+            reference
+                .name
+                .strip_prefix("refs/heads/")
+                .map(|branch| branch.to_string())
+        })
+        .collect::<Vec<_>>();
+    branches.sort();
+    if branches.is_empty() {
+        return Ok(());
+    }
+    if branches.len() == 1 {
+        eprintln!("Note: A branch outside the refs/remotes/ hierarchy was not removed;");
+        eprintln!("to delete it, use:");
+    } else {
+        eprintln!("Note: Some branches outside the refs/remotes/ hierarchy were not removed;");
+        eprintln!("to delete them, use:");
+    }
+    for branch in branches {
+        eprintln!("  git branch -d {branch}");
+    }
+    Ok(())
 }
 
 fn rename_remote_tracking_refs(
