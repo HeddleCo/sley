@@ -6439,7 +6439,7 @@ fn write_remote_show_query(
     writeln!(stdout, "  Fetch URL: {display_url}")?;
     if push_urls.is_empty() {
         if fetch_urls.is_empty() {
-            writeln!(stdout, "  Push  URL: (no URL)")?;
+            writeln!(stdout, "  Push  URL: {display_url}")?;
         } else {
             for url in &fetch_urls {
                 writeln!(stdout, "  Push  URL: {url}")?;
@@ -6530,7 +6530,7 @@ fn write_remote_show_no_query(
     writeln!(stdout, "  Fetch URL: {display_url}")?;
     if push_urls.is_empty() {
         if fetch_urls.is_empty() {
-            writeln!(stdout, "  Push  URL: (no URL)")?;
+            writeln!(stdout, "  Push  URL: {display_url}")?;
         } else {
             for url in &fetch_urls {
                 writeln!(stdout, "  Push  URL: {url}")?;
@@ -6830,7 +6830,20 @@ fn remote_show_query_push_rows(
     remote_refs: &[sley_refs::Ref],
 ) -> Vec<RemotePushConfig> {
     let mut rows = Vec::new();
-    for spec in remote_config_values(config, remote, "push") {
+    let specs = remote_config_values(config, remote, "push");
+    if specs.is_empty() {
+        for local in local_branch_names(local_refs) {
+            if direct_ref_oid(remote_refs, &format!("refs/heads/{local}")).is_some() {
+                rows.push(RemotePushConfig {
+                    src: local.clone(),
+                    dst: local,
+                    forced: false,
+                });
+            }
+        }
+        return rows;
+    }
+    for spec in specs {
         if spec == ":" {
             for local in local_branch_names(local_refs) {
                 if direct_ref_oid(remote_refs, &format!("refs/heads/{local}")).is_some() {
@@ -6856,7 +6869,16 @@ fn remote_show_query_push_rows(
 
 fn remote_show_no_query_push_rows(config: &GitConfig, remote: &str) -> Vec<RemotePushConfig> {
     let mut rows = Vec::new();
-    for spec in remote_config_values(config, remote, "push") {
+    let specs = remote_config_values(config, remote, "push");
+    if specs.is_empty() {
+        rows.push(RemotePushConfig {
+            src: "(matching)".into(),
+            dst: "(matching)".into(),
+            forced: false,
+        });
+        return rows;
+    }
+    for spec in specs {
         if spec == ":" {
             rows.push(RemotePushConfig {
                 src: "(matching)".into(),
