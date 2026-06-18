@@ -2549,6 +2549,15 @@ pub fn refresh_untracked_cache_after_status(
         }
     }
     let old_cache = index.untracked_cache(format).ok().flatten();
+    let ident = untracked_cache_ident(worktree_root);
+    if old_cache
+        .as_ref()
+        .is_some_and(|cache| cache.ident != ident)
+    {
+        eprintln!("warning: untracked cache is disabled on this system or location");
+        emit_untracked_cache_bypass_trace();
+        return Ok(());
+    }
     let cache = build_untracked_cache(worktree_root, git_dir, format, &index, untracked_mode)?;
     emit_untracked_cache_trace(old_cache.as_ref(), &cache);
     index.set_untracked_cache(format, Some(&cache))?;
@@ -2584,6 +2593,18 @@ fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> {
         offset = end;
     }
     filtered
+}
+
+fn preserved_index_extensions(git_dir: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
+    let index_path = repository_index_path(git_dir);
+    match fs::read(&index_path) {
+        Ok(bytes) => {
+            let index = Index::parse(&bytes, format)?;
+            Ok(index_extensions_without_cache_tree(&index.extensions))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn invalidate_untracked_cache_for_git_paths(
@@ -3622,8 +3643,9 @@ fn collect_short_status_with_options(
     } else {
         Some(head_tree_entries(git_dir, format, &db)?)
     };
+    let known_tracked_paths = index.keys().cloned().collect::<BTreeSet<_>>();
     let tracked_paths = if options.untracked_mode == StatusUntrackedMode::None {
-        Some(index.keys().cloned().collect::<BTreeSet<_>>())
+        Some(&known_tracked_paths)
     } else {
         None
     };
@@ -3634,7 +3656,8 @@ fn collect_short_status_with_options(
             git_dir,
             format,
             &stat_cache,
-            tracked_paths.as_ref(),
+            Some(&known_tracked_paths),
+            tracked_paths,
             Some(&mut ignores),
         )?;
     let mut entries = Vec::new();
@@ -6876,12 +6899,25 @@ fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
     let ignore_len = ignores.patterns.len();
     let mut entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, ignores, None)?;
     entries.sort_by_key(|entry| entry.file_name());
+    let exclude_path = if dir_git_path.is_empty() {
+        b".gitignore".to_vec()
+    } else {
+        let mut path = dir_git_path.to_vec();
+        path.push(b'/');
+        path.extend_from_slice(b".gitignore");
+        path
+    };
+    let exclude_oid = if tracked.tracked_kind(&exclude_path).is_some() {
+        None
+    } else {
+        per_directory_ignore_oid(dir, format)?
+    };
     let mut node = UntrackedCacheDir {
         name: name.to_vec(),
         stat: fs::symlink_metadata(dir)
             .map(|metadata| untracked_cache_stat_data(&metadata))
             .unwrap_or_default(),
-        exclude_oid: per_directory_ignore_oid(dir, format)?,
+        exclude_oid,
         valid: true,
         check_only,
         recurse: true,
@@ -10859,12 +10895,13 @@ fn checkout_commit_to_index_and_worktree_filtered(
         index_entries.push(index_entry);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let extensions = preserved_index_extensions(git_dir, format)?;
     fs::write(
         repository_index_path(git_dir),
         Index {
             version: 2,
             entries: index_entries,
-            extensions: Vec::new(),
+            extensions,
             checksum: None,
         }
         .write(format)?,
@@ -10997,7 +11034,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
     let mut index = Index {
         version: 2,
         entries: index_entries,
-        extensions: Vec::new(),
+        extensions: preserved_index_extensions(git_dir, format)?,
         checksum: None,
     };
     normalize_index_version_for_extended_flags(&mut index);
@@ -11194,6 +11231,8 @@ fn restore_index_paths_from_entries(
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let index_version = index.version;
+    let extensions = index_extensions_without_cache_tree(&index.extensions);
     let mut index_entries = index
         .entries
         .into_iter()
@@ -11259,16 +11298,15 @@ fn restore_index_paths_from_entries(
     }
     let mut entries = index_entries.into_values().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(
-        repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let restored_paths = restored.iter().cloned().collect::<Vec<_>>();
+    let mut index = Index {
+        version: index_version,
+        entries,
+        extensions,
+        checksum: None,
+    };
+    invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
+    fs::write(repository_index_path(git_dir), index.write(format)?)?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11348,6 +11386,8 @@ fn restore_index_and_worktree_paths_from_entries(
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let index_version = index.version;
+    let extensions = index_extensions_without_cache_tree(&index.extensions);
     let mut index_entries = index
         .entries
         .into_iter()
@@ -11403,16 +11443,15 @@ fn restore_index_and_worktree_paths_from_entries(
     }
     let mut entries = index_entries.into_values().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(
-        repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let restored_paths = restored.iter().cloned().collect::<Vec<_>>();
+    let mut index = Index {
+        version: index_version,
+        entries,
+        extensions,
+        checksum: None,
+    };
+    invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
+    fs::write(repository_index_path(git_dir), index.write(format)?)?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11457,12 +11496,13 @@ pub fn reset_index_and_worktree_to_commit(
         )?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let extensions = preserved_index_extensions(git_dir, format)?;
     fs::write(
         repository_index_path(git_dir),
         Index {
             version: 2,
             entries: index_entries,
-            extensions: Vec::new(),
+            extensions,
             checksum: None,
         }
         .write(format)?,
@@ -11739,12 +11779,13 @@ pub fn checkout_tree_to_index_and_worktree(
         index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let extensions = preserved_index_extensions(git_dir, format)?;
     fs::write(
         repository_index_path(git_dir),
         Index {
             version: 2,
             entries: index_entries,
-            extensions: Vec::new(),
+            extensions,
             checksum: None,
         }
         .write(format)?,
@@ -11792,7 +11833,7 @@ pub fn reset_index_to_commit(
     let mut index = Index {
         version: 2,
         entries: index_entries,
-        extensions: Vec::new(),
+        extensions: preserved_index_extensions(git_dir, format)?,
         checksum: None,
     };
     index.upgrade_version_for_flags();
@@ -13938,6 +13979,7 @@ fn worktree_entries_with_submodule_dirt(
         matcher: &mut attr_matcher,
         requested: &attr_requested,
         stat_cache,
+        known_tracked_paths: tracked_paths,
         tracked_paths,
         ignores,
         entries: &mut entries,
@@ -13954,6 +13996,7 @@ fn status_worktree_entries_with_submodule_dirt(
     git_dir: &Path,
     format: ObjectFormat,
     stat_cache: &IndexStatCache,
+    known_tracked_paths: Option<&BTreeSet<Vec<u8>>>,
     tracked_paths: Option<&BTreeSet<Vec<u8>>>,
     ignores: Option<&mut IgnoreMatcher>,
 ) -> Result<StatusWorktreeSnapshot> {
@@ -13970,6 +14013,7 @@ fn status_worktree_entries_with_submodule_dirt(
         matcher: &mut attr_matcher,
         requested: &attr_requested,
         stat_cache: Some(stat_cache),
+        known_tracked_paths,
         tracked_paths,
         ignores,
         entries: &mut entries,
@@ -14332,6 +14376,7 @@ struct WorktreeEntriesWalk<'a> {
     matcher: &'a mut AttributeMatcher,
     requested: &'a [Vec<u8>],
     stat_cache: Option<&'a IndexStatCache>,
+    known_tracked_paths: Option<&'a BTreeSet<Vec<u8>>>,
     tracked_paths: Option<&'a BTreeSet<Vec<u8>>>,
     ignores: Option<&'a mut IgnoreMatcher>,
     entries: &'a mut BTreeMap<Vec<u8>, TrackedEntry>,
@@ -14426,14 +14471,20 @@ fn collect_worktree_entries(
             .as_ref()
             .is_some_and(|ignores| ignores.is_ignored(&git_path, metadata.is_dir()))
         {
-            if metadata.is_dir()
-                && context.tracked_paths.is_some_and(|tracked_paths| {
+            let tracked = context.known_tracked_paths.is_some_and(|tracked_paths| {
+                if metadata.is_dir() {
                     tracked_paths_may_contain(tracked_paths, &git_path)
-                })
-            {
-                collect_worktree_entries(context, &path, &git_path)?;
+                } else {
+                    tracked_paths.contains(&git_path)
+                }
+            });
+            if !tracked {
+                continue;
             }
-            continue;
+            if metadata.is_dir() {
+                collect_worktree_entries(context, &path, &git_path)?;
+                continue;
+            }
         }
         if metadata.is_dir() {
             // A directory staged as a gitlink (mode 160000) is opaque: the walk
