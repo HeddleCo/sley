@@ -2199,6 +2199,24 @@ fn check_todo_dropped_commits(
     Ok(false)
 }
 
+fn check_todo_dropped_commits_against_backup(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    new_items: &[RebaseTodoItem],
+) -> Result<bool> {
+    let Ok(backup) = fs::read_to_string(ctx.state_path("git-rebase-todo.backup")) else {
+        return Ok(false);
+    };
+    let mut resolver = make_resolver(ctx, db);
+    let (backup_items, _) = seq::parse_todo_buffer(
+        &backup,
+        ctx.state_path("done").exists(),
+        comment_char(&ctx.git_dir) as char,
+        &mut resolver,
+    );
+    check_todo_dropped_commits(ctx, db, &backup_items, new_items)
+}
+
 fn launch_sequence_editor(ctx: &Ctx, path: &Path) -> Result<()> {
     let editor = env::var("GIT_SEQUENCE_EDITOR")
         .ok()
@@ -3743,6 +3761,12 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     }
 
     let mut todo = read_populate_todo(ctx, &db)?;
+    if ctx.state_path("dropped").exists() {
+        if check_todo_dropped_commits_against_backup(ctx, &db, &todo.items)? {
+            return Err(GitError::Exit(1));
+        }
+        let _ = fs::remove_file(ctx.state_path("dropped"));
+    }
 
     if commit_staged_changes(ctx, &db, &opts, &todo)? {
         return Err(GitError::Exit(1));
@@ -3942,6 +3966,14 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
             // only re-attaches HEAD to it. Updating the branch ref here would
             // add a spurious branch-reflog entry; git leaves it untouched
             // (t3406 #15).
+            if refs.read_ref(head_name)?.is_none() {
+                tx.update(RefUpdate {
+                    name: head_name.clone(),
+                    expected: None,
+                    new: RefTarget::Direct(target),
+                    reflog: None,
+                });
+            }
             tx.update(RefUpdate {
                 name: "HEAD".into(),
                 expected: None,
@@ -3989,14 +4021,27 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
     let text = fs::read_to_string(&todo_path)?;
     let stripped = stripspace_drop_comments(&text, comment_char(&ctx.git_dir));
     let mut resolver = make_resolver(ctx, &db);
-    let (items, _messages) = seq::parse_todo_buffer(
+    let (items, old_messages) = seq::parse_todo_buffer(
         &stripped,
         ctx.state_path("done").exists(),
         comment_char(&ctx.git_dir) as char,
         &mut resolver,
     );
     drop(resolver);
+    let incorrect = !old_messages.is_empty() || ctx.state_path("dropped").exists();
     write_todo_file(ctx, &todo_path, &items, true, true, None, None, &db)?;
+    if !incorrect {
+        write_todo_file(
+            ctx,
+            &ctx.state_path("git-rebase-todo.backup"),
+            &items,
+            false,
+            true,
+            None,
+            None,
+            &db,
+        )?;
+    }
     launch_sequence_editor(ctx, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
     let stripped = stripspace_drop_comments(&edited, comment_char(&ctx.git_dir));
@@ -4012,6 +4057,17 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
         for message in messages {
             eprintln!("{message}");
         }
+        return Err(GitError::Exit(1));
+    }
+    if incorrect {
+        for message in old_messages {
+            eprintln!("{message}");
+        }
+        if check_todo_dropped_commits_against_backup(ctx, &db, &new_items)? {
+            return Err(GitError::Exit(1));
+        }
+        let _ = fs::remove_file(ctx.state_path("dropped"));
+    } else if check_todo_dropped_commits(ctx, &db, &items, &new_items)? {
         return Err(GitError::Exit(1));
     }
     write_todo_file(ctx, &todo_path, &new_items, false, false, None, None, &db)?;
