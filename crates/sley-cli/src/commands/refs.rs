@@ -1692,7 +1692,7 @@ fn dispatch_ref_stdin_command(
                 return Ok(());
             }
             transaction.mark_applied();
-            update_ref_stdin_symref_create(context.store, &name, &target)
+            update_ref_stdin_symref_create(context, &name, &target)
         }
         "symref-update" => {
             let Some(raw_name) = cursor.parse_refname()? else {
@@ -1741,7 +1741,7 @@ fn dispatch_ref_stdin_command(
                 return Ok(());
             }
             transaction.mark_applied();
-            update_ref_stdin_symref_update(context.store, context.format, &name, &target, expected)
+            update_ref_stdin_symref_update(context, &name, &target, expected)
         }
         "symref-verify" => {
             if *deref {
@@ -2369,20 +2369,25 @@ fn update_ref_stdin_delete_zero(name: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-fn update_ref_stdin_symref_create(store: &FileRefStore, name: &str, target: &str) -> Result<()> {
+fn update_ref_stdin_symref_create(
+    context: &UpdateRefStdinContext<'_>,
+    name: &str,
+    target: &str,
+) -> Result<()> {
     validate_ref_name(name)?;
-    if let Some(current) = store.read_ref(name)? {
+    if let Some(current) = context.store.read_ref(name)? {
         return match current {
             RefTarget::Symbolic(_) => update_ref_stdin_symref_exists(name, true),
             RefTarget::Direct(_) => update_ref_stdin_symref_exists(name, false),
         };
     }
-    let mut tx = store.transaction();
+    let reflog = update_ref_stdin_symref_reflog(context, name, target)?;
+    let mut tx = context.store.transaction();
     tx.update(RefUpdate {
         name: name.to_string(),
         expected: None,
         new: RefTarget::Symbolic(target.to_string()),
-        reflog: None,
+        reflog,
     });
     tx.commit()
 }
@@ -2393,8 +2398,7 @@ enum UpdateRefStdinSymrefExpected {
 }
 
 fn update_ref_stdin_symref_update(
-    store: &FileRefStore,
-    format: ObjectFormat,
+    context: &UpdateRefStdinContext<'_>,
     name: &str,
     target: &str,
     expected: Option<UpdateRefStdinSymrefExpected>,
@@ -2402,22 +2406,48 @@ fn update_ref_stdin_symref_update(
     validate_ref_name(name)?;
     match expected {
         Some(UpdateRefStdinSymrefExpected::Target(expected)) => {
-            update_ref_stdin_symref_verify(store, name, Some(&expected))?;
+            update_ref_stdin_symref_verify(context.store, name, Some(&expected))?;
         }
         Some(UpdateRefStdinSymrefExpected::Oid(expected)) => {
-            let current = store.read_ref(name)?;
-            update_ref_stdin_symref_verify_oid(store, format, name, current.as_ref(), &expected)?;
+            let current = context.store.read_ref(name)?;
+            update_ref_stdin_symref_verify_oid(
+                context.store,
+                context.format,
+                name,
+                current.as_ref(),
+                &expected,
+            )?;
         }
         None => {}
     }
-    let mut tx = store.transaction();
+    let reflog = update_ref_stdin_symref_reflog(context, name, target)?;
+    let mut tx = context.store.transaction();
     tx.update(RefUpdate {
         name: name.to_string(),
         expected: None,
         new: RefTarget::Symbolic(target.to_string()),
-        reflog: None,
+        reflog,
     });
     tx.commit()
+}
+
+fn update_ref_stdin_symref_reflog(
+    context: &UpdateRefStdinContext<'_>,
+    name: &str,
+    target: &str,
+) -> Result<Option<ReflogEntry>> {
+    if !update_ref_should_write_reflog(context.git_dir, name, context.create_reflog)? {
+        return Ok(None);
+    }
+    let zero = zero_oid(context.format)?;
+    let old_oid = resolve_ref_peeled(context.store, name)?.unwrap_or(zero);
+    let new_oid = resolve_ref_peeled(context.store, target)?.unwrap_or(zero);
+    Ok(Some(ReflogEntry {
+        old_oid,
+        new_oid,
+        committer: default_committer(),
+        message: context.message.clone(),
+    }))
 }
 
 fn update_ref_stdin_symref_verify(
@@ -2928,9 +2958,13 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
     let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
         return Ok(false);
     };
-    Ok(config
-        .get("core", None, "logAllRefUpdates")
-        .is_some_and(|value| update_ref_log_all_ref_updates_matches(name, value)))
+    if let Some(value) = config.get("core", None, "logAllRefUpdates") {
+        return Ok(update_ref_log_all_ref_updates_matches(name, value));
+    }
+    if config.get_bool("core", None, "bare").unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(update_ref_log_all_ref_updates_matches(name, "true"))
 }
 
 fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
