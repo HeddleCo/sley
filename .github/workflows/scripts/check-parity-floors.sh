@@ -548,7 +548,13 @@ declare -A FLOOR=(
     [t5505-remote.sh]=126
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
-    [t5516-fetch-push.sh]=63
+    # codex-wave-11 (push.default resolution): nothing/current/upstream/simple/
+    # matching modes, triangular pushRemote/pushDefault, @{push}, no-upstream +
+    # name-mismatch errors + --set-upstream hint, autoSetupRemote. t5528 NEW@31;
+    # side gain t5516-fetch-push 63->72. remote/tracking floors held t5505=126
+    # t5520=38 t6040=44 t3200=134.
+    [t5528-push-default.sh]=31
+    [t5516-fetch-push.sh]=72
     [t5520-pull.sh]=38
     [t5601-clone.sh]=72
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;

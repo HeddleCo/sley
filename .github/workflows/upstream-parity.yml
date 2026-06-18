@@ -215,6 +215,7 @@ jobs:
             t5511-refspec.sh
             t5515-fetch-merge-logic.sh
             t5516-fetch-push.sh
+            t5528-push-default.sh
             t5520-pull.sh
             t5601-clone.sh
             t5603-clone-dirname.sh
