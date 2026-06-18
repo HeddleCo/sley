@@ -5413,7 +5413,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         write_reftable_stack(
             &git_dir,
             &[(
-                "000000000001-000000000001-rust.ref",
+                "0x000000000001-0x000000000001-00000000.ref",
                 vec![
                     sley_formats::ReftableRefRecord {
                         name: "HEAD".into(),
@@ -5492,7 +5492,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             &git_dir,
             &[
                 (
-                    "000000000001-000000000001-base.ref",
+                    "0x000000000001-0x000000000001-00000000.ref",
                     vec![
                         sley_formats::ReftableRefRecord {
                             name: "refs/heads/main".into(),
@@ -5565,7 +5565,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         write_reftable_stack(
             &git_dir,
             &[(
-                "000000000001-000000000001-base.ref",
+                "0x000000000001-0x000000000001-00000000.ref",
                 vec![sley_formats::ReftableRefRecord {
                     name: "refs/heads/main".into(),
                     update_index: 1,
@@ -5644,7 +5644,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         write_reftable_stack(
             &git_dir,
             &[(
-                "000000000001-000000000001-base.ref",
+                "0x000000000001-0x000000000001-00000000.ref",
                 vec![
                     sley_formats::ReftableRefRecord {
                         name: "refs/heads/main".into(),

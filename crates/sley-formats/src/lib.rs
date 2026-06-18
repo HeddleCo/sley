@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const REFTABLE_MAGIC: &[u8; 4] = b"REFT";
+const REFTABLE_DEFAULT_BLOCK_SIZE: u32 = 4096;
 const REFTABLE_MAX_BLOCK_SIZE: u32 = 0x00ff_ffff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +227,7 @@ impl Reftable {
         };
         let header = ReftableHeader {
             version,
-            block_size: 0,
+            block_size: REFTABLE_DEFAULT_BLOCK_SIZE,
             min_update_index,
             max_update_index,
             object_format: format,
@@ -2817,7 +2818,7 @@ fn write_initial_reftable(
     shared_repository: Option<&str>,
 ) -> Result<()> {
     let update_index = 1;
-    let table_name = format!("{update_index:012}-{update_index:012}-init.ref");
+    let table_name = format!("0x{update_index:012x}-0x{update_index:012x}-00000000.ref");
     let refs = vec![ReftableRefRecord {
         name: "HEAD".into(),
         update_index,
@@ -2831,6 +2832,14 @@ fn write_initial_reftable(
     let list_path = reftable_dir.join("tables.list");
     fs::write(&list_path, format!("{table_name}\n"))?;
     apply_shared_file_mode(&list_path, shared_repository)?;
+    let refs_dir = git_dir.join("refs");
+    fs::create_dir_all(&refs_dir)?;
+    let refs_heads = refs_dir.join("heads");
+    fs::write(
+        &refs_heads,
+        b"this repository uses the reftable format\n" as &[u8],
+    )?;
+    apply_shared_file_mode(&refs_heads, shared_repository)?;
     Ok(())
 }
 
@@ -3324,7 +3333,7 @@ mod tests {
             fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n").expect("write HEAD");
             let reftable_dir = git_dir.join("reftable");
             fs::create_dir_all(&reftable_dir).expect("create reftable dir");
-            let table_name = "000000000001-000000000001-rust.ref";
+            let table_name = "0x000000000001-0x000000000001-00000000.ref";
             let table = Reftable::write_ref_only(
                 ObjectFormat::Sha1,
                 1,
@@ -4275,7 +4284,10 @@ mod tests {
             Some("reftable")
         );
         assert!(layout.git_dir.join("reftable/tables.list").is_file());
-        assert!(!layout.git_dir.join("refs/heads").exists());
+        assert_eq!(
+            fs::read(layout.git_dir.join("refs/heads")).expect("read reftable sentinel"),
+            b"this repository uses the reftable format\n"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
