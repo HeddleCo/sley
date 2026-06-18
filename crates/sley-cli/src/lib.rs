@@ -1272,16 +1272,23 @@ fn write_check_attr_state(
     Ok(())
 }
 
-fn check_ignore_tracked_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
-    Ok(sley_worktree::read_repository_index(git_dir, format)?
-        .map(|index| {
-            index
-                .entries
-                .into_iter()
-                .map(|entry| entry.path.into_bytes())
-                .collect()
-        })
-        .unwrap_or_default())
+fn check_ignore_tracked_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<(BTreeSet<Vec<u8>>, Vec<Vec<u8>>)> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok((BTreeSet::new(), Vec::new()));
+    };
+    let mut tracked = BTreeSet::new();
+    let mut gitlinks = Vec::new();
+    for entry in index.entries {
+        let path = entry.path.into_bytes();
+        if sley_index::is_gitlink(entry.mode) {
+            gitlinks.push(path.clone());
+        }
+        tracked.insert(path);
+    }
+    Ok((tracked, gitlinks))
 }
 
 fn read_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<PathBuf>> {

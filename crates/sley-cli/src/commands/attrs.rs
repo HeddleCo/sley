@@ -1,13 +1,15 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 
 use sley_core::{GitError, Result};
 
 use crate::{
     RepositoryContext, check_ignore_tracked_paths, normalize_ls_files_pathspec, resolve_cli_path,
-    worktree_prefix, write_check_attr_state,
+    require_work_tree, worktree_prefix, write_check_attr_state,
 };
 
 pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
@@ -63,37 +65,44 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
             _ => path_args.push(arg.as_bytes().to_vec()),
         }
     }
-    if read_stdin && !path_args.is_empty() {
-        return Err(GitError::Command(
-            "check-ignore --stdin cannot be combined with path arguments".into(),
-        ));
+    if read_stdin {
+        if !path_args.is_empty() {
+            eprintln!("fatal: cannot specify pathnames with --stdin");
+            return Err(GitError::Exit(128));
+        }
+    } else {
+        if z {
+            eprintln!("fatal: -z only makes sense with --stdin");
+            return Err(GitError::Exit(128));
+        }
+        if path_args.is_empty() {
+            eprintln!("fatal: no path specified");
+            return Err(GitError::Exit(128));
+        }
     }
-    if quiet && verbose {
-        eprintln!("fatal: cannot have both --quiet and --verbose");
-        return Err(GitError::Exit(128));
-    }
-    if z && !read_stdin {
-        eprintln!("fatal: -z only makes sense with --stdin");
-        return Err(GitError::Exit(128));
+    if quiet {
+        if path_args.len() > 1 {
+            eprintln!("fatal: --quiet is only valid with a single pathname");
+            return Err(GitError::Exit(128));
+        }
+        if verbose {
+            eprintln!("fatal: cannot have both --quiet and --verbose");
+            return Err(GitError::Exit(128));
+        }
     }
     if non_matching && !verbose {
         eprintln!("fatal: --non-matching is only valid with --verbose");
         return Err(GitError::Exit(128));
-    }
-    if !read_stdin && path_args.is_empty() {
-        return Err(GitError::Command(
-            "check-ignore requires path arguments or --stdin".into(),
-        ));
     }
 
     let repo = RepositoryContext::discover_current()?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
-    let worktree_root = repo.worktree_root()?;
+    let worktree_root = &require_work_tree(git_dir)?;
     let prefix = worktree_prefix(cwd, git_dir)?;
-    let tracked_paths = if no_index {
-        BTreeSet::new()
+    let (tracked_paths, gitlink_paths) = if no_index {
+        (BTreeSet::new(), Vec::new())
     } else {
         check_ignore_tracked_paths(git_dir, format)?
     };
@@ -104,6 +113,12 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         |display_path: Vec<u8>, stdout: &mut std::io::StdoutLock<'_>| -> Result<bool> {
             let path_arg = String::from_utf8_lossy(&display_path);
             let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
+            validate_check_ignore_pathspec(
+                worktree_root,
+                &git_path,
+                &display_path,
+                &gitlink_paths,
+            )?;
             let absolute = resolve_cli_path(cwd, &path_arg);
             // Tracked paths are never ignored (upstream check-ignore consults the
             // index via find_pathspecs_matching_against_index and skips matching
@@ -133,7 +148,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
                         write!(stdout, ":{}:", ignore_match.line_number)?;
                         stdout.write_all(&ignore_match.pattern)?;
                         stdout.write_all(b"\t")?;
-                        stdout.write_all(&display_path)?;
+                        write_check_ignore_quoted(stdout, &display_path)?;
                         stdout.write_all(&[terminator])?;
                     }
                 } else if !quiet && ignore_match.ignored {
@@ -147,7 +162,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
                     stdout.write_all(&[0])?;
                 } else {
                     stdout.write_all(b"::\t")?;
-                    stdout.write_all(&display_path)?;
+                    write_check_ignore_quoted(stdout, &display_path)?;
                     stdout.write_all(&[terminator])?;
                 }
             }
@@ -163,6 +178,9 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
                 }
                 if !z {
                     crate::commands::stdin_stream::strip_trailing_cr(&mut display_path);
+                    if display_path.first() == Some(&b'"') {
+                        display_path = c_unquote_check_ignore_stdin(&display_path)?;
+                    }
                 }
                 if process_path(display_path, stdout)? {
                     matched_any = true;
@@ -183,6 +201,93 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
     } else {
         Err(GitError::Exit(1))
     }
+}
+
+fn validate_check_ignore_pathspec(
+    worktree_root: &Path,
+    git_path: &[u8],
+    display_path: &[u8],
+    gitlink_paths: &[Vec<u8>],
+) -> Result<()> {
+    let mut absolute = worktree_root.to_path_buf();
+    let mut components = git_path
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        absolute.push(String::from_utf8_lossy(component).as_ref());
+        if fs::symlink_metadata(&absolute)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "fatal: pathspec '{}' is beyond a symbolic link",
+                String::from_utf8_lossy(display_path)
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+
+    for gitlink in gitlink_paths {
+        if git_path != gitlink
+            && git_path
+                .strip_prefix(gitlink.as_slice())
+                .is_some_and(|rest| rest.first() == Some(&b'/'))
+        {
+            eprintln!(
+                "fatal: Pathspec '{}' is in submodule '{}'",
+                String::from_utf8_lossy(display_path),
+                String::from_utf8_lossy(gitlink)
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
+}
+
+fn c_unquote_check_ignore_stdin(input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut index = 1;
+    while index < input.len() {
+        match input[index] {
+            b'"' if index + 1 == input.len() => return Ok(out),
+            b'\\' if index + 1 < input.len() => {
+                index += 1;
+                out.push(input[index]);
+            }
+            byte => out.push(byte),
+        }
+        index += 1;
+    }
+    eprintln!("fatal: line is badly quoted");
+    Err(GitError::Exit(128))
+}
+
+fn write_check_ignore_quoted(stdout: &mut impl Write, path: &[u8]) -> Result<()> {
+    let needs_quote = path
+        .iter()
+        .any(|byte| matches!(*byte, b'"' | b'\\' | b'\t' | b'\n'));
+    if !needs_quote {
+        stdout.write_all(path)?;
+        return Ok(());
+    }
+    stdout.write_all(b"\"")?;
+    for byte in path {
+        match *byte {
+            b'"' | b'\\' => {
+                stdout.write_all(b"\\")?;
+                stdout.write_all(&[*byte])?;
+            }
+            b'\t' => stdout.write_all(b"\\t")?,
+            b'\n' => stdout.write_all(b"\\n")?,
+            _ => stdout.write_all(&[*byte])?,
+        }
+    }
+    stdout.write_all(b"\"")?;
+    Ok(())
 }
 
 pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {

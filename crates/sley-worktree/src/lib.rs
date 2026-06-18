@@ -6547,7 +6547,7 @@ fn read_dir_entries_with_ignore_patterns(
             source.push(b'/');
         }
         source.extend_from_slice(b".gitignore");
-        read_ignore_patterns_into_matcher(path, matcher, base, &source);
+        read_per_directory_ignore_patterns_into_matcher(path, matcher, base, &source)?;
     }
     Ok(entries)
 }
@@ -7080,37 +7080,37 @@ impl IgnoreMatcher {
     /// the tree exactly once instead of doing a separate full-tree ignore pass.
     fn from_worktree_base(root: &Path) -> Result<Self> {
         let mut matcher = Self::default();
+        if !read_core_excludes_file(root, &mut matcher.patterns) {
+            read_default_global_excludes_file(&mut matcher.patterns);
+        }
         read_ignore_patterns(
             root.join(".git").join("info").join("exclude"),
             &mut matcher.patterns,
             &[],
             b".git/info/exclude",
         );
-        if !read_core_excludes_file(root, &mut matcher.patterns) {
-            read_default_global_excludes_file(&mut matcher.patterns);
-        }
         matcher.rebuild_buckets();
         Ok(matcher)
     }
 
     fn from_worktree_root(root: &Path) -> Result<Self> {
         let mut matcher = Self::default();
+        if !read_core_excludes_file(root, &mut matcher.patterns) {
+            read_default_global_excludes_file(&mut matcher.patterns);
+        }
         read_ignore_patterns(
             root.join(".git").join("info").join("exclude"),
             &mut matcher.patterns,
             &[],
             b".git/info/exclude",
         );
-        if !read_core_excludes_file(root, &mut matcher.patterns) {
-            read_default_global_excludes_file(&mut matcher.patterns);
-        }
-        collect_per_directory_patterns(
+        matcher.rebuild_buckets();
+        collect_per_directory_patterns_into_matcher(
             root,
             root,
             &[String::from(".gitignore")],
-            &mut matcher.patterns,
+            &mut matcher,
         )?;
-        matcher.rebuild_buckets();
         Ok(matcher)
     }
 
@@ -7124,8 +7124,7 @@ impl IgnoreMatcher {
         if names.is_empty() {
             return Ok(());
         }
-        collect_per_directory_patterns(root, root, names, &mut self.patterns)?;
-        self.rebuild_buckets();
+        collect_per_directory_patterns_into_matcher(root, root, names, self)?;
         Ok(())
     }
 
@@ -7619,12 +7618,26 @@ fn read_default_global_excludes_file(patterns: &mut Vec<IgnorePattern>) {
     }
 }
 
-fn collect_per_directory_patterns(
+fn collect_per_directory_patterns_into_matcher(
     root: &Path,
     dir: &Path,
     names: &[String],
-    patterns: &mut Vec<IgnorePattern>,
+    matcher: &mut IgnoreMatcher,
 ) -> Result<()> {
+    for name in names {
+        let path = dir.join(name);
+        let relative = dir.strip_prefix(root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
+        })?;
+        let base = git_path_bytes(relative)?;
+        let mut source = base.clone();
+        if !source.is_empty() {
+            source.push(b'/');
+        }
+        source.extend_from_slice(name.as_bytes());
+        read_per_directory_ignore_patterns_into_matcher(&path, matcher, &base, &source)?;
+    }
+
     let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
@@ -7632,31 +7645,19 @@ fn collect_per_directory_patterns(
         if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
             continue;
         }
-        let metadata = entry.metadata()?;
+        let metadata = entry.file_type()?;
+        if metadata.is_symlink() {
+            continue;
+        }
         if metadata.is_dir() {
-            collect_per_directory_patterns(root, &path, names, patterns)?;
-            continue;
+            let relative = path.strip_prefix(root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            let git_path = git_path_bytes(relative)?;
+            if !matcher.is_ignored(&git_path, true) {
+                collect_per_directory_patterns_into_matcher(root, &path, names, matcher)?;
+            }
         }
-        if !metadata.is_file() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !names.iter().any(|name| name == file_name) {
-            continue;
-        }
-        let parent = path.parent().unwrap_or(root);
-        let relative = parent.strip_prefix(root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", parent.display()))
-        })?;
-        let base = git_path_bytes(relative)?;
-        let mut source = base.clone();
-        if !source.is_empty() {
-            source.push(b'/');
-        }
-        source.extend_from_slice(file_name.as_bytes());
-        read_ignore_patterns(&path, patterns, &base, &source);
     }
     Ok(())
 }
@@ -7675,18 +7676,32 @@ fn read_ignore_patterns(
     }
 }
 
-fn read_ignore_patterns_into_matcher(
+fn read_per_directory_ignore_patterns_into_matcher(
     path: impl AsRef<Path>,
     matcher: &mut IgnoreMatcher,
     base: &[u8],
     source: &[u8],
-) {
-    let Ok(contents) = fs::read(path) else {
-        return;
+) -> Result<()> {
+    let path = path.as_ref();
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(GitError::Io(err.to_string())),
     };
+    if metadata.file_type().is_symlink() {
+        return Err(GitError::Command(format!(
+            "unable to access '{}'",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let contents = fs::read(path)?;
     for (line, raw) in contents.split(|byte| *byte == b'\n').enumerate() {
         matcher.push_raw_pattern(raw, base, source, line + 1);
     }
+    Ok(())
 }
 
 fn push_ignore_pattern(
@@ -8334,8 +8349,7 @@ fn read_dir_ignore_patterns_for_base(
         source.push(b'/');
     }
     source.extend_from_slice(b".gitignore");
-    read_ignore_patterns_into_matcher(dir.join(".gitignore"), matcher, base, &source);
-    Ok(())
+    read_per_directory_ignore_patterns_into_matcher(dir.join(".gitignore"), matcher, base, &source)
 }
 
 /// Fold `dir`'s `.gitattributes` (if any) into `matcher`, scoped to `dir`'s path
