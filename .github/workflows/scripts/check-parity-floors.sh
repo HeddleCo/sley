@@ -574,8 +574,14 @@ declare -A FLOOR=(
     [t3437-rebase-fixup-options.sh]=7
     [t1404-update-ref-errors.sh]=38
     [t1416-ref-transaction-hooks.sh]=7
-    [t1091-sparse-checkout-builtin.sh]=45
-    [t1092-sparse-checkout-compatibility.sh]=22
+    # codex-wave-9 (sparse-checkout engine): cone/non-cone + escaped-cone patterns,
+    # sparse-index expansion for diff/status, skip-worktree missing-file suppression,
+    # sparse-dir write-tree, read-tree sparse reapply hook, native reset -p path.
+    # t1092 22->29; side gains t1091 45->50 (measured 51/53, slack closed), t1011 7->9.
+    # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
+    # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
+    [t1091-sparse-checkout-builtin.sh]=50
+    [t1092-sparse-checkout-compatibility.sh]=29
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
