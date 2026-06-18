@@ -365,6 +365,7 @@ struct MachineOpts {
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
+    squash_onto: Option<ObjectId>,
 }
 
 fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
@@ -378,6 +379,9 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     fs::write(dir.join("head-name"), format!("{head_name}\n"))?;
     fs::write(dir.join("onto"), format!("{}\n", opts.onto))?;
     fs::write(dir.join("orig-head"), format!("{}\n", opts.orig_head))?;
+    if let Some(squash_onto) = opts.squash_onto {
+        fs::write(dir.join("squash-onto"), format!("{squash_onto}\n"))?;
+    }
     if opts.quiet {
         fs::write(dir.join("quiet"), b"")?;
     }
@@ -418,6 +422,14 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         .ok_or_else(|| GitError::not_found("rebase-merge/orig-head"))?;
     let orig_head = ObjectId::from_hex(ctx.format, orig_raw.trim())
         .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
+    let squash_onto = match seq::read_state_line(&ctx.git_dir, "squash-onto") {
+        Some(raw) => Some(
+            ObjectId::from_hex(ctx.format, raw.trim()).map_err(|_| {
+                GitError::InvalidObject("invalid squash-onto value during rebase".into())
+            })?,
+        ),
+        None => None,
+    };
     let exists = |name: &str| ctx.state_path(name).exists();
     let signoff = exists("signoff");
     Ok(MachineOpts {
@@ -437,6 +449,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         },
         onto,
         orig_head,
+        squash_onto,
     })
 }
 
@@ -910,12 +923,20 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     // Onto.
+    let mut squash_onto = None;
     let onto_name = match &args.onto_name {
         Some(name) => name.clone(),
+        None if args.root => {
+            let oid = create_squash_onto(ctx)?;
+            squash_onto = Some(oid);
+            oid.to_hex()
+        }
         None if args.keep_base => format!("{upstream_name}...{branch_name}"),
         None => upstream_name.clone(),
     };
-    let onto = if onto_name.contains("...") {
+    let onto = if args.root && args.onto_name.is_none() {
+        squash_onto.expect("created squash-onto for --root")
+    } else if onto_name.contains("...") {
         let (left, right) = onto_name.split_once("...").expect("contains ...");
         let left_oid = resolve_revision(
             &ctx.git_dir,
@@ -1100,6 +1121,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         head_name: head_name.clone(),
         onto,
         orig_head,
+        squash_onto,
     };
 
     // Generate the todo list.
@@ -1548,6 +1570,22 @@ fn print_rebase_diffstat(
         }
     }
     Ok(())
+}
+
+fn create_squash_onto(ctx: &Ctx) -> Result<ObjectId> {
+    let ident = commit_identity_from_env("COMMITTER")?;
+    let mut writer = ctx.db();
+    sley_sequencer::create_commit(
+        &mut writer,
+        sley_sequencer::CommitCreate {
+            tree: ObjectId::empty_tree(ctx.format),
+            parents: Vec::new(),
+            author: ident.clone(),
+            committer: ident,
+            message: Vec::new(),
+            encoding: None,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2501,6 +2539,11 @@ fn pick_one_commit(
 
     let is_fixup = item.command.is_fixup();
     let final_fixup = is_fixup && !next_is_fixup(todo);
+    let create_root = opts.squash_onto == Some(head);
+    if create_root && is_fixup {
+        eprintln!("error: cannot fixup root commit");
+        return Ok(PickOutcome::Fail(1));
+    }
 
     // Write the author script for --continue / commit amending.
     if let Some(script) = seq::format_author_script(&record.commit.author) {
@@ -2510,7 +2553,7 @@ fn pick_one_commit(
     let parent = record.parents.first().copied();
 
     // Fast-forward when the pick's parent is exactly HEAD.
-    if opts.allow_ff && !is_fixup && parent == Some(head) {
+    if opts.allow_ff && !create_root && !is_fixup && parent == Some(head) {
         sley_worktree::reset_index_and_worktree_to_commit(
             &ctx.worktree_root,
             &ctx.git_dir,
@@ -2536,6 +2579,7 @@ fn pick_one_commit(
                         amend: true,
                         edit: true,
                         allow_empty: true,
+                        create_root: false,
                         message_file: None,
                         reflog_sub: "reword",
                         original: Some(&record),
@@ -2730,6 +2774,7 @@ fn pick_one_commit(
             amend,
             edit: edit || item.command == TodoCommand::Reword,
             allow_empty,
+            create_root,
             message_file: commit_message_file,
             reflog_sub: command_reflog_name(item.command),
             original: Some(&record),
@@ -3257,6 +3302,7 @@ struct MachineCommit<'a> {
     amend: bool,
     edit: bool,
     allow_empty: bool,
+    create_root: bool,
     /// Seed message file (MERGE_MSG / message-squash / message-fixup); `None`
     /// amends with HEAD's message.
     message_file: Option<PathBuf>,
@@ -3331,7 +3377,16 @@ fn machine_commit(
     } else {
         None
     };
-    let (parents, author) = if commit.amend {
+    let (parents, author) = if commit.create_root {
+        let author = match read_author_script_identity(ctx)? {
+            Some(identity) => identity,
+            None => match commit.original {
+                Some(record) => record.commit.author.clone(),
+                None => commit_identity_from_env("AUTHOR")?,
+            },
+        };
+        (Vec::new(), author)
+    } else if commit.amend {
         let author = head_record.commit.author.clone();
         (head_record.commit.parents.clone(), author)
     } else {
@@ -3345,7 +3400,7 @@ fn machine_commit(
         (vec![head], author)
     };
 
-    if !commit.amend && !commit.allow_empty {
+    if !commit.amend && !commit.create_root && !commit.allow_empty {
         let parent_tree = commit_tree_oid(db, ctx.format, &head)?;
         if tree == parent_tree {
             return Ok(CommitOutcome::Failed(1));
@@ -3730,6 +3785,7 @@ fn commit_staged_changes(
             amend,
             edit: edit && !cleanup_only,
             allow_empty: true,
+            create_root: false,
             message_file,
             reflog_sub: "continue",
             original: None,
