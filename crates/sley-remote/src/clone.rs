@@ -230,6 +230,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         request.options.deepen_since,
         request.options.deepen_not.clone(),
         request.options.filter.clone(),
+        !request.options.checkout,
     );
     fetch(
         crate::fetch::FetchRequest {
@@ -411,6 +412,7 @@ fn fetch_local_partial_clone_checkout_blobs(
         wants,
         None,
         true,
+        false,
         Some(sley_odb::PackObjectFilter::BlobNone),
         false,
         None,
@@ -467,6 +469,7 @@ fn clone_fetch_options(
     deepen_since: Option<i64>,
     deepen_not: Vec<String>,
     filter: Option<sley_odb::PackObjectFilter>,
+    record_promisor_refs: bool,
 ) -> FetchOptions {
     FetchOptions {
         quiet: true,
@@ -483,6 +486,7 @@ fn clone_fetch_options(
         filter,
         refetch: false,
         cloning: true,
+        record_promisor_refs,
         update_shallow: false,
         deepen_relative: false,
         update_head_ok: false,

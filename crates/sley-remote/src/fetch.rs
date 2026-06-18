@@ -110,6 +110,10 @@ pub struct FetchOptions {
     /// This fetch is a clone (`fetch_pack_args.cloning`): shallow points sent
     /// by a shallow server are accepted into `$GIT_DIR/shallow` unconditionally.
     pub cloning: bool,
+    /// Whether an in-process local promisor install should append the wanted ref
+    /// names to the `.promisor` sidecar. No-checkout partial clone keeps these
+    /// lines; checkout hydration leaves the final sidecar empty like upstream.
+    pub record_promisor_refs: bool,
     /// `--update-shallow`: accept new shallow points from a shallow server
     /// (otherwise refs whose history needs them are rejected).
     pub update_shallow: bool,
@@ -649,6 +653,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     starts,
                     deepen_plan.as_ref(),
                     promisor_remote,
+                    options.record_promisor_refs,
                     options.filter.clone(),
                     options.refetch,
                     None,
@@ -1589,6 +1594,7 @@ mod tests {
             filter: None,
             refetch: false,
             cloning: false,
+            record_promisor_refs: true,
             update_shallow: false,
             deepen_relative: false,
             update_head_ok: false,

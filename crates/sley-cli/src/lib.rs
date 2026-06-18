@@ -4769,6 +4769,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         vec![*oid],
         None,
         true,
+        false,
         None,
         false,
         None,

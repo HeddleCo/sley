@@ -263,6 +263,7 @@ mod tests {
             filter: None,
             refetch: false,
             cloning: false,
+            record_promisor_refs: true,
             update_shallow: false,
             deepen_relative: false,
             update_head_ok: false,

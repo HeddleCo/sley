@@ -816,6 +816,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     wants: Vec<ObjectId>,
     deepen: Option<&LocalDeepenPlan>,
     promisor: bool,
+    record_promisor_refs: bool,
     filter: Option<sley_odb::PackObjectFilter>,
     refetch: bool,
     unpack_limit: Option<usize>,
@@ -934,6 +935,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         unpack_limit,
     )?;
     if promisor
+        && record_promisor_refs
         && let Some(result) = install
         && let Some(promisor_path) = result.promisor_path
     {
