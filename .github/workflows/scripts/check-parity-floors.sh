@@ -375,6 +375,12 @@ declare -A FLOOR=(
     [t1400-update-ref.sh]=275
     [t1401-symbolic-ref.sh]=25
     [t1450-fsck.sh]=96
+    # codex-wave-10 (refs optimize / pack-refs): native pack-refs (selected loose
+    # packing w/ include/exclude + default tag behavior), prune of packed loose
+    # refs, packed-refs parse diagnostics, --auto heuristic, lock retry, packed
+    # no-op update, verified tag peeling. t1463 11->43. Ref-store consumers held:
+    # t1400=275 t6300=410 t7004=228 t3200=134 t1450=96 t5505=93 t1410=20 t5601=72.
+    [t1463-refs-optimize.sh]=43
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861

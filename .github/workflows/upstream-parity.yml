@@ -111,6 +111,7 @@ jobs:
             t1400-update-ref.sh
             t1401-symbolic-ref.sh
             t1450-fsck.sh
+            t1463-refs-optimize.sh
             t1461-refs-list.sh
             t1462-refs-exists.sh
             t1500-rev-parse.sh
