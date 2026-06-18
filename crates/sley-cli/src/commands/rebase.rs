@@ -70,6 +70,7 @@ struct RebaseArgs {
     rebase_merges: Option<bool>,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
+    gpg_sign: Option<String>,
     positional: Vec<String>,
     total_args: usize,
 }
@@ -111,6 +112,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         rebase_merges: None,
         strategy: None,
         strategy_opts: Vec::new(),
+        gpg_sign: None,
         positional: Vec::new(),
         total_args: args.len(),
     };
@@ -214,6 +216,14 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             "--no-verify" => out.no_verify = true,
             "--verify" => out.no_verify = false,
+            "-S" | "--gpg-sign" => out.gpg_sign = Some(String::new()),
+            _ if arg.starts_with("-S") && arg.len() > 2 => {
+                out.gpg_sign = Some(arg[2..].to_string());
+            }
+            _ if arg.starts_with("--gpg-sign=") => {
+                out.gpg_sign = Some(arg["--gpg-sign=".len()..].to_string());
+            }
+            "--no-gpg-sign" => out.gpg_sign = None,
             "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
             "--allow-empty-message" => {}
             "--committer-date-is-author-date" => {
@@ -362,6 +372,7 @@ struct MachineOpts {
     reschedule_failed_exec: bool,
     committer_date_is_author_date: bool,
     ignore_date: bool,
+    gpg_sign: Option<String>,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
@@ -408,6 +419,14 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     if opts.ignore_date {
         fs::write(dir.join("ignore_date"), b"")?;
     }
+    if let Some(key) = &opts.gpg_sign {
+        let opt = if key.is_empty() {
+            "-S".to_string()
+        } else {
+            format!("-S{key}")
+        };
+        fs::write(dir.join("gpg_sign_opt"), format!("{opt}\n"))?;
+    }
     Ok(())
 }
 
@@ -432,6 +451,8 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
     };
     let exists = |name: &str| ctx.state_path(name).exists();
     let signoff = exists("signoff");
+    let gpg_sign = seq::read_state_line(&ctx.git_dir, "gpg_sign_opt")
+        .and_then(|value| value.strip_prefix("-S").map(str::to_string));
     Ok(MachineOpts {
         quiet: exists("quiet"),
         verbose: exists("verbose"),
@@ -442,6 +463,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         reschedule_failed_exec: exists("reschedule-failed-exec"),
         committer_date_is_author_date: exists("cdate_is_adate"),
         ignore_date: exists("ignore_date"),
+        gpg_sign,
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -1118,6 +1140,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         reschedule_failed_exec,
         committer_date_is_author_date: args.committer_date_is_author_date,
         ignore_date: args.ignore_date,
+        gpg_sign: args.gpg_sign.clone(),
         head_name: head_name.clone(),
         onto,
         orig_head,
@@ -2962,7 +2985,6 @@ fn stop_with_patch(
     exit_code: i32,
     to_amend: bool,
 ) -> Result<PickOutcome> {
-    let _ = opts;
     fs::write(ctx.state_path("stopped-sha"), format!("{}\n", record.oid))?;
     fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
 
@@ -2985,9 +3007,19 @@ fn stop_with_patch(
 
     if to_amend {
         intend_to_amend(ctx)?;
+        let sign_opt = opts.gpg_sign.as_ref().map(|key| {
+            if key.is_empty() {
+                " -S".to_string()
+            } else {
+                format!(" '-S{key}'")
+            }
+        });
         eprintln!("You can amend the commit now, with");
         eprintln!();
-        eprintln!("  git commit --amend ");
+        eprintln!(
+            "  git commit --amend{} ",
+            sign_opt.as_deref().unwrap_or("")
+        );
         eprintln!();
         eprintln!("Once you are satisfied with your changes, run");
         eprintln!();
