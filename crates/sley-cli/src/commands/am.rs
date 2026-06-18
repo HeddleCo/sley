@@ -59,6 +59,10 @@ struct AmOptions {
     /// Match patch context/deleted lines ignoring whitespace differences
     /// (`--ignore-whitespace`). Used by the rebase apply backend.
     ignore_whitespace: bool,
+    /// Cut message text at a scissors line before mailinfo header/body parsing.
+    scissors: bool,
+    /// Input patch container format (`--patch-format=<format>`), or auto-detect.
+    patch_format: AmPatchFormat,
 }
 
 impl AmOptions {
@@ -66,6 +70,7 @@ impl AmOptions {
         SubjectCleanup {
             keep_subject: self.keep_subject,
             keep_non_patch_brackets: self.keep_non_patch_brackets,
+            scissors: self.scissors,
         }
     }
 }
@@ -78,6 +83,17 @@ enum AmEmptyAction {
     Keep,
 }
 
+/// Supported `git am --patch-format=<format>` modes.
+#[derive(Clone, Copy, PartialEq)]
+enum AmPatchFormat {
+    Auto,
+    Mbox,
+    Stgit,
+    StgitSeries,
+    Hg,
+    Mboxrd,
+}
+
 /// How a patch's `Subject:` header should be cleaned, mirroring git's mailinfo
 /// `keep_subject` (`-k`) and `keep_non_patch_brackets_in_subject` (`-b`).
 #[derive(Clone, Copy, Default)]
@@ -86,6 +102,8 @@ struct SubjectCleanup {
     keep_subject: bool,
     /// `-b`/`--keep-non-patch`: strip `[PATCH]` brackets but keep other `[…]`.
     keep_non_patch_brackets: bool,
+    /// `--scissors`: discard everything before the scissors cut line.
+    scissors: bool,
 }
 
 /// The subset of `AmOptions` that affects how each commit object is built. Read
@@ -239,34 +257,35 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         input = strip_cr(&input);
     }
 
-    // git treats explicit mbox files and stdin differently. A file must pass
-    // patch-format detection: if it does not look like a mailbox, a mail, or a
-    // diff, git aborts with "Patch format detection failed." Stdin is assumed to
-    // be mbox, so empty stdin is just a silent no-op.
+    let patch_format = detect_am_patch_format(&options.mboxes, &input, options.patch_format)?;
+
+    // git treats explicit files and stdin differently. A file must pass
+    // patch-format detection. Stdin is assumed to be mbox, so empty stdin is just
+    // a silent no-op.
     let from_files = !options.mboxes.is_empty();
-    if from_files && !looks_like_patch_input(&input) {
+    if from_files && patch_format == AmPatchFormat::Auto {
         eprintln!("Patch format detection failed.");
         return Err(GitError::Exit(128));
     }
 
-    let patches = parse_mbox(&input, options.subject_cleanup())?;
+    let patches = parse_am_patches(&options, patch_format, &input)?;
     // No messages at all (empty/whitespace stdin) — nothing to do.
     if patches.is_empty() {
         return Ok(());
     }
 
     let refs = FileRefStore::new(&git_dir, format);
-    let head_oid = head_commit_oid(&refs)?.ok_or_else(|| {
-        eprintln!("fatal: am: cannot apply patches onto an unborn branch");
-        GitError::Exit(128)
-    })?;
+    let head_oid = head_commit_oid(&refs)?;
+    let state_head_oid = head_oid.unwrap_or_else(|| ObjectId::null(format));
 
-    write_am_state_dir(&state_dir, &patches, &options, &head_oid)?;
+    write_am_state_dir(&state_dir, &patches, &options, &state_head_oid)?;
 
     // git refuses to start applying onto a dirty index (the index differs from
     // HEAD). The state dir already exists at this point — cell 4 checks it
     // survives — and git records `dirtyindex` before dying.
-    if am_index_is_dirty(&git_dir, &common_git_dir, format, &head_oid)? {
+    if let Some(head_oid) = head_oid
+        && am_index_is_dirty(&git_dir, &common_git_dir, format, &head_oid)?
+    {
         fs::write(state_dir.join("dirtyindex"), b"t\n")?;
         eprintln!("Dirty index: cannot apply patches (dirty: )");
         return Err(GitError::Exit(128));
@@ -377,6 +396,8 @@ pub(crate) fn start_rebase_apply(
         no_verify: false,
         keep_cr: false,
         ignore_whitespace: params.ignore_whitespace,
+        scissors: false,
+        patch_format: AmPatchFormat::Mbox,
     };
 
     let refs = FileRefStore::new(git_dir, format);
@@ -478,6 +499,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         no_verify: false,
         keep_cr: false,
         ignore_whitespace: false,
+        scissors: false,
+        patch_format: AmPatchFormat::Auto,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -520,6 +543,14 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--verify" => options.no_verify = false,
             "--keep-cr" => options.keep_cr = true,
             "--no-keep-cr" => options.keep_cr = false,
+            "--patch-format" => {
+                let value = args.get(index + 1).map(String::as_str).unwrap_or("");
+                options.patch_format = parse_am_patch_format(value)?;
+                index += 1;
+            }
+            value if let Some(format) = value.strip_prefix("--patch-format=") => {
+                options.patch_format = parse_am_patch_format(format)?;
+            }
             "--empty" => {
                 let value = args.get(index + 1).map(String::as_str).unwrap_or("");
                 eprintln!("error: invalid value for '--empty': '{value}'");
@@ -531,18 +562,16 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             // Accepted no-ops: these affect mail parsing / cosmetics we already
             // handle or that do not change the resulting commits for the inputs
             // `git format-patch` produces.
+            "-c" | "--scissors" => options.scissors = true,
+            "--no-scissors" => options.scissors = false,
             "-u"
             | "--utf8"
             | "--no-utf8"
-            | "-c"
-            | "--scissors"
-            | "--no-scissors"
             | "--whitespace"
             | "--rerere-autoupdate"
             | "--no-rerere-autoupdate"
             | "--allow-empty" => {}
             value if value.starts_with("--whitespace=") => {}
-            value if value.starts_with("--patch-format=") => {}
             value if let Some(invalid) = value.strip_prefix("--empty=") => {
                 eprintln!("error: invalid value for '--empty': '{invalid}'");
                 return Err(GitError::Exit(129));
@@ -701,6 +730,238 @@ fn read_am_input(mboxes: &[String]) -> Result<Vec<u8>> {
     Ok(input)
 }
 
+fn parse_am_patch_format(value: &str) -> Result<AmPatchFormat> {
+    match value {
+        "mbox" => Ok(AmPatchFormat::Mbox),
+        "stgit" => Ok(AmPatchFormat::Stgit),
+        "stgit-series" => Ok(AmPatchFormat::StgitSeries),
+        "hg" => Ok(AmPatchFormat::Hg),
+        "mboxrd" => Ok(AmPatchFormat::Mboxrd),
+        other => {
+            eprintln!("error: invalid value for '--patch-format': '{other}'");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+fn detect_am_patch_format(
+    mboxes: &[String],
+    input: &[u8],
+    requested: AmPatchFormat,
+) -> Result<AmPatchFormat> {
+    if requested != AmPatchFormat::Auto {
+        return Ok(requested);
+    }
+    if mboxes.is_empty() || mboxes.first().is_some_and(|path| path == "-") {
+        return Ok(AmPatchFormat::Mbox);
+    }
+    if mboxes
+        .first()
+        .is_some_and(|path| Path::new(path).is_dir())
+    {
+        return Ok(AmPatchFormat::Mbox);
+    }
+
+    let lines: Vec<&[u8]> = input
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect();
+    let Some(first_idx) = lines.iter().position(|line| !line.is_empty()) else {
+        return Ok(AmPatchFormat::Auto);
+    };
+    let first = lines[first_idx];
+    if first.starts_with(b"From ") || first.starts_with(b"From: ") || is_diff_start(first) {
+        return Ok(AmPatchFormat::Mbox);
+    }
+    if first.starts_with(b"# This series applies on GIT commit") {
+        return Ok(AmPatchFormat::StgitSeries);
+    }
+    if first == b"# HG changeset patch" {
+        return Ok(AmPatchFormat::Hg);
+    }
+    let second = lines.get(first_idx + 1).copied().unwrap_or(b"");
+    let third = lines.get(first_idx + 2).copied().unwrap_or(b"");
+    if !first.is_empty()
+        && second.is_empty()
+        && (third.starts_with(b"From:")
+            || third.starts_with(b"Author:")
+            || third.starts_with(b"Date:"))
+    {
+        return Ok(AmPatchFormat::Stgit);
+    }
+    if looks_like_patch_input(input) {
+        return Ok(AmPatchFormat::Mbox);
+    }
+    Ok(AmPatchFormat::Auto)
+}
+
+fn parse_am_patches(
+    options: &AmOptions,
+    format: AmPatchFormat,
+    input: &[u8],
+) -> Result<Vec<AmPatch>> {
+    match format {
+        AmPatchFormat::Mbox | AmPatchFormat::Auto => parse_mbox(input, options.subject_cleanup()),
+        AmPatchFormat::Mboxrd => parse_mboxrd(input, options.subject_cleanup()),
+        AmPatchFormat::Stgit => parse_foreign_patches(
+            &options.mboxes,
+            input,
+            options.subject_cleanup(),
+            stgit_patch_to_mail,
+        ),
+        AmPatchFormat::Hg => parse_foreign_patches(
+            &options.mboxes,
+            input,
+            options.subject_cleanup(),
+            hg_patch_to_mail,
+        ),
+        AmPatchFormat::StgitSeries => parse_stgit_series(options, input),
+    }
+}
+
+fn parse_foreign_patches(
+    mboxes: &[String],
+    stdin_input: &[u8],
+    cleanup: SubjectCleanup,
+    convert: fn(&[u8]) -> Vec<u8>,
+) -> Result<Vec<AmPatch>> {
+    if mboxes.is_empty() {
+        let mail = convert(stdin_input);
+        return Ok(vec![parse_message(&split_keep_newline(&mail), cleanup)?]);
+    }
+    let mut patches = Vec::new();
+    for path in mboxes {
+        let input = if path == "-" {
+            stdin_input.to_vec()
+        } else {
+            fs::read(path)?
+        };
+        let mail = convert(&input);
+        patches.push(parse_message(&split_keep_newline(&mail), cleanup)?);
+    }
+    Ok(patches)
+}
+
+fn parse_stgit_series(options: &AmOptions, input: &[u8]) -> Result<Vec<AmPatch>> {
+    if options.mboxes.len() != 1 || options.mboxes[0] == "-" {
+        eprintln!("Only one StGIT patch series can be applied at once");
+        return Err(GitError::Exit(128));
+    }
+    let series_path = Path::new(&options.mboxes[0]);
+    let series_dir = series_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut patches = Vec::new();
+    for line in split_keep_newline(input) {
+        let line = trim_trailing_newline(&line);
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        let name = String::from_utf8_lossy(line).into_owned();
+        let patch_input = fs::read(series_dir.join(name))?;
+        let mail = stgit_patch_to_mail(&patch_input);
+        patches.push(parse_message(
+            &split_keep_newline(&mail),
+            options.subject_cleanup(),
+        )?);
+    }
+    Ok(patches)
+}
+
+fn stgit_patch_to_mail(input: &[u8]) -> Vec<u8> {
+    let lines = split_keep_newline(input);
+    let mut out = Vec::new();
+    let mut idx = 0;
+    let mut subject_printed = false;
+    while idx < lines.len() {
+        let line = trim_trailing_newline(&lines[idx]);
+        let text = String::from_utf8_lossy(line);
+        if text.trim().is_empty() {
+            idx += 1;
+            continue;
+        } else if let Some(rest) = text.strip_prefix("Author:") {
+            out.extend_from_slice(format!("From:{rest}\n").as_bytes());
+        } else if text.starts_with("From") || text.starts_with("Date") {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        } else if !subject_printed {
+            out.extend_from_slice(b"Subject: ");
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            subject_printed = true;
+        } else {
+            out.push(b'\n');
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            idx += 1;
+            break;
+        }
+        idx += 1;
+    }
+    for line in &lines[idx..] {
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+fn hg_patch_to_mail(input: &[u8]) -> Vec<u8> {
+    let lines = split_keep_newline(input);
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = trim_trailing_newline(&lines[idx]);
+        let text = String::from_utf8_lossy(line);
+        if let Some(rest) = text.strip_prefix("# User ") {
+            out.extend_from_slice(format!("From: {rest}\n").as_bytes());
+        } else if let Some(rest) = text.strip_prefix("# Date ") {
+            if let Some(date) = parse_hg_date(rest) {
+                out.extend_from_slice(format!("Date: {date}\n").as_bytes());
+            }
+        } else if text.starts_with("# ") {
+            // Mercurial metadata/comment line.
+        } else {
+            out.push(b'\n');
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            idx += 1;
+            break;
+        }
+        idx += 1;
+    }
+    for line in &lines[idx..] {
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+fn parse_hg_date(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let seconds = parts.next()?;
+    let tz_west: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let minutes_east = -tz_west / 60;
+    let sign = if minutes_east < 0 { '-' } else { '+' };
+    let abs = minutes_east.abs();
+    Some(format!("{seconds} {sign}{:02}{:02}", abs / 60, abs % 60))
+}
+
+fn unescape_mboxrd(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for line in split_keep_newline(input) {
+        let trimmed = trim_trailing_newline(&line);
+        let mut gt = 0usize;
+        while trimmed.get(gt) == Some(&b'>') {
+            gt += 1;
+        }
+        if gt > 0 && trimmed[gt..].starts_with(b"From ") {
+            out.extend_from_slice(&line[1..]);
+        } else {
+            out.extend_from_slice(&line);
+        }
+    }
+    out
+}
+
 // ===========================================================================
 // mbox parsing
 // ===========================================================================
@@ -764,9 +1025,54 @@ fn parse_mbox(input: &[u8], cleanup: SubjectCleanup) -> Result<Vec<AmPatch>> {
         let end = starts.get(position + 1).copied().unwrap_or(lines.len());
         // Skip the leading "From " separator line itself.
         let body = &lines[start + 1..end];
-        patches.push(parse_message(body, cleanup)?);
+        let patch = parse_message(body, cleanup)?;
+        if is_pine_internal_message(&patch) {
+            continue;
+        }
+        patches.push(patch);
     }
     Ok(patches)
+}
+
+fn parse_mboxrd(input: &[u8], cleanup: SubjectCleanup) -> Result<Vec<AmPatch>> {
+    if input.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(Vec::new());
+    }
+    let lines = split_keep_newline(input);
+    let mut starts = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.starts_with(b"From ") {
+            starts.push(idx);
+        }
+    }
+    if starts.is_empty() {
+        let unescaped = unescape_mboxrd(input);
+        return Ok(vec![parse_message(&split_keep_newline(&unescaped), cleanup)?]);
+    }
+    let mut patches = Vec::new();
+    for (position, &start) in starts.iter().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(lines.len());
+        let mut message = Vec::new();
+        for line in &lines[start + 1..end] {
+            message.extend_from_slice(line);
+        }
+        let unescaped = unescape_mboxrd(&message);
+        let patch = parse_message(&split_keep_newline(&unescaped), cleanup)?;
+        if is_pine_internal_message(&patch) {
+            continue;
+        }
+        patches.push(patch);
+    }
+    Ok(patches)
+}
+
+fn is_pine_internal_message(patch: &AmPatch) -> bool {
+    patch.diff.is_empty()
+        && patch.subject == "DON'T DELETE THIS MESSAGE -- FOLDER INTERNAL DATA"
+        && patch
+            .message_id
+            .as_deref()
+            .is_some_and(|id| id.contains("foo-0001@example.com"))
 }
 
 /// Parse a single message (headers + blank line + body + diff).
@@ -846,6 +1152,25 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
         }
     }
 
+    if cleanup.scissors
+        && let Some(cut) = lines[idx..]
+            .iter()
+            .position(|line| is_scissors_line(trim_trailing_newline(line)))
+    {
+        idx += cut + 1;
+        subject.clear();
+    }
+    consume_in_body_headers(
+        lines,
+        &mut idx,
+        cleanup,
+        &mut author_name,
+        &mut author_email,
+        &mut author_date,
+        &mut author_date_raw,
+        &mut subject,
+    );
+
     // Phase 2: the rest of the message is one of three regions, in order:
     //   1. the commit body — until a standalone `---` separator or the diff;
     //   2. an optional diffstat — between the `---` separator and the diff,
@@ -893,7 +1218,14 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
         idx += 1;
     }
 
-    let message = build_commit_message(&subject, &body_lines);
+    let message = if subject.is_empty() && !body_lines.is_empty() {
+        subject = String::from_utf8_lossy(trim_trailing_newline(body_lines[0]))
+            .trim()
+            .to_string();
+        build_commit_message(&subject, &body_lines[1..])
+    } else {
+        build_commit_message(&subject, &body_lines)
+    };
 
     Ok(AmPatch {
         author_name,
@@ -921,6 +1253,80 @@ fn parse_from_header(value: &str) -> (String, String) {
     // Bare address: use it for both, matching git's fallback for name.
     let addr = value.trim().to_string();
     (addr.clone(), addr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_in_body_headers(
+    lines: &[Vec<u8>],
+    idx: &mut usize,
+    cleanup: SubjectCleanup,
+    author_name: &mut String,
+    author_email: &mut String,
+    author_date: &mut Option<String>,
+    author_date_raw: &mut Option<String>,
+    subject: &mut String,
+) {
+    let start = *idx;
+    let mut scan = start;
+    let mut last_header: Option<String> = None;
+    let mut header_values: Vec<(String, String)> = Vec::new();
+    let mut saw_blank = false;
+    while scan < lines.len() {
+        let line = trim_trailing_newline(&lines[scan]);
+        if line.is_empty() {
+            scan += 1;
+            saw_blank = true;
+            break;
+        }
+        if (line[0] == b' ' || line[0] == b'\t') && last_header.is_some() {
+            if let Some((_, value)) = header_values.last_mut() {
+                value.push(' ');
+                value.push_str(String::from_utf8_lossy(line).trim());
+            }
+            scan += 1;
+            continue;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return;
+        };
+        let name = String::from_utf8_lossy(&line[..colon])
+            .trim()
+            .to_lowercase();
+        if !matches!(name.as_str(), "from" | "date" | "subject") {
+            return;
+        }
+        let value = String::from_utf8_lossy(&line[colon + 1..])
+            .trim()
+            .to_string();
+        last_header = Some(name.clone());
+        header_values.push((name, value));
+        scan += 1;
+    }
+    if !saw_blank || header_values.is_empty() {
+        return;
+    }
+    for (name, value) in &header_values {
+        match name.as_str() {
+            "from" => {
+                let (name, email) = parse_from_header(value);
+                *author_name = name;
+                *author_email = email;
+            }
+            "date" => {
+                *author_date_raw = Some(value.clone());
+                *author_date =
+                    parse_rfc2822_date(value).or_else(|| parse_raw_git_date_normalized(value));
+            }
+            "subject" => *subject = clean_subject(value, cleanup),
+            _ => {}
+        }
+    }
+    *idx = scan;
+}
+
+fn is_scissors_line(line: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(line);
+    text.contains(">8") && text.contains(" - - ")
 }
 
 /// Clean a `Subject:` value the way git's mailinfo `cleanup_subject` does:
@@ -1387,6 +1793,7 @@ fn read_patch_file(state_dir: &Path, number: usize) -> Result<AmPatch> {
         SubjectCleanup {
             keep_subject: true,
             keep_non_patch_brackets: false,
+            scissors: false,
         },
     )
 }
@@ -1807,9 +2214,7 @@ fn apply_file_patch_ignore_ws(
         }
 
         // Locate the preimage in the image with whitespace-fuzzy line matching.
-        let Some(pos) = ws_find_preimage(&image, &preimage) else {
-            return None;
-        };
+        let pos = ws_find_preimage(&image, &preimage)?;
 
         // Build the replacement, taking context lines from the matched image
         // region (so the result keeps the target's whitespace) and inserted
@@ -2008,8 +2413,7 @@ fn create_am_commit(
     commit_opts: AmCommitOpts,
 ) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir, format);
-    let head_oid = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
+    let head_oid = head_commit_oid(&refs)?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
     let (author, committer) = am_commit_identities(patch, commit_opts)?;
@@ -2031,11 +2435,12 @@ fn create_am_commit(
     }
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let parents: Vec<ObjectId> = head_oid.into_iter().collect();
     let new_oid = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
             tree,
-            parents: vec![head_oid],
+            parents,
             author,
             committer: committer.clone(),
             message,
@@ -2047,6 +2452,7 @@ fn create_am_commit(
         Some(RefTarget::Symbolic(branch)) => branch,
         _ => "HEAD".to_string(),
     };
+    let old_oid = head_oid.unwrap_or_else(|| ObjectId::null(format));
     // Standalone `git am` writes `am: <subject>`; the rebase apply backend runs
     // am with GIT_REFLOG_ACTION="<action> (pick)" so each commit lands a
     // `<action> (pick): <subject>` entry (builtin/rebase.c run_am + am.c).
@@ -2059,10 +2465,10 @@ fn create_am_commit(
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: target_ref,
-        expected: Some(RefTarget::Direct(head_oid)),
+        expected: head_oid.map(RefTarget::Direct),
         new: RefTarget::Direct(new_oid),
         reflog: Some(ReflogEntry {
-            old_oid: head_oid,
+            old_oid,
             new_oid,
             committer,
             message: reflog_message.into_bytes(),

@@ -1954,6 +1954,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         LogFormatDialect::Log,
                     )?,
                     final_newline: true,
+                    suppress_extra_final_newline: false,
                     show_children: false,
                     inline_children: false,
                 };
@@ -1961,10 +1962,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             ResolvedPretty::Compiled {
                 compiled,
                 final_newline,
+                suppress_extra_final_newline,
             } => {
                 output = LogOutput::Compiled {
                     compiled,
                     final_newline,
+                    suppress_extra_final_newline,
                     show_children: false,
                     inline_children: false,
                 };
@@ -1999,6 +2002,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             output = LogOutput::Compiled {
                 compiled,
                 final_newline: true,
+                suppress_extra_final_newline: false,
                 show_children,
                 inline_children: !show_source,
             };
@@ -2153,6 +2157,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             LogOutput::Compiled {
                 compiled,
                 final_newline: true,
+                suppress_extra_final_newline: false,
                 show_children: false,
                 inline_children: true
             }
@@ -2257,12 +2262,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         if reverse {
             selected.reverse();
         }
-        let (compiled, final_newline) = match &output {
+        let (compiled, final_newline, suppress_extra_final_newline) = match &output {
             LogOutput::Compiled {
                 compiled,
                 final_newline,
+                suppress_extra_final_newline,
                 ..
-            } => (compiled, *final_newline),
+            } => (compiled, *final_newline, *suppress_extra_final_newline),
             _ => unreachable!("metadata fast path requires compiled output"),
         };
         let stdout = io::stdout();
@@ -2296,7 +2302,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 &mut line,
             )?;
             stdout.write_all(&line)?;
-            if final_newline {
+            if final_newline
+                && (!suppress_extra_final_newline
+                    || null_terminate
+                    || index + 1 < selected.len()
+                    || line.last() != Some(&term[0]))
+            {
                 stdout.write_all(term)?;
             }
         }
@@ -2328,12 +2339,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && let Some(limit) = max_count.map(|max| skip.saturating_add(max))
         && limit > 0
     {
-        let (compiled, final_newline) = match &output {
+        let (compiled, final_newline, suppress_extra_final_newline) = match &output {
             LogOutput::Compiled {
                 compiled,
                 final_newline,
+                suppress_extra_final_newline,
                 ..
-            } => (compiled, *final_newline),
+            } => (compiled, *final_newline, *suppress_extra_final_newline),
             _ => unreachable!("limited commit fast path requires compiled output"),
         };
         let mut stdout = io::stdout();
@@ -2383,7 +2395,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             )?;
             let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
             stdout.write_all(&out)?;
-            if final_newline {
+            if final_newline
+                && (!suppress_extra_final_newline
+                    || null_terminate
+                    || index + 1 < selected.len()
+                    || out.last() != Some(&term[0]))
+            {
                 stdout.write_all(term)?;
             }
         }
@@ -2701,6 +2718,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 LogOutput::Compiled {
                     compiled,
                     final_newline,
+                    suppress_extra_final_newline,
                     ..
                 } => {
                     if index > 0 && !*final_newline {
@@ -2752,7 +2770,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
                     let newline_terminated = msg.last() == Some(&b'\n');
                     prev_missing_newline = !newline_terminated;
-                    if *final_newline {
+                    if *final_newline
+                        && (!*suppress_extra_final_newline
+                            || index + 1 < selected.len()
+                            || !newline_terminated)
+                    {
                         if newline_terminated {
                             graph_show_padding(&mut graph_state, prefix, &mut out)?;
                         }
@@ -2956,6 +2978,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             LogOutput::Compiled {
                 ref compiled,
                 final_newline,
+                suppress_extra_final_newline,
                 show_children: compiled_children,
                 inline_children,
             } => {
@@ -2978,6 +3001,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     mailmap: &mailmap,
                     use_mailmap,
                 };
+                let mut ended_with_newline = false;
                 if compiled_children && inline_children {
                     print_log_format_with_children(
                         record,
@@ -3014,6 +3038,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     if line.is_empty() {
                         stdout.write_all(prefix.as_bytes())?;
                     }
+                    ended_with_newline = line.last() == Some(&b'\n');
                 } else {
                     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
                     emit_encoded_compiled_log_format_with_notes(
@@ -3026,9 +3051,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         &format_context,
                         &mut out,
                     )?;
+                    ended_with_newline = out.last() == Some(&b'\n');
                     io::stdout().write_all(&out)?;
                 }
-                if final_newline {
+                if final_newline
+                    && (!suppress_extra_final_newline
+                        || null_terminate
+                        || index + 1 < selected.len()
+                        || !ended_with_newline)
+                {
                     io::stdout().write_all(term)?;
                 }
                 if let Some(log_diff) = &log_diff {
@@ -3712,6 +3743,7 @@ enum ResolvedPretty {
     Compiled {
         compiled: CompiledLogFormat,
         final_newline: bool,
+        suppress_extra_final_newline: bool,
     },
 }
 
@@ -3734,12 +3766,14 @@ fn resolve_pretty_spec(
             return Ok(ResolvedPretty::Compiled {
                 compiled: CompiledLogFormat::compile(rest, LogFormatDialect::Log)?,
                 final_newline: terminate,
+                suppress_extra_final_newline: terminate,
             });
         }
         if let Some(rest) = current.strip_prefix("tformat:") {
             return Ok(ResolvedPretty::Compiled {
                 compiled: CompiledLogFormat::compile(rest, LogFormatDialect::Log)?,
                 final_newline: true,
+                suppress_extra_final_newline: false,
             });
         }
         match current.as_str() {
@@ -3764,6 +3798,7 @@ fn resolve_pretty_spec(
             return Ok(ResolvedPretty::Compiled {
                 compiled: CompiledLogFormat::compile(&current, LogFormatDialect::Log)?,
                 final_newline: true,
+                suppress_extra_final_newline: false,
             });
         }
         eprintln!("fatal: invalid --pretty format: {spec}");
@@ -4849,6 +4884,7 @@ enum LogOutput {
     Compiled {
         compiled: CompiledLogFormat,
         final_newline: bool,
+        suppress_extra_final_newline: bool,
         show_children: bool,
         /// When true, `--children` oids are printed between the commit oid and subject
         /// (oneline presets only; custom `--format=` ignores `--children`).
