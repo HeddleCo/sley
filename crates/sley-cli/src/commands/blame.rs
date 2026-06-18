@@ -600,7 +600,7 @@ fn read_path_blob(
     let Some(blob_oid) = lookup_tree_path(db, format, &tree_oid, repo_path)? else {
         return Ok(None);
     };
-    let object = db.read_object(&blob_oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, &blob_oid)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
