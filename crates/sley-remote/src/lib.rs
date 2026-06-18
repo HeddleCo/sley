@@ -550,6 +550,7 @@ mod tests {
             // The live test clones a specific branch via --single-branch, so the
             // branch was explicitly requested (a missing remote tip is a hard error).
             branch_explicit: true,
+            ref_storage: sley_formats::RefStorageFormat::Files,
         };
         let mut clone_credentials = NoCredentials;
         let mut progress = SilentProgress;

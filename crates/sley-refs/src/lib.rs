@@ -742,6 +742,10 @@ impl FileRefStore {
     where
         F: FnMut(&str, &ObjectId) -> Result<Option<ObjectId>>,
     {
+        if self.uses_reftable()? {
+            self.compact_reftable_stack()?;
+            return Ok(Vec::new());
+        }
         let mut packed_refs = BTreeMap::new();
         let packed_path = self.common_dir.join("packed-refs");
         if packed_path.exists() {
@@ -1341,7 +1345,7 @@ impl FileRefStore {
         Ok(tables)
     }
 
-    fn uses_reftable(&self) -> Result<bool> {
+    pub fn uses_reftable(&self) -> Result<bool> {
         let config_path = self.common_dir.join("config");
         if !config_path.exists() {
             return Ok(false);
@@ -1408,15 +1412,129 @@ impl FileRefStore {
         }
         let table_name = reftable_table_name(update_index, update_index);
         let bytes = Reftable::write(self.format, update_index, update_index, &refs, &logs)?;
-        write_locked(&reftable_dir.join(&table_name), &bytes)?;
+        let table_path = reftable_dir.join(&table_name);
+        write_locked(&table_path, &bytes)?;
+        self.apply_reftable_shared_file_mode(&table_path)?;
         table_names.push(table_name);
         let mut list = Vec::new();
         for name in &table_names {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        write_locked(&reftable_dir.join("tables.list"), &list)?;
+        let list_path = reftable_dir.join("tables.list");
+        write_locked(&list_path, &list)?;
+        self.apply_reftable_shared_file_mode(&list_path)?;
+        if logs.is_empty() && table_names.len() > 6 {
+            self.auto_compact_reftable_stack()?;
+        }
         Ok(update_index)
+    }
+
+    pub fn compact_reftable_stack(&self) -> Result<()> {
+        let reftable_dir = self.common_dir.join("reftable");
+        let old_names = self.reftable_table_names()?;
+        if old_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut refs: BTreeMap<String, ReftableRefRecord> = BTreeMap::new();
+        let mut logs: BTreeMap<(String, u64), ReftableLogRecord> = BTreeMap::new();
+        let mut min_index = u64::MAX;
+        let mut max_index = 0u64;
+        for table in self.reftables()? {
+            for record in table.refs {
+                match record.value {
+                    ReftableRefValue::Deletion => {
+                        refs.remove(&record.name);
+                    }
+                    _ => {
+                        min_index = min_index.min(record.update_index);
+                        max_index = max_index.max(record.update_index);
+                        refs.insert(record.name.clone(), record);
+                    }
+                }
+            }
+            for record in table.logs {
+                let key = (record.refname.clone(), record.update_index);
+                match record.value {
+                    ReftableLogValue::Deletion => {
+                        logs.remove(&key);
+                    }
+                    _ => {
+                        min_index = min_index.min(record.update_index);
+                        max_index = max_index.max(record.update_index);
+                        logs.insert(key, record);
+                    }
+                }
+            }
+        }
+
+        if refs.is_empty() && logs.is_empty() {
+            min_index = old_names
+                .iter()
+                .filter_map(|name| Reftable::parse(&fs::read(reftable_dir.join(name)).ok()?).ok())
+                .map(|table| table.header.min_update_index)
+                .min()
+                .unwrap_or(1);
+            max_index = min_index;
+        }
+
+        let table_name = reftable_table_name(min_index, max_index);
+        let refs = refs.into_values().collect::<Vec<_>>();
+        let logs = logs.into_values().collect::<Vec<_>>();
+        let bytes = Reftable::write(self.format, min_index, max_index, &refs, &logs)?;
+        let table_path = reftable_dir.join(&table_name);
+        write_locked(&table_path, &bytes)?;
+        self.apply_reftable_shared_file_mode(&table_path)?;
+        let list_path = reftable_dir.join("tables.list");
+        write_locked(&list_path, format!("{table_name}\n").as_bytes())?;
+        self.apply_reftable_shared_file_mode(&list_path)?;
+        for name in old_names {
+            if name != table_name {
+                let _ = fs::remove_file(reftable_dir.join(name));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_reftable_shared_file_mode(&self, path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let config_path = self.common_dir.join("config");
+            let Ok(config) = GitConfig::read(config_path) else {
+                return Ok(());
+            };
+            let Some(value) = config.get("core", None, "sharedRepository") else {
+                return Ok(());
+            };
+            let mode_or = match value {
+                "1" | "group" | "true" => 0o660,
+                "2" | "all" | "world" | "everybody" => 0o664,
+                _ => return Ok(()),
+            };
+            let metadata = fs::metadata(path)?;
+            let old_mode = metadata.permissions().mode();
+            let mut permissions = metadata.permissions();
+            permissions.set_mode((old_mode | mode_or) & 0o7777);
+            fs::set_permissions(path, permissions)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+
+    fn auto_compact_reftable_stack(&self) -> Result<()> {
+        if reftable_autocompaction_disabled() {
+            return Ok(());
+        }
+        if self.reftable_table_names()?.len() > 1 {
+            self.compact_reftable_stack()?;
+        }
+        Ok(())
     }
 
     /// Merge the log records for `name` across the whole stack into the reflog
@@ -1633,6 +1751,7 @@ impl FileRefStore {
                     value: ReftableLogValue::Update(update),
                 }],
             )?;
+            self.auto_compact_reftable_stack()?;
             return Ok(());
         }
         let path = self.reflog_path(name);
@@ -1705,7 +1824,17 @@ impl FileRefStore {
         if logs.is_empty() {
             return Ok(());
         }
+        let leave_empty_rewrite_tombstones_separate = entries.is_empty();
+        if leave_empty_rewrite_tombstones_separate
+            && !reftable_autocompaction_disabled()
+            && self.reftable_table_names()?.len() > 1
+        {
+            self.compact_reftable_stack()?;
+        }
         self.append_reftable_table_spanning(Vec::new(), logs)?;
+        if !leave_empty_rewrite_tombstones_separate {
+            self.auto_compact_reftable_stack()?;
+        }
         Ok(())
     }
 
@@ -1737,14 +1866,18 @@ impl FileRefStore {
         }
         let table_name = reftable_table_name(min_index, max_index);
         let bytes = Reftable::write(self.format, min_index, max_index, &refs, &logs)?;
-        write_locked(&reftable_dir.join(&table_name), &bytes)?;
+        let table_path = reftable_dir.join(&table_name);
+        write_locked(&table_path, &bytes)?;
+        self.apply_reftable_shared_file_mode(&table_path)?;
         table_names.push(table_name);
         let mut list = Vec::new();
         for name in &table_names {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        write_locked(&reftable_dir.join("tables.list"), &list)?;
+        let list_path = reftable_dir.join("tables.list");
+        write_locked(&list_path, &list)?;
+        self.apply_reftable_shared_file_mode(&list_path)?;
         Ok(max_index)
     }
 
@@ -1916,6 +2049,11 @@ fn reftable_table_name(min_update_index: u64, max_update_index: u64) -> String {
     // pick distinct names; truncate to 32 bits to match git's `%08x`.
     let salt = (nanos as u64) ^ (u64::from(std::process::id()) << 16);
     format!("0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref", salt as u32)
+}
+
+fn reftable_autocompaction_disabled() -> bool {
+    std::env::var("GIT_TEST_REFTABLE_AUTOCOMPACTION")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("false"))
 }
 
 /// Whether `name` parses as a valid reftable file name the way git's
@@ -2176,12 +2314,11 @@ impl<'a> FileRefTransaction<'a> {
         {
             return Err(ref_transaction_hook_abort(RefTransactionPhase::Preparing));
         }
-        let result = if store.uses_reftable()? {
+        if store.uses_reftable()? {
             store.commit_reftable(changes)
         } else {
             store.commit_loose_hooked(changes, hook, hook_updates.as_deref())
-        };
-        result
+        }
     }
 }
 
@@ -2321,6 +2458,7 @@ impl FileRefStore {
 
     /// Atomic, all-or-nothing commit for the loose-ref backend. See
     /// [`FileRefTransaction::commit`] for the full ordering and rollback rules.
+    #[allow(dead_code)]
     fn commit_loose(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
         self.commit_loose_hooked(changes, None, None)
     }

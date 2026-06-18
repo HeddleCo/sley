@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_formats::RepositoryLayout;
+use sley_formats::{InitOptions, RefStorageFormat, RepositoryBootstrap};
 use sley_object::{Commit, ObjectType, Tree};
 use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
@@ -113,6 +113,8 @@ pub struct CloneOptions<'a> {
     /// missing remote tip for that branch is a hard error ("Remote branch … not
     /// found"); when unset, a missing tip is an empty/unborn-repository clone.
     pub branch_explicit: bool,
+    /// Destination repository ref storage format.
+    pub ref_storage: RefStorageFormat,
 }
 
 /// The structured result of a [`clone`].
@@ -183,12 +185,21 @@ pub struct CloneServices<'a> {
 /// fetch is reported as [`GitError::NotFound`] for the caller to map (the CLI
 /// turns an explicit `--branch` miss into its own message).
 pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<CloneOutcome> {
-    let layout = RepositoryLayout::init_at_with_initial_branch(
-        request.destination,
-        request.format,
-        false,
-        CLONE_UNBORN_BRANCH,
-    )?;
+    let layout = RepositoryBootstrap::init(InitOptions {
+        git_dir_override: None,
+        core_worktree: None,
+        worktree: request.destination.to_path_buf(),
+        object_format: request.format,
+        object_format_explicit: false,
+        bare: false,
+        initial_branch: CLONE_UNBORN_BRANCH.into(),
+        template_dir: None,
+        copy_template_config: false,
+        separate_git_dir: None,
+        shared_repository: None,
+        ref_storage: request.options.ref_storage,
+        ref_storage_explicit: request.options.ref_storage != RefStorageFormat::Files,
+    })?;
     let git_dir = layout.git_dir;
 
     let config = (services.configure)(&git_dir)?;
