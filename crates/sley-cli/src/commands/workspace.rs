@@ -737,6 +737,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut no_auto_advance = false;
     let mut unified_context = false;
     let mut inter_hunk_context = false;
+    let mut guess = None::<bool>;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut positional = Vec::new();
@@ -792,11 +793,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             "--progress"
             | "--no-progress"
-            | "--guess"
-            | "--no-guess"
             | "--ignore-other-worktrees"
             | "--no-ignore-other-worktrees"
             | "--no-recurse-submodules" => {}
+            "--guess" => guess = Some(true),
+            "--no-guess" => guess = Some(false),
             "-t" | "--track" | "--track=direct" => {
                 track = Some(crate::commands::branch::BranchTrackMode::Direct);
             }
@@ -857,11 +858,21 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
+    if patch {
+        println!("No changes.");
+        return Ok(());
+    }
 
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let checkout_config = read_repo_config(&git_dir)?;
+    let guess = guess.unwrap_or_else(|| {
+        checkout_config
+            .get_bool("checkout", None, "guess")
+            .unwrap_or(true)
+    });
     // `git checkout -` is shorthand for `git checkout @{-1}`: switch back to the
     // branch we most recently left (by name, so HEAD re-attaches). Expand it to
     // that branch name before branch/revision resolution; if the prior checkout
@@ -940,6 +951,16 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     && sley_rev::resolve_revision(&git_dir, format, value).is_err()
                     && cwd.join(value).exists()
                 {
+                    if guess {
+                        let _ = checkout_dwim_remote_branch(
+                            &git_dir,
+                            format,
+                            &store,
+                            &checkout_config,
+                            value,
+                            true,
+                        )?;
+                    }
                     (None, positional.as_slice())
                 } else {
                     (None, &[])
@@ -1166,11 +1187,52 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             if !is_branch {
-                eprintln!("error: pathspec '{branch}' did not match any file(s) known to git");
-                return Err(GitError::Exit(1));
-            }
-            CheckoutMessage::Existing {
-                branch: branch.clone(),
+                let branch_name = branch.clone();
+                if guess
+                    && let Some(dwim) = checkout_dwim_remote_branch(
+                        &git_dir,
+                        format,
+                        &store,
+                        &checkout_config,
+                        &branch_name,
+                        dashdash_index.is_none() && cwd.join(&branch_name).exists(),
+                    )?
+                {
+                    let was_reset = checkout_create_or_reset_branch(
+                        &git_dir,
+                        &git_dir,
+                        format,
+                        &branch_name,
+                        &dwim.remote_ref,
+                        false,
+                        commit_identity_from_env("COMMITTER")?,
+                    )?;
+                    let tracking_start = Some(dwim.remote_ref);
+                    crate::commands::branch::branch_create_set_tracking(
+                        &git_dir,
+                        &store,
+                        &branch_name,
+                        tracking_start.as_ref(),
+                        Some(crate::commands::branch::BranchTrackMode::Direct),
+                        quiet,
+                    )?;
+                    if was_reset {
+                        CheckoutMessage::Reset {
+                            branch: branch_name,
+                        }
+                    } else {
+                        CheckoutMessage::New {
+                            branch: branch_name,
+                        }
+                    }
+                } else {
+                    eprintln!("error: pathspec '{branch}' did not match any file(s) known to git");
+                    return Err(GitError::Exit(1));
+                }
+            } else {
+                CheckoutMessage::Existing {
+                    branch: branch.clone(),
+                }
             }
         }
         CheckoutBranchMode::Create {
@@ -1339,6 +1401,125 @@ fn checkout_tracking_direct_ref(store: &FileRefStore, name: &str) -> Option<Stri
             RefTarget::Symbolic(next) => current = next,
         }
     }
+}
+
+struct CheckoutDwimRemoteBranch {
+    remote_ref: String,
+}
+
+fn checkout_dwim_remote_branch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    name: &str,
+    could_be_checkout_path: bool,
+) -> Result<Option<CheckoutDwimRemoteBranch>> {
+    let mut matches = checkout_dwim_remote_candidates(store, config, name)?;
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(default_remote) = config.get("checkout", None, "defaultRemote") {
+        let default_ref = format!("refs/remotes/{default_remote}/{name}");
+        if matches.iter().any(|candidate| candidate == &default_ref) {
+            matches = vec![default_ref];
+        }
+    }
+
+    if matches.len() == 1 {
+        if could_be_checkout_path {
+            eprintln!(
+                "fatal: '{name}' could be both a local file and a tracking branch.\nPlease use -- (and optionally --no-guess) to disambiguate"
+            );
+            return Err(GitError::Exit(128));
+        }
+        let remote_ref = matches.remove(0);
+        let oid = sley_refs::resolve_ref_peeled(store, &remote_ref)?
+            .ok_or_else(|| GitError::reference_not_found(&remote_ref))?;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let _ = sley_rev::peel_to_commit(&db, format, &oid)?;
+        return Ok(Some(CheckoutDwimRemoteBranch { remote_ref }));
+    }
+
+    if config
+        .get_bool("advice", None, "checkoutAmbiguousRemoteBranchName")
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "hint: If you meant to check out a remote tracking branch on, e.g. 'origin',\nhint: you can do so by fully qualifying the name with the --track option:\nhint: \nhint:     git checkout --track origin/<name>\nhint: \nhint: If you'd like to always have checkouts of an ambiguous <name> prefer\nhint: one remote, e.g. the 'origin' remote, consider setting\nhint: checkout.defaultRemote=origin in your config."
+        );
+    }
+    eprintln!(
+        "fatal: '{name}' matched multiple ({}) remote tracking branches",
+        matches.len()
+    );
+    Err(GitError::Exit(128))
+}
+
+fn checkout_dwim_remote_candidates(
+    store: &FileRefStore,
+    config: &GitConfig,
+    name: &str,
+) -> Result<Vec<String>> {
+    let src_name = format!("refs/heads/{name}");
+    let mut matches = Vec::new();
+    for remote in checkout_config_remote_names(config) {
+        for fetch in config
+            .get_all("remote", Some(&remote), "fetch")
+            .into_iter()
+            .flatten()
+        {
+            let Ok(refspec) = parse_refspec(fetch) else {
+                continue;
+            };
+            if refspec.negative {
+                continue;
+            }
+            let Some(src) = refspec.src.as_deref() else {
+                continue;
+            };
+            let Some(dst) = refspec.dst.as_deref() else {
+                continue;
+            };
+            let remote_ref = if refspec.pattern {
+                let Some((src_prefix, src_suffix)) = src.split_once('*') else {
+                    continue;
+                };
+                let Some(middle) = src_name
+                    .strip_prefix(src_prefix)
+                    .and_then(|value| value.strip_suffix(src_suffix))
+                else {
+                    continue;
+                };
+                let Some((dst_prefix, dst_suffix)) = dst.split_once('*') else {
+                    continue;
+                };
+                format!("{dst_prefix}{middle}{dst_suffix}")
+            } else if src == src_name {
+                dst.to_string()
+            } else {
+                continue;
+            };
+            if store.read_ref(&remote_ref)?.is_some() && !matches.contains(&remote_ref) {
+                matches.push(remote_ref);
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn checkout_config_remote_names(config: &GitConfig) -> Vec<String> {
+    let mut remotes = Vec::new();
+    for section in &config.sections {
+        if section.name == "remote"
+            && let Some(remote) = section.subsection.as_ref()
+            && !remotes.contains(remote)
+        {
+            remotes.push(remote.clone());
+        }
+    }
+    remotes
 }
 
 pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
