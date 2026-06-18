@@ -93,6 +93,16 @@ pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u
     let value = std::str::from_utf8(bytes)
         .map_err(|err| GitError::InvalidFormat(err.to_string()))?
         .trim_end_matches('\n');
+    if name == "FETCH_HEAD" {
+        let oid = value
+            .lines()
+            .find_map(|line| line.split_whitespace().next())
+            .ok_or_else(|| GitError::InvalidFormat("FETCH_HEAD is empty".into()))?;
+        return Ok(Ref {
+            name,
+            target: RefTarget::Direct(ObjectId::from_hex(format, oid)?),
+        });
+    }
     let target = if let Some(symbolic) = value.strip_prefix("ref: ") {
         RefTarget::Symbolic(symbolic.to_string())
     } else {
@@ -566,7 +576,13 @@ impl FileRefStore {
 
     fn read_ref_unchecked(&self, name: &str) -> Result<Option<RefTarget>> {
         if self.uses_reftable()? {
-            return self.read_reftable_ref(name);
+            if let Some(target) = self.read_reftable_ref(name)? {
+                return Ok(Some(target));
+            }
+            if name != "HEAD" && is_root_ref_syntax(name) {
+                return Ok(self.read_loose_ref(name)?.map(|reference| reference.target));
+            }
+            return Ok(None);
         }
         if let Some(reference) = self.read_loose_ref(name)? {
             return Ok(Some(reference.target));
@@ -588,7 +604,13 @@ impl FileRefStore {
     ///     live and no packed entry); git maps both to exit code 2.
     pub fn raw_ref_exists(&self, name: &str) -> Result<bool> {
         if self.uses_reftable()? {
-            return Ok(self.read_reftable_ref(name)?.is_some());
+            if self.read_reftable_ref(name)?.is_some() {
+                return Ok(true);
+            }
+            if name != "HEAD" && is_root_ref_syntax(name) {
+                return Ok(self.read_loose_ref(name)?.is_some());
+            }
+            return Ok(false);
         }
         // git routes root-ref-syntax names (HEAD, FETCH_HEAD, MERGE_HEAD, …) to
         // the per-worktree gitdir and everything else to the common dir; mirror
@@ -2097,7 +2119,7 @@ impl FileRefStore {
     }
 
     fn ref_base_dir(&self, name: &str) -> &Path {
-        if name == "HEAD" || name.starts_with("refs/worktree/") {
+        if is_root_ref_syntax(name) || name.starts_with("refs/worktree/") {
             &self.git_dir
         } else {
             &self.common_dir
@@ -4376,6 +4398,19 @@ mod tests {
     }
 
     #[test]
+    fn loose_fetch_head_reads_first_object_id() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let bytes = b"ce013625030ba8dba906f756967f9e9ca394464a\t\tbranch 'main' of ../sub\n";
+        let reference = parse_loose_ref(ObjectFormat::Sha1, "FETCH_HEAD", bytes)
+            .expect("test operation should succeed");
+        assert_eq!(reference.target, RefTarget::Direct(oid));
+    }
+
+    #[test]
     fn symref_names_allow_onelevel_pseudo_refs() {
         for name in ["NOTHEAD", "FOO", "ORIG_HEAD", "TEST_SYMREF"] {
             validate_symref_name(name).expect("symref name should be valid");
@@ -5624,6 +5659,42 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     target: RefTarget::Direct(tag_oid),
                 },
             ]
+        );
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_reads_loose_fetch_head_in_reftable_repo() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")
+            .expect("test operation should succeed");
+        fs::create_dir_all(git_dir.join("reftable")).expect("test operation should succeed");
+        fs::write(git_dir.join("reftable").join("tables.list"), b"")
+            .expect("test operation should succeed");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            git_dir.join("FETCH_HEAD"),
+            b"ce013625030ba8dba906f756967f9e9ca394464a\t\tbranch 'main' of ../sub\n",
+        )
+        .expect("test operation should succeed");
+
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert_eq!(
+            store
+                .read_ref("FETCH_HEAD")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(oid))
+        );
+        assert!(
+            store
+                .raw_ref_exists("FETCH_HEAD")
+                .expect("test operation should succeed")
         );
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
