@@ -3073,8 +3073,10 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             match db.loose().verify_object(&oid, &display_path)? {
                 None | Some(LooseObjectIntegrity::Ok) => {}
                 Some(LooseObjectIntegrity::HashMismatch { actual }) => {
-                    eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
-                    bad_loose.insert(oid);
+                    if !connectivity_only {
+                        eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
+                        bad_loose.insert(oid);
+                    }
                 }
                 Some(LooseObjectIntegrity::Corrupt) => {
                     eprintln!("error: {oid}: object corrupt or missing: {display_path}");
