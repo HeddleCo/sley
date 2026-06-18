@@ -1884,6 +1884,15 @@ fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+fn patch_validate_unified_context(value: &str, short: bool) -> Result<()> {
+    commit_validate_unified_context(value, short)?;
+    if git_count_value_is_negative(value) {
+        eprintln!("fatal: --unified cannot be negative");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 fn commit_unified_expects_numerical_value_error(short: bool) -> Result<()> {
     if short {
         eprintln!("error: switch `U' expects a numerical value");
@@ -1906,9 +1915,26 @@ fn commit_validate_inter_hunk_context(value: &str) -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+fn patch_validate_inter_hunk_context(value: &str) -> Result<()> {
+    commit_validate_inter_hunk_context(value)?;
+    if git_count_value_is_negative(value) {
+        eprintln!("fatal: --inter-hunk-context cannot be negative");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 fn commit_inter_hunk_context_expects_numerical_value_error() -> Result<()> {
     eprintln!("error: option `inter-hunk-context' expects a numerical value");
     Err(GitError::Exit(129))
+}
+
+fn git_count_value_is_negative(value: &str) -> bool {
+    let number = match value.as_bytes().last() {
+        Some(b'k' | b'K' | b'm' | b'M' | b'g' | b'G') => &value[..value.len() - 1],
+        _ => value,
+    };
+    number.trim_start().starts_with('-')
 }
 
 fn git_count_value_is_valid(value: &str) -> bool {

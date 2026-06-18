@@ -15,6 +15,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use sley_config::GitConfig;
 use sley_core::{GitError, Result};
 
 use crate::{discover_git_dir, worktree_root_for_git_dir};
@@ -859,11 +860,13 @@ fn run_patch_menu(
         _ => return Ok(()),
     };
     let selected_paths: Vec<String> = chosen.iter().map(|&i| items[i].path.clone()).collect();
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let cfg = resolve_patch_config(&git_dir, None, None, true)?;
     super::add_patch::run_add_patch(
         super::add_patch::PatchMode::Add,
         &selected_paths,
         stdin,
-        Default::default(),
+        cfg,
     )
 }
 
@@ -951,12 +954,73 @@ fn resolve_patch_config(
         .as_ref()
         .and_then(|c| c.get("diff", None, "algorithm"))
         .map(|v| v.trim().to_string());
+    let colors = patch_color_enabled(config.as_ref(), "diff")
+        .then(|| super::diff_words::DiffColors::enabled(config.as_ref()));
+    let interactive_enabled = patch_color_enabled(config.as_ref(), "interactive");
+    let prompt_color = patch_color_slot(
+        config.as_ref(),
+        interactive_enabled,
+        "interactive",
+        "prompt",
+        "\x1b[1;34m",
+    );
+    let header_color = patch_color_slot(
+        config.as_ref(),
+        interactive_enabled,
+        "interactive",
+        "header",
+        "\x1b[1m",
+    );
+    let reset_interactive = if interactive_enabled {
+        "\x1b[m".to_string()
+    } else {
+        String::new()
+    };
+    let diff_filter = colors.as_ref().and_then(|_| {
+        config
+            .as_ref()
+            .and_then(|c| c.get("interactive", None, "diffFilter"))
+            .map(str::to_string)
+    });
     Ok(super::add_patch::PatchConfig {
         auto_advance,
         context: context.map(|v| v as usize),
         interhunk: interhunk.map(|v| v as usize),
         diff_algorithm,
+        colors,
+        prompt_color,
+        header_color,
+        reset_interactive,
+        diff_filter,
     })
+}
+
+fn patch_color_enabled(config: Option<&GitConfig>, slot: &str) -> bool {
+    let key = config
+        .and_then(|c| c.get("color", None, slot))
+        .or_else(|| config.and_then(|c| c.get("color", None, "ui")));
+    match key.as_deref().map(str::trim) {
+        Some("always") | Some("auto") => true,
+        Some(value) => sley_config::parse_config_bool(value).unwrap_or(false),
+        None => env::var("GIT_PAGER_IN_USE").is_ok()
+            && env::var("TERM").is_ok_and(|term| term != "dumb"),
+    }
+}
+
+fn patch_color_slot(
+    config: Option<&GitConfig>,
+    enabled: bool,
+    section: &str,
+    slot: &str,
+    default: &str,
+) -> String {
+    if !enabled {
+        return String::new();
+    }
+    config
+        .and_then(|c| c.get("color", Some(section), slot))
+        .and_then(|value| super::diff_words::parse_color_value(&value))
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Drain all of stdin (used when a command path needs the buffered input but

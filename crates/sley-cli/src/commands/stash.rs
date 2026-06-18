@@ -1290,11 +1290,11 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 let Some(value) = args.get(index) else {
                     return commit_unified_requires_value_error(true);
                 };
-                commit_validate_unified_context(value, true)?;
+                patch_validate_unified_context(value, true)?;
                 unified_context = true;
             }
             value if value.starts_with("-U") && value.len() > 2 => {
-                commit_validate_unified_context(&value[2..], true)?;
+                patch_validate_unified_context(&value[2..], true)?;
                 unified_context = true;
             }
             "--unified" => {
@@ -1302,14 +1302,14 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 let Some(value) = args.get(index) else {
                     return commit_unified_requires_value_error(false);
                 };
-                commit_validate_unified_context(value, false)?;
+                patch_validate_unified_context(value, false)?;
                 unified_context = true;
             }
             "--unified=" => {
                 return commit_unified_expects_numerical_value_error(false);
             }
             value if value.starts_with("--unified=") => {
-                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                patch_validate_unified_context(&value["--unified=".len()..], false)?;
                 unified_context = true;
             }
             "--inter-hunk-context" => {
@@ -1317,14 +1317,14 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 let Some(value) = args.get(index) else {
                     return commit_inter_hunk_context_requires_value_error();
                 };
-                commit_validate_inter_hunk_context(value)?;
+                patch_validate_inter_hunk_context(value)?;
                 inter_hunk_context = true;
             }
             "--inter-hunk-context=" => {
                 return commit_inter_hunk_context_expects_numerical_value_error();
             }
             value if value.starts_with("--inter-hunk-context=") => {
-                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
             "-m" | "--message" => {
@@ -1545,11 +1545,11 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
                 let Some(value) = args.get(index) else {
                     return commit_unified_requires_value_error(true);
                 };
-                commit_validate_unified_context(value, true)?;
+                patch_validate_unified_context(value, true)?;
                 unified_context = true;
             }
             value if value.starts_with("-U") && value.len() > 2 => {
-                commit_validate_unified_context(&value[2..], true)?;
+                patch_validate_unified_context(&value[2..], true)?;
                 unified_context = true;
             }
             "--unified" => {
@@ -1557,14 +1557,14 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
                 let Some(value) = args.get(index) else {
                     return commit_unified_requires_value_error(false);
                 };
-                commit_validate_unified_context(value, false)?;
+                patch_validate_unified_context(value, false)?;
                 unified_context = true;
             }
             "--unified=" => {
                 return commit_unified_expects_numerical_value_error(false);
             }
             value if value.starts_with("--unified=") => {
-                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                patch_validate_unified_context(&value["--unified=".len()..], false)?;
                 unified_context = true;
             }
             "--inter-hunk-context" => {
@@ -1572,14 +1572,14 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
                 let Some(value) = args.get(index) else {
                     return commit_inter_hunk_context_requires_value_error();
                 };
-                commit_validate_inter_hunk_context(value)?;
+                patch_validate_inter_hunk_context(value)?;
                 inter_hunk_context = true;
             }
             "--inter-hunk-context=" => {
                 return commit_inter_hunk_context_expects_numerical_value_error();
             }
             value if value.starts_with("--inter-hunk-context=") => {
-                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
             "-m" | "--message" => {
