@@ -378,13 +378,13 @@ declare -A FLOOR=(
     [t1500-rev-parse.sh]=81
     [t2400-worktree-add.sh]=214
     [t3070-wildmatch.sh]=1861
-    [t6300-for-each-ref.sh]=382
+    [t6300-for-each-ref.sh]=410
     # codex-wave-4 (2026-06-17): for-each-ref atoms (sley-ref-filter) t6302 enroll@17.
-    [t6302-for-each-ref-filter.sh]=17
+    [t6302-for-each-ref-filter.sh]=55
     # codex-wave-4: merge-tree --write-tree t4301 enroll@18; blame siblings t8001 99->110/t8002 117->128/t8012 98->109; sparse t1091 40->45.
     [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
-    [t7004-tag.sh]=190
+    [t7004-tag.sh]=228
     [t3200-branch.sh]=122
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
@@ -402,7 +402,7 @@ declare -A FLOOR=(
     [t3309-notes-merge-auto-resolve.sh]=31
     [t3311-notes-merge-fanout.sh]=24
     [t3301-notes.sh]=144
-    [t1461-refs-list.sh]=382
+    [t1461-refs-list.sh]=410
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
     # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).
