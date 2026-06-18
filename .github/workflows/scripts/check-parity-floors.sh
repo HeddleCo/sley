@@ -537,7 +537,7 @@ declare -A FLOOR=(
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
     [t3650-replay-basics.sh]=43
-    [t3701-add-interactive.sh]=86
+    [t3701-add-interactive.sh]=98
     [t4011-diff-symlink.sh]=1
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
     [t6402-merge-rename.sh]=34
