@@ -809,6 +809,9 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
         RebaseAction::ShowCurrentPatch => {
             let path = ctx.state_path("patch");
             if let Ok(patch) = fs::read(path) {
+                if env::var_os("GIT_TRACE").is_some() {
+                    eprintln!("trace: built-in: git show REBASE_HEAD");
+                }
                 io::stdout().write_all(&patch)?;
                 return Ok(());
             }
