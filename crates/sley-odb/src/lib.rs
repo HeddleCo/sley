@@ -630,8 +630,21 @@ pub struct RepackResult {
     /// Loose object ids that are now also present in the new pack and therefore
     /// redundant on disk.
     pub packed_loose: Vec<ObjectId>,
+    /// Pack stems (`pack-<checksum>`) that policy says must survive pruning
+    /// even if the new pack contains all of their objects.
+    retained_pack_stems: Vec<String>,
     pack_checksum: ObjectId,
     index_entries: Vec<PackIndexEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepackOptions {
+    /// Do not borrow objects from alternates (`git repack --local`).
+    pub local: bool,
+    /// Repack objects that are already in `.keep` / `--keep-pack` packs.
+    pub pack_kept_objects: bool,
+    /// Explicit `--keep-pack=<name>` pack stems (`pack-<checksum>`).
+    pub keep_pack_stems: HashSet<String>,
 }
 
 /// Gather every object in `git_dir` (loose objects and every existing pack) and
@@ -658,8 +671,31 @@ pub fn repack_reachable_objects(
     format: ObjectFormat,
     roots: &[ObjectId],
 ) -> Result<Option<RepackResult>> {
+    repack_reachable_objects_with_options(git_dir, format, roots, &RepackOptions::default())
+}
+
+pub fn repack_reachable_objects_with_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    options: &RepackOptions,
+) -> Result<Option<RepackResult>> {
     let objects_dir = repository_objects_dir(git_dir);
-    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let database = if options.local {
+        FileObjectDatabase::without_alternates(objects_dir.clone(), format)
+    } else {
+        FileObjectDatabase::new(objects_dir.clone(), format)
+    };
+    let retained_pack_stems = repack_retained_pack_stems(
+        &objects_dir.join("pack"),
+        &options.keep_pack_stems,
+        !options.pack_kept_objects,
+    )?;
+    let excluded_oids = if options.pack_kept_objects {
+        HashSet::new()
+    } else {
+        pack_oids_for_stems(&objects_dir.join("pack"), format, &retained_pack_stems)?
+    };
 
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut objects: Vec<ReachablePackObject> = Vec::new();
@@ -693,7 +729,9 @@ pub fn repack_reachable_objects(
             }
             ObjectType::Blob => {}
         }
-        objects.push(ReachablePackObject { oid, object });
+        if !excluded_oids.contains(&oid) {
+            objects.push(ReachablePackObject { oid, object });
+        }
     }
     if objects.is_empty() {
         return Ok(None);
@@ -726,9 +764,57 @@ pub fn repack_reachable_objects(
         object_count,
         obsolete_packs,
         packed_loose,
+        retained_pack_stems,
         pack_checksum,
         index_entries,
     }))
+}
+
+fn repack_retained_pack_stems(
+    pack_dir: &Path,
+    explicit: &HashSet<String>,
+    keep_dot_keep: bool,
+) -> Result<Vec<String>> {
+    let mut stems = explicit.clone();
+    if keep_dot_keep {
+        for pack_path in existing_pack_files(pack_dir)? {
+            if pack_path.with_extension("keep").exists()
+                && let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str())
+            {
+                stems.insert(stem.to_string());
+            }
+        }
+    }
+    let mut stems = stems.into_iter().collect::<Vec<_>>();
+    stems.sort();
+    Ok(stems)
+}
+
+fn pack_oids_for_stems(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    stems: &[String],
+) -> Result<HashSet<ObjectId>> {
+    let wanted: HashSet<&str> = stems.iter().map(String::as_str).collect();
+    if wanted.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut oids = HashSet::new();
+    for pack_path in existing_pack_files(pack_dir)? {
+        let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !wanted.contains(stem) {
+            continue;
+        }
+        let index_path = pack_path.with_extension("idx");
+        if !index_path.exists() {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(index_path)?, format)?;
+        oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+    }
+    Ok(oids)
 }
 
 pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
@@ -784,6 +870,7 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         object_count,
         obsolete_packs,
         packed_loose,
+        retained_pack_stems: Vec::new(),
         pack_checksum: written.checksum,
         index_entries: written.entries,
     }))
@@ -828,6 +915,7 @@ pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Opti
         object_count,
         obsolete_packs: Vec::new(),
         packed_loose,
+        retained_pack_stems: Vec::new(),
         pack_checksum,
         index_entries,
     }))
@@ -1043,6 +1131,7 @@ pub fn repack_geometric(
             object_count,
             obsolete_packs: rolled_up_packs.clone(),
             packed_loose,
+            retained_pack_stems: Vec::new(),
             pack_checksum,
             index_entries,
         }),
@@ -1151,7 +1240,13 @@ pub fn install_repack_result_with_bitmap(
     // pack is never removed for an object the new index cannot serve.
     let present: HashSet<ObjectId> = parsed_index.entries.iter().map(|entry| entry.oid).collect();
 
-    prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
+    prune_packs_contained_in(
+        &objects_dir,
+        format,
+        &present,
+        &new_pack_path,
+        &result.retained_pack_stems,
+    )?;
     prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
     Ok(())
 }
@@ -1509,6 +1604,7 @@ pub fn repack_cruft(
                 object_count: written.entries.len(),
                 obsolete_packs: Vec::new(),
                 packed_loose,
+                retained_pack_stems: Vec::new(),
                 pack_checksum: written.checksum,
                 index_entries: written.entries,
             })
@@ -1796,9 +1892,12 @@ fn prune_packs_contained_in(
     format: ObjectFormat,
     present: &HashSet<ObjectId>,
     keep: &Path,
+    retained_pack_stems: &[String],
 ) -> Result<()> {
     let pack_dir = objects_dir.join("pack");
     let keep_stem = keep.file_stem().map(|stem| stem.to_owned());
+    let retained_pack_stems: HashSet<&str> =
+        retained_pack_stems.iter().map(String::as_str).collect();
     let mut removed_stems: HashSet<String> = HashSet::new();
 
     for pack_path in existing_pack_files(&pack_dir)? {
@@ -1809,6 +1908,11 @@ fn prune_packs_contained_in(
             continue;
         };
         if Some(stem) == keep_stem.as_deref() {
+            continue;
+        }
+        if let Some(stem) = stem.to_str()
+            && retained_pack_stems.contains(stem)
+        {
             continue;
         }
         if pack_path.with_extension("keep").exists()

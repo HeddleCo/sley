@@ -759,11 +759,13 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
     let mut all = false;
+    let mut local = false;
     let mut write_bitmaps: Option<bool> = None;
     let mut geometric: Option<u64> = None;
     let mut write_midx = false;
     let mut keep_packs: Vec<String> = Vec::new();
     let mut pack_kept_objects = false;
+    let mut update_server_info: Option<bool> = None;
     let mut cruft = false;
     let mut cruft_expiration: Option<Option<u32>> = None;
     let mut expire_to: Option<String> = None;
@@ -776,6 +778,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             "--no-write-bitmap-index" => write_bitmaps = Some(false),
             "-a" | "-A" => all = true,
             "-m" | "--write-midx" => write_midx = true,
+            "-l" | "--local" => local = true,
+            "-n" => update_server_info = Some(false),
             "--cruft" => cruft = true,
             "--cruft-expiration" => {
                 cruft = true;
@@ -798,11 +802,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             value if value.starts_with("--expire-to=") => {
                 expire_to = Some(value["--expire-to=".len()..].to_string());
             }
-            "-k" | "--keep-unreachable" | "--pack-kept-objects" => {
-                if arg == "--pack-kept-objects" {
-                    pack_kept_objects = true;
-                }
-            }
+            "-k" | "--keep-unreachable" => {}
+            "--pack-kept-objects" => pack_kept_objects = true,
             "-g" | "--geometric" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("option `geometric' requires a value".into())
@@ -823,7 +824,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             }
             "--no-cruft" => cruft = false,
             // Accepted no-ops.
-            "-l" | "-f" | "-F" | "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
+            "-f" | "-F" | "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
             value
                 if value.starts_with("--window")
                     || value.starts_with("--depth")
@@ -847,12 +848,32 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let write_bitmaps = match write_bitmaps {
+    let config = read_repo_config(&common_git_dir)?;
+    let update_server_info = update_server_info.unwrap_or_else(|| {
+        config
+            .get_bool("repack", None, "updateServerInfo")
+            .unwrap_or(true)
+    });
+    let config_write_bitmaps = config.get_bool("repack", None, "writeBitmaps");
+    let auto_bare_bitmaps = write_bitmaps.is_none()
+        && config_write_bitmaps.is_none()
+        && all
+        && !write_midx
+        && sley_worktree::worktree_root_for_git_dir(&common_git_dir)?.is_none()
+        && !pack_dir_has_kept_packs(&common_git_dir)?;
+    let mut write_bitmaps = match write_bitmaps {
         Some(explicit) => explicit,
-        None => read_repo_config(&common_git_dir)?
-            .get_bool("repack", None, "writeBitmaps")
-            .unwrap_or(false),
+        None => config_write_bitmaps.unwrap_or(auto_bare_bitmaps),
     };
+    let include_kept_objects = pack_kept_objects
+        || (write_bitmaps
+            && !write_midx
+            && !auto_bare_bitmaps);
+
+    if write_bitmaps && local && object_dir_has_alternates(&common_git_dir) {
+        eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
+        write_bitmaps = false;
+    }
 
     if let Some(split_factor) = geometric {
         // `--geometric` and `-a`/`-A` are mutually exclusive (builtin/repack.c).
@@ -871,7 +892,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             write_midx,
             write_bitmaps,
             &keep_packs,
-            pack_kept_objects,
+            include_kept_objects,
         );
     }
 
@@ -900,7 +921,13 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     // loose objects and leave existing packs in place.
     let result = if all {
         let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
-        sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)?
+        let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
+        let options = sley_odb::RepackOptions {
+            local,
+            pack_kept_objects: include_kept_objects,
+            keep_pack_stems,
+        };
+        sley_odb::repack_reachable_objects_with_options(&common_git_dir, format, &roots, &options)?
     } else {
         sley_odb::repack_loose_objects(&common_git_dir, format)?
     };
@@ -919,8 +946,14 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             bitmap_tips.as_ref(),
         )?;
     }
+    if all && (!write_bitmaps || write_midx) {
+        remove_pack_bitmap_sidecars(&common_git_dir)?;
+    }
     if write_midx {
         cmd_multi_pack_index_write(&[])?;
+    }
+    if update_server_info {
+        crate::commands::refs::cmd_update_server_info(&[])?;
     }
     let _ = quiet;
     Ok(())
@@ -1128,6 +1161,51 @@ fn write_expire_to_cruft_pack(
 }
 
 /// True when `objects/pack` holds at least one `.pack` file.
+fn object_dir_has_alternates(common_git_dir: &Path) -> bool {
+    if env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES").is_some() {
+        return true;
+    }
+    repository_objects_dir(common_git_dir)
+        .join("info")
+        .join("alternates")
+        .exists()
+}
+
+fn pack_dir_has_kept_packs(common_git_dir: &Path) -> Result<bool> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(false);
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("keep") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remove_pack_bitmap_sidecars(common_git_dir: &Path) -> Result<()> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("pack-") && name.ends_with(".bitmap") {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(GitError::Io(err.to_string())),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pack_dir_has_packs(common_git_dir: &Path, format: ObjectFormat) -> Result<bool> {
     let _ = format;
     let pack_dir = repository_objects_dir(common_git_dir).join("pack");
