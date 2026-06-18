@@ -12,9 +12,10 @@
 
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use sley_config::GitConfig;
 use sley_core::{GitError, Result};
 
 use crate::{discover_git_dir, worktree_root_for_git_dir};
@@ -59,6 +60,114 @@ fn run_status(args: &[&str], stdin_bytes: Option<&[u8]>) -> io::Result<i32> {
     }
     let status = child.wait()?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[derive(Clone)]
+struct InteractiveStyle {
+    enabled: bool,
+    header: String,
+    help: String,
+    prompt: String,
+    error: String,
+    reset: &'static str,
+}
+
+impl InteractiveStyle {
+    fn load(git_dir: &Path) -> Self {
+        let config = crate::read_repo_config(git_dir).ok();
+        let get = |section: &str, subsection: Option<&str>, key: &str| -> Option<String> {
+            config
+                .as_ref()
+                .and_then(|c| c.get(section, subsection, key))
+                .map(|v| v.trim().to_string())
+        };
+        let interactive = get("color", None, "interactive");
+        let color_ui = get("color", None, "ui");
+        let enabled = match interactive.as_deref().and_then(sley_config::parse_config_bool) {
+            Some(value) => value,
+            None => match color_ui.as_deref().and_then(sley_config::parse_config_bool) {
+                Some(value) => value,
+                None => env::var("GIT_PAGER_IN_USE").is_ok()
+                    && env::var("TERM").map(|term| term != "dumb").unwrap_or(false),
+            },
+        };
+        let color_slot = |slot: &str, default: &str| -> String {
+            if !enabled {
+                String::new()
+            } else {
+                get("color", Some("interactive"), slot)
+                    .as_deref()
+                    .and_then(ansi_color)
+                    .unwrap_or(default)
+                    .to_string()
+            }
+        };
+        InteractiveStyle {
+            enabled,
+            header: color_slot("header", "\x1b[1m"),
+            help: color_slot("help", "\x1b[1;31m"),
+            prompt: color_slot("prompt", "\x1b[1;34m"),
+            error: color_slot("error", "\x1b[1;31m"),
+            reset: "\x1b[m",
+        }
+    }
+
+    fn stdout_line(&self, color: &str, text: &str) {
+        if self.enabled {
+            println!("{color}{text}{}", self.reset);
+        } else {
+            println!("{text}");
+        }
+    }
+
+    fn stderr_line(&self, color: &str, text: &str) {
+        if self.enabled {
+            eprintln!("{color}{text}{}", self.reset);
+        } else {
+            eprintln!("{text}");
+        }
+    }
+
+    fn prompt(&self, text: &str) {
+        if self.enabled {
+            print!("{}{text}{}> ", self.prompt, self.reset);
+        } else {
+            print!("{text}> ");
+        }
+    }
+}
+
+fn ansi_color(value: &str) -> Option<&'static str> {
+    let mut bold = false;
+    let mut color = None;
+    for word in value.split_whitespace() {
+        match word.to_ascii_lowercase().as_str() {
+            "bold" => bold = true,
+            "black" => color = Some(30),
+            "red" => color = Some(31),
+            "green" => color = Some(32),
+            "yellow" => color = Some(33),
+            "blue" => color = Some(34),
+            "magenta" => color = Some(35),
+            "cyan" => color = Some(36),
+            "white" => color = Some(37),
+            _ => {}
+        }
+    }
+    match (bold, color) {
+        (true, Some(31)) => Some("\x1b[1;31m"),
+        (true, Some(34)) => Some("\x1b[1;34m"),
+        (true, _) => Some("\x1b[1m"),
+        (false, Some(30)) => Some("\x1b[30m"),
+        (false, Some(31)) => Some("\x1b[31m"),
+        (false, Some(32)) => Some("\x1b[32m"),
+        (false, Some(33)) => Some("\x1b[33m"),
+        (false, Some(34)) => Some("\x1b[34m"),
+        (false, Some(35)) => Some("\x1b[35m"),
+        (false, Some(36)) => Some("\x1b[36m"),
+        (false, Some(37)) => Some("\x1b[37m"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,15 +341,29 @@ fn find_unique_prefixes(items: &mut [FileItem]) {
 
 /// Format one file row. With `only_names` (add-untracked), prints just the
 /// name; otherwise the `staged unstaged path` columns.
-fn format_file_row(item: &FileItem, idx: usize, selected: bool, only_names: bool) -> String {
+fn format_file_row(
+    item: &FileItem,
+    idx: usize,
+    selected: bool,
+    only_names: bool,
+    style: &InteractiveStyle,
+) -> String {
     let highlighted = if item.prefix_len > 0 && is_valid_prefix(&item.path, item.prefix_len) {
-        // Color is disabled in the oracle, so the "highlight" is the bracket
-        // form used in non-color mode: `[p]ath`.
-        format!(
-            "[{}]{}",
-            &item.path[..item.prefix_len],
-            &item.path[item.prefix_len..]
-        )
+        if style.enabled {
+            format!(
+                "{}{}{}{}",
+                style.prompt,
+                &item.path[..item.prefix_len],
+                style.reset,
+                &item.path[item.prefix_len..]
+            )
+        } else {
+            format!(
+                "[{}]{}",
+                &item.path[..item.prefix_len],
+                &item.path[item.prefix_len..]
+            )
+        }
     } else {
         item.path.clone()
     };
@@ -270,7 +393,13 @@ fn status_header() -> String {
 
 /// Print the listing (header + rows). The header is indented to line up with
 /// the row gutter `%c%2d: ` which is 5 columns wide.
-fn print_list(items: &[FileItem], selected: &[bool], only_names: bool, header: bool) {
+fn print_list(
+    items: &[FileItem],
+    selected: &[bool],
+    only_names: bool,
+    header: bool,
+    style: &InteractiveStyle,
+) {
     if items.is_empty() {
         return;
     }
@@ -278,12 +407,12 @@ fn print_list(items: &[FileItem], selected: &[bool], only_names: bool, header: b
         // git prints the header with a 5-char gutter ("%c%2d: " width) before
         // the `%12s %12s %s` columns: 5 spaces + "      staged ..." yields the
         // observed `           staged     unstaged path` (11 leading spaces).
-        print!("     ");
-        println!("{}", status_header());
+        let line = format!("     {}", status_header());
+        style.stdout_line(&style.header, &line);
     }
     for (i, item) in items.iter().enumerate() {
         let sel = selected.get(i).copied().unwrap_or(false);
-        println!("{}", format_file_row(item, i, sel, only_names));
+        println!("{}", format_file_row(item, i, sel, only_names, style));
     }
 }
 
@@ -309,7 +438,7 @@ fn read_line(stdin: &mut impl BufRead) -> Option<String> {
 /// Parse a selection token list ("2-5 8-", "*", "1", "-3") into selected flags
 /// toggled over `selected`. Returns the number of newly-selected entries seen
 /// in this call (git returns the running count of selected items).
-fn apply_choices(input: &str, selected: &mut [bool], items: &[FileItem]) {
+fn apply_choices(input: &str, selected: &mut [bool], items: &[FileItem]) -> Option<String> {
     let n = selected.len();
     for raw in input.split([' ', '\t', '\r', '\n', ',']) {
         if raw.is_empty() {
@@ -327,10 +456,18 @@ fn apply_choices(input: &str, selected: &mut [bool], items: &[FileItem]) {
         // (e.g. `t` for "to-delete"). Match against the item paths by prefix.
         let first = tok.as_bytes()[0];
         if tok != "*" && !first.is_ascii_digit() {
-            if let Some(idx) = items.iter().position(|it| it.path.starts_with(tok)) {
-                if idx < n {
-                    selected[idx] = choose;
-                }
+            let mut matches = items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| it.path.starts_with(tok))
+                .map(|(idx, _)| idx);
+            if let Some(idx) = matches.next()
+                && matches.next().is_none()
+                && idx < n
+            {
+                selected[idx] = choose;
+            } else {
+                return Some(tok.to_string());
             }
             continue;
         }
@@ -341,28 +478,32 @@ fn apply_choices(input: &str, selected: &mut [bool], items: &[FileItem]) {
             let hi_str = &tok[dash + 1..];
             let lo = match lo {
                 Some(v) => v - 1,
-                None => continue,
+                None => return Some(tok.to_string()),
             };
             let hi = if hi_str.is_empty() {
                 n as isize
             } else {
                 match hi_str.parse::<isize>() {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => return Some(tok.to_string()),
                 }
             };
             (lo, hi)
         } else if let Ok(v) = tok.parse::<isize>() {
             (v - 1, v)
         } else {
-            continue;
+            return Some(tok.to_string());
         };
+        if from < 0 || from >= n as isize {
+            return Some(tok.to_string());
+        }
         let lo = from.max(0) as usize;
         let hi = (to.max(0) as usize).min(n);
         for s in selected.iter_mut().take(hi).skip(lo) {
             *s = choose;
         }
     }
+    None
 }
 
 /// Interactive multi-select over a file list. Returns the indices selected, or
@@ -373,12 +514,17 @@ fn list_and_choose(
     prompt: &str,
     only_names: bool,
     immediate: bool,
+    style: &InteractiveStyle,
 ) -> Option<Vec<usize>> {
     find_unique_prefixes(items);
     let mut selected = vec![false; items.len()];
     loop {
-        print_list(items, &selected, only_names, false);
-        print!("{prompt}>> ");
+        print_list(items, &selected, only_names, false, style);
+        if style.enabled {
+            print!("{}{prompt}{}>> ", style.prompt, style.reset);
+        } else {
+            print!("{prompt}>> ");
+        }
         let _ = io::stdout().flush();
         let line = match read_line(stdin) {
             Some(l) => l,
@@ -394,7 +540,9 @@ fn list_and_choose(
             print_choose_help();
             continue;
         }
-        apply_choices(&line, &mut selected, items);
+        if let Some(bad) = apply_choices(&line, &mut selected, items) {
+            style.stderr_line(&style.error, &format!("Huh ({bad})?"));
+        }
         if immediate {
             return collect(&selected);
         }
@@ -428,24 +576,51 @@ fn print_choose_help() {
 // Main menu (add -i)
 // ---------------------------------------------------------------------------
 
-const MENU: &str = "*** Commands ***\n  \
-    1: [s]tatus\t  2: [u]pdate\t  3: [r]evert\t  4: [a]dd untracked\n  \
-    5: [p]atch\t  6: [d]iff\t  7: [q]uit\t  8: [h]elp\n";
+fn print_menu(style: &InteractiveStyle) {
+    style.stdout_line(&style.header, "*** Commands ***");
+    if style.enabled {
+        println!(
+            "  1: {}s{}tatus\t  2: {}u{}pdate\t  3: {}r{}evert\t  4: {}a{}dd untracked",
+            style.prompt,
+            style.reset,
+            style.prompt,
+            style.reset,
+            style.prompt,
+            style.reset,
+            style.prompt,
+            style.reset
+        );
+        println!(
+            "  5: {}p{}atch\t  6: {}d{}iff\t  7: {}q{}uit\t  8: {}h{}elp",
+            style.prompt,
+            style.reset,
+            style.prompt,
+            style.reset,
+            style.prompt,
+            style.reset,
+            style.prompt,
+            style.reset
+        );
+    } else {
+        println!("  1: [s]tatus\t  2: [u]pdate\t  3: [r]evert\t  4: [a]dd untracked");
+        println!("  5: [p]atch\t  6: [d]iff\t  7: [q]uit\t  8: [h]elp");
+    }
+}
 
-fn print_status_table(paths: &[String]) {
+fn print_status_table(paths: &[String], style: &InteractiveStyle) {
     let items = get_modified_files(Filter::NoFilter, paths);
     let selected = vec![false; items.len()];
-    print_list(&items, &selected, false, true);
+    print_list(&items, &selected, false, true, style);
     println!();
 }
 
-fn run_main_loop(paths: &[String]) -> Result<()> {
+fn run_main_loop(paths: &[String], style: &InteractiveStyle) -> Result<()> {
     let stdin = io::stdin();
     let mut handle = stdin.lock();
+    print_status_table(paths, style);
     loop {
-        print_status_table(paths);
-        print!("{MENU}");
-        print!("What now> ");
+        print_menu(style);
+        style.prompt("What now");
         let _ = io::stdout().flush();
         let line = match read_line(&mut handle) {
             Some(l) => l,
@@ -457,23 +632,27 @@ fn run_main_loop(paths: &[String]) -> Result<()> {
         };
         let cmd = line.trim();
         if cmd.is_empty() {
-            // Empty input on the main prompt re-lists; but git treats EOF as
-            // quit. A blank line re-shows the menu.
             continue;
         }
         match menu_command(cmd) {
-            Some(MenuCmd::Status) => { /* re-loop reprints status */ }
-            Some(MenuCmd::Update) => run_update(&mut handle, paths)?,
-            Some(MenuCmd::Revert) => run_revert(&mut handle, paths)?,
-            Some(MenuCmd::AddUntracked) => run_add_untracked(&mut handle, paths)?,
-            Some(MenuCmd::Patch) => run_patch_menu(&mut handle, paths)?,
-            Some(MenuCmd::Diff) => run_diff(&mut handle, paths)?,
+            Some(MenuCmd::Status) => print_status_table(paths, style),
+            Some(MenuCmd::Update) => run_update(&mut handle, paths, style)?,
+            Some(MenuCmd::Revert) => run_revert(&mut handle, paths, style)?,
+            Some(MenuCmd::AddUntracked) => run_add_untracked(&mut handle, paths, style)?,
+            Some(MenuCmd::Patch) => run_patch_menu(&mut handle, paths, style)?,
+            Some(MenuCmd::Diff) => run_diff(&mut handle, paths, style)?,
             Some(MenuCmd::Quit) => {
-                println!();
+                println!("Bye.");
                 return Ok(());
             }
-            Some(MenuCmd::Help) => print_main_help(),
-            None => {}
+            Some(MenuCmd::Help) => print_main_help(style),
+            None => {
+                let first = cmd
+                    .split([' ', '\t', '\r', '\n', ','])
+                    .next()
+                    .unwrap_or(cmd);
+                style.stderr_line(&style.error, &format!("Huh ({first})?"));
+            }
         }
     }
 }
@@ -504,22 +683,26 @@ fn menu_command(cmd: &str) -> Option<MenuCmd> {
     }
 }
 
-fn print_main_help() {
-    println!("status        - show paths with changes");
-    println!("update        - add working tree state to the staged set of changes");
-    println!("revert        - revert staged set of changes back to the HEAD version");
-    println!("patch         - pick hunks and update selectively");
-    println!("diff          - view diff between HEAD and index");
-    println!("add untracked - add contents of untracked files to the staged set of changes");
+fn print_main_help(style: &InteractiveStyle) {
+    for line in [
+        "status        - show paths with changes",
+        "update        - add working tree state to the staged set of changes",
+        "revert        - revert staged set of changes back to the HEAD version",
+        "patch         - pick hunks and update selectively",
+        "diff          - view diff between HEAD and index",
+        "add untracked - add contents of untracked files to the staged set of changes",
+    ] {
+        style.stdout_line(&style.help, line);
+    }
 }
 
-fn run_update(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
+fn run_update(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle) -> Result<()> {
     let mut items = get_modified_files(Filter::WorktreeOnly, paths);
     if items.is_empty() {
         println!();
         return Ok(());
     }
-    let chosen = list_and_choose(stdin, &mut items, "Update", false, false);
+    let chosen = list_and_choose(stdin, &mut items, "Update", false, false, style);
     let chosen = match chosen {
         Some(v) if !v.is_empty() => v,
         _ => {
@@ -543,13 +726,13 @@ fn run_update(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_revert(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
+fn run_revert(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle) -> Result<()> {
     let mut items = get_modified_files(Filter::IndexOnly, paths);
     if items.is_empty() {
         println!();
         return Ok(());
     }
-    let chosen = list_and_choose(stdin, &mut items, "Revert", false, false);
+    let chosen = list_and_choose(stdin, &mut items, "Revert", false, false, style);
     let chosen = match chosen {
         Some(v) if !v.is_empty() => v,
         _ => {
@@ -576,14 +759,18 @@ fn run_revert(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_add_untracked(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
+fn run_add_untracked(
+    stdin: &mut impl BufRead,
+    paths: &[String],
+    style: &InteractiveStyle,
+) -> Result<()> {
     let mut items = get_untracked_files(paths);
     if items.is_empty() {
         println!("No untracked files.");
         println!();
         return Ok(());
     }
-    let chosen = list_and_choose(stdin, &mut items, "Add untracked", true, false);
+    let chosen = list_and_choose(stdin, &mut items, "Add untracked", true, false, style);
     let chosen = match chosen {
         Some(v) if !v.is_empty() => v,
         _ => {
@@ -633,13 +820,13 @@ fn get_untracked_files(paths: &[String]) -> Vec<FileItem> {
     items
 }
 
-fn run_diff(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
+fn run_diff(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle) -> Result<()> {
     let mut items = get_modified_files(Filter::IndexOnly, paths);
     if items.is_empty() {
         println!();
         return Ok(());
     }
-    let chosen = list_and_choose(stdin, &mut items, "Review diff", false, true);
+    let chosen = list_and_choose(stdin, &mut items, "Review diff", false, true, style);
     if let Some(v) = chosen
         && !v.is_empty()
     {
@@ -655,7 +842,11 @@ fn run_diff(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_patch_menu(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
+fn run_patch_menu(
+    stdin: &mut impl BufRead,
+    paths: &[String],
+    style: &InteractiveStyle,
+) -> Result<()> {
     let mut items = get_modified_files(Filter::WorktreeOnly, paths);
     // Drop binary / unmerged entries (best-effort: numstat marks binary).
     items.retain(|i| !i.index_binary && !i.worktree_binary);
@@ -663,17 +854,19 @@ fn run_patch_menu(stdin: &mut impl BufRead, paths: &[String]) -> Result<()> {
         eprintln!("No changes.");
         return Ok(());
     }
-    let chosen = list_and_choose(stdin, &mut items, "Patch update", false, false);
+    let chosen = list_and_choose(stdin, &mut items, "Patch update", false, false, style);
     let chosen = match chosen {
         Some(v) if !v.is_empty() => v,
         _ => return Ok(()),
     };
     let selected_paths: Vec<String> = chosen.iter().map(|&i| items[i].path.clone()).collect();
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let cfg = resolve_patch_config(&git_dir, None, None, true)?;
     super::add_patch::run_add_patch(
         super::add_patch::PatchMode::Add,
         &selected_paths,
         stdin,
-        Default::default(),
+        cfg,
     )
 }
 
@@ -686,7 +879,8 @@ pub(crate) fn cmd_add_interactive(paths: &[String]) -> Result<()> {
     // Ensure we are inside a repo (git errors otherwise via discover).
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let _ = worktree_root_for_git_dir(&git_dir)?;
-    run_main_loop(paths)
+    let style = InteractiveStyle::load(&git_dir);
+    run_main_loop(paths, &style)
 }
 
 /// `git add --patch [-U<n>] [--inter-hunk-context=<n>] [-- <pathspec>...]`.
@@ -760,12 +954,73 @@ fn resolve_patch_config(
         .as_ref()
         .and_then(|c| c.get("diff", None, "algorithm"))
         .map(|v| v.trim().to_string());
+    let colors = patch_color_enabled(config.as_ref(), "diff")
+        .then(|| super::diff_words::DiffColors::enabled(config.as_ref()));
+    let interactive_enabled = patch_color_enabled(config.as_ref(), "interactive");
+    let prompt_color = patch_color_slot(
+        config.as_ref(),
+        interactive_enabled,
+        "interactive",
+        "prompt",
+        "\x1b[1;34m",
+    );
+    let header_color = patch_color_slot(
+        config.as_ref(),
+        interactive_enabled,
+        "interactive",
+        "header",
+        "\x1b[1m",
+    );
+    let reset_interactive = if interactive_enabled {
+        "\x1b[m".to_string()
+    } else {
+        String::new()
+    };
+    let diff_filter = colors.as_ref().and_then(|_| {
+        config
+            .as_ref()
+            .and_then(|c| c.get("interactive", None, "diffFilter"))
+            .map(str::to_string)
+    });
     Ok(super::add_patch::PatchConfig {
         auto_advance,
         context: context.map(|v| v as usize),
         interhunk: interhunk.map(|v| v as usize),
         diff_algorithm,
+        colors,
+        prompt_color,
+        header_color,
+        reset_interactive,
+        diff_filter,
     })
+}
+
+fn patch_color_enabled(config: Option<&GitConfig>, slot: &str) -> bool {
+    let key = config
+        .and_then(|c| c.get("color", None, slot))
+        .or_else(|| config.and_then(|c| c.get("color", None, "ui")));
+    match key.as_deref().map(str::trim) {
+        Some("always") | Some("auto") => true,
+        Some(value) => sley_config::parse_config_bool(value).unwrap_or(false),
+        None => env::var("GIT_PAGER_IN_USE").is_ok()
+            && env::var("TERM").is_ok_and(|term| term != "dumb"),
+    }
+}
+
+fn patch_color_slot(
+    config: Option<&GitConfig>,
+    enabled: bool,
+    section: &str,
+    slot: &str,
+    default: &str,
+) -> String {
+    if !enabled {
+        return String::new();
+    }
+    config
+        .and_then(|c| c.get("color", Some(section), slot))
+        .and_then(|value| super::diff_words::parse_color_value(&value))
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Drain all of stdin (used when a command path needs the buffered input but

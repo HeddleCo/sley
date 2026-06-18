@@ -55,7 +55,7 @@ impl DiffColors {
 /// Parse a git color word ("red", "bold", "green dim", ...) into an ANSI
 /// sequence. Only the simple forms the diff palette uses are supported;
 /// unknown words yield `None` (caller keeps the default).
-fn parse_color_value(value: &str) -> Option<String> {
+pub(crate) fn parse_color_value(value: &str) -> Option<String> {
     let mut fg: Option<u8> = None;
     let mut bg: Option<u8> = None;
     let mut attrs: Vec<u8> = Vec::new();
@@ -76,6 +76,7 @@ fn parse_color_value(value: &str) -> Option<String> {
         match word {
             "bold" => attrs.push(1),
             "dim" => attrs.push(2),
+            "italic" => attrs.push(3),
             "ul" => attrs.push(4),
             "blink" => attrs.push(5),
             "reverse" => attrs.push(7),

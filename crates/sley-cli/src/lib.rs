@@ -1055,6 +1055,15 @@ fn resolve_add_update_actions(
 }
 
 fn add_path_matches(path: &Path, pathspec: &Path) -> bool {
+    let pathspec_text = pathspec.to_string_lossy();
+    if sley_worktree::pathspec_is_glob(pathspec_text.as_bytes()) {
+        let path_text = path.to_string_lossy();
+        return sley_worktree::pathspec_item_matches(
+            pathspec_text.as_bytes(),
+            path_text.as_bytes(),
+            sley_worktree::PathspecMatchMagic::default(),
+        );
+    }
     path == pathspec || path.starts_with(pathspec)
 }
 
@@ -1875,6 +1884,15 @@ fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+fn patch_validate_unified_context(value: &str, short: bool) -> Result<()> {
+    commit_validate_unified_context(value, short)?;
+    if git_count_value_is_negative(value) {
+        eprintln!("fatal: --unified cannot be negative");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 fn commit_unified_expects_numerical_value_error(short: bool) -> Result<()> {
     if short {
         eprintln!("error: switch `U' expects a numerical value");
@@ -1897,9 +1915,26 @@ fn commit_validate_inter_hunk_context(value: &str) -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+fn patch_validate_inter_hunk_context(value: &str) -> Result<()> {
+    commit_validate_inter_hunk_context(value)?;
+    if git_count_value_is_negative(value) {
+        eprintln!("fatal: --inter-hunk-context cannot be negative");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 fn commit_inter_hunk_context_expects_numerical_value_error() -> Result<()> {
     eprintln!("error: option `inter-hunk-context' expects a numerical value");
     Err(GitError::Exit(129))
+}
+
+fn git_count_value_is_negative(value: &str) -> bool {
+    let number = match value.as_bytes().last() {
+        Some(b'k' | b'K' | b'm' | b'M' | b'g' | b'G') => &value[..value.len() - 1],
+        _ => value,
+    };
+    number.trim_start().starts_with('-')
 }
 
 fn git_count_value_is_valid(value: &str) -> bool {
@@ -2713,6 +2748,14 @@ pub(crate) fn write_diff_patch_entry(
             diff_patch_mode_suffix(entry)
         ),
     )?;
+    let empty_add_or_delete = matches!(
+        entry.status,
+        sley_diff_merge::NameStatus::Added | sley_diff_merge::NameStatus::Deleted
+    ) && old_content.as_deref().unwrap_or_default().is_empty()
+        && new_content.as_deref().unwrap_or_default().is_empty();
+    if empty_add_or_delete {
+        return Ok(());
+    }
     match entry.status {
         sley_diff_merge::NameStatus::Added => {
             write_diff_meta_line(stdout, colors, "--- /dev/null")?;

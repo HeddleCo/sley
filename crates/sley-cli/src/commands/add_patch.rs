@@ -33,6 +33,11 @@ pub(crate) struct PatchConfig {
     pub interhunk: Option<usize>,
     /// `diff.algorithm` value to forward to the spawned `diff-files`, if set.
     pub diff_algorithm: Option<String>,
+    pub colors: Option<crate::commands::diff_words::DiffColors>,
+    pub prompt_color: String,
+    pub header_color: String,
+    pub reset_interactive: String,
+    pub diff_filter: Option<String>,
 }
 
 impl Default for PatchConfig {
@@ -42,6 +47,11 @@ impl Default for PatchConfig {
             context: None,
             interhunk: None,
             diff_algorithm: None,
+            colors: None,
+            prompt_color: String::new(),
+            header_color: String::new(),
+            reset_interactive: String::new(),
+            diff_filter: None,
         }
     }
 }
@@ -91,6 +101,8 @@ struct Hunk {
     heading: String,
     /// Body lines, raw (with leading marker, no trailing newline list).
     body: Vec<String>,
+    display_header: Option<String>,
+    display_body: Vec<String>,
     use_hunk: HunkUse,
     /// Number of independent pieces this hunk could split into.
     splittable_into: usize,
@@ -116,6 +128,7 @@ struct FileDiff {
     mode: u32,
     /// Header lines (diff --git ... up to but excluding the first @@).
     header: Vec<String>,
+    display_header: Vec<String>,
     hunks: Vec<Hunk>,
     /// True for an addition (no old content), deletion, or mode-only change.
     added: bool,
@@ -209,6 +222,7 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                 path,
                 mode,
                 header,
+                display_header: Vec::new(),
                 hunks: Vec::new(),
                 added,
                 deleted,
@@ -226,6 +240,8 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                     new_count: 0,
                     heading: String::new(),
                     body: mode_lines,
+                    display_header: None,
+                    display_body: Vec::new(),
                     use_hunk: HunkUse::Undecided,
                     splittable_into: 1,
                     is_mode_change: true,
@@ -249,6 +265,8 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                     new_count: 0,
                     heading: String::new(),
                     body: Vec::new(),
+                    display_header: None,
+                    display_body: Vec::new(),
                     use_hunk: HunkUse::Undecided,
                     splittable_into: 1,
                     is_mode_change: false,
@@ -260,6 +278,145 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
         }
     }
     files
+}
+
+fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
+    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let mut index = 0usize;
+    for fd in files {
+        if index + fd.header.len() > lines.len() {
+            eprintln!("error: mismatched output from interactive.diffFilter");
+            return Err(GitError::Exit(1));
+        }
+        fd.display_header = lines[index..index + fd.header.len()].to_vec();
+        index += fd.header.len();
+        for hunk in &mut fd.hunks {
+            if hunk.is_mode_change || (hunk.old_offset == 0 && hunk.new_offset == 0 && hunk.body.is_empty()) {
+                hunk.display_header = None;
+            } else {
+                if index >= lines.len() {
+                    eprintln!("error: mismatched output from interactive.diffFilter");
+                    return Err(GitError::Exit(1));
+                }
+                hunk.display_header = Some(lines[index].clone());
+                index += 1;
+            }
+            if index + hunk.body.len() > lines.len() {
+                eprintln!("error: mismatched output from interactive.diffFilter");
+                return Err(GitError::Exit(1));
+            }
+            hunk.display_body = lines[index..index + hunk.body.len()].to_vec();
+            index += hunk.body.len();
+        }
+    }
+    let trailing_empty = index + 1 == lines.len() && lines.get(index).is_some_and(|line| line.is_empty());
+    if index != lines.len() && !trailing_empty {
+        eprintln!("error: mismatched output from interactive.diffFilter");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn render_display_diff_text(files: &[FileDiff], cfg: &PatchConfig) -> String {
+    let mut out = String::new();
+    for fd in files {
+        for line in &fd.header {
+            out.push_str(&display_line(line, cfg));
+            out.push('\n');
+        }
+        for hunk in &fd.hunks {
+            let special =
+                hunk.is_mode_change || (hunk.old_offset == 0 && hunk.new_offset == 0 && hunk.body.is_empty());
+            if !special {
+                out.push_str(&display_line(&format_hunk_header(hunk, 0), cfg));
+                out.push('\n');
+            }
+            for line in &hunk.body {
+                out.push_str(&display_line(line, cfg));
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn filter_display_diff(filter: &str, input: &str) -> Result<String> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|_| {
+            eprintln!("error: failed to run '{filter}'");
+            GitError::Exit(1)
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|e| GitError::Io(e.to_string()))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| GitError::Io(e.to_string()))?;
+    if !output.status.success() {
+        eprintln!("error: failed to run '{filter}'");
+        return Err(GitError::Exit(1));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn display_line(line: &str, cfg: &PatchConfig) -> String {
+    let Some(colors) = cfg.colors.as_ref() else {
+        return line.to_string();
+    };
+    let color = if line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+    {
+        &colors.meta
+    } else if line.starts_with("@@ ") {
+        &colors.frag
+    } else if line.starts_with('-') {
+        &colors.old
+    } else if line.starts_with('+') {
+        &colors.new
+    } else if line.starts_with(' ') {
+        &colors.context
+    } else {
+        ""
+    };
+    wrap_color(color, &colors.reset, line)
+}
+
+fn wrap_color(color: &str, reset: &str, text: &str) -> String {
+    if color.is_empty() {
+        text.to_string()
+    } else {
+        format!("{color}{text}{reset}")
+    }
+}
+
+fn print_colored(color: &str, reset: &str, text: &str) {
+    if color.is_empty() {
+        print!("{text}");
+    } else {
+        print!("{color}{text}{reset}");
+    }
+}
+
+fn print_colored_line(color: &str, reset: &str, text: &str) {
+    if color.is_empty() {
+        println!("{text}");
+    } else {
+        println!("{color}{text}{reset}");
+    }
 }
 
 /// Extract the path from a `diff --git a/<p> b/<p>` line.
@@ -305,6 +462,8 @@ fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
             new_count,
             heading,
             body,
+            display_header: None,
+            display_body: Vec::new(),
             use_hunk: HunkUse::Undecided,
             splittable_into: splittable,
             is_mode_change: false,
@@ -445,6 +604,13 @@ pub(crate) fn run_add_patch(
     }
     let diff_text = String::from_utf8_lossy(&diff).into_owned();
     let mut files = parse_diff(&diff_text);
+    if cfg.colors.is_some() {
+        let mut display = render_display_diff_text(&files, &cfg);
+        if let Some(filter) = cfg.diff_filter.as_deref() {
+            display = filter_display_diff(filter, &display)?;
+        }
+        attach_display_diff(&mut files, &display)?;
+    }
 
     if files.is_empty() || files.iter().all(|f| f.hunks.is_empty()) {
         // The direct `git add -p` path prints "No changes." (or "Only binary
@@ -577,7 +743,7 @@ fn patch_update_file(
     let mut all_decided = false;
 
     // The file's diff header (`diff --git ...`) is printed exactly once on entry.
-    render_file_header(fd);
+    render_file_header(fd, cfg);
 
     loop {
         let nr = fd.hunks.len();
@@ -624,7 +790,7 @@ fn patch_update_file(
 
         // Render the hunk if newly arrived at.
         if rendered != Some(hunk_index) {
-            render_hunk(fd, hunk_index, 0);
+            render_hunk(fd, hunk_index, 0, cfg);
             rendered = Some(hunk_index);
         }
 
@@ -650,11 +816,12 @@ fn patch_update_file(
             HunkUse::Skip => " (was: n)",
             HunkUse::Undecided => "",
         };
-        print!(
+        let prompt = format!(
             "({}/{}) {kind}{was} [y,n,q,a,d{suffix},?]? ",
             hunk_index + 1,
             nr
         );
+        print_colored(&cfg.prompt_color, &cfg.reset_interactive, &prompt);
         let _ = io::stdout().flush();
 
         let line = match read_line(stdin) {
@@ -771,7 +938,11 @@ fn patch_update_file(
             's' => {
                 if fd.hunks[hunk_index].splittable_into > 1 {
                     let n = split_hunk(fd, hunk_index);
-                    println!("Split into {n} hunks.");
+                    print_colored_line(
+                        &cfg.header_color,
+                        &cfg.reset_interactive,
+                        &format!("Split into {n} hunks."),
+                    );
                     rendered = None;
                 } else {
                     pending_err = Some("Sorry, cannot split this hunk\n".to_string());
@@ -1095,7 +1266,7 @@ fn regex_lite_compile(pat: &str) -> Option<LiteRe> {
 
 /// Render a hunk to stdout: the `@@` header (with `delta`-adjusted offset for
 /// printing the live hunk, which is 0) plus body lines.
-fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
+fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64, cfg: &PatchConfig) {
     let h = &fd.hunks[hunk_index];
     // Special pseudo-hunks (mode change, or a deletion / empty addition with no
     // real content) have zero `@@` offsets and render no `@@` header — just their
@@ -1103,10 +1274,19 @@ fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64) {
     // both offsets are zero.
     let special = h.is_mode_change || (h.old_offset == 0 && h.new_offset == 0 && h.body.is_empty());
     if !special {
-        println!("{}", format_hunk_header(h, 0));
+        match h.display_header.as_deref() {
+            Some(line) => println!("{line}"),
+            None => println!("{}", display_line(&format_hunk_header(h, 0), cfg)),
+        }
     }
-    for line in &h.body {
-        println!("{line}");
+    if h.display_body.len() == h.body.len() {
+        for line in &h.display_body {
+            println!("{line}");
+        }
+    } else {
+        for line in &h.body {
+            println!("{}", display_line(line, cfg));
+        }
     }
 }
 
@@ -1206,6 +1386,8 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
             new_count,
             heading: fd.hunks[hunk_index].heading.clone(),
             body: new_body,
+            display_header: None,
+            display_body: Vec::new(),
             use_hunk: HunkUse::Use,
             splittable_into: 1,
             is_mode_change: false,
@@ -1296,9 +1478,14 @@ fn edited_hunk_applies(fd: &FileDiff, candidate: &Hunk) -> bool {
 
 /// Print the file's diff header (the `diff --git ...` block up to the first
 /// `@@`). git emits this exactly once, when the file is first entered.
-fn render_file_header(fd: &FileDiff) {
-    for h in &fd.header {
-        println!("{h}");
+fn render_file_header(fd: &FileDiff, cfg: &PatchConfig) {
+    let headers = if fd.display_header.len() == fd.header.len() {
+        &fd.display_header
+    } else {
+        &fd.header
+    };
+    for h in headers {
+        println!("{}", display_line(h, cfg));
     }
 }
 
@@ -1441,6 +1628,8 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
             new_count,
             heading: heading.clone(),
             body: piece.clone(),
+            display_header: None,
+            display_body: Vec::new(),
             use_hunk: HunkUse::Undecided,
             splittable_into: 1,
             is_mode_change: false,
