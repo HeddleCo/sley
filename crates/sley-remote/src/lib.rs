@@ -264,6 +264,7 @@ mod tests {
             cloning: false,
             update_shallow: false,
             deepen_relative: false,
+            update_head_ok: false,
             deepen_since: None,
             deepen_not: Vec::new(),
         }

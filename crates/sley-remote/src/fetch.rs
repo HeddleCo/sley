@@ -112,6 +112,9 @@ pub struct FetchOptions {
     /// `--deepen=N`: `depth` is relative to the client's current boundary.
     /// Local-only today; HTTP and SSH treat `depth` as an absolute `--depth N`.
     pub deepen_relative: bool,
+    /// Allow updating the currently checked-out branch (`git fetch -u` /
+    /// `--update-head-ok`). Porcelain `pull` uses this internally.
+    pub update_head_ok: bool,
     /// `--shallow-since=<date>`: deepen to commits newer than the date.
     /// Local-only today; HTTP and SSH do not send `deepen-since` yet.
     pub deepen_since: Option<i64>,
@@ -860,6 +863,7 @@ fn finalize_fetch(
         return Ok(());
     }
     downgrade_non_commit_for_merge(git_dir, format, updates);
+    validate_fetch_ref_updates(git_dir, format, store, options.update_head_ok, updates)?;
     if options.write_fetch_head {
         if default_head_fetch
             && updates.len() == 1
@@ -884,6 +888,71 @@ fn finalize_fetch(
     store.apply_bundle_ref_updates(&ref_updates, None)?;
     outcome.ref_updates = std::mem::take(updates);
     Ok(())
+}
+
+fn validate_fetch_ref_updates(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    update_head_ok: bool,
+    updates: &[FetchRefUpdate],
+) -> Result<()> {
+    let checked_out = checked_out_branch_refs(git_dir, format)?;
+    for update in updates {
+        let Some(dst) = update.dst.as_deref() else {
+            continue;
+        };
+        let old = match store.read_ref(dst)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            Some(RefTarget::Symbolic(target)) => {
+                return Err(GitError::Transaction(format!(
+                    "ref {dst} would overwrite symbolic ref {target}"
+                )));
+            }
+            None => None,
+        };
+        if old.is_some()
+            && !update_head_ok
+            && checked_out.contains(dst)
+            && dst.starts_with("refs/heads/")
+        {
+            return Err(GitError::Command(format!(
+                "! [rejected]        {} -> {}  (can't fetch into checked-out branch)",
+                update.src, dst
+            )));
+        }
+        if old.is_some() && old != Some(update.oid) && dst.starts_with("refs/tags/") && !update.force
+        {
+            return Err(GitError::Command(format!(
+                "! [rejected]        {} -> {}  (would clobber existing tag)",
+                update.src, dst
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn checked_out_branch_refs(git_dir: &Path, format: ObjectFormat) -> Result<HashSet<String>> {
+    let mut refs = HashSet::new();
+    if let Some(RefTarget::Symbolic(target)) = FileRefStore::new(git_dir, format).read_ref("HEAD")?
+    {
+        refs.insert(target);
+    }
+    let worktrees = git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees) else {
+        return Ok(refs);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let head = entry.path().join("HEAD");
+        let Ok(contents) = fs::read_to_string(head) else {
+            continue;
+        };
+        if let Some(target) = contents.trim().strip_prefix("ref: ") {
+            refs.insert(target.to_string());
+        }
+    }
+    Ok(refs)
 }
 
 /// The remote's advertised `HEAD` symref target (`HEAD:<target>` capability).
@@ -1092,6 +1161,7 @@ pub fn append_reachable_auto_follow_tags(
             dst: Some(reference.name.clone()),
             oid: reference.oid,
             not_for_merge: true,
+            force: false,
         });
     }
     followed.sort_by(|a, b| a.src.cmp(&b.src));
@@ -1404,6 +1474,7 @@ mod tests {
             cloning: false,
             update_shallow: false,
             deepen_relative: false,
+            update_head_ok: false,
             deepen_since: None,
             deepen_not: Vec::new(),
         }

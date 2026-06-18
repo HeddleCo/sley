@@ -4743,6 +4743,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         cloning: false,
         update_shallow: false,
         deepen_relative: false,
+        update_head_ok: true,
         deepen_since: None,
         deepen_not: Vec::new(),
     };
