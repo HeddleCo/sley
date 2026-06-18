@@ -20,6 +20,7 @@ struct ReflogShowOptions {
 #[derive(Debug)]
 enum ReflogFormat {
     Default,
+    NewOid { final_newline: bool },
     Message { final_newline: bool },
 }
 
@@ -78,6 +79,13 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
                 shown,
                 String::from_utf8_lossy(&entry.message)
             ),
+            ReflogFormat::NewOid { final_newline } => {
+                if final_newline || shown + 1 < selected.len() {
+                    println!("{}", entry.new_oid);
+                } else {
+                    print!("{}", entry.new_oid);
+                }
+            }
             ReflogFormat::Message { final_newline } => {
                 if final_newline || shown + 1 < selected.len() {
                     println!("{}", String::from_utf8_lossy(&entry.message));
@@ -701,9 +709,19 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
                 break;
             }
             "--oneline" => format = ReflogFormat::Default,
+            "--format=%H" | "--pretty=%H" => {
+                format = ReflogFormat::NewOid {
+                    final_newline: true,
+                };
+            }
             "--format=%gs" | "--pretty=%gs" => {
                 format = ReflogFormat::Message {
                     final_newline: true,
+                };
+            }
+            "--pretty=format:%H" | "--format=format:%H" => {
+                format = ReflogFormat::NewOid {
+                    final_newline: false,
                 };
             }
             "--pretty=format:%gs" | "--format=format:%gs" => {
@@ -717,9 +735,19 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
                     return Err(GitError::Command(format!("{arg} requires a value")));
                 };
                 match value.as_str() {
+                    "%H" => {
+                        format = ReflogFormat::NewOid {
+                            final_newline: true,
+                        };
+                    }
                     "%gs" => {
                         format = ReflogFormat::Message {
                             final_newline: true,
+                        };
+                    }
+                    "format:%H" => {
+                        format = ReflogFormat::NewOid {
+                            final_newline: false,
                         };
                     }
                     "format:%gs" => {

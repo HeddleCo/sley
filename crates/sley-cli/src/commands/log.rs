@@ -3560,10 +3560,49 @@ fn emit_compiled_reflog_walk_format(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
+    let reflog_timestamp = commit_identity_timestamp(&entry.committer);
     for token in &compiled.tokens {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
+            FormatToken::CommitterName | FormatToken::CommitterNameMapped => {
+                out.extend_from_slice(reflog_name.as_bytes())
+            }
+            FormatToken::CommitterEmail | FormatToken::CommitterEmailMapped => {
+                out.extend_from_slice(reflog_email.as_bytes())
+            }
+            FormatToken::CommitterEmailLocal | FormatToken::CommitterEmailLocalMapped => {
+                out.extend_from_slice(log_email_local_part(&reflog_email).as_bytes())
+            }
+            FormatToken::CommitterTimestamp => out.extend_from_slice(reflog_timestamp.as_bytes()),
+            FormatToken::CommitterDate => {
+                write!(out, "{}", commit_identity_date(&entry.committer, &DateMode::Default))
+                    .map_err(io::Error::from)?
+            }
+            FormatToken::CommitterDateIso => {
+                write!(out, "{}", commit_identity_date(&entry.committer, &DateMode::Iso))
+                    .map_err(io::Error::from)?
+            }
+            FormatToken::CommitterDateIsoStrict => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&entry.committer, &DateMode::IsoStrict)
+                )
+                .map_err(io::Error::from)?
+            }
+            FormatToken::CommitterDateShort => {
+                write!(out, "{}", commit_identity_date(&entry.committer, &DateMode::Short))
+                    .map_err(io::Error::from)?
+            }
+            FormatToken::CommitterDateRfc2822 => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&entry.committer, &DateMode::Rfc2822)
+                )
+                .map_err(io::Error::from)?
+            }
             FormatToken::ReflogGs => out.extend_from_slice(&entry.message),
             FormatToken::ReflogGd | FormatToken::ReflogGD => {
                 write!(out, "{reference}@{{{index}}}").map_err(io::Error::from)?;

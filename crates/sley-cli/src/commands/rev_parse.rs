@@ -77,7 +77,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             continue;
         }
         match arg.as_str() {
-            "--" if verify => break,
+            "--" => break,
             "--end-of-options" if verify => {}
             "--git-dir" => println!("{}", display_git_dir(&cwd, &git_dir, path_format)?),
             "--absolute-git-dir" => println!("{}", fs::canonicalize(&git_dir)?.display()),

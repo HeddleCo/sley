@@ -15,7 +15,9 @@ use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader, repository_objects_dir};
-use sley_refs::{FileRefStore, PackedRef, RefTarget, resolve_ref_peeled, validate_symref_name};
+use sley_refs::{
+    FileRefStore, PackedRef, RefTarget, ReflogEntry, resolve_ref_peeled, validate_symref_name,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::ops::Range;
@@ -436,13 +438,15 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
         "HEAD".to_string()
     } else if rev.starts_with("refs/") {
         rev.to_string()
-    } else if refs.read_ref(&format!("refs/heads/{rev}"))?.is_some() {
-        format!("refs/heads/{rev}")
+    } else if refs.read_ref(&format!("refs/{rev}"))?.is_some() {
+        // git's ref_rev_parse_rules try "refs/%s" before tags/heads. This
+        // matters for pseudo-names such as "stash" (refs/stash), not just names
+        // containing a slash.
+        format!("refs/{rev}")
     } else if refs.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
         format!("refs/tags/{rev}")
-    } else if rev.contains('/') && refs.read_ref(&format!("refs/{rev}"))?.is_some() {
-        // git's lookup rule #2 ("refs/%s") — e.g. `bisect/bad`, `notes/commits`.
-        format!("refs/{rev}")
+    } else if refs.read_ref(&format!("refs/heads/{rev}"))?.is_some() {
+        format!("refs/heads/{rev}")
     } else if refs.read_ref(&format!("refs/remotes/{rev}"))?.is_some() {
         format!("refs/remotes/{rev}")
     } else if refs
@@ -531,11 +535,7 @@ fn resolve_at_selector(
         return Ok(Some(resolve_reflog_nth(git_dir, format, base, count, rev)?));
     }
 
-    // Date-based selectors such as `@{yesterday}` / `@{2 days ago}` are not
-    // implemented; report them rather than silently mis-resolving.
-    Err(GitError::Unsupported(format!(
-        "revision selector @{{{inner}}}"
-    )))
+    Ok(Some(resolve_reflog_date(git_dir, format, base, inner, rev)?))
 }
 
 /// Parse the numeric portion of an `@{N}` / `@{-N}` selector.
@@ -625,6 +625,129 @@ fn resolve_reflog_nth(
         )));
     }
     Ok(entries[len - 1 - n].new_oid)
+}
+
+fn resolve_reflog_date(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    base: &str,
+    date: &str,
+    rev: &str,
+) -> Result<ObjectId> {
+    let cutoff = parse_reflog_selector_date(date).ok_or_else(|| {
+        GitError::Unsupported(format!("revision selector @{{{date}}}"))
+    })?;
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let ref_name = reflog_ref_name(&refs, base);
+    let entries = refs.read_reflog(&ref_name)?;
+    if entries.is_empty() {
+        return Err(GitError::not_found(format!(
+            "no reflog for '{}' to resolve {rev}",
+            reflog_display_name(base)
+        )));
+    }
+    for entry in entries.iter().rev() {
+        if reflog_entry_timestamp(entry)? <= cutoff {
+            return Ok(entry.new_oid);
+        }
+    }
+    Err(GitError::not_found(format!(
+        "log for '{}' only goes back to {}",
+        reflog_display_name(base),
+        date
+    )))
+}
+
+fn reflog_entry_timestamp(entry: &ReflogEntry) -> Result<i64> {
+    entry.timestamp_seconds()
+}
+
+fn parse_reflog_selector_date(value: &str) -> Option<i64> {
+    let mut parts = value.split_ascii_whitespace();
+    let _weekday = parts.next()?;
+    let month = parse_reflog_month(parts.next()?)?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let time = parts.next()?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let tz = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts.next()?.parse::<i64>().ok()?;
+    if time_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let offset = parse_reflog_timezone(tz)?;
+    Some(
+        days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second - offset,
+    )
+}
+
+fn parse_reflog_month(value: &str) -> Option<u32> {
+    match value {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_reflog_timezone(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 5 || (bytes[0] != b'+' && bytes[0] != b'-') {
+        return None;
+    }
+    let hours = value[1..3].parse::<i64>().ok()?;
+    let minutes = value[3..5].parse::<i64>().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3_600 + minutes * 60;
+    if bytes[0] == b'-' {
+        Some(-seconds)
+    } else {
+        Some(seconds)
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 /// Human-facing name for a reflog target in error messages (HEAD, or the branch
