@@ -816,7 +816,9 @@ pub fn install_fetch_pack_via_local_upload_pack(
     wants: Vec<ObjectId>,
     deepen: Option<&LocalDeepenPlan>,
     promisor: bool,
+    record_promisor_refs: bool,
     filter: Option<sley_odb::PackObjectFilter>,
+    refetch: bool,
     unpack_limit: Option<usize>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
@@ -833,7 +835,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         Some(plan) => plan.shallow_info.is_empty() && plan.extra_wants.is_empty(),
         None => true,
     };
-    if all_wants_present && deepen_noop {
+    if all_wants_present && deepen_noop && !refetch {
         return Ok(Vec::new());
     }
 
@@ -860,7 +862,11 @@ pub fn install_fetch_pack_via_local_upload_pack(
     let decoded_request = read_upload_pack_request(format, &mut encoded_request.as_slice())?
         .ok_or_else(|| GitError::InvalidFormat("encoded upload-pack request was empty".into()))?;
 
-    let haves = local_have_oids(git_dir, format)?;
+    let haves = if refetch {
+        Vec::new()
+    } else {
+        local_have_oids(git_dir, format)?
+    };
     let negotiation = UploadPackNegotiationRequest { haves, done: true };
     let mut encoded_negotiation = Vec::new();
     write_upload_pack_negotiation_request(&mut encoded_negotiation, &negotiation)?;
@@ -894,7 +900,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         deepen.map(|plan| plan.client_shallow.len()).unwrap_or(0),
         deepen.is_some_and(|plan| plan.deepen_since),
         deepen.map(|plan| plan.deepen_not).unwrap_or(0),
-        filter,
+        filter.as_ref(),
     );
     // With a deepen plan the haves walk is cut at the client's existing
     // boundary: having a commit inside the old shallow window must not imply
@@ -908,6 +914,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         None => collect_reachable_object_ids(&remote_db, format, known_haves)?,
     };
     let mut starts = decoded_request.wants;
+    let promisor_ref_wants = starts.iter().copied().collect::<HashSet<_>>();
     for want in &starts {
         excluded.remove(want);
     }
@@ -917,19 +924,70 @@ pub fn install_fetch_pack_via_local_upload_pack(
         excluded.extend(plan.excluded.iter().copied());
         starts.extend(plan.extra_wants.iter().copied());
     }
-    build_and_install_reachable_pack_filtered(
+    let install = build_and_install_reachable_pack_filtered(
         &remote_db,
         &local_db,
         format,
         starts,
         &excluded,
         RawPackInstallOptions { promisor },
-        filter,
+        filter.clone(),
         unpack_limit,
     )?;
+    if promisor
+        && record_promisor_refs
+        && let Some(result) = install
+        && let Some(promisor_path) = result.promisor_path
+    {
+        append_promisor_ref_lines(&promisor_path, remote_git_dir, format, &promisor_ref_wants)?;
+    }
     Ok(deepen
         .map(|plan| plan.shallow_info.clone())
         .unwrap_or_default())
+}
+
+fn append_promisor_ref_lines(
+    promisor_path: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wanted: &HashSet<ObjectId>,
+) -> Result<()> {
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let store = FileRefStore::new(remote_git_dir, format);
+    let mut lines = Vec::new();
+    if let Some(head_target) = store.read_ref("HEAD")? {
+        let head = Ref {
+            name: "HEAD".into(),
+            target: head_target,
+        };
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &head)?
+            && wanted.contains(&oid)
+        {
+            lines.push(format!("{oid} HEAD\n"));
+        }
+    }
+    for reference in store.list_refs()? {
+        let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+            continue;
+        };
+        if wanted.contains(&oid) {
+            lines.push(format!("{oid} {}\n", reference.name));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    lines.sort();
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(promisor_path)?;
+    use std::io::Write as _;
+    for line in lines {
+        file.write_all(line.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Append upstream upload-pack's `fetch-info` data_json event to the file
@@ -942,7 +1000,7 @@ fn trace2_fetch_info(
     shallows: usize,
     deepen_since: bool,
     deepen_not: usize,
-    filter: Option<sley_odb::PackObjectFilter>,
+    filter: Option<&sley_odb::PackObjectFilter>,
 ) {
     let Some(path) = std::env::var_os("GIT_TRACE2_EVENT") else {
         return;
@@ -952,6 +1010,13 @@ fn trace2_fetch_info(
     }
     let filter_json = match filter {
         Some(sley_odb::PackObjectFilter::BlobNone) => "\"blob:none\"".to_string(),
+        Some(sley_odb::PackObjectFilter::BlobLimit(limit)) => {
+            format!("\"blob:limit={limit}\"")
+        }
+        Some(sley_odb::PackObjectFilter::TreeDepth(depth)) => {
+            format!("\"tree:{depth}\"")
+        }
+        Some(sley_odb::PackObjectFilter::SparsePathSet(_)) => "\"sparse:oid\"".to_string(),
         None => "null".to_string(),
     };
     let line = format!(

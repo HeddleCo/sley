@@ -226,6 +226,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
             "--missing=print" => missing_action = RevListMissingAction::Print,
             "--missing=allow-any" => missing_action = RevListMissingAction::AllowAny,
+            "--missing=allow-promisor" => missing_action = RevListMissingAction::AllowPromisor,
             "--boundary" => boundary = true,
             "--disk-usage" => disk_usage = Some(false),
             "--disk-usage=human" => disk_usage = Some(true),
@@ -1604,6 +1605,7 @@ enum RevListMissingAction {
     Error,
     Print,
     AllowAny,
+    AllowPromisor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1934,6 +1936,16 @@ fn rev_list_collect_tree_objects(
     if !seen.insert(*tree_oid) {
         return Ok(());
     }
+    let object = match walk.db.read_object(tree_oid) {
+        Ok(object) => object,
+        Err(err) => return rev_list_handle_missing_object(walk, tree_oid, state, err),
+    };
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
     rev_list_record_filter_decision(
         walk,
         ObjectType::Tree,
@@ -1953,16 +1965,6 @@ fn rev_list_collect_tree_objects(
             );
         }
         return Ok(());
-    }
-    let object = match walk.db.read_object(tree_oid) {
-        Ok(object) => object,
-        Err(err) => return rev_list_handle_missing_object(walk, tree_oid, state, err),
-    };
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
     }
     for entry in TreeEntries::new(walk.format, &object.body) {
         let entry = entry?;
@@ -1984,7 +1986,10 @@ fn rev_list_collect_tree_objects(
             }
             let size = if entry_type == ObjectType::Blob
                 && (rev_list_filter_needs_blob_size(walk.filter)
-                    || walk.missing_action != RevListMissingAction::AllowAny)
+                    || !matches!(
+                        walk.missing_action,
+                        RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor
+                    ))
             {
                 let object = match walk.db.read_object(&entry.oid) {
                     Ok(object) => object,
@@ -1997,6 +2002,20 @@ fn rev_list_collect_tree_objects(
             } else {
                 None
             };
+            if matches!(
+                walk.missing_action,
+                RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor
+            ) && size.is_none()
+                && !walk.db.contains(&entry.oid)?
+            {
+                rev_list_handle_missing_object(
+                    walk,
+                    &entry.oid,
+                    state,
+                    GitError::object_not_found(entry.oid),
+                )?;
+                continue;
+            }
             rev_list_record_filter_decision(
                 walk,
                 entry_type,
@@ -2087,7 +2106,7 @@ fn rev_list_handle_missing_object(
 ) -> Result<()> {
     match walk.missing_action {
         RevListMissingAction::Error => Err(err),
-        RevListMissingAction::AllowAny => Ok(()),
+        RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor => Ok(()),
         RevListMissingAction::Print => {
             if state.missing_oids.insert(*oid) {
                 state.missing.push(RevListObject {

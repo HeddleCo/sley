@@ -271,7 +271,9 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             wants,
             deepen_plan.as_ref(),
             false,
+            false,
             None,
+            false,
             None,
         )?;
         apply_shallow_info(&git_dir, format, &shallow_info)?;

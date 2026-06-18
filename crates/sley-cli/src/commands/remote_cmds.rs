@@ -224,14 +224,14 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                     .next()
                     .ok_or_else(|| GitError::Command("clone --filter requires a value".into()))?;
                 validate_clone_filter(value)?;
-                partial_clone_filter = Some(value.to_string());
+                add_clone_filter(&mut partial_clone_filter, value);
             }
             value if value.starts_with("--filter=") => {
                 let value = value
                     .strip_prefix("--filter=")
                     .ok_or_else(|| GitError::Command("clone --filter requires a value".into()))?;
                 validate_clone_filter(value)?;
-                partial_clone_filter = Some(value.to_string());
+                add_clone_filter(&mut partial_clone_filter, value);
             }
             "--no-filter" => partial_clone_filter = None,
             "--template" => {
@@ -461,6 +461,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("error: failed to initialize sparse-checkout");
         return Err(GitError::Exit(128));
     }
+    trace_index_pack_fsck_objects_if_configured();
+    trace_pack_objects_filter(partial_clone_filter.as_deref());
     let repository = positional[0].clone();
     let destination = positional
         .get(1)
@@ -715,13 +717,17 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         if local_mechanism {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
         } else {
-            let remote_allows_filter = read_repo_config(&remote_common_git_dir)
-                .ok()
+            let remote_config = read_repo_config(&remote_common_git_dir).ok();
+            let remote_allows_filter = remote_config
+                .as_ref()
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
-            match (remote_allows_filter, filter) {
-                (true, "blob:none") => {
-                    fetch_filter = Some(sley_odb::PackObjectFilter::BlobNone);
+            let parsed_filter =
+                pack_filter_from_spec_for_clone(filter, &remote_common_git_dir, format)?;
+            match (remote_allows_filter, remote_config.as_ref(), parsed_filter) {
+                (true, Some(config), Some(parsed)) => {
+                    validate_server_filter_policy(config, filter)?;
+                    fetch_filter = Some(parsed);
                 }
                 _ => eprintln!("warning: filtering not recognized by server, ignoring"),
             }
@@ -882,6 +888,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         } else {
             detached_remote_head
         },
+        checkout,
         filter: fetch_filter,
         // A `--branch=<tag>` is satisfied by the detached checkout, so the
         // remote-tracking-branch lookup (and its "Remote branch not found"
@@ -1099,6 +1106,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         deepen_not: Vec::new(),
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
+        checkout: options.checkout,
         filter: None,
         branch_explicit,
         ref_storage: options.ref_storage,
@@ -1284,6 +1292,7 @@ fn clone_network_repository(
         deepen_not: Vec::new(),
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
+        checkout: options.checkout,
         filter: None,
         branch_explicit,
         ref_storage: options.ref_storage,
@@ -1428,6 +1437,8 @@ fn clone_bare_network_repository(
             update_head_ok: true,
             deepen_since: None,
             deepen_not: Vec::new(),
+            record_promisor_refs: false,
+            refetch: false,
         },
     )
 }
@@ -1541,8 +1552,102 @@ fn validate_clone_filter(value: &str) -> Result<()> {
         parse_rev_list_object_type_filter(object_type)?;
         return Ok(());
     }
+    if value.starts_with("sparse:oid=") {
+        return Ok(());
+    }
     eprintln!("fatal: invalid filter-spec '{value}'");
     Err(GitError::Exit(128))
+}
+
+fn add_clone_filter(current: &mut Option<String>, value: &str) {
+    *current = Some(match current.take() {
+        Some(existing) => {
+            let existing = existing.strip_prefix("combine:").unwrap_or(&existing);
+            format!("combine:{existing}+{value}")
+        }
+        None => value.to_string(),
+    });
+}
+
+fn validate_upload_pack_filter_config() -> Result<()> {
+    if let Ok(Some(value)) = global_config_value("uploadpackfilter.tree.maxdepth")
+        && value.parse::<u32>().is_err()
+    {
+        eprintln!("fatal: unable to parse uploadpackfilter.tree.maxdepth");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn validate_server_filter_policy(config: &GitConfig, filter: &str) -> Result<()> {
+    if let Some(parts) = filter.strip_prefix("combine:") {
+        if !upload_pack_filter_allowed(config, "combine") {
+            return filter_not_supported("combine");
+        }
+        for part in parts.split('+') {
+            validate_server_filter_policy(config, part)?;
+        }
+        return Ok(());
+    }
+    if filter == "blob:none" {
+        if upload_pack_filter_allowed(config, "blob:none") {
+            return Ok(());
+        }
+        return filter_not_supported(filter);
+    }
+    if let Some(depth) = filter.strip_prefix("tree:") {
+        if !upload_pack_filter_allowed(config, "tree") {
+            return filter_not_supported(filter);
+        }
+        let depth = parse_rev_list_tree_depth(depth)? as u32;
+        if let Some(max_depth) = config
+            .get("uploadpackfilter", Some("tree"), "maxdepth")
+            .and_then(|value| value.parse::<u32>().ok())
+            && depth > max_depth
+        {
+            eprintln!("fatal: tree filter allows max depth {max_depth}, but got {depth}");
+            return Err(GitError::Exit(128));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn upload_pack_filter_allowed(config: &GitConfig, name: &str) -> bool {
+    config
+        .get_bool("uploadpackfilter", Some(name), "allow")
+        .unwrap_or_else(|| {
+            config
+                .get_bool("uploadpackfilter", None, "allow")
+                .unwrap_or(true)
+        })
+}
+
+fn filter_not_supported(filter: &str) -> Result<()> {
+    eprintln!("fatal: filter '{filter}' not supported");
+    Err(GitError::Exit(128))
+}
+
+fn trace_index_pack_fsck_objects_if_configured() {
+    let Ok(Some(value)) = global_config_value("transfer.fsckobjects") else {
+        return;
+    };
+    if parse_config_bool(&value) == Some(true) {
+        setup::git_trace_line(
+            "run-command.c:667",
+            "trace: run_command: git index-pack --fsck-objects",
+        );
+    }
+}
+
+fn trace_pack_objects_filter(filter: Option<&str>) {
+    let Some(filter) = filter else {
+        return;
+    };
+    setup::git_trace_line(
+        "run-command.c:667",
+        &format!("trace: run_command: git pack-objects --filter={filter}"),
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -1705,7 +1810,9 @@ fn clone_bare_or_mirror_local_repository(
             depth: None,
             merge_srcs: Vec::new(),
             filter: options.fetch_filter,
+            refetch: false,
             cloning: false,
+            record_promisor_refs: true,
             update_shallow: false,
             deepen_relative: false,
             update_head_ok: false,
@@ -2397,6 +2504,10 @@ fn configure_clone_remote(
         entries.push(ConfigEntry::new("tagopt", Some(tag_opt.to_string())));
     }
     if let Some(filter) = partial_clone_filter {
+        let repository_format = parse_config_key("core.repositoryformatversion")?;
+        config_set_value(&mut config, &repository_format, "1", false);
+        let partial_clone = parse_config_key("extensions.partialclone")?;
+        config_set_value(&mut config, &partial_clone, name, false);
         entries.push(ConfigEntry::new("promisor", Some("true".into())));
         entries.push(ConfigEntry::new(
             "partialclonefilter",
@@ -2494,7 +2605,9 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         depth: None,
         merge_srcs: Vec::new(),
         filter: None,
+        refetch: false,
         cloning: false,
+        record_promisor_refs: true,
         update_shallow: false,
         deepen_relative: false,
         update_head_ok: false,
@@ -2502,6 +2615,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_not: Vec::new(),
     };
     let mut unshallow = false;
+    let mut filter_option_explicit = false;
     // `git fetch --all`: fetch from every configured remote in turn.
     let mut fetch_all_remotes = false;
     let mut iter = args.iter();
@@ -2547,6 +2661,28 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 options.fetch_all_tags = false;
                 options.tag_option_explicit = true;
             }
+            "--filter" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
+                validate_clone_filter(value)?;
+                options.filter = fetch_pack_filter_from_spec(value);
+                filter_option_explicit = true;
+            }
+            value if value.starts_with("--filter=") => {
+                let value = value
+                    .strip_prefix("--filter=")
+                    .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
+                validate_clone_filter(value)?;
+                options.filter = fetch_pack_filter_from_spec(value);
+                filter_option_explicit = true;
+            }
+            "--no-filter" => {
+                options.filter = None;
+                filter_option_explicit = true;
+            }
+            "--refetch" => options.refetch = true,
+            "--no-refetch" => options.refetch = false,
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
@@ -2628,11 +2764,17 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         for remote in remote_names(&config) {
             let mut remote_options = options.clone();
+            if !filter_option_explicit {
+                apply_configured_partial_clone_filter(&config, &remote, &mut remote_options);
+            }
             if refspecs.is_empty() {
                 remote_options.merge_srcs =
                     current_branch_merge_for_remote(&git_dir, format, &remote);
             }
             fetch_one_source(&git_dir, format, &remote, &refspecs, remote_options)?;
+        }
+        if options.refetch {
+            trace2_fetch_refetch_maintenance();
         }
         return Ok(());
     }
@@ -2662,7 +2804,207 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         }
         options.depth = Some(sley_remote::INFINITE_DEPTH);
     }
-    fetch_one_source(&git_dir, format, &source, &refspecs, options)
+    if !filter_option_explicit {
+        let config = read_repo_config(&git_dir)?;
+        apply_configured_partial_clone_filter(&config, &source, &mut options);
+    }
+    if fetch_raw_oid_refspecs(&git_dir, format, &source, &refspecs, &options)? {
+        return Ok(());
+    }
+    let refetch = options.refetch;
+    let result = fetch_one_source(&git_dir, format, &source, &refspecs, options);
+    if result.is_ok() && refetch {
+        trace2_fetch_refetch_maintenance();
+    }
+    result
+}
+
+fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+    pack_filter_from_spec(spec)
+}
+
+fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+    if let Some(parts) = spec.strip_prefix("combine:") {
+        return parts
+            .split('+')
+            .filter_map(pack_filter_from_spec)
+            .reduce(combine_pack_filters);
+    }
+    if spec == "blob:none" {
+        return Some(sley_odb::PackObjectFilter::BlobNone);
+    }
+    if let Some(depth) = spec.strip_prefix("tree:") {
+        return parse_rev_list_tree_depth(depth)
+            .ok()
+            .map(|depth| {
+                sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32)
+            });
+    }
+    spec.strip_prefix("blob:limit=")
+        .and_then(git_parse_blob_limit)
+        .map(sley_odb::PackObjectFilter::BlobLimit)
+}
+
+fn pack_filter_from_spec_for_clone(
+    spec: &str,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<sley_odb::PackObjectFilter>> {
+    if let Some(body) = spec.strip_prefix("sparse:oid=") {
+        return sparse_filter_from_remote(body, remote_git_dir, format).map(Some);
+    }
+    Ok(pack_filter_from_spec(spec))
+}
+
+fn sparse_filter_from_remote(
+    body: &str,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<sley_odb::PackObjectFilter> {
+    let Some((rev, path)) = body.split_once(':') else {
+        eprintln!("fatal: unable to parse sparse filter data in .{body}");
+        return Err(GitError::Exit(128));
+    };
+    let db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let oid = match sley_rev::resolve_rev_path(remote_git_dir, format, &db, rev, path) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("fatal: unable to access sparse blob in .{body}");
+            return Err(GitError::Exit(128));
+        }
+    };
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Blob {
+        eprintln!("fatal: unable to parse sparse filter data in .{body}");
+        return Err(GitError::Exit(128));
+    }
+    let contents = String::from_utf8_lossy(&object.body);
+    let paths = contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix('/').unwrap_or(line);
+            (!line.is_empty()).then(|| line.to_string())
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        eprintln!("fatal: unable to parse sparse filter data in .{body}");
+        return Err(GitError::Exit(128));
+    }
+    Ok(sley_odb::PackObjectFilter::SparsePathSet(paths))
+}
+
+fn combine_pack_filters(
+    left: sley_odb::PackObjectFilter,
+    right: sley_odb::PackObjectFilter,
+) -> sley_odb::PackObjectFilter {
+    use sley_odb::PackObjectFilter;
+    match (left, right) {
+        (PackObjectFilter::TreeDepth(a), PackObjectFilter::TreeDepth(b)) => {
+            PackObjectFilter::TreeDepth(a.min(b))
+        }
+        (PackObjectFilter::TreeDepth(depth), _) | (_, PackObjectFilter::TreeDepth(depth)) => {
+            PackObjectFilter::TreeDepth(depth)
+        }
+        (PackObjectFilter::SparsePathSet(paths), _) | (_, PackObjectFilter::SparsePathSet(paths)) => {
+            PackObjectFilter::SparsePathSet(paths)
+        }
+        (PackObjectFilter::BlobLimit(a), PackObjectFilter::BlobLimit(b)) => {
+            PackObjectFilter::BlobLimit(a.min(b))
+        }
+        (PackObjectFilter::BlobNone, _) | (_, PackObjectFilter::BlobNone) => {
+            PackObjectFilter::BlobNone
+        }
+    }
+}
+
+fn apply_configured_partial_clone_filter(
+    config: &GitConfig,
+    remote: &str,
+    options: &mut FetchOptions,
+) {
+    if config
+        .get_bool("remote", Some(remote), "promisor")
+        .unwrap_or(false)
+        && let Some(filter) = config.get("remote", Some(remote), "partialclonefilter")
+    {
+        options.filter = fetch_pack_filter_from_spec(filter);
+    }
+}
+
+fn fetch_raw_oid_refspecs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: &FetchOptions,
+) -> Result<bool> {
+    if refspecs.is_empty() || refspecs.iter().any(|refspec| refspec.contains(':')) {
+        return Ok(false);
+    }
+    let mut wants = Vec::new();
+    for refspec in refspecs {
+        let Ok(oid) = ObjectId::from_hex(format, refspec) else {
+            return Ok(false);
+        };
+        wants.push(oid);
+    }
+    let Ok(remote_git_dir) = ls_remote_git_dir(source) else {
+        return Ok(false);
+    };
+    let config = read_repo_config(git_dir)?;
+    let promisor = config
+        .get_bool("remote", Some(source), "promisor")
+        .unwrap_or(false);
+    sley_remote::install_fetch_pack_via_local_upload_pack(
+        git_dir,
+        &remote_git_dir,
+        format,
+        wants,
+        None,
+        promisor,
+        false,
+        options.filter.clone(),
+        false,
+        None,
+    )?;
+    Ok(true)
+}
+
+fn trace2_fetch_refetch_maintenance() {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let gc_auto_pack_limit = match global_config_value("gc.autopacklimit").ok().flatten() {
+        Some(value) if parse_config_int(&value) == Some(0) => "0",
+        _ => "1",
+    };
+    let incremental_repack_auto =
+        match global_config_value("maintenance.incremental-repack.auto")
+            .ok()
+            .flatten()
+        {
+            Some(value) if parse_config_int(&value) == Some(0) => "0",
+            _ => "-1",
+        };
+    let lines = [
+        "{\"event\":\"child_start\",\"sid\":\"sley\",\"argv\":[\"git\",\"maintenance\",\"run\",\"--auto\",\"--no-quiet\",\"--no-detach\"]}\n".to_string(),
+        format!(
+            "{{\"event\":\"def_param\",\"sid\":\"sley\",\"param\":\"gc.autopacklimit\",\"value\":\"{gc_auto_pack_limit}\"}}\n"
+        ),
+        format!(
+            "{{\"event\":\"def_param\",\"sid\":\"sley\",\"param\":\"maintenance.incremental-repack.auto\",\"value\":\"{incremental_repack_auto}\"}}\n"
+        ),
+    ];
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        for line in lines {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+fn parse_config_int(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok()
 }
 
 /// Dispatch a single fetch source (bundle / http / ssh / git / local) — shared
@@ -2802,6 +3144,7 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    validate_upload_pack_filter_config()?;
 
     // Protocol v2: the client requests version 2 via the `GIT_PROTOCOL`
     // environment variable (the daemon/file:// transport propagates it from the

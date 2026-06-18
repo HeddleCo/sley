@@ -8,7 +8,10 @@ use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
-use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
+use sley_object::{
+    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
+    tree_entry_object_type,
+};
 use sley_pack::{
     MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
     PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
@@ -421,10 +424,16 @@ where
 /// server supports: directly-wanted tips are always packed; the filter only
 /// prunes objects reached *through* the traversal (upstream's
 /// `filter_blobs_none` runs on traversed blobs, never on wanted tips).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackObjectFilter {
     /// `blob:none`: omit every blob reached through tree traversal.
     BlobNone,
+    /// `blob:limit=<n>`: omit traversed blobs whose body is at least `n` bytes.
+    BlobLimit(u64),
+    /// `tree:<n>`: keep only trees shallower than `n`, and omit traversed blobs.
+    TreeDepth(u32),
+    /// `sparse:oid=<blob>`: keep only blobs whose repo path is listed.
+    SparsePathSet(Vec<String>),
 }
 
 /// [`build_and_install_reachable_pack`] with an optional partial-clone
@@ -454,6 +463,36 @@ where
                 entry.object.object_type != ObjectType::Blob || wanted.contains(&entry.oid)
             });
         }
+        Some(PackObjectFilter::BlobLimit(limit)) => {
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob
+                    || wanted.contains(&entry.oid)
+                    || (entry.object.body.len() as u64) < limit
+            });
+        }
+        Some(PackObjectFilter::TreeDepth(depth)) => {
+            let tree_depths = collect_tree_filter_depths(source, format, &objects)?;
+            objects.retain(|entry| {
+                if wanted.contains(&entry.oid) {
+                    return true;
+                }
+                match entry.object.object_type {
+                    ObjectType::Blob => false,
+                    ObjectType::Tree => tree_depths
+                        .get(&entry.oid)
+                        .is_some_and(|tree_depth| *tree_depth < depth),
+                    _ => true,
+                }
+            });
+        }
+        Some(PackObjectFilter::SparsePathSet(paths)) => {
+            let allowed_blobs = collect_sparse_filter_blobs(source, format, &objects, &paths)?;
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob
+                    || wanted.contains(&entry.oid)
+                    || allowed_blobs.contains(&entry.oid)
+            });
+        }
         None => {}
     }
     if objects.is_empty() {
@@ -475,6 +514,125 @@ where
     destination
         .install_generated_pack_unchecked(&pack, options)
         .map(Some)
+}
+
+fn collect_tree_filter_depths<R>(
+    reader: &R,
+    format: ObjectFormat,
+    objects: &[ReachablePackObject],
+) -> Result<HashMap<ObjectId, u32>>
+where
+    R: ObjectReader,
+{
+    let available: HashSet<ObjectId> = objects.iter().map(|entry| entry.oid).collect();
+    let mut depths = HashMap::new();
+    let mut stack = Vec::new();
+    for entry in objects {
+        if entry.object.object_type != ObjectType::Commit {
+            continue;
+        }
+        let commit = Commit::parse(format, &entry.object.body)?;
+        if available.contains(&commit.tree) {
+            stack.push((commit.tree, 0u32));
+        }
+    }
+    while let Some((tree_oid, depth)) = stack.pop() {
+        if depths
+            .get(&tree_oid)
+            .is_some_and(|old_depth| *old_depth <= depth)
+        {
+            continue;
+        }
+        depths.insert(tree_oid, depth);
+        let tree = reader.read_object(&tree_oid)?;
+        if tree.object_type != ObjectType::Tree {
+            continue;
+        }
+        let child_depth = depth.saturating_add(1);
+        for entry in TreeEntries::new(format, &tree.body) {
+            let entry = entry?;
+            if tree_entry_object_type(entry.mode) == ObjectType::Tree
+                && available.contains(&entry.oid)
+            {
+                stack.push((entry.oid, child_depth));
+            }
+        }
+    }
+    Ok(depths)
+}
+
+fn collect_sparse_filter_blobs<R>(
+    reader: &R,
+    format: ObjectFormat,
+    objects: &[ReachablePackObject],
+    paths: &[String],
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+{
+    let wanted_paths: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let mut allowed = HashSet::new();
+    let mut seen_trees = HashSet::new();
+    for entry in objects {
+        if entry.object.object_type != ObjectType::Commit {
+            continue;
+        }
+        let commit = Commit::parse(format, &entry.object.body)?;
+        collect_sparse_tree_blobs(
+            reader,
+            format,
+            &commit.tree,
+            "",
+            &wanted_paths,
+            &mut seen_trees,
+            &mut allowed,
+        )?;
+    }
+    Ok(allowed)
+}
+
+fn collect_sparse_tree_blobs<R>(
+    reader: &R,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: &str,
+    wanted_paths: &HashSet<&str>,
+    seen_trees: &mut HashSet<ObjectId>,
+    allowed: &mut HashSet<ObjectId>,
+) -> Result<()>
+where
+    R: ObjectReader,
+{
+    if !seen_trees.insert(*tree_oid) {
+        return Ok(());
+    }
+    let tree = reader.read_object(tree_oid)?;
+    if tree.object_type != ObjectType::Tree {
+        return Ok(());
+    }
+    for entry in TreeEntries::new(format, &tree.body) {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name);
+        let path = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if tree_entry_object_type(entry.mode) == ObjectType::Tree {
+            collect_sparse_tree_blobs(
+                reader,
+                format,
+                &entry.oid,
+                &path,
+                wanted_paths,
+                seen_trees,
+                allowed,
+            )?;
+        } else if wanted_paths.contains(path.as_str()) {
+            allowed.insert(entry.oid);
+        }
+    }
+    Ok(())
 }
 
 /// Assemble a pack stream that reuses an existing pack's object data verbatim

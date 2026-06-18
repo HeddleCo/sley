@@ -4710,13 +4710,71 @@ fn diff_rename_limit_requires_integer_error() -> GitError {
 }
 
 fn read_blob_content(db: &FileObjectDatabase, oid: &ObjectId) -> Result<DiffBlobContent> {
-    let object = db.read_object(oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, oid)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
             "diff expected blob object {oid}"
         )));
     }
     Ok(DiffBlobContent::Object(object))
+}
+
+fn read_object_maybe_prefetch_promisor(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+) -> Result<Arc<EncodedObject>> {
+    let object = match db.read_object(oid) {
+        Ok(object) => object,
+        Err(err @ GitError::NotFound(_)) => {
+            if !prefetch_local_promisor_object(db, oid)? {
+                return Err(err);
+            }
+            db.read_object(oid)?
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(object)
+}
+
+fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Result<bool> {
+    let Some(git_dir) = database_git_dir(db) else {
+        return Ok(false);
+    };
+    let Ok(config) = read_repo_config(&git_dir) else {
+        return Ok(false);
+    };
+    let Some(remote_name) = config
+        .get("extensions", None, "partialclone")
+        .map(str::to_string)
+        .or_else(|| {
+            remote_names(&config).into_iter().find(|name| {
+                config
+                    .get_bool("remote", Some(name), "promisor")
+                    == Some(true)
+            })
+        })
+    else {
+        return Ok(false);
+    };
+    let Some(url) = config.get("remote", Some(&remote_name), "url") else {
+        return Ok(false);
+    };
+    let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+        return Ok(false);
+    };
+    sley_remote::install_fetch_pack_via_local_upload_pack(
+        &git_dir,
+        &remote_git_dir,
+        db.object_format(),
+        vec![*oid],
+        None,
+        true,
+        false,
+        None,
+        false,
+        None,
+    )?;
+    Ok(true)
 }
 
 fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
