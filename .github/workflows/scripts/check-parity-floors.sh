@@ -478,7 +478,12 @@ declare -A FLOOR=(
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
     # wave-2 submodule (2026-06-18, integ/submodule): t4060 7->15 (diff porcelain options).
     [t4051-diff-function-context.sh]=32
-    [t4060-diff-submodule-option-diff-format.sh]=15
+    # codex-wave-10 (diff --submodule formats): short/log/diff + diff.submodule
+    # default + dirty-suffix + (rewind)/(not present) annotations. FULL PASS both:
+    # t4060 15->51, t4041 14->47. log/show/stash blast-radius held (t4205=110
+    # t4202=101 t3903=134 t4013=191 t4014=202 t7508=114).
+    [t4060-diff-submodule-option-diff-format.sh]=51
+    [t4041-diff-submodule-option.sh]=47
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
@@ -530,7 +535,7 @@ declare -A FLOOR=(
     [t5511-refspec.sh]=47
     [t5515-fetch-merge-logic.sh]=65
     [t5516-fetch-push.sh]=63
-    [t5520-pull.sh]=32
+    [t5520-pull.sh]=38
     [t5601-clone.sh]=72
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
@@ -609,7 +614,14 @@ declare -A FLOOR=(
     # wave-12 (2026-06-17): repack/gc engine (geometric + cruft repack + gc orchestration),
     # diff indent-heuristic, reftable log-block engine. Incidental pack-floor gains bumped above
     # (t5304 10->13, t5319 74->77, t5326 342->344, t5329 16->19). NEW floors locking the gains:
-    [t7700-repack.sh]=17
+    # codex-wave-10 (repack engine): kept-pack retention, .keep/--keep-pack,
+    # cruft retention around kept packs, server-info, bitmap/stale-bitmap, orphan
+    # idx, cruft numeric config validation + error shape. t7700 17->29. Pack
+    # floors held t5300=46 t5303=21 t5319=77 t1450=96. Plus wave-10 merge/pull
+    # config (t7601 NEW@65 FULL: merge.ff/pull.ff/pull.rebase + branch mergeoptions;
+    # side t5520 32->38).
+    [t7601-merge-pull-config.sh]=65
+    [t7700-repack.sh]=29
     [t7703-repack-geometric.sh]=11
     [t7704-repack-cruft.sh]=15
     [t6500-gc.sh]=14

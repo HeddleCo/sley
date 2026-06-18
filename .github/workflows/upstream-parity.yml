@@ -156,6 +156,7 @@ jobs:
             t4047-diff-dirstat.sh
             t4051-diff-function-context.sh
             t4060-diff-submodule-option-diff-format.sh
+            t4041-diff-submodule-option.sh
             t4052-stat-output.sh
             t4124-apply-ws-rule.sh
             t4150-am.sh
@@ -250,6 +251,7 @@ jobs:
             t7406-submodule-update.sh
             t4203-mailmap.sh
             t7700-repack.sh
+            t7601-merge-pull-config.sh
             t7703-repack-geometric.sh
             t7704-repack-cruft.sh
             t6500-gc.sh
