@@ -4842,6 +4842,17 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 relative_paths,
             },
         )?;
+        if !pathspec.has_filters() && !show_ignored && explicit_untracked {
+            sley_worktree::emit_untracked_cache_bypass_trace();
+        } else if !pathspec.has_filters() && !show_ignored {
+            sley_worktree::refresh_untracked_cache_after_status(
+                &worktree_root,
+                &git_dir,
+                format,
+                &config,
+                untracked_mode,
+            )?;
+        }
         return Ok(());
     }
     let mut entries = crate::collect_short_status_with_options(
@@ -4948,6 +4959,17 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 "--dst-prefix=w/".to_string(),
             ])?;
         }
+    }
+    if !pathspec.has_filters() && !show_ignored && explicit_untracked {
+        sley_worktree::emit_untracked_cache_bypass_trace();
+    } else if !pathspec.has_filters() && !show_ignored {
+        sley_worktree::refresh_untracked_cache_after_status(
+            &worktree_root,
+            &git_dir,
+            format,
+            &config,
+            untracked_mode,
+        )?;
     }
     Ok(())
 }

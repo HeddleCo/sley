@@ -105,6 +105,56 @@ pub struct Index {
     pub checksum: Option<ObjectId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UntrackedCache {
+    pub ident: Vec<u8>,
+    pub info_exclude: UntrackedCacheOidStat,
+    pub excludes_file: UntrackedCacheOidStat,
+    pub dir_flags: u32,
+    pub exclude_per_dir: Vec<u8>,
+    pub root: Option<UntrackedCacheDir>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrackedCacheOidStat {
+    pub stat: UntrackedCacheStatData,
+    pub oid: ObjectId,
+}
+
+impl Default for UntrackedCacheOidStat {
+    fn default() -> Self {
+        Self {
+            stat: UntrackedCacheStatData::default(),
+            oid: ObjectId::null(ObjectFormat::Sha1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UntrackedCacheStatData {
+    pub ctime_seconds: u32,
+    pub ctime_nanoseconds: u32,
+    pub mtime_seconds: u32,
+    pub mtime_nanoseconds: u32,
+    pub dev: u32,
+    pub ino: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UntrackedCacheDir {
+    pub name: Vec<u8>,
+    pub stat: UntrackedCacheStatData,
+    pub exclude_oid: Option<ObjectId>,
+    pub untracked: Vec<Vec<u8>>,
+    pub dirs: Vec<UntrackedCacheDir>,
+    pub valid: bool,
+    pub check_only: bool,
+    pub recurse: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub ctime_seconds: u32,
@@ -709,6 +759,14 @@ impl Index {
         }
     }
 
+    /// Parse the `UNTR` (untracked-cache) extension, if present.
+    pub fn untracked_cache(&self, format: ObjectFormat) -> Result<Option<UntrackedCache>> {
+        match self.extension(b"UNTR")? {
+            Some(body) => Ok(Some(UntrackedCache::parse(format, body)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Replace (or insert) the `TREE` extension with `cache_tree`, keeping every
     /// other extension chunk in its original order.
     ///
@@ -741,6 +799,561 @@ impl Index {
         self.extensions = rebuilt;
         Ok(())
     }
+
+    /// Replace (or insert) the `UNTR` extension, keeping every other extension
+    /// chunk in its original order. Passing `None` removes the extension.
+    pub fn set_untracked_cache(
+        &mut self,
+        format: ObjectFormat,
+        cache: Option<&UntrackedCache>,
+    ) -> Result<()> {
+        self.replace_extension(b"UNTR", cache.map(|cache| cache.write(format)).transpose()?)
+    }
+
+    fn replace_extension(&mut self, signature: &[u8; 4], body: Option<Vec<u8>>) -> Result<()> {
+        let chunks = self.extension_chunks()?;
+        let mut rebuilt = Vec::with_capacity(self.extensions.len());
+        let mut replaced = false;
+        for (id, chunk_body) in chunks {
+            if &id == signature {
+                if let Some(body) = body.as_ref() {
+                    encode_index_extension(&mut rebuilt, signature, body)?;
+                }
+                replaced = true;
+            } else {
+                encode_index_extension(&mut rebuilt, &id, chunk_body)?;
+            }
+        }
+        if !replaced
+            && let Some(body) = body.as_ref()
+        {
+            encode_index_extension(&mut rebuilt, signature, body)?;
+        }
+        self.extensions = rebuilt;
+        Ok(())
+    }
+}
+
+impl UntrackedCache {
+    pub fn new(format: ObjectFormat, ident: Vec<u8>, dir_flags: u32) -> Self {
+        Self {
+            ident,
+            info_exclude: UntrackedCacheOidStat::new(format),
+            excludes_file: UntrackedCacheOidStat::new(format),
+            dir_flags,
+            exclude_per_dir: b".gitignore".to_vec(),
+            root: None,
+        }
+    }
+
+    pub fn parse(format: ObjectFormat, body: &[u8]) -> Result<Self> {
+        let hash_len = format.raw_len();
+        if body.len() <= 1 || body.last().copied() != Some(0) {
+            return Err(GitError::InvalidFormat(
+                "invalid untracked-cache extension terminator".into(),
+            ));
+        }
+        let end = body.len() - 1;
+        let mut offset = 0;
+        let ident_len = decode_untracked_varint(body, &mut offset, end)?;
+        if offset
+            .checked_add(ident_len)
+            .filter(|next| *next <= end)
+            .is_none()
+        {
+            return Err(GitError::InvalidFormat(
+                "truncated untracked-cache ident".into(),
+            ));
+        }
+        let ident = body[offset..offset + ident_len].to_vec();
+        offset += ident_len;
+        let header_len = UNTRACKED_STAT_DATA_LEN * 2 + 4 + hash_len * 2;
+        if offset
+            .checked_add(header_len + 1)
+            .filter(|next| *next <= end)
+            .is_none()
+        {
+            return Err(GitError::InvalidFormat(
+                "truncated untracked-cache header".into(),
+            ));
+        }
+        let info_stat = UntrackedCacheStatData::parse(&body[offset..offset + 36])?;
+        offset += 36;
+        let excludes_stat = UntrackedCacheStatData::parse(&body[offset..offset + 36])?;
+        offset += 36;
+        let dir_flags = u32_be(&body[offset..offset + 4]);
+        offset += 4;
+        let info_oid = ObjectId::from_raw(format, &body[offset..offset + hash_len])?;
+        offset += hash_len;
+        let excludes_oid = ObjectId::from_raw(format, &body[offset..offset + hash_len])?;
+        offset += hash_len;
+        let exclude_end = memchr_zero(&body[offset..end]).ok_or_else(|| {
+            GitError::InvalidFormat("unterminated untracked-cache exclude_per_dir".into())
+        })?;
+        let exclude_per_dir = body[offset..offset + exclude_end].to_vec();
+        offset += exclude_end + 1;
+        if offset >= end {
+            return Ok(Self {
+                ident,
+                info_exclude: UntrackedCacheOidStat {
+                    stat: info_stat,
+                    oid: info_oid,
+                },
+                excludes_file: UntrackedCacheOidStat {
+                    stat: excludes_stat,
+                    oid: excludes_oid,
+                },
+                dir_flags,
+                exclude_per_dir,
+                root: None,
+            });
+        }
+        let dir_count = decode_untracked_varint(body, &mut offset, end)?;
+        let mut dirs = Vec::with_capacity(dir_count);
+        let root = if dir_count == 0 {
+            None
+        } else {
+            Some(read_untracked_cache_dir(body, &mut offset, end, &mut dirs)?)
+        };
+        if dir_count == 0 {
+            if offset != end {
+                return Err(GitError::InvalidFormat(
+                    "trailing bytes in empty untracked-cache extension".into(),
+                ));
+            }
+            return Ok(Self {
+                ident,
+                info_exclude: UntrackedCacheOidStat {
+                    stat: info_stat,
+                    oid: info_oid,
+                },
+                excludes_file: UntrackedCacheOidStat {
+                    stat: excludes_stat,
+                    oid: excludes_oid,
+                },
+                dir_flags,
+                exclude_per_dir,
+                root: None,
+            });
+        }
+        if dirs.len() != dir_count {
+            return Err(GitError::InvalidFormat(
+                "untracked-cache directory count mismatch".into(),
+            ));
+        }
+        let valid = read_ewah_positions(body, &mut offset, end)?;
+        let check_only = read_ewah_positions(body, &mut offset, end)?;
+        let oid_valid = read_ewah_positions(body, &mut offset, end)?;
+        for pos in check_only {
+            let Some(dir) = dirs.get_mut(pos as usize) else {
+                return Err(GitError::InvalidFormat(
+                    "untracked-cache check_only bit out of range".into(),
+                ));
+            };
+            dir.check_only = true;
+        }
+        for pos in valid {
+            let Some(dir) = dirs.get_mut(pos as usize) else {
+                return Err(GitError::InvalidFormat(
+                    "untracked-cache valid bit out of range".into(),
+                ));
+            };
+            if offset + UNTRACKED_STAT_DATA_LEN > end {
+                return Err(GitError::InvalidFormat(
+                    "truncated untracked-cache directory stat".into(),
+                ));
+            }
+            dir.stat = UntrackedCacheStatData::parse(&body[offset..offset + 36])?;
+            dir.valid = true;
+            offset += UNTRACKED_STAT_DATA_LEN;
+        }
+        for pos in oid_valid {
+            let Some(dir) = dirs.get_mut(pos as usize) else {
+                return Err(GitError::InvalidFormat(
+                    "untracked-cache oid bit out of range".into(),
+                ));
+            };
+            if offset + hash_len > end {
+                return Err(GitError::InvalidFormat(
+                    "truncated untracked-cache directory oid".into(),
+                ));
+            }
+            dir.exclude_oid = Some(ObjectId::from_raw(format, &body[offset..offset + hash_len])?);
+            offset += hash_len;
+        }
+        if offset != end {
+            return Err(GitError::InvalidFormat(
+                "trailing bytes in untracked-cache extension".into(),
+            ));
+        }
+        let mut root = root;
+        if let Some(root) = root.as_mut() {
+            apply_untracked_dir_side_data(root, &dirs, &mut 0);
+        }
+        Ok(Self {
+            ident,
+            info_exclude: UntrackedCacheOidStat {
+                stat: info_stat,
+                oid: info_oid,
+            },
+            excludes_file: UntrackedCacheOidStat {
+                stat: excludes_stat,
+                oid: excludes_oid,
+            },
+            dir_flags,
+            exclude_per_dir,
+            root,
+        })
+    }
+
+    pub fn write(&self, format: ObjectFormat) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        encode_untracked_varint(self.ident.len(), &mut out);
+        out.extend_from_slice(&self.ident);
+        self.info_exclude.stat.write(&mut out);
+        self.excludes_file.stat.write(&mut out);
+        out.extend_from_slice(&self.dir_flags.to_be_bytes());
+        ensure_oid_format(&self.info_exclude.oid, format)?;
+        ensure_oid_format(&self.excludes_file.oid, format)?;
+        out.extend_from_slice(self.info_exclude.oid.as_bytes());
+        out.extend_from_slice(self.excludes_file.oid.as_bytes());
+        out.extend_from_slice(&self.exclude_per_dir);
+        out.push(0);
+        let Some(root) = self.root.as_ref() else {
+            encode_untracked_varint(0, &mut out);
+            out.push(0);
+            return Ok(out);
+        };
+        let mut dirs = Vec::new();
+        root.write_preorder(&mut dirs);
+        encode_untracked_varint(dirs.len(), &mut out);
+        let mut dir_bytes = Vec::new();
+        for dir in &dirs {
+            dir.write_record(&mut dir_bytes);
+        }
+        out.extend_from_slice(&dir_bytes);
+        let valid = dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dir)| dir.valid.then_some(idx as u32))
+            .collect::<Vec<_>>();
+        let check_only = dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dir)| dir.check_only.then_some(idx as u32))
+            .collect::<Vec<_>>();
+        let oid_valid = dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, dir)| dir.exclude_oid.is_some().then_some(idx as u32))
+            .collect::<Vec<_>>();
+        write_ewah_positions(dirs.len() as u32, &valid, &mut out);
+        write_ewah_positions(dirs.len() as u32, &check_only, &mut out);
+        write_ewah_positions(dirs.len() as u32, &oid_valid, &mut out);
+        for dir in &dirs {
+            if dir.valid {
+                dir.stat.write(&mut out);
+            }
+        }
+        for dir in &dirs {
+            if let Some(oid) = dir.exclude_oid.as_ref() {
+                ensure_oid_format(oid, format)?;
+                out.extend_from_slice(oid.as_bytes());
+            }
+        }
+        out.push(0);
+        Ok(out)
+    }
+}
+
+impl UntrackedCacheOidStat {
+    pub fn new(format: ObjectFormat) -> Self {
+        Self {
+            stat: UntrackedCacheStatData::default(),
+            oid: ObjectId::null(format),
+        }
+    }
+}
+
+impl UntrackedCacheStatData {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < UNTRACKED_STAT_DATA_LEN {
+            return Err(GitError::InvalidFormat(
+                "truncated untracked-cache stat data".into(),
+            ));
+        }
+        Ok(Self {
+            ctime_seconds: u32_be(&bytes[0..4]),
+            ctime_nanoseconds: u32_be(&bytes[4..8]),
+            mtime_seconds: u32_be(&bytes[8..12]),
+            mtime_nanoseconds: u32_be(&bytes[12..16]),
+            dev: u32_be(&bytes[16..20]),
+            ino: u32_be(&bytes[20..24]),
+            uid: u32_be(&bytes[24..28]),
+            gid: u32_be(&bytes[28..32]),
+            size: u32_be(&bytes[32..36]),
+        })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.ctime_seconds.to_be_bytes());
+        out.extend_from_slice(&self.ctime_nanoseconds.to_be_bytes());
+        out.extend_from_slice(&self.mtime_seconds.to_be_bytes());
+        out.extend_from_slice(&self.mtime_nanoseconds.to_be_bytes());
+        out.extend_from_slice(&self.dev.to_be_bytes());
+        out.extend_from_slice(&self.ino.to_be_bytes());
+        out.extend_from_slice(&self.uid.to_be_bytes());
+        out.extend_from_slice(&self.gid.to_be_bytes());
+        out.extend_from_slice(&self.size.to_be_bytes());
+    }
+}
+
+impl UntrackedCacheDir {
+    fn write_preorder<'a>(&'a self, dirs: &mut Vec<&'a Self>) {
+        dirs.push(self);
+        for dir in self.dirs.iter().filter(|dir| dir.recurse) {
+            dir.write_preorder(dirs);
+        }
+    }
+
+    fn write_record(&self, out: &mut Vec<u8>) {
+        let mut untracked = self.untracked.clone();
+        if !self.valid {
+            untracked.clear();
+        }
+        encode_untracked_varint(untracked.len(), out);
+        let recurse_dirs = self.dirs.iter().filter(|dir| dir.recurse).count();
+        encode_untracked_varint(recurse_dirs, out);
+        out.extend_from_slice(&self.name);
+        out.push(0);
+        for path in untracked {
+            out.extend_from_slice(&path);
+            out.push(0);
+        }
+    }
+}
+
+const UNTRACKED_STAT_DATA_LEN: usize = 36;
+const UNTRACKED_CACHE_NORMAL_FLAGS: u32 = 0x0000_0006;
+
+pub fn untracked_cache_normal_flags() -> u32 {
+    UNTRACKED_CACHE_NORMAL_FLAGS
+}
+
+fn ensure_oid_format(oid: &ObjectId, format: ObjectFormat) -> Result<()> {
+    if oid.format() != format {
+        return Err(GitError::Unsupported(format!(
+            "untracked-cache writer expects {} ids",
+            format.name()
+        )));
+    }
+    Ok(())
+}
+
+fn encode_untracked_varint(mut value: usize, out: &mut Vec<u8>) {
+    let mut bytes = [0u8; 16];
+    let mut len = 0;
+    bytes[len] = (value & 0x7f) as u8;
+    len += 1;
+    value >>= 7;
+    while value != 0 {
+        value -= 1;
+        bytes[len] = 0x80 | (value & 0x7f) as u8;
+        len += 1;
+        value >>= 7;
+    }
+    out.extend(bytes[..len].iter().rev());
+}
+
+fn decode_untracked_varint(bytes: &[u8], offset: &mut usize, end: usize) -> Result<usize> {
+    let mut value = 0usize;
+    loop {
+        if *offset >= end {
+            return Err(GitError::InvalidFormat(
+                "truncated untracked-cache varint".into(),
+            ));
+        }
+        let byte = bytes[*offset];
+        *offset += 1;
+        value = value
+            .checked_add((byte & 0x7f) as usize)
+            .ok_or_else(|| GitError::InvalidFormat("untracked-cache varint overflow".into()))?;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        value = value
+            .checked_add(1)
+            .and_then(|value| value.checked_shl(7))
+            .ok_or_else(|| GitError::InvalidFormat("untracked-cache varint overflow".into()))?;
+    }
+}
+
+fn memchr_zero(bytes: &[u8]) -> Option<usize> {
+    bytes.iter().position(|byte| *byte == 0)
+}
+
+fn read_untracked_cache_dir(
+    bytes: &[u8],
+    offset: &mut usize,
+    end: usize,
+    flat: &mut Vec<UntrackedCacheDir>,
+) -> Result<UntrackedCacheDir> {
+    let untracked_nr = decode_untracked_varint(bytes, offset, end)?;
+    let dirs_nr = decode_untracked_varint(bytes, offset, end)?;
+    let name_end = memchr_zero(&bytes[*offset..end]).ok_or_else(|| {
+        GitError::InvalidFormat("unterminated untracked-cache directory name".into())
+    })?;
+    let name = bytes[*offset..*offset + name_end].to_vec();
+    *offset += name_end + 1;
+    let mut untracked = Vec::with_capacity(untracked_nr);
+    for _ in 0..untracked_nr {
+        let entry_end = memchr_zero(&bytes[*offset..end]).ok_or_else(|| {
+            GitError::InvalidFormat("unterminated untracked-cache entry name".into())
+        })?;
+        untracked.push(bytes[*offset..*offset + entry_end].to_vec());
+        *offset += entry_end + 1;
+    }
+    let flat_index = flat.len();
+    flat.push(UntrackedCacheDir {
+        name: name.clone(),
+        untracked: untracked.clone(),
+        recurse: true,
+        ..UntrackedCacheDir::default()
+    });
+    let mut dirs = Vec::with_capacity(dirs_nr);
+    for _ in 0..dirs_nr {
+        dirs.push(read_untracked_cache_dir(bytes, offset, end, flat)?);
+    }
+    let dir = UntrackedCacheDir {
+        name,
+        untracked,
+        dirs,
+        recurse: true,
+        ..UntrackedCacheDir::default()
+    };
+    flat[flat_index] = dir.clone();
+    Ok(dir)
+}
+
+fn apply_untracked_dir_side_data(
+    dir: &mut UntrackedCacheDir,
+    flat: &[UntrackedCacheDir],
+    index: &mut usize,
+) {
+    if let Some(source) = flat.get(*index) {
+        dir.stat = source.stat;
+        dir.exclude_oid = source.exclude_oid;
+        dir.valid = source.valid;
+        dir.check_only = source.check_only;
+    }
+    *index += 1;
+    for child in &mut dir.dirs {
+        apply_untracked_dir_side_data(child, flat, index);
+    }
+}
+
+fn read_ewah_positions(bytes: &[u8], offset: &mut usize, end: usize) -> Result<Vec<u32>> {
+    if end.saturating_sub(*offset) < 12 {
+        return Err(GitError::InvalidFormat(
+            "truncated untracked-cache ewah bitmap".into(),
+        ));
+    }
+    let bit_size = u32_be(&bytes[*offset..*offset + 4]);
+    *offset += 4;
+    let word_count = u32_be(&bytes[*offset..*offset + 4]) as usize;
+    *offset += 4;
+    let words_end = offset
+        .checked_add(word_count * 8)
+        .filter(|next| *next <= end.saturating_sub(4))
+        .ok_or_else(|| GitError::InvalidFormat("truncated untracked-cache ewah words".into()))?;
+    let mut words = Vec::with_capacity(word_count);
+    while *offset < words_end {
+        words.push(u64_be(&bytes[*offset..*offset + 8]));
+        *offset += 8;
+    }
+    let _rlw_position = u32_be(&bytes[*offset..*offset + 4]);
+    *offset += 4;
+    let mut raw = Vec::new();
+    let mut idx = 0;
+    while idx < words.len() {
+        let rlw = words[idx];
+        idx += 1;
+        let run_bit = rlw & 1;
+        let run_words = ((rlw >> 1) & 0xffff_ffff) as usize;
+        let literal_words = (rlw >> 33) as usize;
+        raw.extend(std::iter::repeat_n(
+            if run_bit == 1 { u64::MAX } else { 0 },
+            run_words,
+        ));
+        if idx + literal_words > words.len() {
+            return Err(GitError::InvalidFormat(
+                "untracked-cache ewah literal overflow".into(),
+            ));
+        }
+        raw.extend_from_slice(&words[idx..idx + literal_words]);
+        idx += literal_words;
+    }
+    let required_words = (bit_size as usize).div_ceil(64);
+    if raw.len() < required_words {
+        raw.resize(required_words, 0);
+    }
+    let mut positions = Vec::new();
+    for (word_index, word) in raw.iter().take(required_words).enumerate() {
+        let mut remaining = *word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            let position = (word_index as u64) * 64 + u64::from(bit);
+            if position < u64::from(bit_size) {
+                positions.push(position as u32);
+            }
+            remaining &= remaining - 1;
+        }
+    }
+    Ok(positions)
+}
+
+fn write_ewah_positions(bit_size: u32, positions: &[u32], out: &mut Vec<u8>) {
+    let word_count = (bit_size as usize).div_ceil(64);
+    let mut raw = vec![0u64; word_count];
+    for position in positions {
+        if *position >= bit_size {
+            continue;
+        }
+        raw[(*position / 64) as usize] |= 1u64 << (*position % 64);
+    }
+    let mut words = Vec::new();
+    let mut rlw_position = 0u32;
+    let mut idx = 0;
+    while idx < raw.len() {
+        rlw_position = words.len() as u32;
+        words.push(0);
+        let mut run_bit = false;
+        let mut run_len = 0usize;
+        if raw[idx] == 0 || raw[idx] == u64::MAX {
+            run_bit = raw[idx] == u64::MAX;
+            while idx < raw.len()
+                && raw[idx] == if run_bit { u64::MAX } else { 0 }
+                && run_len < 0xffff_ffff
+            {
+                run_len += 1;
+                idx += 1;
+            }
+        }
+        let literal_start = idx;
+        while idx < raw.len() && raw[idx] != 0 && raw[idx] != u64::MAX {
+            idx += 1;
+        }
+        let literal_len = idx - literal_start;
+        let rlw = (run_bit as u64) | ((run_len as u64) << 1) | ((literal_len as u64) << 33);
+        words[rlw_position as usize] = rlw;
+        words.extend_from_slice(&raw[literal_start..literal_start + literal_len]);
+    }
+    out.extend_from_slice(&bit_size.to_be_bytes());
+    out.extend_from_slice(&(words.len() as u32).to_be_bytes());
+    for word in words {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    out.extend_from_slice(&rlw_position.to_be_bytes());
 }
 
 /// The `CE_VALID`/assume-unchanged bit in [`IndexEntry::flags`] (git's
@@ -1689,6 +2302,12 @@ fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 
 fn u32_be(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn u64_be(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 fn u16_be(bytes: &[u8]) -> u16 {

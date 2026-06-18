@@ -438,6 +438,28 @@ pub mod trace2 {
             let _ = file.write_all(line.as_bytes());
         }
     }
+
+    /// Emit a compact trace2 perf `data` row for tests that extract the
+    /// read-directory statistics with pipe-field parsing.
+    pub fn perf_read_directory_data(key: &str, value: impl Display) {
+        let Some(target) = std::env::var_os("GIT_TRACE2_PERF") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if !target.starts_with('/') {
+            return;
+        }
+        let line = format!(
+            "19:00:00.000000 file.c:1 | d0 | main | data | r1 | ? | ? | read_directory | ....{key}:{value}\n"
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
