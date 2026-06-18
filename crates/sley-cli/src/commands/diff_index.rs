@@ -64,6 +64,8 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut indent_heuristic: Option<bool> = None;
+    let mut submodule_format = commands::diff_options::SubmoduleDiffFormat::Short;
+    let mut ignore_submodules_cli: Option<SubmoduleIgnoreMode> = None;
     let mut setup_args: Vec<String> = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
@@ -144,16 +146,18 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             "--no-indent-heuristic" => indent_heuristic = Some(false),
             "-B" | "--break-rewrites" => {}
             "--full-index" => patch_full_index = true,
-            "--submodule" => {}
+            "--submodule" => submodule_format = commands::diff_options::SubmoduleDiffFormat::Log,
             value if let Some(value) = value.strip_prefix("--submodule=") => {
                 log_validate_submodule_format(value)?;
+                submodule_format = commands::diff_options::SubmoduleDiffFormat::parse(value);
             }
-            "--ignore-submodules" => {}
+            "--ignore-submodules" => ignore_submodules_cli = Some(SubmoduleIgnoreMode::All),
             value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
-                if !matches!(value, "none" | "untracked" | "dirty" | "all") {
+                let Some(mode) = parse_submodule_ignore_mode(value) else {
                     eprintln!("fatal: bad --ignore-submodules argument: {value}");
                     return Err(GitError::Exit(128));
-                }
+                };
+                ignore_submodules_cli = Some(mode);
             }
             "--abbrev" => abbrev = AbbrevRequest::Auto,
             "--no-abbrev" => abbrev = AbbrevRequest::None,
@@ -336,6 +340,19 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             )?
         }
     };
+    let submodule_config = submodule_diff_config(git_dir, worktree_root, ignore_submodules_cli);
+    let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
+    let submodule_dirt = match (!cached, worktree_root) {
+        (true, Some(root)) => collect_dirty_submodules(
+            &mut entries,
+            git_dir,
+            format,
+            root,
+            &submodule_config,
+            None,
+        )?,
+        _ => HashMap::new(),
+    };
 
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if match_missing && !cached {
@@ -407,6 +424,8 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
                 src_prefix: &src_prefix,
                 dst_prefix: &dst_prefix,
                 indent_heuristic,
+                submodule_format,
+                submodule_dirt: &submodule_dirt,
             },
         )?;
     }
@@ -459,6 +478,8 @@ struct RenderContext<'a> {
     src_prefix: &'a str,
     dst_prefix: &'a str,
     indent_heuristic: bool,
+    submodule_format: commands::diff_options::SubmoduleDiffFormat,
+    submodule_dirt: &'a HashMap<Vec<u8>, u8>,
 }
 
 fn render(
@@ -561,7 +582,8 @@ fn render(
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
-                dirty_submodules: None,
+                submodule_format: ctx.submodule_format,
+                submodule_dirt: Some(ctx.submodule_dirt),
                 ws_error_rule: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),

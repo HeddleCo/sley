@@ -224,7 +224,7 @@ pub(crate) enum SubmoduleDiffFormat {
 }
 
 impl SubmoduleDiffFormat {
-    fn parse(value: &str) -> Self {
+    pub(crate) fn parse(value: &str) -> Self {
         match value {
             "short" => Self::Short,
             "diff" => Self::Diff,

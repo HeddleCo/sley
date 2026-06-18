@@ -374,15 +374,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff rewrite controls are not supported for this output mode".into(),
         ));
     }
-    if diff_submodule_format.is_some_and(|format| {
-        format != commands::diff_options::SubmoduleDiffFormat::Short
-    }) && !name_status
-        && !name_only
-    {
-        return Err(GitError::Unsupported(
-            "diff submodule output controls are not supported for this output mode".into(),
-        ));
-    }
     if reverse && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff reverse output is not supported for this output mode".into(),
@@ -446,6 +437,19 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    let diff_submodule_format = diff_submodule_format.or_else(|| {
+        read_repo_config(&git_dir)
+            .ok()
+            .and_then(|config| config.get("diff", None, "submodule").map(str::to_owned))
+            .and_then(|value| match value.as_str() {
+                "short" | "log" | "diff" => {
+                    Some(commands::diff_options::SubmoduleDiffFormat::parse(&value))
+                }
+                _ => None,
+            })
+    });
+    let submodule_format =
+        diff_submodule_format.unwrap_or(commands::diff_options::SubmoduleDiffFormat::Short);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     // Resolve the diff path prefixes from `diff.*Prefix` config, then layer the
     // CLI overrides on top (git's diff_setup_done → diff_opt_* precedence):
@@ -611,7 +615,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .min(format.hex_len())
     };
     let worktree_root = if cached {
-        None
+        worktree_root_for_git_dir(&git_dir).ok()
     } else {
         Some(worktree_root_for_git_dir(&git_dir)?)
     };
@@ -774,7 +778,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // comparison alone cannot see.
     let skip_submodule_work = matches!(precomputed_staged_gitlinks.as_deref(), Some([]));
     let (entries, dirty_submodules) = if skip_submodule_work {
-        (entries, HashSet::new())
+        (entries, HashMap::new())
     } else {
         let submodule_config =
             submodule_diff_config(&git_dir, worktree_root.as_deref(), ignore_submodules_cli);
@@ -788,7 +792,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 &submodule_config,
                 precomputed_staged_gitlinks.as_deref(),
             )?,
-            _ => HashSet::new(),
+            _ => HashMap::new(),
         };
         (entries, dirty_submodules)
     };
@@ -1068,7 +1072,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
                     no_index_contents: None,
-                    dirty_submodules: Some(&dirty_submodules),
+                    submodule_format,
+                    submodule_dirt: Some(&dirty_submodules),
                     ws_error_rule,
                     interhunk: interhunk.unwrap_or(0),
                     ws_ignore,
@@ -1608,7 +1613,8 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                     entry.old_content.as_deref(),
                     entry.new_content.as_deref(),
                 )),
-                dirty_submodules: None,
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
                 // No-index has no attributes; the rule is core.whitespace (or the
                 // default), used only when color is on.
                 ws_error_rule: (colors.is_some() && word_request.is_none()).then(|| {
