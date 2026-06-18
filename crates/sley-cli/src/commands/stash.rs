@@ -27,6 +27,8 @@ struct StashListOptions {
     invert_grep: bool,
     regexp_ignore_case: bool,
     note_refs: Vec<String>,
+    show_patch: bool,
+    combined_patch: bool,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,8 @@ pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
         Some("clear") => cmd_stash_clear(&args[1..]),
         Some("create") => cmd_stash_create(&args[1..]),
         Some("drop") => cmd_stash_drop(&args[1..]),
+        Some("export") => cmd_stash_export(&args[1..]),
+        Some("import") => cmd_stash_import(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
         Some("pop") => cmd_stash_pop(&args[1..]),
         Some("push") => cmd_stash_push(&args[1..]),
@@ -132,6 +136,8 @@ fn stash_usage_stdout() {
     println!("   or: git stash clear");
     println!("   or: git stash create [<message>]");
     println!("   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>");
+    println!("   or: git stash export (--print | --to-ref <ref>) [<stash>...]");
+    println!("   or: git stash import <commit>");
 }
 
 fn stash_usage_stderr() {
@@ -146,6 +152,8 @@ fn stash_usage_stderr() {
     eprintln!("   or: git stash clear");
     eprintln!("   or: git stash create [<message>]");
     eprintln!("   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>");
+    eprintln!("   or: git stash export (--print | --to-ref <ref>) [<stash>...]");
+    eprintln!("   or: git stash import <commit>");
 }
 
 fn stash_push_usage_stdout() {
@@ -3046,6 +3054,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
         });
     for (position, (stash_index, entry)) in entries.iter().skip(skipped).take(selected).enumerate()
     {
+        let mut listed_commit = None;
         match &options.format {
             StashListFormat::Default => {
                 println!(
@@ -3066,6 +3075,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
             } => {
                 let object = db.read_object(&entry.new_oid)?;
                 let commit = Commit::parse(format, &object.body)?;
+                listed_commit = Some(commit.clone());
                 print_stash_compiled_format(
                     entry,
                     *stash_index,
@@ -3078,6 +3088,21 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                 if *final_newline || position + 1 < selected {
                     println!();
                 }
+            }
+        }
+        if options.show_patch {
+            println!();
+            let commit = match listed_commit {
+                Some(commit) => commit,
+                None => {
+                    let object = db.read_object(&entry.new_oid)?;
+                    Commit::parse(format, &object.body)?
+                }
+            };
+            if options.combined_patch {
+                write_stash_list_combined_patch(&mut io::stdout(), &db, format, &commit)?;
+            } else {
+                write_stash_list_patch(&mut io::stdout(), &db, format, &commit)?;
             }
         }
     }
@@ -3104,6 +3129,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut regexp_ignore_case = false;
     let mut regexp_mode = SimpleLogRegexMode::Basic;
     let mut note_refs = Vec::new();
+    let mut show_patch = false;
+    let mut combined_patch = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -3117,6 +3144,11 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 ));
             }
             "--oneline" => format = StashListFormat::Oneline,
+            "-p" | "--patch" => show_patch = true,
+            "--cc" => {
+                show_patch = true;
+                combined_patch = true;
+            }
             "--reverse" => {
                 eprintln!(
                     "fatal: options '--reverse' and '--walk-reflogs' cannot be used together"
@@ -3711,6 +3743,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         invert_grep,
         regexp_ignore_case,
         note_refs,
+        show_patch,
+        combined_patch,
     })
 }
 
@@ -3990,6 +4024,337 @@ fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> 
     let timestamp = commit_identity_timestamp_i64(&commit.committer)?;
     Ok(options.max_age.is_none_or(|age| timestamp >= age)
         && options.min_age.is_none_or(|age| timestamp <= age))
+}
+
+fn write_stash_list_patch(
+    stdout: &mut impl Write,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit: &Commit,
+) -> Result<()> {
+    let Some(base_oid) = commit.parents.first() else {
+        return Ok(());
+    };
+    let base = Commit::parse(format, &db.read_object(base_oid)?.body)?;
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        &base.tree,
+        &commit.tree,
+        sley_diff_merge::DiffNameStatusOptions::default(),
+    )?;
+    let abbrev = repository_abbrev(&common_git_dir_for_git_dir(&discover_git_dir(
+        &env::current_dir()?,
+    )?)?, format)?
+    .unwrap_or(7)
+    .min(format.hex_len());
+    for entry in &entries {
+        let options = DiffPatchOptions {
+            db,
+            worktree_root: None,
+            use_worktree_new: false,
+            format,
+            abbrev,
+            src_prefix: "a/",
+            dst_prefix: "b/",
+            context: 3,
+            userdiff: None,
+            colors: None,
+            word_diff: None,
+            no_index_contents: None,
+            dirty_submodules: None,
+            ws_error_rule: None,
+            interhunk: 0,
+            ws_ignore: sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ignore_blank_lines: false,
+            ignore_regexes: &[],
+            line_ranges: None,
+            indent_heuristic: true,
+        };
+        write_diff_patch_entry(stdout, entry, options)?;
+    }
+    Ok(())
+}
+
+fn write_stash_list_combined_patch(
+    stdout: &mut impl Write,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit: &Commit,
+) -> Result<()> {
+    if commit.parents.len() < 2 {
+        return Ok(());
+    }
+    let base = Commit::parse(format, &db.read_object(&commit.parents[0])?.body)?;
+    let index = Commit::parse(format, &db.read_object(&commit.parents[1])?.body)?;
+    let base_map = stash_tree_entry_map(db, format, &base.tree)?;
+    let index_map = stash_tree_entry_map(db, format, &index.tree)?;
+    let result_map = stash_tree_entry_map(db, format, &commit.tree)?;
+    let mut paths = BTreeSet::new();
+    paths.extend(base_map.keys().cloned());
+    paths.extend(index_map.keys().cloned());
+    paths.extend(result_map.keys().cloned());
+    for path in paths {
+        let Some((result_mode, result_oid)) = result_map.get(&path) else {
+            continue;
+        };
+        let base_entry = base_map.get(&path);
+        let index_entry = index_map.get(&path);
+        if base_entry == Some(&(*result_mode, *result_oid))
+            && index_entry == Some(&(*result_mode, *result_oid))
+        {
+            continue;
+        }
+        let Some((_, base_oid)) = base_entry else {
+            continue;
+        };
+        let Some((_, index_oid)) = index_entry else {
+            continue;
+        };
+        let base_content = merge_read_blob(db, base_oid)?;
+        let index_content = merge_read_blob(db, index_oid)?;
+        let result_content = merge_read_blob(db, result_oid)?;
+        let mut body = Vec::new();
+        if !sley_diff_merge::render::render_combined(
+            &mut body,
+            &result_content,
+            &[base_content.as_slice(), index_content.as_slice()],
+        ) {
+            continue;
+        }
+        let path_display = String::from_utf8_lossy(&path);
+        writeln!(stdout, "diff --cc {path_display}")?;
+        writeln!(
+            stdout,
+            "index {},{}..{}",
+            format_log_oid(base_oid, Some(7)),
+            format_log_oid(index_oid, Some(7)),
+            format_log_oid(result_oid, Some(7))
+        )?;
+        writeln!(stdout, "--- a/{path_display}")?;
+        writeln!(stdout, "+++ b/{path_display}")?;
+        stdout.write_all(&body)?;
+    }
+    Ok(())
+}
+
+fn cmd_stash_export(args: &[String]) -> Result<()> {
+    let mut print = false;
+    let mut to_ref: Option<String> = None;
+    let mut specs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--print" => print = true,
+            "--to-ref" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("error: option `to-ref' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                to_ref = Some(value.clone());
+            }
+            value if let Some(value) = value.strip_prefix("--to-ref=") => {
+                to_ref = Some(value.to_string());
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                eprintln!("usage: git stash export (--print | --to-ref <ref>) [<stash>...]");
+                return Err(GitError::Exit(129));
+            }
+            value => specs.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if print == to_ref.is_some() {
+        eprintln!("error: exactly one of --print and --to-ref is required");
+        return Err(GitError::Exit(1));
+    }
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let store = FileRefStore::new(&common_git_dir, format);
+    let mut stash_oids = Vec::new();
+    if specs.is_empty() {
+        let entries = store.read_reflog("refs/stash")?;
+        stash_oids.extend(entries.iter().map(|entry| entry.new_oid));
+    } else {
+        for spec in &specs {
+            let oid = match resolve_stash_argument(
+                &common_git_dir,
+                format,
+                &store,
+                &db,
+                Some(spec.as_str()),
+            ) {
+                Ok(oid) => oid,
+                Err(_) => {
+                    eprintln!("error: unable to find stash entry {spec}");
+                    return Err(GitError::Exit(1));
+                }
+            };
+            stash_oids.push(oid);
+        }
+    }
+    for oid in &stash_oids {
+        validate_stash_like_commit(&db, format, oid)?;
+    }
+
+    let exported = write_stash_export_chain(&mut db, format, &stash_oids)?;
+    if let Some(refname) = to_ref {
+        let old_oid = match store.read_ref(&refname)? {
+            Some(RefTarget::Direct(oid)) => oid,
+            Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
+        };
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: refname,
+            expected: None,
+            new: RefTarget::Direct(exported),
+            reflog: Some(ReflogEntry {
+                old_oid,
+                new_oid: exported,
+                committer: stash_export_identity(),
+                message: b"stash export".to_vec(),
+            }),
+        });
+        tx.commit()?;
+    } else {
+        println!("{exported}");
+    }
+    Ok(())
+}
+
+fn write_stash_export_chain(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    stash_oids: &[ObjectId],
+) -> Result<ObjectId> {
+    let empty_tree = db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree {
+            entries: Vec::new(),
+        }
+        .write(),
+    ))?;
+    let ident = stash_export_identity();
+    let mut previous = sley_sequencer::create_commit(
+        db,
+        sley_sequencer::CommitCreate {
+            tree: empty_tree,
+            parents: Vec::new(),
+            author: ident.clone(),
+            committer: ident.clone(),
+            message: Vec::new(),
+            encoding: None,
+        },
+    )?;
+    for stash_oid in stash_oids {
+        let object = db.read_object(stash_oid)?;
+        let stash = Commit::parse(format, &object.body)?;
+        let mut message = b"git stash: ".to_vec();
+        message.extend_from_slice(&stash.message);
+        if !message.ends_with(b"\n") {
+            message.push(b'\n');
+        }
+        previous = sley_sequencer::create_commit(
+            db,
+            sley_sequencer::CommitCreate {
+                tree: empty_tree,
+                parents: vec![previous, *stash_oid],
+                author: stash.author,
+                committer: stash.committer,
+                message,
+                encoding: stash.encoding,
+            },
+        )?;
+    }
+    Ok(previous)
+}
+
+fn cmd_stash_import(args: &[String]) -> Result<()> {
+    if args.len() != 1 || args.first().is_some_and(|arg| arg.starts_with('-')) {
+        eprintln!("usage: git stash import <commit>");
+        return Err(GitError::Exit(129));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let chain = match resolve_revision(&common_git_dir, format, &args[0]) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("error: not a valid revision: {}", args[0]);
+            return Err(GitError::Exit(1));
+        }
+    };
+    let stashes = read_stash_export_chain(&db, format, &chain)?;
+    for stash_oid in stashes {
+        let object = db.read_object(&stash_oid)?;
+        let stash = Commit::parse(format, &object.body)?;
+        let message = String::from_utf8_lossy(&stash.message);
+        store_stash_commit(&stash_oid, message.trim_end_matches('\n'))?;
+    }
+    Ok(())
+}
+
+fn read_stash_export_chain(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    chain: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let empty_tree = empty_tree_oid(db, format)?;
+    let mut current = *chain;
+    let mut stashes = Vec::new();
+    loop {
+        let object = db.read_object(&current)?;
+        if object.object_type != ObjectType::Commit {
+            eprintln!("error: not a commit: {current}");
+            return Err(GitError::Exit(1));
+        }
+        let commit = Commit::parse(format, &object.body)?;
+        if commit.tree != empty_tree || (commit.parents.len() != 2 && !commit.parents.is_empty()) {
+            eprintln!("error: {current} is not a valid exported stash commit");
+            return Err(GitError::Exit(1));
+        }
+        if commit.parents.is_empty() {
+            if commit.author != stash_export_identity() || commit.committer != stash_export_identity() {
+                eprintln!("error: found root commit {current} with invalid data");
+                return Err(GitError::Exit(1));
+            }
+            break;
+        }
+        if !commit.message.starts_with(b"git stash: ") {
+            eprintln!("error: found stash commit {current} without expected prefix");
+            return Err(GitError::Exit(1));
+        }
+        let stash_oid = commit.parents[1];
+        validate_stash_like_commit(db, format, &stash_oid)?;
+        stashes.push(stash_oid);
+        current = commit.parents[0];
+    }
+    stashes.reverse();
+    Ok(stashes)
+}
+
+fn empty_tree_oid(db: &FileObjectDatabase, format: ObjectFormat) -> Result<ObjectId> {
+    sley_core::object_id_for_bytes(format, "tree", &[]).and_then(|oid| {
+        if db.read_object(&oid).is_ok() {
+            Ok(oid)
+        } else {
+            Ok(oid)
+        }
+    })
+}
+
+fn stash_export_identity() -> Vec<u8> {
+    b"git stash <git@stash> 1000684800 +0000".to_vec()
 }
 
 // ===== rebase autostash bridge =====

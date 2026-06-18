@@ -1191,6 +1191,14 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
     if value == "HEAD" || value.starts_with("refs/") {
         return Ok(value.to_string());
     }
+    if let Ok(git_dir) = discover_git_dir(env::current_dir()?)
+        && let Ok(format) = repository_object_format(&git_dir)
+    {
+        let store = FileRefStore::new(&git_dir, format);
+        if store.read_ref(&format!("refs/{value}"))?.is_some() {
+            return Ok(format!("refs/{value}"));
+        }
+    }
     branch_ref_name(value)
 }
 
