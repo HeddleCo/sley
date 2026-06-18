@@ -1376,7 +1376,10 @@ committer C O Mitter <c@d.com> 1 +0000\n\nm\n"
         body.extend_from_slice(&[0u8; 20]);
         let f = check_object_content(ObjectType::Tree, &body, &cfg());
         // null sha1 + bad filemode both fire; check badFilemode present as warn.
-        let bad = f.iter().find(|x| x.msg_id == MsgId::BadFilemode).unwrap();
+        let bad = f
+            .iter()
+            .find(|x| x.msg_id == MsgId::BadFilemode)
+            .expect("badFilemode finding");
         assert_eq!(bad.severity, Severity::Warn);
     }
 
@@ -1387,7 +1390,10 @@ committer C O Mitter <c@d.com> 1 +0000\n\nm\n"
         let mut body = b"100000 foo\0".to_vec();
         body.extend_from_slice(&[0x11u8; 20]);
         let f = check_object_content(ObjectType::Tree, &body, &config);
-        let bad = f.iter().find(|x| x.msg_id == MsgId::BadFilemode).unwrap();
+        let bad = f
+            .iter()
+            .find(|x| x.msg_id == MsgId::BadFilemode)
+            .expect("badFilemode finding");
         assert_eq!(bad.severity, Severity::Error);
     }
 
@@ -1476,7 +1482,10 @@ msg\n"
         let mut body = b"100644 .git\0".to_vec();
         body.extend_from_slice(&[0x55u8; 20]);
         let f = check_object_content(ObjectType::Tree, &body, &config);
-        let dotgit = f.iter().find(|x| x.msg_id == MsgId::HasDotgit).unwrap();
+        let dotgit = f
+            .iter()
+            .find(|x| x.msg_id == MsgId::HasDotgit)
+            .expect("hasDotgit finding");
         assert_eq!(dotgit.severity, Severity::Error);
     }
 }
