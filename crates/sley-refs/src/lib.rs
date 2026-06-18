@@ -2732,13 +2732,13 @@ impl FileRefStore {
                             }
                         }
                     };
-                    if !matches!(update.precondition, RefPrecondition::Any) {
-                        if !update.precondition.is_satisfied_by(current.as_ref()) {
-                            release_pending_locks(&pending);
-                            return Err(GitError::Transaction(
-                                update.precondition.describe(&update.name),
-                            ));
-                        }
+                    if !matches!(update.precondition, RefPrecondition::Any)
+                        && !update.precondition.is_satisfied_by(current.as_ref())
+                    {
+                        release_pending_locks(&pending);
+                        return Err(GitError::Transaction(
+                            update.precondition.describe(&update.name),
+                        ));
                     }
                     pending[index].original = match read_optional_file(&pending[index].path) {
                         Ok(original) => original,
