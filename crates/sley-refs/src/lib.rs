@@ -1488,6 +1488,10 @@ impl FileRefStore {
         ))
     }
 
+    pub fn reftable_table_count(&self) -> Result<usize> {
+        Ok(self.reftable_table_names()?.len())
+    }
+
     fn append_reftable_records(&self, records: Vec<ReftableRefRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -1586,22 +1590,48 @@ impl FileRefStore {
     }
 
     pub fn compact_reftable_stack(&self) -> Result<()> {
+        let old_names = self.reftable_table_names()?;
+        self.compact_reftable_stack_range(0, old_names.len(), true)
+    }
+
+    fn compact_reftable_stack_range(
+        &self,
+        start: usize,
+        end: usize,
+        fail_on_locked_table: bool,
+    ) -> Result<()> {
         let reftable_dir = self.common_dir.join("reftable");
         let list_path = reftable_dir.join("tables.list");
         let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
         let old_names = self.reftable_table_names_from(&list_path)?;
-        if old_names.is_empty() {
+        if start >= end || end > old_names.len() {
             return Ok(());
+        }
+        let compact_names = old_names[start..end].to_vec();
+        if compact_names.is_empty() {
+            return Ok(());
+        }
+        if fail_on_locked_table {
+            for name in &compact_names {
+                if reftable_dir.join(format!("{name}.lock")).exists() {
+                    return Err(GitError::Io(format!(
+                        "cannot lock references: {}: File exists",
+                        reftable_dir.join(format!("{name}.lock")).display()
+                    )));
+                }
+            }
         }
 
         let mut refs: BTreeMap<String, ReftableRefRecord> = BTreeMap::new();
         let mut logs: BTreeMap<(String, u64), ReftableLogRecord> = BTreeMap::new();
         let mut min_index = u64::MAX;
         let mut max_index = 0u64;
-        for table in self.reftables()? {
+        let drop_tombstones = start == 0;
+        for name in &compact_names {
+            let table = Reftable::parse(&fs::read(reftable_dir.join(name))?)?;
             for record in table.refs {
                 match record.value {
-                    ReftableRefValue::Deletion => {
+                    ReftableRefValue::Deletion if drop_tombstones => {
                         refs.remove(&record.name);
                     }
                     _ => {
@@ -1614,7 +1644,7 @@ impl FileRefStore {
             for record in table.logs {
                 let key = (record.refname.clone(), record.update_index);
                 match record.value {
-                    ReftableLogValue::Deletion => {
+                    ReftableLogValue::Deletion if drop_tombstones => {
                         logs.remove(&key);
                     }
                     _ => {
@@ -1627,7 +1657,7 @@ impl FileRefStore {
         }
 
         if refs.is_empty() && logs.is_empty() {
-            min_index = old_names
+            min_index = compact_names
                 .iter()
                 .filter_map(|name| Reftable::parse(&fs::read(reftable_dir.join(name)).ok()?).ok())
                 .map(|table| table.header.min_update_index)
@@ -1643,9 +1673,20 @@ impl FileRefStore {
         let table_path = reftable_dir.join(&table_name);
         write_locked(&table_path, &bytes)?;
         self.apply_reftable_shared_file_mode(&table_path)?;
-        list_lock.commit(format!("{table_name}\n").as_bytes())?;
+        let mut list = Vec::new();
+        for name in &old_names[..start] {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        list.extend_from_slice(table_name.as_bytes());
+        list.push(b'\n');
+        for name in &old_names[end..] {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        list_lock.commit(&list)?;
         self.apply_reftable_shared_file_mode(&list_path)?;
-        for name in old_names {
+        for name in compact_names {
             if name != table_name {
                 let _ = fs::remove_file(reftable_dir.join(name));
             }
@@ -1687,8 +1728,17 @@ impl FileRefStore {
         if reftable_autocompaction_disabled() {
             return Ok(());
         }
-        if self.reftable_table_names()?.len() > 1 {
-            self.compact_reftable_stack()?;
+        let names = self.reftable_table_names()?;
+        if names.len() <= 1 {
+            return Ok(());
+        }
+        let reftable_dir = self.common_dir.join("reftable");
+        let start = names
+            .iter()
+            .rposition(|name| reftable_dir.join(format!("{name}.lock")).exists())
+            .map_or(0, |index| index + 1);
+        if names.len().saturating_sub(start) > 1 {
+            self.compact_reftable_stack_range(start, names.len(), false)?;
         }
         Ok(())
     }

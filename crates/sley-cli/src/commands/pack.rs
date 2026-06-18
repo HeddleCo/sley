@@ -1320,6 +1320,7 @@ fn midx_covers_current_packs(common_git_dir: &Path, format: ObjectFormat) -> Res
 
 pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     let mut quiet = false;
+    let mut auto = false;
     // `--cruft` / `--no-cruft` override gc.cruftPacks; None means "use config".
     let mut cruft_flag: Option<bool> = None;
     // `--prune[=<date>]` / `--no-prune` override gc.pruneExpire. The sentinel
@@ -1337,8 +1338,8 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
                 prune_override = Some(Some(value["--prune=".len()..].to_string()));
             }
             // Accepted no-ops.
-            "--auto"
-            | "--aggressive"
+            "--auto" => auto = true,
+            "--aggressive"
             | "--force"
             | "--detach"
             | "--no-detach"
@@ -1420,6 +1421,12 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
         if let Some(result) = sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)? {
             sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
         }
+    }
+
+    let store = FileRefStore::new(&common_git_dir, format)
+        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
+    if auto && store.uses_reftable()? && store.reftable_table_count()? > 2 {
+        store.compact_reftable_stack()?;
     }
 
     let _ = quiet;
@@ -2762,6 +2769,9 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&common_git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if store.uses_reftable()? {
+        if options.auto && store.reftable_table_count()? <= 2 {
+            return Ok(());
+        }
         return store.compact_reftable_stack().map_err(|err| {
             if matches!(err, GitError::Io(ref message) if message.contains("File exists")) {
                 eprintln!("error: unable to compact stack: data is locked");
