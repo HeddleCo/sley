@@ -80,7 +80,9 @@ pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
 fn stash_can_start_assumed_push(value: &str) -> bool {
     matches!(
         value,
-        "-q" | "--quiet"
+        "--"
+            | "-q"
+            | "--quiet"
             | "--no-quiet"
             | "-u"
             | "--include-untracked"
@@ -263,7 +265,14 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         eprintln!("No branch name specified");
         return Err(GitError::Exit(1));
     }
-    if args.len() > 2 || args[0].starts_with('-') {
+    if args.len() > 2 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            args[1], args[2]
+        );
+        return Err(GitError::Exit(1));
+    }
+    if args[0].starts_with('-') {
         eprintln!("usage: git stash branch <branchname> [<stash>]");
         return Err(GitError::Exit(129));
     }
@@ -1387,6 +1396,25 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         return stash_patch_option_requires_patch_error("inter-hunk-context");
     }
     if patch {
+        if include_untracked {
+            eprintln!("Can't use --patch and --include-untracked or --all at the same time");
+            return Err(GitError::Exit(1));
+        }
+        if create_stash_commit(
+            &message_args,
+            false,
+            false,
+            StashCreateMode::Worktree,
+            &pathspecs,
+            quiet,
+        )?
+        .is_none()
+        {
+            if !quiet {
+                println!("No local changes to save");
+            }
+            return Ok(());
+        }
         return Err(GitError::Unsupported(
             "stash push --patch is not implemented".into(),
         ));
@@ -1581,6 +1609,25 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
         return stash_patch_option_requires_patch_error("inter-hunk-context");
     }
     if patch {
+        if include_untracked {
+            eprintln!("Can't use --patch and --include-untracked or --all at the same time");
+            return Err(GitError::Exit(1));
+        }
+        if create_stash_commit(
+            &message_args,
+            false,
+            false,
+            StashCreateMode::Worktree,
+            &[],
+            quiet,
+        )?
+        .is_none()
+        {
+            if !quiet {
+                println!("No local changes to save");
+            }
+            return Ok(());
+        }
         return Err(GitError::Unsupported(
             "stash save --patch is not implemented".into(),
         ));
@@ -1726,6 +1773,12 @@ fn create_stash_commit(
         .filter(|entry| index_entry_stage(entry) == 0)
         .cloned()
         .collect::<Vec<_>>();
+    if index_entries.iter().any(IndexEntry::is_intent_to_add) {
+        if !quiet {
+            eprintln!("Cannot save the current index state");
+        }
+        return Err(GitError::Exit(1));
+    }
     let pathspec = if pathspecs.is_empty() {
         None
     } else {
