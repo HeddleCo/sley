@@ -3050,7 +3050,11 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         }
         (remote, specs)
     } else {
-        push_remote_and_refspecs(&git_dir, &store, &positional)?
+        let resolved = push_remote_and_refspecs(&git_dir, &store, &positional)?;
+        if resolved.set_upstream {
+            set_upstream = true;
+        }
+        (resolved.remote, resolved.refspecs)
     };
     default_head_push_destinations(&store, &mut refspecs)?;
     let options = PushOptions {
@@ -3148,8 +3152,7 @@ fn mirror_all_remote(
     }
     // Reuse the no-positional resolution path (default remote), discarding the
     // refspecs it would compute.
-    let (remote, _) = push_remote_and_refspecs(git_dir, store, &[])?;
-    Ok(remote)
+    Ok(push_remote_and_refspecs(git_dir, store, &[])?.remote)
 }
 
 /// Resolve `--force-with-lease=<ref>[:<expect>]` specs into `(dst, expected_old)`
@@ -3327,9 +3330,20 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         &config,
     )?;
 
-    // A no-op push (no refspec matched anything) prints nothing and exits 0,
-    // matching git's `transport_refs_pushed` short-circuit on an empty ref list.
+    // A matching refspec (`:` / `+:`) against a remote with no refs is not the
+    // normal no-op case: git reports the empty expansion as a push failure.
     if plan.refs.is_empty() {
+        if req.refspecs.iter().any(|refspec| {
+            let body = refspec.strip_prefix('+').unwrap_or(refspec);
+            body == ":"
+        }) {
+            let url = push_resolved_url(req.remote).unwrap_or_else(|_| req.remote.to_string());
+            eprintln!("No refs in common and none specified; doing nothing.");
+            eprintln!("Perhaps you should specify a branch.");
+            eprintln!("fatal: the remote end hung up unexpectedly");
+            eprintln!("error: failed to push some refs to '{url}'");
+            return Err(GitError::Exit(1));
+        }
         return Ok(());
     }
 
@@ -3924,61 +3938,257 @@ fn push_resolved_url(remote: &str) -> Result<String> {
     Ok(remote.to_string())
 }
 
+struct PushRemoteAndRefspecs {
+    remote: String,
+    refspecs: Vec<String>,
+    set_upstream: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PushDefaultMode {
+    Unspecified,
+    Nothing,
+    Matching,
+    Simple,
+    Upstream,
+    Current,
+}
+
 fn push_remote_and_refspecs(
     git_dir: &Path,
     store: &FileRefStore,
     positional: &[String],
-) -> Result<(String, Vec<String>)> {
+) -> Result<PushRemoteAndRefspecs> {
     match positional {
         [] => {
-            let branch = store.current_branch()?.ok_or_else(|| {
-                GitError::Command("push requires a refspec when HEAD is detached".into())
-            })?;
             let config = read_repo_config(git_dir).unwrap_or_default();
-            if matches!(
-                config.get("push", None, "default"),
-                Some("upstream" | "tracking")
-            ) && let Some((remote, merge)) = push_upstream_for_branch(&config, &branch)
-            {
-                return Ok((remote, vec![format!("refs/heads/{branch}:{merge}")]));
-            }
-            if let Some(refspec) = configured_push_refspec_for_branch(&config, "origin", &branch) {
-                return Ok(("origin".into(), vec![refspec]));
-            }
-            Ok(("origin".into(), vec![branch]))
+            let branch = store.current_branch()?;
+            let remote = default_push_remote(&config, branch.as_deref())?;
+            let refspecs = default_push_refspecs(&config, branch.as_deref(), &remote)?;
+            Ok(PushRemoteAndRefspecs {
+                remote,
+                refspecs: refspecs.refspecs,
+                set_upstream: refspecs.set_upstream,
+            })
         }
         [remote] => {
-            let branch = store.current_branch()?.ok_or_else(|| {
-                GitError::Command("push requires a refspec when HEAD is detached".into())
-            })?;
             let config = read_repo_config(git_dir).unwrap_or_default();
-            if let Some(refspec) = configured_push_refspec_for_branch(&config, remote, &branch) {
-                return Ok((remote.clone(), vec![refspec]));
-            }
-            Ok((remote.clone(), vec![branch]))
+            let branch = store.current_branch()?;
+            let refspecs = default_push_refspecs(&config, branch.as_deref(), remote)?;
+            Ok(PushRemoteAndRefspecs {
+                remote: remote.clone(),
+                refspecs: refspecs.refspecs,
+                set_upstream: refspecs.set_upstream,
+            })
         }
-        [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
+        [remote, refspecs @ ..] => Ok(PushRemoteAndRefspecs {
+            remote: remote.clone(),
+            refspecs: refspecs.to_vec(),
+            set_upstream: false,
+        }),
     }
 }
 
-fn configured_push_refspec_for_branch(
+struct DefaultPushRefspecs {
+    refspecs: Vec<String>,
+    set_upstream: bool,
+}
+
+fn default_push_refspecs(
     config: &GitConfig,
+    branch: Option<&str>,
     remote: &str,
-    branch: &str,
-) -> Option<String> {
-    let local_ref = format!("refs/heads/{branch}");
-    for push in config.get_all("remote", Some(remote), "push").into_iter().flatten() {
-        if let Some(dst) = map_remote_push_refspec(push, &local_ref) {
-            return Some(format!("{local_ref}:{dst}"));
-        }
+) -> Result<DefaultPushRefspecs> {
+    let configured_push = config
+        .get_all("remote", Some(remote), "push")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !configured_push.is_empty() {
+        return Ok(DefaultPushRefspecs {
+            refspecs: configured_push,
+            set_upstream: false,
+        });
     }
-    None
+
+    match push_default_mode(config) {
+        PushDefaultMode::Matching => {
+            return Ok(DefaultPushRefspecs {
+                refspecs: vec![":".to_string()],
+                set_upstream: false,
+            });
+        }
+        PushDefaultMode::Nothing => {
+            eprintln!(
+                "fatal: You didn't specify any refspecs to push, and push.default is \"nothing\"."
+            );
+            return Err(GitError::Exit(128));
+        }
+        _ => {}
+    }
+
+    let Some(branch) = branch else {
+        eprintln!(
+            "fatal: You are not currently on a branch.\n\
+To push the history leading to the current (detached HEAD)\n\
+state now, use\n\n\
+    git push {remote} HEAD:<name-of-remote-branch>"
+        );
+        return Err(GitError::Exit(128));
+    };
+
+    let mode = push_default_mode(config);
+    let branch_ref = format!("refs/heads/{branch}");
+    let same_remote = default_fetch_remote_for_branch(config, branch) == remote;
+    let auto_setup = config
+        .get_bool("push", None, "autoSetupRemote")
+        .unwrap_or(false);
+    let mut dst = branch_ref.clone();
+    let mut set_upstream = false;
+
+    match mode {
+        PushDefaultMode::Unspecified | PushDefaultMode::Simple => {
+            if same_remote {
+                let upstream = push_upstream_ref(config, branch, remote, auto_setup)?;
+                if branch_ref != upstream {
+                    die_push_simple(config, remote, &upstream)?;
+                }
+            }
+        }
+        PushDefaultMode::Upstream => {
+            if !same_remote {
+                eprintln!(
+                    "fatal: You are pushing to remote '{remote}', which is not the upstream of\n\
+your current branch '{branch}', without telling me what to push\n\
+to update which remote branch."
+                );
+                return Err(GitError::Exit(128));
+            }
+            dst = push_upstream_ref(config, branch, remote, auto_setup)?;
+        }
+        PushDefaultMode::Current => {}
+        PushDefaultMode::Matching | PushDefaultMode::Nothing => unreachable!(),
+    }
+
+    if auto_setup && config.get_all("branch", Some(branch), "merge").is_empty() {
+        set_upstream = true;
+    }
+
+    Ok(DefaultPushRefspecs {
+        refspecs: vec![format!("{branch_ref}:{dst}")],
+        set_upstream,
+    })
 }
 
-fn push_upstream_for_branch(config: &GitConfig, branch: &str) -> Option<(String, String)> {
-    let remote = config.get("branch", Some(branch), "remote")?.to_string();
-    let merge = config.get("branch", Some(branch), "merge")?.to_string();
-    Some((remote, merge))
+fn push_default_mode(config: &GitConfig) -> PushDefaultMode {
+    match config.get("push", None, "default") {
+        Some("nothing") => PushDefaultMode::Nothing,
+        Some("matching") => PushDefaultMode::Matching,
+        Some("simple") => PushDefaultMode::Simple,
+        Some("upstream" | "tracking") => PushDefaultMode::Upstream,
+        Some("current") => PushDefaultMode::Current,
+        _ => PushDefaultMode::Unspecified,
+    }
+}
+
+fn default_push_remote(config: &GitConfig, branch: Option<&str>) -> Result<String> {
+    if let Some(branch) = branch
+        && let Some(remote) = config.get("branch", Some(branch), "pushRemote")
+    {
+        return Ok(remote.to_string());
+    }
+    if let Some(remote) = config.get("remote", None, "pushDefault") {
+        return Ok(remote.to_string());
+    }
+    if let Some(branch) = branch
+        && let Some(remote) = config.get("branch", Some(branch), "remote")
+    {
+        return Ok(remote.to_string());
+    }
+    if remote_exists(config, "origin") {
+        return Ok("origin".to_string());
+    }
+    let remotes = remote_names(config);
+    if let [remote] = remotes.as_slice() {
+        return Ok(remote.clone());
+    }
+    eprintln!(
+        "fatal: No configured push destination.\n\
+Either specify the URL from the command-line or configure a remote repository using\n\n\
+    git remote add <name> <url>\n\n\
+and then push using the remote name\n\n\
+    git push <name>"
+    );
+    Err(GitError::Exit(128))
+}
+
+fn default_fetch_remote_for_branch(config: &GitConfig, branch: &str) -> String {
+    if let Some(remote) = config.get("branch", Some(branch), "remote") {
+        return remote.to_string();
+    }
+    if remote_exists(config, "origin") {
+        return "origin".to_string();
+    }
+    let remotes = remote_names(config);
+    match remotes.as_slice() {
+        [remote] => remote.clone(),
+        _ => "origin".to_string(),
+    }
+}
+
+fn push_upstream_ref(
+    config: &GitConfig,
+    branch: &str,
+    remote: &str,
+    auto_setup: bool,
+) -> Result<String> {
+    let merges = config
+        .get_all("branch", Some(branch), "merge")
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if merges.is_empty() && auto_setup {
+        return Ok(format!("refs/heads/{branch}"));
+    }
+    if merges.is_empty() || config.get("branch", Some(branch), "remote").is_none() {
+        let advice = if auto_setup {
+            ""
+        } else {
+            "\nTo have this happen automatically for branches without a tracking\nupstream, see 'push.autoSetupRemote' in 'git help config'.\n"
+        };
+        eprintln!(
+            "fatal: The current branch {branch} has no upstream branch.\n\
+To push the current branch and set the remote as upstream, use\n\n\
+    git push --set-upstream {remote} {branch}\n\
+{advice}"
+        );
+        return Err(GitError::Exit(128));
+    }
+    if merges.len() != 1 {
+        eprintln!("fatal: The current branch {branch} has multiple upstream branches, refusing to push.");
+        return Err(GitError::Exit(128));
+    }
+    Ok(merges[0].to_string())
+}
+
+fn die_push_simple(config: &GitConfig, remote: &str, upstream: &str) -> Result<()> {
+    let short_upstream = upstream.strip_prefix("refs/heads/").unwrap_or(upstream);
+    let advice_pushdefault = if matches!(push_default_mode(config), PushDefaultMode::Unspecified) {
+        "\nTo choose either option permanently, see push.default in 'git help config'.\n"
+    } else {
+        ""
+    };
+    eprintln!(
+        "fatal: The upstream branch of your current branch does not match\n\
+the name of your current branch.  To push to the upstream branch\n\
+on the remote, use\n\n\
+    git push {remote} HEAD:{short_upstream}\n\n\
+To push to the branch of the same name on the remote, use\n\n\
+    git push {remote} HEAD\n\
+{advice_pushdefault}"
+    );
+    Err(GitError::Exit(128))
 }
 
 fn configure_push_upstreams(
