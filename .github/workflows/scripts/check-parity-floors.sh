@@ -559,7 +559,7 @@ declare -A FLOOR=(
     [t1404-update-ref-errors.sh]=38
     [t1416-ref-transaction-hooks.sh]=7
     [t1091-sparse-checkout-builtin.sh]=45
-    [t1092-sparse-checkout-compatibility.sh]=3
+    [t1092-sparse-checkout-compatibility.sh]=22
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
