@@ -2253,9 +2253,11 @@ fn update_ref_stdin_commit_staged(
     let zero = zero_oid(context.format)?;
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
     let mut tx = context.store.transaction().with_hook(&hook);
+    let mut requested_by_name = BTreeMap::new();
     for change in staged {
         match change {
             UpdateRefStdinStagedChange::Write(write) => {
+                requested_by_name.insert(write.name.clone(), write.requested.clone());
                 let current = context.store.read_ref(&write.name)?;
                 if let Some(expected_oid) = write.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
@@ -2307,6 +2309,7 @@ fn update_ref_stdin_commit_staged(
                 });
             }
             UpdateRefStdinStagedChange::Delete(delete) => {
+                requested_by_name.insert(delete.name.clone(), delete.requested.clone());
                 let current = context.store.read_ref(&delete.name)?;
                 if let Some(expected_oid) = delete.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
@@ -2327,6 +2330,7 @@ fn update_ref_stdin_commit_staged(
                 }
             }
             UpdateRefStdinStagedChange::Verify(verify) => {
+                requested_by_name.insert(verify.name.clone(), verify.requested.clone());
                 let current = context.store.read_ref(&verify.name)?;
                 check_update_ref_stdin_expected_named(
                     context.store,
@@ -2338,6 +2342,7 @@ fn update_ref_stdin_commit_staged(
                 )?;
             }
             UpdateRefStdinStagedChange::SymrefUpdate(update) => {
+                requested_by_name.insert(update.name.clone(), update.requested.clone());
                 update_ref_stdin_symref_update(
                     context,
                     &update.requested,
@@ -2348,7 +2353,23 @@ fn update_ref_stdin_commit_staged(
             }
         }
     }
-    tx.commit()
+    match tx.commit() {
+        Err(GitError::Transaction(message)) => {
+            if let Some((new_ref, existing_ref)) = parse_df_conflict_message(&message) {
+                let requested = requested_by_name
+                    .get(&new_ref)
+                    .map(String::as_str)
+                    .unwrap_or(new_ref.as_str());
+                eprintln!(
+                    "fatal: cannot lock ref '{requested}': '{existing_ref}' exists; cannot create '{new_ref}'"
+                );
+            } else {
+                eprintln!("fatal: {message}");
+            }
+            Err(GitError::Exit(128))
+        }
+        result => result,
+    }
 }
 
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
