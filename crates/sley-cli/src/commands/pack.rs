@@ -1107,24 +1107,24 @@ fn cmd_repack_cruft(
     // expire-to repo as a second cruft pack (with no expiration, so it keeps
     // them all). Compute the pre-expiry unreachable set first so we can diff.
     let pre_expiry = if expire_to.is_some() && prune {
-        Some(sley_odb::repack_cruft_with_options(
+        Some(repack_cruft_or_bad_object(sley_odb::repack_cruft_with_options(
             common_git_dir,
             format,
             &roots,
             None,
             &options,
-        )?)
+        ))?)
     } else {
         None
     };
 
-    let result = sley_odb::repack_cruft_with_options(
+    let result = repack_cruft_or_bad_object(sley_odb::repack_cruft_with_options(
         common_git_dir,
         format,
         &roots,
         cruft_expiration,
         &options,
-    )?;
+    ))?;
     sley_odb::install_cruft_repack_result(common_git_dir, format, &result, prune)?;
 
     // Move the expired objects into the --expire-to repository.
@@ -1154,6 +1154,23 @@ fn cmd_repack_cruft(
         cmd_multi_pack_index_write(&[])?;
     }
     Ok(())
+}
+
+fn repack_cruft_or_bad_object(
+    result: Result<sley_odb::CruftRepackResult>,
+) -> Result<sley_odb::CruftRepackResult> {
+    match result {
+        Ok(result) => Ok(result),
+        Err(GitError::NotFound(kind)) => {
+            if let Some(oid) = kind.object_id() {
+                eprintln!("fatal: bad object {oid}");
+                Err(GitError::Exit(128))
+            } else {
+                Err(GitError::NotFound(kind))
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Write a cruft pack of `expired` objects into the `--expire-to` repository's
