@@ -432,7 +432,7 @@ declare -A FLOOR=(
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=55
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
-    [t4202-log.sh]=96
+    [t4202-log.sh]=101
     # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
     # confusing-path rejection (.git/HFS/NTFS/backslash/NUL) 4->28 FULL PASS (safe trees still load).
     [t4201-shortlog.sh]=21
