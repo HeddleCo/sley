@@ -650,7 +650,7 @@ impl FileRefStore {
     pub fn write_reflog(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
-            return self.rewrite_reftable_logs(name, entries);
+            return self.rewrite_reftable_logs(name, entries, true);
         }
         let path = self.reflog_path(name);
         let parent = path
@@ -677,7 +677,7 @@ impl FileRefStore {
             }
             let removed = original_len - retained.len();
             if removed > 0 {
-                self.rewrite_reftable_logs(name, &retained)?;
+                self.rewrite_reftable_logs(name, &retained, true)?;
             }
             return Ok(removed);
         }
@@ -731,7 +731,7 @@ impl FileRefStore {
             )?;
             let removed = original_len - retained.len();
             if write && removed > 0 {
-                self.rewrite_reftable_logs(name, &retained)?;
+                self.rewrite_reftable_logs(name, &retained, true)?;
             }
             return Ok(removed);
         }
@@ -1924,7 +1924,7 @@ impl FileRefStore {
     /// reflog reads as absent. Mirrors git unlinking `logs/<name>` on the loose
     /// backend; the reftable analogue is an all-tombstone table.
     fn tombstone_reftable_logs(&self, name: &str) -> Result<()> {
-        self.rewrite_reftable_logs(name, &[])
+        self.rewrite_reftable_logs(name, &[], false)
     }
 
     /// Mirror git's `files_log_ref_write`: when a transaction updates a branch
@@ -2003,7 +2003,12 @@ impl FileRefStore {
     /// stack-friendly analogue of rewriting a loose `logs/<name>` file — used by
     /// `write_reflog` / reflog expiry. An empty `entries` slice clears the
     /// reflog (an empty `git reflog`).
-    fn rewrite_reftable_logs(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
+    fn rewrite_reftable_logs(
+        &self,
+        name: &str,
+        entries: &[ReflogEntry],
+        preserve_empty: bool,
+    ) -> Result<()> {
         // Gather every update index that currently carries a live log record for
         // `name`, so we can mask them with deletion tombstones.
         let mut live_indexes: BTreeSet<u64> = BTreeSet::new();
@@ -2047,6 +2052,22 @@ impl FileRefStore {
                 refname: name.to_string(),
                 update_index,
                 value: ReftableLogValue::Update(reftable_update_from_reflog(entry)?),
+            });
+        }
+        if entries.is_empty() && preserve_empty {
+            let null = ObjectId::null(self.format);
+            logs.push(ReftableLogRecord {
+                refname: name.to_string(),
+                update_index: base,
+                value: ReftableLogValue::Update(ReftableLogUpdate {
+                    old_oid: null,
+                    new_oid: null,
+                    name: String::new(),
+                    email: String::new(),
+                    time: 0,
+                    tz_offset: 0,
+                    message: String::new(),
+                }),
             });
         }
         if logs.is_empty() {
@@ -5696,6 +5717,41 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .raw_ref_exists("FETCH_HEAD")
                 .expect("test operation should succeed")
         );
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_empty_reftable_reflog_rewrite_keeps_marker() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        fs::create_dir_all(git_dir.join("reftable")).expect("test operation should succeed");
+        fs::write(git_dir.join("reftable").join("tables.list"), b"")
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+
+        store
+            .write_reflog("refs/heads/main", &[])
+            .expect("test operation should succeed");
+
+        assert!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("test operation should succeed")
+                .is_empty()
+        );
+        let tables = store.reftables().expect("test operation should succeed");
+        let marker = tables
+            .iter()
+            .flat_map(|table| table.logs.iter())
+            .find(|record| record.refname == "refs/heads/main")
+            .expect("empty reflog marker should exist");
+        let ReftableLogValue::Update(update) = &marker.value else {
+            panic!("empty reflog marker should be an update");
+        };
+        let null = ObjectId::null(ObjectFormat::Sha1);
+        assert_eq!(update.old_oid, null);
+        assert_eq!(update.new_oid, null);
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
