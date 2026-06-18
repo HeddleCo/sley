@@ -4180,6 +4180,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.signature_file = Some(path.to_string());
             }
             "--zero-commit" => options.zero_commit = true,
+            "--always" => {}
             "--ignore-if-in-upstream" => options.ignore_if_in_upstream = true,
             "--base" => {
                 let value = iter
