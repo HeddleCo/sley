@@ -450,6 +450,27 @@ fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
         .any(|token| matches!(token, FormatToken::NoteName))
 }
 
+fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> {
+    let mut out = Vec::new();
+    writeln!(out, "commit {}", record.oid).expect("write to Vec cannot fail");
+    writeln!(out, "tree {}", record.commit.tree).expect("write to Vec cannot fail");
+    for parent in &record.parents {
+        writeln!(out, "parent {parent}").expect("write to Vec cannot fail");
+    }
+    out.extend_from_slice(b"author ");
+    out.extend_from_slice(&record.commit.author);
+    out.push(b'\n');
+    out.extend_from_slice(b"committer ");
+    out.extend_from_slice(&record.commit.committer);
+    out.extend_from_slice(b"\n\n");
+    for line in String::from_utf8_lossy(&record.commit.message).lines() {
+        out.extend_from_slice(b"    ");
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
 fn log_source_label<'a>(
     oid: &ObjectId,
     source: Option<&'a str>,
@@ -590,10 +611,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut decorate_refs_include: Vec<String> = Vec::new();
     let mut decorate_refs_exclude: Vec<String> = Vec::new();
     let mut clear_decorations = false;
-    // `--simplify-by-decoration`: accepted (so the option doesn't error); the
-    // decoration-keeping simplification itself is not yet wired, but accepting
-    // it matches git for the common pathspec-limited walks.
-    let mut _simplify_by_decoration = false;
+    // `--simplify-by-decoration`: retain commits with decorations plus roots,
+    // then apply the normal skip/count/reverse output limiting.
+    let mut simplify_by_decoration = false;
     let mut read_stdin = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
@@ -667,6 +687,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // commit selection). `None` = defer to config.
     let mut renames_override: Option<bool> = None;
     let mut copies_override: Option<bool> = None;
+    let mut find_copies_harder = false;
     // Track which pickaxe *kinds* were requested (git OR-s the bits and rejects
     // any combination of -G / -S / --find-object). `-S`/`-G` overwrite the
     // needle but each still records its kind-bit for the conflict check.
@@ -904,7 +925,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--no-relative"
             | "--ext-diff"
             | "--no-ext-diff"
-            | "--find-copies-harder"
             | "--no-find-copies-harder"
             | "--function-context"
             | "--default-prefix"
@@ -930,7 +950,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--find-renames" | "-M" => renames_override = Some(true),
             "--find-copies" | "-C" => {
                 renames_override = Some(true);
+                if copies_override == Some(true) {
+                    find_copies_harder = true;
+                }
                 copies_override = Some(true);
+            }
+            "--find-copies-harder" => {
+                renames_override = Some(true);
+                copies_override = Some(true);
+                find_copies_harder = true;
             }
             "--indent-heuristic" => {
                 diff_opts.indent_heuristic = true;
@@ -981,7 +1009,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             "--no-decorate-refs" => decorate_refs_include.clear(),
             "--no-decorate-refs-exclude" => decorate_refs_exclude.clear(),
-            "--simplify-by-decoration" => _simplify_by_decoration = true,
+            "--simplify-by-decoration" => simplify_by_decoration = true,
             value if value.starts_with("-M") => {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
                 renames_override = Some(true);
@@ -989,6 +1017,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("-C") => {
                 log_validate_similarity_option(&value[2..], "find-copies")?;
                 renames_override = Some(true);
+                if copies_override == Some(true) {
+                    find_copies_harder = true;
+                }
                 copies_override = Some(true);
             }
             value if value.starts_with("-B") => {
@@ -1000,6 +1031,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             value if value.starts_with("--find-copies=") => {
                 log_validate_similarity_option(&value["--find-copies=".len()..], "find-copies")?;
+                if copies_override == Some(true) {
+                    find_copies_harder = true;
+                }
+                renames_override = Some(true);
+                copies_override = Some(true);
             }
             "--diff-merges" => {
                 let value = iter
@@ -1669,7 +1705,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // unconditionally at startup (git rejects a wrong value with exit 128 even
     // for a plain `git log` with no diff output).
     let config_diff_merges = match config.get("log", None, "diffMerges") {
-        Some(value) => Some(log_parse_diff_merges_config(&value)?),
+        Some(value) => Some(log_parse_diff_merges_config(value)?),
         None => None,
     };
     if diff_opts.merges.is_none() {
@@ -1886,6 +1922,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     } else {
         None
     };
+    // `log.decorate` config sets the default decoration mode when no
+    // `--decorate*` flag was given. Resolve it before compiling presets such as
+    // `--oneline`, which bake `%d` into the format when decoration is active.
+    if !decoration_explicit
+        && let Some(value) = config.get("log", None, "decorate")
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
+            "full" => decoration = LogDecorationMode::Full,
+            "no" | "false" | "off" | "0" | "auto" => decoration = LogDecorationMode::Off,
+            _ => decoration = LogDecorationMode::Short,
+        }
+    }
     // Resolve the captured `--pretty=`/`--format=` spec now that config (and its
     // `pretty.<name>` aliases) is available.
     if let Some((spec, format_kind)) = pretty_spec.take() {
@@ -1893,6 +1942,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         match resolve_pretty_spec(&spec, format_kind, &config)? {
             ResolvedPretty::Oneline => preset_oneline = Some(true),
             ResolvedPretty::Default => output = LogOutput::Default(LogDefaultKind::Medium),
+            ResolvedPretty::Raw => output = LogOutput::Default(LogDefaultKind::Raw),
             ResolvedPretty::Reference => {
                 // reference defaults the date to short; an explicit --date wins.
                 if !date_explicit {
@@ -2423,15 +2473,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         };
         let mut kept = Vec::with_capacity(selected.len());
         for record in selected {
-            if diff_filter_commit_matches(
-                &db,
-                format,
-                record,
+            let filter_opts = DiffFilterMatchOptions {
                 mask,
-                filter_detect_renames,
-                filter_detect_copies,
-                filter_pathspec.as_ref(),
-            )? {
+                detect_renames: filter_detect_renames,
+                detect_copies: filter_detect_copies,
+                find_copies_harder,
+                pathspec: filter_pathspec.as_ref(),
+            };
+            if diff_filter_commit_matches(&db, format, record, filter_opts)? {
                 kept.push(record);
             }
         }
@@ -2508,33 +2557,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         )?;
         selected = simplified_storage.iter().collect();
     }
-    // For `--graph`, a parent is "interesting" iff it will be shown — judged
-    // against the full selection BEFORE `--skip`/`-n` truncation (matching
-    // upstream `get_commit_action`, which is truncation-blind).
-    let graph_shown: Option<HashSet<ObjectId>> =
-        graph.then(|| selected.iter().map(|record| record.oid).collect());
-    if skip > 0 {
-        selected = selected.into_iter().skip(skip).collect();
-    }
-    if let Some(max_count) = max_count {
-        selected.truncate(max_count);
-    }
-    if reverse {
-        selected.reverse();
-    }
-    // `log.decorate` config sets the default decoration mode when no
-    // `--decorate*` flag was given. `auto` (and unset) means tty-dependent,
-    // which resolves to off for the redirected output these tests use.
-    if !decoration_explicit
-        && let Some(value) = config.get("log", None, "decorate")
-    {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
-            "full" => decoration = LogDecorationMode::Full,
-            "no" | "false" | "off" | "0" | "auto" => decoration = LogDecorationMode::Off,
-            _ => decoration = LogDecorationMode::Short,
-        }
-    }
     // Build the decoration ref filter: `--decorate-refs` (include-only globs),
     // `--decorate-refs-exclude`, and `log.excludeDecoration` config (a missing
     // value is reported but non-fatal).
@@ -2583,17 +2605,44 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         }
         _ => None,
     };
-    let decorations = if decoration == LogDecorationMode::Off && custom_decoration_mode.is_none() {
+    let display_decorations =
+        decoration != LogDecorationMode::Off || custom_decoration_mode.is_some();
+    let mut decorations = if !display_decorations && !simplify_by_decoration {
         HashMap::new()
     } else {
+        let map_mode = custom_decoration_mode.unwrap_or(if decoration == LogDecorationMode::Off {
+            LogDecorationMode::Short
+        } else {
+            decoration
+        });
         log_decoration_map(
             &git_dir,
             &db,
             format,
-            custom_decoration_mode.unwrap_or(decoration),
+            map_mode,
             &decoration_filter,
         )?
     };
+    if simplify_by_decoration {
+        selected.retain(|record| decorations.contains_key(&record.oid) || record.parents.is_empty());
+    }
+    // For `--graph`, a parent is "interesting" iff it will be shown — judged
+    // against the full selection BEFORE `--skip`/`-n` truncation (matching
+    // upstream `get_commit_action`, which is truncation-blind).
+    let graph_shown: Option<HashSet<ObjectId>> =
+        graph.then(|| selected.iter().map(|record| record.oid).collect());
+    if skip > 0 {
+        selected = selected.into_iter().skip(skip).collect();
+    }
+    if let Some(max_count) = max_count {
+        selected.truncate(max_count);
+    }
+    if reverse {
+        selected.reverse();
+    }
+    if !display_decorations {
+        decorations.clear();
+    }
     // Object access for `%(describe)`.
     let describe_ctx = LogDescribeContext {
         git_dir: &git_dir,
@@ -2712,6 +2761,28 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     }
                 }
                 LogOutput::Default(kind) => {
+                    if *kind == LogDefaultKind::Raw {
+                        if index > 0 {
+                            graph_show_padding(&mut graph_state, prefix, &mut out)?;
+                            out.write_all(b"\n")?;
+                        }
+                        graph_show_commit(&mut graph_state, prefix, &mut out)?;
+                        let mut msg = render_log_raw_pretty(record);
+                        if let Some(log_diff) = &log_diff {
+                            let mut padding = String::new();
+                            graph_state.padding_line(&mut padding);
+                            let prefix_width =
+                                log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
+                            let block = log_diff.render(record, prefix_width)?;
+                            if !block.is_empty() {
+                                msg.extend_from_slice(diff_opts.block_separator_for(record));
+                                msg.extend_from_slice(&block);
+                            }
+                        }
+                        graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
+                        prev_missing_newline = false;
+                        continue;
+                    }
                     if index > 0 {
                         graph_show_padding(&mut graph_state, prefix, &mut out)?;
                         out.write_all(b"\n")?;
@@ -2808,6 +2879,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     None => Vec::new(),
                 };
                 if whatchanged && log_diff.is_some() && diff_block.is_empty() {
+                    continue;
+                }
+                if kind == LogDefaultKind::Raw {
+                    if printed_entries > 0 {
+                        println!();
+                    }
+                    printed_entries += 1;
+                    let mut raw = render_log_raw_pretty(record);
+                    if !diff_block.is_empty() {
+                        raw.extend_from_slice(diff_opts.block_separator_for(record));
+                        raw.extend_from_slice(&diff_block);
+                    }
+                    io::stdout().write_all(&raw)?;
                     continue;
                 }
                 if printed_entries > 0 {
@@ -3621,6 +3705,7 @@ fn emit_compiled_reflog_walk_format(
 enum ResolvedPretty {
     Oneline,
     Default,
+    Raw,
     /// `--pretty=reference`: `%C(auto)%h (%s, %ad)` with a default short date
     /// that an explicit `--date=` overrides (but `log.date` config does not).
     Reference,
@@ -3660,6 +3745,7 @@ fn resolve_pretty_spec(
         match current.as_str() {
             "oneline" => return Ok(ResolvedPretty::Oneline),
             "short" | "medium" => return Ok(ResolvedPretty::Default),
+            "raw" => return Ok(ResolvedPretty::Raw),
             "reference" => {
                 return Ok(ResolvedPretty::Reference);
             }
@@ -3714,8 +3800,8 @@ fn log_graph_color_palette(config: &GitConfig) -> Vec<String> {
     palette
 }
 
-/// Emit graph rows up to and including the current commit's row (no trailing
-/// newline), prefixing each physical line with `prefix`.
+// Emit graph rows up to and including the current commit's row (no trailing
+// newline), prefixing each physical line with `prefix`.
 
 /// How merge commits participate in log diff output (`--diff-merges`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3970,16 +4056,22 @@ fn diff_filter_entry_bit(entry: &sley_diff_merge::NameStatusEntry) -> u32 {
     diff_filter_letter_bit(entry.status.code())
 }
 
+#[derive(Clone, Copy)]
+struct DiffFilterMatchOptions<'a> {
+    mask: u32,
+    detect_renames: bool,
+    detect_copies: bool,
+    find_copies_harder: bool,
+    pathspec: Option<&'a DiffPathspec>,
+}
+
 /// Whether a commit's first-parent diff contains a filepair matching the
 /// `--diff-filter` mask. With rename/copy bits requested, rename detection runs.
 fn diff_filter_commit_matches(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
-    mask: u32,
-    detect_renames: bool,
-    detect_copies: bool,
-    pathspec: Option<&DiffPathspec>,
+    opts: DiffFilterMatchOptions<'_>,
 ) -> Result<bool> {
     let parents = &record.commit.parents;
     let parent_tree = match parents.first() {
@@ -3991,12 +4083,12 @@ fn diff_filter_commit_matches(
     };
     let tree = &record.commit.tree;
     let base = sley_diff_merge::DiffNameStatusOptions {
-        detect_renames,
-        detect_copies,
-        find_copies_harder: false,
+        detect_renames: opts.detect_renames,
+        detect_copies: opts.detect_copies,
+        find_copies_harder: opts.find_copies_harder,
         rename_empty: true,
     };
-    let entries = match (&parent_tree, detect_renames) {
+    let entries = match (&parent_tree, opts.detect_renames) {
         (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
             db,
             format,
@@ -4016,14 +4108,14 @@ fn diff_filter_commit_matches(
             sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
         }
     };
-    let entries = match pathspec {
+    let entries = match opts.pathspec {
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
     };
     // The `*` (all-or-none) bit doesn't change the "is any filepair a match"
     // question for commit selection (it only affects which filepairs are kept
     // for output), so test the status bits directly.
-    let status_mask = mask & !DIFF_FILTER_AON;
+    let status_mask = opts.mask & !DIFF_FILTER_AON;
     Ok(entries
         .iter()
         .any(|entry| diff_filter_entry_bit(entry) & status_mask != 0))
@@ -4745,6 +4837,8 @@ enum LogDefaultKind {
     Medium,
     /// `--pretty=short`: omits the `Date:` line.
     Short,
+    /// `--pretty=raw`: full object headers and raw identity lines.
+    Raw,
 }
 
 #[derive(Debug, Clone)]

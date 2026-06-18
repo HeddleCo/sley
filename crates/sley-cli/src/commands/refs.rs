@@ -15,6 +15,7 @@ struct ReflogShowOptions {
     display: String,
     format: ReflogFormat,
     max_count: Option<usize>,
+    abbrev_commit: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -47,6 +48,12 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    let abbrev_commit = options.abbrev_commit.unwrap_or(true);
+    let abbrev_len = if abbrev_commit {
+        repository_abbrev(&git_dir, format)?
+    } else {
+        None
+    };
     let store = FileRefStore::new(&git_dir, format);
     let mut entries = store.read_reflog(&options.reference)?;
     entries.reverse();
@@ -74,7 +81,7 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
         match options.format {
             ReflogFormat::Default => println!(
                 "{} {}@{{{}}}: {}",
-                format_log_abbrev_oid(&entry.new_oid),
+                format_log_oid(&entry.new_oid, abbrev_len),
                 options.display,
                 shown,
                 String::from_utf8_lossy(&entry.message)
@@ -699,6 +706,7 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
     }
     let mut format = ReflogFormat::Default;
     let mut max_count = None;
+    let mut abbrev_commit = None;
     let mut refs = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -709,6 +717,8 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
                 break;
             }
             "--oneline" => format = ReflogFormat::Default,
+            "--abbrev-commit" => abbrev_commit = Some(true),
+            "--no-abbrev-commit" => abbrev_commit = Some(false),
             "--format=%H" | "--pretty=%H" => {
                 format = ReflogFormat::NewOid {
                     final_newline: true,
@@ -803,6 +813,7 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
         display,
         format,
         max_count,
+        abbrev_commit,
     })
 }
 

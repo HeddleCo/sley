@@ -7820,52 +7820,38 @@ pub(crate) fn log_decoration_map(
     let store = FileRefStore::new(git_dir, format);
     let head_ref = store.current_branch_ref()?;
     let mut decorations = HashMap::<ObjectId, Vec<String>>::new();
-    // The branch HEAD points at survives the filter independently of "HEAD"; we
-    // only collapse to "HEAD -> branch" when both survive (git's
-    // current_pointed_by_HEAD). Track whether the pointed-at branch is filtered
-    // so the loop below can emit it standalone when HEAD itself is excluded.
+    // Git stores decorations in a per-object linked list by prepending each ref
+    // as refs_for_each_ref() visits sorted refs; the rendered order is therefore
+    // reverse ref iteration order. HEAD is loaded after refs, so it prepends over
+    // all ordinary names and can collapse with the branch it points at.
+    let mut head_decoration: Option<(ObjectId, String)> = None;
     let mut head_branch_shown_inline = false;
     if let Some(head_target) = store.read_ref("HEAD")? {
         let head_kept = filter.matches("HEAD");
         match head_target {
             RefTarget::Symbolic(name) => {
-                if let Some(target) = store.read_ref(&name)?
-                    && let RefTarget::Direct(oid) = target
+                if let Some(RefTarget::Direct(oid)) = store.read_ref(&name)?
                     && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
                 {
                     let branch_kept = filter.matches(&name);
                     if head_kept && branch_kept {
                         let label = log_decoration_ref_name(&name, mode);
-                        decorations
-                            .entry(commit)
-                            .or_default()
-                            .push(format!("HEAD -> {label}"));
+                        head_decoration = Some((commit, format!("HEAD -> {label}")));
                         head_branch_shown_inline = true;
                     } else if head_kept {
-                        decorations
-                            .entry(commit)
-                            .or_default()
-                            .push("HEAD".to_string());
+                        head_decoration = Some((commit, "HEAD".to_string()));
                     }
-                    // If only the branch survives, the loop below emits it.
                 }
             }
             RefTarget::Direct(oid) => {
                 if head_kept
                     && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
                 {
-                    decorations
-                        .entry(commit)
-                        .or_default()
-                        .push("HEAD".to_string());
+                    head_decoration = Some((commit, "HEAD".to_string()));
                 }
             }
         }
     }
-    let mut tag_labels = Vec::new();
-    let mut branch_labels = Vec::new();
-    let mut remote_labels = Vec::new();
-    let mut other_labels = Vec::new();
     for reference in store.list_refs()? {
         if head_branch_shown_inline && head_ref.as_deref() == Some(reference.name.as_str()) {
             continue;
@@ -7880,26 +7866,10 @@ pub(crate) fn log_decoration_map(
             continue;
         };
         let label = log_decoration_label(&reference.name, mode);
-        if reference.name.starts_with("refs/tags/") {
-            tag_labels.push((commit, label));
-        } else if reference.name.starts_with("refs/heads/") {
-            branch_labels.push((commit, label));
-        } else if reference.name.starts_with("refs/remotes/") {
-            remote_labels.push((commit, label));
-        } else {
-            other_labels.push((commit, label));
-        }
+        decorations.entry(commit).or_default().insert(0, label);
     }
-    for labels in [
-        &mut tag_labels,
-        &mut branch_labels,
-        &mut remote_labels,
-        &mut other_labels,
-    ] {
-        labels.sort_by(|left, right| left.1.cmp(&right.1));
-        for (commit, label) in labels.drain(..) {
-            decorations.entry(commit).or_default().push(label);
-        }
+    if let Some((commit, label)) = head_decoration {
+        decorations.entry(commit).or_default().insert(0, label);
     }
     Ok(decorations)
 }
