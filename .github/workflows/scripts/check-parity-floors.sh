@@ -392,6 +392,13 @@ declare -A FLOOR=(
     # back-pointer after a move, broken-link detection + repair messages, repair
     # both-moved + specific-path. t2406 7->24 FULL; side gain t2403 25->27.
     [t2406-worktree-repair.sh]=24
+    # codex-wave-11 (checkout DWIM + checkout-index --temp): remote-tracking DWIM
+    # auto-create local branch + track, --no-guess; checkout-index --temp/--all/-z
+    # tempname mapping + --prefix/--stage. t2024 ->21, t2004 ->23 FULL. (t2501
+    # cwd-removed unchanged @3.) worktree/branch floors held t2400=214 t3200=134
+    # t6040=44 t7508=114.
+    [t2024-checkout-dwim.sh]=21
+    [t2004-checkout-cache-temp.sh]=23
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=410
     # codex-wave-10 (branch tracking-info): branch -vv ahead/behind+gone column,

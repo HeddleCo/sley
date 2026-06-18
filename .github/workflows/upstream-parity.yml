@@ -121,6 +121,8 @@ jobs:
             t2020-checkout-detach.sh
             t2107-update-index-basic.sh
             t2400-worktree-add.sh
+            t2024-checkout-dwim.sh
+            t2004-checkout-cache-temp.sh
             t2406-worktree-repair.sh
             t3000-ls-files-others.sh
             t3070-wildmatch.sh
