@@ -1532,18 +1532,16 @@ fn compute_summary_diff_index(
     let mut new = index_relevant_paths(index, old);
     if !cached {
         // Default mode: run_diff_index(0) compares against the WORKTREE.
-        // For each gitlink: if the submodule is checked out, the dst is its
-        // current HEAD (the dirty-submodule fill); if the worktree path is gone
-        // entirely, the dst is null (a deletion, via check_removed).
+        // For each relevant path, the dst side is the actual worktree entry:
+        // a checked-out embedded repository is a gitlink at its HEAD, a file is
+        // the blob on disk, and a missing path is a deletion. This matters for
+        // typechanges where the index still records a blob but the worktree has
+        // already been replaced by a submodule (or the reverse).
         let mut removed = Vec::new();
         for (path, slot) in new.iter_mut() {
-            if slot.0 == 0o160000 {
-                let submodule_root = worktree_root.join(path);
-                if let Ok((_, head_oid)) = submodule_head(&submodule_root) {
-                    slot.1 = head_oid;
-                } else if !submodule_root.exists() {
-                    removed.push(path.clone());
-                }
+            match summary_worktree_side(worktree_root, format, path)? {
+                Some(side) => *slot = side,
+                None => removed.push(path.clone()),
             }
         }
         for path in removed {
@@ -1561,19 +1559,12 @@ fn compute_summary_diff_files(
     format: ObjectFormat,
     index: &Option<Index>,
 ) -> Result<Vec<SubmoduleSummaryEntry>> {
-    let old = index_relevant_paths(index, &BTreeMap::new());
+    let old = index_relevant_paths_for_files(worktree_root, format, index)?;
     let mut new = BTreeMap::new();
-    for (path, (mode, oid)) in &old {
-        let submodule_root = worktree_root.join(path);
-        if *mode == 0o160000 {
-            if let Ok((_, head_oid)) = submodule_head(&submodule_root) {
-                new.insert(path.clone(), (*mode, head_oid));
-                continue;
-            }
+    for path in old.keys() {
+        if let Some(side) = summary_worktree_side(worktree_root, format, path)? {
+            new.insert(path.clone(), side);
         }
-        // Not a checked-out gitlink: leave the worktree side equal to the index
-        // (no change), so only real moves surface.
-        new.insert(path.clone(), (*mode, *oid));
     }
     Ok(diff_gitlink_sides(format, &old, &new)
         .into_iter()
@@ -1581,9 +1572,86 @@ fn compute_summary_diff_files(
         .collect())
 }
 
+fn index_relevant_paths_for_files(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    index: &Option<Index>,
+) -> Result<BTreeMap<String, (u32, ObjectId)>> {
+    use sley_index::Stage;
+    let mut out = BTreeMap::new();
+    if let Some(index) = index {
+        for entry in &index.entries {
+            if entry.stage() != Stage::Normal {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            let worktree_is_gitlink = summary_worktree_side(worktree_root, format, &path)?
+                .is_some_and(|(mode, _)| mode == 0o160000);
+            if entry.mode == 0o160000 || worktree_is_gitlink {
+                out.insert(path, (entry.mode, entry.oid));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn summary_worktree_side(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    path: &str,
+) -> Result<Option<(u32, ObjectId)>> {
+    let worktree_path = worktree_root.join(path);
+    if let Ok((_, head_oid)) = submodule_head(&worktree_path) {
+        return Ok(Some((0o160000, head_oid)));
+    }
+    let metadata = match fs::symlink_metadata(&worktree_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        return Ok(None);
+    }
+    if !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(None);
+    }
+    let body = if file_type.is_symlink() {
+        fs::read_link(&worktree_path)?
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec()
+    } else {
+        fs::read(&worktree_path)?
+    };
+    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+    let mode = if file_type.is_symlink() {
+        0o120000
+    } else {
+        summary_file_mode(&metadata)
+    };
+    Ok(Some((mode, oid)))
+}
+
+#[cfg(unix)]
+fn summary_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(not(unix))]
+fn summary_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o100644
+}
+
 /// The index modes/oids at every stage-0 path that is a gitlink in the index OR
-/// a gitlink on the `tree_side` (so a `gitlink -> blob` type-change is captured
-/// from the index's blob mode). Keyed by path.
+/// present on the `tree_side` (so both `gitlink -> blob` and `blob -> gitlink`
+/// type-changes can be captured once the default summary substitutes the
+/// worktree side). Keyed by path.
 fn index_relevant_paths(
     index: &Option<Index>,
     tree_side: &BTreeMap<String, (u32, ObjectId)>,
@@ -1596,8 +1664,7 @@ fn index_relevant_paths(
                 continue;
             }
             let path = String::from_utf8_lossy(&entry.path).into_owned();
-            let tree_is_gitlink = tree_side.get(&path).is_some_and(|(m, _)| *m == 0o160000);
-            if entry.mode == 0o160000 || tree_is_gitlink {
+            if entry.mode == 0o160000 || tree_side.contains_key(&path) {
                 out.insert(path, (entry.mode, entry.oid));
             }
         }
