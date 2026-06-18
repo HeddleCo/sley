@@ -3054,6 +3054,10 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         if resolved.set_upstream {
             set_upstream = true;
         }
+        if resolved.mirror {
+            mirror = true;
+            force = true;
+        }
         (resolved.remote, resolved.refspecs)
     };
     default_head_push_destinations(&store, &mut refspecs)?;
@@ -3942,6 +3946,7 @@ struct PushRemoteAndRefspecs {
     remote: String,
     refspecs: Vec<String>,
     set_upstream: bool,
+    mirror: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3969,6 +3974,7 @@ fn push_remote_and_refspecs(
                 remote,
                 refspecs: refspecs.refspecs,
                 set_upstream: refspecs.set_upstream,
+                mirror: refspecs.mirror,
             })
         }
         [remote] => {
@@ -3979,12 +3985,14 @@ fn push_remote_and_refspecs(
                 remote: remote.clone(),
                 refspecs: refspecs.refspecs,
                 set_upstream: refspecs.set_upstream,
+                mirror: refspecs.mirror,
             })
         }
         [remote, refspecs @ ..] => Ok(PushRemoteAndRefspecs {
             remote: remote.clone(),
             refspecs: refspecs.to_vec(),
             set_upstream: false,
+            mirror: false,
         }),
     }
 }
@@ -3992,6 +4000,7 @@ fn push_remote_and_refspecs(
 struct DefaultPushRefspecs {
     refspecs: Vec<String>,
     set_upstream: bool,
+    mirror: bool,
 }
 
 fn default_push_refspecs(
@@ -4009,6 +4018,17 @@ fn default_push_refspecs(
         return Ok(DefaultPushRefspecs {
             refspecs: configured_push,
             set_upstream: false,
+            mirror: false,
+        });
+    }
+    if config
+        .get_bool("remote", Some(remote), "mirror")
+        .unwrap_or(false)
+    {
+        return Ok(DefaultPushRefspecs {
+            refspecs: vec!["refs/*:refs/*".to_string()],
+            set_upstream: false,
+            mirror: true,
         });
     }
 
@@ -4017,6 +4037,7 @@ fn default_push_refspecs(
             return Ok(DefaultPushRefspecs {
                 refspecs: vec![":".to_string()],
                 set_upstream: false,
+                mirror: false,
             });
         }
         PushDefaultMode::Nothing => {
@@ -4078,6 +4099,7 @@ to update which remote branch."
     Ok(DefaultPushRefspecs {
         refspecs: vec![format!("{branch_ref}:{dst}")],
         set_upstream,
+        mirror: false,
     })
 }
 
