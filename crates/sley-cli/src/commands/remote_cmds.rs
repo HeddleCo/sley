@@ -5148,7 +5148,11 @@ fn remote_list(verbose: bool) -> Result<()> {
                 let fetch_url = rewrite_url_with_config(&config, url, false);
                 let push_url = config.get("remote", Some(&name), "pushurl").unwrap_or(url);
                 let push_url = rewrite_url_with_config(&config, push_url, true);
-                writeln!(stdout, "{name}\t{fetch_url} (fetch)")?;
+                if let Some(filter) = config.get("remote", Some(&name), "partialclonefilter") {
+                    writeln!(stdout, "{name}\t{fetch_url} (fetch) [{filter}]")?;
+                } else {
+                    writeln!(stdout, "{name}\t{fetch_url} (fetch)")?;
+                }
                 writeln!(stdout, "{name}\t{push_url} (push)")?;
             }
         } else {

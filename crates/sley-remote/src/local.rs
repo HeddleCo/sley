@@ -833,6 +833,9 @@ pub fn install_fetch_pack_via_local_upload_pack(
         None => collect_reachable_object_ids(&remote_db, format, known_haves)?,
     };
     let mut starts = decoded_request.wants;
+    for want in &starts {
+        excluded.remove(want);
+    }
     if let Some(plan) = deepen {
         // Stop the pack walk at the shallow boundary and pack the history a
         // moved boundary newly exposes.
