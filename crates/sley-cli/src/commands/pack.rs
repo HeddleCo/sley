@@ -716,8 +716,24 @@ fn repack_traversal_roots(
     if let Ok(head) = resolve_revision(git_dir, format, "HEAD") {
         roots.push(head);
     }
-    // Reflogs: parse the leading "<old> <new>" oid pair of each line under
-    // logs/ (both sides — upstream's --reflog marks both).
+    roots.extend(reflog_traversal_roots(git_dir, common_git_dir, format)?);
+    // Indexed blobs (upstream --indexed-objects).
+    if let Ok(bytes) = fs::read(git_dir.join("index"))
+        && let Ok(index) = sley_index::Index::parse(&bytes, format)
+    {
+        for entry in &index.entries {
+            roots.push(entry.oid);
+        }
+    }
+    Ok(roots)
+}
+
+fn reflog_traversal_roots(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let mut roots = Vec::new();
     let mut log_dirs = vec![common_git_dir.join("logs"), git_dir.join("logs")];
     log_dirs.dedup();
     let zero = "0".repeat(format.hex_len());
@@ -742,14 +758,6 @@ fn repack_traversal_roots(
                     }
                 }
             }
-        }
-    }
-    // Indexed blobs (upstream --indexed-objects).
-    if let Ok(bytes) = fs::read(git_dir.join("index"))
-        && let Ok(index) = sley_index::Index::parse(&bytes, format)
-    {
-        for entry in &index.entries {
-            roots.push(entry.oid);
         }
     }
     Ok(roots)
@@ -3501,6 +3509,8 @@ fn prune_roots(git_dir: &Path, format: ObjectFormat, heads: &[String]) -> Result
     for head in heads {
         roots.insert(resolve_revision(git_dir, format, head)?);
     }
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    roots.extend(reflog_traversal_roots(git_dir, &common_git_dir, format)?);
     Ok(roots.into_iter().collect())
 }
 

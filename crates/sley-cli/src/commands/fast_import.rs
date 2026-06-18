@@ -83,7 +83,15 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         }
         if let Some(rest) = line_after(line, b"commit ") {
             let ref_name = resolve_commit_ref(&store, rest)?;
-            handle_commit(&mut parser, &mut db, &store, format, &mut marks, ref_name)?;
+            handle_commit(
+                &mut parser,
+                &mut db,
+                &store,
+                &git_dir,
+                format,
+                &mut marks,
+                ref_name,
+            )?;
         } else if let Some(rest) = line_after(line, b"blob") {
             handle_blob(&mut parser, &mut db, &mut marks, rest)?;
         } else if line_after(line, b"reset ").is_some() {
@@ -158,6 +166,7 @@ fn handle_commit(
     parser: &mut StreamParser<'_>,
     db: &mut FileObjectDatabase,
     store: &FileRefStore,
+    git_dir: &Path,
     format: ObjectFormat,
     marks: &mut HashMap<u64, ObjectId>,
     ref_name: String,
@@ -178,10 +187,10 @@ fn handle_commit(
             commit_mark = Some(parse_mark(rest)?);
             parser.next_command_line();
         } else if let Some(rest) = line_after(line, b"author ") {
-            author = Some(rest.to_vec());
+            author = Some(normalize_fast_import_ident(rest));
             parser.next_command_line();
         } else if let Some(rest) = line_after(line, b"committer ") {
-            committer = Some(rest.to_vec());
+            committer = Some(normalize_fast_import_ident(rest));
             parser.next_command_line();
         } else if line_after(line, b"data").is_some() {
             parser.next_command_line();
@@ -249,10 +258,9 @@ fn handle_commit(
         &mut tree,
     )?;
 
-    let author =
-        author.ok_or_else(|| GitError::Command("fast-import: commit missing author".into()))?;
     let committer = committer
         .ok_or_else(|| GitError::Command("fast-import: commit missing committer".into()))?;
+    let author = author.unwrap_or_else(|| committer.clone());
     let message =
         message.ok_or_else(|| GitError::Command("fast-import: commit missing data".into()))?;
 
@@ -264,8 +272,17 @@ fn handle_commit(
         message,
     };
     let oid = write_commit(db, build, marks, commit_mark)?;
-    update_branch(store, format, &ref_name, oid)?;
+    update_branch(store, git_dir, format, &ref_name, oid)?;
     Ok(())
+}
+
+fn normalize_fast_import_ident(ident: &[u8]) -> Vec<u8> {
+    let Some(prefix) = ident.strip_suffix(b" now") else {
+        return ident.to_vec();
+    };
+    let mut out = prefix.to_vec();
+    out.extend_from_slice(format!(" {} +0000", current_unix_seconds()).as_bytes());
+    out
 }
 
 fn write_commit(
@@ -587,6 +604,7 @@ fn tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
 /// both work after a bulk import.
 fn update_branch(
     store: &FileRefStore,
+    git_dir: &Path,
     format: ObjectFormat,
     ref_name: &str,
     new_oid: ObjectId,
@@ -595,20 +613,63 @@ fn update_branch(
         Some(RefTarget::Direct(oid)) => oid,
         _ => zero_oid(format)?,
     };
-    let reflog = ReflogEntry {
+    let reflog = fast_import_should_write_reflog(git_dir, ref_name)?.then(|| ReflogEntry {
         old_oid,
         new_oid,
         committer: default_committer(),
         message: b"fast-import".to_vec(),
-    };
+    });
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name: ref_name.to_string(),
         expected: None,
         new: RefTarget::Direct(new_oid),
-        reflog: Some(reflog),
+        reflog,
     });
     tx.commit()
+}
+
+fn fast_import_should_write_reflog(git_dir: &Path, name: &str) -> Result<bool> {
+    if reflog_path_for_ref_name(git_dir, name)?.exists() {
+        return Ok(true);
+    }
+    if let Some(value) = global_config_value("core.logAllRefUpdates")? {
+        return Ok(fast_import_log_all_ref_updates_matches(name, &value));
+    }
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+        return Ok(false);
+    };
+    if let Some(value) = config.get("core", None, "logAllRefUpdates") {
+        return Ok(fast_import_log_all_ref_updates_matches(name, value));
+    }
+    if config.get_bool("core", None, "bare").unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(fast_import_log_all_ref_updates_matches(name, "true"))
+}
+
+fn reflog_path_for_ref_name(git_dir: &Path, name: &str) -> Result<PathBuf> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let base = if name == "HEAD" || name.starts_with("refs/bisect/") {
+        git_dir
+    } else {
+        &common_git_dir
+    };
+    Ok(base.join("logs").join(name))
+}
+
+fn fast_import_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
+    if value.eq_ignore_ascii_case("always") {
+        return true;
+    }
+    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+        return false;
+    }
+    name == "HEAD"
+        || name.starts_with("refs/heads/")
+        || name.starts_with("refs/remotes/")
+        || name.starts_with("refs/notes/")
 }
 
 // ---------------------------------------------------------------------------

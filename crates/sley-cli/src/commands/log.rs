@@ -3543,51 +3543,78 @@ fn log_walk_reflogs(
     output: &LogOutput,
     reverse: bool,
 ) -> Result<()> {
-    let requested = revisions.first().map(String::as_str);
-    let reference = reflog_reference_name(requested)?;
-    let display_reference = requested.unwrap_or(&reference);
     let store = FileRefStore::new(git_dir, format);
-    let mut entries = store.read_reflog(&reference)?;
-    entries.reverse();
-    if skip > 0 {
-        entries = entries.into_iter().skip(skip).collect();
-    }
-    if let Some(max_count) = max_count {
-        entries.truncate(max_count);
-    }
-    if reverse {
-        entries.reverse();
-    }
+    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut stdout = io::stdout();
-    for (index, entry) in entries.iter().enumerate() {
-        match output {
-            LogOutput::Compiled {
-                compiled,
-                final_newline,
-                ..
-            } => {
-                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                emit_compiled_reflog_walk_format(
+    let references = if revisions.is_empty() {
+        vec![reflog_reference_name(None)?]
+    } else {
+        revisions
+            .iter()
+            .map(|revision| reflog_reference_name(Some(revision)))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut skipped = 0usize;
+    let mut emitted = 0usize;
+    for reference in references {
+        let display_reference = reflog_walk_display_reference(&reference);
+        let full_display_reference = reflog_walk_display_reference(&reference);
+        let mut entries = store.read_reflog(&reference)?;
+        entries.reverse();
+        if reverse {
+            entries.reverse();
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+            if max_count.is_some_and(|max_count| emitted >= max_count) {
+                stdout.flush()?;
+                return Ok(());
+            }
+            match output {
+                LogOutput::Compiled {
                     compiled,
-                    entry,
-                    index,
-                    display_reference,
-                    &reference,
-                    &mut line,
-                )?;
-                stdout.write_all(&line)?;
-                if *final_newline && !line.ends_with(b"\n") {
+                    final_newline,
+                    ..
+                } => {
+                    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                    let mut ctx = ReflogWalkFormatContext {
+                        compiled,
+                        db: &mut db,
+                        format,
+                        display_reference: &display_reference,
+                        full_reference: &full_display_reference,
+                    };
+                    emit_compiled_reflog_walk_format(
+                        &mut ctx,
+                        entry,
+                        index,
+                        &mut line,
+                    )?;
+                    stdout.write_all(&line)?;
+                    if *final_newline && !line.ends_with(b"\n") {
+                        stdout.write_all(b"\n")?;
+                    }
+                }
+                LogOutput::Default(_) => {
+                    stdout.write_all(&entry.message)?;
                     stdout.write_all(b"\n")?;
                 }
             }
-            LogOutput::Default(_) => {
-                stdout.write_all(&entry.message)?;
-                stdout.write_all(b"\n")?;
-            }
+            emitted += 1;
         }
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn reflog_walk_display_reference(reference: &str) -> String {
+    reference
+        .strip_prefix("refs/heads/")
+        .unwrap_or(reference)
+        .to_string()
 }
 
 fn compile_log_filter_matcher(
@@ -3677,17 +3704,23 @@ fn log_grep_matcher_matches(
     matched != invert
 }
 
+struct ReflogWalkFormatContext<'a> {
+    compiled: &'a CompiledLogFormat,
+    db: &'a mut FileObjectDatabase,
+    format: ObjectFormat,
+    display_reference: &'a str,
+    full_reference: &'a str,
+}
+
 fn emit_compiled_reflog_walk_format(
-    compiled: &CompiledLogFormat,
+    ctx: &mut ReflogWalkFormatContext<'_>,
     entry: &ReflogEntry,
     index: usize,
-    display_reference: &str,
-    full_reference: &str,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
     let reflog_timestamp = commit_identity_timestamp(&entry.committer);
-    for token in &compiled.tokens {
+    for token in &ctx.compiled.tokens {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
@@ -3729,12 +3762,14 @@ fn emit_compiled_reflog_walk_format(
                 )
                 .map_err(io::Error::from)?
             }
-            FormatToken::ReflogGs => out.extend_from_slice(&entry.message),
+            FormatToken::ReflogGs => {
+                out.extend_from_slice(&reflog_walk_subject(ctx.db, ctx.format, entry)?);
+            }
             FormatToken::ReflogGd => {
-                write!(out, "{display_reference}@{{{index}}}").map_err(io::Error::from)?;
+                write!(out, "{}@{{{index}}}", ctx.display_reference).map_err(io::Error::from)?;
             }
             FormatToken::ReflogGD => {
-                write!(out, "{full_reference}@{{{index}}}").map_err(io::Error::from)?;
+                write!(out, "{}@{{{index}}}", ctx.full_reference).map_err(io::Error::from)?;
             }
             FormatToken::ReflogGn => out.extend_from_slice(reflog_name.as_bytes()),
             FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),
@@ -3744,6 +3779,29 @@ fn emit_compiled_reflog_walk_format(
         }
     }
     Ok(())
+}
+
+fn reflog_walk_subject(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+) -> Result<Vec<u8>> {
+    let Some(rest) = entry.message.strip_prefix(b"commit: ") else {
+        return Ok(entry.message.clone());
+    };
+    let object = match db.read_object(&entry.new_oid) {
+        Ok(object) if object.object_type == ObjectType::Commit => object,
+        _ => return Ok(entry.message.clone()),
+    };
+    let Ok(commit) = Commit::parse_ref(format, &object.body) else {
+        return Ok(entry.message.clone());
+    };
+    if !commit.parents.is_empty() {
+        return Ok(entry.message.clone());
+    }
+    let mut subject = b"commit (initial): ".to_vec();
+    subject.extend_from_slice(rest);
+    Ok(subject)
 }
 
 /// The outcome of resolving a `--pretty=`/`--format=` spec.

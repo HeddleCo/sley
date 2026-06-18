@@ -7562,7 +7562,7 @@ fn create_branch_from_start_with_reflog(
     store: &FileRefStore,
     branch: &str,
     start: Option<&String>,
-    _create_reflog: bool,
+    create_reflog: bool,
 ) -> Result<()> {
     let refname = validate_branch_creation_name(branch)?;
     if store.read_ref(&refname)?.is_some() {
@@ -7579,13 +7579,63 @@ fn create_branch_from_start_with_reflog(
         )
         .into_bytes(),
     };
-    store.create_branch(
-        branch,
-        start_oid,
-        commit_identity_from_env("COMMITTER")?,
-        message,
-    )?;
+    let reflog = if branch_should_write_reflog(git_dir, &refname, create_reflog)? {
+        Some(ReflogEntry {
+            old_oid: ObjectId::null(format),
+            new_oid: start_oid,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message,
+        })
+    } else {
+        None
+    };
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: refname,
+        expected: None,
+        new: RefTarget::Direct(start_oid),
+        reflog,
+    });
+    tx.commit()?;
     Ok(())
+}
+
+fn branch_should_write_reflog(git_dir: &Path, name: &str, create_reflog: bool) -> Result<bool> {
+    if create_reflog || branch_reflog_path(git_dir, name)?.exists() {
+        return Ok(true);
+    }
+    if let Some(value) = global_config_value("core.logAllRefUpdates")? {
+        return Ok(branch_log_all_ref_updates_matches(name, &value));
+    }
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+        return Ok(false);
+    };
+    if let Some(value) = config.get("core", None, "logAllRefUpdates") {
+        return Ok(branch_log_all_ref_updates_matches(name, value));
+    }
+    if config.get_bool("core", None, "bare").unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(branch_log_all_ref_updates_matches(name, "true"))
+}
+
+fn branch_reflog_path(git_dir: &Path, name: &str) -> Result<PathBuf> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    Ok(common_git_dir.join("logs").join(name))
+}
+
+fn branch_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
+    if value.eq_ignore_ascii_case("always") {
+        return true;
+    }
+    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+        return false;
+    }
+    name == "HEAD"
+        || name.starts_with("refs/heads/")
+        || name.starts_with("refs/remotes/")
+        || name.starts_with("refs/notes/")
 }
 
 fn validate_branch_creation_name(branch: &str) -> Result<String> {
