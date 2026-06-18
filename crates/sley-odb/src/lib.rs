@@ -1054,7 +1054,6 @@ fn compute_geometry_split(packs: &[GeometryPack], split_factor: u64) -> usize {
     // the progression in the heavy half, so absorb heavy-half packs until it
     // holds again.
     let mut total_size: u64 = packs[..split].iter().map(|p| p.weight).sum();
-    let mut split = split;
     for pack in &packs[split..] {
         if pack.weight < split_factor.saturating_mul(total_size) {
             split += 1;
