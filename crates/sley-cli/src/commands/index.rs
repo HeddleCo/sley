@@ -1655,6 +1655,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         .zip(path_modes.iter().copied())
         .map(|(path, mode)| sley_worktree::UpdateIndexPath { path, mode })
         .collect::<Vec<_>>();
+    if let Some(enabled) = untracked_cache {
+        if enabled {
+            sley_worktree::enable_untracked_cache(&worktree_root, &git_dir, format)?;
+        } else {
+            sley_worktree::disable_untracked_cache(&git_dir, format)?;
+        }
+    }
     if refresh {
         sley_worktree::refresh_index_paths(
             &worktree_root,
@@ -1726,12 +1733,6 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             &resolved_paths,
             assume_unchanged,
         )?;
-    } else if let Some(enabled) = untracked_cache {
-        if enabled {
-            sley_worktree::enable_untracked_cache(&worktree_root, &git_dir, format)?;
-        } else {
-            sley_worktree::disable_untracked_cache(&git_dir, format)?;
-        }
     } else if !ordered_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
         sley_worktree::update_index_ordered_paths_filtered(
