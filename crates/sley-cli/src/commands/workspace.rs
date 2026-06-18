@@ -23,6 +23,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
     let mut intent_to_add = false;
+    let mut no_auto_advance = false;
     // git's `reset --mixed` refreshes the index stat-cache by default; `--no-refresh`
     // leaves the freshly-restored entries stat-dirty so `git diff-files` shows them.
     let mut refresh = true;
@@ -48,6 +49,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
+            "--no-auto-advance" => no_auto_advance = true,
             // A whole-tree `--mixed` reset restores index entries with a zeroed
             // cached stat (see `restored_head_index_entry`). git refreshes them
             // by default (re-stat + clear the stat-dirty state for unchanged
@@ -108,6 +110,10 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     }
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if no_auto_advance {
+        eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
@@ -648,6 +654,8 @@ fn print_reset_unstaged_changes(
 pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut force = false;
+    let mut patch = false;
+    let mut no_auto_advance = false;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut positional = Vec::new();
@@ -659,6 +667,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
+            "-p" | "--patch" => patch = true,
+            "--no-patch" => patch = false,
+            "--no-auto-advance" => no_auto_advance = true,
             "--progress"
             | "--no-progress"
             | "--guess"
@@ -713,6 +724,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             value => positional.push(value.to_string()),
         }
+    }
+    if no_auto_advance && !patch {
+        eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
+        return Err(GitError::Exit(128));
     }
 
     let cwd = env::current_dir()?;
