@@ -16,6 +16,7 @@ usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
 pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut positionals = Vec::new();
     let mut quiet = false;
+    let mut recurse_submodules = false;
     let mut mode = ResetMode::Mixed;
     let mut parsing_options = true;
     let mut saw_separator = false;
@@ -101,7 +102,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             // stat-dirty so diff-files reports them `M` (t7102 cell 28).
             "--refresh" => refresh = true,
             "--no-refresh" => refresh = false,
-            "--no-recurse-submodules" => {}
+            "--recurse-submodules" => recurse_submodules = true,
+            "--no-recurse-submodules" => recurse_submodules = false,
             "--mixed" => mode = ResetMode::Mixed,
             "--soft" => mode = ResetMode::Soft,
             "--hard" => mode = ResetMode::Hard,
@@ -286,6 +288,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             Some(&head_tree),
             &target_tree,
             commands::read_tree::UnpackPorcelain::ReadTree,
+            recurse_submodules,
         )?;
         // git's second pass: `if (reset_type == KEEP && !err) reset_index(MIXED)`
         // — an index-only reset to the target tree, so the resulting index
@@ -734,6 +737,7 @@ fn print_reset_unstaged_changes(
 pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut force = false;
+    let mut recurse_submodules = false;
     let mut patch = false;
     let mut no_auto_advance = false;
     let mut unified_context = false;
@@ -792,11 +796,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
-            "--progress"
-            | "--no-progress"
-            | "--ignore-other-worktrees"
-            | "--no-ignore-other-worktrees"
-            | "--no-recurse-submodules" => {}
+            "--progress" | "--no-progress" | "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
+            "--recurse-submodules" => recurse_submodules = true,
+            "--no-recurse-submodules" => recurse_submodules = false,
             "--guess" => guess = Some(true),
             "--no-guess" => guess = Some(false),
             "-t" | "--track" | "--track=direct" => {
@@ -1112,7 +1114,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             ) {
                 Ok(_) => {}
                 Err(err) if checkout_is_dirty_tree_error(&err) => {
-                    checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid))?;
+                    checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid), recurse_submodules)?;
                     detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
                 }
                 Err(err) => return Err(err),
@@ -1166,7 +1168,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 ) {
                     Ok(_) => {}
                     Err(err) if checkout_is_dirty_tree_error(&err) => {
-                        checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid))?;
+                        checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid), recurse_submodules)?;
                         detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
                     }
                     Err(err) => return Err(err),
@@ -1326,7 +1328,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let from = checkout_reflog_from_name(&store);
             let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
                 .ok_or_else(|| GitError::reference_not_found("branch"))?;
-            checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target))?;
+            checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target), recurse_submodules)?;
             switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
         }
         Err(err) => return Err(err),
@@ -1558,7 +1560,7 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
         let git_dir = discover_git_dir(&cwd)?;
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
-        checkout_twoway_dirty(&git_dir, &worktree_root, format, None)?;
+        checkout_twoway_dirty(&git_dir, &worktree_root, format, None, false)?;
         checkout_switch_to_unborn_branch(&git_dir, branch)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !args.iter().any(|arg| arg == "-q" || arg == "--quiet") {
@@ -2030,6 +2032,7 @@ fn checkout_twoway_dirty(
     worktree_root: &Path,
     format: ObjectFormat,
     target: Option<&ObjectId>,
+    recurse_submodules: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
 
@@ -2056,6 +2059,7 @@ fn checkout_twoway_dirty(
         old_tree.as_ref(),
         &target_tree,
         commands::read_tree::UnpackPorcelain::Checkout,
+        recurse_submodules,
     )
 }
 

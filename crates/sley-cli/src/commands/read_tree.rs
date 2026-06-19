@@ -52,6 +52,7 @@ enum ReadTreeMode {
 struct ReadTreeArgs {
     mode: ReadTreeMode,
     update_worktree: bool,
+    recurse_submodules: bool,
     sparse_checkout: bool,
     empty: bool,
     /// git's `-n` / `--dry-run`: compute (and validate) the merge without
@@ -127,6 +128,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     db,
                     repo.config(),
                     &mut entries,
+                    parsed.recurse_submodules,
                 )?;
             }
             if !parsed.dry_run {
@@ -148,6 +150,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     db,
                     repo.config(),
                     &mut entries,
+                    parsed.recurse_submodules,
                 )?;
             }
             if !parsed.dry_run {
@@ -169,6 +172,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 repo.config(),
                 &tree_oids,
                 apply_worktree,
+                parsed.recurse_submodules,
             )?;
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
@@ -232,6 +236,7 @@ fn apply_read_tree_sparse_checkout(git_dir: &Path, format: ObjectFormat) -> Resu
 fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     let mut mode: Option<ReadTreeMode> = None;
     let mut update_worktree = false;
+    let mut recurse_submodules = false;
     let mut sparse_checkout = true;
     let mut empty = false;
     let mut dry_run = false;
@@ -252,6 +257,8 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             "-i" => {} // "don't check the working tree" — we already skip those checks.
             "--empty" => empty = true,
             "--no-empty" => empty = false,
+            "--recurse-submodules" => recurse_submodules = true,
+            "--no-recurse-submodules" => recurse_submodules = false,
             "--prefix" => {
                 let value = iter.next().ok_or_else(|| {
                     eprintln!("error: option `prefix' requires a value");
@@ -301,6 +308,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
         return Ok(ReadTreeArgs {
             mode,
             update_worktree,
+            recurse_submodules,
             sparse_checkout,
             empty,
             dry_run,
@@ -313,6 +321,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     Ok(ReadTreeArgs {
         mode,
         update_worktree,
+        recurse_submodules,
         sparse_checkout,
         empty,
         dry_run,
@@ -690,6 +699,9 @@ struct ReadTreeWorktree<'a> {
     /// `setup_unpack_trees_porcelain`). `read-tree` keeps its historic
     /// per-path messages; `checkout`/`switch` use the collected-path block.
     porcelain: UnpackPorcelain,
+    /// Whether tree application should run the submodule move-head mutation path
+    /// rather than only creating/removing the gitlink directory placeholder.
+    recurse_submodules: bool,
 }
 
 impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
@@ -903,7 +915,7 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
         mode: u32,
         oid: &ObjectId,
     ) -> Result<Option<sley_unpack_trees::StatInfo>> {
-        write_blob_to_worktree(
+        write_tree_entry_to_worktree(
             &self.worktree_root,
             &self.git_dir,
             self.format,
@@ -912,11 +924,27 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
             path,
             mode,
             oid,
+            self.recurse_submodules,
         )
     }
 
     fn remove_path(&mut self, path: &[u8]) -> Result<()> {
+        if self.recurse_submodules && self.path_is_configured_submodule(path) {
+            return remove_submodule_worktree(&self.worktree_root, &self.git_dir, path);
+        }
         remove_worktree_path(&self.worktree_root, path)
+    }
+}
+
+impl ReadTreeWorktree<'_> {
+    fn path_is_configured_submodule(&self, path: &[u8]) -> bool {
+        let Ok(path) = std::str::from_utf8(path) else {
+            return false;
+        };
+        self.submodules
+            .as_ref()
+            .and_then(|set| set.from_path(path))
+            .is_some()
     }
 }
 
@@ -956,6 +984,7 @@ pub(crate) fn checkout_two_way_engine(
     old_tree: Option<&ObjectId>,
     new_tree: &ObjectId,
     porcelain: UnpackPorcelain,
+    recurse_submodules: bool,
 ) -> Result<()> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
 
@@ -988,6 +1017,7 @@ pub(crate) fn checkout_two_way_engine(
         format,
         original_paths: original_index_paths(git_dir, format)?,
         porcelain,
+        recurse_submodules,
     };
 
     // git's `merge_working_tree` runs the merge to *populate the result* with
@@ -1037,6 +1067,7 @@ fn merge_trees(
     config: &GitConfig,
     tree_oids: &[ObjectId],
     update_worktree: bool,
+    recurse_submodules: bool,
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
 
@@ -1091,6 +1122,7 @@ fn merge_trees(
         format,
         original_paths: original_index_paths(git_dir, format)?,
         porcelain: UnpackPorcelain::ReadTree,
+        recurse_submodules,
     };
 
     let mut result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
@@ -1382,6 +1414,7 @@ fn update_worktree_for_entries(
     db: &FileObjectDatabase,
     config: &GitConfig,
     entries: &mut [(Vec<u8>, StagedEntry)],
+    recurse_submodules: bool,
 ) -> Result<()> {
     let original = current_index_stage0(git_dir, format)?;
     let mut written: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>> = BTreeMap::new();
@@ -1393,7 +1426,17 @@ fn update_worktree_for_entries(
         .map(|(path, entry)| (path.clone(), entry.mode, entry.oid))
         .collect();
     for (path, mode, oid) in plan {
-        let stat = write_blob_to_worktree(worktree_root, git_dir, format, db, config, &path, mode, &oid)?;
+        let stat = write_tree_entry_to_worktree(
+            worktree_root,
+            git_dir,
+            format,
+            db,
+            config,
+            &path,
+            mode,
+            &oid,
+            recurse_submodules,
+        )?;
         written.insert(path, stat);
     }
     for (path, entry) in entries.iter_mut() {
@@ -1416,6 +1459,7 @@ fn reset_worktree_to_entries(
     db: &FileObjectDatabase,
     config: &GitConfig,
     entries: &mut [(Vec<u8>, StagedEntry)],
+    recurse_submodules: bool,
 ) -> Result<()> {
     let target: BTreeSet<&Vec<u8>> = entries.iter().map(|(path, _)| path).collect();
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
@@ -1431,7 +1475,17 @@ fn reset_worktree_to_entries(
         .collect();
     let mut written: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>> = BTreeMap::new();
     for (path, mode, oid) in plan {
-        let stat = write_blob_to_worktree(worktree_root, git_dir, format, db, config, &path, mode, &oid)?;
+        let stat = write_tree_entry_to_worktree(
+            worktree_root,
+            git_dir,
+            format,
+            db,
+            config,
+            &path,
+            mode,
+            &oid,
+            recurse_submodules,
+        )?;
         written.insert(path, stat);
     }
     for (path, entry) in entries.iter_mut() {
@@ -1576,6 +1630,196 @@ fn write_blob_to_worktree(
     }
 
     Ok(Some(stat_info_from_lstat(&file_path)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_tree_entry_to_worktree(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    path: &[u8],
+    mode: u32,
+    oid: &ObjectId,
+    recurse_submodules: bool,
+) -> Result<Option<sley_unpack_trees::StatInfo>> {
+    if recurse_submodules && sley_index::is_gitlink(mode) {
+        checkout_submodule_to_commit(worktree_root, git_dir, format, path, oid)?;
+        return Ok(None);
+    }
+    write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, mode, oid)
+}
+
+fn checkout_submodule_to_commit(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    oid: &ObjectId,
+) -> Result<()> {
+    let Some(sub_root) = safe_worktree_path(worktree_root, path) else {
+        return Ok(());
+    };
+    let path_str = String::from_utf8_lossy(path);
+    let sub_git_dir = submodule_admin_git_dir(git_dir, &path_str);
+    if !sub_git_dir.is_dir() {
+        if sub_root.join(".git").is_dir() {
+            copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
+        } else {
+            eprintln!("fatal: could not get a repository handle for submodule '{path_str}'");
+            return Err(GitError::Exit(128));
+        }
+    }
+
+    fs::create_dir_all(&sub_root)?;
+    connect_submodule_worktree(&sub_root, &sub_git_dir, &path_str)?;
+
+    let sub_format = repository_object_format(&sub_git_dir).unwrap_or(format);
+    if let Err(_err) =
+        sley_worktree::reset_index_and_worktree_to_commit(&sub_root, &sub_git_dir, sub_format, oid)
+    {
+        eprintln!("fatal: Unable to checkout '{oid}' in submodule path '{path_str}'");
+        return Err(GitError::Exit(128));
+    }
+    fs::write(sub_git_dir.join("HEAD"), format!("{oid}\n"))?;
+
+    if let Some(nested) = load_superproject_submodules(&sub_root)
+        && let Ok(index) = sley_worktree::read_repository_index(&sub_git_dir, sub_format)
+    {
+        for entry in index
+            .into_iter()
+            .flat_map(|index| index.entries)
+            .filter(|entry| entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode))
+        {
+            let nested_path = entry.path.as_bytes();
+            let Ok(nested_path_str) = std::str::from_utf8(nested_path) else {
+                continue;
+            };
+            if nested.from_path(nested_path_str).is_some() {
+                checkout_submodule_to_commit(
+                    &sub_root,
+                    &sub_git_dir,
+                    sub_format,
+                    nested_path,
+                    &entry.oid,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) -> Result<()> {
+    let Some(sub_root) = safe_worktree_path(worktree_root, path) else {
+        return Ok(());
+    };
+    let path_str = String::from_utf8_lossy(path);
+    let sub_git_dir = submodule_admin_git_dir(git_dir, &path_str);
+    if sub_root.join(".git").is_dir() && !sub_git_dir.is_dir() {
+        copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
+    }
+    if sub_root.exists() {
+        fs::remove_dir_all(&sub_root)?;
+    }
+    unset_core_worktree(&sub_git_dir)?;
+    prune_empty_dirs(worktree_root, sub_root.parent());
+    Ok(())
+}
+
+fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
+    let mut path = super_git_dir.join("modules");
+    for component in name.split('/') {
+        if !component.is_empty() {
+            path.push(component);
+        }
+    }
+    path
+}
+
+fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path, path: &str) -> Result<()> {
+    fs::create_dir_all(sub_git_dir)?;
+    fs::write(sub_root.join(".git"), format!("gitdir: {}\n", sub_git_dir.display()))?;
+    set_core_worktree(sub_git_dir, &core_worktree_value(sub_root, path))?;
+    Ok(())
+}
+
+fn core_worktree_value(sub_root: &Path, path: &str) -> String {
+    if !path.contains('/') {
+        format!("../../../{path}")
+    } else {
+        sub_root.display().to_string()
+    }
+}
+
+fn set_core_worktree(git_dir: &Path, value: &str) -> Result<()> {
+    let config = git_dir.join("config");
+    let mut text = fs::read_to_string(&config).unwrap_or_default();
+    remove_config_key_in_place(&mut text, "core", "worktree");
+    if !text.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str("[core]\n");
+    text.push_str("\tworktree = ");
+    text.push_str(value);
+    text.push('\n');
+    fs::write(config, text)?;
+    Ok(())
+}
+
+fn unset_core_worktree(git_dir: &Path) -> Result<()> {
+    let config = git_dir.join("config");
+    let Ok(mut text) = fs::read_to_string(&config) else {
+        return Ok(());
+    };
+    remove_config_key_in_place(&mut text, "core", "worktree");
+    fs::write(config, text)?;
+    Ok(())
+}
+
+fn remove_config_key_in_place(text: &mut String, section: &str, key: &str) {
+    let mut current_section = String::new();
+    let mut out = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_ascii_lowercase();
+        }
+        let line_key = trimmed
+            .split_once('=')
+            .map(|(left, _)| left.trim().to_ascii_lowercase());
+        if current_section == section && line_key.as_deref() == Some(key) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    *text = out;
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// git's `fill_stat_cache_info`/`fill_stat_data`: `lstat` the just-written path
