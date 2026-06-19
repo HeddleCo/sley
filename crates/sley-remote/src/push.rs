@@ -940,6 +940,9 @@ pub struct PushReportRequest<'a> {
     /// is supplied via [`Self::force_with_lease`]; this flag only governs whether
     /// a lease was requested at all (used for the "no actual ref" diagnostics).
     pub force_with_lease_default: bool,
+    /// Receive-pack-side config values supplied by the invoked receive-pack
+    /// command, e.g. `--receive-pack="git -c receive.denyDeletes=false receive-pack"`.
+    pub receive_config_overrides: &'a [(String, String)],
 }
 
 /// Push to a local repository, returning git's per-ref status report instead of
@@ -1112,6 +1115,21 @@ fn classify_push_command(
         return Ok(PushRefStatus::UpToDate);
     }
 
+    if command.new_id.is_null() && !command.old_id.is_null() {
+        if receive_config_bool(config, request.receive_config_overrides, "denydeletes")
+            .unwrap_or(false)
+        {
+            return Ok(PushRefStatus::RemoteReject(
+                "deletion prohibited".to_string(),
+            ));
+        }
+        if receive_targets_current_branch(format, command, remote_git_dir)? {
+            return Ok(PushRefStatus::RemoteReject(
+                "deletion of the current branch prohibited".to_string(),
+            ));
+        }
+    }
+
     if !request.dry_run && receive_denies_current_branch(format, command, config, remote_git_dir)? {
         return Ok(PushRefStatus::RemoteReject(
             "branch is currently checked out".to_string(),
@@ -1138,6 +1156,23 @@ fn classify_push_command(
         return Ok(PushRefStatus::Ok);
     }
 
+    if command.name.starts_with("refs/heads/")
+        && !command.old_id.is_null()
+        && !command.new_id.is_null()
+        && !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?
+        && receive_config_bool(
+            config,
+            request.receive_config_overrides,
+            "denynonfastforwards",
+        )
+        .unwrap_or(false)
+    {
+        return Ok(PushRefStatus::RemoteReject(format!(
+            "denying non-fast-forward {} (you should pull first)",
+            command.name
+        )));
+    }
+
     // Non-fast-forward branch update: rejected unless forced. Creations,
     // deletions, and non-branch refs skip this gate (matching git's send-pack).
     if !plan.force
@@ -1152,12 +1187,28 @@ fn classify_push_command(
     Ok(PushRefStatus::Ok)
 }
 
+fn receive_config_bool(
+    config: &GitConfig,
+    overrides: &[(String, String)],
+    key: &str,
+) -> Option<bool> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| sley_config::parse_config_bool(value))
+        .or_else(|| config.get_bool("receive", None, key))
+}
+
 fn receive_denies_current_branch(
     format: ObjectFormat,
     command: &ReceivePackCommand,
     config: &GitConfig,
     remote_git_dir: &Path,
 ) -> Result<bool> {
+    if command.new_id.is_null() {
+        return Ok(false);
+    }
     if !command.name.starts_with("refs/heads/") {
         return Ok(false);
     }
@@ -1169,6 +1220,24 @@ fn receive_denies_current_branch(
         "true" | "yes" | "on" | "1" | "refuse"
     );
     if !denies {
+        return Ok(false);
+    }
+    if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
+        return Ok(false);
+    }
+    let store = FileRefStore::new(remote_git_dir, format);
+    Ok(matches!(
+        store.read_ref("HEAD")?,
+        Some(RefTarget::Symbolic(target)) if target == command.name
+    ))
+}
+
+fn receive_targets_current_branch(
+    format: ObjectFormat,
+    command: &ReceivePackCommand,
+    remote_git_dir: &Path,
+) -> Result<bool> {
+    if !command.name.starts_with("refs/heads/") {
         return Ok(false);
     }
     if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {

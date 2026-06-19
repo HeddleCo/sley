@@ -3719,6 +3719,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
     let mut all_refs = false;
     let mut quiet = false;
     let mut force_with_lease_specs: Vec<String> = Vec::new();
+    let mut receive_pack_command: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -3741,16 +3742,28 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
             value if value.starts_with("--force-with-lease=") => {
                 force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
             }
-            "--receive-pack" | "--exec" | "--remote" | "--push-option" => {
+            "--receive-pack" | "--exec" => {
+                receive_pack_command = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command(format!(
+                                "send-pack {} requires a value",
+                                arg.as_str()
+                            ))
+                        })?
+                        .to_string(),
+                );
+            }
+            "--remote" | "--push-option" => {
                 iter.next().ok_or_else(|| {
                     GitError::Command(format!("send-pack {} requires a value", arg.as_str()))
                 })?;
             }
-            value
-                if value.starts_with("--receive-pack=")
-                    || value.starts_with("--exec=")
-                    || value.starts_with("--remote=")
-                    || value.starts_with("--push-option=") => {}
+            value if value.starts_with("--receive-pack=") || value.starts_with("--exec=") => {
+                let (_, command) = value.split_once('=').unwrap_or((value, ""));
+                receive_pack_command = Some(command.to_string());
+            }
+            value if value.starts_with("--remote=") || value.starts_with("--push-option=") => {}
             "--" => {
                 positional.extend(iter.map(|value| value.to_string()));
                 break;
@@ -3829,6 +3842,8 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
 
     let force_with_lease =
         resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+    let receive_config_overrides =
+        receive_pack_config_overrides(receive_pack_command.as_deref());
     let options = PushOptions {
         quiet,
         set_upstream: false,
@@ -3849,6 +3864,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         atomic,
         force_with_lease: &force_with_lease,
         force_with_lease_default: false,
+        receive_config_overrides: &receive_config_overrides,
     })
 }
 
@@ -3870,6 +3886,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut all_refs = false;
     let mut tags = false;
     let mut prune = false;
+    let mut receive_pack_command: Option<String> = None;
     // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
     // bare flag (lease every pushed ref against its remote-tracking ref).
     let mut force_with_lease_default = false;
@@ -3910,15 +3927,25 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             value if value.starts_with("--force-with-lease=") => {
                 force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
             }
-            "--repo" | "--receive-pack" | "--exec" => {
+            "--repo" => {
                 iter.next().ok_or_else(|| {
                     GitError::Command(format!("push {} requires a value", arg.as_str()))
                 })?;
             }
-            value
-                if value.starts_with("--repo=")
-                    || value.starts_with("--receive-pack=")
-                    || value.starts_with("--exec=") => {}
+            "--receive-pack" | "--exec" => {
+                receive_pack_command = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command(format!("push {} requires a value", arg.as_str()))
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--receive-pack=") || value.starts_with("--exec=") => {
+                let (_, command) = value.split_once('=').unwrap_or((value, ""));
+                receive_pack_command = Some(command.to_string());
+            }
+            value if value.starts_with("--repo=") => {}
             "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
@@ -4064,6 +4091,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         }
         let force_with_lease =
             resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+        let receive_config_overrides =
+            receive_pack_config_overrides(receive_pack_command.as_deref());
         return run_push_local_report(RunPushLocalReport {
             git_dir: &git_dir,
             common_git_dir: &common_git_dir,
@@ -4077,6 +4106,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             atomic,
             force_with_lease: &force_with_lease,
             force_with_lease_default,
+            receive_config_overrides: &receive_config_overrides,
         });
     }
 
@@ -4182,6 +4212,41 @@ fn resolve_force_with_lease(
         out.push((dst, expected));
     }
     Ok(out)
+}
+
+fn receive_pack_config_overrides(command: Option<&str>) -> Vec<(String, String)> {
+    let Some(command) = command else {
+        return Vec::new();
+    };
+    let mut overrides = Vec::new();
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let Some(raw) = token
+            .strip_prefix("-c")
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                if token == "-c" {
+                    tokens.next().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        else {
+            continue;
+        };
+        let Some((key, value)) = raw.split_once('=') else {
+            continue;
+        };
+        let Some(receive_key) = key.trim().strip_prefix("receive.") else {
+            continue;
+        };
+        overrides.push((
+            receive_key.to_string(),
+            value.trim().trim_matches('"').to_string(),
+        ));
+    }
+    overrides
 }
 
 fn default_head_push_destinations(store: &FileRefStore, refspecs: &mut [String]) -> Result<()> {
@@ -4295,6 +4360,7 @@ struct RunPushLocalReport<'a> {
     atomic: bool,
     force_with_lease: &'a [(String, Option<ObjectId>)],
     force_with_lease_default: bool,
+    receive_config_overrides: &'a [(String, String)],
 }
 
 /// Drive a file:// push through [`sley_remote::push_local_with_report`], render
@@ -4302,6 +4368,7 @@ struct RunPushLocalReport<'a> {
 /// and return the git exit code (1 when any ref was rejected).
 fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
+    trace_local_receive_pack_advertisement(req.remote_git_dir, req.format);
     let push_negotiate = config
         .get_bool("push", None, "negotiate")
         .unwrap_or(false);
@@ -4325,6 +4392,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             dry_run: true,
             force_with_lease: req.force_with_lease,
             force_with_lease_default: req.force_with_lease_default,
+            receive_config_overrides: req.receive_config_overrides,
         },
         &config,
     )?;
@@ -4402,6 +4470,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 dry_run: false,
                 force_with_lease: req.force_with_lease,
                 force_with_lease_default: req.force_with_lease_default,
+                receive_config_overrides: req.receive_config_overrides,
             },
             &config,
         )?
@@ -4423,6 +4492,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             }
             trace2_push_wrote(5);
         }
+        run_local_receive_pack_auto_gc(req.remote_git_dir);
     }
 
     if pre_receive_declined {
@@ -4511,6 +4581,145 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn trace_local_receive_pack_advertisement(remote_git_dir: &Path, format: ObjectFormat) {
+    let Some(mut sink) = packet_trace_file() else {
+        return;
+    };
+    let store = FileRefStore::new(remote_git_dir, format);
+    let Ok(refs) = store.list_refs() else {
+        return;
+    };
+    let mut local_oids = std::collections::HashSet::new();
+    for reference in refs {
+        let Some(oid) = resolve_local_ref_target(&store, &reference).ok().flatten()
+        else {
+            continue;
+        };
+        local_oids.insert(oid);
+        let _ = writeln!(sink, "packet:         push< {oid} {}", reference.name);
+    }
+    trace_alternate_have_advertisements(remote_git_dir, format, &local_oids, &mut sink);
+    let _ = writeln!(sink, "packet:         push< 0000");
+}
+
+fn packet_trace_file() -> Option<fs::File> {
+    let value = env::var("GIT_TRACE_PACKET").ok()?;
+    if matches!(value.as_str(), "" | "0" | "false" | "FALSE") {
+        return None;
+    }
+    if matches!(value.as_str(), "1" | "2" | "true" | "TRUE") {
+        return None;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(value)
+        .ok()
+}
+
+fn trace_alternate_have_advertisements(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    local_oids: &std::collections::HashSet<ObjectId>,
+    sink: &mut fs::File,
+) {
+    let alternates = remote_git_dir.join("objects/info/alternates");
+    let Ok(text) = fs::read_to_string(alternates) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let objects_dir = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            remote_git_dir.join("objects").join(line)
+        };
+        let Some(alternate_git_dir) = objects_dir.parent() else {
+            continue;
+        };
+        let store = FileRefStore::new(alternate_git_dir, format);
+        let Ok(refs) = store.list_refs() else {
+            continue;
+        };
+        for reference in refs {
+            let Some(oid) = resolve_local_ref_target(&store, &reference).ok().flatten()
+            else {
+                continue;
+            };
+            if local_oids.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            let _ = writeln!(sink, "packet:         push< {oid} .have");
+        }
+    }
+}
+
+fn resolve_local_ref_target(
+    store: &FileRefStore,
+    reference: &sley_refs::Ref,
+) -> Result<Option<ObjectId>> {
+    let mut target = reference.target.clone();
+    for _ in 0..5 {
+        match target {
+            RefTarget::Direct(oid) => return Ok(Some(oid)),
+            RefTarget::Symbolic(name) => {
+                let Some(next) = store.read_ref(&name)? else {
+                    return Ok(None);
+                };
+                target = next;
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn run_local_receive_pack_auto_gc(remote_git_dir: &Path) {
+    let config = read_repo_config_on_disk(remote_git_dir).unwrap_or_default();
+    if config.get_bool("maintenance", None, "auto") == Some(false) {
+        return;
+    }
+    prune_stale_object_tempfiles(remote_git_dir);
+}
+
+fn prune_stale_object_tempfiles(remote_git_dir: &Path) {
+    let objects_dir = remote_git_dir.join("objects");
+    let Ok(entries) = fs::read_dir(objects_dir) else {
+        return;
+    };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    const TWO_WEEKS_SECS: u64 = 14 * 24 * 60 * 60;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("tmp_") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(modified) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        if now.as_secs().saturating_sub(modified.as_secs()) >= TWO_WEEKS_SECS {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn push_warns_current_branch(
