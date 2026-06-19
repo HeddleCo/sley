@@ -3574,9 +3574,18 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 "push --delete requires at least one ref".into(),
             ));
         }
+        let specs = if names.first().is_some_and(|name| name == "tag") {
+            names
+                .iter()
+                .skip(1)
+                .map(|name| format!(":refs/tags/{name}"))
+                .collect()
+        } else {
+            names.iter().map(|refspec| format!(":{refspec}")).collect()
+        };
         (
             remote.clone(),
-            names.iter().map(|refspec| format!(":{refspec}")).collect(),
+            specs,
         )
     } else if mirror {
         // `--mirror`: push every local ref to the same name, mirroring; the
