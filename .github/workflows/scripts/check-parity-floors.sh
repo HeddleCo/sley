@@ -487,7 +487,7 @@ declare -A FLOOR=(
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
     [t3404-rebase-interactive.sh]=80
     [t3406-rebase-message.sh]=32
-    [t3418-rebase-continue.sh]=11
+    [t3418-rebase-continue.sh]=12
     [t3420-rebase-autostash.sh]=40
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
@@ -703,6 +703,11 @@ declare -A FLOOR=(
     [t2013-checkout-submodule.sh]=23
     [t7112-reset-submodule.sh]=25
     [t6438-submodule-directory-file-conflicts.sh]=32
+    # wave-12 Batch B (rebasemerges, integ/wave12B onto 81856328): --rebase-merges
+    # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
+    # t3404 held 80, t3418 11->12; cross-guard t5520-pull held 75 (pull-rebase now
+    # routes through the rewritten rebase.rs) and t6132 held 23 (log.rs/lib.rs merge).
+    [t3430-rebase-merges.sh]=17
 )
 
 fail=0
