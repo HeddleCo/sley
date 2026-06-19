@@ -6320,6 +6320,7 @@ fn commit_graph_commit_time_from_committer(committer: &[u8]) -> Result<u64> {
 
 fn cmd_bundle_create(args: &[String]) -> Result<()> {
     let mut quiet = false;
+    let mut progress = false;
     let mut version = None;
     let mut path = None::<String>;
     let mut rev_args = Vec::new();
@@ -6331,7 +6332,10 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
         }
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
-            "--progress" | "--all-progress" | "--all-progress-implied" | "--no-quiet" => {}
+            "--progress" | "--all-progress" | "--all-progress-implied" | "--no-quiet" => {
+                progress = true
+            }
+            "--no-progress" => progress = false,
             "--version" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("bundle create --version requires a value".into())
@@ -6349,7 +6353,6 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
             value => path = Some(value.to_string()),
         }
     }
-    let _ = quiet;
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_CREATE_USAGE);
     };
@@ -6410,6 +6413,10 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
         io::stdout().write_all(&bytes)?;
     } else {
         fs::write(path, bytes)?;
+    }
+    if progress && !quiet {
+        let count = bundle.references.len();
+        eprintln!("Writing objects: 100% ({count}/{count}), done.");
     }
     Ok(())
 }
@@ -6731,11 +6738,13 @@ fn bundle_create_selection(
         )?;
     }
 
-    let excluded_objects = collect_reachable_object_ids(db, format, excludes.iter().copied())?;
+    let user_excluded_objects = collect_reachable_object_ids(db, format, excludes.iter().copied())?;
     let mut references =
-        filter_bundle_references(git_dir, format, db, includes, options, &excluded_objects)?;
+        filter_bundle_references(git_dir, format, db, includes, options, &user_excluded_objects)?;
     dedupe_bundle_references(&mut references);
     let starts = references.iter().map(|reference| reference.oid).collect::<Vec<_>>();
+    excludes.extend(bundle_limit_excludes(db, format, &starts, options)?);
+    let excluded_objects = collect_reachable_object_ids(db, format, excludes.iter().copied())?;
     let mut prerequisites = bundle_boundary_prerequisites(db, format, &starts, &excluded_objects)?;
     order_bundle_prerequisites(db, format, &mut prerequisites, &excludes);
     Ok(BundleCreateSelection {
@@ -6972,12 +6981,60 @@ fn bundle_boundary_prerequisites(
             }
             ObjectType::Tag => {
                 let tag = Tag::parse_ref(format, &object.body)?;
-                pending.push_back(tag.object);
+                if !excluded_objects.contains(&tag.object) {
+                    pending.push_back(tag.object);
+                }
             }
             _ => {}
         }
     }
     Ok(prerequisites)
+}
+
+fn bundle_limit_excludes(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: &[ObjectId],
+    options: &BundleRevisionOptions,
+) -> Result<Vec<ObjectId>> {
+    let mut excludes = Vec::new();
+    let mut seen = HashSet::new();
+    if options.max_count.is_some() {
+        for oid in starts {
+            let object = db.read_object(oid)?;
+            if object.object_type != ObjectType::Commit {
+                continue;
+            }
+            for parent in Commit::parse_ref(format, &object.body)?.parents {
+                if seen.insert(parent) {
+                    excludes.push(parent);
+                }
+            }
+        }
+    }
+    if let Some(since) = options.since {
+        let mut pending = VecDeque::from(starts.to_vec());
+        while let Some(oid) = pending.pop_front() {
+            let object = db.read_object(&oid)?;
+            match object.object_type {
+                ObjectType::Commit => {
+                    if bundle_object_timestamp(db, format, &oid).is_some_and(|time| time <= since)
+                    {
+                        if seen.insert(oid) {
+                            excludes.push(oid);
+                        }
+                        continue;
+                    }
+                    for parent in Commit::parse_ref(format, &object.body)?.parents {
+                        pending.push_back(parent);
+                    }
+                }
+                ObjectType::Tag => {}
+                _ => {}
+            }
+        }
+    }
+    Ok(excludes)
 }
 
 fn order_bundle_prerequisites(
