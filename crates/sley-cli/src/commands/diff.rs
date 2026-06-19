@@ -126,12 +126,13 @@ fn diff_split_revisions(
     {
         return diff_usage_error();
     }
-    // Otherwise peel up to two leading args that each resolve as a revision.
+    // Otherwise peel up to three leading args that each resolve as a revision.
+    // The three-tree form is a combined diff: result parent1 parent2.
     let mut trees = Vec::new();
     let mut rest = Vec::new();
     let mut iter = path_args.into_iter();
     for token in iter.by_ref() {
-        if trees.len() < 2
+        if trees.len() < 3
             && let Ok(tree) = diff_peel_rev_tree(git_dir, format, db, &token)
         {
             trees.push(tree);
@@ -808,6 +809,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         exit_code,
         allow_external,
         output,
+        line_prefix,
         compact_summary,
         stat_count,
         stat_widths,
@@ -842,6 +844,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         word_diff_mode,
         word_diff_regex,
         no_index,
+        combined,
         mut diff_relative,
         diff_relative_explicit,
         mut src_prefix,
@@ -1177,6 +1180,31 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
         DiffPathspec::new(&cwd, &worktree_root, &path_args)?
     };
+    if diff_trees.len() == 3 {
+        let has_differences = write_diff_combined_three_tree(
+            &db,
+            format,
+            &diff_trees,
+            &pathspec,
+            CombinedDiffOptions {
+                dense: combined.unwrap_or(true),
+                output_format,
+                patch_abbrev,
+                raw_abbrev,
+                z,
+                src_prefix: &src_prefix,
+                dst_prefix: &dst_prefix,
+                context: patch_context,
+                ws_ignore,
+                diff_algorithm,
+                line_prefix: line_prefix.as_deref(),
+            },
+        )?;
+        if (quiet || exit_code) && has_differences {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
     let name_status_options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
@@ -1494,7 +1522,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     }
     if !quiet && !no_patch {
-        let mut stdout = io::stdout();
+        let mut stdout = Vec::new();
         let show_raw = raw && !name_only && !name_status;
         let show_numstat = numstat && !name_only && !name_status;
         let show_stat = (stat || compact_summary) && !name_only && !name_status;
@@ -1748,9 +1776,128 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 }
             }
         }
+        let mut output = io::stdout();
+        if let Some(prefix) = line_prefix.as_deref() {
+            write_line_prefixed(&mut output, &stdout, prefix.as_bytes())?;
+        } else {
+            output.write_all(&stdout)?;
+        }
     }
     if (quiet || exit_code) && has_differences {
         return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+struct CombinedDiffOptions<'a> {
+    dense: bool,
+    output_format: commands::diff_options::DiffOutputFormat,
+    patch_abbrev: usize,
+    raw_abbrev: Option<usize>,
+    z: bool,
+    src_prefix: &'a str,
+    dst_prefix: &'a str,
+    context: usize,
+    ws_ignore: sley_diff_merge::WsIgnore,
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    line_prefix: Option<&'a str>,
+}
+
+fn write_diff_combined_three_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    trees: &[ObjectId],
+    pathspec: &DiffPathspec,
+    options: CombinedDiffOptions<'_>,
+) -> Result<bool> {
+    let parent_trees = [trees[1], trees[2]];
+    let mut paths = commands::combined::combined_paths(db, format, &trees[0], &parent_trees)?;
+    paths.retain(|path| pathspec.matches(&path.path));
+    if paths.is_empty() {
+        return Ok(false);
+    }
+
+    let name_status = options
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
+    let name_only = options
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
+    let raw = options
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::RAW);
+    let patch = options
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::PATCH);
+    let no_output = options
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
+    let no_output_mode = !raw && !name_status && !name_only && !patch && !no_output;
+    let show_patch = !name_status && !name_only && (patch || no_output_mode);
+
+    let render_ctx = commands::combined::CombinedRenderCtx {
+        db,
+        format,
+        dense: options.dense,
+        all_paths: false,
+        context: options.context,
+        ws_ignore: options.ws_ignore,
+        diff_algorithm: options.diff_algorithm,
+        src_prefix: options.src_prefix,
+        dst_prefix: options.dst_prefix,
+        patch_abbrev: options.patch_abbrev,
+        raw_abbrev: options.raw_abbrev,
+    };
+    let mut out = Vec::new();
+    if raw && !name_status && !name_only {
+        for path in &paths {
+            commands::combined::write_combined_raw(&mut out, &render_ctx, path, options.z)?;
+        }
+    }
+    if name_status {
+        for path in &paths {
+            commands::combined::write_combined_name_status(&mut out, path, options.z)?;
+        }
+    }
+    if name_only {
+        for path in &paths {
+            if options.z {
+                out.write_all(&path.path)?;
+                out.write_all(b"\0")?;
+            } else {
+                writeln!(out, "{}", status_quote_path(&path.path, false))?;
+            }
+        }
+    }
+    if show_patch {
+        if raw {
+            writeln!(out)?;
+        }
+        for path in &paths {
+            commands::combined::write_combined_patch(&mut out, &render_ctx, path)?;
+        }
+    }
+
+    let mut stdout = io::stdout();
+    if let Some(prefix) = options.line_prefix {
+        write_line_prefixed(&mut stdout, &out, prefix.as_bytes())?;
+    } else {
+        stdout.write_all(&out)?;
+    }
+    Ok(!out.is_empty())
+}
+
+fn write_line_prefixed(stdout: &mut dyn Write, bytes: &[u8], prefix: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut at_line_start = true;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if at_line_start {
+            stdout.write_all(prefix)?;
+        }
+        stdout.write_all(line)?;
+        at_line_start = line.ends_with(b"\n");
     }
     Ok(())
 }
