@@ -113,6 +113,14 @@ fn packet_trace(data: &[u8], is_write: bool) {
     let _ = sink.flush();
 }
 
+pub fn trace_packet_read_payload(payload: &[u8]) {
+    packet_trace(payload, false);
+}
+
+pub fn trace_packet_write_payload(payload: &[u8]) {
+    packet_trace(payload, true);
+}
+
 /// Trace a frame on the wire. Flush/delim/response-end map to their 4-byte
 /// tokens (`0000`/`0001`/`0002`) like git, data frames to their payload.
 fn packet_trace_frame(frame: &PktLineFrame, is_write: bool) {
@@ -2331,9 +2339,10 @@ pub fn parse_protocol_v2_command_request(
             }
             PktLineFrame::Delimiter => {
                 if in_arguments {
-                    return Err(GitError::InvalidFormat(
-                        "protocol v2 command request has duplicate delimiter".into(),
-                    ));
+                    return Err(GitError::InvalidFormat(format!(
+                        "expected flush after {} arguments",
+                        command
+                    )));
                 }
                 if saw_flush {
                     return Err(GitError::InvalidFormat(
@@ -2432,7 +2441,31 @@ pub fn write_protocol_v2_request(
 pub fn read_protocol_v2_command_request(
     reader: &mut impl Read,
 ) -> Result<ProtocolV2CommandRequest> {
-    let frames = read_pkt_line_frames_until_flush(reader)?;
+    let mut frames = Vec::new();
+    loop {
+        let Some(frame) = read_pkt_line_frame(reader)? else {
+            if let Some(command) = frames.first().and_then(|frame| match frame {
+                PktLineFrame::Data(payload) => parse_protocol_v2_command_line(payload).ok(),
+                _ => None,
+            }) && frames
+                .iter()
+                .any(|frame| matches!(frame, PktLineFrame::Delimiter))
+            {
+                return Err(GitError::InvalidFormat(format!(
+                    "expected flush after {} arguments",
+                    command
+                )));
+            }
+            return Err(GitError::InvalidFormat(
+                "pkt-line stream ended before control packet".into(),
+            ));
+        };
+        let done = matches!(frame, PktLineFrame::Flush);
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
     parse_protocol_v2_command_request(&frames)
 }
 
@@ -4305,9 +4338,7 @@ pub fn parse_upload_pack_features(capabilities: &[Capability]) -> Result<UploadP
             }
             "symref" => {
                 let Some(symref) = &capability.value else {
-                    return Err(GitError::InvalidFormat(
-                        "upload-pack symref capability is missing value".into(),
-                    ));
+                    continue;
                 };
                 validate_capability_field("upload-pack symref", symref)?;
                 features.symrefs.push(symref.clone());

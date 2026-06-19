@@ -23,7 +23,7 @@ use sley_pathspec::{
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
     RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, read_fetch_head,
-    read_receive_pack_push_options, read_receive_pack_request,
+    read_receive_pack_push_options, read_receive_pack_request, read_ref_advertisement_set,
     read_upload_pack_negotiation_request, read_upload_pack_request, refspec_map_source,
     write_receive_pack_report_status, write_ref_advertisement_set,
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,

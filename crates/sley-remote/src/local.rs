@@ -1286,8 +1286,20 @@ pub fn serve_upload_pack_v2(
     writer.flush()?;
 
     // EOF / a lone flush after the advertisement ends the session: the client
-    // disconnected (e.g. `ls-remote` reads the refs and leaves).
-    while let Ok(request) = read_protocol_v2_command_request(reader) {
+    // disconnected (e.g. `ls-remote` reads the refs and leaves). Malformed
+    // requests after a command line are protocol violations and must fail
+    // visibly instead of being treated as a clean disconnect.
+    loop {
+        let request = match read_protocol_v2_command_request(reader) {
+            Ok(request) => request,
+            Err(GitError::InvalidFormat(message))
+                if message == "pkt-line stream ended before control packet"
+                    || message == "protocol v2 command request must start with a command line" =>
+            {
+                break;
+            }
+            Err(err) => return Err(err),
+        };
         match request.command.as_str() {
             "ls-refs" => {
                 let ls_refs = ProtocolV2LsRefsRequest::from_command_request(&request)?;

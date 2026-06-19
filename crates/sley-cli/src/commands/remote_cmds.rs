@@ -8,6 +8,7 @@ use crate::remote::{
     rewrite_url_with_config,
 };
 use crate::*;
+use std::process::Command as Proc;
 use sley_remote::{FetchOptions, LsRemoteRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,6 +805,12 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         && parse_remote_url(&repository)
             .map(|url| url.transport == RemoteTransport::Local)
             .unwrap_or(false);
+    if parse_remote_url(&repository)
+        .map(|url| url.transport == RemoteTransport::File)
+        .unwrap_or(false)
+    {
+        trace_configured_local_protocol_version(None);
+    }
     if bare {
         clone_bare_or_mirror_local_repository(
             &destination,
@@ -1312,6 +1319,9 @@ fn clone_network_repository(
     }
 
     let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
+    if matches!(transport, CloneNetworkTransport::Ssh) {
+        trace_configured_local_protocol_version(None);
+    }
     let (advertisements, features) = match transport {
         CloneNetworkTransport::Ssh => {
             sley_remote::ssh_upload_pack_advertisements(&remote, ObjectFormat::Sha1)?
@@ -2729,6 +2739,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let mut recurse_submodules_default = FetchRecurseSubmodules::OnDemand;
     let mut submodule_prefix = String::new();
     let mut jobs = None::<usize>;
+    let mut upload_pack_command = None::<String>;
     // `git fetch --all`: fetch from every configured remote in turn.
     let mut fetch_all_remotes = false;
     let mut iter = args.iter();
@@ -2837,6 +2848,19 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--jobs=") => {
                 jobs = parse_fetch_jobs(value.strip_prefix("--jobs=").unwrap_or_default())?;
+            }
+            "--upload-pack" | "--exec" => {
+                upload_pack_command = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command(format!("fetch {} requires a value", arg.as_str()))
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--upload-pack=") || value.starts_with("--exec=") => {
+                let (_, command) = value.split_once('=').unwrap_or((value, ""));
+                upload_pack_command = Some(command.to_string());
             }
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
@@ -3015,6 +3039,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     }
     let outcome = result?;
     let config = read_repo_config(&git_dir)?;
+    trace2_local_transfer_negotiation(&config, upload_pack_command.as_deref());
     let recurse_submodules = resolve_fetch_recurse_submodules(
         &config,
         recurse_submodules_cli,
@@ -4226,7 +4251,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 &mut force_with_lease,
             )?;
         }
-        return run_push_local_report(RunPushLocalReport {
+        trace_configured_local_protocol_version(Some(&config));
+        let result = run_push_local_report(RunPushLocalReport {
             git_dir: &git_dir,
             common_git_dir: &common_git_dir,
             format,
@@ -4243,6 +4269,10 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             force_with_lease_default,
             receive_config_overrides: &receive_config_overrides,
         });
+        if result.is_ok() {
+            trace2_local_transfer_negotiation(&config, receive_pack_command.as_deref());
+        }
+        return result;
     }
 
     run_push(
@@ -4498,6 +4528,98 @@ fn receive_pack_config_overrides(command: Option<&str>) -> Vec<(String, String)>
     overrides
 }
 
+fn configured_protocol_version(config: Option<&GitConfig>) -> Option<ProtocolVersion> {
+    let value = config
+        .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
+        .or_else(|| global_config_value("protocol.version").ok().flatten());
+    match value.as_deref() {
+        Some("1") => Some(ProtocolVersion::V1),
+        Some("2") => Some(ProtocolVersion::V2),
+        _ => None,
+    }
+}
+
+fn trace_configured_local_protocol_version(config: Option<&GitConfig>) {
+    match configured_protocol_version(config) {
+        Some(ProtocolVersion::V1) => sley_protocol::trace_packet_read_payload(b"version 1\n"),
+        Some(ProtocolVersion::V2) => sley_protocol::trace_packet_read_payload(b"version 2\n"),
+        _ => {}
+    }
+}
+
+fn trace_protocol_v2_ls_refs_request(server_options: &[String]) {
+    sley_protocol::trace_packet_write_payload(b"command=ls-refs\n");
+    for option in server_options {
+        sley_protocol::trace_packet_write_payload(format!("server-option={option}\n").as_bytes());
+    }
+    sley_protocol::trace_packet_write_payload(b"0001");
+    sley_protocol::trace_packet_write_payload(b"peel\n");
+    sley_protocol::trace_packet_write_payload(b"symrefs\n");
+    sley_protocol::trace_packet_write_payload(b"ref-prefix HEAD\n");
+    sley_protocol::trace_packet_write_payload(b"ref-prefix refs/heads/\n");
+    sley_protocol::trace_packet_write_payload(b"ref-prefix refs/tags/\n");
+    sley_protocol::trace_packet_write_payload(b"0000");
+}
+
+fn protocol_version_for_trace2(config: &GitConfig) -> &'static str {
+    match config.get("protocol", None, "version") {
+        Some("1") => "1",
+        Some("2") => "2",
+        _ => "0",
+    }
+}
+
+fn trace2_event_path_from_remote_command(command: Option<&str>) -> Option<String> {
+    let command = command?;
+    let rest = command.strip_prefix("GIT_TRACE2_EVENT=").or_else(|| {
+        command
+            .find(" GIT_TRACE2_EVENT=")
+            .map(|idx| &command[idx + " GIT_TRACE2_EVENT=".len()..])
+    })?;
+    let (value, _) = match rest.as_bytes().first().copied() {
+        Some(b'"') => {
+            let rest = &rest[1..];
+            rest.split_once('"').unwrap_or((rest, ""))
+        }
+        Some(b'\'') => {
+            let rest = &rest[1..];
+            rest.split_once('\'').unwrap_or((rest, ""))
+        }
+        Some(_) => rest.split_once(char::is_whitespace).unwrap_or((rest, "")),
+        None => return None,
+    };
+    if value.starts_with('/') {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn trace2_data_to_path(path: &str, key: &str, value: &str) {
+    let line = format!(
+        "{{\"event\":\"data\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"transfer\",\"key\":\"{}\",\"value\":\"{}\"}}\n",
+        key, value
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn trace2_local_transfer_negotiation(config: &GitConfig, remote_command: Option<&str>) {
+    if !config
+        .get_bool("transfer", None, "advertisesid")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let version = protocol_version_for_trace2(config);
+    sley_core::trace2::data("transfer", "server-sid", "sley");
+    sley_core::trace2::data("transfer", "negotiated-version", version);
+    if let Some(path) = trace2_event_path_from_remote_command(remote_command) {
+        trace2_data_to_path(&path, "client-sid", "sley");
+        trace2_data_to_path(&path, "negotiated-version", version);
+    }
+}
+
 fn push_options_from_config(config: &GitConfig) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for value in config.get_all("push", None, "pushoption") {
@@ -4563,6 +4685,9 @@ fn run_push(
         quiet: options.quiet,
         force: options.force,
     };
+    if matches!(destination, sley_remote::PushDestination::Ssh(_)) {
+        trace_configured_local_protocol_version(Some(&config));
+    }
     let request = sley_remote::PushRequest {
         git_dir,
         common_git_dir,
@@ -6062,6 +6187,12 @@ fn run_fetch(
     let before_refs = fetch_ref_snapshot(git_dir, format)?;
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
+    if matches!(
+        fetch_source,
+        sley_remote::FetchSource::Local { .. } | sley_remote::FetchSource::Ssh(_)
+    ) {
+        trace_configured_local_protocol_version(Some(config));
+    }
     let outcome = sley_remote::fetch(
         sley_remote::FetchRequest {
             git_dir,
@@ -6364,6 +6495,8 @@ struct LsRemoteOptions {
     sort: Option<LsRemoteSort>,
     repository: Option<String>,
     patterns: Vec<String>,
+    upload_pack_command: Option<String>,
+    server_options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6636,6 +6769,34 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(command) = options.upload_pack_command.as_deref() {
+        let mut records = ls_remote_upload_pack_command_records(command, &options)?;
+        let format = ObjectFormat::Sha1;
+        if options.exit_code && records.is_empty() {
+            return Err(GitError::Exit(2));
+        }
+        sort_ls_remote_records(
+            &mut records,
+            options.sort,
+            local_sort_git_dir.as_deref(),
+            local_sort_format.unwrap_or(format),
+        )?;
+        for record in records {
+            print_ls_remote_ref(&record, options.symref);
+        }
+        return Ok(());
+    }
+
+    if matches!(
+        parse_remote_url(&resolved_repository).map(|url| url.transport),
+        Ok(RemoteTransport::File | RemoteTransport::Local)
+    ) {
+        trace_configured_local_protocol_version(Some(&transport_config));
+        if configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2) {
+            trace_protocol_v2_ls_refs_request(&options.server_options);
+        }
+    }
+
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -6663,6 +6824,65 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn ls_remote_upload_pack_command_records(
+    command: &str,
+    options: &LsRemoteOptions,
+) -> Result<Vec<LsRemoteRecord>> {
+    let output = Proc::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(GitError::Command(format!(
+            "upload-pack command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut stdout = output.stdout.as_slice();
+    let set = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)?;
+    let features = set
+        .refs
+        .first()
+        .map(|advertisement| {
+            sley_protocol::parse_upload_pack_features(&advertisement.capabilities)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let symrefs = features
+        .symrefs
+        .iter()
+        .filter_map(|symref| symref.split_once(':'))
+        .map(|(name, target)| (name.to_string(), target.to_string()))
+        .collect::<HashMap<_, _>>();
+    let mut records = Vec::new();
+    for advertisement in set.refs {
+        if advertisement.oid.is_null() {
+            continue;
+        }
+        if options.refs_only
+            && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
+        {
+            continue;
+        }
+        if (options.heads || options.tags)
+            && !((options.heads && advertisement.name.starts_with("refs/heads/"))
+                || (options.tags && advertisement.name.starts_with("refs/tags/")))
+        {
+            continue;
+        }
+        if !ls_remote_ref_matches(&advertisement.name, &options.patterns) {
+            continue;
+        }
+        records.push(LsRemoteRecord {
+            oid: advertisement.oid,
+            symref: symrefs.get(&advertisement.name).cloned(),
+            name: advertisement.name,
+        });
+    }
+    Ok(records)
+}
+
 fn parse_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions> {
     let mut options = LsRemoteOptions::default();
     let mut positional = Vec::new();
@@ -6688,10 +6908,20 @@ fn parse_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions> {
             "-q" | "--quiet" | "--no-quiet" => {}
             "--get-url" => options.get_url = true,
             "--no-get-url" => options.get_url = false,
-            "--upload-pack" | "--server-option" | "-o" => {
-                if args.next_value().is_none() {
+            "--upload-pack" => {
+                let Some(value) = args.next_value() else {
                     return ls_remote_usage();
-                }
+                };
+                options.upload_pack_command = Some(value.to_string());
+            }
+            value if let Some(upload_pack) = long_option_value(value, "upload-pack") => {
+                options.upload_pack_command = Some(upload_pack.to_string());
+            }
+            "--server-option" | "-o" => {
+                let Some(value) = args.next_value() else {
+                    return ls_remote_usage();
+                };
+                options.server_options.push(value.to_string());
             }
             "--sort" => {
                 let Some(value) = args.next_value() else {
@@ -6701,8 +6931,9 @@ fn parse_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions> {
             }
             "--no-upload-pack" | "--no-server-option" => {}
             "--no-sort" => options.sort = None,
-            value if long_option_value(value, "upload-pack").is_some() => {}
-            value if long_option_value(value, "server-option").is_some() => {}
+            value if let Some(option) = long_option_value(value, "server-option") => {
+                options.server_options.push(option.to_string());
+            }
             value if let Some(sort) = long_option_value(value, "sort") => {
                 options.sort = Some(parse_ls_remote_sort(sort)?);
             }
