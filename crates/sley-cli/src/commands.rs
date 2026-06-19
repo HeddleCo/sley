@@ -38,6 +38,7 @@ pub(crate) mod hash_object_fsck;
 pub(crate) mod hooks;
 pub(crate) mod index;
 pub(crate) mod interpret_trailers;
+pub(crate) mod last_modified;
 pub(crate) mod line_log;
 pub(crate) mod log;
 pub(crate) mod merge_file;
