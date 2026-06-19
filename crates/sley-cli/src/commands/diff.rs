@@ -15,6 +15,50 @@ fn diff_peel_rev_tree(
     sley_rev::peel_to_tree(db, format, &oid)
 }
 
+pub(crate) fn diff_resolve_commit_arg(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    rev: &str,
+) -> Result<ObjectId> {
+    let oid = resolve_revision(git_dir, format, rev)?;
+    match sley_rev::peel_to_commit(db, format, &oid) {
+        Ok(commit) => Ok(commit),
+        Err(err) => {
+            if let Ok(object) = db.read_object(&oid) {
+                eprintln!(
+                    "error: object {oid} is a {}, not a commit",
+                    object.object_type.as_str()
+                );
+                Err(GitError::Exit(128))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+pub(crate) fn diff_single_merge_base(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    left: &ObjectId,
+    right: &ObjectId,
+) -> Result<ObjectId> {
+    let bases = sley_rev::merge_bases(git_dir, format, db, left, right)?;
+    match bases.as_slice() {
+        [] => {
+            eprintln!("fatal: no merge base found");
+            Err(GitError::Exit(128))
+        }
+        [base] => Ok(*base),
+        _ => {
+            eprintln!("fatal: multiple merge bases found");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 fn diff_split_revisions(
     git_dir: &Path,
     format: ObjectFormat,
@@ -35,17 +79,25 @@ fn diff_split_revisions(
         let left_spec = if left.is_empty() { "HEAD" } else { left };
         let right_spec = if right.is_empty() { "HEAD" } else { right };
         if let (Ok(left_oid), Ok(right_oid)) = (
-            resolve_revision(git_dir, format, left_spec),
-            resolve_revision(git_dir, format, right_spec),
+            diff_resolve_commit_arg(git_dir, format, db, left_spec),
+            diff_resolve_commit_arg(git_dir, format, db, right_spec),
         ) {
-            let Some(base) = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?
-                .into_iter()
-                .next()
+            if path_args[1..]
+                .iter()
+                .any(|arg| diff_arg_looks_like_extra_revision(git_dir, format, db, arg))
+            {
+                return diff_usage_error();
+            }
+            let bases = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?;
+            let Some(base) = bases.first()
             else {
                 eprintln!("fatal: {first}: no merge base");
                 return Err(GitError::Exit(128));
             };
-            let base_tree = sley_rev::peel_to_tree(db, format, &base)?;
+            if bases.len() > 1 {
+                eprintln!("warning: {first}: multiple merge bases, using {base}");
+            }
+            let base_tree = sley_rev::peel_to_tree(db, format, base)?;
             let right_tree = sley_rev::peel_to_tree(db, format, &right_oid)?;
             return Ok((vec![base_tree, right_tree], path_args[1..].to_vec()));
         }
@@ -59,8 +111,20 @@ fn diff_split_revisions(
             diff_peel_rev_tree(git_dir, format, db, left_spec),
             diff_peel_rev_tree(git_dir, format, db, right_spec),
         ) {
+            if path_args[1..]
+                .iter()
+                .any(|arg| diff_arg_looks_like_extra_revision(git_dir, format, db, arg))
+            {
+                return diff_usage_error();
+            }
             return Ok((vec![left_tree, right_tree], path_args[1..].to_vec()));
         }
+    }
+    if path_args[1..]
+        .iter()
+        .any(|arg| diff_arg_is_revision_range(git_dir, format, db, arg))
+    {
+        return diff_usage_error();
     }
     // Otherwise peel up to two leading args that each resolve as a revision.
     let mut trees = Vec::new();
@@ -78,6 +142,107 @@ fn diff_split_revisions(
     }
     rest.extend(iter);
     Ok((trees, rest))
+}
+
+fn diff_split_merge_base(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    _cached: bool,
+    path_args: Vec<String>,
+) -> Result<(Vec<ObjectId>, Vec<String>)> {
+    let mut commits: Vec<(ObjectId, String)> = Vec::new();
+    let mut rest = Vec::new();
+    let mut iter = path_args.into_iter();
+    for token in iter.by_ref() {
+        if diff_arg_is_revision_range(git_dir, format, db, &token) {
+            eprintln!("fatal: --merge-base does not work with ranges");
+            return Err(GitError::Exit(128));
+        }
+        if commits.len() < 2
+            && resolve_revision(git_dir, format, &token).is_ok()
+        {
+            let commit = diff_resolve_commit_arg(git_dir, format, db, &token)?;
+            commits.push((commit, token));
+            continue;
+        }
+        rest.push(token);
+        break;
+    }
+    rest.extend(iter);
+    if commits.is_empty() {
+        return diff_usage_error();
+    }
+    if commits.len() == 2
+        && rest
+            .iter()
+            .any(|arg| diff_arg_looks_like_extra_revision(git_dir, format, db, arg))
+    {
+        return diff_usage_error();
+    }
+
+    let head_storage;
+    let (left, right) = if commits.len() == 1 {
+        head_storage = diff_resolve_commit_arg(git_dir, format, db, "HEAD")?;
+        (&head_storage, &commits[0].0)
+    } else {
+        (&commits[0].0, &commits[1].0)
+    };
+    let base = diff_single_merge_base(git_dir, format, db, left, right)?;
+    let base_tree = sley_rev::peel_to_tree(db, format, &base)?;
+    if commits.len() == 1 {
+        Ok((vec![base_tree], rest))
+    } else {
+        let right_tree = sley_rev::peel_to_tree(db, format, right)?;
+        Ok((vec![base_tree, right_tree], rest))
+    }
+}
+
+fn diff_arg_is_revision_range(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    arg: &str,
+) -> bool {
+    if let Some((left, right)) = arg.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_resolve_commit_arg(git_dir, format, db, left).is_ok()
+            && diff_resolve_commit_arg(git_dir, format, db, right).is_ok();
+    }
+    if let Some((left, right)) = arg.split_once("..") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_peel_rev_tree(git_dir, format, db, left).is_ok()
+            && diff_peel_rev_tree(git_dir, format, db, right).is_ok();
+    }
+    false
+}
+
+fn diff_arg_looks_like_extra_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    arg: &str,
+) -> bool {
+    if let Some((left, right)) = arg.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_resolve_commit_arg(git_dir, format, db, left).is_ok()
+            && diff_resolve_commit_arg(git_dir, format, db, right).is_ok();
+    }
+    if let Some((left, right)) = arg.split_once("..") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_peel_rev_tree(git_dir, format, db, left).is_ok()
+            && diff_peel_rev_tree(git_dir, format, db, right).is_ok();
+    }
+    diff_peel_rev_tree(git_dir, format, db, arg).is_ok()
+}
+
+fn diff_usage_error<T>() -> Result<T> {
+    eprintln!("usage: git diff [<options>] [<commit>] [--] [<path>...]");
+    Err(GitError::Exit(129))
 }
 
 /// The `whitespace` attribute + `core.whitespace` config, resolved into the
@@ -646,6 +811,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         copy_threshold,
         diff_filter,
         ignore_submodules_cli,
+        merge_base,
         mut path_args,
         explicit_paths,
     } = commands::diff_options::setup_diff_options(args)?;
@@ -895,11 +1061,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // A bare `diff HEAD` keeps its dedicated head-vs-worktree path, but
     // `diff HEAD <rev>` / `diff HEAD HEAD` means the consumed HEAD is the first of
     // several revisions — hand it back to the splitter.
-    if head && !path_args.is_empty() {
+    if head && (!path_args.is_empty() || merge_base) {
         path_args.insert(0, "HEAD".to_string());
         head = false;
     }
-    let (diff_trees, mut path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
+    let (diff_trees, mut path_args) = if merge_base {
+        diff_split_merge_base(&git_dir, format, &db, cached, path_args)?
+    } else {
+        diff_split_revisions(&git_dir, format, &db, path_args)?
+    };
     path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
     let no_output_mode = !raw

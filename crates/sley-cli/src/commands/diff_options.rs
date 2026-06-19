@@ -123,6 +123,7 @@ pub(crate) struct DiffOptions {
     pub(crate) copy_threshold: u8,
     pub(crate) diff_filter: DiffFilter,
     pub(crate) ignore_submodules_cli: Option<SubmoduleIgnoreMode>,
+    pub(crate) merge_base: bool,
     pub(crate) path_args: Vec<String>,
     pub(crate) explicit_paths: Vec<String>,
 }
@@ -189,6 +190,7 @@ impl Default for DiffOptions {
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             diff_filter: DiffFilter::default(),
             ignore_submodules_cli: None,
+            merge_base: false,
             path_args: Vec::new(),
             explicit_paths: Vec::new(),
         }
@@ -279,6 +281,12 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
         ),
         opt_bool(Some('r'), None, OptFlags::NONE, "recurse into subtrees"),
         opt_bool(None, Some("cached"), OptFlags::NONE, "show cached changes"),
+        opt_bool(
+            None,
+            Some("merge-base"),
+            OptFlags::NONE,
+            "use the merge base as the old side",
+        ),
         opt_bool(None, Some("staged"), OptFlags::NONE, "show staged changes"),
         opt_bool(None, Some("quiet"), OptFlags::NONE, "disable all output"),
         opt_bool(
@@ -875,6 +883,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("name-only")) => options.output_format.insert(DiffOutputFormat::NAME_ONLY),
         (Some('r'), None) => {}
         (_, Some("cached" | "staged")) => options.cached = true,
+        (_, Some("merge-base")) => options.merge_base = bool_value(option),
         (_, Some("quiet")) => options.quiet = bool_value(option),
         (_, Some("exit-code")) => options.exit_code = bool_value(option),
         (_, Some("output")) => options.output = Some(str_value(option).to_string()),

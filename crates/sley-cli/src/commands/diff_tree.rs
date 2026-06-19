@@ -88,6 +88,9 @@ struct DiffTreeOptions {
     /// `--root`: for a single commit with no parent, diff against the empty tree
     /// instead of producing nothing.
     root: bool,
+    /// `--merge-base`: diff the merge base of two commits against the second
+    /// commit.
+    merge_base: bool,
     /// `--no-commit-id`: suppress the per-commit object-id header line.
     no_commit_id: bool,
     /// `--pretty[=medium|oneline]` / `-v`: print a commit-log header instead of
@@ -151,6 +154,7 @@ impl Default for DiffTreeOptions {
             show_trees: false,
             reverse: false,
             root: false,
+            merge_base: false,
             no_commit_id: false,
             pretty: None,
             merges_separate: false,
@@ -255,6 +259,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             }
             "-R" => options.reverse = true,
             "--root" => options.root = true,
+            "--merge-base" => options.merge_base = true,
             "--check" => options.check = true,
             "--no-commit-id" => options.no_commit_id = true,
             "--stdin" => options.stdin = true,
@@ -564,11 +569,20 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             }
         }
     } else {
+        if options.merge_base && setup.options.positives.len() == 1 {
+            eprintln!("fatal: --merge-base only works with two commits");
+            return Err(GitError::Exit(128));
+        }
         if setup.options.positives.is_empty() {
             print_diff_tree_usage();
             return Err(GitError::Exit(129));
         }
-        for request in resolve_arg_request(db, &options, &setup.options.positives)? {
+        let requests = if options.merge_base {
+            resolve_merge_base_arg_request(git_dir, db, &setup.options.positives)?
+        } else {
+            resolve_arg_request(db, &options, &setup.options.positives)?
+        };
+        for request in requests {
             if run_diff_request(&mut stdout, &request_context, &request)? {
                 has_differences = true;
             }
@@ -651,6 +665,26 @@ fn resolve_arg_request(
             ..Default::default()
         }])
     }
+}
+
+fn resolve_merge_base_arg_request(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    revs: &[sley_rev::RevisionTip],
+) -> Result<Vec<DiffRequest>> {
+    if revs.len() != 2 {
+        print_diff_tree_usage();
+        return Err(GitError::Exit(129));
+    }
+    let format = db.object_format();
+    let left = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &revs[0].rev)?;
+    let right = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &revs[1].rev)?;
+    let base = commands::diff::diff_single_merge_base(git_dir, format, db, &left, &right)?;
+    Ok(vec![DiffRequest {
+        left: Some(sley_rev::peel_to_tree(db, format, &base)?),
+        right: Some(sley_rev::peel_to_tree(db, format, &right)?),
+        ..Default::default()
+    }])
 }
 
 /// Build a single-commit diff request: commit tree vs first-parent tree.
