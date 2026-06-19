@@ -203,6 +203,7 @@ impl Repository {
             self.object_format(),
             &filter,
             matches,
+            Some(ctx.config()),
             credentials,
         )?
         .0)

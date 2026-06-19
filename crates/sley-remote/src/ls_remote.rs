@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::ObjectType;
 use sley_odb::{FileObjectDatabase, ObjectReader};
@@ -95,10 +96,11 @@ pub fn ls_remote(
     format: ObjectFormat,
     filter: &LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
+    config: Option<&GitConfig>,
     #[cfg_attr(not(feature = "http"), allow(unused_variables))]
     credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
-    crate::protocol::check_transport_allowed(scheme_for_ls_remote_source(source), None, None)
+    crate::protocol::check_transport_allowed(scheme_for_ls_remote_source(source), config, None)
         .map_err(crate::protocol::transport_policy_git_error)?;
     match source {
         #[cfg(feature = "http")]

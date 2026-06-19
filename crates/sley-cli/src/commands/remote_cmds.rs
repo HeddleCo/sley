@@ -5666,6 +5666,7 @@ fn fetch_http_repository_with_outcome(
 fn ls_remote_http_records(
     repository: &str,
     options: &LsRemoteOptions,
+    transport_config: &GitConfig,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
     let remote_url = ls_remote_resolved_url(repository)?;
     let parsed = parse_remote_url(&remote_url)?;
@@ -5684,6 +5685,7 @@ fn ls_remote_http_records(
         ObjectFormat::Sha1,
         &ls_remote_filter(options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
+        Some(transport_config),
         &mut credentials,
     )?;
     Ok(Some(records))
@@ -5927,7 +5929,9 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let resolved_repository = ls_remote_resolved_url(repository)?;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
 
-    if let Some((mut records, format)) = ls_remote_ssh_records(repository, &options)? {
+    if let Some((mut records, format)) =
+        ls_remote_ssh_records(repository, &options, &transport_config)?
+    {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
         }
@@ -5943,7 +5947,9 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    if let Some((mut records, format)) = ls_remote_git_records(repository, &options)? {
+    if let Some((mut records, format)) =
+        ls_remote_git_records(repository, &options, &transport_config)?
+    {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
         }
@@ -5959,7 +5965,9 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    if let Some((mut records, format)) = ls_remote_http_records(repository, &options)? {
+    if let Some((mut records, format)) =
+        ls_remote_http_records(repository, &options, &transport_config)?
+    {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
         }
@@ -5983,6 +5991,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         format,
         &ls_remote_filter(&options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
+        Some(&transport_config),
         &mut sley_remote::NoCredentials,
     )?;
 
@@ -6143,9 +6152,10 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
 fn ls_remote_ssh_records(
     repository: &str,
     options: &LsRemoteOptions,
+    transport_config: &GitConfig,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
     let parsed = parse_remote_url(&ls_remote_resolved_url(repository)?)?;
-    if parsed.transport != RemoteTransport::Ssh {
+    if !matches!(parsed.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Ok(None);
     }
     let records = sley_remote::ls_remote(
@@ -6153,6 +6163,7 @@ fn ls_remote_ssh_records(
         ObjectFormat::Sha1,
         &ls_remote_filter(options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
+        Some(transport_config),
         &mut sley_remote::NoCredentials,
     )?;
     Ok(Some(records))
@@ -6161,6 +6172,7 @@ fn ls_remote_ssh_records(
 fn ls_remote_git_records(
     repository: &str,
     options: &LsRemoteOptions,
+    transport_config: &GitConfig,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
     let parsed = parse_remote_url(&ls_remote_resolved_url(repository)?)?;
     if parsed.transport != RemoteTransport::Git {
@@ -6171,6 +6183,7 @@ fn ls_remote_git_records(
         ObjectFormat::Sha1,
         &ls_remote_filter(options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
+        Some(transport_config),
         &mut sley_remote::NoCredentials,
     )?;
     Ok(Some(records))
