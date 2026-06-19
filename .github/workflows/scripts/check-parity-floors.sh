@@ -725,10 +725,14 @@ declare -A FLOOR=(
     [t2204-add-ignored.sh]=47
     [t6020-bundle-misc.sh]=28
     [t4068-diff-symmetric-merge-base.sh]=36
-    [t1423-ref-backend.sh]=25
-    # t1460-refs-migrate NOT floored: migrate works for its 34 numbered assertions
-    # (1->34) but `git refs migrate` HANGS on a tail case (harness TIMEOUT after ok=34).
-    # New command (no regression); follow-up fix needed before enrolling. Code lands.
+    [t1423-ref-backend.sh]=27
+    # consolidation round 1 (2026-06-19, integ/consol1 onto 9d28b991): behavior-neutral
+    # refactors (rev-list engine lib.rs->sley_rev::revlist -521 lines; range-diff/rebase
+    # alloc cleanups) held floors EXACTLY (t4202=110 t6022=13 t3206=45 t3404=89 t3430=19).
+    # migrate-hang FIXED: the hang was t1460 setup auto-GC reflog-expire + 3000-ref
+    # update-ref-stdin pathology (now cached/hash-based, also a perf win). t1460 now
+    # PASS 37/37 (no timeout) -> floored; t1423 25->27.
+    [t1460-refs-migrate.sh]=37
 )
 
 fail=0
