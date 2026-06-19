@@ -10,6 +10,37 @@ use crate::remote::{
 use crate::*;
 use sley_remote::{FetchOptions, LsRemoteRecord};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchRecurseSubmodules {
+    Default,
+    OnDemand,
+    On,
+    Off,
+}
+
+impl FetchRecurseSubmodules {
+    fn from_arg(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("yes") {
+            "yes" | "true" | "on" => Ok(Self::On),
+            "on-demand" => Ok(Self::OnDemand),
+            "no" | "false" | "off" => Ok(Self::Off),
+            other => {
+                eprintln!("fatal: bad --recurse-submodules argument: {other}");
+                Err(GitError::Exit(128))
+            }
+        }
+    }
+
+    fn from_config(value: &str) -> Self {
+        match sley_submodule::parse_fetch_recurse(value) {
+            sley_submodule::RecurseMode::On => Self::On,
+            sley_submodule::RecurseMode::Off => Self::Off,
+            sley_submodule::RecurseMode::OnDemand => Self::OnDemand,
+            _ => Self::Default,
+        }
+    }
+}
+
 pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut explicit_bare = None::<bool>;
@@ -1483,6 +1514,7 @@ fn clone_bare_network_repository(
             refetch: false,
         },
     )
+    .map(|_| ())
 }
 
 /// Map a [`sley_remote::clone`] result that failed because the requested branch
@@ -2659,6 +2691,10 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let mut unshallow = false;
     let mut filter_option_explicit = false;
     let mut prefetch = false;
+    let mut recurse_submodules_cli = FetchRecurseSubmodules::Default;
+    let mut recurse_submodules_default = FetchRecurseSubmodules::OnDemand;
+    let mut submodule_prefix = String::new();
+    let mut jobs = None::<usize>;
     // `git fetch --all`: fetch from every configured remote in turn.
     let mut fetch_all_remotes = false;
     let mut iter = args.iter();
@@ -2728,12 +2764,46 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-refetch" => options.refetch = false,
             "--prefetch" => prefetch = true,
             "--no-prefetch" => prefetch = false,
-            "--recurse-submodules"
-            | "--no-recurse-submodules"
-            | "--recurse-submodules-default" => {}
-            value
-                if value.starts_with("--recurse-submodules=")
-                    || value.starts_with("--recurse-submodules-default=") => {}
+            "--recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::On,
+            "--no-recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::Off,
+            value if value.starts_with("--recurse-submodules=") => {
+                let value = value
+                    .strip_prefix("--recurse-submodules=")
+                    .ok_or_else(|| GitError::Command("fetch --recurse-submodules requires a value".into()))?;
+                recurse_submodules_cli = FetchRecurseSubmodules::from_arg(Some(value))?;
+            }
+            "--recurse-submodules-default" => {
+                recurse_submodules_default = FetchRecurseSubmodules::OnDemand;
+            }
+            value if value.starts_with("--recurse-submodules-default=") => {
+                let value = value
+                    .strip_prefix("--recurse-submodules-default=")
+                    .ok_or_else(|| GitError::Command("fetch --recurse-submodules-default requires a value".into()))?;
+                recurse_submodules_default = FetchRecurseSubmodules::from_arg(Some(value))?;
+            }
+            "--submodule-prefix" => {
+                submodule_prefix = iter.next().ok_or_else(|| {
+                    GitError::Command("fetch --submodule-prefix requires a value".into())
+                })?.clone();
+            }
+            value if value.starts_with("--submodule-prefix=") => {
+                submodule_prefix = value
+                    .strip_prefix("--submodule-prefix=")
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            "-j" | "--jobs" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("fetch --jobs requires a value".into()))?;
+                jobs = parse_fetch_jobs(value)?;
+            }
+            value if value.starts_with("-j") && value.len() > 2 => {
+                jobs = parse_fetch_jobs(&value[2..])?;
+            }
+            value if value.starts_with("--jobs=") => {
+                jobs = parse_fetch_jobs(value.strip_prefix("--jobs=").unwrap_or_default())?;
+            }
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
@@ -2827,13 +2897,37 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             } else {
                 refspecs.clone()
             };
-            fetch_one_source(
+            let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
+            let outcome = fetch_one_source_with_outcome(
                 &git_dir,
                 format,
                 &remote,
                 &effective_refspecs,
-                remote_options,
+                remote_options.clone(),
             )?;
+            let recurse_submodules = resolve_fetch_recurse_submodules(
+                &config,
+                recurse_submodules_cli,
+                recurse_submodules_default,
+            );
+            fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+                git_dir: &git_dir,
+                format,
+                worktree_root: &cwd,
+                config: &config,
+                recurse_submodules,
+                default_recurse_submodules: recurse_submodules_default,
+                source: &remote,
+                changed_gitlinks: changed_gitlinks_for_fetch(
+                    &git_dir,
+                    format,
+                    &before_fetch_refs,
+                    &outcome,
+                )?,
+                options: &remote_options,
+                submodule_prefix: &submodule_prefix,
+                jobs,
+            })?;
         }
         if options.refetch {
             trace2_fetch_refetch_maintenance();
@@ -2879,16 +2973,303 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     if fetch_raw_oid_refspecs(&git_dir, format, &source, &effective_refspecs, &options)? {
         return Ok(());
     }
+    let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
     let refetch = options.refetch;
-    let result = fetch_one_source(&git_dir, format, &source, &effective_refspecs, options);
+    let result = fetch_one_source_with_outcome(&git_dir, format, &source, &effective_refspecs, options.clone());
     if result.is_ok() && refetch {
         trace2_fetch_refetch_maintenance();
     }
-    result
+    let outcome = result?;
+    let config = read_repo_config(&git_dir)?;
+    let recurse_submodules = resolve_fetch_recurse_submodules(
+        &config,
+        recurse_submodules_cli,
+        recurse_submodules_default,
+    );
+    fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+        git_dir: &git_dir,
+        format,
+        worktree_root: &cwd,
+        config: &config,
+        recurse_submodules,
+        default_recurse_submodules: recurse_submodules_default,
+        source: &source,
+        changed_gitlinks: changed_gitlinks_for_fetch(&git_dir, format, &before_fetch_refs, &outcome)?,
+        options: &options,
+        submodule_prefix: &submodule_prefix,
+        jobs,
+    })?;
+    Ok(())
 }
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
     pack_filter_from_spec(spec)
+}
+
+fn parse_fetch_jobs(value: &str) -> Result<Option<usize>> {
+    let parsed = value
+        .parse::<isize>()
+        .map_err(|_| GitError::Command(format!("invalid number of parallel jobs: {value}")))?;
+    if parsed < 0 {
+        return Err(GitError::Command(format!(
+            "negative values not allowed for submodule.fetchJobs"
+        )));
+    }
+    if parsed == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(parsed as usize))
+    }
+}
+
+fn resolve_fetch_recurse_submodules(
+    config: &GitConfig,
+    cli: FetchRecurseSubmodules,
+    default_mode: FetchRecurseSubmodules,
+) -> FetchRecurseSubmodules {
+    if cli != FetchRecurseSubmodules::Default {
+        return cli;
+    }
+    if config
+        .get_bool("submodule", None, "recurse")
+        .unwrap_or(false)
+    {
+        return FetchRecurseSubmodules::On;
+    }
+    if let Some(value) = config.get("fetch", None, "recursesubmodules") {
+        let mode = FetchRecurseSubmodules::from_config(value);
+        if mode != FetchRecurseSubmodules::Default {
+            return mode;
+        }
+    }
+    default_mode
+}
+
+struct FetchSubmoduleRequest<'a> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    worktree_root: &'a Path,
+    config: &'a GitConfig,
+    recurse_submodules: FetchRecurseSubmodules,
+    default_recurse_submodules: FetchRecurseSubmodules,
+    source: &'a str,
+    changed_gitlinks: std::collections::BTreeSet<String>,
+    options: &'a FetchOptions,
+    submodule_prefix: &'a str,
+    jobs: Option<usize>,
+}
+
+struct CurrentDirGuard {
+    previous: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn enter(path: &Path) -> Result<Self> {
+        let previous = env::current_dir()?;
+        env::set_current_dir(path)?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.previous);
+    }
+}
+
+fn fetch_populated_submodules_after_superproject(req: FetchSubmoduleRequest<'_>) -> Result<()> {
+    if req.recurse_submodules == FetchRecurseSubmodules::Off {
+        return Ok(());
+    }
+    let submodules = crate::commands::submodule::read_submodule_configs(req.worktree_root)?;
+    if submodules.is_empty() {
+        return Ok(());
+    }
+    let jobs = req.jobs.or_else(|| configured_submodule_fetch_jobs(req.config));
+    trace_fetch_submodule_jobs(jobs.unwrap_or(1));
+    for submodule in submodules {
+        if !fetch_submodule_is_active(req.config, &submodule) {
+            continue;
+        }
+        let mode = fetch_recurse_mode_for_submodule(
+            req.config,
+            req.worktree_root,
+            &submodule,
+            req.recurse_submodules,
+        );
+        let should_fetch = match mode {
+            FetchRecurseSubmodules::On => true,
+            FetchRecurseSubmodules::OnDemand => req.changed_gitlinks.contains(&submodule.path),
+            FetchRecurseSubmodules::Default => req.default_recurse_submodules == FetchRecurseSubmodules::On,
+            FetchRecurseSubmodules::Off => false,
+        };
+        if !should_fetch {
+            continue;
+        }
+        let submodule_root = req.worktree_root.join(&submodule.path);
+        let Some(sub_git_dir) = sley_diff_merge::gitlink_git_dir(&submodule_root) else {
+            continue;
+        };
+        let sub_format = repository_object_format(&sub_git_dir)?;
+        let sub_source = default_fetch_remote(&sub_git_dir, sub_format)?;
+        if !req.options.quiet {
+            eprintln!(
+                "Fetching submodule {}{}",
+                req.submodule_prefix, submodule.path
+            );
+        }
+        let mut sub_options = req.options.clone();
+        sub_options.merge_srcs = current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
+        let _guard = CurrentDirGuard::enter(&submodule_root)?;
+        let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
+        let outcome = fetch_one_source_with_outcome(&sub_git_dir, sub_format, &sub_source, &[], sub_options.clone())?;
+        let nested_changed_gitlinks =
+            changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
+        let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
+        let nested_config = read_repo_config(&sub_git_dir)?;
+        fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+            git_dir: &sub_git_dir,
+            format: sub_format,
+            worktree_root: &submodule_root,
+            config: &nested_config,
+            recurse_submodules: mode,
+            default_recurse_submodules: req.default_recurse_submodules,
+            source: &sub_source,
+            changed_gitlinks: nested_changed_gitlinks,
+            options: &sub_options,
+            submodule_prefix: &nested_prefix,
+            jobs,
+        })?;
+    }
+    let _ = (req.git_dir, req.format, req.source);
+    Ok(())
+}
+
+fn configured_submodule_fetch_jobs(config: &GitConfig) -> Option<usize> {
+    config
+        .get("submodule", None, "fetchjobs")
+        .and_then(|value| parse_fetch_jobs(value).ok().flatten())
+}
+
+fn trace_fetch_submodule_jobs(jobs: usize) {
+    let Some(path) = env::var_os("GIT_TRACE") else {
+        return;
+    };
+    if path == "1" || path == "true" {
+        eprintln!("trace: run_processes_parallel: preparing to run up to {jobs} tasks");
+        return;
+    }
+    let line = format!("trace: run_processes_parallel: preparing to run up to {jobs} tasks\n");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn fetch_submodule_is_active(
+    config: &GitConfig,
+    submodule: &crate::commands::submodule::SubmoduleConfigEntry,
+) -> bool {
+    if let Some(active) = config.get_bool("submodule", Some(&submodule.path), "active") {
+        return active;
+    }
+    true
+}
+
+fn fetch_recurse_mode_for_submodule(
+    config: &GitConfig,
+    worktree_root: &Path,
+    submodule: &crate::commands::submodule::SubmoduleConfigEntry,
+    inherited: FetchRecurseSubmodules,
+) -> FetchRecurseSubmodules {
+    if inherited == FetchRecurseSubmodules::On || inherited == FetchRecurseSubmodules::Off {
+        return inherited;
+    }
+    if let Some(value) = config.get("submodule", Some(&submodule.path), "fetchrecursesubmodules") {
+        let mode = FetchRecurseSubmodules::from_config(value);
+        if mode != FetchRecurseSubmodules::Default {
+            return mode;
+        }
+    }
+    if let Ok(gitmodules) = GitConfig::read(worktree_root.join(".gitmodules")) {
+        if let Some(value) = gitmodules.get("submodule", Some(&submodule.path), "fetchrecursesubmodules") {
+            let mode = FetchRecurseSubmodules::from_config(value);
+            if mode != FetchRecurseSubmodules::Default {
+                return mode;
+            }
+        }
+    }
+    inherited
+}
+
+fn fetch_ref_snapshot(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<std::collections::BTreeMap<String, ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut refs = std::collections::BTreeMap::new();
+    for reference in store.list_refs()? {
+        if let RefTarget::Direct(oid) = reference.target {
+            refs.insert(reference.name, oid);
+        }
+    }
+    Ok(refs)
+}
+
+fn changed_gitlinks_for_fetch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    before: &std::collections::BTreeMap<String, ObjectId>,
+    outcome: &sley_remote::FetchOutcome,
+) -> Result<std::collections::BTreeSet<String>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut changed = std::collections::BTreeSet::new();
+    for update in &outcome.ref_updates {
+        let Some(dst) = update.dst.as_deref() else {
+            continue;
+        };
+        let old = before.get(dst).copied();
+        if old == Some(update.oid) {
+            continue;
+        }
+        let new_gitlinks = commit_gitlinks(&db, format, &update.oid)?;
+        let old_gitlinks = match old {
+            Some(old) => commit_gitlinks(&db, format, &old)?,
+            None => std::collections::BTreeMap::new(),
+        };
+        for (path, oid) in new_gitlinks {
+            if old_gitlinks.get(&path) != Some(&oid)
+                && let Ok(path) = String::from_utf8(path)
+            {
+                changed.insert(path);
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn commit_gitlinks(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectId>> {
+    let object = db.read_object(commit_oid)?;
+    let commit = match object.object_type {
+        ObjectType::Commit => Commit::parse_ref(format, &object.body)?,
+        ObjectType::Tag => {
+            let tag = Tag::parse_ref(format, &object.body)?;
+            return commit_gitlinks(db, format, &tag.object);
+        }
+        _ => return Ok(std::collections::BTreeMap::new()),
+    };
+    let tree = db.read_object(&commit.tree)?;
+    if tree.object_type != ObjectType::Tree {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    Ok(sley_diff_merge::flatten_tree(db, format, &commit.tree)?
+        .into_iter()
+        .filter(|(_, (mode, _))| sley_index::is_gitlink(*mode))
+        .map(|(path, (_, oid))| (path, oid))
+        .collect())
 }
 
 fn prefetch_refspecs(config: &GitConfig, remote: &str, refspecs: &[String]) -> Vec<String> {
@@ -3113,13 +3494,13 @@ fn parse_config_int(value: &str) -> Option<i64> {
 
 /// Dispatch a single fetch source (bundle / http / ssh / git / local) — shared
 /// by the plain `git fetch <remote>` path and the `--all` per-remote loop.
-fn fetch_one_source(
+fn fetch_one_source_with_outcome(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
-) -> Result<()> {
+) -> Result<sley_remote::FetchOutcome> {
     if let Ok(input) = fs::read(source)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
@@ -3128,21 +3509,22 @@ fn fetch_one_source(
         if options.depth.is_some() {
             eprintln!("warning: --depth is ignored in bundle fetches; use file:// instead.");
         }
-        return fetch_bundle(git_dir, format, source, refspecs, &bundle, options);
+        fetch_bundle(git_dir, format, source, refspecs, &bundle, options)?;
+        return Ok(sley_remote::FetchOutcome::default());
     }
     let config = transport_policy_config_for_cwd()?;
     let resolved = ls_remote_resolved_url(source)?;
     check_transport_allowed_url(&resolved, Some(&config))?;
     if fetch_source_is_http(source)? {
-        return fetch_http_repository(git_dir, format, source, refspecs, options);
+        return fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options);
     }
     if fetch_source_is_ssh(source)? {
-        return fetch_ssh_repository(git_dir, format, source, refspecs, options);
+        return fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options);
     }
     if fetch_source_is_git(source)? {
-        return fetch_git_repository(git_dir, format, source, refspecs, options);
+        return fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options);
     }
-    fetch_local_repository(git_dir, format, source, refspecs, options)
+    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options)
 }
 
 /// Parse a `--shallow-since` date through the approxidate layer, mirroring
@@ -4972,6 +5354,16 @@ pub(crate) fn fetch_local_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
+    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+}
+
+fn fetch_local_repository_with_outcome(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<sley_remote::FetchOutcome> {
     let remote_git_dir = ls_remote_git_dir(source)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let config = repo_config_with_transport_policy(git_dir)?;
@@ -5013,7 +5405,8 @@ fn run_fetch(
     fetch_source: &sley_remote::FetchSource,
     refspecs: &[String],
     options: FetchOptions,
-) -> Result<()> {
+) -> Result<sley_remote::FetchOutcome> {
+    let before_refs = fetch_ref_snapshot(git_dir, format)?;
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
     let outcome = sley_remote::fetch(
@@ -5032,6 +5425,54 @@ fn run_fetch(
         },
     )?;
     maybe_set_remote_head_on_fetch(git_dir, format, config, source, refspecs, &outcome)?;
+    print_fetch_status(git_dir, format, config, source, options.quiet, &before_refs, &outcome)?;
+    Ok(outcome)
+}
+
+fn print_fetch_status(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    source: &str,
+    quiet: bool,
+    before_refs: &std::collections::BTreeMap<String, ObjectId>,
+    outcome: &sley_remote::FetchOutcome,
+) -> Result<()> {
+    if quiet {
+        return Ok(());
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut rows = Vec::new();
+    for update in &outcome.ref_updates {
+        let Some(dst) = update.dst.as_deref() else {
+            continue;
+        };
+        let old = before_refs.get(dst).copied();
+        if old == Some(update.oid) {
+            continue;
+        }
+        let src = prettify_refname(&update.src);
+        let dst = prettify_refname(dst);
+        let summary = match old {
+            Some(old) => format!("{}..{}", unique_abbrev(&old, &db), unique_abbrev(&update.oid, &db)),
+            None if update.dst.as_deref().is_some_and(|name| name.starts_with("refs/tags/")) => {
+                "[new tag]".to_string()
+            }
+            None if update.dst.as_deref().is_some_and(|name| name.starts_with("refs/heads/") || name.starts_with("refs/remotes/")) => {
+                "[new branch]".to_string()
+            }
+            None => "[new ref]".to_string(),
+        };
+        rows.push((summary, src, dst));
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let source = sley_remote::fetch_head_source_description(config, source);
+    eprintln!("From {source}");
+    for (summary, src, dst) in rows {
+        eprintln!("   {summary:<16}  {src:<10} -> {dst}");
+    }
     Ok(())
 }
 
@@ -5117,6 +5558,16 @@ pub(crate) fn fetch_ssh_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
+    fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+}
+
+fn fetch_ssh_repository_with_outcome(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<sley_remote::FetchOutcome> {
     let config = repo_config_with_transport_policy(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Ssh(remote);
@@ -5138,6 +5589,16 @@ pub(crate) fn fetch_git_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
+    fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+}
+
+fn fetch_git_repository_with_outcome(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<sley_remote::FetchOutcome> {
     let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Git(remote);
@@ -5174,6 +5635,16 @@ fn fetch_http_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
+    fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+}
+
+fn fetch_http_repository_with_outcome(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<sley_remote::FetchOutcome> {
     let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Http(remote);
