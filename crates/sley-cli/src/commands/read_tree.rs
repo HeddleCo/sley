@@ -1729,7 +1729,6 @@ fn checkout_submodule_to_commit(
                 git_dir,
                 &sub_root,
                 &sub_git_dir,
-                &path_str,
                 &url,
             )?;
         } else {
@@ -1739,7 +1738,7 @@ fn checkout_submodule_to_commit(
     }
 
     fs::create_dir_all(&sub_root)?;
-    connect_submodule_worktree(&sub_root, &sub_git_dir, &path_str)?;
+    connect_submodule_worktree(&sub_root, &sub_git_dir)?;
 
     let sub_format = repository_object_format(&sub_git_dir).unwrap_or(format);
     if let Err(_err) =
@@ -1791,7 +1790,6 @@ fn clone_submodule_for_checkout(
     git_dir: &Path,
     sub_root: &Path,
     sub_git_dir: &Path,
-    path: &str,
     url: &str,
 ) -> Result<()> {
     let config = read_repo_config(git_dir).unwrap_or_default();
@@ -1805,7 +1803,7 @@ fn clone_submodule_for_checkout(
         sub_root.display().to_string(),
     ];
     super::remote_cmds::cmd_clone(&args)?;
-    connect_submodule_worktree(sub_root, sub_git_dir, path)?;
+    connect_submodule_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }
 
@@ -1836,45 +1834,10 @@ fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
     path
 }
 
-fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path, path: &str) -> Result<()> {
+fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path) -> Result<()> {
     fs::create_dir_all(sub_git_dir)?;
     fs::write(sub_root.join(".git"), format!("gitdir: {}\n", sub_git_dir.display()))?;
-    set_core_worktree(sub_git_dir, &core_worktree_value(sub_root, sub_git_dir, path))?;
-    Ok(())
-}
-
-fn core_worktree_value(sub_root: &Path, sub_git_dir: &Path, path: &str) -> String {
-    if !path.contains('/') && is_top_level_submodule_gitdir(sub_git_dir) {
-        format!("../../../{path}")
-    } else {
-        sub_root.display().to_string()
-    }
-}
-
-fn is_top_level_submodule_gitdir(sub_git_dir: &Path) -> bool {
-    sub_git_dir
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "modules")
-        && sub_git_dir
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == ".git")
-}
-
-fn set_core_worktree(git_dir: &Path, value: &str) -> Result<()> {
-    let config = git_dir.join("config");
-    let mut text = fs::read_to_string(&config).unwrap_or_default();
-    remove_config_key_in_place(&mut text, "core", "worktree");
-    if !text.ends_with('\n') && !text.is_empty() {
-        text.push('\n');
-    }
-    text.push_str("[core]\n");
-    text.push_str("\tworktree = ");
-    text.push_str(value);
-    text.push('\n');
-    fs::write(config, text)?;
+    crate::commands::submodule::set_submodule_core_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }
 

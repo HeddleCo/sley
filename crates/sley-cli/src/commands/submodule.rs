@@ -1209,7 +1209,10 @@ fn rewrite_submodule_gitdir_file(submodule_root: &Path, modules_git_dir: &Path) 
     Ok(())
 }
 
-fn set_submodule_core_worktree(submodule_root: &Path, modules_git_dir: &Path) -> Result<()> {
+pub(crate) fn set_submodule_core_worktree(
+    submodule_root: &Path,
+    modules_git_dir: &Path,
+) -> Result<()> {
     let mut config = read_repo_config(modules_git_dir)?;
     let worktree = relative_path_from_absolute_components(modules_git_dir, submodule_root)?;
     set_config_value(&mut config, "core", None, "worktree", &worktree);
