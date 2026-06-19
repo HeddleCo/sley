@@ -249,6 +249,13 @@ struct FormatPatchOptions {
     relative_mode: RelativeMode,
     /// Resolved repository-relative path prefix to strip from diff output.
     relative_prefix: Option<Vec<u8>>,
+    /// `--grep=<pattern>` commit-message filters.
+    grep_patterns: Vec<String>,
+    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind_explicit: bool,
+    grep_ignore_case: bool,
+    grep_all_match: bool,
+    grep_invert: bool,
     /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
     setup_args: Vec<String>,
 }
@@ -353,6 +360,12 @@ impl Default for FormatPatchOptions {
             ignore_if_in_upstream: false,
             relative_mode: RelativeMode::Config,
             relative_prefix: None,
+            grep_patterns: Vec::new(),
+            grep_pattern_kind: crate::grep_source::PatternKind::Basic,
+            grep_pattern_kind_explicit: false,
+            grep_ignore_case: false,
+            grep_all_match: false,
+            grep_invert: false,
             setup_args: Vec::new(),
         }
     }
@@ -3052,6 +3065,23 @@ fn select_commits(
         .into_iter()
         .filter(|record| !excluded.contains(&record.oid) && record.parents.len() <= 1)
         .collect();
+    let grep_kind = log_grep_pattern_kind_from_config(
+        repo.config(),
+        options.grep_pattern_kind,
+        options.grep_pattern_kind_explicit,
+    );
+    if let Some(matcher) =
+        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?
+    {
+        selected.retain(|record| {
+            let matched = if options.grep_all_match {
+                matcher.matches_all(&record.commit.message)
+            } else {
+                matcher.matches_any(&record.commit.message)
+            };
+            matched != options.grep_invert
+        });
+    }
     if !setup.pathspecs.is_empty() {
         let pathspec = sley_rev::Pathspec::parse(
             setup.pathspecs.iter().map(|spec| spec.as_bytes()),
@@ -4294,6 +4324,34 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 };
             }
             "--no-base" => options.base = BaseMode::None,
+            "--grep" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--grep requires a value".into()))?;
+                options.grep_patterns.push(value.clone());
+            }
+            value if let Some(pattern) = value.strip_prefix("--grep=") => {
+                options.grep_patterns.push(pattern.to_string());
+            }
+            "--all-match" => options.grep_all_match = true,
+            "--invert-grep" => options.grep_invert = true,
+            "-i" | "--regexp-ignore-case" => options.grep_ignore_case = true,
+            "-F" | "--fixed-strings" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
+                options.grep_pattern_kind_explicit = true;
+            }
+            "--basic-regexp" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Basic;
+                options.grep_pattern_kind_explicit = true;
+            }
+            "-E" | "--extended-regexp" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Extended;
+                options.grep_pattern_kind_explicit = true;
+            }
+            "-P" | "--perl-regexp" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Perl;
+                options.grep_pattern_kind_explicit = true;
+            }
             // Accepted-but-inert formatting knobs that do not change the bytes
             // sley emits for the common path.
             "--no-color"

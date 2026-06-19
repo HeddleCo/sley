@@ -1648,6 +1648,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 }
                 if let Some((_, path)) = log_pathspec_magic(value) {
                     setup_args.push(path.to_string());
+                } else if value == ".." && Path::new(value).is_dir() {
+                    if !setup_args.iter().any(|arg| arg == "--") {
+                        setup_args.push("--".to_string());
+                    }
+                    setup_args.push(value.to_string());
                 } else {
                     setup_args.push(value.to_string());
                 }
@@ -2679,8 +2684,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // decorations to the standard decorating namespaces (so refs/prefetch,
     // refs/rebase-merge, refs/bundle, &c. are not shown). `--clear-decorations`
     // disables this default so all refs decorate.
+    let initial_decoration_set_all = config
+        .get("log", None, "initialdecorationset")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("all"));
     let mut include = decorate_refs_include.clone();
     if !clear_decorations
+        && !initial_decoration_set_all
         && include.is_empty()
         && decorate_refs_exclude.is_empty()
         && exclude_config.is_empty()

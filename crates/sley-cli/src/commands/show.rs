@@ -131,6 +131,13 @@ struct ShowOptions {
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<crate::grep_source::Regex>,
+    /// `--grep=<pattern>` commit-message filters.
+    grep_patterns: Vec<String>,
+    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind_explicit: bool,
+    grep_ignore_case: bool,
+    grep_all_match: bool,
+    grep_invert: bool,
     /// `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
     /// `diff.indentHeuristic` config (default git-enabled).
     indent_heuristic: Option<bool>,
@@ -204,6 +211,12 @@ impl Default for ShowOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            grep_patterns: Vec::new(),
+            grep_pattern_kind: crate::grep_source::PatternKind::Basic,
+            grep_pattern_kind_explicit: false,
+            grep_ignore_case: false,
+            grep_all_match: false,
+            grep_invert: false,
             indent_heuristic: None,
             setup_args: Vec::new(),
         }
@@ -319,7 +332,24 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
     };
+    let grep_kind = log_grep_pattern_kind_from_config(
+        config,
+        options.grep_pattern_kind,
+        options.grep_pattern_kind_explicit,
+    );
+    let grep_matcher =
+        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?;
     for tip in &setup.options.positives {
+        if !show_tip_matches_grep(
+            db,
+            format,
+            &tip.oid,
+            grep_matcher.as_ref(),
+            options.grep_all_match,
+            options.grep_invert,
+        )? {
+            continue;
+        }
         show_object(
             &mut stdout,
             &context,
@@ -331,6 +361,38 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn show_tip_matches_grep(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    matcher: Option<&crate::grep_source::GrepMatcher>,
+    all_match: bool,
+    invert: bool,
+) -> Result<bool> {
+    let Some(matcher) = matcher else {
+        return Ok(true);
+    };
+    let object = db.read_object(oid)?;
+    let message = match object.object_type {
+        ObjectType::Commit => Commit::parse(format, &object.body)?.message,
+        ObjectType::Tag => {
+            let tag = Tag::parse(format, &object.body)?;
+            let target = db.read_object(&tag.object)?;
+            if target.object_type != ObjectType::Commit {
+                return Ok(false != invert);
+            }
+            Commit::parse(format, &target.body)?.message
+        }
+        _ => return Ok(false != invert),
+    };
+    let matched = if all_match {
+        matcher.matches_all(&message)
+    } else {
+        matcher.matches_any(&message)
+    };
+    Ok(matched != invert)
 }
 
 /// Resolve and display a single object reachable from `oid`, where `name` is the
@@ -1269,6 +1331,34 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             }
             value if value.starts_with("-I") && value.len() > 2 => {
                 ignore_regex_patterns.push(value[2..].to_string());
+            }
+            "--grep" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--grep requires a value".into()))?;
+                options.grep_patterns.push(value.clone());
+            }
+            value if let Some(pattern) = value.strip_prefix("--grep=") => {
+                options.grep_patterns.push(pattern.to_string());
+            }
+            "--all-match" => options.grep_all_match = true,
+            "--invert-grep" => options.grep_invert = true,
+            "-i" | "--regexp-ignore-case" => options.grep_ignore_case = true,
+            "-F" | "--fixed-strings" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
+                options.grep_pattern_kind_explicit = true;
+            }
+            "--basic-regexp" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Basic;
+                options.grep_pattern_kind_explicit = true;
+            }
+            "-E" | "--extended-regexp" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Extended;
+                options.grep_pattern_kind_explicit = true;
+            }
+            "-P" | "--perl-regexp" => {
+                options.grep_pattern_kind = crate::grep_source::PatternKind::Perl;
+                options.grep_pattern_kind_explicit = true;
             }
             "--indent-heuristic" => options.indent_heuristic = Some(true),
             "--no-indent-heuristic" => options.indent_heuristic = Some(false),

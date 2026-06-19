@@ -8396,6 +8396,49 @@ fn parse_log_filter_patterns(
         .collect()
 }
 
+fn log_grep_pattern_kind_from_config(
+    config: &GitConfig,
+    current: grep_source::PatternKind,
+    explicit: bool,
+) -> grep_source::PatternKind {
+    if explicit {
+        return current;
+    }
+    match config
+        .get("grep", None, "patterntype")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("fixed") => grep_source::PatternKind::Fixed,
+        Some("basic") => grep_source::PatternKind::Basic,
+        Some("extended") => grep_source::PatternKind::Extended,
+        Some("perl") => grep_source::PatternKind::Perl,
+        _ => current,
+    }
+}
+
+fn compile_log_message_grep_matcher(
+    patterns: &[String],
+    kind: grep_source::PatternKind,
+    ignore_case: bool,
+) -> Result<Option<grep_source::GrepMatcher>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    grep_source::GrepMatcher::compile_with_error_context(
+        grep_source::GrepCompileConfig {
+            patterns,
+            kind,
+            ignore_case,
+            word: false,
+            line_regexp: false,
+            diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity::from_env(),
+        },
+        "command line",
+    )
+    .map(Some)
+}
+
 fn split_log_regex_alternatives(pattern: &str) -> Vec<&str> {
     let mut alternatives = Vec::new();
     let bytes = pattern.as_bytes();
