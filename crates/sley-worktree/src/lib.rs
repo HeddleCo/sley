@@ -1063,7 +1063,7 @@ pub fn add_update_all_tracked_filtered(
     if index_dirty {
         normalize_index_version_for_extended_flags(&mut index);
         index.extensions = index_extensions_without_cache_tree(&index.extensions);
-        write_repository_index(git_dir, format, index.clone())?;
+        write_repository_index_ref(git_dir, format, &index)?;
     }
     Ok(actions)
 }
@@ -1235,7 +1235,7 @@ pub fn add_exact_tracked_path_with_index(
     if dirty {
         normalize_index_version_for_extended_flags(&mut index);
         index.extensions = index_extensions_without_cache_tree(&index.extensions);
-        write_repository_index(git_dir, format, index.clone())?;
+        write_repository_index_ref(git_dir, format, &index)?;
     }
     Ok(action)
 }
@@ -1927,7 +1927,7 @@ fn update_index_paths_impl(
         format,
         &untracked_cache_invalidation_paths,
     )?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     if verbose {
         let mut stdout = std::io::stdout().lock();
         for line in &reports {
@@ -2091,7 +2091,7 @@ pub fn refresh_index_paths(
         }
     }
     if index_dirty {
-        write_repository_index(git_dir, format, index.clone())?;
+        write_repository_index_ref(git_dir, format, &index)?;
     }
     if needs_update && !quiet {
         return Err(GitError::Exit(1));
@@ -2184,7 +2184,7 @@ fn refresh_all_index_paths_parallel(
         }
     }
     if index_dirty {
-        write_repository_index(git_dir, format, index.clone())?;
+        write_repository_index_ref(git_dir, format, &index)?;
     }
     if needs_update && !quiet {
         return Err(GitError::Exit(1));
@@ -2296,7 +2296,7 @@ pub fn set_index_assume_unchanged_paths(
         let matcher = SparseMatcher::new(&sparse, mode);
         collapse_to_sparse_index(&mut index, &matcher, &db, format)?;
     }
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2385,7 +2385,7 @@ pub fn set_index_skip_worktree_paths(
         let matcher = SparseMatcher::new(&sparse, mode);
         collapse_to_sparse_index(&mut index, &matcher, &db, format)?;
     }
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2472,7 +2472,7 @@ pub fn set_index_version(
     }
     index.version = version;
     normalize_index_version_for_extended_flags(&mut index);
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2496,7 +2496,7 @@ pub fn force_write_index(
         }
     };
     normalize_index_version_for_extended_flags(&mut index);
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2526,7 +2526,7 @@ pub fn enable_untracked_cache(
         _ => UntrackedCache::new(format, ident, dir_flags),
     };
     index.set_untracked_cache(format, Some(&cache))?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
 }
 
@@ -2538,7 +2538,7 @@ pub fn disable_untracked_cache(git_dir: impl AsRef<Path>, format: ObjectFormat) 
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     index.set_untracked_cache(format, None)?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
 }
 
@@ -2563,7 +2563,7 @@ pub fn refresh_untracked_cache_after_status(
     match config.get("core", None, "untrackedCache") {
         Some("false") | Some("no") | Some("off") | Some("0") => {
             index.set_untracked_cache(format, None)?;
-            write_repository_index(git_dir, format, index.clone())?;
+            write_repository_index_ref(git_dir, format, &index)?;
             return Ok(());
         }
         Some("true") | Some("yes") | Some("on") | Some("1") => {}
@@ -2591,7 +2591,7 @@ pub fn refresh_untracked_cache_after_status(
     let cache = build_untracked_cache(worktree_root, git_dir, format, &index, untracked_mode)?;
     emit_untracked_cache_trace(old_cache.as_ref(), &cache);
     index.set_untracked_cache(format, Some(&cache))?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
 }
 
@@ -2625,6 +2625,34 @@ fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> {
     filtered
 }
 
+fn index_extensions_without_split_index_link(extensions: &[u8]) -> Vec<u8> {
+    let mut offset = 0;
+    let mut filtered = Vec::new();
+    while offset < extensions.len() {
+        if extensions.len().saturating_sub(offset) < 8 {
+            filtered.extend_from_slice(&extensions[offset..]);
+            break;
+        }
+        let signature = &extensions[offset..offset + 4];
+        let len = u32::from_be_bytes([
+            extensions[offset + 4],
+            extensions[offset + 5],
+            extensions[offset + 6],
+            extensions[offset + 7],
+        ]) as usize;
+        let end = offset.saturating_add(8).saturating_add(len);
+        if end > extensions.len() {
+            filtered.extend_from_slice(&extensions[offset..]);
+            break;
+        }
+        if signature != b"link" {
+            filtered.extend_from_slice(&extensions[offset..end]);
+        }
+        offset = end;
+    }
+    filtered
+}
+
 fn preserved_index_extensions(git_dir: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
     let index_path = repository_index_path(git_dir);
     match fs::read(&index_path) {
@@ -2650,24 +2678,39 @@ fn repository_index_is_split(git_dir: &Path, format: ObjectFormat) -> Result<boo
 
 pub fn write_repository_index(git_dir: &Path, format: ObjectFormat, index: Index) -> Result<()> {
     let split = index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
-    write_repository_index_with_split(git_dir, format, index, split)
+    write_repository_index_ref_with_split(git_dir, format, &index, split)
 }
 
-fn write_repository_index_with_split(
+pub fn write_repository_index_ref(git_dir: &Path, format: ObjectFormat, index: &Index) -> Result<()> {
+    let split = index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
+    write_repository_index_ref_with_split(git_dir, format, index, split)
+}
+
+fn write_repository_index_ref_with_split(
     git_dir: &Path,
     format: ObjectFormat,
-    mut index: Index,
+    index: &Index,
     split: bool,
 ) -> Result<()> {
-    smudge_racily_clean_entries_before_write(git_dir, format, &mut index)?;
     let index_path = repository_index_path(git_dir);
     if !split {
-        index.clear_split_index_link()?;
-        fs::write(index_path, index.write(format)?)?;
+        let smudged_entries = racily_clean_entry_indexes_before_write(git_dir, format, index)?;
+        let extensions = if index.split_index_link(format)?.is_some() {
+            Cow::Owned(index_extensions_without_split_index_link(&index.extensions))
+        } else {
+            Cow::Borrowed(index.extensions.as_slice())
+        };
+        let bytes = if smudged_entries.is_empty() && matches!(extensions, Cow::Borrowed(_)) {
+            index.write(format)?
+        } else {
+            write_index_with_entry_size_overrides(format, index, &smudged_entries, &extensions)?
+        };
+        fs::write(index_path, bytes)?;
         return Ok(());
     }
 
     let mut shared = index.clone();
+    smudge_racily_clean_entries_before_write(git_dir, format, &mut shared)?;
     shared.clear_split_index_link()?;
     shared.extensions = index_extensions_without_cache_tree(&shared.extensions);
     let shared_bytes = shared.write(format)?;
@@ -2688,6 +2731,104 @@ fn write_repository_index_with_split(
     Ok(())
 }
 
+fn write_index_with_entry_size_overrides(
+    format: ObjectFormat,
+    index: &Index,
+    zero_size_entries: &[usize],
+    extensions: &[u8],
+) -> Result<Vec<u8>> {
+    if !(2..=4).contains(&index.version) {
+        return Err(GitError::Unsupported(
+            "canonical writer currently emits index v2/v3/v4".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"DIRC");
+    out.extend_from_slice(&index.version.to_be_bytes());
+    out.extend_from_slice(&(index.entries.len() as u32).to_be_bytes());
+    let mut previous_path = Vec::new();
+    for (position, entry) in index.entries.iter().enumerate() {
+        let start = out.len();
+        out.extend_from_slice(&entry.ctime_seconds.to_be_bytes());
+        out.extend_from_slice(&entry.ctime_nanoseconds.to_be_bytes());
+        out.extend_from_slice(&entry.mtime_seconds.to_be_bytes());
+        out.extend_from_slice(&entry.mtime_nanoseconds.to_be_bytes());
+        out.extend_from_slice(&entry.dev.to_be_bytes());
+        out.extend_from_slice(&entry.ino.to_be_bytes());
+        out.extend_from_slice(&entry.mode.to_be_bytes());
+        out.extend_from_slice(&entry.uid.to_be_bytes());
+        out.extend_from_slice(&entry.gid.to_be_bytes());
+        let size = if zero_size_entries.binary_search(&position).is_ok() {
+            0
+        } else {
+            entry.size
+        };
+        out.extend_from_slice(&size.to_be_bytes());
+        if entry.oid.format() != format {
+            return Err(GitError::Unsupported(format!(
+                "index writer expects {} ids",
+                format.name()
+            )));
+        }
+        out.extend_from_slice(entry.oid.as_bytes());
+        let has_extended_flags =
+            entry.flags & INDEX_FLAG_EXTENDED != 0 || entry.flags_extended != 0;
+        if has_extended_flags && index.version < 3 {
+            return Err(GitError::Unsupported(
+                "index extended flags require version 3".into(),
+            ));
+        }
+        let flags = if has_extended_flags {
+            entry.flags | INDEX_FLAG_EXTENDED
+        } else {
+            entry.flags & !INDEX_FLAG_EXTENDED
+        };
+        out.extend_from_slice(&flags.to_be_bytes());
+        if has_extended_flags {
+            out.extend_from_slice(&entry.flags_extended.to_be_bytes());
+        }
+        if index.version == 4 {
+            let common_prefix_len = common_prefix_len(&previous_path, entry.path.as_bytes());
+            let strip_len = previous_path.len() - common_prefix_len;
+            encode_index_v4_path_strip_len(strip_len, &mut out);
+            out.extend_from_slice(&entry.path.as_bytes()[common_prefix_len..]);
+            out.push(0);
+            previous_path = entry.path.as_bytes().to_vec();
+        } else {
+            out.extend_from_slice(entry.path.as_bytes());
+            out.push(0);
+            while (out.len() - start) % 8 != 0 {
+                out.push(0);
+            }
+        }
+    }
+    out.extend_from_slice(extensions);
+    let checksum = sley_core::digest_bytes(format, &out)?;
+    out.extend_from_slice(checksum.as_bytes());
+    Ok(out)
+}
+
+fn encode_index_v4_path_strip_len(strip_len: usize, out: &mut Vec<u8>) {
+    let mut bytes = Vec::new();
+    bytes.push((strip_len & 0x7f) as u8);
+    let mut value = strip_len >> 7;
+    while value != 0 {
+        value -= 1;
+        bytes.push(((value & 0x7f) as u8) | 0x80);
+        value >>= 7;
+    }
+    for byte in bytes.iter().rev() {
+        out.push(*byte);
+    }
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn index_checksum_from_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
     let hash_len = format.raw_len();
     if bytes.len() < hash_len {
@@ -2700,7 +2841,7 @@ pub fn enable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Re
     let git_dir = git_dir.as_ref();
     let mut index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
     normalize_index_version_for_extended_flags(&mut index);
-    write_repository_index_with_split(git_dir, format, index.clone(), true)?;
+    write_repository_index_ref_with_split(git_dir, format, &index, true)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2717,7 +2858,7 @@ pub fn disable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> R
     }
     let mut index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
     normalize_index_version_for_extended_flags(&mut index);
-    write_repository_index_with_split(git_dir, format, index.clone(), false)?;
+    write_repository_index_ref_with_split(git_dir, format, &index, false)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2729,20 +2870,32 @@ fn smudge_racily_clean_entries_before_write(
     format: ObjectFormat,
     index: &mut Index,
 ) -> Result<()> {
+    for position in racily_clean_entry_indexes_before_write(git_dir, format, index)? {
+        index.entries[position].size = 0;
+    }
+    Ok(())
+}
+
+fn racily_clean_entry_indexes_before_write(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+) -> Result<Vec<usize>> {
     let index_path = repository_index_path(git_dir);
     let Some(index_mtime) = fs::metadata(&index_path)
         .ok()
         .and_then(|metadata| sley_index::file_mtime_parts(&metadata))
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if index_mtime == (0, 0) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(worktree_root) = worktree_root_for_git_dir(git_dir)? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    for entry in &mut index.entries {
+    let mut smudged = Vec::new();
+    for (position, entry) in index.entries.iter().enumerate() {
         if index_entry_stage(entry) != 0 || sley_index::is_gitlink(entry.mode) {
             continue;
         }
@@ -2769,10 +2922,10 @@ fn smudge_racily_clean_entries_before_write(
         };
         let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
         if oid != entry.oid {
-            entry.size = 0;
+            smudged.push(position);
         }
     }
-    Ok(())
+    Ok(smudged)
 }
 
 fn invalidate_untracked_cache_for_git_paths(
@@ -2903,7 +3056,7 @@ pub fn update_index_cacheinfo(
         format,
         &untracked_cache_invalidation_paths,
     )?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     if verbose {
         flush_update_index_reports(&reports)?;
     }
@@ -2991,7 +3144,7 @@ pub fn update_index_index_info(
         format,
         &untracked_cache_invalidation_paths,
     )?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
@@ -11484,7 +11637,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
         checksum: None,
     };
     normalize_index_version_for_extended_flags(&mut index);
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(target_entries.len())
 }
 
@@ -11597,7 +11750,7 @@ fn restore_worktree_paths_inner(
             return Err(GitError::Exit(1));
         }
     }
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11762,7 +11915,7 @@ fn restore_index_paths_from_entries(
         let matcher = SparseMatcher::new(&sparse, mode);
         collapse_to_sparse_index(&mut index, &matcher, db, format)?;
     }
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11907,7 +12060,7 @@ fn restore_index_and_worktree_paths_from_entries(
         checksum: None,
     };
     invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -12302,7 +12455,7 @@ pub fn reset_index_to_commit(
         checksum: None,
     };
     index.upgrade_version_for_flags();
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
@@ -12523,7 +12676,7 @@ pub fn apply_sparse_checkout_with_mode(
     } else {
         index.clear_sparse_extension()?;
     }
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(ApplySparseResult {
         materialized,
         skipped,
@@ -13624,7 +13777,7 @@ pub fn move_index_and_worktree_path(
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
         index.extensions.clear();
-        write_repository_index(git_dir, format, index.clone())?;
+        write_repository_index_ref(git_dir, format, &index)?;
         return Ok(MoveResult {
             source: source_path,
             destination: destination_path,
@@ -13712,7 +13865,7 @@ pub fn move_index_and_worktree_path(
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
     index.extensions.clear();
-    write_repository_index(git_dir, format, index.clone())?;
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(MoveResult {
         source: source_path,
         destination: destination_path,
