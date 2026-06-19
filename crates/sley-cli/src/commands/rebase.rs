@@ -2729,6 +2729,15 @@ fn checkout_would_overwrite_untracked(
     Ok(overwritten)
 }
 
+fn print_merge_would_overwrite_untracked(paths: &[Vec<u8>]) {
+    eprintln!("error: The following untracked working tree files would be overwritten by merge:");
+    for path in paths {
+        eprintln!("\t{}", String::from_utf8_lossy(path));
+    }
+    eprintln!("Please move or remove them before you merge.");
+    eprintln!("Aborting");
+}
+
 fn checkout_onto_base(
     ctx: &Ctx,
     opts: &MachineOpts,
@@ -3553,6 +3562,14 @@ fn pick_one_commit(
 
     // Fast-forward when the pick's parent is exactly HEAD.
     if opts.allow_ff && !create_root && !is_fixup && parent == Some(head) {
+        let target_tree = commit_tree_oid(db, ctx.format, &oid)?;
+        let overwritten = checkout_would_overwrite_untracked(ctx, db, &target_tree)?;
+        if !overwritten.is_empty() {
+            print_merge_would_overwrite_untracked(&overwritten);
+            fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+            reschedule_current(ctx, db, todo, item)?;
+            return Ok(PickOutcome::Fail(1));
+        }
         sley_worktree::reset_index_and_worktree_to_commit(
             &ctx.worktree_root,
             &ctx.git_dir,
@@ -3614,6 +3631,13 @@ fn pick_one_commit(
     };
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
     let theirs_tree = record.commit.tree;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &theirs_tree)?;
+    if !overwritten.is_empty() {
+        print_merge_would_overwrite_untracked(&overwritten);
+        fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+        reschedule_current(ctx, db, todo, item)?;
+        return Ok(PickOutcome::Fail(1));
+    }
     let base_map = stash_tree_entry_map(db, ctx.format, &parent_tree)?;
     let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
