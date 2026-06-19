@@ -9,9 +9,9 @@
 //!
 //! Scope: enough to serve the `git://` transport for the upstream protocol-v2
 //! suite (`--base-path`, `--export-all`, `--enable=receive-pack`,
-//! `--listen`/`--port`/`--reuseaddr`/`--pid-file`/`--verbose`). Interpolated
-//! paths, user-relative paths (`~user`), syslog, and the inetd path are not
-//! implemented.
+//! `--listen`/`--port`/`--reuseaddr`/`--pid-file`/`--verbose`) plus the inetd
+//! stdio mode used by `remote-ext` tests. User-relative paths (`~user`) and
+//! syslog are not implemented.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -28,6 +28,8 @@ struct DaemonOptions {
     base_path: Option<PathBuf>,
     export_all: bool,
     enable_receive_pack: bool,
+    inetd: bool,
+    interpolated_path: Option<PathBuf>,
     pid_file: Option<PathBuf>,
     verbose: bool,
     /// The trailing positional directory (the document root); requests resolve
@@ -50,6 +52,8 @@ fn parse_options(args: &[String]) -> Result<DaemonOptions> {
         base_path: None,
         export_all: false,
         enable_receive_pack: false,
+        inetd: false,
+        interpolated_path: None,
         pid_file: None,
         verbose: false,
         root: None,
@@ -57,6 +61,7 @@ fn parse_options(args: &[String]) -> Result<DaemonOptions> {
     for arg in args {
         match arg.as_str() {
             "--export-all" => opts.export_all = true,
+            "--inetd" => opts.inetd = true,
             "--verbose" => opts.verbose = true,
             "--reuseaddr" => {} // SO_REUSEADDR is always set below.
             "--informative-errors" | "--no-informative-errors" => {}
@@ -71,6 +76,10 @@ fn parse_options(args: &[String]) -> Result<DaemonOptions> {
             }
             value if value.starts_with("--base-path=") => {
                 opts.base_path = Some(PathBuf::from(&value["--base-path=".len()..]));
+            }
+            value if value.starts_with("--interpolated-path=") => {
+                opts.interpolated_path =
+                    Some(PathBuf::from(&value["--interpolated-path=".len()..]));
             }
             value if value.starts_with("--pid-file=") => {
                 opts.pid_file = Some(PathBuf::from(&value["--pid-file=".len()..]));
@@ -111,6 +120,10 @@ fn loginfo(opts: &DaemonOptions, msg: &str) {
 pub(crate) fn cmd_daemon(args: &[String]) -> Result<()> {
     let opts = parse_options(args)?;
 
+    if opts.inetd {
+        return handle_inetd_connection(&opts);
+    }
+
     let listener = bind_listener(&opts.listen, opts.port)?;
 
     if let Some(pid_file) = &opts.pid_file {
@@ -150,7 +163,41 @@ fn handle_connection(opts: &DaemonOptions, mut stream: TcpStream) -> Result<()> 
     let Some(PktLineFrame::Data(payload)) = read_pkt_line_frame(&mut stream)? else {
         return Ok(());
     };
+    let request = parse_daemon_request(&payload)?;
+    if let Some((repo, receive)) = prepare_daemon_request(
+        opts,
+        &request,
+        |msg| write_error(&mut stream, msg),
+    )? {
+        run_service(&repo, receive, request.git_protocol.as_deref(), stream)?;
+    }
+    Ok(())
+}
 
+fn handle_inetd_connection(opts: &DaemonOptions) -> Result<()> {
+    let mut stdin = std::io::stdin().lock();
+    let Some(PktLineFrame::Data(payload)) = read_pkt_line_frame(&mut stdin)? else {
+        return Ok(());
+    };
+    let request = parse_daemon_request(&payload)?;
+    if let Some((repo, receive)) = prepare_daemon_request(
+        opts,
+        &request,
+        |msg| write_error_stdio(msg),
+    )? {
+        run_service_stdio(&repo, receive, request.git_protocol.as_deref())?;
+    }
+    Ok(())
+}
+
+struct DaemonRequest {
+    service: String,
+    path: String,
+    host: Option<String>,
+    git_protocol: Option<String>,
+}
+
+fn parse_daemon_request(payload: &[u8]) -> Result<DaemonRequest> {
     // `git-upload-pack <path>\0host=<h>\0\0version=2\0`
     // The service line ends at the first NUL (or the trailing LF); everything
     // after it is extra args, each NUL-terminated.
@@ -162,33 +209,49 @@ fn handle_connection(opts: &DaemonOptions, mut stream: TcpStream) -> Result<()> 
     let line = std::str::from_utf8(line)
         .map_err(|_| GitError::InvalidFormat("daemon request is not valid UTF-8".into()))?;
 
-    let git_protocol = parse_extra_args(&payload[line_end..]);
+    let (host, git_protocol) = parse_extra_args(&payload[line_end..]);
 
     // Match `git-<service> <path>`.
     let (service, path) = parse_service_line(line)?;
-    let requested_receive_pack = match service {
+    Ok(DaemonRequest {
+        service: service.to_string(),
+        path: path.to_string(),
+        host,
+        git_protocol,
+    })
+}
+
+fn prepare_daemon_request(
+    opts: &DaemonOptions,
+    request: &DaemonRequest,
+    mut write_failure: impl FnMut(&str) -> Result<()>,
+) -> Result<Option<(PathBuf, bool)>> {
+    let requested_receive_pack = match request.service.as_str() {
         "upload-pack" => false,
         "receive-pack" => true,
         other => {
-            write_error(&mut stream, &format!("unknown service git-{other}"))?;
-            return Ok(());
+            write_failure(&format!("unknown service git-{other}"))?;
+            return Ok(None);
         }
     };
 
-    let repo = resolve_repository(opts, path)?;
+    let repo = resolve_repository(opts, &request.path, request.host.as_deref())?;
     let Some(repo) = repo else {
-        write_error(&mut stream, "access denied or repository not exported")?;
-        return Ok(());
+        write_failure("access denied or repository not exported")?;
+        return Ok(None);
     };
 
     if requested_receive_pack && !receive_pack_enabled(opts, &repo) {
-        write_error(&mut stream, "service not enabled")?;
-        return Ok(());
+        write_failure("service not enabled")?;
+        return Ok(None);
     }
 
-    loginfo(opts, &format!("Request {service} for '{}'", repo.display()));
+    loginfo(
+        opts,
+        &format!("Request {} for '{}'", request.service, repo.display()),
+    );
 
-    run_service(&repo, requested_receive_pack, git_protocol.as_deref(), stream)
+    Ok(Some((repo, requested_receive_pack)))
 }
 
 /// Split `git-<service> <path>` into `(service, path)`.
@@ -202,11 +265,11 @@ fn parse_service_line(line: &str) -> Result<(&str, &str)> {
     Ok((service, path))
 }
 
-/// Collect the post-first-NUL extra args (`host=`, `version=2`, ...) into the
-/// colon-joined `GIT_PROTOCOL` value, dropping the `host=` arg (handled
-/// separately by upstream; we have no vhost routing). Mirrors
-/// `daemon.c::parse_extra_args`.
-fn parse_extra_args(extra: &[u8]) -> Option<String> {
+/// Collect the post-first-NUL extra args (`host=`, `version=2`, ...). `host=`
+/// participates in interpolated-path routing; the remaining args become the
+/// colon-joined `GIT_PROTOCOL` value. Mirrors `daemon.c::parse_extra_args`.
+fn parse_extra_args(extra: &[u8]) -> (Option<String>, Option<String>) {
+    let mut host = None;
     let mut protocol_parts: Vec<String> = Vec::new();
     // `extra` begins with the NUL that terminated the service line; iterate the
     // NUL-separated tokens that follow.
@@ -218,29 +281,39 @@ fn parse_extra_args(extra: &[u8]) -> Option<String> {
             continue;
         };
         if let Some(rest) = arg.strip_prefix("host=") {
-            let _ = rest; // No virtual-host routing; ignore.
+            host = Some(rest.to_string());
             continue;
         }
         protocol_parts.push(arg.to_string());
     }
-    if protocol_parts.is_empty() {
+    let git_protocol = if protocol_parts.is_empty() {
         None
     } else {
         Some(protocol_parts.join(":"))
-    }
+    };
+    (host, git_protocol)
 }
 
 /// Resolve the request `path` against the document root, enforcing
 /// `--export-all` / `git-daemon-export-ok`. Returns `None` when the repository
 /// is not exported. Mirrors `daemon.c::run_service`'s `path_ok` + export check.
-fn resolve_repository(opts: &DaemonOptions, path: &str) -> Result<Option<PathBuf>> {
+fn resolve_repository(
+    opts: &DaemonOptions,
+    path: &str,
+    host: Option<&str>,
+) -> Result<Option<PathBuf>> {
     let root = opts.document_root().ok_or_else(|| {
         GitError::Command("daemon: no --base-path or document root configured".into())
     })?;
-    // The wire path is absolute relative to the base-path: `/parent` => join.
-    let rel = path.trim_start_matches('/');
-    let mut repo = root.to_path_buf();
-    repo.push(rel);
+    let repo = if let Some(template) = &opts.interpolated_path {
+        interpolate_daemon_path(template, path, host)
+    } else {
+        // The wire path is absolute relative to the base-path: `/parent` => join.
+        let rel = path.trim_start_matches('/');
+        let mut repo = root.to_path_buf();
+        repo.push(rel);
+        repo
+    };
 
     // Resolve to a real repository: accept either a bare repo dir or a worktree
     // with `.git`. We canonicalize to guard against `..` traversal outside root.
@@ -261,6 +334,13 @@ fn resolve_repository(opts: &DaemonOptions, path: &str) -> Result<Option<PathBuf
         }
     }
     Ok(Some(repo))
+}
+
+fn interpolate_daemon_path(template: &Path, path: &str, host: Option<&str>) -> PathBuf {
+    let mut out = template.to_string_lossy().into_owned();
+    out = out.replace("%H", host.unwrap_or(""));
+    out = out.replace("%D", path);
+    PathBuf::from(out)
 }
 
 fn receive_pack_enabled(opts: &DaemonOptions, repo: &Path) -> bool {
@@ -325,6 +405,32 @@ fn run_service(
     Ok(())
 }
 
+fn run_service_stdio(repo: &Path, receive: bool, git_protocol: Option<&str>) -> Result<()> {
+    let self_exe = std::env::current_exe()
+        .map_err(|err| GitError::Command(format!("daemon: cannot locate self: {err}")))?;
+    let service = if receive {
+        "receive-pack"
+    } else {
+        "upload-pack"
+    };
+    let mut command = Command::new(self_exe);
+    command
+        .arg(service)
+        .arg(repo)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::null())
+        .env_remove("GIT_PROTOCOL");
+    if let Some(protocol) = git_protocol {
+        command.env("GIT_PROTOCOL", protocol);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| GitError::Command(format!("daemon: cannot spawn {service}: {err}")))?;
+    let _ = child.wait();
+    Ok(())
+}
+
 /// Write a `ERR <msg>` pkt-line to the client (the format git's clients expect
 /// for a daemon-side refusal).
 fn write_error(stream: &mut TcpStream, msg: &str) -> Result<()> {
@@ -334,6 +440,16 @@ fn write_error(stream: &mut TcpStream, msg: &str) -> Result<()> {
     stream.write_all(&encoded)?;
     stream.flush()?;
     let _ = read_drain(stream);
+    Ok(())
+}
+
+fn write_error_stdio(msg: &str) -> Result<()> {
+    let body = format!("ERR {msg}");
+    let frame = PktLineFrame::data(format!("{body}\n").into_bytes())?;
+    let encoded = frame.encode();
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&encoded)?;
+    stdout.flush()?;
     Ok(())
 }
 
