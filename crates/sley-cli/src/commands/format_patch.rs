@@ -3511,8 +3511,8 @@ fn write_patch_diff_entry(
     options: &FormatPatchOptions,
     abbrev: usize,
 ) -> Result<()> {
-    let old_content = entry_old_content(entry, db)?;
-    let new_content = entry_new_content(entry, db)?;
+    let old_content = entry_old_content(entry, db, format)?;
+    let new_content = entry_new_content(entry, db, format)?;
     let content_changed = old_content.as_deref() != new_content.as_deref();
 
     let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
@@ -3908,7 +3908,14 @@ fn write_patch_summary_entry(
 fn entry_old_content(
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
+    format: ObjectFormat,
 ) -> Result<Option<Vec<u8>>> {
+    if entry.old_mode.is_some_and(sley_index::is_gitlink) {
+        return Ok(entry
+            .old_oid
+            .as_ref()
+            .map(|oid| gitlink_patch_content(format, oid)));
+    }
     entry
         .old_oid
         .as_ref()
@@ -3920,15 +3927,26 @@ fn entry_old_content(
 fn entry_new_content(
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
+    format: ObjectFormat,
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode.is_none() {
         return Ok(None);
+    }
+    if entry.new_mode.is_some_and(sley_index::is_gitlink) {
+        return Ok(entry
+            .new_oid
+            .as_ref()
+            .map(|oid| gitlink_patch_content(format, oid)));
     }
     entry
         .new_oid
         .as_ref()
         .map(|oid| read_patch_blob(db, oid))
         .transpose()
+}
+
+fn gitlink_patch_content(_format: ObjectFormat, oid: &ObjectId) -> Vec<u8> {
+    format!("Subproject commit {oid}\n").into_bytes()
 }
 
 /// Read a blob object's bytes, erroring if the id is not a blob.
@@ -4080,6 +4098,13 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // quirkily, does *not* disable the stat — so it is a no-op here.
             "-p" => options.stat = false,
             "--patch" | "--no-patch-with-stat" | "--numstat" => {}
+            "--ignore-submodules" | "--no-ignore-submodules" => {}
+            value if let Some(mode) = value.strip_prefix("--ignore-submodules=") => {
+                if !matches!(mode, "" | "all" | "dirty" | "untracked" | "none") {
+                    eprintln!("fatal: bad --ignore-submodules argument: {mode}");
+                    return Err(GitError::Exit(128));
+                }
+            }
             "--full-index" => options.full_index = true,
             "--no-renames" => options.detect_renames = false,
             "-M" | "--find-renames" => options.detect_renames = true,

@@ -87,6 +87,15 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 explicit_branch = Some(true);
                 explicit_long = false;
             }
+            "-su" | "-us" => {
+                short = true;
+                explicit_short = true;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
+                explicit_long = false;
+                untracked_mode = sley_worktree::StatusUntrackedMode::All;
+                explicit_untracked = true;
+            }
             "--no-short" => {
                 short = false;
                 explicit_short = true;

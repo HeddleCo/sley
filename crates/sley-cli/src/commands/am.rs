@@ -2356,7 +2356,16 @@ fn stage_and_commit(
                 mode,
                 content,
             } => {
-                let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
+                let oid = if sley_index::is_gitlink(*mode) {
+                    gitlink_oid_from_subproject_content(format, content)?.ok_or_else(|| {
+                        GitError::InvalidFormat(format!(
+                            "patch for gitlink {} did not name a subproject commit",
+                            String::from_utf8_lossy(path)
+                        ))
+                    })?
+                } else {
+                    db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?
+                };
                 upsert_index_entry(&mut index, path, *mode, oid);
             }
             ApplyFileAction::Remove { path } => {
@@ -2686,6 +2695,28 @@ fn apply_three_way(
             .ok_or_else(|| GitError::InvalidFormat("patch missing target path".into()))?;
         let old_path = file.old_path.clone().unwrap_or_else(|| path.clone());
 
+        if file_patch_touches_gitlink(file) {
+            let (old_oid, new_oid) = gitlink_oids_from_patch(file, format)?;
+            let base_mode = file.old_mode.unwrap_or(0o160000);
+            let mode = file.new_mode.or(file.old_mode).unwrap_or(0o160000);
+            if file.is_new {
+                base_map.remove(&path);
+            } else if let Some(old_oid) = old_oid
+                .or_else(|| ours_map.get(&old_path).or_else(|| ours_map.get(&path)).map(|(_, oid)| *oid))
+            {
+                base_map.insert(old_path.clone(), (base_mode, old_oid));
+            }
+            if file.is_delete {
+                theirs_map.remove(&path);
+            } else if let Some(new_oid) = new_oid {
+                theirs_map.insert(path.clone(), (mode, new_oid));
+                if file.is_rename {
+                    theirs_map.remove(&old_path);
+                }
+            }
+            continue;
+        }
+
         let base_bytes = if file.is_new {
             Vec::new()
         } else if let Some(bytes) =
@@ -2851,6 +2882,65 @@ fn parse_patch_index_oids(diff: &[u8]) -> BTreeMap<Vec<u8>, String> {
     map
 }
 
+fn file_patch_touches_gitlink(file: &sley_diff_merge::FilePatch) -> bool {
+    file.old_mode.is_some_and(sley_index::is_gitlink)
+        || file.new_mode.is_some_and(sley_index::is_gitlink)
+        || file.hunks.iter().any(|hunk| {
+            hunk.lines.iter().any(|line| match line {
+                sley_diff_merge::HunkLine::Context(bytes)
+                | sley_diff_merge::HunkLine::Delete(bytes)
+                | sley_diff_merge::HunkLine::Insert(bytes) => {
+                    bytes.starts_with(b"Subproject commit ")
+                }
+            })
+        })
+}
+
+fn gitlink_oids_from_patch(
+    file: &sley_diff_merge::FilePatch,
+    format: ObjectFormat,
+) -> Result<(Option<ObjectId>, Option<ObjectId>)> {
+    let mut old_oid = None;
+    let mut new_oid = None;
+    for hunk in &file.hunks {
+        for line in &hunk.lines {
+            match line {
+                sley_diff_merge::HunkLine::Delete(bytes) => {
+                    old_oid = gitlink_oid_from_subproject_content(format, bytes)?;
+                }
+                sley_diff_merge::HunkLine::Insert(bytes) => {
+                    new_oid = gitlink_oid_from_subproject_content(format, bytes)?;
+                }
+                sley_diff_merge::HunkLine::Context(bytes) => {
+                    let oid = gitlink_oid_from_subproject_content(format, bytes)?;
+                    old_oid = old_oid.or(oid);
+                    new_oid = new_oid.or(oid);
+                }
+            }
+        }
+    }
+    Ok((old_oid, new_oid))
+}
+
+fn gitlink_oid_from_subproject_content(
+    format: ObjectFormat,
+    content: &[u8],
+) -> Result<Option<ObjectId>> {
+    let Some(rest) = content.strip_prefix(b"Subproject commit ") else {
+        return Ok(None);
+    };
+    let text = String::from_utf8_lossy(rest);
+    let hex = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if hex.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ObjectId::from_hex(format, hex)?))
+}
+
 /// Extract the new-side path from a `diff --git <old> <new>` line. The usual
 /// form carries `a/<path> b/<path>` prefixes, but a `--no-prefix` patch emits
 /// `diff --git <path> <path>` (identical, unprefixed paths) — handle both.
@@ -2954,7 +3044,11 @@ fn write_merge_index_and_worktree(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(db, oid)?;
+                    let content = if sley_index::is_gitlink(*mode) {
+                        Vec::new()
+                    } else {
+                        merge_read_blob(db, oid)?
+                    };
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
             }

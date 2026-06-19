@@ -12,7 +12,7 @@ use std::process::Command as Proc;
 use sley_remote::{FetchOptions, LsRemoteRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FetchRecurseSubmodules {
+pub(crate) enum FetchRecurseSubmodules {
     Default,
     OnDemand,
     On,
@@ -20,7 +20,7 @@ enum FetchRecurseSubmodules {
 }
 
 impl FetchRecurseSubmodules {
-    fn from_arg(value: Option<&str>) -> Result<Self> {
+    pub(crate) fn from_arg(value: Option<&str>) -> Result<Self> {
         match value.unwrap_or("yes") {
             "yes" | "true" | "on" => Ok(Self::On),
             "on-demand" => Ok(Self::OnDemand),
@@ -32,7 +32,7 @@ impl FetchRecurseSubmodules {
         }
     }
 
-    fn from_config(value: &str) -> Self {
+    pub(crate) fn from_config(value: &str) -> Self {
         match sley_submodule::parse_fetch_recurse(value) {
             sley_submodule::RecurseMode::On => Self::On,
             sley_submodule::RecurseMode::Off => Self::Off,
@@ -3155,7 +3155,7 @@ fn parse_fetch_jobs(value: &str) -> Result<Option<usize>> {
     }
 }
 
-fn resolve_fetch_recurse_submodules(
+pub(crate) fn resolve_fetch_recurse_submodules(
     config: &GitConfig,
     cli: FetchRecurseSubmodules,
     default_mode: FetchRecurseSubmodules,
@@ -3178,18 +3178,18 @@ fn resolve_fetch_recurse_submodules(
     default_mode
 }
 
-struct FetchSubmoduleRequest<'a> {
-    git_dir: &'a Path,
-    format: ObjectFormat,
-    worktree_root: &'a Path,
-    config: &'a GitConfig,
-    recurse_submodules: FetchRecurseSubmodules,
-    default_recurse_submodules: FetchRecurseSubmodules,
-    source: &'a str,
-    changed_gitlinks: std::collections::BTreeSet<String>,
-    options: &'a FetchOptions,
-    submodule_prefix: &'a str,
-    jobs: Option<usize>,
+pub(crate) struct FetchSubmoduleRequest<'a> {
+    pub(crate) git_dir: &'a Path,
+    pub(crate) format: ObjectFormat,
+    pub(crate) worktree_root: &'a Path,
+    pub(crate) config: &'a GitConfig,
+    pub(crate) recurse_submodules: FetchRecurseSubmodules,
+    pub(crate) default_recurse_submodules: FetchRecurseSubmodules,
+    pub(crate) source: &'a str,
+    pub(crate) changed_gitlinks: std::collections::BTreeSet<String>,
+    pub(crate) options: &'a FetchOptions,
+    pub(crate) submodule_prefix: &'a str,
+    pub(crate) jobs: Option<usize>,
 }
 
 struct CurrentDirGuard {
@@ -3210,7 +3210,7 @@ impl Drop for CurrentDirGuard {
     }
 }
 
-fn fetch_populated_submodules_after_superproject(req: FetchSubmoduleRequest<'_>) -> Result<()> {
+pub(crate) fn fetch_populated_submodules_after_superproject(req: FetchSubmoduleRequest<'_>) -> Result<()> {
     if req.recurse_submodules == FetchRecurseSubmodules::Off {
         return Ok(());
     }
@@ -3334,7 +3334,7 @@ fn fetch_recurse_mode_for_submodule(
     inherited
 }
 
-fn fetch_ref_snapshot(
+pub(crate) fn fetch_ref_snapshot(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<std::collections::BTreeMap<String, ObjectId>> {
@@ -3348,7 +3348,7 @@ fn fetch_ref_snapshot(
     Ok(refs)
 }
 
-fn changed_gitlinks_for_fetch(
+pub(crate) fn changed_gitlinks_for_fetch(
     git_dir: &Path,
     format: ObjectFormat,
     before: &std::collections::BTreeMap<String, ObjectId>,

@@ -86,6 +86,7 @@ struct RebaseArgs {
     gpg_sign: Option<String>,
     positional: Vec<String>,
     total_args: usize,
+    recurse_submodules: bool,
 }
 
 fn rebase_usage_error() -> GitError {
@@ -133,6 +134,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         gpg_sign: None,
         positional: Vec::new(),
         total_args: args.len(),
+        recurse_submodules: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -191,6 +193,12 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--stat" => out.stat = Some(true),
             "--autostash" => out.autostash = Some(true),
             "--no-autostash" => out.autostash = Some(false),
+            "--recurse-submodules" => out.recurse_submodules = true,
+            "--no-recurse-submodules" => out.recurse_submodules = false,
+            _ if arg.starts_with("--recurse-submodules=") => {
+                let value = &arg["--recurse-submodules=".len()..];
+                out.recurse_submodules = !matches!(value, "no" | "false" | "off");
+            }
             "--autosquash" => out.autosquash = Some(true),
             "--no-autosquash" => out.autosquash = Some(false),
             "-k" | "--keep-empty" => out.keep_empty = true,
@@ -373,6 +381,7 @@ struct Ctx {
     format: ObjectFormat,
     /// `GIT_REFLOG_ACTION` or `"rebase"`.
     reflog_action: String,
+    recurse_submodules: bool,
 }
 
 impl Ctx {
@@ -389,6 +398,7 @@ impl Ctx {
             worktree_root,
             format,
             reflog_action,
+            recurse_submodules: false,
         })
     }
 
@@ -411,6 +421,26 @@ impl Ctx {
             out.push_str(rest);
         }
         out.into_bytes()
+    }
+}
+
+fn reset_index_and_worktree_to_commit_for_rebase(ctx: &Ctx, commit: &ObjectId) -> Result<()> {
+    if ctx.recurse_submodules {
+        commands::read_tree::reset_index_and_worktree_to_commit(
+            &ctx.worktree_root,
+            &ctx.git_dir,
+            ctx.format,
+            commit,
+            true,
+        )
+    } else {
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &ctx.worktree_root,
+            &ctx.git_dir,
+            ctx.format,
+            commit,
+        )?;
+        Ok(())
     }
 }
 
@@ -797,7 +827,8 @@ fn rebase_merges_config(ctx: &Ctx) -> Option<RebaseMergesMode> {
 
 pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
     let parsed = parse_rebase_args(args)?;
-    let ctx = Ctx::discover()?;
+    let mut ctx = Ctx::discover()?;
+    ctx.recurse_submodules = parsed.recurse_submodules;
 
     if parsed.action != RebaseAction::None && parsed.total_args != 1 {
         return Err(rebase_usage_error());
@@ -1215,12 +1246,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     // The apply backend's explicit fast-forward case.
     if allow_preemptive_ff && !force && branch_base.as_ref() == Some(&orig_head) {
         // onto is a descendant of orig_head: fast-forward.
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &ctx.worktree_root,
-            &ctx.git_dir,
-            ctx.format,
-            &onto,
-        )?;
+        reset_index_and_worktree_to_commit_for_rebase(&ctx, &onto)?;
         let committer = commit_identity_from_env("COMMITTER")?;
         detach_head_with_reflog(
             ctx,
@@ -1513,12 +1539,7 @@ fn checkout_onto_for_apply(
         eprintln!("error: could not detach HEAD");
         return Err(GitError::Exit(1));
     }
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        base,
-    )?;
+    reset_index_and_worktree_to_commit_for_rebase(ctx, base)?;
     let committer = commit_identity_from_env("COMMITTER")?;
     detach_head_with_reflog(
         ctx,
@@ -1642,12 +1663,7 @@ fn checkout_up_to_date(
         eprintln!("error: could not switch to branch '{branch}'");
         return Err(GitError::Exit(1));
     }
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        oid,
-    )?;
+    reset_index_and_worktree_to_commit_for_rebase(ctx, oid)?;
     let refs = ctx.refs();
     let committer = commit_identity_from_env("COMMITTER")?;
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
@@ -2819,12 +2835,7 @@ fn checkout_onto_base(
         eprintln!("error: could not detach HEAD");
         return Err(GitError::Exit(1));
     }
-    if let Err(err) = sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        base,
-    ) {
+    if let Err(err) = reset_index_and_worktree_to_commit_for_rebase(ctx, base) {
         apply_autostash(ctx);
         seq::remove_merge_state(&ctx.git_dir);
         eprintln!("error: could not detach HEAD");
@@ -3121,12 +3132,7 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
         eprintln!("Please move or remove them before you reset.");
         return Err(GitError::Exit(1));
     }
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        &target,
-    )?;
+    reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
     let committer = commit_identity_from_env("COMMITTER")?;
@@ -3166,12 +3172,7 @@ fn do_merge(
 
     if opts.squash_onto == Some(head) && merge_heads.len() == 1 {
         let target = merge_heads[0].1;
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &ctx.worktree_root,
-            &ctx.git_dir,
-            ctx.format,
-            &target,
-        )?;
+        reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
         let committer = commit_identity_from_env("COMMITTER")?;
         detach_head_with_reflog(ctx, head, target, ctx.reflog("merge", None), committer)?;
         return Ok(PickOutcome::Continue);
@@ -3185,12 +3186,7 @@ fn do_merge(
             .copied()
             .eq(merge_heads.iter().map(|(_, oid)| *oid))
     {
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &ctx.worktree_root,
-            &ctx.git_dir,
-            ctx.format,
-            &record.oid,
-        )?;
+        reset_index_and_worktree_to_commit_for_rebase(ctx, &record.oid)?;
         let committer = commit_identity_from_env("COMMITTER")?;
         detach_head_with_reflog(
             ctx,
@@ -3640,12 +3636,7 @@ fn pick_one_commit(
             reschedule_current(ctx, db, todo, item)?;
             return Ok(PickOutcome::Fail(1));
         }
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &ctx.worktree_root,
-            &ctx.git_dir,
-            ctx.format,
-            &oid,
-        )?;
+        reset_index_and_worktree_to_commit_for_rebase(ctx, &oid)?;
         let committer = commit_identity_from_env("COMMITTER")?;
         detach_head_with_reflog(
             ctx,
@@ -4973,12 +4964,7 @@ fn rebase_skip(ctx: &Ctx) -> Result<()> {
     let refs = ctx.refs();
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        &head,
-    )?;
+    reset_index_and_worktree_to_commit_for_rebase(ctx, &head)?;
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(ctx.git_dir.join("AUTO_MERGE"));
@@ -4996,12 +4982,7 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
     let opts = read_basic_state(ctx)?;
     let db = ctx.db();
     let target = sley_rev::peel_to_commit(&db, ctx.format, &opts.orig_head)?;
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        &target,
-    )?;
+    reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
     let committer = commit_identity_from_env("COMMITTER")?;
     let old_head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
@@ -5162,12 +5143,7 @@ fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     let refs = ctx.refs();
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
-    sley_worktree::reset_index_and_worktree_to_commit(
-        &ctx.worktree_root,
-        &ctx.git_dir,
-        ctx.format,
-        &head,
-    )?;
+    reset_index_and_worktree_to_commit_for_rebase(ctx, &head)?;
     Ok(())
 }
 

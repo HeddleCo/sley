@@ -1,7 +1,10 @@
 //! Merge, rebase, pull, cherry-pick, revert, and merge-base commands.
 
 use crate::commands::remote_cmds::{
-    StdoutProgress, fetch_bundle, fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir,
+    FetchRecurseSubmodules, FetchSubmoduleRequest, StdoutProgress, changed_gitlinks_for_fetch,
+    fetch_bundle, fetch_populated_submodules_after_superproject, fetch_ref_snapshot,
+    fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir,
+    resolve_fetch_recurse_submodules,
 };
 use crate::*;
 use sley_remote::FetchOptions;
@@ -1009,11 +1012,12 @@ fn merge_octopus(
             }),
         });
         tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(
+        reset_index_and_worktree_to_commit_for_merge(
             worktree_root,
             git_dir,
             format,
             &new_oid,
+            options.recurse_submodules,
         )?;
         if !options.quiet {
             let mut stdout = io::stdout();
@@ -1697,6 +1701,8 @@ struct MergeOptions {
     /// `--into-name=<name>`: override the destination name used in the generated
     /// merge message title.
     into_name: Option<String>,
+    /// Move populated submodule worktrees when gitlink entries change.
+    recurse_submodules: bool,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -1729,6 +1735,7 @@ impl Default for MergeOptions {
             edit: None,
             autostash: None,
             into_name: None,
+            recurse_submodules: false,
         }
     }
 }
@@ -2854,6 +2861,12 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--continue" => parsed.continue_merge = true,
             "--autostash" => options.autostash = Some(true),
             "--no-autostash" => options.autostash = Some(false),
+            "--recurse-submodules" => options.recurse_submodules = true,
+            "--no-recurse-submodules" => options.recurse_submodules = false,
+            value if value.starts_with("--recurse-submodules=") => {
+                let value = value.strip_prefix("--recurse-submodules=").unwrap_or("");
+                options.recurse_submodules = !matches!(value, "no" | "false" | "off");
+            }
             "--no-ff" => set_merge_fast_forward(options, FastForward::No),
             "--ff" => set_merge_fast_forward(options, FastForward::Allow),
             "--ff-only" => set_merge_fast_forward(options, FastForward::Only),
@@ -3276,11 +3289,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             }),
         });
         tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(
+        reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
             &git_dir,
             format,
             &other_oid,
+            options.recurse_submodules,
         )?;
         return Ok(());
     };
@@ -3351,11 +3365,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             &target,
             prepare_merge_commit_message(&git_dir, &message, &options)?,
         )?;
-        sley_worktree::reset_index_and_worktree_to_commit(
+        reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
             &git_dir,
             format,
             &merged_oid,
+            options.recurse_submodules,
         )?;
         commands::hooks::run_hook_l("post-merge", &["0"])?;
         if merge_autostash {
@@ -3385,11 +3400,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             }
             return Err(err);
         }
-        sley_worktree::reset_index_and_worktree_to_commit(
+        reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
             &git_dir,
             format,
             &other_oid,
+            options.recurse_submodules,
         )?;
         write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
         if !options.quiet {
@@ -3455,11 +3471,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             }),
         });
         tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(
+        reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
             &git_dir,
             format,
             &other_oid,
+            options.recurse_submodules,
         )?;
         commands::hooks::run_hook_l("post-merge", &["0"])?;
         if !options.quiet {
@@ -3666,11 +3683,12 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         // a file `after`). Clear those file-in-the-way ancestors before the
         // checkout materializes the subtree, else `create_dir_all` fails EEXIST.
         clear_merge_df_blockers(&worktree_root, &results);
-        sley_worktree::reset_index_and_worktree_to_commit(
+        reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
             &git_dir,
             format,
             &merged_oid,
+            options.recurse_submodules,
         )?;
         commands::hooks::run_hook_l("post-merge", &["0"])?;
         if merge_autostash {
@@ -4141,6 +4159,27 @@ fn verify_fast_forward_untracked_safe(
         }
     }
     Ok(())
+}
+
+fn reset_index_and_worktree_to_commit_for_merge(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    commit: &ObjectId,
+    recurse_submodules: bool,
+) -> Result<()> {
+    if recurse_submodules {
+        commands::read_tree::reset_index_and_worktree_to_commit(
+            worktree_root,
+            git_dir,
+            format,
+            commit,
+            true,
+        )
+    } else {
+        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
+        Ok(())
+    }
 }
 
 // ===== pull / rebase / merge-continue =====
@@ -5417,6 +5456,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let mut depth = None::<u32>;
     let mut expect_depth_value = false;
     let mut _all = false;
+    let mut recurse_submodules_cli = FetchRecurseSubmodules::Default;
     for arg in args {
         if expect_depth_value {
             expect_depth_value = false;
@@ -5442,6 +5482,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "--all" => _all = true,
             "--no-all" => _all = false,
+            "--recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::On,
+            "--no-recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::Off,
+            value if value.starts_with("--recurse-submodules=") => {
+                let value = value
+                    .strip_prefix("--recurse-submodules=")
+                    .ok_or_else(|| GitError::Command("pull --recurse-submodules requires a value".into()))?;
+                recurse_submodules_cli = FetchRecurseSubmodules::from_arg(Some(value))?;
+            }
             "--depth" => expect_depth_value = true,
             value if value.starts_with("--depth=") => {
                 depth = Some(crate::commands::remote_cmds::parse_clone_depth(
@@ -5450,7 +5498,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
-                    "pull currently supports --ff-only, --no-ff, --rebase, --no-rebase, --autostash, --no-autostash, --quiet, and remote/branch arguments; unsupported option {value}"
+                    "pull currently supports --ff-only, --no-ff, --rebase, --no-rebase, --autostash, --no-autostash, --quiet, --recurse-submodules, --no-recurse-submodules, and remote/branch arguments; unsupported option {value}"
                 )));
             }
             value => {
@@ -5546,20 +5594,54 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
     };
+    let fetch_recurse_submodules = resolve_fetch_recurse_submodules(
+        &config,
+        recurse_submodules_cli,
+        FetchRecurseSubmodules::OnDemand,
+    );
+    let update_recurse_submodules = match recurse_submodules_cli {
+        FetchRecurseSubmodules::On | FetchRecurseSubmodules::OnDemand => true,
+        FetchRecurseSubmodules::Off => false,
+        FetchRecurseSubmodules::Default => config
+            .get_bool("submodule", None, "recurse")
+            .unwrap_or(false),
+    };
     // git captures `orig_head` (HEAD before the fetch). A refspec like
     // `main:main` can create the current branch during the fetch, but the
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
     let orig_head_unborn = orig_head.is_none();
-    if let Err(err) = pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options) {
+    let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
+    let fetch_outcome = match pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options.clone()) {
+        Ok(outcome) => outcome,
+        Err(err) => {
         if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
             print_pull_no_such_ref_fetched(&merge_srcs);
             return Err(GitError::Exit(1));
         }
         return Err(err);
-    }
+        }
+    };
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+        git_dir: &git_dir,
+        format,
+        worktree_root: &worktree_root,
+        config: &config,
+        recurse_submodules: fetch_recurse_submodules,
+        default_recurse_submodules: FetchRecurseSubmodules::OnDemand,
+        source: &remote,
+        changed_gitlinks: changed_gitlinks_for_fetch(
+            &git_dir,
+            format,
+            &before_fetch_refs,
+            &fetch_outcome,
+        )?,
+        options: &fetch_options,
+        submodule_prefix: "",
+        jobs: None,
+    })?;
     let curr_head = head_commit_oid(&store)?;
     update_worktree_after_fetch_moved_head(
         &git_dir,
@@ -5676,6 +5758,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         } else if let Some(ff) = opt_ff {
             merge_args.push(ff.as_merge_arg().to_string());
         }
+        if update_recurse_submodules {
+            merge_args.push("--recurse-submodules".to_string());
+        }
         push_autostash_arg(&mut merge_args, effective_autostash);
         if quiet {
             merge_args.push("--quiet".to_string());
@@ -5695,6 +5780,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         if force_rebase {
             rebase_args.push("--force-rebase".to_string());
         }
+        if update_recurse_submodules {
+            rebase_args.push("--recurse-submodules".to_string());
+        }
         if let Some(fork_point) = rebase_fork_point {
             rebase_args.push("--onto".to_string());
             rebase_args.push("FETCH_HEAD".to_string());
@@ -5707,6 +5795,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let mut merge_args = Vec::new();
     if let Some(ff) = opt_ff {
         merge_args.push(ff.as_merge_arg().to_string());
+    }
+    if update_recurse_submodules {
+        merge_args.push("--recurse-submodules".to_string());
     }
     push_autostash_arg(&mut merge_args, effective_autostash);
     if quiet {
