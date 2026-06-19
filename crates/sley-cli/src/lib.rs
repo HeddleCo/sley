@@ -295,6 +295,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "push" => commands::remote_cmds::cmd_push(&args[1..]),
         "send-pack" => commands::remote_cmds::cmd_send_pack(&args[1..]),
         "fetch-pack" => commands::fetch_pack::cmd_fetch_pack(&args[1..]),
+        "filter-branch" => commands::filter_branch::cmd_filter_branch(&args[1..]),
         "unpack-objects" => commands::pack::cmd_unpack_objects(&args[1..]),
         "receive-pack" => commands::remote_cmds::cmd_receive_pack(&args[1..]),
         "upload-pack" => commands::remote_cmds::cmd_upload_pack(&args[1..]),
