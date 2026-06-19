@@ -5111,6 +5111,8 @@ pub struct MergeTreesResult {
     /// cleanup-only paths for porcelains materializing a conflicted merge; they
     /// are absent from the merged tree.
     pub cleanup_paths: Vec<Vec<u8>>,
+    /// Non-conflict informational messages produced while detecting renames.
+    pub info_messages: Vec<MergeInfoMessage>,
 }
 
 impl MergeTreesResult {
@@ -5118,6 +5120,27 @@ impl MergeTreesResult {
     pub fn conflicts(&self) -> impl Iterator<Item = &MergedPath> {
         self.paths.iter().filter(|entry| entry.conflict.is_some())
     }
+}
+
+/// Non-conflict merge information that porcelain commands may print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeInfoMessage {
+    /// A directory rename was skipped because the suggested target directory was
+    /// itself renamed away on this side.
+    DirRenameSkippedDueToRerename {
+        old_dir: Vec<u8>,
+        path: Vec<u8>,
+        new_dir: Vec<u8>,
+    },
+    /// A path was updated due to a directory rename in
+    /// `merge.directoryRenames=true` mode.
+    DirRenameApplied {
+        old_path: Vec<u8>,
+        new_path: Vec<u8>,
+        renamed_from: Option<Vec<u8>>,
+        added_in: String,
+        dir_renamed_in: String,
+    },
 }
 
 /// Read a tree object (by oid) into a flattened path -> (mode, oid) map,
@@ -5239,8 +5262,10 @@ pub fn merge_entry_maps(
     // destination paths so every merged path consults directory renames.
     let mut dir_rename_dirty = false;
     let mut rehomed_paths: BTreeMap<Vec<u8>, RehomeSides> = BTreeMap::new();
+    let mut dir_rename_two_to_one: Vec<DirRenameTwoToOne> = Vec::new();
     let mut dir_rename_collisions: Vec<DirRenameCollision> = Vec::new();
     let mut dir_rename_splits: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut info_messages = Vec::new();
     let mut cleanup_paths: BTreeSet<Vec<u8>> = renames
         .dest_to_source
         .values()
@@ -5258,6 +5283,7 @@ pub fn merge_entry_maps(
             ours_side,
             theirs_side,
             &dir_renames,
+            &renames.dest_to_source,
         );
         eff_base = outcome.base;
         eff_ours = outcome.ours;
@@ -5265,8 +5291,10 @@ pub fn merge_entry_maps(
         rehomed_paths = outcome.rehomed;
         dir_rename_collisions = outcome.collisions;
         dir_rename_splits = outcome.splits;
+        info_messages = outcome.info_messages;
         dir_rename_dirty = outcome.dirty;
         remap_rename_destinations(&mut renames, &rehomed_paths);
+        dir_rename_two_to_one = collect_dir_rename_two_to_one(&renames, &rehomed_paths);
     }
     for info in rehomed_paths
         .values()
@@ -5274,6 +5302,24 @@ pub fn merge_entry_maps(
         .flatten()
     {
         cleanup_paths.insert(info.old_path.clone());
+    }
+    if options.directory_renames == DirectoryRenames::True {
+        for (dest, sides) in &rehomed_paths {
+            for info in [&sides.ours, &sides.theirs].into_iter().flatten() {
+                let (added_in, dir_renamed_in) = if info.added_on_ours {
+                    (options.ours_label.to_string(), options.theirs_label.to_string())
+                } else {
+                    (options.theirs_label.to_string(), options.ours_label.to_string())
+                };
+                info_messages.push(MergeInfoMessage::DirRenameApplied {
+                    old_path: info.old_path.clone(),
+                    new_path: dest.clone(),
+                    renamed_from: info.renamed_from.clone(),
+                    added_in,
+                    dir_renamed_in,
+                });
+            }
+        }
     }
     // In =conflict mode, every re-homed path is reported as a location conflict
     // (the tree still gets the re-homed content, but the merge is marked dirty).
@@ -5516,6 +5562,19 @@ pub fn merge_entry_maps(
         clean = false;
     }
 
+    if !dir_rename_two_to_one.is_empty() {
+        apply_dir_rename_two_to_one_conflicts(
+            db,
+            &eff_ours,
+            &eff_theirs,
+            &dir_rename_two_to_one,
+            &mut paths,
+            &mut leaves,
+            options,
+        )?;
+        clean = false;
+    }
+
     // Rename/delete conflicts: a file renamed on one side whose source the other
     // side deleted. The merge core resolved the destination cleanly (only the
     // renaming side has it), but git flags this as a conflict — keep the renamed
@@ -5588,6 +5647,17 @@ pub fn merge_entry_maps(
             slot.conflict = Some(MergeConflictKind::DirRenameImplicitCollision {
                 sources: collision.sources.clone(),
             });
+        } else if !paths.iter().any(|p| p.path == collision.dest) {
+            paths.push(MergedPath {
+                path: collision.dest.clone(),
+                stages: MergeStages::default(),
+                result: None,
+                worktree: None,
+                conflict: Some(MergeConflictKind::DirRenameImplicitCollision {
+                    sources: collision.sources.clone(),
+                }),
+                auto_merged: false,
+            });
         }
     }
     for source_dir in &dir_rename_splits {
@@ -5654,6 +5724,7 @@ pub fn merge_entry_maps(
         paths,
         clean,
         cleanup_paths: cleanup_paths.into_iter().collect(),
+        info_messages,
     })
 }
 
@@ -5759,7 +5830,10 @@ fn resolve_directory_file_conflicts(
             slot.result = Some(entry);
             // Preserve any pre-existing higher-order stages; a clean file leaf has
             // none, so seed ours/theirs from the effective maps for `ls-files -u`.
-            if slot.conflict.is_none() {
+            if slot.stages.base.is_none()
+                && slot.stages.ours.is_none()
+                && slot.stages.theirs.is_none()
+            {
                 slot.stages = MergeStages {
                     base: None,
                     ours: if from_ours { Some(entry) } else { None },
@@ -6231,11 +6305,12 @@ struct DirectoryRenameMaps {
     ours: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Directory renames detected on theirs' side.
     theirs: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Source directories whose split was unclear (no unique majority target);
-    /// re-homing a path out of one of these is a conflict, not silent. Also
-    /// holds source dirs that were renamed on BOTH sides (dropped from the maps
-    /// by `handle_directory_level_conflicts` but still conflict markers).
-    split_dirs: BTreeSet<Vec<u8>>,
+    /// Source directories whose split was unclear on ours' side (no unique
+    /// majority target); paths on theirs that would need to follow such a rename
+    /// are a conflict, not silent.
+    ours_split: BTreeSet<Vec<u8>>,
+    /// Source directories whose split was unclear on theirs' side.
+    theirs_split: BTreeSet<Vec<u8>>,
 }
 
 /// Infer directory renames from the complete per-side file-rename sets, mirroring
@@ -6255,11 +6330,6 @@ fn compute_directory_renames(
     let ours = compute_side_dir_renames(&ours_side.pairs, ours_map);
     let theirs = compute_side_dir_renames(&theirs_side.pairs, theirs_map);
 
-    // Collect split dirs from both sides.
-    let mut split_dirs = BTreeSet::new();
-    split_dirs.extend(ours.split.iter().cloned());
-    split_dirs.extend(theirs.split.iter().cloned());
-
     // A directory renamed on BOTH sides (to whatever target) is ambiguous;
     // git's handle_directory_level_conflicts drops it from both maps so neither
     // side's directory rename is applied.
@@ -6278,7 +6348,8 @@ fn compute_directory_renames(
     DirectoryRenameMaps {
         ours: ours_map_out,
         theirs: theirs_map_out,
-        split_dirs,
+        ours_split: ours.split,
+        theirs_split: theirs.split,
     }
 }
 
@@ -6452,6 +6523,14 @@ struct DirRenameMove {
     renamed_from: Option<Vec<u8>>,
 }
 
+struct DirRenameTwoToOne {
+    dest: Vec<u8>,
+    ours_source: Vec<u8>,
+    theirs_source: Vec<u8>,
+    ours_label_path: Vec<u8>,
+    theirs_label_path: Vec<u8>,
+}
+
 /// Provenance of a re-homed path, for `=conflict`-mode `CONFLICT (file location)`
 /// reporting.
 #[derive(Clone)]
@@ -6502,6 +6581,7 @@ struct DirRenameOutcome {
     /// True if a directory-level collision or split made the merge dirty even in
     /// `=true` mode (e.g. two paths re-homed onto one destination).
     dirty: bool,
+    info_messages: Vec<MergeInfoMessage>,
 }
 
 /// Apply directory renames to both sides' effective maps.
@@ -6526,6 +6606,7 @@ fn apply_directory_renames(
     ours_side: &SideRenames,
     theirs_side: &SideRenames,
     dir_renames: &DirectoryRenameMaps,
+    file_rename_dests: &BTreeMap<Vec<u8>, MergeRename>,
 ) -> DirRenameOutcome {
     let mut base = eff_base.clone();
     let mut ours = eff_ours.clone();
@@ -6533,6 +6614,7 @@ fn apply_directory_renames(
     let mut rehomed = BTreeMap::new();
     let mut collisions = Vec::new();
     let mut splits = BTreeSet::new();
+    let mut info_messages = Vec::new();
     let mut dirty = false;
 
     // Ours' paths follow THEIRS' directory renames; the exclusions are OURS' own
@@ -6550,9 +6632,10 @@ fn apply_directory_renames(
         ours_side,
         &dir_renames.theirs,
         &ours_excl,
-        &dir_renames.split_dirs,
+        &dir_renames.theirs_split,
         &mut collisions,
         &mut splits,
+        &mut info_messages,
         &mut dirty,
     );
     let theirs_moves = plan_rehome(
@@ -6561,13 +6644,16 @@ fn apply_directory_renames(
         theirs_side,
         &dir_renames.ours,
         &theirs_excl,
-        &dir_renames.split_dirs,
+        &dir_renames.ours_split,
         &mut collisions,
         &mut splits,
+        &mut info_messages,
         &mut dirty,
     );
 
     apply_rehome_moves(
+        base_map,
+        file_rename_dests,
         &mut base,
         &mut ours,
         &mut theirs,
@@ -6578,6 +6664,8 @@ fn apply_directory_renames(
         &mut dirty,
     );
     apply_rehome_moves(
+        base_map,
+        file_rename_dests,
         &mut base,
         &mut ours,
         &mut theirs,
@@ -6596,6 +6684,7 @@ fn apply_directory_renames(
         collisions,
         splits,
         dirty,
+        info_messages,
     }
 }
 
@@ -6630,6 +6719,7 @@ fn plan_rehome(
     split_dirs: &BTreeSet<Vec<u8>>,
     collisions: &mut Vec<DirRenameCollision>,
     splits: &mut BTreeSet<Vec<u8>>,
+    info_messages: &mut Vec<MergeInfoMessage>,
     dirty: &mut bool,
 ) -> Vec<DirRenameMove> {
     if renamer_dirs.is_empty() && split_dirs.is_empty() {
@@ -6665,6 +6755,11 @@ fn plan_rehome(
         // itself renamed; that would cause a spurious rename/rename(1to2). The
         // file instead follows this side's own rename, so leave it.
         if exclusions.contains(new_dir) {
+            info_messages.push(MergeInfoMessage::DirRenameSkippedDueToRerename {
+                old_dir: old_dir.to_vec(),
+                path: path.clone(),
+                new_dir: new_dir.to_vec(),
+            });
             continue;
         }
         let dest = apply_dir_rename(old_dir, new_dir, &path);
@@ -6717,6 +6812,8 @@ fn check_dir_split<'a>(path: &[u8], split_dirs: &'a BTreeSet<Vec<u8>>) -> Option
 /// new location; a pure add re-homes only its own side.
 #[allow(clippy::too_many_arguments)]
 fn apply_rehome_moves(
+    original_base: &MergeEntryMap,
+    file_rename_dests: &BTreeMap<Vec<u8>, MergeRename>,
     base: &mut MergeEntryMap,
     ours: &mut MergeEntryMap,
     theirs: &mut MergeEntryMap,
@@ -6732,11 +6829,21 @@ fn apply_rehome_moves(
         // occupies the destination, applying this move produces the normal
         // two-sided conflict at that path (e.g. t6423 1d's rename/rename(2to1)).
         let occupied_on_this_side = if side_is_ours {
-            ours.contains_key(&mv.to)
+            ours.contains_key(&mv.to) || map_has_directory_at(ours, &mv.to)
         } else {
-            theirs.contains_key(&mv.to)
+            theirs.contains_key(&mv.to) || map_has_directory_at(theirs, &mv.to)
         };
-        if (base.contains_key(&mv.to) || occupied_on_this_side) && mv.to != mv.from {
+        let occupied_by_cross_rename =
+            file_rename_dests
+                .get(&mv.to)
+                .is_some_and(|rename| match (side_is_ours, rename.side) {
+                    (true, RenameSide::Theirs) | (false, RenameSide::Ours) => true,
+                    (true, RenameSide::Ours) | (false, RenameSide::Theirs) => false,
+                });
+        if (original_base.contains_key(&mv.to)
+            || (occupied_on_this_side && !occupied_by_cross_rename))
+            && mv.to != mv.from
+        {
             *dirty = true;
             collisions.push(DirRenameCollision {
                 dest: mv.to.clone(),
@@ -6744,14 +6851,31 @@ fn apply_rehome_moves(
             });
             continue;
         }
-        // Move the path on every map that holds it (base for the ancestor, and
-        // whichever sides carry content at the path). This keeps a content-merge
-        // keyed consistently at the re-homed destination.
         let mut moved = false;
-        for m in [&mut *base, &mut *ours, &mut *theirs] {
-            if let Some(entry) = m.remove(&mv.from) {
-                m.insert(mv.to.clone(), entry);
-                moved = true;
+        if occupied_by_cross_rename {
+            base.remove(&mv.from);
+            if side_is_ours {
+                if let Some(entry) = ours.remove(&mv.from) {
+                    ours.insert(mv.to.clone(), entry);
+                    moved = true;
+                }
+                theirs.remove(&mv.from);
+            } else {
+                ours.remove(&mv.from);
+                if let Some(entry) = theirs.remove(&mv.from) {
+                    theirs.insert(mv.to.clone(), entry);
+                    moved = true;
+                }
+            }
+        } else {
+            // Move the path on every map that holds it (base for the ancestor,
+            // and whichever sides carry content at the path). This keeps a
+            // content-merge keyed consistently at the re-homed destination.
+            for m in [&mut *base, &mut *ours, &mut *theirs] {
+                if let Some(entry) = m.remove(&mv.from) {
+                    m.insert(mv.to.clone(), entry);
+                    moved = true;
+                }
             }
         }
         if moved {
@@ -6768,6 +6892,57 @@ fn apply_rehome_moves(
             }
         }
     }
+}
+
+fn collect_dir_rename_two_to_one(
+    renames: &MergeRenames,
+    rehomed: &BTreeMap<Vec<u8>, RehomeSides>,
+) -> Vec<DirRenameTwoToOne> {
+    let mut conflicts = Vec::new();
+    for (dest, sides) in rehomed {
+        let Some(file_rename) = renames.dest_to_source.get(dest) else {
+            continue;
+        };
+        match file_rename.side {
+            RenameSide::Ours => {
+                let Some(info) = sides.theirs.as_ref() else {
+                    continue;
+                };
+                let Some(theirs_source) = info.renamed_from.as_ref() else {
+                    continue;
+                };
+                conflicts.push(DirRenameTwoToOne {
+                    dest: dest.clone(),
+                    ours_source: file_rename.source.clone(),
+                    theirs_source: theirs_source.clone(),
+                    ours_label_path: dest.clone(),
+                    theirs_label_path: info.old_path.clone(),
+                });
+            }
+            RenameSide::Theirs => {
+                let Some(info) = sides.ours.as_ref() else {
+                    continue;
+                };
+                let Some(ours_source) = info.renamed_from.as_ref() else {
+                    continue;
+                };
+                conflicts.push(DirRenameTwoToOne {
+                    dest: dest.clone(),
+                    ours_source: ours_source.clone(),
+                    theirs_source: file_rename.source.clone(),
+                    ours_label_path: info.old_path.clone(),
+                    theirs_label_path: dest.clone(),
+                });
+            }
+        }
+    }
+    conflicts
+}
+
+fn map_has_directory_at(map: &MergeEntryMap, path: &[u8]) -> bool {
+    let mut prefix = path.to_vec();
+    prefix.push(b'/');
+    map.keys().any(|candidate| candidate.starts_with(&prefix))
 }
 
 fn remap_rename_destinations(renames: &mut MergeRenames, rehomed: &BTreeMap<Vec<u8>, RehomeSides>) {
@@ -6814,6 +6989,75 @@ fn remap_rename_destinations(renames: &mut MergeRenames, rehomed: &BTreeMap<Vec<
     }
 }
 
+fn apply_dir_rename_two_to_one_conflicts(
+    db: &FileObjectDatabase,
+    eff_ours: &MergeEntryMap,
+    eff_theirs: &MergeEntryMap,
+    conflicts: &[DirRenameTwoToOne],
+    paths: &mut [MergedPath],
+    leaves: &mut MergeEntryMap,
+    options: &MergeTreesOptions<'_>,
+) -> Result<()> {
+    for conflict in conflicts {
+        let Some(slot) = paths.iter_mut().find(|path| path.path == conflict.dest) else {
+            continue;
+        };
+        let ours_entry = eff_ours.get(&conflict.dest).copied();
+        let theirs_entry = eff_theirs.get(&conflict.dest).copied();
+        let (Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) =
+            (ours_entry, theirs_entry)
+        else {
+            continue;
+        };
+        let ours_bytes = merge_blob_bytes(db, &ours_oid)?;
+        let theirs_bytes = merge_blob_bytes(db, &theirs_oid)?;
+        let (resolved_mode, mode_conflict) = merge_file_modes(None, ours_mode, theirs_mode);
+        let result = if is_mergeable_file_mode(ours_mode) && is_mergeable_file_mode(theirs_mode) {
+            merge_blobs(
+                &[],
+                &ours_bytes,
+                &theirs_bytes,
+                &MergeBlobOptions {
+                    ours_label: &qualify_label(options.ours_label, &conflict.ours_label_path),
+                    theirs_label: &qualify_label(
+                        options.theirs_label,
+                        &conflict.theirs_label_path,
+                    ),
+                    base_label: options.ancestor_label,
+                    style: options.style,
+                },
+            )
+        } else {
+            MergeBlobResult {
+                content: ours_bytes.clone(),
+                conflicted: true,
+            }
+        };
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, result.content.clone()))?;
+        leaves.insert(conflict.dest.clone(), (resolved_mode, oid));
+        slot.stages = MergeStages {
+            base: None,
+            ours: ours_entry,
+            theirs: theirs_entry,
+        };
+        slot.result = Some((resolved_mode, oid));
+        slot.worktree = Some((
+            if ours_mode == theirs_mode {
+                ours_mode
+            } else {
+                0o100644
+            },
+            result.content,
+        ));
+        slot.conflict = Some(MergeConflictKind::RenameRenameTwoToOne {
+            ours_path: conflict.ours_source.clone(),
+            theirs_path: conflict.theirs_source.clone(),
+        });
+        slot.auto_merged = !mode_conflict;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_rename_rename_one_to_two_conflicts(
     db: &FileObjectDatabase,
@@ -6829,6 +7073,8 @@ fn apply_rename_rename_one_to_two_conflicts(
         let base_entry = base_map.get(old_path).copied();
         let ours_entry = eff_ours.get(&conflict.ours_dest).copied();
         let theirs_entry = eff_theirs.get(&conflict.theirs_dest).copied();
+        let theirs_add_at_ours_dest = eff_theirs.get(&conflict.ours_dest).copied();
+        let ours_add_at_theirs_dest = eff_ours.get(&conflict.theirs_dest).copied();
 
         leaves.remove(old_path);
         leaves.remove(&conflict.ours_dest);
@@ -6867,7 +7113,7 @@ fn apply_rename_rename_one_to_two_conflicts(
             stages: MergeStages {
                 base: None,
                 ours: ours_entry,
-                theirs: None,
+                theirs: theirs_add_at_ours_dest,
             },
             result: None,
             worktree: ours_worktree,
@@ -6883,7 +7129,7 @@ fn apply_rename_rename_one_to_two_conflicts(
             path: conflict.theirs_dest.clone(),
             stages: MergeStages {
                 base: None,
-                ours: None,
+                ours: ours_add_at_theirs_dest,
                 theirs: theirs_entry,
             },
             result: None,
