@@ -1815,6 +1815,7 @@ fn diff_name_status_index_worktree_changes(
     };
     let index_bytes = fs::read(&index_path)?;
     if let Ok(index) = BorrowedIndex::parse(&index_bytes, format)
+        && index.extension(&sley_index::INDEX_EXT_LINK)?.is_none()
         && !index.entries.iter().any(borrowed_entry_is_sparse_dir)
     {
         let (has_non_normal_stage, staged_gitlinks) =
@@ -1839,7 +1840,11 @@ fn diff_name_status_index_worktree_changes(
             staged_gitlinks,
         });
     }
-    let index = expand_sparse_index_for_worktree_diff(Index::parse(&index_bytes, format)?, git_dir, format)?;
+    let index = expand_sparse_index_for_worktree_diff(
+        sley_index::read_repository_index(git_dir, format)?,
+        git_dir,
+        format,
+    )?;
     let (has_non_normal_stage, staged_gitlinks) =
         index_worktree_metadata_for_entries(&index.entries);
     if has_non_normal_stage {
@@ -2188,12 +2193,10 @@ fn read_unmerged_stages(
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, ConflictStages>> {
     let index_path = sley_index::repository_index_path(git_dir);
-    let index_bytes = match fs::read(&index_path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(err) => return Err(err.into()),
-    };
-    let index = sley_index::Index::parse(&index_bytes, format)?;
+    if !index_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let index = sley_index::read_repository_index(git_dir, format)?;
     let mut out: BTreeMap<Vec<u8>, ConflictStages> = BTreeMap::new();
     for entry in &index.entries {
         let stage = entry.stage();
@@ -3235,7 +3238,7 @@ fn read_intent_to_add_paths(
         return Ok(std::collections::HashSet::new());
     }
     let index = expand_sparse_index_for_worktree_diff(
-        Index::parse(&fs::read(&index_path)?, format)?,
+        sley_index::read_repository_index(git_dir, format)?,
         git_dir,
         format,
     )?;
@@ -3260,7 +3263,7 @@ fn read_index_snapshot(git_dir: &Path, format: ObjectFormat) -> Result<IndexSnap
         Err(err) => return Err(err.into()),
     };
     let index = expand_sparse_index_for_worktree_diff(
-        Index::parse(&fs::read(&index_path)?, format)?,
+        sley_index::read_repository_index(git_dir, format)?,
         git_dir,
         format,
     )?;

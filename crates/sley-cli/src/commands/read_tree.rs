@@ -1396,8 +1396,7 @@ fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>)
         extensions: Vec::new(),
         checksum: None,
     };
-    let bytes = index.write(format)?;
-    fs::write(sley_worktree::repository_index_path(git_dir), bytes)?;
+    sley_worktree::write_repository_index(git_dir, format, index)?;
     Ok(())
 }
 

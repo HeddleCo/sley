@@ -767,6 +767,14 @@ impl Index {
         }
     }
 
+    /// Parse the `link` split-index extension, if present.
+    pub fn split_index_link(&self, format: ObjectFormat) -> Result<Option<SplitIndexLink>> {
+        match self.extension(&INDEX_EXT_LINK)? {
+            Some(body) => Ok(Some(SplitIndexLink::parse(format, body)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Replace (or insert) the `TREE` extension with `cache_tree`, keeping every
     /// other extension chunk in its original order.
     ///
@@ -810,6 +818,16 @@ impl Index {
         self.replace_extension(b"UNTR", cache.map(|cache| cache.write(format)).transpose()?)
     }
 
+    /// Replace (or remove) the split-index `link` extension.
+    pub fn set_split_index_link(&mut self, link: Option<&SplitIndexLink>) -> Result<()> {
+        self.replace_extension(&INDEX_EXT_LINK, link.map(SplitIndexLink::write).transpose()?)
+    }
+
+    /// Remove the split-index `link` extension.
+    pub fn clear_split_index_link(&mut self) -> Result<()> {
+        self.set_split_index_link(None)
+    }
+
     fn replace_extension(&mut self, signature: &[u8; 4], body: Option<Vec<u8>>) -> Result<()> {
         let chunks = self.extension_chunks()?;
         let mut rebuilt = Vec::with_capacity(self.extensions.len());
@@ -831,6 +849,67 @@ impl Index {
         }
         self.extensions = rebuilt;
         Ok(())
+    }
+}
+
+impl SplitIndexLink {
+    pub fn new(base_oid: ObjectId) -> Self {
+        Self {
+            base_oid,
+            delete_positions: Vec::new(),
+            replace_positions: Vec::new(),
+        }
+    }
+
+    pub fn parse(format: ObjectFormat, body: &[u8]) -> Result<Self> {
+        let hash_len = format.raw_len();
+        if body.len() < hash_len {
+            return Err(GitError::InvalidFormat(
+                "corrupt link extension (too short)".into(),
+            ));
+        }
+        let base_oid = ObjectId::from_raw(format, &body[..hash_len])?;
+        let mut offset = hash_len;
+        if offset == body.len() {
+            return Ok(Self::new(base_oid));
+        }
+        let delete_positions = read_ewah_positions(body, &mut offset, body.len())?;
+        let replace_positions = read_ewah_positions(body, &mut offset, body.len())?;
+        if offset != body.len() {
+            return Err(GitError::InvalidFormat(
+                "garbage at the end of link extension".into(),
+            ));
+        }
+        Ok(Self {
+            base_oid,
+            delete_positions,
+            replace_positions,
+        })
+    }
+
+    pub fn write(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(self.base_oid.as_bytes());
+        if self.delete_positions.is_empty() && self.replace_positions.is_empty() {
+            return Ok(out);
+        }
+        let delete_bits = self
+            .delete_positions
+            .iter()
+            .copied()
+            .max()
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        let replace_bits = self
+            .replace_positions
+            .iter()
+            .copied()
+            .max()
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        write_ewah_positions(delete_bits, &self.delete_positions, &mut out);
+        write_ewah_positions(replace_bits, &self.replace_positions, &mut out);
+        Ok(out)
     }
 }
 
@@ -1388,6 +1467,17 @@ pub const SPARSE_DIR_MODE: u32 = 0o040000;
 /// expand sparse-directory entries before operating on individual paths.
 pub const INDEX_EXT_SPARSE_DIRECTORIES: [u8; 4] = *b"sdir";
 
+/// The four-byte signature of git's split-index link extension (`link`).
+pub const INDEX_EXT_LINK: [u8; 4] = *b"link";
+
+/// Parsed body of the split-index `link` extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitIndexLink {
+    pub base_oid: ObjectId,
+    pub delete_positions: Vec<u32>,
+    pub replace_positions: Vec<u32>,
+}
+
 impl Index {
     /// Whether this index is collapsed (carries `sdir` or any sparse-directory
     /// entry). A collapsed index must be expanded before per-path operations.
@@ -1481,6 +1571,98 @@ pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
     env::var_os("GIT_INDEX_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| git_dir.as_ref().join("index"))
+}
+
+/// Read this repository's index and expand a split index through its
+/// `sharedindex.<hash>` base when a `link` extension is present.
+pub fn read_repository_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<Index> {
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    read_index_file_expanded(&index_path, git_dir, format)
+}
+
+fn read_index_file_expanded(index_path: &Path, git_dir: &Path, format: ObjectFormat) -> Result<Index> {
+    let mut index = Index::parse(&fs::read(index_path)?, format)?;
+    let Some(link) = index.split_index_link(format)? else {
+        return Ok(index);
+    };
+    if link.base_oid.is_null() {
+        index.clear_split_index_link()?;
+        return Ok(index);
+    }
+    let shared_path = git_dir.join(format!("sharedindex.{}", link.base_oid));
+    let shared = Index::parse(&fs::read(&shared_path)?, format)?;
+    let shared_checksum = shared.checksum.ok_or_else(|| {
+        GitError::InvalidFormat(format!(
+            "shared index {} has no checksum",
+            shared_path.display()
+        ))
+    })?;
+    if shared_checksum != link.base_oid {
+        return Err(GitError::InvalidFormat(format!(
+            "shared index checksum mismatch: expected {}, got {}",
+            link.base_oid, shared_checksum
+        )));
+    }
+    index.entries = merge_split_index_entries(shared.entries, index.entries, &link)?;
+    Ok(index)
+}
+
+fn merge_split_index_entries(
+    mut base_entries: Vec<IndexEntry>,
+    delta_entries: Vec<IndexEntry>,
+    link: &SplitIndexLink,
+) -> Result<Vec<IndexEntry>> {
+    let mut replacement_iter = delta_entries.iter();
+    for position in &link.replace_positions {
+        let position = *position as usize;
+        if position >= base_entries.len() {
+            return Err(GitError::InvalidFormat(
+                "position for replacement exceeds base index size".into(),
+            ));
+        }
+        let Some(replacement) = replacement_iter.next() else {
+            return Err(GitError::InvalidFormat("too few replacement entries".into()));
+        };
+        let mut replacement = replacement.clone();
+        if replacement.path.is_empty() {
+            replacement.path = base_entries[position].path.clone();
+            replacement.refresh_name_length();
+        }
+        base_entries[position] = replacement;
+    }
+
+    let mut delete_positions = link
+        .delete_positions
+        .iter()
+        .map(|position| *position as usize)
+        .collect::<Vec<_>>();
+    delete_positions.sort_unstable();
+    delete_positions.dedup();
+    for position in delete_positions.iter().rev() {
+        if *position >= base_entries.len() {
+            return Err(GitError::InvalidFormat(
+                "position for delete exceeds base index size".into(),
+            ));
+        }
+        base_entries.remove(*position);
+    }
+
+    for entry in replacement_iter {
+        if entry.path.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "corrupt link extension replacement/addition ordering".into(),
+            ));
+        }
+        base_entries.push(entry.clone());
+    }
+    base_entries.sort_by(|left, right| {
+        left.path
+            .as_bytes()
+            .cmp(right.path.as_bytes())
+            .then_with(|| left.stage().as_u16().cmp(&right.stage().as_u16()))
+    });
+    Ok(base_entries)
 }
 
 /// The file's modification time split into whole seconds and nanoseconds,
