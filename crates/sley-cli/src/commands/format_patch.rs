@@ -371,6 +371,32 @@ impl Default for FormatPatchOptions {
     }
 }
 
+impl super::grep_args::GrepArgOptions for FormatPatchOptions {
+    fn grep_patterns_mut(&mut self) -> &mut Vec<String> {
+        &mut self.grep_patterns
+    }
+
+    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind {
+        &mut self.grep_pattern_kind
+    }
+
+    fn grep_pattern_kind_explicit_mut(&mut self) -> &mut bool {
+        &mut self.grep_pattern_kind_explicit
+    }
+
+    fn grep_ignore_case_mut(&mut self) -> &mut bool {
+        &mut self.grep_ignore_case
+    }
+
+    fn grep_all_match_mut(&mut self) -> &mut bool {
+        &mut self.grep_all_match
+    }
+
+    fn grep_invert_mut(&mut self) -> &mut bool {
+        &mut self.grep_invert
+    }
+}
+
 /// An author/committer identity split into display name and email, used for the
 /// `--from` rewrite and the redundant-in-body-from check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,13 +626,13 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
 
     if let Some(output) = options.output.as_deref() {
         let output_path = resolve_cli_path(cwd, output);
-        let mut stream = Vec::new();
+        let mut stream = io::BufWriter::new(fs::File::create(output_path)?);
         if let Some(cover) = &cover {
-            stream.extend_from_slice(cover);
+            stream.write_all(cover)?;
         }
         for (idx, record) in commits.iter().enumerate() {
             if idx > 0 {
-                stream.push(b'\n');
+                stream.write_all(b"\n")?;
             }
             let buffer = render_patch(RenderContext {
                 db,
@@ -628,9 +654,9 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
             })?;
-            stream.extend_from_slice(&buffer);
+            stream.write_all(&buffer)?;
         }
-        fs::write(output_path, stream)?;
+        stream.flush()?;
         return Ok(());
     }
 
@@ -784,7 +810,7 @@ fn build_cover_letter(
     };
     let encode = encode_email_headers_on(options, config);
     write_from_header(&mut out, &from_name, &from_email, encode);
-    out.extend_from_slice(format!("Date: {}\n", cover_letter_date()).as_bytes());
+    writeln_fmt_buf(&mut out, format_args!("Date: {}", cover_letter_date()));
 
     // Resolve the cover subject + blurb body from the branch description /
     // --description-file under the cover-from-description rules.
@@ -2130,7 +2156,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
 
     // Date: header — the *author* date in git's RFC 2822 rendering.
     let date = commit_identity_date(&commit.author, &DateMode::Rfc2822);
-    out.extend_from_slice(format!("Date: {date}\n").as_bytes());
+    writeln_fmt_buf(&mut out, format_args!("Date: {date}"));
 
     // Subject: [PREFIX n/m] <subject>. The subject is the collapsed leading
     // paragraph (multi-line subjects join with a space), RFC 2047-encoded when
@@ -2336,7 +2362,7 @@ fn write_email_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &[u8], 
     const MAX_LENGTH: isize = 78;
     let header_start = out.len();
     match prefix {
-        Some(prefix) => out.extend_from_slice(format!("Subject: {prefix} ").as_bytes()),
+        Some(prefix) => write_fmt_buf(out, format_args!("Subject: {prefix} ")),
         None => out.extend_from_slice(b"Subject: "),
     }
     if encode && needs_rfc2047_encoding(subject) {
@@ -2376,7 +2402,7 @@ fn write_from_header(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
     if max_length < needed {
         out.push(b'\n');
     }
-    out.extend_from_slice(format!(" <{email}>\n").as_bytes());
+    writeln_fmt_buf(out, format_args!(" <{email}>"));
 }
 
 /// Per-mail threading headers: the `Message-ID`, the `In-Reply-To` target, and
@@ -2395,13 +2421,13 @@ impl MailThreadHeaders {
     /// the rest indented by a single tab.
     fn write(&self, out: &mut Vec<u8>) {
         if let Some(id) = &self.message_id {
-            out.extend_from_slice(format!("Message-ID: <{id}>\n").as_bytes());
+            writeln_fmt_buf(out, format_args!("Message-ID: <{id}>"));
         }
         if let Some(last) = self.references.last() {
-            out.extend_from_slice(format!("In-Reply-To: <{last}>\n").as_bytes());
+            writeln_fmt_buf(out, format_args!("In-Reply-To: <{last}>"));
             for (i, r) in self.references.iter().enumerate() {
                 let lead = if i > 0 { "\t" } else { "References: " };
-                out.extend_from_slice(format!("{lead}<{r}>\n").as_bytes());
+                writeln_fmt_buf(out, format_args!("{lead}<{r}>"));
             }
         }
     }
@@ -3548,7 +3574,10 @@ fn write_patch_diff_entry(
     let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
     let diff_old_path = patch_prefixed_path(&options.src_prefix, old_path);
     let diff_new_path = patch_prefixed_path(&options.dst_prefix, &entry.path);
-    writeln_buf(out, &format!("diff --git {diff_old_path} {diff_new_path}"));
+    writeln_fmt_buf(
+        out,
+        format_args!("diff --git {diff_old_path} {diff_new_path}"),
+    );
     write_patch_mode_headers(out, entry);
     write_patch_similarity_headers(out, entry, old_path, &entry.path);
 
@@ -3558,9 +3587,9 @@ fn write_patch_diff_entry(
         if !content_changed {
             return Ok(());
         }
-        writeln_buf(
+        writeln_fmt_buf(
             out,
-            &format!(
+            format_args!(
                 "index {}..{}{}",
                 patch_blob_oid(
                     entry.old_oid.as_ref(),
@@ -3587,16 +3616,16 @@ fn write_patch_diff_entry(
         } else {
             "/dev/null".to_string()
         };
-        writeln_buf(out, &format!("Binary files {old} and {new} differ"));
+        writeln_fmt_buf(out, format_args!("Binary files {old} and {new} differ"));
         return Ok(());
     }
 
     if !content_changed {
         return Ok(());
     }
-    writeln_buf(
+    writeln_fmt_buf(
         out,
-        &format!(
+        format_args!(
             "index {}..{}{}",
             patch_blob_oid(
                 entry.old_oid.as_ref(),
@@ -3615,16 +3644,19 @@ fn write_patch_diff_entry(
     );
     match entry.status {
         sley_diff_merge::NameStatus::Added => writeln_buf(out, "--- /dev/null"),
-        _ => writeln_buf(
+        _ => writeln_fmt_buf(
             out,
-            &format!("--- {}", patch_header_path(&options.src_prefix, old_path)),
+            format_args!("--- {}", patch_header_path(&options.src_prefix, old_path)),
         ),
     }
     match entry.status {
         sley_diff_merge::NameStatus::Deleted => writeln_buf(out, "+++ /dev/null"),
-        _ => writeln_buf(
+        _ => writeln_fmt_buf(
             out,
-            &format!("+++ {}", patch_header_path(&options.dst_prefix, &entry.path)),
+            format_args!(
+                "+++ {}",
+                patch_header_path(&options.dst_prefix, &entry.path)
+            ),
         ),
     }
     if options.context_lines == HUNK_CONTEXT {
@@ -3649,12 +3681,12 @@ fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStat
     match entry.status {
         sley_diff_merge::NameStatus::Added => {
             if let Some(mode) = entry.new_mode {
-                writeln_buf(out, &format!("new file mode {mode:06o}"));
+                writeln_fmt_buf(out, format_args!("new file mode {mode:06o}"));
             }
         }
         sley_diff_merge::NameStatus::Deleted => {
             if let Some(mode) = entry.old_mode {
-                writeln_buf(out, &format!("deleted file mode {mode:06o}"));
+                writeln_fmt_buf(out, format_args!("deleted file mode {mode:06o}"));
             }
         }
         sley_diff_merge::NameStatus::Modified
@@ -3663,8 +3695,8 @@ fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStat
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
-                writeln_buf(out, &format!("old mode {old_mode:06o}"));
-                writeln_buf(out, &format!("new mode {new_mode:06o}"));
+                writeln_fmt_buf(out, format_args!("old mode {old_mode:06o}"));
+                writeln_fmt_buf(out, format_args!("new mode {new_mode:06o}"));
             }
         }
         sley_diff_merge::NameStatus::Unmerged => {}
@@ -3683,14 +3715,14 @@ fn write_patch_similarity_headers(
     let new = status_quote_path(path, false);
     match entry.status {
         sley_diff_merge::NameStatus::Renamed(score) => {
-            writeln_buf(out, &format!("similarity index {score}%"));
-            writeln_buf(out, &format!("rename from {old}"));
-            writeln_buf(out, &format!("rename to {new}"));
+            writeln_fmt_buf(out, format_args!("similarity index {score}%"));
+            writeln_fmt_buf(out, format_args!("rename from {old}"));
+            writeln_fmt_buf(out, format_args!("rename to {new}"));
         }
         sley_diff_merge::NameStatus::Copied(score) => {
-            writeln_buf(out, &format!("similarity index {score}%"));
-            writeln_buf(out, &format!("copy from {old}"));
-            writeln_buf(out, &format!("copy to {new}"));
+            writeln_fmt_buf(out, format_args!("similarity index {score}%"));
+            writeln_fmt_buf(out, format_args!("copy from {old}"));
+            writeln_fmt_buf(out, format_args!("copy to {new}"));
         }
         _ => {}
     }
@@ -4045,6 +4077,15 @@ fn writeln_buf(out: &mut Vec<u8>, text: &str) {
     out.push(b'\n');
 }
 
+fn write_fmt_buf(out: &mut Vec<u8>, args: std::fmt::Arguments<'_>) {
+    std::io::Write::write_fmt(out, args).expect("writing to Vec cannot fail");
+}
+
+fn writeln_fmt_buf(out: &mut Vec<u8>, args: std::fmt::Arguments<'_>) {
+    write_fmt_buf(out, args);
+    out.push(b'\n');
+}
+
 /// Parse `git format-patch` arguments into [`FormatPatchOptions`]. Recognizes the
 /// common flags; `--` forces remaining tokens to be revision arguments.
 fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
@@ -4054,6 +4095,9 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
     while let Some(arg) = iter.next() {
         if positional_only {
             options.setup_args.push(arg.clone());
+            continue;
+        }
+        if super::grep_args::parse_grep_args(arg, &mut iter, &mut options)? {
             continue;
         }
         match arg.as_str() {
@@ -4324,34 +4368,6 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 };
             }
             "--no-base" => options.base = BaseMode::None,
-            "--grep" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--grep requires a value".into()))?;
-                options.grep_patterns.push(value.clone());
-            }
-            value if let Some(pattern) = value.strip_prefix("--grep=") => {
-                options.grep_patterns.push(pattern.to_string());
-            }
-            "--all-match" => options.grep_all_match = true,
-            "--invert-grep" => options.grep_invert = true,
-            "-i" | "--regexp-ignore-case" => options.grep_ignore_case = true,
-            "-F" | "--fixed-strings" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "--basic-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Basic;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "-E" | "--extended-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Extended;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "-P" | "--perl-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Perl;
-                options.grep_pattern_kind_explicit = true;
-            }
             // Accepted-but-inert formatting knobs that do not change the bytes
             // sley emits for the common path.
             "--no-color"

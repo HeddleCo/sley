@@ -255,6 +255,32 @@ impl ShowOptions {
     }
 }
 
+impl super::grep_args::GrepArgOptions for ShowOptions {
+    fn grep_patterns_mut(&mut self) -> &mut Vec<String> {
+        &mut self.grep_patterns
+    }
+
+    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind {
+        &mut self.grep_pattern_kind
+    }
+
+    fn grep_pattern_kind_explicit_mut(&mut self) -> &mut bool {
+        &mut self.grep_pattern_kind_explicit
+    }
+
+    fn grep_ignore_case_mut(&mut self) -> &mut bool {
+        &mut self.grep_ignore_case
+    }
+
+    fn grep_all_match_mut(&mut self) -> &mut bool {
+        &mut self.grep_all_match
+    }
+
+    fn grep_invert_mut(&mut self) -> &mut bool {
+        &mut self.grep_invert
+    }
+}
+
 pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     let options = parse_show_args(args)?;
 
@@ -1129,6 +1155,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             options.setup_args.push(arg.clone());
             continue;
         }
+        if super::grep_args::parse_grep_args(arg, &mut iter, &mut options)? {
+            continue;
+        }
         match arg.as_str() {
             "--" => {
                 options.setup_args.push(arg.clone());
@@ -1331,34 +1360,6 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             }
             value if value.starts_with("-I") && value.len() > 2 => {
                 ignore_regex_patterns.push(value[2..].to_string());
-            }
-            "--grep" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--grep requires a value".into()))?;
-                options.grep_patterns.push(value.clone());
-            }
-            value if let Some(pattern) = value.strip_prefix("--grep=") => {
-                options.grep_patterns.push(pattern.to_string());
-            }
-            "--all-match" => options.grep_all_match = true,
-            "--invert-grep" => options.grep_invert = true,
-            "-i" | "--regexp-ignore-case" => options.grep_ignore_case = true,
-            "-F" | "--fixed-strings" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "--basic-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Basic;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "-E" | "--extended-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Extended;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "-P" | "--perl-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Perl;
-                options.grep_pattern_kind_explicit = true;
             }
             "--indent-heuristic" => options.indent_heuristic = Some(true),
             "--no-indent-heuristic" => options.indent_heuristic = Some(false),
