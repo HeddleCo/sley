@@ -110,6 +110,7 @@ struct DiffFilesOptions {
     // `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
     // `diff.indentHeuristic` config (default git-enabled).
     indent_heuristic: Option<bool>,
+    ignore_submodules: bool,
     path_args: Vec<String>,
 }
 
@@ -151,6 +152,7 @@ impl Default for DiffFilesOptions {
             interhunk: None,
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             indent_heuristic: None,
+            ignore_submodules: false,
             path_args: Vec::new(),
         }
     }
@@ -302,12 +304,14 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
             "--patience" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
             "--histogram" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
             // add-patch spawns `diff-files --no-color --ignore-submodules=dirty`.
-            // Plumbing diff-files never colorizes, and the index-vs-worktree path
-            // already treats dirty submodules as unchanged, so both are no-ops.
+            // Plumbing diff-files never colorizes; `--ignore-submodules` filters
+            // gitlink pairs before rendering below.
             "--color" | "--no-color" => {}
-            "--ignore-submodules" => {}
-            value
-                if value.starts_with("--color=") || value.starts_with("--ignore-submodules=") => {}
+            "--ignore-submodules" => o.ignore_submodules = true,
+            value if value.starts_with("--color=") => {}
+            value if let Some(mode) = value.strip_prefix("--ignore-submodules=") => {
+                o.ignore_submodules = mode != "none";
+            }
             "--full-index" => o.patch_full_index = true,
             "--no-prefix" => {
                 o.src_prefix.clear();
@@ -567,6 +571,17 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         &config,
     )?;
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = if o.ignore_submodules {
+        entries
+            .into_iter()
+            .filter(|entry| {
+                entry.old_mode != Some(sley_index::GITLINK_MODE)
+                    && entry.new_mode != Some(sley_index::GITLINK_MODE)
+            })
+            .collect()
+    } else {
+        entries
+    };
     let entries = if o.reverse {
         reverse_diff_entries(entries)
     } else {
