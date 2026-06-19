@@ -371,6 +371,32 @@ impl Default for FormatPatchOptions {
     }
 }
 
+impl super::grep_args::GrepArgOptions for FormatPatchOptions {
+    fn grep_patterns_mut(&mut self) -> &mut Vec<String> {
+        &mut self.grep_patterns
+    }
+
+    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind {
+        &mut self.grep_pattern_kind
+    }
+
+    fn grep_pattern_kind_explicit_mut(&mut self) -> &mut bool {
+        &mut self.grep_pattern_kind_explicit
+    }
+
+    fn grep_ignore_case_mut(&mut self) -> &mut bool {
+        &mut self.grep_ignore_case
+    }
+
+    fn grep_all_match_mut(&mut self) -> &mut bool {
+        &mut self.grep_all_match
+    }
+
+    fn grep_invert_mut(&mut self) -> &mut bool {
+        &mut self.grep_invert
+    }
+}
+
 /// An author/committer identity split into display name and email, used for the
 /// `--from` rewrite and the redundant-in-body-from check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4071,6 +4097,9 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             options.setup_args.push(arg.clone());
             continue;
         }
+        if super::grep_args::parse_grep_args(arg, &mut iter, &mut options)? {
+            continue;
+        }
         match arg.as_str() {
             "--" => {
                 positional_only = true;
@@ -4339,34 +4368,6 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 };
             }
             "--no-base" => options.base = BaseMode::None,
-            "--grep" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--grep requires a value".into()))?;
-                options.grep_patterns.push(value.clone());
-            }
-            value if let Some(pattern) = value.strip_prefix("--grep=") => {
-                options.grep_patterns.push(pattern.to_string());
-            }
-            "--all-match" => options.grep_all_match = true,
-            "--invert-grep" => options.grep_invert = true,
-            "-i" | "--regexp-ignore-case" => options.grep_ignore_case = true,
-            "-F" | "--fixed-strings" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "--basic-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Basic;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "-E" | "--extended-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Extended;
-                options.grep_pattern_kind_explicit = true;
-            }
-            "-P" | "--perl-regexp" => {
-                options.grep_pattern_kind = crate::grep_source::PatternKind::Perl;
-                options.grep_pattern_kind_explicit = true;
-            }
             // Accepted-but-inert formatting knobs that do not change the bytes
             // sley emits for the common path.
             "--no-color"
