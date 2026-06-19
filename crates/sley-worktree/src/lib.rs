@@ -4,8 +4,8 @@ use sley_core::{
     Result,
 };
 use sley_index::{
-    BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, SPARSE_DIR_MODE, Stage,
-    UntrackedCache, UntrackedCacheDir, UntrackedCacheOidStat, UntrackedCacheStatData,
+    BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, SPARSE_DIR_MODE, SplitIndexLink,
+    Stage, UntrackedCache, UntrackedCacheDir, UntrackedCacheOidStat, UntrackedCacheStatData,
 };
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectPresenceChecker, ObjectReader, ObjectWriter};
@@ -628,11 +628,12 @@ pub fn read_repository_index(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<Option<Index>> {
+    let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(None);
     }
-    Ok(Some(Index::parse(&fs::read(index_path)?, format)?))
+    Ok(Some(sley_index::read_repository_index(git_dir, format)?))
 }
 
 fn empty_index() -> Index {
@@ -1062,7 +1063,7 @@ pub fn add_update_all_tracked_filtered(
     if index_dirty {
         normalize_index_version_for_extended_flags(&mut index);
         index.extensions = index_extensions_without_cache_tree(&index.extensions);
-        fs::write(index_path, index.write(format)?)?;
+        write_repository_index(git_dir, format, index.clone())?;
     }
     Ok(actions)
 }
@@ -1234,7 +1235,7 @@ pub fn add_exact_tracked_path_with_index(
     if dirty {
         normalize_index_version_for_extended_flags(&mut index);
         index.extensions = index_extensions_without_cache_tree(&index.extensions);
-        fs::write(index_path, index.write(format)?)?;
+        write_repository_index(git_dir, format, index.clone())?;
     }
     Ok(action)
 }
@@ -1698,7 +1699,6 @@ fn update_index_paths_impl(
     clean_config: Option<&GitConfig>,
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
-    let index_path = repository_index_path(git_dir);
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     if options.allow_skip_worktree_entries {
         expand_sparse_index(&mut index, &odb, format)?;
@@ -1927,7 +1927,7 @@ fn update_index_paths_impl(
         format,
         &untracked_cache_invalidation_paths,
     )?;
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     if verbose {
         let mut stdout = std::io::stdout().lock();
         for line in &reports {
@@ -1995,7 +1995,7 @@ pub fn refresh_index_paths(
     {
         return refresh_all_index_paths_parallel(
             worktree_root,
-            &index_path,
+            git_dir,
             format,
             index,
             stat_cache,
@@ -2091,7 +2091,7 @@ pub fn refresh_index_paths(
         }
     }
     if index_dirty {
-        fs::write(&index_path, index.write(format)?)?;
+        write_repository_index(git_dir, format, index.clone())?;
     }
     if needs_update && !quiet {
         return Err(GitError::Exit(1));
@@ -2104,7 +2104,7 @@ pub fn refresh_index_paths(
 
 fn refresh_all_index_paths_parallel(
     worktree_root: &Path,
-    index_path: &Path,
+    git_dir: &Path,
     format: ObjectFormat,
     mut index: Index,
     stat_cache: IndexStatCache,
@@ -2184,7 +2184,7 @@ fn refresh_all_index_paths_parallel(
         }
     }
     if index_dirty {
-        fs::write(index_path, index.write(format)?)?;
+        write_repository_index(git_dir, format, index.clone())?;
     }
     if needs_update && !quiet {
         return Err(GitError::Exit(1));
@@ -2285,7 +2285,7 @@ pub fn set_index_assume_unchanged_paths(
         }
     }
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2363,7 +2363,7 @@ pub fn set_index_skip_worktree_paths(
         }
     }
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2450,7 +2450,7 @@ pub fn set_index_version(
     }
     index.version = version;
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2474,7 +2474,7 @@ pub fn force_write_index(
         }
     };
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -2504,7 +2504,7 @@ pub fn enable_untracked_cache(
         _ => UntrackedCache::new(format, ident, dir_flags),
     };
     index.set_untracked_cache(format, Some(&cache))?;
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(())
 }
 
@@ -2516,7 +2516,7 @@ pub fn disable_untracked_cache(git_dir: impl AsRef<Path>, format: ObjectFormat) 
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     index.set_untracked_cache(format, None)?;
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(())
 }
 
@@ -2541,7 +2541,7 @@ pub fn refresh_untracked_cache_after_status(
     match config.get("core", None, "untrackedCache") {
         Some("false") | Some("no") | Some("off") | Some("0") => {
             index.set_untracked_cache(format, None)?;
-            fs::write(index_path, index.write(format)?)?;
+            write_repository_index(git_dir, format, index.clone())?;
             return Ok(());
         }
         Some("true") | Some("yes") | Some("on") | Some("1") => {}
@@ -2569,7 +2569,7 @@ pub fn refresh_untracked_cache_after_status(
     let cache = build_untracked_cache(worktree_root, git_dir, format, &index, untracked_mode)?;
     emit_untracked_cache_trace(old_cache.as_ref(), &cache);
     index.set_untracked_cache(format, Some(&cache))?;
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(())
 }
 
@@ -2613,6 +2613,144 @@ fn preserved_index_extensions(git_dir: &Path, format: ObjectFormat) -> Result<Ve
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err.into()),
     }
+}
+
+fn repository_index_is_split(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let index_path = repository_index_path(git_dir);
+    match fs::read(index_path) {
+        Ok(bytes) => Ok(Index::parse(&bytes, format)?
+            .split_index_link(format)?
+            .is_some()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub fn write_repository_index(git_dir: &Path, format: ObjectFormat, index: Index) -> Result<()> {
+    let split = index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
+    write_repository_index_with_split(git_dir, format, index, split)
+}
+
+fn write_repository_index_with_split(
+    git_dir: &Path,
+    format: ObjectFormat,
+    mut index: Index,
+    split: bool,
+) -> Result<()> {
+    smudge_racily_clean_entries_before_write(git_dir, format, &mut index)?;
+    let index_path = repository_index_path(git_dir);
+    if !split {
+        index.clear_split_index_link()?;
+        fs::write(index_path, index.write(format)?)?;
+        return Ok(());
+    }
+
+    let mut shared = index.clone();
+    shared.clear_split_index_link()?;
+    shared.extensions = index_extensions_without_cache_tree(&shared.extensions);
+    let shared_bytes = shared.write(format)?;
+    let shared_oid = index_checksum_from_bytes(format, &shared_bytes)?;
+    let shared_path = git_dir.join(format!("sharedindex.{shared_oid}"));
+    if !shared_path.exists() {
+        fs::write(&shared_path, &shared_bytes)?;
+    }
+
+    let mut primary = Index {
+        version: index.version,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    primary.set_split_index_link(Some(&SplitIndexLink::new(shared_oid)))?;
+    fs::write(index_path, primary.write(format)?)?;
+    Ok(())
+}
+
+fn index_checksum_from_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
+    let hash_len = format.raw_len();
+    if bytes.len() < hash_len {
+        return Err(GitError::InvalidFormat("index too short for checksum".into()));
+    }
+    ObjectId::from_raw(format, &bytes[bytes.len() - hash_len..])
+}
+
+pub fn enable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<UpdateIndexResult> {
+    let git_dir = git_dir.as_ref();
+    let mut index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    normalize_index_version_for_extended_flags(&mut index);
+    write_repository_index_with_split(git_dir, format, index.clone(), true)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+pub fn disable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<UpdateIndexResult> {
+    let git_dir = git_dir.as_ref();
+    if !repository_index_path(git_dir).exists() {
+        return Ok(UpdateIndexResult {
+            entries: 0,
+            updated: Vec::new(),
+        });
+    }
+    let mut index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    normalize_index_version_for_extended_flags(&mut index);
+    write_repository_index_with_split(git_dir, format, index.clone(), false)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+fn smudge_racily_clean_entries_before_write(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &mut Index,
+) -> Result<()> {
+    let index_path = repository_index_path(git_dir);
+    let Some(index_mtime) = fs::metadata(&index_path)
+        .ok()
+        .and_then(|metadata| sley_index::file_mtime_parts(&metadata))
+    else {
+        return Ok(());
+    };
+    if index_mtime == (0, 0) {
+        return Ok(());
+    }
+    let Some(worktree_root) = worktree_root_for_git_dir(git_dir)? else {
+        return Ok(());
+    };
+    for entry in &mut index.entries {
+        if index_entry_stage(entry) != 0 || sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        let entry_mtime = (
+            u64::from(entry.mtime_seconds),
+            u64::from(entry.mtime_nanoseconds),
+        );
+        if entry_mtime == (0, 0) || index_mtime > entry_mtime {
+            continue;
+        }
+        let absolute = worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?);
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
+            continue;
+        };
+        if entry.mode != worktree_entry_mode(&metadata) || !worktree_entry_is_uptodate(entry, &metadata) {
+            continue;
+        }
+        let body = if metadata.file_type().is_symlink() {
+            symlink_target_bytes(&absolute)?
+        } else if metadata.is_file() {
+            fs::read(&absolute)?
+        } else {
+            continue;
+        };
+        let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+        if oid != entry.oid {
+            entry.size = 0;
+        }
+    }
+    Ok(())
 }
 
 fn invalidate_untracked_cache_for_git_paths(
@@ -2743,7 +2881,7 @@ pub fn update_index_cacheinfo(
         format,
         &untracked_cache_invalidation_paths,
     )?;
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     if verbose {
         flush_update_index_reports(&reports)?;
     }
@@ -2831,7 +2969,7 @@ pub fn update_index_index_info(
         format,
         &untracked_cache_invalidation_paths,
     )?;
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
@@ -11052,7 +11190,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
         checksum: None,
     };
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(repository_index_path(git_dir), index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(target_entries.len())
 }
 
@@ -11165,7 +11303,7 @@ fn restore_worktree_paths_inner(
             return Err(GitError::Exit(1));
         }
     }
-    fs::write(&index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11320,7 +11458,7 @@ fn restore_index_paths_from_entries(
         checksum: None,
     };
     invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
-    fs::write(repository_index_path(git_dir), index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11465,7 +11603,7 @@ fn restore_index_and_worktree_paths_from_entries(
         checksum: None,
     };
     invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
-    fs::write(repository_index_path(git_dir), index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(RestoreResult {
         restored: restored.len(),
     })
@@ -11860,7 +11998,7 @@ pub fn reset_index_to_commit(
         checksum: None,
     };
     index.upgrade_version_for_flags();
-    fs::write(&index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
@@ -12034,7 +12172,7 @@ pub fn apply_sparse_checkout_with_mode(
     } else {
         index.clear_sparse_extension()?;
     }
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(ApplySparseResult {
         materialized,
         skipped,
@@ -13130,7 +13268,7 @@ pub fn move_index_and_worktree_path(
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
         index.extensions.clear();
-        fs::write(index_path, index.write(format)?)?;
+        write_repository_index(git_dir, format, index.clone())?;
         return Ok(MoveResult {
             source: source_path,
             destination: destination_path,
@@ -13218,7 +13356,7 @@ pub fn move_index_and_worktree_path(
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
     index.extensions.clear();
-    fs::write(index_path, index.write(format)?)?;
+    write_repository_index(git_dir, format, index.clone())?;
     Ok(MoveResult {
         source: source_path,
         destination: destination_path,

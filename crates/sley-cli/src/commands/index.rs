@@ -1298,6 +1298,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut skip_worktree = None;
     let mut fsmonitor_valid = None;
     let mut index_version = None;
+    let mut split_index = None;
     let mut positional_only = false;
     let mut allow_no_input = false;
     let mut show_index_version = false;
@@ -1419,8 +1420,15 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             | "--no-replace"
             | "--unmerged"
             | "--no-unmerged"
-            | "--no-split-index"
             | "--no-force-untracked-cache" => allow_no_input = true,
+            "--split-index" => {
+                split_index = Some(true);
+                allow_no_input = true;
+            }
+            "--no-split-index" => {
+                split_index = Some(false);
+                allow_no_input = true;
+            }
             "--untracked-cache" | "--force-untracked-cache" => {
                 untracked_cache = Some(true);
                 allow_no_input = true;
@@ -1584,6 +1592,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         && !refresh
         && !again
         && index_version.is_none()
+        && split_index.is_none()
         && !force_write_index
         && untracked_cache.is_none()
     {
@@ -1591,12 +1600,20 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             if unresolve_only {
                 return Ok(());
             }
-            let git_dir = if show_index_version || fsmonitor {
+            let git_dir = if show_index_version || fsmonitor || split_index.is_some() {
                 let cwd = env::current_dir()?;
                 Some(discover_git_dir(&cwd)?)
             } else {
                 None
             };
+            if let (Some(split_index), Some(git_dir)) = (split_index, &git_dir) {
+                let format = repository_object_format(git_dir)?;
+                if split_index {
+                    sley_worktree::enable_split_index(git_dir, format)?;
+                } else {
+                    sley_worktree::disable_split_index(git_dir, format)?;
+                }
+            }
             if fsmonitor && let Some(git_dir) = &git_dir {
                 let format = repository_object_format(git_dir)?;
                 sley_worktree::force_write_index(git_dir, format)?;
@@ -1764,6 +1781,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             .map(|entry| entry.into_worktree_entry(format))
             .collect::<Result<Vec<_>>>()?;
         sley_worktree::update_index_cacheinfo(&git_dir, format, &cacheinfo, add, verbose)?;
+    }
+    if let Some(split_index) = split_index {
+        if split_index {
+            sley_worktree::enable_split_index(&git_dir, format)?;
+        } else {
+            sley_worktree::disable_split_index(&git_dir, format)?;
+        }
     }
     if show_index_version && !suppress_after_unresolve {
         print_update_index_version(&git_dir)?;
