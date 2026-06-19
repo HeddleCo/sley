@@ -637,7 +637,7 @@ declare -A FLOOR=(
     [t5543-atomic-push.sh]=11
     [t5548-push-porcelain.sh]=11
     [t6430-merge-recursive.sh]=23
-    [t5702-protocol-v2.sh]=5
+    [t5702-protocol-v2.sh]=21
     [t7103-reset-bare.sh]=12
     [t7110-reset-merge.sh]=21
     [t7201-co.sh]=19
@@ -758,6 +758,17 @@ declare -A FLOOR=(
     [t5523-push-upstream.sh]=16
     [t5403-post-checkout-hook.sh]=14
     [t5402-post-merge-hook.sh]=3
+    # wave-17 (2026-06-19, integ/wave17 onto 47d14609): v1/v2 wire handshake + connect-helper
+    # (completes the push+protocol frontier). MY measurements of the integ binary:
+    # t5704-violations 0->3 FULL, t5705-session-id 5->17 FULL, t5802-connect-helper 2->8 FULL,
+    # t5702-protocol-v2 ->21 (60-cell suite now fully runs), t5700-protocol-v1 6->9. Cross-guards
+    # held (t5813=81 t5505=126 t5601=73 t5516=92). NOTE: cargo test's reapply_after_set_matches_git
+    # (sparse_checkout.rs) FAILS on BASE too (flaky non-hermetic match-git test, sley#30 class) —
+    # NOT a wave-17 regression; separate hermeticity fix needed.
+    [t5700-protocol-v1.sh]=9
+    [t5704-protocol-violations.sh]=3
+    [t5705-session-id-in-capabilities.sh]=17
+    [t5802-connect-helper.sh]=8
 )
 
 fail=0
