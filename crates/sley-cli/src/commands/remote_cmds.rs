@@ -1413,7 +1413,7 @@ fn clone_network_repository(
                 )?;
                 apply_clone_config_overrides(git_dir, config_overrides)?;
                 apply_clone_submodule_active(git_dir, submodule_active)?;
-                read_repo_config(git_dir)
+                repo_config_with_transport_policy(git_dir)
             },
             configure_branch: &mut |git_dir, branch| {
                 configure_clone_branch(git_dir, branch, origin)?;

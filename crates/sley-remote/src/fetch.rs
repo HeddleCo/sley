@@ -37,7 +37,7 @@ use sley_protocol::{
     refspec_map_source,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
-use sley_transport::RemoteUrl;
+use sley_transport::{RemoteTransport, RemoteUrl};
 
 use crate::{CredentialProvider, ProgressSink};
 
@@ -380,6 +380,14 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 configured_remote_fetch,
                 has_merge_config,
             })?;
+            if remote.transport == RemoteTransport::Ext && options.auto_follow_tags {
+                append_missing_ext_advertised_tags(
+                    &advertisements,
+                    &parsed_refspecs,
+                    &store,
+                    &mut updates,
+                )?;
+            }
             let wants = updates.iter().map(|update| update.oid).collect();
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
             // boundary, deepen to `depth`, then apply the server's shallow-info.
@@ -795,15 +803,30 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         configured_remote_fetch,
         has_merge_config,
     } = input;
-    let mut updates = plan_fetch_ref_updates(advertisements, refspecs, options.auto_follow_tags)?;
+    let visible_advertisements = advertisements_without_peeled_refs(advertisements);
+    let planning_advertisements = if visible_advertisements.len() == advertisements.len() {
+        advertisements
+    } else {
+        visible_advertisements.as_slice()
+    };
+    let mut updates =
+        plan_fetch_ref_updates(planning_advertisements, refspecs, options.auto_follow_tags)?;
     if options.fetch_all_tags {
         mark_tag_refspec_updates_not_for_merge(&mut updates);
     } else {
         if options.auto_follow_tags
             && let Some((remote_db, advertisements)) = reachable
         {
+            let visible_reachable_advertisements =
+                advertisements_without_peeled_refs(advertisements);
+            let reachable_advertisements =
+                if visible_reachable_advertisements.len() == advertisements.len() {
+                    advertisements
+                } else {
+                    visible_reachable_advertisements.as_slice()
+                };
             append_reachable_auto_follow_tags(
-                advertisements,
+                reachable_advertisements,
                 remote_db,
                 local_db,
                 format,
@@ -849,6 +872,47 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         updates.sort_by_key(|update| update.not_for_merge);
     }
     Ok(updates)
+}
+
+fn advertisements_without_peeled_refs(advertisements: &[RefAdvertisement]) -> Vec<RefAdvertisement> {
+    advertisements
+        .iter()
+        .filter(|advertisement| !advertisement.name.ends_with("^{}"))
+        .cloned()
+        .collect()
+}
+
+fn append_missing_ext_advertised_tags(
+    advertisements: &[RefAdvertisement],
+    refspecs: &[RefSpec],
+    store: &FileRefStore,
+    updates: &mut Vec<FetchRefUpdate>,
+) -> Result<()> {
+    let mut seen = updates
+        .iter()
+        .map(|update| update.src.clone())
+        .collect::<HashSet<_>>();
+    let mut tags = Vec::new();
+    for reference in advertisements {
+        if !reference.name.starts_with("refs/tags/")
+            || reference.name.ends_with("^{}")
+            || !seen.insert(reference.name.clone())
+            || fetch_refspec_excludes(refspecs, &reference.name)?
+            || store.read_ref(&reference.name)?.is_some()
+        {
+            continue;
+        }
+        tags.push(FetchRefUpdate {
+            src: reference.name.clone(),
+            dst: Some(reference.name.clone()),
+            oid: reference.oid,
+            not_for_merge: true,
+            force: false,
+        });
+    }
+    tags.sort_by(|a, b| a.src.cmp(&b.src));
+    updates.extend(tags);
+    Ok(())
 }
 
 /// Write `FETCH_HEAD`, apply the remote-tracking ref updates, and record the

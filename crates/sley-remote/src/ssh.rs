@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 
@@ -39,9 +39,10 @@ use sley_protocol::{
     read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
+use sley_protocol::write_pkt_line_payload;
 use sley_refs::FileRefStore;
 use sley_transport::{
-    RemoteTransport, RemoteUrl, SshCommandVariant, SshProcessCommand, ssh_process_command,
+    RemoteTransport, RemoteUrl, SshCommandVariant, ssh_process_command,
 };
 
 use crate::{PushOutcome, PushRequest};
@@ -57,50 +58,177 @@ pub fn ssh_program() -> String {
 fn ssh_process_command_for_remote(
     remote: &RemoteUrl,
     service: GitService,
-) -> Result<SshProcessCommand> {
+) -> Result<ServiceProcessCommand> {
     if remote.transport == RemoteTransport::Ext {
         return ext_process_command_for_remote(remote, service);
     }
     validate_git_ssh_command()?;
-    ssh_process_command(remote, service, ssh_program(), ssh_command_variant())
+    let command = ssh_process_command(remote, service, ssh_program(), ssh_command_variant())?;
+    Ok(ServiceProcessCommand {
+        program: command.program,
+        args: command.args,
+        env: Vec::new(),
+        git_request: None,
+    })
+}
+
+struct ServiceProcessCommand {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    git_request: Option<ExtGitRequest>,
+}
+
+struct ExtGitRequest {
+    repo: String,
+    vhost: Option<String>,
 }
 
 fn ext_process_command_for_remote(
     remote: &RemoteUrl,
     service: GitService,
-) -> Result<SshProcessCommand> {
-    let words = split_shell_words(&remote.path)?;
-    let Some((program, args)) = words.split_first() else {
+) -> Result<ServiceProcessCommand> {
+    let parsed = parse_remote_ext_command(&remote.path, service)?;
+    let Some((program, args)) = parsed.argv.split_first() else {
         return Err(GitError::InvalidFormat("ext remote command is empty".into()));
     };
-    Ok(SshProcessCommand {
-        program: expand_ext_service_placeholders(program, service),
-        args: args
-            .iter()
-            .map(|arg| expand_ext_service_placeholders(arg, service))
-            .collect(),
+    Ok(ServiceProcessCommand {
+        program: program.clone(),
+        args: args.to_vec(),
+        env: vec![
+            ("GIT_EXT_SERVICE".into(), service.as_str().into()),
+            (
+                "GIT_EXT_SERVICE_NOPREFIX".into(),
+                service.as_str().strip_prefix("git-").unwrap_or(service.as_str()).into(),
+            ),
+        ],
+        git_request: parsed.git_request.map(|repo| ExtGitRequest {
+            repo,
+            vhost: parsed.git_request_vhost,
+        }),
     })
 }
 
-fn expand_ext_service_placeholders(value: &str, service: GitService) -> String {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('S') => out.push_str(service.as_str()),
-            Some('%') => out.push('%'),
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
-            None => out.push('%'),
+struct ParsedRemoteExtCommand {
+    argv: Vec<String>,
+    git_request: Option<String>,
+    git_request_vhost: Option<String>,
+}
+
+fn parse_remote_ext_command(command: &str, service: GitService) -> Result<ParsedRemoteExtCommand> {
+    let service_name = service.as_str();
+    let service_noprefix = service_name.strip_prefix("git-").unwrap_or(service_name);
+    let mut rest = command;
+    let mut argv = Vec::new();
+    let mut git_request = None;
+    let mut git_request_vhost = None;
+
+    while !rest.is_empty() {
+        let (arg, next) = parse_remote_ext_arg(rest, service_name, service_noprefix)?;
+        rest = next;
+        match arg {
+            RemoteExtArg::Arg(value) => argv.push(value),
+            RemoteExtArg::GitRequest(value) => git_request = Some(value),
+            RemoteExtArg::GitRequestVhost(value) => git_request_vhost = Some(value),
         }
     }
-    out
+
+    Ok(ParsedRemoteExtCommand {
+        argv,
+        git_request,
+        git_request_vhost,
+    })
+}
+
+enum RemoteExtArg {
+    Arg(String),
+    GitRequest(String),
+    GitRequestVhost(String),
+}
+
+fn parse_remote_ext_arg<'a>(
+    input: &'a str,
+    service: &str,
+    service_noprefix: &str,
+) -> Result<(RemoteExtArg, &'a str)> {
+    let bytes = input.as_bytes();
+    let mut end = 0;
+    let mut escaped = false;
+    let mut special = None::<u8>;
+    while end < bytes.len() && (escaped || bytes[end] != b' ') {
+        if escaped {
+            match bytes[end] {
+                b' ' | b'%' | b's' | b'S' => {}
+                b'G' | b'V' if end == 1 => special = Some(bytes[end]),
+                other => {
+                    return Err(GitError::InvalidFormat(format!(
+                        "Bad remote-ext placeholder '%{}'",
+                        other as char
+                    )));
+                }
+            }
+            escaped = false;
+        } else {
+            escaped = bytes[end] == b'%';
+        }
+        end += 1;
+    }
+    if escaped && end == bytes.len() {
+        return Err(GitError::InvalidFormat(
+            "remote-ext command has incomplete placeholder".into(),
+        ));
+    }
+    let mut next = &input[end..];
+    if next.starts_with(' ') {
+        next = &next[1..];
+    }
+
+    let body = if special.is_some() {
+        &input[2..end]
+    } else {
+        &input[..end]
+    };
+    let expanded = expand_remote_ext_arg(body, service, service_noprefix)?;
+    let arg = match special {
+        Some(b'G') => RemoteExtArg::GitRequest(expanded),
+        Some(b'V') => RemoteExtArg::GitRequestVhost(expanded),
+        Some(_) => unreachable!("validated remote-ext special"),
+        None => RemoteExtArg::Arg(expanded),
+    };
+    Ok((arg, next))
+}
+
+fn expand_remote_ext_arg(input: &str, service: &str, service_noprefix: &str) -> Result<String> {
+    let mut out = String::new();
+    let bytes = input.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] != b'%' {
+            out.push(bytes[pos] as char);
+            pos += 1;
+            continue;
+        }
+        pos += 1;
+        if pos == bytes.len() {
+            return Err(GitError::InvalidFormat(
+                "remote-ext command has incomplete placeholder".into(),
+            ));
+        }
+        match bytes[pos] {
+            b' ' => out.push(' '),
+            b'%' => out.push('%'),
+            b's' => out.push_str(service_noprefix),
+            b'S' => out.push_str(service),
+            other => {
+                return Err(GitError::InvalidFormat(format!(
+                    "Bad remote-ext placeholder '%{}'",
+                    other as char
+                )));
+            }
+        }
+        pos += 1;
+    }
+    Ok(out)
 }
 
 fn ssh_command_variant() -> SshCommandVariant {
@@ -175,6 +303,59 @@ fn split_shell_words(command: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+fn spawn_service_process(
+    remote: &RemoteUrl,
+    service: GitService,
+    keep_stdin: bool,
+) -> Result<(Child, Option<ChildStdin>, ChildStdout)> {
+    let command = ssh_process_command_for_remote(remote, service)?;
+    let mut process = ProcessCommand::new(&command.program);
+    process
+        .args(&command.args)
+        .envs(command.env)
+        .stdin(if keep_stdin || command.git_request.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn()?;
+    let mut stdin = child.stdin.take();
+    if let Some(request) = &command.git_request {
+        let Some(input) = stdin.as_mut() else {
+            return Err(GitError::Command("remote-ext stdin was not piped".into()));
+        };
+        write_remote_ext_git_request(input, service, request)?;
+    }
+    if !keep_stdin {
+        drop(stdin.take());
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command("service stdout was not piped".into()))?;
+    Ok((child, stdin, stdout))
+}
+
+fn write_remote_ext_git_request(
+    writer: &mut impl Write,
+    service: GitService,
+    request: &ExtGitRequest,
+) -> Result<()> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(service.as_str().as_bytes());
+    payload.push(b' ');
+    payload.extend_from_slice(request.repo.as_bytes());
+    payload.push(0);
+    if let Some(vhost) = &request.vhost {
+        payload.extend_from_slice(b"host=");
+        payload.extend_from_slice(vhost.as_bytes());
+        payload.push(0);
+    }
+    write_pkt_line_payload(writer, &payload)
+}
+
 /// Push to a resolved SSH `remote` from the repository at `git_dir`.
 ///
 /// Performs the work the CLI's `push_ssh_repository` did, sharing the
@@ -227,20 +408,9 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command_for_remote(remote, GitService::ReceivePack)?;
-    let mut child = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Command("ssh receive-pack stdout was not piped".into()))?;
-    let stdin = child
-        .stdin
-        .take()
+    let (child, stdin, mut stdout) =
+        spawn_service_process(remote, GitService::ReceivePack, true)?;
+    let stdin = stdin
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
     let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
@@ -327,20 +497,9 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command_for_remote(remote, GitService::ReceivePack)?;
-    let mut child = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Command("ssh receive-pack stdout was not piped".into()))?;
-    let stdin = child
-        .stdin
-        .take()
+    let (child, stdin, mut stdout) =
+        spawn_service_process(remote, GitService::ReceivePack, true)?;
+    let stdin = stdin
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
     let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
@@ -478,13 +637,11 @@ pub(crate) fn ls_remote_ssh(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command_for_remote(remote, GitService::UploadPack)?;
-    let output = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::null())
-        .output()?;
-    let mut stdout = output.stdout.as_slice();
-    let set = match read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout) {
+    let (child, _stdin, mut stdout) =
+        spawn_service_process(remote, GitService::UploadPack, false)?;
+    let set_result = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout);
+    let output = child.wait_with_output()?;
+    let set = match set_result {
         Ok(set) => set,
         Err(_) if !output.status.success() => {
             return Err(GitError::Command(format!(
@@ -653,13 +810,11 @@ pub fn ssh_upload_pack_advertisements(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command_for_remote(remote, GitService::UploadPack)?;
-    let output = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::null())
-        .output()?;
-    let mut stdout = output.stdout.as_slice();
-    let set = match read_ref_advertisement_set(format, &mut stdout) {
+    let (child, _stdin, mut stdout) =
+        spawn_service_process(remote, GitService::UploadPack, false)?;
+    let set_result = read_ref_advertisement_set(format, &mut stdout);
+    let output = child.wait_with_output()?;
+    let set = match set_result {
         Ok(set) => set,
         Err(_) if !output.status.success() => {
             return Err(GitError::Command(format!(
@@ -732,20 +887,9 @@ fn ssh_upload_pack_fetch_response_inner(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let ssh = ssh_process_command_for_remote(remote, GitService::UploadPack)?;
-    let mut child = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Command("ssh upload-pack stdout was not piped".into()))?;
-    let mut stdin = child
-        .stdin
-        .take()
+    let (child, stdin, mut stdout) =
+        spawn_service_process(remote, GitService::UploadPack, true)?;
+    let mut stdin = stdin
         .ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
 
     read_ref_advertisement_set(format, &mut stdout)?;
@@ -801,4 +945,43 @@ fn ssh_remote_display(remote: &RemoteUrl) -> String {
         out.push_str(&remote.path);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_ext_parser_keeps_percent_escaped_spaces_inside_arguments() {
+        let parsed = parse_remote_ext_command("sh -c %S% ..", GitService::UploadPack)
+            .expect("remote-ext command parses");
+
+        assert_eq!(
+            parsed.argv,
+            vec!["sh", "-c", "git-upload-pack .."],
+        );
+        assert_eq!(parsed.git_request, None);
+        assert_eq!(parsed.git_request_vhost, None);
+    }
+
+    #[test]
+    fn remote_ext_parser_expands_service_without_git_prefix() {
+        let parsed = parse_remote_ext_command("helper %s %%", GitService::ReceivePack)
+            .expect("remote-ext command parses");
+
+        assert_eq!(parsed.argv, vec!["helper", "receive-pack", "%"]);
+    }
+
+    #[test]
+    fn remote_ext_parser_extracts_git_daemon_request_arguments() {
+        let parsed = parse_remote_ext_command(
+            "fake-daemon %G/two.git %Vhost",
+            GitService::UploadPack,
+        )
+        .expect("remote-ext command parses");
+
+        assert_eq!(parsed.argv, vec!["fake-daemon"]);
+        assert_eq!(parsed.git_request.as_deref(), Some("/two.git"));
+        assert_eq!(parsed.git_request_vhost.as_deref(), Some("host"));
+    }
 }
