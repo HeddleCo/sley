@@ -2285,10 +2285,9 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// `--ignore-submodules` filtering. The bitmask uses
     /// `sley_worktree::DIRTY_SUBMODULE_*`.
     pub(crate) submodule_dirt: Option<&'a HashMap<Vec<u8>, u8>>,
-    /// The whitespace rule used to highlight whitespace errors on new lines
-    /// (`--ws-error-highlight`, default new-only) when color is enabled.
-    /// `None` disables whitespace-error highlighting.
-    pub(crate) ws_error_rule: Option<sley_diff_merge::ws::WsRule>,
+    /// Whitespace-error highlighting (`--ws-error-highlight` /
+    /// `diff.wsErrorHighlight`) when color is enabled. `None` disables it.
+    pub(crate) ws_error: Option<sley_diff_merge::render::WsErrorHighlight>,
     /// Extra inter-hunk merge distance (`--inter-hunk-context`).
     pub(crate) interhunk: usize,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
@@ -2565,7 +2564,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
-                ws_error_rule: None,
+                ws_error: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
@@ -2879,15 +2878,7 @@ pub(crate) fn write_diff_patch_entry(
         .map(commands::format_patch::WordDiffAdapter::new);
     // Whitespace-error highlighting (`--ws-error-highlight`, default new-only)
     // is active only when both color and a resolved rule are present.
-    let ws_error = match (colors, options.ws_error_rule) {
-        (Some(_), Some(rule)) => Some(sley_diff_merge::render::WsErrorHighlight {
-            rule,
-            old: false,
-            new: true,
-            context: false,
-        }),
-        _ => None,
-    };
+    let ws_error = colors.and(options.ws_error);
     // `--ignore-blank-lines` / `-I<regex>` change-group suppression: build the
     // regex predicate over the compiled `-I` patterns (ERE substring match,
     // like git's regexec_buf over the line including its trailing newline).
@@ -4406,7 +4397,7 @@ fn write_submodule_inline_diff(
                     no_index_contents: None,
                     submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                     submodule_dirt: Some(&submodule_dirt),
-                    ws_error_rule: None,
+                    ws_error: None,
                     interhunk: options.interhunk,
                     ws_ignore: sley_diff_merge::WsIgnore::default(),
                     diff_algorithm: options.diff_algorithm,
@@ -4448,7 +4439,7 @@ fn write_submodule_inline_diff(
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                 submodule_dirt: Some(&nested_dirt),
-                ws_error_rule: None,
+                ws_error: None,
                 interhunk: options.interhunk,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: options.diff_algorithm,

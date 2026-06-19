@@ -1698,6 +1698,20 @@ fn write_patch_line_colored(
     };
 
     if let Some(rule) = ws_rule {
+        if rule == 0 {
+            out.extend_from_slice(color.as_bytes());
+            out.push(prefix);
+            out.extend_from_slice(body);
+            out.extend_from_slice(colors.reset.as_bytes());
+            out.push(b'\n');
+            if !terminated {
+                out.extend_from_slice(colors.context.as_bytes());
+                out.extend_from_slice(b"\\ No newline at end of file");
+                out.extend_from_slice(colors.reset.as_bytes());
+                out.push(b'\n');
+            }
+            return;
+        }
         // Sign in the line color, then the body through ws_check_emit (no
         // trailing newline in `body`, so the emit's own LF handling is inert).
         out.extend_from_slice(color.as_bytes());
@@ -1711,7 +1725,12 @@ fn write_patch_line_colored(
         crate::ws::ws_check_emit(body, rule, out, &emit_colors);
         out.push(b'\n');
         if !terminated {
-            out.extend_from_slice(colors.context.as_bytes());
+            let marker_color = if rule & crate::ws::WS_INCOMPLETE_LINE != 0 {
+                colors.whitespace
+            } else {
+                colors.context
+            };
+            out.extend_from_slice(marker_color.as_bytes());
             out.extend_from_slice(b"\\ No newline at end of file");
             out.extend_from_slice(colors.reset.as_bytes());
             out.push(b'\n');

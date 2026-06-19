@@ -15,6 +15,50 @@ fn diff_peel_rev_tree(
     sley_rev::peel_to_tree(db, format, &oid)
 }
 
+pub(crate) fn diff_resolve_commit_arg(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    rev: &str,
+) -> Result<ObjectId> {
+    let oid = resolve_revision(git_dir, format, rev)?;
+    match sley_rev::peel_to_commit(db, format, &oid) {
+        Ok(commit) => Ok(commit),
+        Err(err) => {
+            if let Ok(object) = db.read_object(&oid) {
+                eprintln!(
+                    "error: object {oid} is a {}, not a commit",
+                    object.object_type.as_str()
+                );
+                Err(GitError::Exit(128))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+pub(crate) fn diff_single_merge_base(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    left: &ObjectId,
+    right: &ObjectId,
+) -> Result<ObjectId> {
+    let bases = sley_rev::merge_bases(git_dir, format, db, left, right)?;
+    match bases.as_slice() {
+        [] => {
+            eprintln!("fatal: no merge base found");
+            Err(GitError::Exit(128))
+        }
+        [base] => Ok(*base),
+        _ => {
+            eprintln!("fatal: multiple merge bases found");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 fn diff_split_revisions(
     git_dir: &Path,
     format: ObjectFormat,
@@ -35,17 +79,25 @@ fn diff_split_revisions(
         let left_spec = if left.is_empty() { "HEAD" } else { left };
         let right_spec = if right.is_empty() { "HEAD" } else { right };
         if let (Ok(left_oid), Ok(right_oid)) = (
-            resolve_revision(git_dir, format, left_spec),
-            resolve_revision(git_dir, format, right_spec),
+            diff_resolve_commit_arg(git_dir, format, db, left_spec),
+            diff_resolve_commit_arg(git_dir, format, db, right_spec),
         ) {
-            let Some(base) = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?
-                .into_iter()
-                .next()
+            if path_args[1..]
+                .iter()
+                .any(|arg| diff_arg_looks_like_extra_revision(git_dir, format, db, arg))
+            {
+                return diff_usage_error();
+            }
+            let bases = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?;
+            let Some(base) = bases.first()
             else {
                 eprintln!("fatal: {first}: no merge base");
                 return Err(GitError::Exit(128));
             };
-            let base_tree = sley_rev::peel_to_tree(db, format, &base)?;
+            if bases.len() > 1 {
+                eprintln!("warning: {first}: multiple merge bases, using {base}");
+            }
+            let base_tree = sley_rev::peel_to_tree(db, format, base)?;
             let right_tree = sley_rev::peel_to_tree(db, format, &right_oid)?;
             return Ok((vec![base_tree, right_tree], path_args[1..].to_vec()));
         }
@@ -59,8 +111,20 @@ fn diff_split_revisions(
             diff_peel_rev_tree(git_dir, format, db, left_spec),
             diff_peel_rev_tree(git_dir, format, db, right_spec),
         ) {
+            if path_args[1..]
+                .iter()
+                .any(|arg| diff_arg_looks_like_extra_revision(git_dir, format, db, arg))
+            {
+                return diff_usage_error();
+            }
             return Ok((vec![left_tree, right_tree], path_args[1..].to_vec()));
         }
+    }
+    if path_args[1..]
+        .iter()
+        .any(|arg| diff_arg_is_revision_range(git_dir, format, db, arg))
+    {
+        return diff_usage_error();
     }
     // Otherwise peel up to two leading args that each resolve as a revision.
     let mut trees = Vec::new();
@@ -78,6 +142,107 @@ fn diff_split_revisions(
     }
     rest.extend(iter);
     Ok((trees, rest))
+}
+
+fn diff_split_merge_base(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    _cached: bool,
+    path_args: Vec<String>,
+) -> Result<(Vec<ObjectId>, Vec<String>)> {
+    let mut commits: Vec<(ObjectId, String)> = Vec::new();
+    let mut rest = Vec::new();
+    let mut iter = path_args.into_iter();
+    for token in iter.by_ref() {
+        if diff_arg_is_revision_range(git_dir, format, db, &token) {
+            eprintln!("fatal: --merge-base does not work with ranges");
+            return Err(GitError::Exit(128));
+        }
+        if commits.len() < 2
+            && resolve_revision(git_dir, format, &token).is_ok()
+        {
+            let commit = diff_resolve_commit_arg(git_dir, format, db, &token)?;
+            commits.push((commit, token));
+            continue;
+        }
+        rest.push(token);
+        break;
+    }
+    rest.extend(iter);
+    if commits.is_empty() {
+        return diff_usage_error();
+    }
+    if commits.len() == 2
+        && rest
+            .iter()
+            .any(|arg| diff_arg_looks_like_extra_revision(git_dir, format, db, arg))
+    {
+        return diff_usage_error();
+    }
+
+    let head_storage;
+    let (left, right) = if commits.len() == 1 {
+        head_storage = diff_resolve_commit_arg(git_dir, format, db, "HEAD")?;
+        (&head_storage, &commits[0].0)
+    } else {
+        (&commits[0].0, &commits[1].0)
+    };
+    let base = diff_single_merge_base(git_dir, format, db, left, right)?;
+    let base_tree = sley_rev::peel_to_tree(db, format, &base)?;
+    if commits.len() == 1 {
+        Ok((vec![base_tree], rest))
+    } else {
+        let right_tree = sley_rev::peel_to_tree(db, format, right)?;
+        Ok((vec![base_tree, right_tree], rest))
+    }
+}
+
+fn diff_arg_is_revision_range(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    arg: &str,
+) -> bool {
+    if let Some((left, right)) = arg.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_resolve_commit_arg(git_dir, format, db, left).is_ok()
+            && diff_resolve_commit_arg(git_dir, format, db, right).is_ok();
+    }
+    if let Some((left, right)) = arg.split_once("..") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_peel_rev_tree(git_dir, format, db, left).is_ok()
+            && diff_peel_rev_tree(git_dir, format, db, right).is_ok();
+    }
+    false
+}
+
+fn diff_arg_looks_like_extra_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    arg: &str,
+) -> bool {
+    if let Some((left, right)) = arg.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_resolve_commit_arg(git_dir, format, db, left).is_ok()
+            && diff_resolve_commit_arg(git_dir, format, db, right).is_ok();
+    }
+    if let Some((left, right)) = arg.split_once("..") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        return diff_peel_rev_tree(git_dir, format, db, left).is_ok()
+            && diff_peel_rev_tree(git_dir, format, db, right).is_ok();
+    }
+    diff_peel_rev_tree(git_dir, format, db, arg).is_ok()
+}
+
+fn diff_usage_error<T>() -> Result<T> {
+    eprintln!("usage: git diff [<options>] [<commit>] [--] [<path>...]");
+    Err(GitError::Exit(129))
 }
 
 /// The `whitespace` attribute + `core.whitespace` config, resolved into the
@@ -156,6 +321,7 @@ pub(crate) fn run_diff_check(
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
+    use_worktree_old: bool,
     use_worktree_new: bool,
     resolver: &WhitespaceRuleResolver,
 ) -> Result<bool> {
@@ -172,7 +338,9 @@ pub(crate) fn run_diff_check(
         let Some(new_content) = new_content else {
             continue;
         };
-        let old_content = diff_entry_old_content(entry, db)?.unwrap_or_default();
+        let old_content =
+            diff_entry_old_content_for_diff(entry, db, worktree_root, use_worktree_old)?
+                .unwrap_or_default();
         let path = status_quote_path(&entry.path, false);
         // A symlink target being an incomplete line is not news (git clears
         // WS_INCOMPLETE_LINE for symlinks). We don't track symlink mode here in
@@ -193,6 +361,53 @@ pub(crate) fn run_diff_check(
         }
     }
     Ok(status)
+}
+
+fn diff_entry_old_content_for_diff(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_old: bool,
+) -> Result<Option<Vec<u8>>> {
+    if !use_worktree_old {
+        return diff_entry_old_content(entry, db);
+    }
+    let Some(mode) = entry.old_mode else {
+        return Ok(None);
+    };
+    if mode == 0o160000 {
+        return Ok(entry
+            .old_oid
+            .as_ref()
+            .map(|oid| gitlink_diff_content(oid, false)));
+    }
+    let root = worktree_root.ok_or_else(|| {
+        GitError::Command("diff -R requires a worktree for worktree comparisons".into())
+    })?;
+    let path = root.join(repo_path_to_path(
+        entry.old_path.as_deref().unwrap_or(&entry.path),
+    ));
+    if mode == 0o120000 {
+        return read_symlink_bytes_for_diff(&path).map(Some);
+    }
+    if path.exists() {
+        return Ok(Some(fs::read(path)?));
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn read_symlink_bytes_for_diff(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn read_symlink_bytes_for_diff(path: &Path) -> Result<Vec<u8>> {
+    Ok(fs::read_link(path)?
+        .to_string_lossy()
+        .replace('\\', "/")
+        .into_bytes())
 }
 
 /// Check a single old/new pair, writing the `checkdiff` report to `out`.
@@ -607,13 +822,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         raw_abbrev,
         patch_abbrev,
         patch_full_index,
-        color_always,
+        mut color_always,
         diff_algorithm_control,
         diff_algorithm,
         diff_driver_control,
         diff_hunk_control,
         interhunk,
         diff_whitespace_control,
+        ws_error_highlight,
         indent_heuristic,
         ws_ignore,
         ignore_blank_lines,
@@ -646,6 +862,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         copy_threshold,
         diff_filter,
         ignore_submodules_cli,
+        merge_base,
         mut path_args,
         explicit_paths,
     } = commands::diff_options::setup_diff_options(args)?;
@@ -694,11 +911,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_rewrite_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff rewrite controls are not supported for this output mode".into(),
-        ));
-    }
-    if reverse && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff reverse output is not supported for this output mode".into(),
         ));
     }
     if (pickaxe.is_some() || pickaxe_all || pickaxe_regex) && !name_status && !name_only {
@@ -759,6 +971,20 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    if !color_always
+        && read_repo_config(&git_dir)
+            .ok()
+            .and_then(|config| config.get("diff", None, "color").map(str::to_owned))
+            .is_some_and(|value| git_config_color_is_always(&value))
+    {
+        color_always = true;
+    }
+    let ws_error_highlight = ws_error_highlight.or_else(|| {
+        read_repo_config(&git_dir)
+            .ok()
+            .and_then(|config| config.get("diff", None, "wserrorhighlight").map(str::to_owned))
+    });
+    let ws_error_kinds = parse_ws_error_highlight_kinds(ws_error_highlight.as_deref());
     let diff_submodule_format = diff_submodule_format.or_else(|| {
         read_repo_config(&git_dir)
             .ok()
@@ -895,11 +1121,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // A bare `diff HEAD` keeps its dedicated head-vs-worktree path, but
     // `diff HEAD <rev>` / `diff HEAD HEAD` means the consumed HEAD is the first of
     // several revisions — hand it back to the splitter.
-    if head && !path_args.is_empty() {
+    if head && (!path_args.is_empty() || merge_base) {
         path_args.insert(0, "HEAD".to_string());
         head = false;
     }
-    let (diff_trees, mut path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
+    let (diff_trees, mut path_args) = if merge_base {
+        diff_split_merge_base(&git_dir, format, &db, cached, path_args)?
+    } else {
+        diff_split_revisions(&git_dir, format, &db, path_args)?
+    };
     path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
     let no_output_mode = !raw
@@ -1139,6 +1369,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         entries
     };
+    let use_worktree_old = reverse && use_worktree_new;
+    let use_worktree_new = use_worktree_new && !reverse;
     // `--relative` rewrites the displayed paths; worktree content reads must
     // keep resolving against the original location, so the effective worktree
     // root gains the stripped prefix.
@@ -1154,6 +1386,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         apply_diff_relative(entries, &prefix)
     };
+    if reverse {
+        std::mem::swap(&mut src_prefix, &mut dst_prefix);
+    }
     let entries: Vec<_> = if diff_filter.all_or_none {
         if !diff_filter.includes.is_empty()
             && entries.iter().any(|entry| {
@@ -1207,6 +1442,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             &entries,
             &db,
             worktree_root.as_deref(),
+            use_worktree_old,
             use_worktree_new,
             &resolver,
         )?;
@@ -1412,10 +1648,43 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 .then(|| WhitespaceRuleResolver::from_git_dir(&git_dir))
                 .transpose()?;
             for entry in &entries {
-                let ws_error_rule = ws_resolver
+                let ws_error = match (ws_resolver.as_ref(), ws_error_kinds) {
+                    (Some(resolver), Some(kinds)) => {
+                        let rule = if kinds.plain {
+                            0
+                        } else {
+                            resolver.rule_for_path(&entry.path)?
+                        };
+                        Some(sley_diff_merge::render::WsErrorHighlight {
+                            rule,
+                            old: kinds.old,
+                            new: kinds.new,
+                            context: kinds.context,
+                        })
+                    }
+                    _ => None,
+                };
+                let materialized_contents = if use_worktree_old {
+                    Some((
+                        diff_entry_old_content_for_diff(
+                            entry,
+                            &db,
+                            worktree_root.as_deref(),
+                            true,
+                        )?,
+                        diff_entry_new_content(
+                            entry,
+                            &db,
+                            worktree_root.as_deref(),
+                            use_worktree_new,
+                        )?,
+                    ))
+                } else {
+                    None
+                };
+                let no_index_contents = materialized_contents
                     .as_ref()
-                    .map(|resolver| resolver.rule_for_path(&entry.path))
-                    .transpose()?;
+                    .map(|(old, new)| (old.as_deref(), new.as_deref()));
                 let options = DiffPatchOptions {
                     db: &db,
                     worktree_root: worktree_root.as_deref(),
@@ -1428,10 +1697,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     userdiff: Some(&userdiff),
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
-                    no_index_contents: None,
+                    no_index_contents,
                     submodule_format,
                     submodule_dirt: Some(&dirty_submodules),
-                    ws_error_rule,
+                    ws_error,
                     interhunk: interhunk.unwrap_or(0),
                     ws_ignore,
                     diff_algorithm,
@@ -1484,6 +1753,63 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn git_config_color_is_always(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "always" | "true" | "yes" | "on" | "1"
+    )
+}
+
+#[derive(Clone, Copy)]
+struct WsErrorHighlightKinds {
+    old: bool,
+    new: bool,
+    context: bool,
+    plain: bool,
+}
+
+fn parse_ws_error_highlight_kinds(value: Option<&str>) -> Option<WsErrorHighlightKinds> {
+    let mut kinds = WsErrorHighlightKinds {
+        old: false,
+        new: true,
+        context: false,
+        plain: false,
+    };
+    for mode in value.unwrap_or("default").split(',') {
+        match mode {
+            "" | "default" => {
+                kinds = WsErrorHighlightKinds {
+                    old: false,
+                    new: true,
+                    context: false,
+                    plain: false,
+                };
+            }
+            "old" => kinds.old = true,
+            "new" => kinds.new = true,
+            "context" => kinds.context = true,
+            "all" => {
+                kinds = WsErrorHighlightKinds {
+                    old: true,
+                    new: true,
+                    context: true,
+                    plain: false,
+                };
+            }
+            "none" => {
+                kinds = WsErrorHighlightKinds {
+                    old: true,
+                    new: true,
+                    context: true,
+                    plain: true,
+                };
+            }
+            _ => {}
+        }
+    }
+    (kinds.old || kinds.new || kinds.context || kinds.plain).then_some(kinds)
 }
 
 fn apply_diff_pickaxe(
@@ -1974,12 +2300,18 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 submodule_dirt: None,
                 // No-index has no attributes; the rule is core.whitespace (or the
                 // default), used only when color is on.
-                ws_error_rule: (colors.is_some() && word_request.is_none()).then(|| {
-                    config
+                ws_error: (colors.is_some() && word_request.is_none()).then(|| {
+                    let rule = config
                         .as_ref()
                         .and_then(|cfg| cfg.get("core", None, "whitespace"))
                         .and_then(sley_diff_merge::ws::parse_whitespace_rule)
-                        .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE)
+                        .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE);
+                    sley_diff_merge::render::WsErrorHighlight {
+                        rule,
+                        old: false,
+                        new: true,
+                        context: false,
+                    }
                 }),
                 interhunk: params.interhunk,
                 ws_ignore: params.ws_ignore,

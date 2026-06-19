@@ -61,6 +61,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut diff_filter = DiffFilter::default();
     let mut abbrev = AbbrevRequest::Default;
     let mut patch_full_index = false;
+    let mut merge_base = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut indent_heuristic: Option<bool> = None;
@@ -94,7 +95,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             // In diff-index, `-m` is "match missing": missing worktree files
             // are treated as matching the index/tree side and omitted.
             "-m" => match_missing = true,
-            "--merge-base" => {}
+            "--merge-base" => merge_base = true,
             "-p" | "-u" | "--patch" => output.patch = true,
             "--raw" => output.raw = true,
             "--name-status" => output.name_status = true,
@@ -263,7 +264,15 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         return diff_index_usage_error();
     }
     let tree_tip = &setup.options.positives[0];
-    let tree_oid = resolve_tree_ish_oid(&repo, tree_tip.oid, &tree_tip.rev)?;
+    let tree_oid = if merge_base {
+        let head = commands::diff::diff_resolve_commit_arg(git_dir, format, db, "HEAD")?;
+        let other =
+            commands::diff::diff_resolve_commit_arg(git_dir, format, db, &tree_tip.rev)?;
+        let base = commands::diff::diff_single_merge_base(git_dir, format, db, &head, &other)?;
+        sley_rev::peel_to_tree(db, format, &base)?
+    } else {
+        resolve_tree_ish_oid(&repo, tree_tip.oid, &tree_tip.rev)?
+    };
 
     // `core.abbrev` (defaulting to 7) is the width used when abbreviation is
     // requested, but unlike porcelain `git diff` the plumbing `diff-index`
@@ -402,6 +411,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             &entries,
             db,
             worktree_root,
+            false,
             !cached,
             &resolver,
         )?;
@@ -596,7 +606,7 @@ fn render(
                 no_index_contents: None,
                 submodule_format: ctx.submodule_format,
                 submodule_dirt: Some(ctx.submodule_dirt),
-                ws_error_rule: None,
+                ws_error: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
