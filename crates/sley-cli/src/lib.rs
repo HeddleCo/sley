@@ -1,8 +1,8 @@
 use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{BString, DateMode, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
-    Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry, InitOptions,
-    RefStorageFormat, RepositoryBootstrap,
+    Bundle, BundleCapability, BundlePrerequisite, BundleReference, CommitGraph,
+    CommitGraphWriteEntry, InitOptions, RefStorageFormat, RepositoryBootstrap,
 };
 use sley_index::{Index, IndexEntry};
 use sley_object::{
