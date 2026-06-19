@@ -464,7 +464,7 @@ declare -A FLOOR=(
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=55
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
-    [t4202-log.sh]=110
+    [t4202-log.sh]=124
     # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
     # confusing-path rejection (.git/HFS/NTFS/backslash/NUL) 4->28 FULL PASS (safe trees still load).
     [t4201-shortlog.sh]=21
@@ -491,7 +491,7 @@ declare -A FLOOR=(
     [t3420-rebase-autostash.sh]=40
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
-    [t4013-diff-various.sh]=191
+    [t4013-diff-various.sh]=195
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
     [t4014-format-patch.sh]=202
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
@@ -817,6 +817,18 @@ declare -A FLOOR=(
     # == base, no regression) to guard the class per the d3f746e6 neighbor-guard lesson.
     [t2016-checkout-patch.sh]=4
     [t4108-apply-threeway.sh]=4
+    # wave-21 (2026-06-19, integ/wave21 onto 01421060): hard-tail, 4 disjoint slices. submodule
+    # recursion in pull/am (t5572 34->40, t4255 1->17 — wired to the wave-20 worktree core;
+    # t3426-rebase-submodule stayed 0/29, needs deeper sequencer/index gitlink work = future
+    # target), diff-various t4013 191->195, log t4202 110->124 (floor was stale-LOW at 110 vs
+    # actual; corrected up), rev-parse --parseopt t1502 11->37 FULL (greenfield optspec parser
+    # + set-- renderer). All hermetic vs the integ binary. format_patch.rs auto-merge (log +
+    # submtransport both touched it) is SAFE — t4014=202 held. submtransport's status.rs short-
+    # status edit did NOT regress t7508 (=119). Cross-guards held EXACTLY (t7508=119 t2013=51
+    # t7112=54 t1013=52 t4150=84 t5520=75 t4205=110 t4015=114 t3404=94 t1500=81 t0040=94).
+    [t5572-pull-submodule.sh]=40
+    [t4255-am-submodule.sh]=17
+    [t1502-rev-parse-parseopt.sh]=37
 )
 
 fail=0

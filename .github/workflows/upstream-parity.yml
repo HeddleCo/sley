@@ -169,6 +169,9 @@ jobs:
             t7060-wtstatus.sh
             t2016-checkout-patch.sh
             t4108-apply-threeway.sh
+            t5572-pull-submodule.sh
+            t4255-am-submodule.sh
+            t1502-rev-parse-parseopt.sh
             t3406-rebase-message.sh
             t3418-rebase-continue.sh
             t3420-rebase-autostash.sh
