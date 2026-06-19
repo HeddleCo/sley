@@ -5201,6 +5201,13 @@ enum CommitGraphSource {
     StdinCommits,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitGraphSplitMode {
+    Off,
+    Append,
+    Replace,
+}
+
 fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -5209,6 +5216,8 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let mut source = CommitGraphSource::AllPacks;
     let mut changed_paths: Option<bool> = None;
     let mut append = false;
+    let mut split = CommitGraphSplitMode::Off;
+    let mut max_new_filters_arg: Option<usize> = None;
     // git's write progress defaults to isatty(2); the harness redirects stderr,
     // so only an explicit --progress emits the progress lines.
     let mut progress = false;
@@ -5219,8 +5228,17 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             "--stdin-packs" => source = CommitGraphSource::StdinPacks,
             "--stdin-commits" => source = CommitGraphSource::StdinCommits,
             "--append" => append = true,
+            "--split" => split = CommitGraphSplitMode::Append,
+            "--split=replace" => split = CommitGraphSplitMode::Replace,
             "--changed-paths" => changed_paths = Some(true),
             "--no-changed-paths" => changed_paths = Some(false),
+            "--max-new-filters" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--max-new-filters requires a value".into())
+                })?;
+                max_new_filters_arg = Some(commit_graph_parse_max_new_filters(value)?);
+            }
+            "--no-max-new-filters" => max_new_filters_arg = None,
             "--object-dir" => {
                 let value = iter
                     .next()
@@ -5234,6 +5252,19 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                     .strip_prefix("--object-dir=")
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
                 object_dir = Some(resolve_cli_path(&cwd, value));
+            }
+            value if value.starts_with("--split=") => {
+                let strategy = value.strip_prefix("--split=").unwrap_or_default();
+                split = match strategy {
+                    "replace" => CommitGraphSplitMode::Replace,
+                    "no-merge" | "merge-all" => CommitGraphSplitMode::Append,
+                    _ => CommitGraphSplitMode::Append,
+                };
+            }
+            value if value.starts_with("--max-new-filters=") => {
+                max_new_filters_arg = Some(commit_graph_parse_max_new_filters(
+                    value.strip_prefix("--max-new-filters=").unwrap_or_default(),
+                )?);
             }
             // Any unrecognized option or positional arg is a usage error
             // (git's parse-options exits 129); `commit-graph write` takes no
@@ -5259,8 +5290,11 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let existing_bloom_settings = existing_commit_graph_bloom_settings(&object_dir, format)?;
-    let bloom_settings =
-        commit_graph_bloom_settings_for_write(existing_bloom_settings, changed_paths_version);
+    let bloom_settings = commit_graph_bloom_settings_for_write(
+        existing_bloom_settings,
+        changed_paths_version,
+        true,
+    );
     // git: write_generation_data = (get_configured_generation_version(r) == 2).
     // Default is 2; `commitGraph.generationVersion=1` omits the GDA2/GDO2 chunks.
     let write_generation_data = commit_graph_generation_version(repo_config.as_ref()) == 2;
@@ -5271,6 +5305,17 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             .unwrap_or(false)
             || existing_bloom_settings.is_some()
     });
+    let max_new_filters = max_new_filters_arg.or_else(|| {
+        repo_config
+            .as_ref()
+            .and_then(|config| config.get("commitGraph", None, "maxNewFilters"))
+            .and_then(|value| commit_graph_parse_max_new_filters(value).ok())
+    });
+    let existing_filters = if changed_paths {
+        existing_commit_graph_bloom_filters(&object_dir, format)?
+    } else {
+        HashMap::new()
+    };
 
     let db = FileObjectDatabase::new(&object_dir, format);
     let starts = match source {
@@ -5282,6 +5327,9 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                 changed_paths,
                 bloom_settings,
                 write_generation_data,
+                max_new_filters,
+                &existing_filters,
+                split,
                 progress,
             );
         }
@@ -5324,11 +5372,17 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         changed_paths,
         bloom_settings,
         write_generation_data,
+        max_new_filters,
+        &existing_filters,
         progress,
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+    if split == CommitGraphSplitMode::Off {
+        write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+    } else {
+        write_split_commit_graph_file(&object_dir, format, &graph, split)?;
+    }
     Ok(())
 }
 
@@ -5374,6 +5428,80 @@ fn write_commit_graph_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn commit_graph_parse_max_new_filters(value: &str) -> Result<usize> {
+    value.parse::<usize>().map_err(|_| {
+        GitError::Command(format!(
+            "bad numeric value '{value}' for '--max-new-filters'"
+        ))
+    })
+}
+
+fn write_split_commit_graph_file(
+    object_dir: &Path,
+    format: ObjectFormat,
+    graph: &[u8],
+    mode: CommitGraphSplitMode,
+) -> Result<()> {
+    let info = object_dir.join("info");
+    let graphs = info.join("commit-graphs");
+    fs::create_dir_all(&graphs)?;
+    let single = info.join("commit-graph");
+    let chain_path = graphs.join("commit-graph-chain");
+    let mut chain = if mode == CommitGraphSplitMode::Replace {
+        Vec::new()
+    } else {
+        read_commit_graph_chain_hashes(&chain_path, format)?
+    };
+    if chain.is_empty() && single.exists() {
+        let bytes = fs::read(&single)?;
+        let hash = graph_file_checksum(&bytes, format)?;
+        let path = graphs.join(format!("graph-{hash}.graph"));
+        if !path.exists() {
+            write_commit_graph_file(&path, &bytes)?;
+        }
+        chain.push(hash);
+    }
+    let hash = graph_file_checksum(graph, format)?;
+    write_commit_graph_file(&graphs.join(format!("graph-{hash}.graph")), graph)?;
+    chain.push(hash);
+    let mut chain_text = String::new();
+    for hash in &chain {
+        chain_text.push_str(&hash.to_hex());
+        chain_text.push('\n');
+    }
+    fs::write(&chain_path, chain_text)?;
+    if single.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&single, fs::Permissions::from_mode(0o600));
+        }
+        let _ = fs::remove_file(&single);
+    }
+    Ok(())
+}
+
+fn read_commit_graph_chain_hashes(path: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| ObjectId::from_hex(format, line.trim()))
+        .collect()
+}
+
+fn graph_file_checksum(bytes: &[u8], format: ObjectFormat) -> Result<ObjectId> {
+    let raw_len = format.raw_len();
+    if bytes.len() < raw_len {
+        return Err(GitError::InvalidFormat("commit-graph file too short".into()));
+    }
+    ObjectId::from_raw(format, &bytes[bytes.len() - raw_len..])
+}
+
 /// `--reachable`: write the graph seeded from refs + HEAD. Always writes a file
 /// (matching git, which produces a header-only graph for an empty repo).
 fn write_reachable_commit_graph(
@@ -5383,6 +5511,9 @@ fn write_reachable_commit_graph(
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
+    max_new_filters: Option<usize>,
+    existing_filters: &HashMap<ObjectId, Vec<u8>>,
+    split: CommitGraphSplitMode,
     progress: bool,
 ) -> Result<()> {
     let graph = commit_graph_for_reachable_refs(
@@ -5392,11 +5523,17 @@ fn write_reachable_commit_graph(
         changed_paths,
         bloom_settings,
         write_generation_data,
+        max_new_filters,
+        existing_filters,
         progress,
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+    if split == CommitGraphSplitMode::Off {
+        write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+    } else {
+        write_split_commit_graph_file(object_dir, format, &graph, split)?;
+    }
     Ok(())
 }
 
@@ -6203,6 +6340,8 @@ fn commit_graph_for_reachable_refs(
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
+    max_new_filters: Option<usize>,
+    existing_filters: &HashMap<ObjectId, Vec<u8>>,
     progress: bool,
 ) -> Result<Vec<u8>> {
     let db = FileObjectDatabase::new(object_dir, format);
@@ -6232,6 +6371,8 @@ fn commit_graph_for_reachable_refs(
         changed_paths,
         bloom_settings,
         write_generation_data,
+        max_new_filters,
+        existing_filters,
         progress,
     )
 }
@@ -6246,6 +6387,8 @@ fn commit_graph_from_starts(
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
+    max_new_filters: Option<usize>,
+    existing_filters: &HashMap<ObjectId, Vec<u8>>,
     progress: bool,
 ) -> Result<Vec<u8>> {
     // git's `close_reachable` walk parses every reachable commit (including
@@ -6269,15 +6412,31 @@ fn commit_graph_from_starts(
         .collect::<HashMap<_, _>>();
     let mut generation_cache = HashMap::new();
     let mut entries = Vec::with_capacity(records.len());
+    let mut bloom_stats = CommitGraphBloomWriteStats::default();
     for record in &records {
         let bloom_filter = if changed_paths {
-            Some(commit_graph_bloom_filter_for_record(
-                db,
-                format,
-                record,
-                &record_map,
-                bloom_settings,
-            )?)
+            if let Some(filter) = existing_filters.get(&record.oid) {
+                bloom_stats.filter_not_computed += 1;
+                Some(filter.clone())
+            } else if max_new_filters.is_some_and(|max| bloom_stats.filter_computed >= max) {
+                bloom_stats.filter_not_computed += 1;
+                None
+            } else {
+                let (filter, disposition) = commit_graph_bloom_filter_for_record(
+                    db,
+                    format,
+                    record,
+                    &record_map,
+                    bloom_settings,
+                )?;
+                bloom_stats.filter_computed += 1;
+                match disposition {
+                    CommitGraphBloomDisposition::Empty => bloom_stats.filter_trunc_empty += 1,
+                    CommitGraphBloomDisposition::Large => bloom_stats.filter_trunc_large += 1,
+                    CommitGraphBloomDisposition::Normal => {}
+                }
+                Some(filter)
+            }
         } else {
             None
         };
@@ -6304,6 +6463,30 @@ fn commit_graph_from_starts(
             "Computing commit graph generation numbers: 100% ({count}/{count}), done."
         );
         eprintln!("Writing out commit graph in 3 passes: 100% ({}/{}), done.", count * 3, count * 3);
+    }
+    if changed_paths {
+        trace_commit_graph_bloom_settings(bloom_settings);
+        sley_core::trace2::data(
+            "commit-graph",
+            "filter-computed",
+            bloom_stats.filter_computed,
+        );
+        sley_core::trace2::data(
+            "commit-graph",
+            "filter-not-computed",
+            bloom_stats.filter_not_computed,
+        );
+        sley_core::trace2::data(
+            "commit-graph",
+            "filter-trunc-empty",
+            bloom_stats.filter_trunc_empty,
+        );
+        sley_core::trace2::data(
+            "commit-graph",
+            "filter-trunc-large",
+            bloom_stats.filter_trunc_large,
+        );
+        sley_core::trace2::data("commit-graph", "filter-upgraded", 0);
     }
     CommitGraph::write_with_options(format, &entries, bloom_settings, write_generation_data)
 }
@@ -6337,13 +6520,27 @@ fn commit_graph_first_unparseable_commit(
     None
 }
 
+#[derive(Default)]
+struct CommitGraphBloomWriteStats {
+    filter_computed: usize,
+    filter_not_computed: usize,
+    filter_trunc_empty: usize,
+    filter_trunc_large: usize,
+}
+
+enum CommitGraphBloomDisposition {
+    Normal,
+    Empty,
+    Large,
+}
+
 fn commit_graph_bloom_filter_for_record(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
     records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, CommitGraphBloomDisposition)> {
     let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: false,
         detect_copies: false,
@@ -6375,13 +6572,25 @@ fn commit_graph_bloom_filter_for_record(
             options,
         )?
     };
-    if changes.len() > bloom_settings.max_changed_paths {
-        return Ok(vec![0xff]);
+    if changes.is_empty() {
+        return Ok((
+            sley_formats::commit_graph_bloom_filter_for_paths(
+                std::iter::empty::<&[u8]>(),
+                bloom_settings,
+            ),
+            CommitGraphBloomDisposition::Empty,
+        ));
     }
-    Ok(sley_formats::commit_graph_bloom_filter_for_paths(
+    let filter = sley_formats::commit_graph_bloom_filter_for_paths(
         changes.iter().map(|entry| entry.path.as_bytes()),
         bloom_settings,
-    ))
+    );
+    let disposition = if filter == [0xff] {
+        CommitGraphBloomDisposition::Large
+    } else {
+        CommitGraphBloomDisposition::Normal
+    };
+    Ok((filter, disposition))
 }
 
 /// `commitGraph.generationVersion` (git's `get_configured_generation_version`):
@@ -6421,6 +6630,7 @@ fn commit_graph_changed_paths_version(config: Option<&sley_config::GitConfig>) -
 fn commit_graph_bloom_settings_for_write(
     existing: Option<sley_formats::CommitGraphBloomSettings>,
     changed_paths_version: i64,
+    honor_env: bool,
 ) -> sley_formats::CommitGraphBloomSettings {
     let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
     if changed_paths_version == -1
@@ -6435,6 +6645,23 @@ fn commit_graph_bloom_settings_for_write(
     } else {
         1
     };
+    if honor_env {
+        if let Ok(value) = env::var("GIT_TEST_BLOOM_SETTINGS_NUM_HASHES")
+            && let Ok(parsed) = value.parse::<u32>()
+        {
+            settings.hash_count = parsed;
+        }
+        if let Ok(value) = env::var("GIT_TEST_BLOOM_SETTINGS_BITS_PER_ENTRY")
+            && let Ok(parsed) = value.parse::<u32>()
+        {
+            settings.bits_per_entry = parsed;
+        }
+        if let Ok(value) = env::var("GIT_TEST_BLOOM_SETTINGS_MAX_CHANGED_PATHS")
+            && let Ok(parsed) = value.parse::<usize>()
+        {
+            settings.max_changed_paths = parsed;
+        }
+    }
     settings
 }
 
@@ -6443,26 +6670,109 @@ fn existing_commit_graph_bloom_settings(
     format: ObjectFormat,
 ) -> Result<Option<sley_formats::CommitGraphBloomSettings>> {
     let graph_path = object_dir.join("info").join("commit-graph");
-    if !graph_path.exists() {
-        return Ok(None);
+    if graph_path.exists()
+        && let Some(settings) = commit_graph_bloom_settings_from_file(&graph_path, format)
+    {
+        return Ok(Some(settings));
     }
-    // git reads existing bloom settings best-effort: a corrupt or unreadable
-    // existing graph (e.g. mid-`corrupt_graph_verify`, which rewrites over a
-    // graph that just failed verify, or a chmod-000 graph) loads as NULL ⇒ no
-    // inherited settings, never a hard error.
-    let Ok(bytes) = fs::read(&graph_path) else {
-        return Ok(None);
+    let chain_path = object_dir
+        .join("info")
+        .join("commit-graphs")
+        .join("commit-graph-chain");
+    let chain_dir = match chain_path.parent() {
+        Some(dir) => dir.to_path_buf(),
+        None => return Ok(None),
     };
-    let Ok(graph) = CommitGraph::parse(&bytes, format) else {
-        return Ok(None);
-    };
-    Ok(graph.bloom_filters.map(|filters| {
+    let hashes = read_commit_graph_chain_hashes(&chain_path, format).unwrap_or_default();
+    for hash in hashes.iter().rev() {
+        let path = chain_dir.join(format!("graph-{hash}.graph"));
+        if let Some(settings) = commit_graph_bloom_settings_from_file(&path, format) {
+            return Ok(Some(settings));
+        }
+    }
+    Ok(None)
+}
+
+fn commit_graph_bloom_settings_from_file(
+    path: &Path,
+    format: ObjectFormat,
+) -> Option<sley_formats::CommitGraphBloomSettings> {
+    let bytes = fs::read(path).ok()?;
+    let graph = CommitGraph::parse(&bytes, format).ok()?;
+    graph.bloom_filters.map(|filters| {
         let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
         settings.hash_version = filters.hash_version;
         settings.hash_count = filters.hash_count;
         settings.bits_per_entry = filters.bits_per_entry;
         settings
-    }))
+    })
+}
+
+fn existing_commit_graph_bloom_filters(
+    object_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashMap<ObjectId, Vec<u8>>> {
+    let mut out = HashMap::new();
+    let info = object_dir.join("info");
+    let single = info.join("commit-graph");
+    if single.exists() {
+        load_commit_graph_bloom_filters_from_file(&single, format, &mut out);
+        return Ok(out);
+    }
+    let chain = info.join("commit-graphs").join("commit-graph-chain");
+    let chain_dir = match chain.parent() {
+        Some(dir) => dir.to_path_buf(),
+        None => return Ok(out),
+    };
+    for hash in read_commit_graph_chain_hashes(&chain, format).unwrap_or_default() {
+        let path = chain_dir.join(format!("graph-{hash}.graph"));
+        load_commit_graph_bloom_filters_from_file(&path, format, &mut out);
+    }
+    Ok(out)
+}
+
+fn load_commit_graph_bloom_filters_from_file(
+    path: &Path,
+    format: ObjectFormat,
+    out: &mut HashMap<ObjectId, Vec<u8>>,
+) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(graph) = CommitGraph::parse(&bytes, format) else {
+        return;
+    };
+    let Some(filters) = &graph.bloom_filters else {
+        return;
+    };
+    for (idx, entry) in graph.commits.iter().enumerate() {
+        let Some(filter) = filters.filter_for_commit(idx) else {
+            continue;
+        };
+        if !filter.is_empty() {
+            out.insert(entry.oid, filter.to_vec());
+        }
+    }
+}
+
+fn trace_commit_graph_bloom_settings(settings: sley_formats::CommitGraphBloomSettings) {
+    let Some(target) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let target = target.to_string_lossy().into_owned();
+    if !target.starts_with('/') {
+        return;
+    }
+    let line = format!(
+        "{{\"event\":\"data_json\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"commit-graph\",\"key\":\"bloom-settings\",\"value\":{{\"hash_version\":{},\"num_hashes\":{},\"bits_per_entry\":{},\"max_changed_paths\":{}}}}}\n",
+        settings.hash_version,
+        settings.hash_count,
+        settings.bits_per_entry,
+        settings.max_changed_paths
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&target) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn read_commit_tree_for_graph(
