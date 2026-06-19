@@ -485,7 +485,7 @@ declare -A FLOOR=(
     # pathspec staging before pre-commit, post-commit on replay/start, rebase-vs-
     # cherry-pick error precedence. t3404 63->80. Neighbors held: t3400=19,
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
-    [t3404-rebase-interactive.sh]=89
+    [t3404-rebase-interactive.sh]=94
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=12
     [t3420-rebase-autostash.sh]=40
@@ -577,7 +577,7 @@ declare -A FLOOR=(
     [t5528-push-default.sh]=31
     [t5516-fetch-push.sh]=92
     [t5520-pull.sh]=75
-    [t5601-clone.sh]=73
+    [t5601-clone.sh]=86
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
     # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's
@@ -627,7 +627,7 @@ declare -A FLOOR=(
     [t1060-object-corruption.sh]=13
     [t2203-add-intent.sh]=11
     [t3650-replay-basics.sh]=43
-    [t3701-add-interactive.sh]=98
+    [t3701-add-interactive.sh]=105
     [t4011-diff-symlink.sh]=1
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
     # codex-wave-9 dir-rename engine side-gain: 34->35.
@@ -699,9 +699,9 @@ declare -A FLOOR=(
     [t6132-pathspec-exclude.sh]=23
     [t6135-pathspec-with-attrs.sh]=27
     [t6022-rev-list-missing.sh]=13
-    [t1013-read-tree-submodule.sh]=32
-    [t2013-checkout-submodule.sh]=28
-    [t7112-reset-submodule.sh]=37
+    [t1013-read-tree-submodule.sh]=52
+    [t2013-checkout-submodule.sh]=51
+    [t7112-reset-submodule.sh]=54
     [t6438-submodule-directory-file-conflicts.sh]=32
     # wave-12 Batch B (rebasemerges, integ/wave12B onto 81856328): --rebase-merges
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
@@ -805,6 +805,18 @@ declare -A FLOOR=(
     # --status renders the status template) — this regression was masked because they weren't.
     [t7064-wtstatus-pv2.sh]=21
     [t7060-wtstatus.sh]=7
+    # wave-20 (2026-06-19, integ/wave20 onto ae0cfe8f): sweep-picked weak-bucket assault, 4
+    # disjoint slices (zero merge conflicts). submodule recursion in worktree commands —
+    # t2013-checkout-submodule 28->51, t7112-reset-submodule 37->54, t1013-read-tree-submodule
+    # 32->52 (denominators GREW 64/70/58 -> 74/82/68 as fixtures unblocked = deep gitlink
+    # support); rebase-i t3404 89->94; add-i t3701 98->105; clone t5601 73->86 (the floored 6
+    # are RAISED in place above). All measured HERMETICALLY vs the integ binary. Cross-guards
+    # held EXACTLY (t7508=119 t7502=77 t7102=37 t2020=17 t1091=53 t1011=19 t7600=83 t3430=19
+    # t3415=22 t4015=114 t5516=92 t5520=75); cargo test green. NEW floors below: t2016/t4108
+    # are patch-engine NEIGHBORS of add-i's add_patch.rs/plumbing.rs — floored at 4 (confirmed
+    # == base, no regression) to guard the class per the d3f746e6 neighbor-guard lesson.
+    [t2016-checkout-patch.sh]=4
+    [t4108-apply-threeway.sh]=4
 )
 
 fail=0
