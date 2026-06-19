@@ -19,6 +19,12 @@ struct ReflogShowOptions {
     max_count: Option<usize>,
     abbrev_commit: Option<bool>,
     pathspecs: Vec<String>,
+    grep_patterns: Vec<String>,
+    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind_explicit: bool,
+    grep_ignore_case: bool,
+    grep_all_match: bool,
+    grep_invert: bool,
 }
 
 #[derive(Debug)]
@@ -74,6 +80,7 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    let config = read_repo_config(&git_dir)?;
     let abbrev_commit = options.abbrev_commit.unwrap_or(true);
     let abbrev_len = if abbrev_commit {
         repository_abbrev(&git_dir, format)?
@@ -86,6 +93,13 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
         return Ok(());
     }
     entries.reverse();
+    let grep_kind = log_grep_pattern_kind_from_config(
+        &config,
+        options.grep_pattern_kind,
+        options.grep_pattern_kind_explicit,
+    );
+    let grep_matcher =
+        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?;
     // `git reflog show` (== `git log -g`) walks the reflog newest-to-oldest and
     // prints EVERY entry verbatim: HEAD@{N} is just the entry's position. There
     // is no reachability filter and no dedup by OID — a no-op `rebase --no-ff`
@@ -98,6 +112,16 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     // real, monotonic reflog accumulates.
     let mut selected = Vec::new();
     for entry in &entries {
+        if let Some(matcher) = grep_matcher.as_ref() {
+            let matched = if options.grep_all_match {
+                matcher.matches_all(&entry.message)
+            } else {
+                matcher.matches_any(&entry.message)
+            };
+            if matched == options.grep_invert {
+                continue;
+            }
+        }
         if options
             .max_count
             .is_some_and(|max_count| selected.len() >= max_count)
@@ -113,7 +137,7 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
                 format_log_oid(&entry.new_oid, abbrev_len),
                 options.display,
                 shown,
-                String::from_utf8_lossy(&entry.message)
+                String::from_utf8_lossy(&reflog_show_message(entry))
             ),
             ReflogFormat::NewOid { final_newline } => {
                 if final_newline || shown + 1 < selected.len() {
@@ -132,6 +156,17 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn reflog_show_message(entry: &ReflogEntry) -> std::borrow::Cow<'_, [u8]> {
+    if entry.old_oid.is_null()
+        && let Some(rest) = entry.message.strip_prefix(b"commit: ")
+    {
+        let mut message = b"commit (initial): ".to_vec();
+        message.extend_from_slice(rest);
+        return std::borrow::Cow::Owned(message);
+    }
+    std::borrow::Cow::Borrowed(&entry.message)
 }
 
 fn cmd_reflog_all() -> Result<()> {
@@ -1198,6 +1233,12 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
     let mut abbrev_commit = None;
     let mut refs = Vec::new();
     let mut pathspecs = Vec::new();
+    let mut grep_patterns = Vec::new();
+    let mut grep_pattern_kind = crate::grep_source::PatternKind::Basic;
+    let mut grep_pattern_kind_explicit = false;
+    let mut grep_ignore_case = false;
+    let mut grep_all_match = false;
+    let mut grep_invert = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1276,6 +1317,35 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
             value if value.starts_with("-n") && value.len() > 2 => {
                 max_count = Some(parse_reflog_count(&value[2..])?);
             }
+            "--grep" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Command("--grep requires a value".into()));
+                };
+                grep_patterns.push(value.clone());
+            }
+            value if let Some(pattern) = value.strip_prefix("--grep=") => {
+                grep_patterns.push(pattern.to_string());
+            }
+            "--all-match" => grep_all_match = true,
+            "--invert-grep" => grep_invert = true,
+            "-i" | "--regexp-ignore-case" => grep_ignore_case = true,
+            "-F" | "--fixed-strings" => {
+                grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
+                grep_pattern_kind_explicit = true;
+            }
+            "--basic-regexp" => {
+                grep_pattern_kind = crate::grep_source::PatternKind::Basic;
+                grep_pattern_kind_explicit = true;
+            }
+            "-E" | "--extended-regexp" => {
+                grep_pattern_kind = crate::grep_source::PatternKind::Extended;
+                grep_pattern_kind_explicit = true;
+            }
+            "-P" | "--perl-regexp" => {
+                grep_pattern_kind = crate::grep_source::PatternKind::Perl;
+                grep_pattern_kind_explicit = true;
+            }
             value
                 if value.starts_with('-')
                     && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
@@ -1305,6 +1375,12 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
         max_count,
         abbrev_commit,
         pathspecs,
+        grep_patterns,
+        grep_pattern_kind,
+        grep_pattern_kind_explicit,
+        grep_ignore_case,
+        grep_all_match,
+        grep_invert,
     })
 }
 
