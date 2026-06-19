@@ -227,6 +227,8 @@ pub enum PushRefStatus {
     RejectNonFastForward,
     /// `--force-with-lease`/`--force-if-includes` expectation was not met.
     RejectStale,
+    /// `--force-if-includes`: tracking ref was updated but not integrated.
+    RejectRemoteUpdated,
     /// The receive-pack side reported `ng <ref> <message>`.
     RemoteReject(String),
     /// Part of an `--atomic` push that failed because a sibling ref was rejected.
@@ -940,6 +942,9 @@ pub struct PushReportRequest<'a> {
     /// is supplied via [`Self::force_with_lease`]; this flag only governs whether
     /// a lease was requested at all (used for the "no actual ref" diagnostics).
     pub force_with_lease_default: bool,
+    /// `--force-if-includes`: for tracking-based leases, reject when the current
+    /// remote tip is not included in the local branch's reflog/history.
+    pub force_if_includes: bool,
     /// Receive-pack-side config values supplied by the invoked receive-pack
     /// command, e.g. `--receive-pack="git -c receive.denyDeletes=false receive-pack"`.
     pub receive_config_overrides: &'a [(String, String)],
@@ -992,13 +997,14 @@ pub fn push_local_with_report(
             &remote_config,
             request.remote_git_dir,
         )?;
-        // git's `forced_update` reflects whether the update is *actually* a
-        // non-fast-forward (a rewind), independent of the `--force` flag — the
-        // flag only permits it. A create/delete is never "forced".
+        // git's `forced_update` reflects either an actual rewind or a rejection
+        // reason (e.g. stale lease) that was overridden by --force.
+        let stale_lease_overridden = plan.force && lease_expectation_mismatch(&request, plan);
         let forced = matches!(status, PushRefStatus::Ok)
             && !plan.command.old_id.is_null()
             && !plan.command.new_id.is_null()
-            && !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?;
+            && (stale_lease_overridden
+                || !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?);
         refs.push(PushReportRef {
             src: plan.source.clone(),
             dst: plan.command.name.clone(),
@@ -1012,7 +1018,9 @@ pub fn push_local_with_report(
     let any_local_reject = refs.iter().any(|reference| {
         matches!(
             reference.status,
-            PushRefStatus::RejectNonFastForward | PushRefStatus::RejectStale
+            PushRefStatus::RejectNonFastForward
+                | PushRefStatus::RejectStale
+                | PushRefStatus::RejectRemoteUpdated
         )
     });
 
@@ -1150,7 +1158,27 @@ fn classify_push_command(
             Some(command.old_id)
         };
         if *expected != actual {
+            if plan.force {
+                return Ok(PushRefStatus::Ok);
+            }
             return Ok(PushRefStatus::RejectStale);
+        }
+        if request.force_if_includes
+            && !command.old_id.is_null()
+            && (command.new_id.is_null()
+                || !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?)
+            && force_if_includes_rejects(
+                local_db,
+                format,
+                request.git_dir,
+                &command.name,
+                &command.old_id,
+            )?
+        {
+            if plan.force {
+                return Ok(PushRefStatus::Ok);
+            }
+            return Ok(PushRefStatus::RejectRemoteUpdated);
         }
         // A satisfied lease forces the update.
         return Ok(PushRefStatus::Ok);
@@ -1185,6 +1213,61 @@ fn classify_push_command(
     }
 
     Ok(PushRefStatus::Ok)
+}
+
+fn lease_expectation_mismatch(
+    request: &PushReportRequest<'_>,
+    plan: &PlannedPushCommand,
+) -> bool {
+    let command = &plan.command;
+    let actual = if command.old_id.is_null() {
+        None
+    } else {
+        Some(command.old_id)
+    };
+    request
+        .force_with_lease
+        .iter()
+        .find(|(dst, _)| *dst == command.name)
+        .is_some_and(|(_, expected)| *expected != actual)
+}
+
+fn force_if_includes_rejects(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    git_dir: &Path,
+    local_ref: &str,
+    remote_old: &ObjectId,
+) -> Result<bool> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut candidates = Vec::new();
+    match store.read_ref(local_ref)? {
+        Some(RefTarget::Direct(oid)) => candidates.push(oid),
+        Some(RefTarget::Symbolic(target)) => {
+            if let Some(RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                candidates.push(oid);
+            }
+        }
+        None => return Ok(false),
+    }
+    for entry in store.read_reflog(local_ref)? {
+        if !entry.new_oid.is_null() {
+            candidates.push(entry.new_oid);
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    for candidate in candidates {
+        if candidate == *remote_old {
+            return Ok(false);
+        }
+        if let Ok(ancestors) = ancestor_depths(db, format, &candidate)
+            && ancestors.contains_key(remote_old)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn receive_config_bool(
