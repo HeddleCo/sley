@@ -3048,10 +3048,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 actions.push(ApplyAction::Remove { path: old.clone() });
             }
         } else {
-            let mode = patch.new_mode.or(patch.old_mode).unwrap_or(0o100644);
             let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
                 return Err(GitError::InvalidFormat("patch missing target path".into()));
             };
+            let mode = apply_write_mode(&worktree_root, patch, &target)?;
             actions.push(ApplyAction::Write {
                 path: target,
                 mode,
@@ -3104,6 +3104,40 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn apply_write_mode(
+    worktree_root: &Path,
+    patch: &sley_diff_merge::FilePatch,
+    target: &[u8],
+) -> Result<u32> {
+    if let Some(mode) = patch.new_mode {
+        return Ok(mode);
+    }
+    if patch.is_new {
+        return Ok(0o100644);
+    }
+    let path = std::str::from_utf8(target)
+        .map_err(|err| GitError::InvalidPath(err.to_string()))
+        .map(|relative| worktree_root.join(relative))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata_to_git_mode(&metadata)),
+        Err(_) => Ok(patch.old_mode.unwrap_or(0o100644)),
+    }
+}
+
+fn metadata_to_git_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.file_type().is_symlink() {
+        return 0o120000;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            return 0o100755;
+        }
+    }
+    0o100644
 }
 
 impl ApplyAction {
