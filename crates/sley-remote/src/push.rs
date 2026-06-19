@@ -951,7 +951,7 @@ pub struct PushReportRequest<'a> {
 /// nothing is sent. The caller renders the report and derives the exit code.
 pub fn push_local_with_report(
     request: PushReportRequest<'_>,
-    config: &GitConfig,
+    _config: &GitConfig,
 ) -> Result<PushStatusReport> {
     let format = request.format;
     let remote_format = crate::object_format_for_git_dir(request.remote_common_git_dir)?;
@@ -974,6 +974,8 @@ pub fn push_local_with_report(
         request.force,
     )?;
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, format);
+    let remote_config =
+        sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
 
     // Classify each planned command the way git's send-pack does, collecting
     // rejections rather than bailing on the first one.
@@ -984,7 +986,7 @@ pub fn push_local_with_report(
             format,
             plan,
             &request,
-            config,
+            &remote_config,
             request.remote_git_dir,
         )?;
         // git's `forced_update` reflects whether the update is *actually* a
@@ -1099,8 +1101,8 @@ fn classify_push_command(
     format: ObjectFormat,
     plan: &PlannedPushCommand,
     request: &PushReportRequest<'_>,
-    _config: &GitConfig,
-    _remote_git_dir: &Path,
+    config: &GitConfig,
+    remote_git_dir: &Path,
 ) -> Result<PushRefStatus> {
     let command = &plan.command;
 
@@ -1108,6 +1110,12 @@ fn classify_push_command(
     // create-from-nothing of a non-existent ref). git reports UPTODATE.
     if command.old_id == command.new_id {
         return Ok(PushRefStatus::UpToDate);
+    }
+
+    if receive_denies_current_branch(format, command, config, remote_git_dir)? {
+        return Ok(PushRefStatus::RemoteReject(
+            "branch is currently checked out".to_string(),
+        ));
     }
 
     // `--force-with-lease`: the remote's current value must match the lease, or
@@ -1142,6 +1150,35 @@ fn classify_push_command(
     }
 
     Ok(PushRefStatus::Ok)
+}
+
+fn receive_denies_current_branch(
+    format: ObjectFormat,
+    command: &ReceivePackCommand,
+    config: &GitConfig,
+    remote_git_dir: &Path,
+) -> Result<bool> {
+    if !command.name.starts_with("refs/heads/") {
+        return Ok(false);
+    }
+    let deny = config
+        .get("receive", None, "denycurrentbranch")
+        .unwrap_or("refuse");
+    let denies = matches!(
+        deny.to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1" | "refuse"
+    );
+    if !denies {
+        return Ok(false);
+    }
+    if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
+        return Ok(false);
+    }
+    let store = FileRefStore::new(remote_git_dir, format);
+    Ok(matches!(
+        store.read_ref("HEAD")?,
+        Some(RefTarget::Symbolic(target)) if target == command.name
+    ))
 }
 
 /// Whether `old` is an ancestor of `new` (a fast-forward). A walk from `new`;

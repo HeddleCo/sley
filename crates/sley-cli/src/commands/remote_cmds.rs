@@ -4053,6 +4053,18 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         }
     }
 
+    let remote_config = read_repo_config(req.remote_git_dir).unwrap_or_default();
+    if !req.options.dry_run
+        && push_warns_current_branch(
+            &report,
+            req.remote_git_dir,
+            req.format,
+            &remote_config,
+        )?
+    {
+        eprintln!("warning: updating the current branch");
+    }
+
     // Post-apply side effects for the refs that landed: post-receive/post-update
     // hooks, remote-tracking ref updates (git updates tracking for every
     // non-rejected ref, including up-to-date ones), and set-upstream config.
@@ -4117,6 +4129,36 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn push_warns_current_branch(
+    report: &sley_remote::PushStatusReport,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    remote_config: &GitConfig,
+) -> Result<bool> {
+    let deny = remote_config
+        .get("receive", None, "denycurrentbranch")
+        .unwrap_or("");
+    if !deny.eq_ignore_ascii_case("warn") {
+        return Ok(false);
+    }
+    if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
+        return Ok(false);
+    }
+    let store = FileRefStore::new(remote_git_dir, format);
+    let Some(RefTarget::Symbolic(head)) = store.read_ref("HEAD")? else {
+        return Ok(false);
+    };
+    Ok(report.refs.iter().any(|reference| {
+        reference.dst == head
+            && !reference.new_id.is_null()
+            && reference.old_id != reference.new_id
+            && matches!(
+                reference.status,
+                sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+            )
+    }))
 }
 
 fn trace2_push_pack_objects(quiet: bool, use_bitmaps: Option<bool>) {
