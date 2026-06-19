@@ -431,6 +431,24 @@ pub(crate) fn three_way_merge_trees_with_favor(
     )
 }
 
+fn merge_favor_from_strategy_opt(value: &str) -> Option<sley_diff_merge::MergeFavor> {
+    match value {
+        "ours" => Some(sley_diff_merge::MergeFavor::Ours),
+        "theirs" => Some(sley_diff_merge::MergeFavor::Theirs),
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_favor_from_strategy_opts(opts: &[String]) -> sley_diff_merge::MergeFavor {
+    let mut favor = sley_diff_merge::MergeFavor::None;
+    for opt in opts {
+        if let Some(next) = merge_favor_from_strategy_opt(opt) {
+            favor = next;
+        }
+    }
+    favor
+}
+
 #[allow(clippy::too_many_arguments)]
 fn three_way_merge_trees_inner(
     db: &FileObjectDatabase,
@@ -1772,10 +1790,12 @@ fn apply_default_merge_strategies(options: &mut MergeOptions, octopus: bool) -> 
 /// `ours`/`theirs` knobs and tolerating the whitespace/diff-algorithm options
 /// that do not change which bytes win for the cases sley models.
 fn apply_merge_strategy_option(value: &str, options: &mut MergeOptions) -> Result<()> {
-    use sley_diff_merge::MergeFavor;
+    if let Some(favor) = merge_favor_from_strategy_opt(value) {
+        options.favor = favor;
+        return Ok(());
+    }
+
     match value {
-        "ours" => options.favor = MergeFavor::Ours,
-        "theirs" => options.favor = MergeFavor::Theirs,
         "ignore-space-change"
         | "ignore-all-space"
         | "ignore-space-at-eol"
