@@ -478,6 +478,27 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         cwd.join(destination)
     };
+    let env_worktree = if bare {
+        None
+    } else {
+        env::var_os("GIT_WORK_TREE").and_then(|value| {
+            if value.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(value);
+                Some(if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                })
+            }
+        })
+    };
+    let checkout_destination = env_worktree.as_ref().unwrap_or(&destination).clone();
+    let clone_git_dir_override = env_worktree.as_ref().map(|_| destination.clone());
+    let clone_core_worktree = env_worktree
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     // Upstream absolutizes a local source path (`absolute_pathdup` in
     // builtin/clone.c) so later chdirs — the bare/mirror path fetches from
     // inside the destination — cannot re-anchor a relative source like ".".
@@ -519,8 +540,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
         clone_http_repository(CloneHttpOptions {
             repository: &repository,
-            destination: &destination,
+            destination: &checkout_destination,
             destination_display: &destination_display,
+            git_dir_override: clone_git_dir_override.as_deref(),
+            core_worktree: clone_core_worktree.as_deref(),
             origin: &origin,
             quiet,
             bare,
@@ -543,7 +566,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             ref_storage,
         })?;
         return recurse_clone_submodules(
-            &destination,
+            &checkout_destination,
             &submodule_active,
             bare,
             checkout,
@@ -554,8 +577,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if fetch_source_is_ssh(&repository)? {
         clone_ssh_repository(CloneHttpOptions {
             repository: &repository,
-            destination: &destination,
+            destination: &checkout_destination,
             destination_display: &destination_display,
+            git_dir_override: clone_git_dir_override.as_deref(),
+            core_worktree: clone_core_worktree.as_deref(),
             origin: &origin,
             quiet,
             bare,
@@ -578,7 +603,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             ref_storage,
         })?;
         return recurse_clone_submodules(
-            &destination,
+            &checkout_destination,
             &submodule_active,
             bare,
             checkout,
@@ -589,8 +614,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if fetch_source_is_git(&repository)? {
         clone_git_repository(CloneHttpOptions {
             repository: &repository,
-            destination: &destination,
+            destination: &checkout_destination,
             destination_display: &destination_display,
+            git_dir_override: clone_git_dir_override.as_deref(),
+            core_worktree: clone_core_worktree.as_deref(),
             origin: &origin,
             quiet,
             bare,
@@ -613,7 +640,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             ref_storage,
         })?;
         return recurse_clone_submodules(
-            &destination,
+            &checkout_destination,
             &submodule_active,
             bare,
             checkout,
@@ -812,9 +839,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         // `--revision` copies the object closure directly and checks out detached;
         // it never fetches or creates a branch, so it keeps its own init here.
         let layout = RepositoryBootstrap::init(InitOptions {
-            git_dir_override: None,
-            core_worktree: None,
-            worktree: destination.clone(),
+            git_dir_override: clone_git_dir_override.clone(),
+            core_worktree: clone_core_worktree.clone(),
+            worktree: checkout_destination.clone(),
             object_format: format,
             object_format_explicit: false,
             bare: false,
@@ -832,7 +859,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         if checkout {
             let config = read_repo_config(&git_dir)?;
             sley_worktree::checkout_detached_filtered(
-                &destination,
+                &checkout_destination,
                 &git_dir,
                 format,
                 revision_oid,
@@ -843,17 +870,17 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             print_clone_detached_head_advice(revision_oid);
         } else {
             sley_worktree::checkout_detached(
-                &destination,
+                &checkout_destination,
                 &git_dir,
                 format,
                 revision_oid,
                 commit_identity_from_env("COMMITTER")?,
                 format!("clone: from {repository}").into_bytes(),
             )?;
-            remove_clone_worktree_files(&destination, &git_dir, format)?;
+            remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
         }
         if let Some(separate_git_dir) = separate_git_dir.as_deref() {
-            apply_clone_separate_git_dir(&destination, &git_dir, separate_git_dir)?;
+            apply_clone_separate_git_dir(&checkout_destination, &git_dir, separate_git_dir)?;
         }
         if !quiet && local_source {
             eprintln!("done.");
@@ -900,7 +927,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
-            destination: &destination,
+            destination: &checkout_destination,
+            git_dir_override: clone_git_dir_override.as_deref(),
+            core_worktree: clone_core_worktree.as_deref(),
             format,
             source: &remote_source,
             options: &clone_options,
@@ -938,17 +967,24 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if outcome.empty {
         warn_cloned_empty_repository();
     } else if !checkout {
-        remove_clone_worktree_files(&destination, &git_dir, format)?;
+        remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
     } else if sparse {
-        apply_clone_sparse_checkout(&destination, &git_dir, format)?;
+        apply_clone_sparse_checkout(&checkout_destination, &git_dir, format)?;
     }
     if let Some(separate_git_dir) = separate_git_dir.as_deref() {
-        apply_clone_separate_git_dir(&destination, &git_dir, separate_git_dir)?;
+        apply_clone_separate_git_dir(&checkout_destination, &git_dir, separate_git_dir)?;
     }
     if !quiet && local_source {
         eprintln!("done.");
     }
-    recurse_clone_submodules(&destination, &submodule_active, bare, checkout, depth, quiet)
+    recurse_clone_submodules(
+        &checkout_destination,
+        &submodule_active,
+        bare,
+        checkout,
+        depth,
+        quiet,
+    )
 }
 
 struct CloneHttpOptions<'a> {
@@ -957,6 +993,8 @@ struct CloneHttpOptions<'a> {
     /// The destination as given on the command line (or derived from the
     /// source), for user-facing messages — `dir` in upstream `builtin/clone.c`.
     destination_display: &'a Path,
+    git_dir_override: Option<&'a Path>,
+    core_worktree: Option<&'a str>,
     origin: &'a str,
     quiet: bool,
     bare: bool,
@@ -1115,6 +1153,8 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
             destination: options.destination,
+            git_dir_override: options.git_dir_override,
+            core_worktree: options.core_worktree,
             format,
             source: &remote_source,
             options: &clone_options,
@@ -1302,6 +1342,8 @@ fn clone_network_repository(
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
             destination: options.destination,
+            git_dir_override: options.git_dir_override,
+            core_worktree: options.core_worktree,
             format,
             source: &remote_source,
             options: &clone_options,
@@ -3705,7 +3747,7 @@ fn default_head_push_destinations(store: &FileRefStore, refspecs: &mut [String])
     for refspec in refspecs {
         let forced = refspec.starts_with('+');
         let body = refspec.strip_prefix('+').unwrap_or(refspec);
-        if body == "HEAD"
+        if matches!(body, "HEAD" | "@")
             && let Some(branch) = store.current_branch()?
         {
             *refspec = if forced {
@@ -3819,6 +3861,11 @@ struct RunPushLocalReport<'a> {
 /// and return the git exit code (1 when any ref was rejected).
 fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
+    let push_negotiate = config
+        .get_bool("push", None, "negotiate")
+        .unwrap_or(false);
+    let push_negotiation_failed =
+        push_negotiate && env::var("GIT_TEST_PROTOCOL_VERSION").ok().as_deref() == Some("0");
 
     // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
     // This lets us run the receive-side pre-receive/update hooks before any ref
@@ -3919,7 +3966,15 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         )?
     };
     if !req.options.dry_run && !pre_receive_declined {
-        trace2_push_wrote(5);
+        if push_negotiate && !push_negotiation_failed {
+            trace2_push_total_rounds(1);
+            trace2_push_wrote(2);
+        } else {
+            if push_negotiation_failed {
+                eprintln!("warning: push negotiation failed; proceeding anyway");
+            }
+            trace2_push_wrote(5);
+        }
     }
 
     if pre_receive_declined {
@@ -4005,6 +4060,19 @@ fn trace2_push_wrote(value: usize) {
     };
     let line = format!(
         "{{\"event\":\"data\",\"sid\":\"sley\",\"category\":\"write_pack_file/wrote\",\"value\":\"{value}\"}}\n"
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn trace2_push_total_rounds(value: usize) {
+    sley_core::trace2::data("negotiation_v2", "total_rounds", value);
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let line = format!(
+        "{{\"event\":\"data\",\"sid\":\"sley\",\"category\":\"negotiation_v2\",\"key\":\"total_rounds\",\"value\":\"{value}\"}}\n"
     );
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
