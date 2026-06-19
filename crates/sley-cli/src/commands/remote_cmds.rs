@@ -3876,6 +3876,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         force,
         no_verify: true,
         dry_run,
+        progress: false,
     };
     run_push_local_report(RunPushLocalReport {
         git_dir: &git_dir,
@@ -3927,6 +3928,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut no_verify = false;
     let mut dry_run = false;
+    let mut progress = false;
     let mut porcelain = false;
     let mut atomic = false;
     let mut mirror = false;
@@ -4006,7 +4008,9 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                     .push(value["--push-option=".len()..].to_string());
             }
             value if value.starts_with("--repo=") => {}
-            "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
+            "--thin" | "--no-thin" => {}
             value if value.starts_with("--recurse-submodules=") => {}
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
@@ -4094,6 +4098,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         force,
         no_verify,
         dry_run,
+        progress,
     };
     let config = transport_policy_config_for_cwd()?;
     let resolved_remote = push_resolved_url(&remote)?;
@@ -4498,6 +4503,7 @@ struct PushOptions {
     force: bool,
     no_verify: bool,
     dry_run: bool,
+    progress: bool,
 }
 
 /// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
@@ -4738,6 +4744,9 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             }
             trace2_push_wrote(5);
         }
+        if req.options.progress && !req.options.quiet {
+            eprintln!("Writing objects: 100% (1/1), done.");
+        }
         run_local_receive_pack_auto_gc(req.remote_git_dir);
     }
 
@@ -4808,7 +4817,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 &applied,
             )?;
             if req.options.set_upstream {
-                configure_push_upstreams(req.git_dir, req.remote, &applied)?;
+                configure_push_upstreams_from_report(req.git_dir, req.remote, &report.refs)?;
             }
         }
     }
@@ -5881,6 +5890,56 @@ fn configure_push_upstreams(
             key: "merge".into(),
         };
         config_set_value(&mut config, &merge_key, &command.name, false);
+    }
+    write_repo_config(git_dir, &config)
+}
+
+fn configure_push_upstreams_from_report(
+    git_dir: &Path,
+    remote: &str,
+    refs: &[sley_remote::PushReportRef],
+) -> Result<()> {
+    let mut config = read_repo_config(git_dir)?;
+    let format = repository_object_format(git_dir)?;
+    let store = FileRefStore::new(git_dir, format);
+    let current_branch = store.current_branch().ok().flatten();
+    for reference in refs {
+        if !matches!(
+            reference.status,
+            sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+        ) || reference.is_deletion()
+        {
+            continue;
+        }
+        let Some(src) = reference.src.as_deref() else {
+            continue;
+        };
+        let branch = if src == "HEAD" {
+            let Some(branch) = current_branch.as_deref() else {
+                continue;
+            };
+            branch
+        } else {
+            let Some(branch) = src.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            branch
+        };
+        if !reference.dst.starts_with("refs/heads/") {
+            continue;
+        }
+        let remote_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(branch.to_string()),
+            key: "remote".into(),
+        };
+        config_set_value(&mut config, &remote_key, remote, false);
+        let merge_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(branch.to_string()),
+            key: "merge".into(),
+        };
+        config_set_value(&mut config, &merge_key, &reference.dst, false);
     }
     write_repo_config(git_dir, &config)
 }
