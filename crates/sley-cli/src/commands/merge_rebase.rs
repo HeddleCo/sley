@@ -59,10 +59,6 @@ pub(crate) fn merge_write_worktree_file(
         remove_blocking_file_ancestors(worktree_root, rel)?;
         fs::create_dir_all(parent)?;
     }
-    // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
-    // change (regular file ⇄ symlink) is overwritten rather than written *through*
-    // an existing symlink or left stale — the symlink-stash-apply / merge cases.
-    merge_unlink_path_in_the_way(&full)?;
     if sley_index::is_gitlink(mode) {
         // Gitlink (submodule) entry: the `oid` is a *commit*, not a blob, so it
         // must NOT be written as file content (the prior unconditional blob write
@@ -71,12 +67,18 @@ pub(crate) fn merge_write_worktree_file(
         // create_lib_submodule_repo's `git revert HEAD`). git's entry.c
         // `write_entry` S_IFGITLINK arm only `mkdir`s the submodule directory
         // (`submodule_move_head` — the embedded checkout — is a higher layer sley
-        // does not perform), so materialize the gitlink exactly as
-        // `sley_worktree::materialize_tree_entry`'s gitlink branch: create the
-        // directory and return, writing no content.
+        // does not perform), preserving an already-populated submodule checkout.
+        if full.is_dir() {
+            return Ok(());
+        }
+        merge_unlink_path_in_the_way(&full)?;
         fs::create_dir_all(&full)?;
         return Ok(());
     }
+    // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
+    // change (regular file ⇄ symlink) is overwritten rather than written *through*
+    // an existing symlink or left stale — the symlink-stash-apply / merge cases.
+    merge_unlink_path_in_the_way(&full)?;
     if (mode & 0o170000) == 0o120000 {
         // Symlink entry (mode 120000): the blob bytes are the link target.
         #[cfg(unix)]

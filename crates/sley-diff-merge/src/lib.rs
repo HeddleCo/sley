@@ -5510,7 +5510,7 @@ pub fn merge_entry_maps(
                 )
             };
             let worktree = match &surviving {
-                Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
+                Some((mode, oid)) => Some((*mode, merge_worktree_bytes(db, *mode, oid)?)),
                 None => None,
             };
             if let Some(entry) = surviving {
@@ -5534,7 +5534,7 @@ pub fn merge_entry_maps(
             let add_add = base.is_none();
             let surviving = ours.or(theirs);
             let worktree = match &surviving {
-                Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
+                Some((mode, oid)) => Some((*mode, merge_worktree_bytes(db, *mode, oid)?)),
                 None => None,
             };
             if let Some(entry) = surviving {
@@ -5610,7 +5610,7 @@ pub fn merge_entry_maps(
                 ),
             };
             let worktree = match &renamed_entry {
-                Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
+                Some((mode, oid)) => Some((*mode, merge_worktree_bytes(db, *mode, oid)?)),
                 None => None,
             };
             slot.stages = MergeStages {
@@ -5808,7 +5808,7 @@ fn resolve_directory_file_conflicts(
         };
         // The moved-aside file must be materialized in the worktree at its new
         // path; read its blob bytes once so the porcelain has worktree content.
-        let moved_bytes = merge_blob_bytes(db, &entry.1)?;
+        let moved_bytes = merge_worktree_bytes(db, entry.0, &entry.1)?;
         // Which side contributed the file? git keys off `dirmask`: the file lives
         // on the side that is NOT the directory. We read it off the effective side
         // maps — whichever side has this path as a plain file. When only theirs has
@@ -5923,6 +5923,14 @@ fn merge_blob_bytes(reader: &impl ObjectReader, oid: &ObjectId) -> Result<Vec<u8
         )));
     }
     Ok(object.body.clone())
+}
+
+fn merge_worktree_bytes(reader: &impl ObjectReader, mode: u32, oid: &ObjectId) -> Result<Vec<u8>> {
+    if sley_index::is_gitlink(mode) {
+        Ok(Vec::new())
+    } else {
+        merge_blob_bytes(reader, oid)
+    }
 }
 
 /// 3-way merge of a file mode. Returns the resolved mode and whether the modes
@@ -7108,7 +7116,7 @@ fn apply_rename_rename_one_to_two_conflicts(
         });
 
         let ours_worktree = match ours_entry {
-            Some((mode, oid)) => Some((mode, merge_blob_bytes(db, &oid)?)),
+            Some((mode, oid)) => Some((mode, merge_worktree_bytes(db, mode, &oid)?)),
             None => None,
         };
         paths.push(MergedPath {
@@ -7125,7 +7133,7 @@ fn apply_rename_rename_one_to_two_conflicts(
         });
 
         let theirs_worktree = match theirs_entry {
-            Some((mode, oid)) => Some((mode, merge_blob_bytes(db, &oid)?)),
+            Some((mode, oid)) => Some((mode, merge_worktree_bytes(db, mode, &oid)?)),
             None => None,
         };
         paths.push(MergedPath {
