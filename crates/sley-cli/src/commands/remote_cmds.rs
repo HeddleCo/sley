@@ -3718,7 +3718,9 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
     let mut mirror = false;
     let mut all_refs = false;
     let mut quiet = false;
+    let mut from_stdin = false;
     let mut force_with_lease_specs: Vec<String> = Vec::new();
+    let mut receive_pack_command: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -3732,6 +3734,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
             "--atomic" => atomic = true,
             "--mirror" => mirror = true,
             "--all" => all_refs = true,
+            "--stdin" => from_stdin = true,
             "-q" | "--quiet" => quiet = true,
             "-v" | "--verbose" | "--progress" | "--no-progress" | "--thin" | "--no-thin"
             | "--stateless-rpc" | "--helper-status" => {}
@@ -3741,16 +3744,28 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
             value if value.starts_with("--force-with-lease=") => {
                 force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
             }
-            "--receive-pack" | "--exec" | "--remote" | "--push-option" => {
+            "--receive-pack" | "--exec" => {
+                receive_pack_command = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command(format!(
+                                "send-pack {} requires a value",
+                                arg.as_str()
+                            ))
+                        })?
+                        .to_string(),
+                );
+            }
+            "--remote" | "--push-option" => {
                 iter.next().ok_or_else(|| {
                     GitError::Command(format!("send-pack {} requires a value", arg.as_str()))
                 })?;
             }
-            value
-                if value.starts_with("--receive-pack=")
-                    || value.starts_with("--exec=")
-                    || value.starts_with("--remote=")
-                    || value.starts_with("--push-option=") => {}
+            value if value.starts_with("--receive-pack=") || value.starts_with("--exec=") => {
+                let (_, command) = value.split_once('=').unwrap_or((value, ""));
+                receive_pack_command = Some(command.to_string());
+            }
+            value if value.starts_with("--remote=") || value.starts_with("--push-option=") => {}
             "--" => {
                 positional.extend(iter.map(|value| value.to_string()));
                 break;
@@ -3772,7 +3787,23 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         eprintln!("{SEND_PACK_USAGE}");
         return Err(GitError::Exit(129));
     };
+    let mut refs = refs.to_vec();
+    if from_stdin {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        refs.extend(
+            input
+                .lines()
+                .map(str::trim_end)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string),
+        );
+    }
     if refs.is_empty() && !all_refs && !mirror {
+        eprintln!("{SEND_PACK_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+    if !refs.is_empty() && (all_refs || mirror) {
         eprintln!("{SEND_PACK_USAGE}");
         return Err(GitError::Exit(129));
     }
@@ -3809,6 +3840,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
             })
             .collect()
     };
+    reject_duplicate_push_destinations(&refspecs)?;
 
     // `--mirror` deletes remote refs the local repo no longer has.
     if mirror {
@@ -3827,14 +3859,24 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         }
     }
 
-    let force_with_lease =
-        resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+    let config = read_repo_config(&git_dir).unwrap_or_default();
+    let force_with_lease = resolve_force_with_lease(
+        &git_dir,
+        &store,
+        &config,
+        format,
+        dest,
+        &force_with_lease_specs,
+    )?;
+    let receive_config_overrides =
+        receive_pack_config_overrides(receive_pack_command.as_deref());
     let options = PushOptions {
         quiet,
         set_upstream: false,
         force,
         no_verify: true,
         dry_run,
+        progress: false,
     };
     run_push_local_report(RunPushLocalReport {
         git_dir: &git_dir,
@@ -3847,9 +3889,31 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         options,
         porcelain: false,
         atomic,
+        force_if_includes: false,
+        push_options: &[],
         force_with_lease: &force_with_lease,
         force_with_lease_default: false,
+        receive_config_overrides: &receive_config_overrides,
     })
+}
+
+fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for refspec in refspecs {
+        let body = refspec.strip_prefix('+').unwrap_or(refspec);
+        let dst = body
+            .split_once(':')
+            .map(|(_, dst)| dst)
+            .unwrap_or(body);
+        if dst.is_empty() || dst.contains('*') {
+            continue;
+        }
+        if !seen.insert(dst.to_string()) {
+            eprintln!("error: multiple updates for ref '{dst}' not allowed");
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
@@ -3864,16 +3928,20 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut no_verify = false;
     let mut dry_run = false;
+    let mut progress = false;
     let mut porcelain = false;
     let mut atomic = false;
     let mut mirror = false;
     let mut all_refs = false;
     let mut tags = false;
     let mut prune = false;
+    let mut receive_pack_command: Option<String> = None;
+    let mut push_options_cmdline: Option<Vec<String>> = None;
     // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
     // bare flag (lease every pushed ref against its remote-tracking ref).
     let mut force_with_lease_default = false;
     let mut force_with_lease_specs: Vec<String> = Vec::new();
+    let mut force_if_includes = false;
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -3903,23 +3971,47 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 force_with_lease_default = false;
                 force_with_lease_specs.clear();
             }
-            // `--force-if-includes` is a refinement of `--force-with-lease`; for
-            // the file:// transport (no remote-tracking reflog to consult) it has
-            // no additional effect, so it is accepted as a no-op.
-            "--force-if-includes" | "--no-force-if-includes" => {}
+            "--force-if-includes" => force_if_includes = true,
+            "--no-force-if-includes" => force_if_includes = false,
             value if value.starts_with("--force-with-lease=") => {
                 force_with_lease_specs.push(value["--force-with-lease=".len()..].to_string());
             }
-            "--repo" | "--receive-pack" | "--exec" => {
+            "--repo" => {
                 iter.next().ok_or_else(|| {
                     GitError::Command(format!("push {} requires a value", arg.as_str()))
                 })?;
             }
-            value
-                if value.starts_with("--repo=")
-                    || value.starts_with("--receive-pack=")
-                    || value.starts_with("--exec=") => {}
-            "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
+            "--receive-pack" | "--exec" => {
+                receive_pack_command = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command(format!("push {} requires a value", arg.as_str()))
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--receive-pack=") || value.starts_with("--exec=") => {
+                let (_, command) = value.split_once('=').unwrap_or((value, ""));
+                receive_pack_command = Some(command.to_string());
+            }
+            "-o" | "--push-option" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command(format!("push {} requires a value", arg.as_str()))
+                })?;
+                push_options_cmdline
+                    .get_or_insert_with(Vec::new)
+                    .push(value.clone());
+            }
+            value if value.starts_with("--push-option=") => {
+                push_options_cmdline
+                    .get_or_insert_with(Vec::new)
+                    .push(value["--push-option=".len()..].to_string());
+            }
+            value if value.starts_with("--repo=") => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
+            "--thin" | "--no-thin" => {}
+            value if value.starts_with("--recurse-submodules=") => {}
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
             // through to the unknown-option path, matching git).
@@ -4006,6 +4098,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         force,
         no_verify,
         dry_run,
+        progress,
     };
     let config = transport_policy_config_for_cwd()?;
     let resolved_remote = push_resolved_url(&remote)?;
@@ -4062,8 +4155,43 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 append_push_prune_refspecs(&mut refspecs, &remote_advertisements, &local_names);
             }
         }
-        let force_with_lease =
-            resolve_force_with_lease(&git_dir, &store, format, &force_with_lease_specs)?;
+        let config = read_repo_config(&git_dir).unwrap_or_default();
+        let force_if_includes = force_if_includes
+            || config
+                .get_bool("push", None, "useforceifincludes")
+                .unwrap_or(false);
+        let push_options = match push_options_cmdline.clone() {
+            Some(options) => options,
+            None => push_options_from_config(&config)?,
+        };
+        let receive_config_overrides =
+            receive_pack_config_overrides(receive_pack_command.as_deref());
+        let mut force_with_lease = resolve_force_with_lease(
+            &git_dir,
+            &store,
+            &config,
+            format,
+            &remote,
+            &force_with_lease_specs,
+        )?;
+        if force_with_lease_default {
+            expand_default_force_with_lease(
+                &git_dir,
+                &common_git_dir,
+                format,
+                &store,
+                &config,
+                &remote,
+                remote_git_dir,
+                remote_common_git_dir,
+                &refspecs,
+                force,
+                atomic,
+                force_if_includes,
+                &receive_config_overrides,
+                &mut force_with_lease,
+            )?;
+        }
         return run_push_local_report(RunPushLocalReport {
             git_dir: &git_dir,
             common_git_dir: &common_git_dir,
@@ -4075,8 +4203,11 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             options,
             porcelain,
             atomic,
+            force_if_includes,
+            push_options: &push_options,
             force_with_lease: &force_with_lease,
             force_with_lease_default,
+            receive_config_overrides: &receive_config_overrides,
         });
     }
 
@@ -4155,7 +4286,9 @@ fn mirror_all_remote(
 fn resolve_force_with_lease(
     git_dir: &Path,
     store: &FileRefStore,
+    config: &GitConfig,
     format: ObjectFormat,
+    remote: &str,
     specs: &[String],
 ) -> Result<Vec<(String, Option<ObjectId>)>> {
     let mut out = Vec::new();
@@ -4168,18 +4301,180 @@ fn resolve_force_with_lease(
         let expected = match expect {
             Some("") => None,
             Some(value) => Some(sley_rev::resolve_revision(git_dir, format, value)?),
-            None => {
-                // Lease against the ref's own remote-tracking value is not
-                // discoverable for an arbitrary file:// remote without the
-                // remote name; treat a bare per-ref lease the same as an
-                // explicit current value lookup against the local ref store.
-                match store.read_ref(&dst)? {
-                    Some(RefTarget::Direct(oid)) => Some(oid),
-                    _ => None,
-                }
-            }
+            None => remote_tracking_oid_for_push_lease(git_dir, format, store, config, remote, &dst)?,
         };
         out.push((dst, expected));
+    }
+    Ok(out)
+}
+
+fn expand_default_force_with_lease(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    remote: &str,
+    remote_git_dir: &Path,
+    remote_common_git_dir: &Path,
+    refspecs: &[String],
+    force: bool,
+    atomic: bool,
+    force_if_includes: bool,
+    receive_config_overrides: &[(String, String)],
+    leases: &mut Vec<(String, Option<ObjectId>)>,
+) -> Result<()> {
+    let preview = sley_remote::push_local_with_report(
+        sley_remote::PushReportRequest {
+            git_dir,
+            common_git_dir,
+            format,
+            remote_git_dir,
+            remote_common_git_dir,
+            refspecs,
+            force,
+            atomic,
+            dry_run: true,
+            force_with_lease: &[],
+            force_with_lease_default: false,
+            force_if_includes,
+            receive_config_overrides,
+        },
+        config,
+    )?;
+    let mut covered: std::collections::HashSet<String> =
+        leases.iter().map(|(dst, _)| dst.clone()).collect();
+    for reference in preview.refs {
+        if !covered.insert(reference.dst.clone()) {
+            continue;
+        }
+        let expected =
+            remote_tracking_oid_for_push_lease(git_dir, format, store, config, remote, &reference.dst)?;
+        leases.push((reference.dst, expected));
+    }
+    Ok(())
+}
+
+fn remote_tracking_oid_for_push_lease(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    remote: &str,
+    refname: &str,
+) -> Result<Option<ObjectId>> {
+    if remote == "origin"
+        && let Some(oid) = fetch_head_oid_for_push_lease(git_dir, format, refname)?
+    {
+        return Ok(Some(oid));
+    }
+    let Some(tracking_ref) = remote_tracking_ref_for_push_lease(config, remote, refname)? else {
+        return Ok(None);
+    };
+    read_direct_or_symbolic_ref(store, &tracking_ref)
+}
+
+fn fetch_head_oid_for_push_lease(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refname: &str,
+) -> Result<Option<ObjectId>> {
+    let Some(branch) = refname.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    let path = git_dir.join("FETCH_HEAD");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Ok(data) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let needle = format!("branch '{branch}'");
+    for line in data.lines() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        let Some(hex) = line.split_whitespace().next() else {
+            continue;
+        };
+        if let Ok(oid) = ObjectId::from_hex(format, hex) {
+            return Ok(Some(oid));
+        }
+    }
+    Ok(None)
+}
+
+fn remote_tracking_ref_for_push_lease(
+    config: &GitConfig,
+    remote: &str,
+    refname: &str,
+) -> Result<Option<String>> {
+    for spec in remote_config_values(config, remote, "fetch") {
+        let parsed = sley_protocol::parse_refspec(&spec)?;
+        if parsed.negative {
+            continue;
+        }
+        if let Some(dst) = sley_protocol::refspec_map_source(&parsed, refname)? {
+            return Ok(Some(dst));
+        }
+    }
+    Ok(None)
+}
+
+fn read_direct_or_symbolic_ref(store: &FileRefStore, refname: &str) -> Result<Option<ObjectId>> {
+    match store.read_ref(refname)? {
+        Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
+        Some(RefTarget::Symbolic(target)) => read_direct_or_symbolic_ref(store, &target),
+        None => Ok(None),
+    }
+}
+
+fn receive_pack_config_overrides(command: Option<&str>) -> Vec<(String, String)> {
+    let Some(command) = command else {
+        return Vec::new();
+    };
+    let mut overrides = Vec::new();
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let Some(raw) = token
+            .strip_prefix("-c")
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                if token == "-c" {
+                    tokens.next().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        else {
+            continue;
+        };
+        let Some((key, value)) = raw.split_once('=') else {
+            continue;
+        };
+        let Some(receive_key) = key.trim().strip_prefix("receive.") else {
+            continue;
+        };
+        overrides.push((
+            receive_key.to_string(),
+            value.trim().trim_matches('"').to_string(),
+        ));
+    }
+    overrides
+}
+
+fn push_options_from_config(config: &GitConfig) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for value in config.get_all("push", None, "pushoption") {
+        match value {
+            Some("") => out.clear(),
+            Some(value) => out.push(value.to_string()),
+            None => {
+                eprintln!("fatal: push.pushOption must have a value");
+                return Err(GitError::Exit(128));
+            }
+        }
     }
     Ok(out)
 }
@@ -4208,6 +4503,7 @@ struct PushOptions {
     force: bool,
     no_verify: bool,
     dry_run: bool,
+    progress: bool,
 }
 
 /// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
@@ -4265,9 +4561,9 @@ fn run_push(
         }
         return Ok(());
     }
-    run_local_receive_pre_hooks(destination, &plan.commands)?;
+    run_local_receive_pre_hooks(destination, &plan.commands, &[])?;
     let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
-    run_local_receive_post_hooks(destination, &outcome.commands)?;
+    run_local_receive_post_hooks(destination, &outcome.commands, &[])?;
     update_push_remote_tracking_refs(git_dir, format, &config, remote, &outcome.commands)?;
     if options.set_upstream {
         configure_push_upstreams(git_dir, remote, &outcome.commands)?;
@@ -4293,8 +4589,11 @@ struct RunPushLocalReport<'a> {
     options: PushOptions,
     porcelain: bool,
     atomic: bool,
+    force_if_includes: bool,
+    push_options: &'a [String],
     force_with_lease: &'a [(String, Option<ObjectId>)],
     force_with_lease_default: bool,
+    receive_config_overrides: &'a [(String, String)],
 }
 
 /// Drive a file:// push through [`sley_remote::push_local_with_report`], render
@@ -4302,11 +4601,29 @@ struct RunPushLocalReport<'a> {
 /// and return the git exit code (1 when any ref was rejected).
 fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
+    trace_local_receive_pack_advertisement(req.remote_git_dir, req.format);
     let push_negotiate = config
         .get_bool("push", None, "negotiate")
         .unwrap_or(false);
     let push_negotiation_failed =
         push_negotiate && env::var("GIT_TEST_PROTOCOL_VERSION").ok().as_deref() == Some("0");
+    let remote_config = read_repo_config(req.remote_git_dir).unwrap_or_default();
+    if req.atomic
+        && !remote_config
+            .get_bool("receive", None, "advertiseatomic")
+            .unwrap_or(true)
+    {
+        eprintln!("fatal: the receiving end does not support --atomic push");
+        return Err(GitError::Exit(128));
+    }
+    if !req.push_options.is_empty()
+        && !remote_config
+            .get_bool("receive", None, "advertisepushoptions")
+            .unwrap_or(false)
+    {
+        eprintln!("fatal: the receiving end does not support push options");
+        return Err(GitError::Exit(128));
+    }
 
     // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
     // This lets us run the receive-side pre-receive/update hooks before any ref
@@ -4325,6 +4642,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             dry_run: true,
             force_with_lease: req.force_with_lease,
             force_with_lease_default: req.force_with_lease_default,
+            force_if_includes: req.force_if_includes,
+            receive_config_overrides: req.receive_config_overrides,
         },
         &config,
     )?;
@@ -4379,14 +4698,14 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     // Run the receive-side pre-receive + update hooks. A failure declines the
     // whole push (git's receive-pack rejects every ref with "pre-receive hook
     // declined"). Skipped under --dry-run.
-    let pre_receive_declined = if !req.options.dry_run && !ok_commands.is_empty() {
-        run_local_receive_pre_hooks(&destination, &ok_commands).is_err()
+    let hook_decline = if !req.options.dry_run && !ok_commands.is_empty() {
+        run_local_receive_pre_hooks_report(&destination, &ok_commands, req.push_options)
     } else {
-        false
+        None
     };
 
     // Second pass: actually apply (unless dry-run or the hook declined).
-    let mut report = if req.options.dry_run || pre_receive_declined {
+    let mut report = if req.options.dry_run || hook_decline.is_some() {
         plan
     } else {
         sley_remote::push_local_with_report(
@@ -4402,11 +4721,13 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 dry_run: false,
                 force_with_lease: req.force_with_lease,
                 force_with_lease_default: req.force_with_lease_default,
+                force_if_includes: req.force_if_includes,
+                receive_config_overrides: req.receive_config_overrides,
             },
             &config,
         )?
     };
-    if !req.options.dry_run && !pre_receive_declined {
+    if !req.options.dry_run && hook_decline.is_none() {
         trace2_push_pack_objects(req.options.quiet, config.get_bool("push", None, "usebitmaps"));
         if config
             .get_bool("pack", None, "usepathwalk")
@@ -4423,19 +4744,32 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             }
             trace2_push_wrote(5);
         }
+        if req.options.progress && !req.options.quiet {
+            eprintln!("Writing objects: 100% (1/1), done.");
+        }
+        run_local_receive_pack_auto_gc(req.remote_git_dir);
     }
 
-    if pre_receive_declined {
+    if let Some(decline) = hook_decline {
         for reference in &mut report.refs {
-            if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
-                reference.status = sley_remote::PushRefStatus::RemoteReject(
+            if !matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+                continue;
+            }
+            reference.status = match &decline {
+                ReceiveHookDecline::PreReceive => sley_remote::PushRefStatus::RemoteReject(
                     "pre-receive hook declined".to_string(),
-                );
+                ),
+                ReceiveHookDecline::Update(name) if reference.dst == *name => {
+                    sley_remote::PushRefStatus::RemoteReject("hook declined".to_string())
+                }
+                ReceiveHookDecline::Update(_) if req.atomic => {
+                    sley_remote::PushRefStatus::RemoteReject("atomic push failure".to_string())
+                }
+                ReceiveHookDecline::Update(_) => sley_remote::PushRefStatus::Ok,
             }
         }
     }
 
-    let remote_config = read_repo_config(req.remote_git_dir).unwrap_or_default();
     if !req.options.dry_run
         && push_warns_current_branch(
             &report,
@@ -4473,7 +4807,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 .cloned()
                 .collect();
             if !landed.is_empty() {
-                run_local_receive_post_hooks(&destination, &landed)?;
+                run_local_receive_post_hooks(&destination, &landed, req.push_options)?;
             }
             update_push_remote_tracking_refs(
                 req.git_dir,
@@ -4483,7 +4817,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 &applied,
             )?;
             if req.options.set_upstream {
-                configure_push_upstreams(req.git_dir, req.remote, &applied)?;
+                configure_push_upstreams_from_report(req.git_dir, req.remote, &report.refs)?;
             }
         }
     }
@@ -4511,6 +4845,145 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn trace_local_receive_pack_advertisement(remote_git_dir: &Path, format: ObjectFormat) {
+    let Some(mut sink) = packet_trace_file() else {
+        return;
+    };
+    let store = FileRefStore::new(remote_git_dir, format);
+    let Ok(refs) = store.list_refs() else {
+        return;
+    };
+    let mut local_oids = std::collections::HashSet::new();
+    for reference in refs {
+        let Some(oid) = resolve_local_ref_target(&store, &reference).ok().flatten()
+        else {
+            continue;
+        };
+        local_oids.insert(oid);
+        let _ = writeln!(sink, "packet:         push< {oid} {}", reference.name);
+    }
+    trace_alternate_have_advertisements(remote_git_dir, format, &local_oids, &mut sink);
+    let _ = writeln!(sink, "packet:         push< 0000");
+}
+
+fn packet_trace_file() -> Option<fs::File> {
+    let value = env::var("GIT_TRACE_PACKET").ok()?;
+    if matches!(value.as_str(), "" | "0" | "false" | "FALSE") {
+        return None;
+    }
+    if matches!(value.as_str(), "1" | "2" | "true" | "TRUE") {
+        return None;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(value)
+        .ok()
+}
+
+fn trace_alternate_have_advertisements(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    local_oids: &std::collections::HashSet<ObjectId>,
+    sink: &mut fs::File,
+) {
+    let alternates = remote_git_dir.join("objects/info/alternates");
+    let Ok(text) = fs::read_to_string(alternates) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let objects_dir = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            remote_git_dir.join("objects").join(line)
+        };
+        let Some(alternate_git_dir) = objects_dir.parent() else {
+            continue;
+        };
+        let store = FileRefStore::new(alternate_git_dir, format);
+        let Ok(refs) = store.list_refs() else {
+            continue;
+        };
+        for reference in refs {
+            let Some(oid) = resolve_local_ref_target(&store, &reference).ok().flatten()
+            else {
+                continue;
+            };
+            if local_oids.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            let _ = writeln!(sink, "packet:         push< {oid} .have");
+        }
+    }
+}
+
+fn resolve_local_ref_target(
+    store: &FileRefStore,
+    reference: &sley_refs::Ref,
+) -> Result<Option<ObjectId>> {
+    let mut target = reference.target.clone();
+    for _ in 0..5 {
+        match target {
+            RefTarget::Direct(oid) => return Ok(Some(oid)),
+            RefTarget::Symbolic(name) => {
+                let Some(next) = store.read_ref(&name)? else {
+                    return Ok(None);
+                };
+                target = next;
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn run_local_receive_pack_auto_gc(remote_git_dir: &Path) {
+    let config = read_repo_config_on_disk(remote_git_dir).unwrap_or_default();
+    if config.get_bool("maintenance", None, "auto") == Some(false) {
+        return;
+    }
+    prune_stale_object_tempfiles(remote_git_dir);
+}
+
+fn prune_stale_object_tempfiles(remote_git_dir: &Path) {
+    let objects_dir = remote_git_dir.join("objects");
+    let Ok(entries) = fs::read_dir(objects_dir) else {
+        return;
+    };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    const TWO_WEEKS_SECS: u64 = 14 * 24 * 60 * 60;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("tmp_") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(modified) = modified.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        if now.as_secs().saturating_sub(modified.as_secs()) >= TWO_WEEKS_SECS {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn push_warns_current_branch(
@@ -4723,6 +5196,14 @@ fn print_push_ref(
         PushRefStatus::RejectStale => {
             ('!', "[rejected]".to_string(), Some("stale info".to_string()))
         }
+        PushRefStatus::RejectRemoteUpdated => (
+            '!',
+            "[rejected]".to_string(),
+            Some("remote ref updated since checkout".to_string()),
+        ),
+        PushRefStatus::RejectAlreadyExists => {
+            ('!', "[rejected]".to_string(), Some("already exists".to_string()))
+        }
         PushRefStatus::RemoteReject(message) => {
             ('!', "[remote rejected]".to_string(), Some(message.clone()))
         }
@@ -4737,7 +5218,12 @@ fn print_push_ref(
     // the reject arms) prints the peer_ref `(delete)` (→ `(delete):dst`). A
     // non-delete uses its source ref both ways.
     let from = if reference.is_deletion() {
-        if matches!(reference.status, PushRefStatus::Ok) {
+        if matches!(reference.status, PushRefStatus::Ok)
+            || matches!(
+                &reference.status,
+                PushRefStatus::RemoteReject(message) if message == "atomic push failure"
+            )
+        {
             None
         } else {
             Some("(delete)".to_string())
@@ -4856,6 +5342,7 @@ fn update_push_remote_tracking_refs(
 fn run_local_receive_pre_hooks(
     destination: &sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
+    push_options: &[String],
 ) -> Result<()> {
     let sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
@@ -4865,11 +5352,14 @@ fn run_local_receive_pre_hooks(
         return Ok(());
     };
     let stdin = receive_hook_stdin(push_commands);
+    let push_option_env = push_option_hook_env(push_options);
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "pre-receive",
         commands::hooks::HookRun {
             stdin: Some(stdin),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
             ..commands::hooks::HookRun::default()
         },
     )?;
@@ -4883,6 +5373,8 @@ fn run_local_receive_pre_hooks(
                     command.old_id.to_string(),
                     command.new_id.to_string(),
                 ],
+                env: push_option_env.clone(),
+                cwd: Some(remote_git_dir.to_path_buf()),
                 ..commands::hooks::HookRun::default()
             },
         )?;
@@ -4890,9 +5382,66 @@ fn run_local_receive_pre_hooks(
     Ok(())
 }
 
+enum ReceiveHookDecline {
+    PreReceive,
+    Update(String),
+}
+
+fn run_local_receive_pre_hooks_report(
+    destination: &sley_remote::PushDestination,
+    push_commands: &[ReceivePackCommand],
+    push_options: &[String],
+) -> Option<ReceiveHookDecline> {
+    let sley_remote::PushDestination::Local {
+        git_dir: remote_git_dir,
+        ..
+    } = destination
+    else {
+        return None;
+    };
+    let stdin = receive_hook_stdin(push_commands);
+    let push_option_env = push_option_hook_env(push_options);
+    if commands::hooks::run_traditional_hook_at(
+        remote_git_dir,
+        "pre-receive",
+        commands::hooks::HookRun {
+            stdin: Some(stdin),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
+            ..commands::hooks::HookRun::default()
+        },
+    )
+    .is_err()
+    {
+        return Some(ReceiveHookDecline::PreReceive);
+    }
+    for command in push_commands {
+        if commands::hooks::run_traditional_hook_at(
+            remote_git_dir,
+            "update",
+            commands::hooks::HookRun {
+                args: vec![
+                    command.name.clone(),
+                    command.old_id.to_string(),
+                    command.new_id.to_string(),
+                ],
+                env: push_option_env.clone(),
+                cwd: Some(remote_git_dir.to_path_buf()),
+                ..commands::hooks::HookRun::default()
+            },
+        )
+        .is_err()
+        {
+            return Some(ReceiveHookDecline::Update(command.name.clone()));
+        }
+    }
+    None
+}
+
 fn run_local_receive_post_hooks(
     destination: &sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
+    push_options: &[String],
 ) -> Result<()> {
     let sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
@@ -4902,11 +5451,14 @@ fn run_local_receive_post_hooks(
         return Ok(());
     };
     let stdin = receive_hook_stdin(push_commands);
+    let push_option_env = push_option_hook_env(push_options);
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "post-receive",
         commands::hooks::HookRun {
             stdin: Some(stdin),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
             ..commands::hooks::HookRun::default()
         },
     )?;
@@ -4918,15 +5470,32 @@ fn run_local_receive_post_hooks(
                 .iter()
                 .map(|command| command.name.clone())
                 .collect(),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
             ..commands::hooks::HookRun::default()
         },
     )?;
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "push-to-checkout",
-        commands::hooks::HookRun::default(),
+        commands::hooks::HookRun {
+            env: push_option_env,
+            cwd: Some(remote_git_dir.to_path_buf()),
+            ..commands::hooks::HookRun::default()
+        },
     )?;
     Ok(())
+}
+
+fn push_option_hook_env(push_options: &[String]) -> Vec<(String, String)> {
+    let mut env = vec![(
+        "GIT_PUSH_OPTION_COUNT".to_string(),
+        push_options.len().to_string(),
+    )];
+    for (index, value) in push_options.iter().enumerate() {
+        env.push((format!("GIT_PUSH_OPTION_{index}"), value.clone()));
+    }
+    env
 }
 
 fn receive_hook_stdin(push_commands: &[ReceivePackCommand]) -> Vec<u8> {
@@ -5321,6 +5890,56 @@ fn configure_push_upstreams(
             key: "merge".into(),
         };
         config_set_value(&mut config, &merge_key, &command.name, false);
+    }
+    write_repo_config(git_dir, &config)
+}
+
+fn configure_push_upstreams_from_report(
+    git_dir: &Path,
+    remote: &str,
+    refs: &[sley_remote::PushReportRef],
+) -> Result<()> {
+    let mut config = read_repo_config(git_dir)?;
+    let format = repository_object_format(git_dir)?;
+    let store = FileRefStore::new(git_dir, format);
+    let current_branch = store.current_branch().ok().flatten();
+    for reference in refs {
+        if !matches!(
+            reference.status,
+            sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+        ) || reference.is_deletion()
+        {
+            continue;
+        }
+        let Some(src) = reference.src.as_deref() else {
+            continue;
+        };
+        let branch = if src == "HEAD" {
+            let Some(branch) = current_branch.as_deref() else {
+                continue;
+            };
+            branch
+        } else {
+            let Some(branch) = src.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            branch
+        };
+        if !reference.dst.starts_with("refs/heads/") {
+            continue;
+        }
+        let remote_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(branch.to_string()),
+            key: "remote".into(),
+        };
+        config_set_value(&mut config, &remote_key, remote, false);
+        let merge_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(branch.to_string()),
+            key: "merge".into(),
+        };
+        config_set_value(&mut config, &merge_key, &reference.dst, false);
     }
     write_repo_config(git_dir, &config)
 }
