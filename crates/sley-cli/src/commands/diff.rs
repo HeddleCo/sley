@@ -1970,21 +1970,22 @@ fn apply_diff_pickaxe(
     if needle.is_empty() {
         return Ok(Vec::new());
     }
+    if pickaxe_all {
+        for entry in &entries {
+            if diff_entry_matches_pickaxe(entry, needle, db, worktree_root, use_worktree_new)? {
+                return Ok(sort_diff_entries_by_path(entries));
+            }
+        }
+        return Ok(Vec::new());
+    }
+
     let mut matches = Vec::new();
     for entry in &entries {
         if diff_entry_matches_pickaxe(entry, needle, db, worktree_root, use_worktree_new)? {
             matches.push(entry.clone());
         }
     }
-    if pickaxe_all {
-        if matches.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Ok(sort_diff_entries_by_path(entries))
-        }
-    } else {
-        Ok(sort_diff_entries_by_path(matches))
-    }
+    Ok(sort_diff_entries_by_path(matches))
 }
 
 fn diff_entry_matches_pickaxe(
