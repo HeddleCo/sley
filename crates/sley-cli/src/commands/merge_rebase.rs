@@ -3338,180 +3338,12 @@ pub(crate) fn conclude_in_progress_merge(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RebaseOntoOutcome {
-    Rebasing,
-    UpToDate,
-}
-
-fn rebase_onto_upstream(
-    git_dir: &Path,
-    worktree_root: &Path,
-    format: ObjectFormat,
-    upstream: &str,
-    quiet: bool,
-) -> Result<RebaseOntoOutcome> {
-    let store = FileRefStore::new(git_dir, format);
-    let branch_name = store
-        .current_branch()?
-        .ok_or_else(|| GitError::Command("rebase requires a branch checkout".into()))?;
-    let head_name = format!("refs/heads/{branch_name}");
-    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let head_oid = resolve_revision(git_dir, format, "HEAD")?;
-    let head_commit = sley_rev::peel_to_commit(&db, format, &head_oid)?;
-    let upstream_oid = if upstream == "FETCH_HEAD" {
-        resolve_fetch_head_revision(git_dir, format)?
-    } else {
-        resolve_revision(git_dir, format, upstream)?
-    };
-    let upstream_commit = sley_rev::peel_to_commit(&db, format, &upstream_oid)?;
-
-    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
-    let tracked_status = status
-        .iter()
-        .filter(|entry| entry.index != b'?' && entry.index != b'!');
-    if tracked_status.clone().next().is_some() {
-        let has_staged = tracked_status.clone().any(|entry| entry.index != b' ');
-        let has_unstaged = tracked_status.clone().any(|entry| entry.worktree != b' ');
-        if has_unstaged && has_staged {
-            eprintln!("error: cannot rebase: You have unstaged changes.");
-            eprintln!("error: additionally, your index contains uncommitted changes.");
-        } else if has_staged {
-            eprintln!("error: cannot rebase: Your index contains uncommitted changes.");
-        } else {
-            eprintln!("error: cannot rebase: You have unstaged changes.");
-        }
-        eprintln!("error: Please commit or stash them.");
-        return Err(GitError::Exit(1));
-    }
-
-    let merge_base = merge_bases(&common_git_dir, &db, format, &head_commit, &upstream_commit)?
-        .into_iter()
-        .next();
-    let commits_to_replay =
-        rebase_commits_to_replay(&db, format, &head_commit, merge_base.as_ref())?;
-    if commits_to_replay.is_empty() {
-        return Ok(RebaseOntoOutcome::UpToDate);
-    }
-
-    let committer = commit_identity_from_env("COMMITTER")?;
-    sley_worktree::reset_index_and_worktree_to_commit(
-        worktree_root,
-        git_dir,
-        format,
-        &upstream_commit,
-    )?;
-    detach_head_at(
-        git_dir,
-        format,
-        head_commit,
-        upstream_commit,
-        format!("checkout: moving to {upstream}").into_bytes(),
-        committer.clone(),
-    )?;
-
-    let onto = upstream_commit;
-    rebase_replay_commits(
-        git_dir,
-        worktree_root,
-        format,
-        &db,
-        &head_name,
-        &branch_name,
-        &upstream_commit,
-        &head_commit,
-        &commits_to_replay,
-        &commits_to_replay,
-        onto,
-        0,
-        quiet,
-        false,
-    )?;
-    Ok(RebaseOntoOutcome::Rebasing)
-}
-
 fn rebase_merge_dir(git_dir: &Path) -> PathBuf {
     git_dir.join("rebase-merge")
 }
 
 pub(crate) fn rebase_in_progress(git_dir: &Path) -> bool {
     rebase_merge_dir(git_dir).is_dir()
-}
-
-fn clear_rebase_merge_state(git_dir: &Path) {
-    let _ = fs::remove_dir_all(rebase_merge_dir(git_dir));
-}
-
-fn rebase_pick_line(record: &sley_rev::CommitRecord) -> String {
-    format!(
-        "pick {} # {}",
-        record.oid.to_hex(),
-        commit_subject(&record.commit.message)
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_rebase_conflict_state(
-    git_dir: &Path,
-    head_name: &str,
-    onto: &ObjectId,
-    orig_head: &ObjectId,
-    record: &sley_rev::CommitRecord,
-    commits_to_replay: &[sley_rev::CommitRecord],
-    conflict_index: usize,
-    conflicts: &[Vec<u8>],
-) -> Result<()> {
-    let dir = rebase_merge_dir(git_dir);
-    fs::create_dir_all(&dir)?;
-
-    let total = commits_to_replay.len();
-    let msgnum = conflict_index + 1;
-
-    fs::write(dir.join("head-name"), format!("{head_name}\n"))?;
-    fs::write(dir.join("onto"), format!("{onto}\n"))?;
-    fs::write(dir.join("orig-head"), format!("{orig_head}\n"))?;
-    fs::write(dir.join("stopped-sha"), format!("{}\n", record.oid))?;
-    fs::write(dir.join("msgnum"), format!("{msgnum}\n"))?;
-    fs::write(dir.join("end"), format!("{total}\n"))?;
-
-    let mut message = record.commit.message.clone();
-    if !message.ends_with(b"\n") {
-        message.push(b'\n');
-    }
-    message.extend_from_slice(b"\n# Conflicts:\n");
-    for conflict in conflicts {
-        message.push(b'#');
-        message.push(b'\t');
-        message.extend_from_slice(conflict);
-        message.push(b'\n');
-    }
-    fs::write(dir.join("message"), message)?;
-
-    let done_lines = commits_to_replay[..=conflict_index]
-        .iter()
-        .map(rebase_pick_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(dir.join("done"), format!("{done_lines}\n"))?;
-    fs::write(dir.join("git-rebase-todo"), b"")?;
-
-    let mut backup = String::new();
-    for replay in commits_to_replay {
-        backup.push_str(&rebase_pick_line(replay));
-        backup.push('\n');
-    }
-    backup.push('\n');
-    backup.push_str(&format!(
-        "# Rebase {}..{} onto {} ({} command{})\n",
-        &onto.to_hex()[..7.min(onto.to_hex().len())],
-        &orig_head.to_hex()[..7.min(orig_head.to_hex().len())],
-        &onto.to_hex()[..7.min(onto.to_hex().len())],
-        total,
-        if total == 1 { "" } else { "s" }
-    ));
-    fs::write(dir.join("git-rebase-todo.backup"), backup)?;
-    Ok(())
 }
 
 fn detach_head_at(
@@ -3550,46 +3382,6 @@ fn update_detached_head_at(
     detach_head_at(git_dir, format, old_oid, new_oid, reflog_message, committer)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish_rebase_update_branch(
-    git_dir: &Path,
-    format: ObjectFormat,
-    head_name: &str,
-    old_branch_oid: ObjectId,
-    new_oid: ObjectId,
-    committer: Vec<u8>,
-    old_head_oid: ObjectId,
-    reflog_prefix: &str,
-) -> Result<()> {
-    let store = FileRefStore::new(git_dir, format);
-    let branch_reflog = ReflogEntry {
-        old_oid: old_branch_oid,
-        new_oid,
-        committer: committer.clone(),
-        message: format!("{reflog_prefix}: {head_name}").into_bytes(),
-    };
-    let head_reflog = ReflogEntry {
-        old_oid: old_head_oid,
-        new_oid,
-        committer,
-        message: format!("{reflog_prefix}: {head_name}").into_bytes(),
-    };
-    let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: head_name.into(),
-        expected: None,
-        new: RefTarget::Direct(new_oid),
-        reflog: Some(branch_reflog),
-    });
-    tx.update(RefUpdate {
-        name: "HEAD".into(),
-        expected: None,
-        new: RefTarget::Symbolic(head_name.into()),
-        reflog: Some(head_reflog),
-    });
-    tx.commit()
-}
-
 pub(crate) fn print_commit_shortstat_between_trees(
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -3609,16 +3401,6 @@ pub(crate) fn print_commit_shortstat_between_trees(
     let mut stdout = io::stdout();
     write_diff_shortstat(&mut stdout, &entries, db, None, false)?;
     Ok(())
-}
-
-fn print_rebase_conflict_hints() {
-    eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
-    eprintln!("hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".");
-    eprintln!("hint: You can instead skip this commit: run \"git rebase --skip\".");
-    eprintln!(
-        "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
-    );
-    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
 }
 
 pub(crate) fn conclude_rebase_step_via_commit(
@@ -3688,254 +3470,6 @@ fn read_rebase_author_script_identity(git_dir: &Path) -> Result<Option<Vec<u8>>>
     )?))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rebase_replay_commits(
-    git_dir: &Path,
-    worktree_root: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    head_name: &str,
-    branch_name: &str,
-    onto: &ObjectId,
-    orig_head: &ObjectId,
-    commits_to_replay: &[sley_rev::CommitRecord],
-    all_commits: &[sley_rev::CommitRecord],
-    mut current_head: ObjectId,
-    start_offset: usize,
-    quiet: bool,
-    finishing_after_continue: bool,
-) -> Result<()> {
-    let total = all_commits.len();
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let progress_to_stdout = io::stdout().is_terminal();
-    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    for (index, record) in commits_to_replay.iter().enumerate() {
-        let msgnum = start_offset + index + 1;
-        if !quiet {
-            let progress = format!("Rebasing ({msgnum}/{total})\r");
-            if progress_to_stdout {
-                print!("{progress}");
-                io::stdout().flush()?;
-            } else {
-                eprint!("{progress}");
-                io::stderr().flush()?;
-            }
-        }
-        let parent_oid = record.parents.first().ok_or_else(|| {
-            GitError::InvalidObject(format!(
-                "cannot replay root commit {} during rebase",
-                record.oid
-            ))
-        })?;
-        let parent_tree = read_commit_tree(db, format, parent_oid)?;
-        let ours_tree = read_commit_tree(db, format, &current_head)?;
-        let theirs_tree = record.commit.tree;
-        let base_map = stash_tree_entry_map(db, format, &parent_tree)?;
-        let ours_map = stash_tree_entry_map(db, format, &ours_tree)?;
-        let theirs_map = stash_tree_entry_map(db, format, &theirs_tree)?;
-        let write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-        let (results, conflicts) = three_way_merge_trees(
-            &write_db,
-            format,
-            &base_map,
-            &ours_map,
-            &theirs_map,
-            "HEAD",
-            branch_name,
-        )?;
-        let auto_merged_paths = results
-            .iter()
-            .filter_map(|(path, result)| {
-                if let MergePathResult::Resolved(Some((mode, oid))) = result
-                    && ours_map.get(path) != Some(&(*mode, *oid))
-                {
-                    return Some(path.clone());
-                }
-                None
-            })
-            .collect::<Vec<_>>();
-        if !conflicts.is_empty() {
-            let mut entries = Vec::new();
-            for (path, result) in &results {
-                match result {
-                    MergePathResult::Resolved(Some((mode, oid))) => {
-                        entries.push(merge_index_entry(path, *mode, *oid, 0));
-                    }
-                    MergePathResult::Resolved(None) => {}
-                    MergePathResult::Conflict {
-                        base, ours, theirs, ..
-                    } => {
-                        if let Some((mode, oid)) = base {
-                            entries.push(merge_index_entry(path, *mode, *oid, 1));
-                        }
-                        if let Some((mode, oid)) = ours {
-                            entries.push(merge_index_entry(path, *mode, *oid, 2));
-                        }
-                        if let Some((mode, oid)) = theirs {
-                            entries.push(merge_index_entry(path, *mode, *oid, 3));
-                        }
-                    }
-                }
-            }
-            entries.sort_by(|left, right| {
-                left.path
-                    .cmp(&right.path)
-                    .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
-            });
-            fs::write(
-                sley_worktree::repository_index_path(git_dir),
-                Index {
-                    version: 2,
-                    entries,
-                    extensions: Vec::new(),
-                    checksum: None,
-                }
-                .write(format)?,
-            )?;
-            for (path, result) in &results {
-                match result {
-                    MergePathResult::Resolved(Some((mode, oid))) => {
-                        if ours_map.get(path) != Some(&(*mode, *oid)) {
-                            let content = merge_read_blob(db, oid)?;
-                            merge_write_worktree_file(worktree_root, path, &content, *mode)?;
-                        }
-                    }
-                    MergePathResult::Resolved(None) => {
-                        merge_remove_worktree_file(worktree_root, path)?
-                    }
-                    MergePathResult::Conflict { worktree, .. } => match worktree {
-                        Some((mode, content)) => {
-                            merge_write_worktree_file(worktree_root, path, content, *mode)?
-                        }
-                        None => merge_remove_worktree_file(worktree_root, path)?,
-                    },
-                }
-            }
-            let merged_tree = sley_worktree::write_tree_from_index(git_dir, format)?;
-            write_rebase_conflict_state(
-                git_dir,
-                head_name,
-                onto,
-                orig_head,
-                record,
-                all_commits,
-                start_offset + index,
-                &conflicts,
-            )?;
-            fs::write(git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
-            let conflict_set = conflicts.iter().cloned().collect::<BTreeSet<_>>();
-            for path in &auto_merged_paths {
-                if !conflict_set.contains(path) {
-                    println!("Auto-merging {}", String::from_utf8_lossy(path));
-                }
-            }
-            for path in &conflicts {
-                let path = String::from_utf8_lossy(path);
-                println!("Auto-merging {path}");
-                println!("CONFLICT (content): Merge conflict in {path}");
-            }
-            let short_oid = &record.oid.to_hex()[..7.min(record.oid.to_hex().len())];
-            let subject = commit_subject(&record.commit.message);
-            eprintln!("error: could not apply {short_oid}... {subject}");
-            print_rebase_conflict_hints();
-            eprintln!("Could not apply {short_oid}... # {subject}");
-            let _ = merged_tree;
-            return Err(GitError::Exit(1));
-        }
-        for path in &auto_merged_paths {
-            println!("Auto-merging {}", String::from_utf8_lossy(path));
-        }
-        let mut entries = Vec::new();
-        for (path, result) in &results {
-            if let MergePathResult::Resolved(Some((mode, oid))) = result {
-                entries.push(merge_index_entry(path, *mode, *oid, 0));
-            }
-        }
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        fs::write(
-            sley_worktree::repository_index_path(git_dir),
-            Index {
-                version: 2,
-                entries,
-                extensions: Vec::new(),
-                checksum: None,
-            }
-            .write(format)?,
-        )?;
-        let merged_tree = sley_worktree::write_tree_from_index(git_dir, format)?;
-        sley_worktree::checkout_tree_to_index_and_worktree(
-            worktree_root,
-            git_dir,
-            format,
-            &merged_tree,
-        )?;
-        let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-        let commit_oid = sley_sequencer::create_commit(
-            &mut writer,
-            sley_sequencer::CommitCreate {
-                tree: merged_tree,
-                parents: vec![current_head.clone()],
-                author: record.commit.author.clone(),
-                committer: committer.clone(),
-                message: record.commit.message.clone(),
-                encoding: None,
-            },
-        )?;
-        update_detached_head_at(
-            git_dir,
-            format,
-            current_head,
-            commit_oid,
-            format!("rebase (pick): {}", commit_subject(&record.commit.message)).into_bytes(),
-            committer.clone(),
-        )?;
-        current_head = commit_oid;
-    }
-    finish_rebase_update_branch(
-        git_dir,
-        format,
-        head_name,
-        orig_head.clone(),
-        current_head.clone(),
-        committer,
-        current_head.clone(),
-        "rebase finished",
-    )?;
-    clear_rebase_merge_state(git_dir);
-    if !quiet {
-        let message = format!("Successfully rebased and updated {head_name}.\n");
-        if finishing_after_continue || !progress_to_stdout {
-            eprint!("{message}");
-        } else {
-            print!("{message}");
-        }
-    }
-    Ok(())
-}
-
-fn rebase_commits_to_replay(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    head: &ObjectId,
-    merge_base: Option<&ObjectId>,
-) -> Result<Vec<sley_rev::CommitRecord>> {
-    let mut commits = Vec::new();
-    let mut current = head.clone();
-    loop {
-        if merge_base.is_some_and(|base| current == *base) {
-            break;
-        }
-        let record = read_rev_list_commit_record(db, format, current)?;
-        let parent = record.parents.first().cloned();
-        commits.push(record);
-        current = match parent {
-            Some(parent) => parent,
-            None => break,
-        };
-    }
-    commits.reverse();
-    Ok(commits)
-}
 fn clear_in_progress_merge_state(git_dir: &Path) {
     let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
@@ -4521,11 +4055,161 @@ fn parse_pull_ff_config(config: &GitConfig) -> Result<Option<PullFastForward>> {
     Err(GitError::Exit(128))
 }
 
-fn parse_pull_rebase_config_value(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "yes" | "on" | "1" | "merges" | "interactive"
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullRebase {
+    False,
+    True,
+    Merges,
+    Interactive,
+}
+
+impl PullRebase {
+    fn enabled(self) -> bool {
+        !matches!(self, PullRebase::False)
+    }
+
+    fn rebase_arg(self) -> Option<&'static str> {
+        match self {
+            PullRebase::False | PullRebase::True => None,
+            PullRebase::Merges => Some("--rebase-merges"),
+            PullRebase::Interactive => Some("--interactive"),
+        }
+    }
+}
+
+fn parse_pull_rebase_value(key: &str, value: &str) -> Result<PullRebase> {
+    let trimmed = value.trim();
+    if let Some(parsed) = parse_maybe_bool(trimmed) {
+        return Ok(if parsed {
+            PullRebase::True
+        } else {
+            PullRebase::False
+        });
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "merges" | "m" => Ok(PullRebase::Merges),
+        "interactive" | "i" => Ok(PullRebase::Interactive),
+        _ => {
+            eprintln!("fatal: invalid value for '{key}': '{trimmed}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn parse_config_bool_value(value: &str) -> Option<bool> {
+    parse_maybe_bool(value.trim())
+}
+
+fn pull_autostash_config(config: &GitConfig, rebase: PullRebase) -> Option<bool> {
+    config
+        .get("pull", None, "autostash")
+        .and_then(parse_config_bool_value)
+        .or_else(|| {
+            if rebase.enabled() {
+                config
+                    .get("rebase", None, "autostash")
+                    .and_then(parse_config_bool_value)
+            } else {
+                None
+            }
+        })
+}
+
+fn push_autostash_arg(args: &mut Vec<String>, autostash: Option<bool>) {
+    match autostash {
+        Some(true) => args.push("--autostash".to_string()),
+        Some(false) => args.push("--no-autostash".to_string()),
+        None => {}
+    }
+}
+
+fn ensure_pull_rebase_clean_without_autostash(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
+    let tracked = status
+        .iter()
+        .filter(|entry| entry.index != b'?' && entry.index != b'!')
+        .collect::<Vec<_>>();
+    if tracked
+        .iter()
+        .all(|entry| entry.index == b' ' && entry.worktree == b' ')
+    {
+        return Ok(());
+    }
+    let has_staged = tracked.iter().any(|entry| entry.index != b' ');
+    let has_unstaged = tracked.iter().any(|entry| entry.worktree != b' ');
+    if has_unstaged {
+        eprintln!("error: cannot pull with rebase: You have unstaged changes.");
+    }
+    if has_staged {
+        eprintln!("error: cannot pull with rebase: Your index contains uncommitted changes.");
+    }
+    eprintln!("error: Please commit or stash them.");
+    Err(GitError::Exit(128))
+}
+
+fn ensure_rebase_not_unborn_with_index(
+    git_dir: &Path,
+    format: ObjectFormat,
+    orig_head: Option<ObjectId>,
+) -> Result<()> {
+    if orig_head.is_some() {
+        return Ok(());
+    }
+    if let Ok(index) = read_worktree_index(git_dir, format)
+        && !index.entries.is_empty()
+    {
+        eprintln!("fatal: Updating an unborn branch with changes added to the index.");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn pull_rebase_fork_point(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    remote: &str,
+    refspecs: &[String],
+    merge_srcs: &[String],
+    orig_head: Option<ObjectId>,
+) -> Result<Option<ObjectId>> {
+    let Some(orig_head) = orig_head else {
+        return Ok(None);
+    };
+    if remote == "." {
+        return Ok(None);
+    }
+    let Some(remote_ref) = refspecs.first().or_else(|| merge_srcs.first()) else {
+        return Ok(None);
+    };
+    let remote_ref = if remote_ref.starts_with("refs/") {
+        remote_ref.to_string()
+    } else {
+        format!("refs/heads/{remote_ref}")
+    };
+    let Some(tracking_ref) = pull_remote_tracking_ref(config, remote, &remote_ref) else {
+        return Ok(None);
+    };
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    merge_base_fork_point(git_dir, format, &db, &tracking_ref, &orig_head)
+}
+
+fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) -> Option<String> {
+    for fetch in config.get_all("remote", Some(remote), "fetch").into_iter().flatten() {
+        let refspec = parse_refspec(fetch).ok()?;
+        if refspec.negative || refspec.dst.is_none() {
+            continue;
+        }
+        if let Ok(Some(mapped)) = refspec_map_source(&refspec, remote_ref) {
+            return Some(mapped);
+        }
+    }
+    None
 }
 
 fn print_fetch_status(
@@ -4746,7 +4430,10 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     }
     let mut opt_ff = None::<PullFastForward>;
     let mut quiet = false;
-    let mut rebase_flag = None::<bool>;
+    let mut rebase_flag = None::<PullRebase>;
+    let mut autostash_flag = None::<bool>;
+    let mut force_rebase = false;
+    let mut verify_signatures = None::<bool>;
     let mut remote = None::<String>;
     let mut branches = Vec::<String>::new();
     let mut depth = None::<u32>;
@@ -4762,8 +4449,17 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--ff" => opt_ff = Some(PullFastForward::Allow),
             "--no-ff" => opt_ff = Some(PullFastForward::No),
             "--ff-only" => opt_ff = Some(PullFastForward::Only),
-            "--rebase" => rebase_flag = Some(true),
-            "--no-rebase" => rebase_flag = Some(false),
+            "--rebase" => rebase_flag = Some(PullRebase::True),
+            value if value.starts_with("--rebase=") => {
+                let value = value.strip_prefix("--rebase=").unwrap_or_default();
+                rebase_flag = Some(parse_pull_rebase_value("--rebase", value)?);
+            }
+            "--no-rebase" => rebase_flag = Some(PullRebase::False),
+            "--autostash" => autostash_flag = Some(true),
+            "--no-autostash" => autostash_flag = Some(false),
+            "-f" | "--force" => force_rebase = true,
+            "--verify-signatures" => verify_signatures = Some(true),
+            "--no-verify-signatures" => verify_signatures = Some(false),
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             "--all" => _all = true,
@@ -4776,7 +4472,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
-                    "pull currently supports --ff-only, --no-ff, --rebase, --no-rebase, --quiet, and remote/branch arguments; unsupported option {value}"
+                    "pull currently supports --ff-only, --no-ff, --rebase, --no-rebase, --autostash, --no-autostash, --quiet, and remote/branch arguments; unsupported option {value}"
                 )));
             }
             value => {
@@ -4822,10 +4518,34 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let (effective_rebase, rebase_unspecified) = match rebase_flag {
         Some(value) => (value, false),
         None => match config_rebase {
-            Some(value) => (parse_pull_rebase_config_value(value), false),
-            None => (false, true),
+            Some(value) => (parse_pull_rebase_value("pull.rebase", value)?, false),
+            None => (PullRebase::False, true),
         },
     };
+    if effective_rebase.enabled() && verify_signatures == Some(true) {
+        eprintln!("warning: ignoring --verify-signatures for rebase");
+    }
+    let effective_autostash =
+        autostash_flag.or_else(|| pull_autostash_config(&config, effective_rebase));
+    let orig_head = head_commit_oid(&store)?;
+    let rebase_fork_point = if effective_rebase.enabled() {
+        ensure_rebase_not_unborn_with_index(&git_dir, format, orig_head)?;
+        pull_rebase_fork_point(
+            &git_dir,
+            format,
+            &config,
+            &remote,
+            &refspecs,
+            &merge_srcs,
+            orig_head,
+        )?
+    } else {
+        None
+    };
+    if effective_rebase.enabled() && effective_autostash != Some(true) {
+        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        ensure_pull_rebase_clean_without_autostash(&git_dir, &worktree_root, format)?;
+    }
     let fetch_options = FetchOptions {
         quiet,
         auto_follow_tags: true,
@@ -4851,7 +4571,6 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // git captures `orig_head` (HEAD before the fetch). A refspec like
     // `main:main` can create the current branch during the fetch, but the
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
-    let orig_head = head_commit_oid(&store)?;
     let orig_head_unborn = orig_head.is_none();
     if let Err(err) = pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options) {
         if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
@@ -4880,7 +4599,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let merge_records = match fetch_head_merge_records(&git_dir, format) {
         Ok(records) if !records.is_empty() => records,
         Ok(_) if !refspecs.is_empty() => {
-            print_pull_no_merge_candidates_for_refspecs(effective_rebase);
+            print_pull_no_merge_candidates_for_refspecs(effective_rebase.enabled());
             return Err(GitError::Exit(1));
         }
         Ok(_) if !merge_srcs.is_empty() => {
@@ -4889,7 +4608,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         }
         Ok(_) => return Err(GitError::reference_not_found("FETCH_HEAD")),
         Err(_) if !refspecs.is_empty() => {
-            print_pull_no_merge_candidates_for_refspecs(effective_rebase);
+            print_pull_no_merge_candidates_for_refspecs(effective_rebase.enabled());
             return Err(GitError::Exit(1));
         }
         Err(_) if !merge_srcs.is_empty() => {
@@ -4934,7 +4653,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         .map(|record| sley_rev::peel_to_commit(&db, format, &record.oid))
         .collect::<Result<Vec<_>>>()?;
     if merge_oids.len() > 1 {
-        if effective_rebase {
+        if effective_rebase.enabled() {
             eprintln!("fatal: Cannot rebase onto multiple branches.");
             return Err(GitError::Exit(128));
         }
@@ -4967,40 +4686,51 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             eprintln!("fatal: Not possible to fast-forward, aborting.");
             return Err(GitError::Exit(128));
         }
-        effective_rebase = false;
+        effective_rebase = PullRebase::False;
     }
     if opt_ff.is_none() && rebase_unspecified && !fast_forward {
         ensure_pull_can_merge()?;
     }
     if fast_forward {
         let mut merge_args = Vec::new();
-        if effective_rebase {
+        if effective_rebase.enabled() {
             merge_args.push("--ff-only".to_string());
         } else if let Some(ff) = opt_ff {
             merge_args.push(ff.as_merge_arg().to_string());
         }
+        push_autostash_arg(&mut merge_args, effective_autostash);
         if quiet {
             merge_args.push("--quiet".to_string());
         }
         merge_args.push("FETCH_HEAD".to_string());
         return cmd_merge(&merge_args);
     }
-    if effective_rebase {
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        match rebase_onto_upstream(&git_dir, &worktree_root, format, "FETCH_HEAD", quiet)? {
-            RebaseOntoOutcome::Rebasing => return Ok(()),
-            RebaseOntoOutcome::UpToDate => {
-                if !quiet {
-                    println!("Already up to date.");
-                }
-                return Ok(());
-            }
+    if effective_rebase.enabled() {
+        let mut rebase_args = Vec::new();
+        if let Some(arg) = effective_rebase.rebase_arg() {
+            rebase_args.push(arg.to_string());
         }
+        push_autostash_arg(&mut rebase_args, effective_autostash);
+        if quiet {
+            rebase_args.push("--quiet".to_string());
+        }
+        if force_rebase {
+            rebase_args.push("--force-rebase".to_string());
+        }
+        if let Some(fork_point) = rebase_fork_point {
+            rebase_args.push("--onto".to_string());
+            rebase_args.push("FETCH_HEAD".to_string());
+            rebase_args.push(fork_point.to_hex());
+        } else {
+            rebase_args.push("FETCH_HEAD".to_string());
+        }
+        return commands::rebase::cmd_rebase(&rebase_args);
     }
     let mut merge_args = Vec::new();
     if let Some(ff) = opt_ff {
         merge_args.push(ff.as_merge_arg().to_string());
     }
+    push_autostash_arg(&mut merge_args, effective_autostash);
     if quiet {
         merge_args.push("--quiet".to_string());
     }
