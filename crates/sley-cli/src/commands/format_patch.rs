@@ -236,6 +236,9 @@ struct FormatPatchOptions {
     /// Notes display state for `--notes[=<ref>]`, `--no-notes`, and
     /// `format.notes`.
     notes: FormatPatchNotes,
+    /// `--range-diff=<previous>` commentary to include in the cover letter or
+    /// single patch.
+    range_diff: Option<String>,
     /// Mboxrd message body escaping (`--pretty=mboxrd` or `format.mboxrd`).
     mboxrd: bool,
     /// `--base=<commit>`, `--base=auto`, `--no-base`, or config fallback.
@@ -344,6 +347,7 @@ impl Default for FormatPatchOptions {
             thread: None,
             in_reply_to: None,
             notes: FormatPatchNotes::default(),
+            range_diff: None,
             mboxrd: false,
             base: BaseMode::Config,
             ignore_if_in_upstream: false,
@@ -436,10 +440,21 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     };
 
     let count = commits.len();
+    let range_diff_setup_args = format_patch_setup_args(&options);
     // A cover letter forces `[PATCH n/m]` numbering (the cover is `0/m`), so it
     // also flips a single-patch run from the bare `[PATCH]` to `[PATCH 1/1]`.
     // git emits no cover (and no patches) when the range is empty.
-    let cover_letter = count > 0 && resolve_cover_letter(&options, config, count);
+    let mut cover_letter = count > 0 && resolve_cover_letter(&options, config, count);
+    if options.range_diff.is_some() && count > 1 {
+        let config_disables_cover = config
+            .get("format", None, "coverLetter")
+            .is_some_and(|value| matches!(git_config_bool_str(value), Some(false)));
+        if options.cover_letter == Some(false) || config_disables_cover {
+            eprintln!("fatal: --range-diff requires --cover-letter for multi-patch series");
+            return Err(GitError::Exit(128));
+        }
+        cover_letter = true;
+    }
     let numbered = match options.number_mode {
         NumberMode::Numbered => true,
         NumberMode::Unnumbered => false,
@@ -461,6 +476,16 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let abbrev = patch_index_abbrev(git_dir, format, &options)?;
     let notes_refs = resolve_format_patch_notes(git_dir, format, &options, config)?;
     let base_info = resolve_base_info(&repo, &options, config, &commits)?;
+    let range_diff = match options.range_diff.as_deref() {
+        Some(previous) => Some(commands::range_diff::render_format_patch_range_diff(
+            &repo,
+            previous,
+            &range_diff_setup_args,
+            &selection.pathspecs,
+            &notes_refs,
+        )?),
+        None => None,
+    };
 
     // Resolve message threading: the `--thread`/`format.thread` level plus any
     // `--in-reply-to` seed determine the Message-ID / In-Reply-To / References on
@@ -514,6 +539,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             last_number,
             abbrev,
             &cover_thread,
+            range_diff.as_deref(),
         )?)
     } else {
         None
@@ -550,6 +576,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
+                range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
             })?;
             stdout.write_all(&buffer)?;
@@ -585,6 +612,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
+                range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
             })?;
             stream.extend_from_slice(&buffer);
@@ -646,6 +674,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             config,
             git_dir,
             notes_refs: &notes_refs,
+            range_diff: range_diff.as_deref().filter(|_| count == 1),
             base_info: base_info.as_ref(),
         })?;
         let file_name = if options.numbered_files {
@@ -706,6 +735,7 @@ fn build_cover_letter(
     last_number: usize,
     abbrev: usize,
     thread: &MailThreadHeaders,
+    range_diff: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let _ = abbrev; // the cover never emits index lines; kept for signature parity.
     let format = repo.format();
@@ -768,6 +798,10 @@ fn build_cover_letter(
     let list_format = resolve_commit_list_format(options, config);
     write_commit_list_cover(&mut out, &list_format, commits)?;
 
+    if let Some(range_diff) = range_diff {
+        write_range_diff_commentary(&mut out, options, range_diff);
+    }
+
     // The cumulative diffstat against the boundary commit, when there is a unique
     // boundary (a single parent of the oldest commit). git omits it otherwise.
     if let Some(origin_tree) = cover_origin_tree(db, format, commits)? {
@@ -811,6 +845,25 @@ fn cover_letter_date() -> String {
     // commit_identity_date parses the trailing `<ts> <tz>` of an identity line.
     let ident = format!("C <c@example.invalid> {secs} {tz}");
     commit_identity_date(ident.as_bytes(), &DateMode::Rfc2822)
+}
+
+fn write_range_diff_commentary(out: &mut Vec<u8>, options: &FormatPatchOptions, range_diff: &[u8]) {
+    match range_diff_previous_label(options) {
+        Some(label) => out.extend_from_slice(format!("Range-diff against {label}:\n").as_bytes()),
+        None => out.extend_from_slice(b"Range-diff:\n"),
+    }
+    for line in range_diff.split_inclusive(|b| *b == b'\n') {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+}
+
+fn range_diff_previous_label(options: &FormatPatchOptions) -> Option<String> {
+    let reroll = options.reroll_count.as_deref()?;
+    let value = reroll.parse::<usize>().ok()?;
+    (value > 0).then(|| format!("v{}", value - 1))
 }
 
 /// Parse a `GIT_COMMITTER_DATE` value of the form `@<unix> <tz>` (the canonical
@@ -1995,6 +2048,8 @@ struct RenderContext<'a> {
     git_dir: &'a Path,
     /// Ordered notes refs to append after the `---` separator.
     notes_refs: &'a [String],
+    /// Optional rendered range-diff commentary for a single-patch output.
+    range_diff: Option<&'a [u8]>,
     /// Optional base/prerequisite metadata block.
     base_info: Option<&'a BaseInfo>,
 }
@@ -2018,6 +2073,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         config,
         git_dir,
         notes_refs,
+        range_diff,
         base_info,
     } = ctx;
 
@@ -2115,6 +2171,10 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         write_mboxrd_escaped_body(&mut out, &body);
     } else {
         out.extend_from_slice(&body);
+    }
+    if let Some(range_diff) = range_diff {
+        out.push(b'\n');
+        write_range_diff_commentary(&mut out, options, range_diff);
     }
 
     // Diff entries against the first parent (or the empty tree for a root).
@@ -4088,6 +4148,15 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             }
             value if let Some(n) = value.strip_prefix("-v") => {
                 options.reroll_count = Some(n.to_string());
+            }
+            "--range-diff" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--range-diff requires a value".into()))?;
+                options.range_diff = Some(value.clone());
+            }
+            value if let Some(previous) = value.strip_prefix("--range-diff=") => {
+                options.range_diff = Some(previous.to_string());
             }
             "--filename-max-length" => {
                 let value = iter.next().ok_or_else(|| {

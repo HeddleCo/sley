@@ -53,6 +53,7 @@ pub(crate) mod patch_id;
 pub(crate) mod plumbing;
 pub(crate) mod pull_strategy;
 pub(crate) mod read_tree;
+pub(crate) mod range_diff;
 pub(crate) mod rebase;
 pub(crate) mod ref_command_stream;
 pub(crate) mod refs;
