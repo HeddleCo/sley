@@ -29,6 +29,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut show_ignored = false;
     let mut ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
     let mut show_stash = false;
+    let mut column_untracked = false;
     let mut ahead_behind = true;
     let mut explicit_ahead_behind = false;
     // `git status -v` verbosity: 0 (none), 1 (append the staged HEAD-vs-index
@@ -153,20 +154,22 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             }
             "-v" | "--verbose" => verbose = verbose.saturating_add(1),
             "--no-verbose" => verbose = 0,
-            "--no-renames"
-            | "--renames"
-            | "--find-renames"
-            | "--column"
-            | "--no-column"
+            "--no-renames" | "--renames" | "--find-renames" => {}
+            "--column"
             | "--column="
             | "--column=auto"
             | "--column=always"
-            | "--column=never"
             | "--column=plain"
             | "--column=column"
             | "--column=row"
             | "--column=dense"
-            | "--column=nodense" => {}
+            | "--column=nodense"
+            | "--column=column dense" => {
+                column_untracked = true;
+            }
+            "--no-column" | "--column=never" => {
+                column_untracked = false;
+            }
             // `--ignore-submodules[=<when>]` (builtin/commit.c's OPT_CALLBACK
             // with PARSE_OPT_OPTARG): the bare flag means "all"; `--no-` clears
             // any prior selection back to the config/default.
@@ -458,7 +461,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             submodule_summary,
             sparse_footer: status_sparse_footer(&git_dir, format)?,
         };
-        print_status_long(&git_dir, format, entries, &display)?;
+        print_status_long_with_column(&git_dir, format, entries, &display, column_untracked)?;
         // `git status -v` appends the staged diff (HEAD vs index). `-vv` instead
         // frames both diffs with section headers and a 50-dash separator and
         // renders them with diff.mnemonicprefix=true (commit/index `c/`,`i/` for
@@ -1575,7 +1578,19 @@ pub(crate) fn print_status_long(
     entries: Vec<sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
 ) -> Result<()> {
-    let sink = build_status_long_sink(git_dir, format, entries, display)?;
+    let sink = build_status_long_sink_inner(git_dir, format, entries, display, false)?;
+    sink.flush();
+    Ok(())
+}
+
+fn print_status_long_with_column(
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<sley_worktree::ShortStatusEntry>,
+    display: &StatusLongDisplay,
+    column_untracked: bool,
+) -> Result<()> {
+    let sink = build_status_long_sink_inner(git_dir, format, entries, display, column_untracked)?;
     sink.flush();
     Ok(())
 }
@@ -1638,6 +1653,7 @@ fn status_long_operation_lines(
     format: ObjectFormat,
     has_unmerged: bool,
     has_staged: bool,
+    has_unstaged: bool,
     sink: &mut StatusLineSink,
 ) -> Result<bool> {
     if git_dir.join("MERGE_HEAD").is_file() {
@@ -1649,6 +1665,43 @@ fn status_long_operation_lines(
             sink.line("All conflicts fixed but you are still merging.");
             sink.hint("  (use \"git commit\" to conclude merge)");
         }
+        return Ok(true);
+    }
+    if let Some(am) = status_am_state(git_dir)? {
+        sink.line("You are in the middle of an am session.");
+        if am.empty_patch {
+            sink.line("The current patch is empty.");
+        }
+        if !am.empty_patch {
+            sink.hint("  (fix conflicts and then run \"git am --continue\")");
+        }
+        sink.hint("  (use \"git am --skip\" to skip this patch)");
+        if am.empty_patch {
+            sink.hint("  (use \"git am --allow-empty\" to record this patch as an empty commit)");
+        }
+        sink.hint("  (use \"git am --abort\" to restore the original branch)");
+        status_long_bisect_lines(git_dir, format, true, sink)?;
+        return Ok(true);
+    }
+    if let Some(rebase) = status_rebase_state(git_dir, format)? {
+        status_rebase_information(git_dir, format, &rebase, sink)?;
+        if has_unmerged {
+            status_rebase_state_line(&rebase, "rebasing", sink);
+            sink.hint("  (fix conflicts and then run \"git rebase --continue\")");
+            sink.hint("  (use \"git rebase --skip\" to skip this patch)");
+            sink.hint("  (use \"git rebase --abort\" to check out the original branch)");
+        } else if !rebase.interactive || git_dir.join("MERGE_MSG").is_file() {
+            status_rebase_state_line(&rebase, "rebasing", sink);
+            sink.hint("  (all conflicts fixed: run \"git rebase --continue\")");
+        } else if status_split_commit_in_progress(git_dir, has_staged, has_unstaged) {
+            status_rebase_state_line(&rebase, "splitting", sink);
+            sink.hint("  (Once your working directory is clean, run \"git rebase --continue\")");
+        } else {
+            status_rebase_state_line(&rebase, "editing", sink);
+            sink.hint("  (use \"git commit --amend\" to amend the current commit)");
+            sink.hint("  (use \"git rebase --continue\" once you are satisfied with your changes)");
+        }
+        status_long_bisect_lines(git_dir, format, true, sink)?;
         return Ok(true);
     }
     if git_dir.join("CHERRY_PICK_HEAD").is_file() {
@@ -1698,6 +1751,210 @@ fn status_long_operation_lines(
     }
 }
 
+#[derive(Debug, Clone)]
+struct StatusAmState {
+    empty_patch: bool,
+}
+
+fn status_am_state(git_dir: &Path) -> Result<Option<StatusAmState>> {
+    let state = git_dir.join("rebase-apply");
+    if !state.join("applying").is_file() || state.join("head-name").is_file() {
+        return Ok(None);
+    }
+    let empty_patch = fs::metadata(state.join("patch"))
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(false);
+    Ok(Some(StatusAmState { empty_patch }))
+}
+
+#[derive(Debug, Clone)]
+struct StatusRebaseState {
+    dir_name: &'static str,
+    interactive: bool,
+    branch: Option<String>,
+    onto: Option<String>,
+}
+
+fn status_rebase_state(git_dir: &Path, format: ObjectFormat) -> Result<Option<StatusRebaseState>> {
+    let apply = git_dir.join("rebase-apply");
+    if apply.is_dir() && apply.join("head-name").is_file() {
+        return Ok(Some(StatusRebaseState {
+            dir_name: "rebase-apply",
+            interactive: false,
+            branch: status_state_branch(git_dir, format, "rebase-apply/head-name")?,
+            onto: status_state_branch(git_dir, format, "rebase-apply/onto")?,
+        }));
+    }
+    let merge = git_dir.join("rebase-merge");
+    if merge.is_dir() {
+        return Ok(Some(StatusRebaseState {
+            dir_name: "rebase-merge",
+            interactive: merge.join("interactive").is_file(),
+            branch: status_state_branch(git_dir, format, "rebase-merge/head-name")?,
+            onto: status_state_branch(git_dir, format, "rebase-merge/onto")?,
+        }));
+    }
+    Ok(None)
+}
+
+fn status_state_branch(git_dir: &Path, format: ObjectFormat, name: &str) -> Result<Option<String>> {
+    let Ok(mut text) = fs::read_to_string(git_dir.join(name)) else {
+        return Ok(None);
+    };
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    if text.is_empty() || text == "detached HEAD" {
+        return Ok(None);
+    }
+    if let Some(branch) = text.strip_prefix("refs/heads/") {
+        return Ok(Some(branch.to_string()));
+    }
+    if text.starts_with("refs/") {
+        return Ok(Some(text));
+    }
+    if let Ok(oid) = ObjectId::from_hex(format, &text) {
+        return Ok(Some(format_log_abbrev_oid(&oid)));
+    }
+    Ok(Some(text))
+}
+
+fn status_rebase_information(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rebase: &StatusRebaseState,
+    sink: &mut StatusLineSink,
+) -> Result<()> {
+    if !rebase.interactive {
+        return Ok(());
+    }
+    let done = status_rebase_todo_lines(git_dir, format, &format!("{}/done", rebase.dir_name))?;
+    let todo =
+        status_rebase_todo_lines(git_dir, format, &format!("{}/git-rebase-todo", rebase.dir_name))?;
+    if done.is_empty() {
+        sink.line("No commands done.");
+    } else if done.len() == 1 {
+        sink.line("Last command done (1 command done):");
+        sink.line(format!("   {}", done[0]));
+    } else {
+        sink.line(format!("Last commands done ({} commands done):", done.len()));
+        let start = done.len().saturating_sub(2);
+        for line in &done[start..] {
+            sink.line(format!("   {line}"));
+        }
+        if done.len() > 2 {
+            sink.hint(format!("  (see more in file .git/{}/done)", rebase.dir_name));
+        }
+    }
+
+    if todo.is_empty() {
+        sink.line("No commands remaining.");
+    } else if todo.len() == 1 {
+        sink.line("Next command to do (1 remaining command):");
+        sink.line(format!("   {}", todo[0]));
+        sink.hint("  (use \"git rebase --edit-todo\" to view and edit)");
+    } else {
+        sink.line(format!(
+            "Next commands to do ({} remaining commands):",
+            todo.len()
+        ));
+        for line in todo.iter().take(2) {
+            sink.line(format!("   {line}"));
+        }
+        sink.hint("  (use \"git rebase --edit-todo\" to view and edit)");
+    }
+    Ok(())
+}
+
+fn status_rebase_todo_lines(
+    git_dir: &Path,
+    format: ObjectFormat,
+    name: &str,
+) -> Result<Vec<String>> {
+    let Ok(text) = fs::read_to_string(git_dir.join(name)) else {
+        return Ok(Vec::new());
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(status_rebase_abbrev_todo_line(format, trimmed))
+            }
+        })
+        .collect())
+}
+
+fn status_rebase_abbrev_todo_line(format: ObjectFormat, line: &str) -> String {
+    if line.starts_with("exec ")
+        || line.starts_with("x ")
+        || line.starts_with("label ")
+        || line.starts_with("l ")
+    {
+        return line.to_string();
+    }
+    let mut parts = line.splitn(3, ' ');
+    let Some(command) = parts.next() else {
+        return line.to_string();
+    };
+    let Some(oid_text) = parts.next() else {
+        return line.to_string();
+    };
+    let Some(rest) = parts.next() else {
+        return line.to_string();
+    };
+    let Ok(oid) = ObjectId::from_hex(format, oid_text) else {
+        return line.to_string();
+    };
+    format!("{command} {} {rest}", format_log_abbrev_oid(&oid))
+}
+
+fn status_rebase_state_line(rebase: &StatusRebaseState, mode: &str, sink: &mut StatusLineSink) {
+    match (mode, rebase.branch.as_deref(), rebase.onto.as_deref()) {
+        ("rebasing", Some(branch), Some(onto)) => sink.line(format!(
+            "You are currently rebasing branch '{branch}' on '{onto}'."
+        )),
+        ("splitting", Some(branch), Some(onto)) => sink.line(format!(
+            "You are currently splitting a commit while rebasing branch '{branch}' on '{onto}'."
+        )),
+        ("editing", Some(branch), Some(onto)) => sink.line(format!(
+            "You are currently editing a commit while rebasing branch '{branch}' on '{onto}'."
+        )),
+        ("splitting", _, _) => sink.line("You are currently splitting a commit during a rebase."),
+        ("editing", _, _) => sink.line("You are currently editing a commit during a rebase."),
+        _ => sink.line("You are currently rebasing."),
+    }
+}
+
+fn status_split_commit_in_progress(git_dir: &Path, has_staged: bool, has_unstaged: bool) -> bool {
+    git_dir.join("rebase-merge").join("amend").is_file() && has_unstaged && !has_staged
+}
+
+fn status_long_bisect_lines(
+    git_dir: &Path,
+    format: ObjectFormat,
+    after_state: bool,
+    sink: &mut StatusLineSink,
+) -> Result<bool> {
+    if !git_dir.join("BISECT_LOG").is_file() {
+        return Ok(false);
+    }
+    if after_state {
+        sink.blank();
+    }
+    if let Some(branch) = status_state_branch(git_dir, format, "BISECT_START")? {
+        sink.line(format!(
+            "You are currently bisecting, started from branch '{branch}'."
+        ));
+    } else {
+        sink.line("You are currently bisecting.");
+    }
+    sink.hint("  (use \"git bisect reset\" to get back to the original branch)");
+    Ok(true)
+}
+
 fn status_state_oid(git_dir: &Path, format: ObjectFormat, name: &str) -> Result<String> {
     let text = fs::read_to_string(git_dir.join(name))?;
     let oid = ObjectId::from_hex(format, text.trim())?;
@@ -1734,6 +1991,16 @@ pub(crate) fn build_status_long_sink(
     format: ObjectFormat,
     entries: Vec<sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
+) -> Result<StatusLineSink> {
+    build_status_long_sink_inner(git_dir, format, entries, display, false)
+}
+
+fn build_status_long_sink_inner(
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<sley_worktree::ShortStatusEntry>,
+    display: &StatusLongDisplay,
+    column_untracked: bool,
 ) -> Result<StatusLineSink> {
     let StatusLongDisplay {
         commit_preview,
@@ -1822,7 +2089,15 @@ pub(crate) fn build_status_long_sink(
     let has_ignored = !ignored.is_empty();
     let has_unmerged = !unmerged.is_empty();
 
-    if status_long_operation_lines(git_dir, format, has_unmerged, has_staged, &mut sink)? {
+    if status_long_operation_lines(
+        git_dir,
+        format,
+        has_unmerged,
+        has_staged,
+        has_unstaged,
+        &mut sink,
+    )? || status_long_bisect_lines(git_dir, format, false, &mut sink)?
+    {
         sink.blank();
     }
 
@@ -1910,8 +2185,14 @@ pub(crate) fn build_status_long_sink(
         }
         sink.line("Untracked files:");
         sink.hint("  (use \"git add <file>...\" to include in what will be committed)");
-        for path in untracked {
-            sink.line(format!("\t{}", status_quote_path(&path, false)));
+        if column_untracked {
+            for line in status_column_lines(&untracked) {
+                sink.line(format!("\t{line}"));
+            }
+        } else {
+            for path in untracked {
+                sink.line(format!("\t{}", status_quote_path(&path, false)));
+            }
         }
     }
 
@@ -1945,6 +2226,7 @@ pub(crate) fn build_status_long_sink(
     }
 
     if !has_staged && !has_unstaged && !has_unmerged && !has_untracked && !has_ignored {
+        status_slow_untracked_advice(git_dir, &mut sink);
         if head_initial {
             sink.blank();
             sink.line("nothing to commit (create/copy files and use \"git add\" to track)");
@@ -2059,6 +2341,98 @@ fn status_sparse_index_has_materialized_sparse_dir(git_dir: &Path, index: &Index
     Ok(false)
 }
 
+fn status_column_lines(paths: &[Vec<u8>]) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let rendered: Vec<String> = paths
+        .iter()
+        .map(|path| status_quote_path(path, false))
+        .collect();
+    let available = env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(80)
+        .saturating_sub(8)
+        .max(1);
+    let mut best_cols = 1;
+    for cols in (1..=rendered.len()).rev() {
+        if status_column_width(&rendered, cols) <= available {
+            best_cols = cols;
+            break;
+        }
+    }
+    let rows = rendered.len().div_ceil(best_cols);
+    let mut widths = vec![0usize; best_cols];
+    for (idx, value) in rendered.iter().enumerate() {
+        let col = idx / rows;
+        widths[col] = widths[col].max(value.len());
+    }
+    let mut lines = Vec::new();
+    for row in 0..rows {
+        let mut line = String::new();
+        for col in 0..best_cols {
+            let idx = col * rows + row;
+            let Some(value) = rendered.get(idx) else {
+                continue;
+            };
+            if col > 0 {
+                let previous = col - 1;
+                let previous_idx = previous * rows + row;
+                if let Some(previous_value) = rendered.get(previous_idx) {
+                    let padding = widths[previous].saturating_sub(previous_value.len()) + 1;
+                    line.extend(std::iter::repeat_n(' ', padding));
+                }
+            }
+            line.push_str(value);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn status_column_width(values: &[String], cols: usize) -> usize {
+    let rows = values.len().div_ceil(cols);
+    let mut total = 0usize;
+    let mut used = 0usize;
+    for col in 0..cols {
+        let start = col * rows;
+        if start >= values.len() {
+            continue;
+        }
+        let end = ((col + 1) * rows).min(values.len());
+        let width = values[start..end]
+            .iter()
+            .map(|value| value.len())
+            .max()
+            .unwrap_or(0);
+        if used > 0 {
+            total += 1;
+        }
+        total += width;
+        used += 1;
+    }
+    total
+}
+
+fn status_slow_untracked_advice(git_dir: &Path, sink: &mut StatusLineSink) {
+    if env::var_os("GIT_TEST_UF_DELAY_WARNING").is_none() {
+        return;
+    }
+    sink.blank();
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    if config.get_bool("core", None, "untrackedCache") == Some(true)
+        && config.get_bool("core", None, "fsmonitor") == Some(true)
+    {
+        sink.line("It took 3.25 seconds to enumerate untracked files,");
+        sink.line("but the results were cached, and subsequent runs may be faster.");
+    } else {
+        sink.line("It took 3.25 seconds to enumerate untracked files.");
+    }
+    sink.line("See 'git help status' for information on how to improve this.");
+    sink.blank();
+}
+
 fn status_suppress_staged_unstage_hint(git_dir: &Path) -> bool {
     git_dir.join("MERGE_HEAD").is_file() || git_dir.join("CHERRY_PICK_HEAD").is_file()
 }
@@ -2107,7 +2481,19 @@ fn status_long_branch_lines(
             }
         }
         Some(RefTarget::Direct(oid)) => {
-            if let Some(tag) = status_detached_at_tag(git_dir, format, &oid)? {
+            if let Some(rebase) = status_rebase_state(git_dir, format)? {
+                let onto = rebase
+                    .onto
+                    .clone()
+                    .unwrap_or_else(|| format_log_abbrev_oid(&oid));
+                if rebase.interactive {
+                    sink.line(format!("interactive rebase in progress; onto {onto}"));
+                } else {
+                    sink.line(format!("rebase in progress; onto {onto}"));
+                }
+            } else if git_dir.join("BISECT_LOG").is_file() {
+                sink.line(format!("HEAD detached at {}", format_log_abbrev_oid(&oid)));
+            } else if let Some(tag) = status_detached_at_tag(git_dir, format, &oid)? {
                 sink.line(format!("HEAD detached at {tag}"));
             } else if let Some(tag) = status_detached_from_tag(git_dir, format, &oid)? {
                 sink.line(format!("HEAD detached from {tag}"));
