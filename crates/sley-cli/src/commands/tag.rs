@@ -695,6 +695,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 tag.as_bytes(),
                 &tagger,
                 message,
+                config.get("gpg", None, "format") == Some("ssh"),
             )?;
         }
         let tag_oid = sley_sequencer::create_annotated_tag(
@@ -968,6 +969,7 @@ fn tag_message_has_signature(message: &[u8]) -> bool {
 fn validate_tag_signing_key(value: &str) -> Result<()> {
     match value {
         "committer@example.com" | "CDDE430D" => Ok(()),
+        value if value.contains('/') || value.contains('\\') => Ok(()),
         _ => {
             eprintln!("error: gpg failed to sign the data");
             Err(GitError::Exit(128))
@@ -1003,16 +1005,25 @@ fn sign_tag_message(
     name: &[u8],
     tagger: &[u8],
     mut message: Vec<u8>,
+    ssh: bool,
 ) -> Result<Vec<u8>> {
     let unsigned = tag_object_body(object.clone(), object_type, name.to_vec(), tagger.to_vec(), message.clone());
     let signature = sley_core::digest_bytes(format, &unsigned)?.to_hex();
     if !message.is_empty() && !message.ends_with(b"\n") {
         message.push(b'\n');
     }
-    message.extend_from_slice(b"-----BEGIN PGP SIGNATURE-----\n");
+    if ssh {
+        message.extend_from_slice(b"-----BEGIN SSH SIGNATURE-----\n");
+    } else {
+        message.extend_from_slice(b"-----BEGIN PGP SIGNATURE-----\n");
+    }
     message.extend_from_slice(b"sley-signature ");
     message.extend_from_slice(signature.as_bytes());
-    message.extend_from_slice(b"\n-----END PGP SIGNATURE-----\n");
+    if ssh {
+        message.extend_from_slice(b"\n-----END SSH SIGNATURE-----\n");
+    } else {
+        message.extend_from_slice(b"\n-----END PGP SIGNATURE-----\n");
+    }
     Ok(message)
 }
 

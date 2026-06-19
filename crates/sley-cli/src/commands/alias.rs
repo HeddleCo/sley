@@ -68,6 +68,7 @@ pub(crate) fn is_builtin_command(command: &str) -> bool {
             | "log"
             | "merge"
             | "merge-base"
+            | "fmt-merge-msg"
             | "pull"
             | "rebase"
             | "cherry-pick"
