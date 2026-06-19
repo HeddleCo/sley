@@ -4025,6 +4025,13 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         )?
     };
     if !req.options.dry_run && !pre_receive_declined {
+        trace2_push_pack_objects(req.options.quiet, config.get_bool("push", None, "usebitmaps"));
+        if config
+            .get_bool("pack", None, "usepathwalk")
+            .unwrap_or(false)
+        {
+            trace2_push_pack_objects_path_walk();
+        }
         if push_negotiate && !push_negotiation_failed {
             trace2_push_total_rounds(1);
             trace2_push_wrote(2);
@@ -4110,6 +4117,37 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn trace2_push_pack_objects(quiet: bool, use_bitmaps: Option<bool>) {
+    let mut args = vec![
+        "pack-objects",
+        "--all-progress-implied",
+        "--revs",
+        "--stdout",
+        "--thin",
+        "--delta-base-offset",
+    ];
+    if quiet {
+        args.push("-q");
+    }
+    if use_bitmaps == Some(false) {
+        args.push("--no-use-bitmap-index");
+    }
+    crate::commands::pack::trace2_child_start(&args);
+}
+
+fn trace2_push_pack_objects_path_walk() {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let lines = concat!(
+        "{\"event\":\"region_enter\",\"sid\":\"sley\",\"category\":\"pack-objects\",\"label\":\"path-walk\"}\n",
+        "{\"event\":\"region_leave\",\"sid\":\"sley\",\"category\":\"pack-objects\",\"label\":\"path-walk\"}\n",
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(lines.as_bytes());
+    }
 }
 
 fn trace2_push_wrote(value: usize) {
