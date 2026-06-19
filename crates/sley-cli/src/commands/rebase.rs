@@ -2844,6 +2844,7 @@ fn checkout_onto_base(
         format!("{}\n", opts.orig_head),
     )?;
     run_rebase_post_checkout_hook(&old, base)?;
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
     Ok(())
 }
 
