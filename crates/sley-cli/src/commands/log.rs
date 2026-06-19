@@ -2584,6 +2584,29 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         );
         selected.retain(|r| on_path.contains(&r.oid));
     }
+    if saw_follow && !pathspecs.is_empty() {
+        let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
+        let ordered_owned: Vec<sley_rev::CommitRecord> = commits.clone();
+        let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
+        let _ = sley_rev::simplify_history_with_bottoms(
+            &db,
+            format,
+            ordered_owned,
+            &pathspec,
+            sley_rev::SimplifyOptions {
+                full_history,
+                first_parent,
+                simplify_merges: revision_options.simplify_merges,
+                show_pulls: revision_options.show_pulls,
+                ancestry_path: revision_options.ancestry_path,
+                want_ancestry: show_parents
+                    || show_children
+                    || graph
+                    || revision_options.simplify_merges,
+            },
+            &bottoms,
+        )?;
+    }
     let follow_applied = saw_follow && pathspecs.len() == 1 && !full_history && !revision_options.simplify_merges;
     if follow_applied {
         selected = log_follow_single_path(
