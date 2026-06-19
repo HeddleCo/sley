@@ -6732,10 +6732,12 @@ fn bundle_create_selection(
     }
 
     let excluded_objects = collect_reachable_object_ids(db, format, excludes.iter().copied())?;
-    let mut references = filter_bundle_references(git_dir, format, db, includes, options)?;
+    let mut references =
+        filter_bundle_references(git_dir, format, db, includes, options, &excluded_objects)?;
     dedupe_bundle_references(&mut references);
     let starts = references.iter().map(|reference| reference.oid).collect::<Vec<_>>();
-    let prerequisites = bundle_boundary_prerequisites(db, format, &starts, &excluded_objects)?;
+    let mut prerequisites = bundle_boundary_prerequisites(db, format, &starts, &excluded_objects)?;
+    order_bundle_prerequisites(db, format, &mut prerequisites, &excludes);
     Ok(BundleCreateSelection {
         references,
         prerequisites,
@@ -6821,8 +6823,16 @@ fn filter_bundle_references(
     db: &FileObjectDatabase,
     includes: Vec<BundleSpec>,
     options: &BundleRevisionOptions,
+    excluded_objects: &HashSet<ObjectId>,
 ) -> Result<Vec<BundleReference>> {
     let mut refs = includes;
+    refs.retain(|reference| {
+        if !excluded_objects.contains(&reference.oid) {
+            return true;
+        }
+        db.read_object(&reference.oid)
+            .is_ok_and(|object| object.object_type == ObjectType::Tag)
+    });
     if let Some(since) = options.since {
         refs.retain(|reference| {
             bundle_object_timestamp(db, format, &reference.oid)
@@ -6968,6 +6978,41 @@ fn bundle_boundary_prerequisites(
         }
     }
     Ok(prerequisites)
+}
+
+fn order_bundle_prerequisites(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    prerequisites: &mut [BundlePrerequisite],
+    exclude_tips: &[ObjectId],
+) {
+    let exact_rank = exclude_tips
+        .iter()
+        .enumerate()
+        .map(|(idx, oid)| (*oid, idx))
+        .collect::<HashMap<_, _>>();
+    let has_exact = prerequisites
+        .iter()
+        .any(|prerequisite| exact_rank.contains_key(&prerequisite.oid));
+    prerequisites.sort_by(|left, right| {
+        match (
+            exact_rank.get(&left.oid).copied(),
+            exact_rank.get(&right.oid).copied(),
+        ) {
+            (Some(left_rank), Some(right_rank)) => left_rank.cmp(&right_rank),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                let left_time = bundle_object_timestamp(db, format, &left.oid).unwrap_or(0);
+                let right_time = bundle_object_timestamp(db, format, &right.oid).unwrap_or(0);
+                if has_exact {
+                    left_time.cmp(&right_time)
+                } else {
+                    right_time.cmp(&left_time)
+                }
+            }
+        }
+    });
 }
 
 fn bundle_is_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<bool> {
