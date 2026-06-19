@@ -996,9 +996,6 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         },
     )?;
     let git_dir = outcome.git_dir;
-    if local_mechanism && alternates.is_empty() {
-        copy_local_object_store(&remote_common_git_dir_for_head, &git_dir)?;
-    }
     if outcome.empty {
         warn_cloned_empty_repository();
     } else if !checkout {
@@ -2097,34 +2094,6 @@ fn copy_local_revision_objects(
         std::iter::once(*revision_oid),
     )
     .map(|_| ())
-}
-
-fn copy_local_object_store(remote_git_dir: &Path, git_dir: &Path) -> Result<()> {
-    let source = remote_git_dir.join("objects");
-    let destination = git_dir.join("objects");
-    copy_local_object_store_entries(&source, &destination)
-}
-
-fn copy_local_object_store_entries(source: &Path, destination: &Path) -> Result<()> {
-    if !source.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let source_path = entry.path();
-        let destination_path = destination.join(&name);
-        if source_path.is_dir() {
-            copy_local_object_store_entries(&source_path, &destination_path)?;
-        } else if !destination_path.exists() {
-            if let Some(parent) = destination_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(source_path, destination_path)?;
-        }
-    }
-    Ok(())
 }
 
 fn apply_clone_bundle_uri(
