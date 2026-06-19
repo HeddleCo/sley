@@ -256,6 +256,7 @@ pub(crate) enum MergePathResult {
 
 type MergePathResults = BTreeMap<Vec<u8>, MergePathResult>;
 type MergeConflictPaths = Vec<Vec<u8>>;
+type MergeInfoMessages = Vec<sley_diff_merge::MergeInfoMessage>;
 
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
 /// to the ODB and returns per-path results plus the sorted list of conflicted
@@ -462,6 +463,34 @@ fn three_way_merge_trees_inner(
     favor: sley_diff_merge::MergeFavor,
     style: sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
+    let (results, conflicts, _) = three_way_merge_trees_inner_with_info(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        favor,
+        style,
+    )?;
+    Ok((results, conflicts))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn three_way_merge_trees_inner_with_info(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    favor: sley_diff_merge::MergeFavor,
+    style: sley_diff_merge::ConflictStyle,
+) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     let merge = sley_diff_merge::merge_entry_maps(
         db,
         format,
@@ -488,6 +517,7 @@ fn three_way_merge_trees_inner(
 
     let mut results = BTreeMap::new();
     let mut conflicts = Vec::new();
+    let info_messages = merge.info_messages.clone();
     let cleanup_paths = merge.cleanup_paths;
     for entry in merge.paths {
         // A directory-rename location "conflict" (=conflict mode) is purely
@@ -540,7 +570,7 @@ fn three_way_merge_trees_inner(
             .entry(path)
             .or_insert(MergePathResult::Resolved(None));
     }
-    Ok((results, conflicts))
+    Ok((results, conflicts, info_messages))
 }
 
 /// Render git merge's post-merge `--stat`/`--compact-summary` block.
@@ -2607,7 +2637,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir)?
     };
 
-    let (results, conflicts) = three_way_merge_trees_with_favor(
+    let (results, conflicts, info_messages) = three_way_merge_trees_inner_with_info(
         &write_db,
         format,
         &base_map,
@@ -2615,7 +2645,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         &theirs_map,
         &ours_label,
         &theirs_label,
+        "merged common ancestors",
         options.favor,
+        sley_diff_merge::ConflictStyle::Merge,
     )?;
 
     // git's pre-merge `verify_uptodate` (unpack-trees): a real 3-way merge
@@ -2724,6 +2756,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if !options.quiet {
             let mut stdout = io::stdout();
             let strategy = if options.resolve_strategy { "resolve" } else { "ort" };
+            print_merge_info_messages(&info_messages);
             if options.resolve_strategy {
                 writeln!(stdout, "Wonderful.")?;
             }
@@ -2892,6 +2925,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     if options.squash {
         write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
         fs::write(git_dir.join("MERGE_MSG"), &conflicts_block)?;
+        print_merge_info_messages(&info_messages);
         print_merge_conflict_messages(&results);
         println!("Squash commit -- not updating HEAD");
         if merge_autostash {
@@ -2913,9 +2947,53 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     }
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
+    print_merge_info_messages(&info_messages);
     print_merge_conflict_messages(&results);
     eprintln!("Automatic merge failed; fix conflicts and then commit the result.");
     Err(GitError::Exit(1))
+}
+
+fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
+    for message in messages {
+        match message {
+            sley_diff_merge::MergeInfoMessage::DirRenameSkippedDueToRerename {
+                old_dir,
+                path,
+                new_dir,
+            } => {
+                println!(
+                    "WARNING: Avoiding applying {} -> {} rename to {}, because {} itself was renamed.",
+                    String::from_utf8_lossy(old_dir),
+                    String::from_utf8_lossy(new_dir),
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(new_dir),
+                );
+            }
+            sley_diff_merge::MergeInfoMessage::DirRenameApplied {
+                old_path,
+                new_path,
+                renamed_from,
+                added_in,
+                dir_renamed_in,
+            } => match renamed_from {
+                Some(source) => println!(
+                    "Path updated: {} renamed to {} in {}, inside a directory that was renamed in {}; moving it to {}.",
+                    String::from_utf8_lossy(source),
+                    String::from_utf8_lossy(old_path),
+                    added_in,
+                    dir_renamed_in,
+                    String::from_utf8_lossy(new_path),
+                ),
+                None => println!(
+                    "Path updated: {} added in {} inside a directory that was renamed in {}; moving it to {}.",
+                    String::from_utf8_lossy(old_path),
+                    added_in,
+                    dir_renamed_in,
+                    String::from_utf8_lossy(new_path),
+                ),
+            },
+        }
+    }
 }
 
 /// Emit git's per-path merge conflict notices, in path order, from the reshaped
@@ -3021,9 +3099,15 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     .map(|s| String::from_utf8_lossy(s).into_owned())
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!(
-                    "CONFLICT (implicit dir rename): Existing file/dir at {path_str} in the way of implicit directory rename(s) putting the following path(s) there: {source_list}."
-                );
+                if sources.len() > 1 {
+                    println!(
+                        "CONFLICT (implicit dir rename): Cannot map more than one path to {path_str}; implicit directory renames tried to put these paths there: {source_list}"
+                    );
+                } else {
+                    println!(
+                        "CONFLICT (implicit dir rename): Existing file/dir at {path_str} in the way of implicit directory rename(s) putting the following path(s) there: {source_list}."
+                    );
+                }
             }
             None => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
