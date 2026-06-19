@@ -449,6 +449,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut show_eol = false;
     let mut debug = false;
     let mut sparse = false;
+    let mut tag = false;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -515,6 +516,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-debug" => debug = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
+            "-t" => tag = true,
+            "--no-t" => tag = false,
             "--recurse-submodules"
             | "--no-recurse-submodules"
             | "--no-killed"
@@ -553,7 +556,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             value if !value.starts_with('-') => path_args.push(arg.clone()),
             value => {
                 return Err(GitError::Command(format!(
-                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --debug, --abbrev[=<n>], --no-abbrev, and -z"
+                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --debug, -t, --abbrev[=<n>], --no-abbrev, and -z"
                 )));
             }
         }
@@ -596,6 +599,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         && !output_stage
         && !show_eol
         && !debug
+        && !tag
         && oid_abbrev.is_none()
         && !nul
         && path_args.is_empty()
@@ -699,6 +703,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         oid_candidates: &oid_candidates,
                         eol,
                         debug,
+                        tag,
                     },
                 )?;
             } else {
@@ -717,6 +722,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         oid_candidates: &oid_candidates,
                         eol,
                         debug,
+                        tag,
                     },
                 )?;
             }
@@ -740,6 +746,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 &oid_candidates,
                 eol,
                 debug,
+                tag,
             )?;
         } else if (deleted || modified) && output_stage {
             write_ls_files_index_with_selected(
@@ -757,6 +764,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                     oid_candidates: &oid_candidates,
                     eol,
                     debug,
+                    tag,
                 },
             )?;
         } else {
@@ -770,6 +778,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 &oid_candidates,
                 eol,
                 debug,
+                tag,
             )?;
         }
     }
@@ -816,6 +825,7 @@ fn write_ls_files_unmerged<'a>(
     oid_candidates: &[ObjectId],
     eol: Option<&EolContext>,
     debug: bool,
+    tag: bool,
 ) -> Result<()> {
     for entry in entries {
         if index_entry_stage(entry) == 0 {
@@ -831,6 +841,7 @@ fn write_ls_files_unmerged<'a>(
             oid_candidates,
             eol,
             debug,
+            tag,
         )?;
     }
     Ok(())
@@ -847,6 +858,7 @@ fn write_ls_files_index<'a>(
     oid_candidates: &[ObjectId],
     eol: Option<&EolContext>,
     debug: bool,
+    tag: bool,
 ) -> Result<()> {
     for entry in entries {
         let Some(path) = pathspec.display(&entry.path) else {
@@ -857,6 +869,9 @@ fn write_ls_files_index<'a>(
             // field reflects the index blob only for regular files.
             let index_oid = is_regular_file_mode(entry.mode).then_some(&entry.oid);
             eol.write_prefix(stdout, &entry.path, index_oid)?;
+        }
+        if tag {
+            write!(stdout, "{} ", ls_files_tag(entry))?;
         }
         if stage {
             let stage = index_entry_stage(entry);
@@ -926,6 +941,7 @@ fn write_ls_files_index_with_selected<'a>(
             options.oid_candidates,
             options.eol,
             options.debug,
+            options.tag,
         )?;
     }
     Ok(())
@@ -993,6 +1009,9 @@ fn write_ls_files_entry(
     if let Some(eol) = options.eol {
         let index_oid = is_regular_file_mode(entry.mode).then_some(&entry.oid);
         eol.write_prefix(stdout, &entry.path, index_oid)?;
+    }
+    if options.tag {
+        write!(stdout, "{} ", ls_files_tag(entry))?;
     }
     if options.stage {
         let stage = index_entry_stage(entry);
@@ -1079,6 +1098,15 @@ struct LsFilesWriteOptions<'a> {
     oid_candidates: &'a [ObjectId],
     eol: Option<&'a EolContext>,
     debug: bool,
+    tag: bool,
+}
+
+fn ls_files_tag(entry: &sley_index::IndexEntry) -> char {
+    if entry.is_skip_worktree() {
+        'S'
+    } else {
+        'H'
+    }
 }
 
 pub(crate) fn cmd_ls_tree(args: &[String]) -> Result<()> {
@@ -1999,6 +2027,10 @@ fn parse_update_index_cacheinfo_split(
 ) -> Result<CliCacheInfoEntry> {
     let mode = u32::from_str_radix(mode, 8)
         .map_err(|_| GitError::Command(format!("invalid update-index --cacheinfo mode {mode}")))?;
+    if mode == sley_index::SPARSE_DIR_MODE && path.ends_with('/') {
+        eprintln!("error: option 'cacheinfo' cannot add sparse directory '{path}'");
+        return Err(GitError::Exit(128));
+    }
     Ok(CliCacheInfoEntry {
         mode,
         oid: oid.to_string(),

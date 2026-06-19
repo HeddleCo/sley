@@ -412,6 +412,37 @@ pub mod trace2 {
         }
     }
 
+    /// Emit a trace2 region enter/leave pair. This is the minimal event shape
+    /// Git's `test_region` helper greps for when asserting sparse-index
+    /// expansion and conversion behaviour.
+    pub fn region(category: &str, label: &str) {
+        region_event("region_enter", category, label);
+        region_event("region_leave", category, label);
+    }
+
+    fn region_event(event: &str, category: &str, label: &str) {
+        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if !target.starts_with('/') {
+            return;
+        }
+        let line = format!(
+            "{{\"event\":\"{}\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"{}\",\"label\":\"{}\"}}\n",
+            escape_json(event),
+            escape_json(category),
+            escape_json(label),
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
     /// Emit the trace2 perf payload used by Git's changed-path Bloom filter
     /// tests. This intentionally writes only the grep-stable statistics string.
     pub fn bloom_statistics(
