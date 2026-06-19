@@ -1382,7 +1382,7 @@ fn normalize_push_refspec_for_sources(
     let normalized = if let Some((src, dst)) = refspec.split_once(':') {
         let (src, src_kind) = normalize_push_source_refname(src, local_refs);
         let dst = normalize_push_destination_refname(dst, src_kind, remote_refs)?;
-        if !src.is_empty() && push_destination_is_onelevel_under_refs(&dst) {
+        if !src.is_empty() && !dst.contains('*') && push_destination_is_onelevel_under_refs(&dst) {
             return Err(GitError::Command(format!(
                 "destination refspec {dst} is not a valid ref"
             )));
