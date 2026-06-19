@@ -1246,6 +1246,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut ignore_removal = false;
     let mut ignore_missing = false;
     let mut intent_to_add = false;
+    let mut sparse = false;
+    let mut refresh = false;
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -1282,6 +1284,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
             "--ignore-missing" => ignore_missing = true,
             "--no-ignore-missing" => ignore_missing = false,
+            "--refresh" => refresh = true,
+            "--no-refresh" => refresh = false,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--chmod" => {
@@ -1297,7 +1301,9 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     .expect("prefix checked by match guard");
                 chmod = Some(parse_add_chmod(value)?);
             }
-            "--ignore-errors" | "--no-ignore-errors" | "--sparse" | "--no-sparse" => {}
+            "--ignore-errors" | "--no-ignore-errors" => {}
+            "--sparse" => sparse = true,
+            "--no-sparse" => sparse = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -1377,6 +1383,10 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    if refresh {
+        refresh_index_after_add(&worktree_root, &git_dir, format, &paths)?;
+        return Ok(());
+    }
     if intent_to_add && !dry_run {
         return add_intent_to_add(&cwd, &worktree_root, &git_dir, format, &paths);
     }
@@ -1394,6 +1404,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 ignore_removal,
                 ignore_missing,
                 dry_run,
+                sparse,
             },
         )?
     {
@@ -1492,6 +1503,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     chmod,
                     info_only: false,
                     ignore_skip_worktree_entries: false,
+                    allow_skip_worktree_entries: sparse,
                 },
                 &config,
             )?;
@@ -1520,6 +1532,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             ignore_removal,
             ignore_missing,
             dry_run,
+            sparse,
         },
         parsed_index,
     )?;
@@ -1588,6 +1601,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             chmod,
             info_only: false,
             ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: sparse,
         };
         if let Some(index) = reusable_index.take() {
             sley_worktree::update_index_paths_filtered_with_index(
@@ -1728,6 +1742,7 @@ fn try_add_regular_exact_tracked_raw(
         || options.chmod.is_some()
         || options.force
         || options.ignore_missing
+        || options.sparse
     {
         return Ok(None);
     }
@@ -1786,11 +1801,10 @@ fn refresh_index_after_add(
     format: ObjectFormat,
     refresh_paths: &[PathBuf],
 ) -> Result<()> {
-    // Pathspecs here may be directories or `.`; refresh_index_paths matches by
-    // exact entry path, so a directory pathspec would refresh nothing. To stay
-    // faithful to git (refresh everything the pathspec covers) we pass the empty
-    // set — refreshing all tracked entries — whenever a non-file pathspec is
-    // present; a pure set of file pathspecs refreshes just those entries.
+    // Pathspecs here may be directories or `.`. Passing an empty set preserves
+    // the fast all-entry refresh path for non-file pathspecs; pure file
+    // pathspecs still force the checked refresh path, matching git's
+    // "needs update" handling without staging changed content.
     let only_files = !refresh_paths.is_empty()
         && refresh_paths.iter().all(|path| {
             let absolute = if path.is_absolute() {
@@ -2067,6 +2081,7 @@ struct AddRegularOptions {
     ignore_removal: bool,
     ignore_missing: bool,
     dry_run: bool,
+    sparse: bool,
 }
 
 struct AddRegularResolution {
@@ -2094,6 +2109,7 @@ fn resolve_add_regular_actions(
     options: AddRegularOptions,
     reusable_index: Option<Index>,
 ) -> Result<AddRegularResolution> {
+    reject_add_paths_outside_sparse_checkout(cwd, worktree_root, git_dir, &paths, options)?;
     if let Some(exact) = resolve_add_regular_tracked_exact_actions(
         cwd,
         worktree_root,
@@ -2201,6 +2217,7 @@ fn resolve_add_regular_tracked_exact_actions(
     options: AddRegularOptions,
     index: Option<&Index>,
 ) -> Result<Option<TrackedExactResolution>> {
+    reject_add_paths_outside_sparse_checkout(cwd, worktree_root, git_dir, paths, options)?;
     if paths.is_empty() || options.chmod.is_some() || options.force || options.dry_run {
         return Ok(None);
     }
@@ -2287,6 +2304,114 @@ fn resolve_add_regular_tracked_exact_actions(
         actions,
         exact_tracked,
     }))
+}
+
+fn reject_add_paths_outside_sparse_checkout(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    paths: &[PathBuf],
+    options: AddRegularOptions,
+) -> Result<()> {
+    if options.sparse || paths.is_empty() {
+        return Ok(());
+    }
+    let Some(active) = active_sparse_checkout_for_add(git_dir)? else {
+        return Ok(());
+    };
+    let mut rejected = Vec::new();
+    for path in paths {
+        if add_pathspec_needs_status_walk(path) {
+            continue;
+        }
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty()
+            || relative == Path::new(".")
+            || relative == Path::new("")
+        {
+            continue;
+        }
+        let mut git_path = match add_git_path_bytes(relative) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if git_path.is_empty() {
+            continue;
+        }
+        if fs::symlink_metadata(&absolute)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
+            && !git_path.ends_with(b"/")
+        {
+            git_path.push(b'/');
+        }
+        if !sley_worktree::path_in_sparse_checkout(&git_path, &active.sparse, active.mode) {
+            rejected.push(path.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    eprintln!("The following paths and/or pathspecs matched paths that exist");
+    eprintln!("outside of your sparse-checkout definition, so will not be");
+    eprintln!("updated in the index:");
+    for path in rejected {
+        eprintln!("{path}");
+    }
+    eprintln!("hint: If you intend to update such entries, try one of the following:");
+    eprintln!("hint: * Use the --sparse option.");
+    eprintln!("hint: * Disable or modify the sparsity rules.");
+    eprintln!("hint: Disable this message with \"git config set advice.updateSparsePath false\"");
+    Err(GitError::Exit(1))
+}
+
+struct ActiveSparseCheckoutForAdd {
+    sparse: sley_worktree::SparseCheckout,
+    mode: sley_worktree::SparseCheckoutMode,
+}
+
+fn active_sparse_checkout_for_add(git_dir: &Path) -> Result<Option<ActiveSparseCheckoutForAdd>> {
+    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let sparse_enabled = worktree_config
+        .get_bool("core", None, "sparseCheckout")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return Ok(None);
+    }
+    let sparse_file = git_dir.join("info").join("sparse-checkout");
+    if !sparse_file.exists() {
+        return Ok(None);
+    }
+    let mut patterns: Vec<Vec<u8>> = fs::read(sparse_file)?
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    if patterns.last().map(Vec::is_empty) == Some(true) {
+        patterns.pop();
+    }
+    let cone = worktree_config
+        .get_bool("core", None, "sparseCheckoutCone")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
+        .unwrap_or(false);
+    let sparse = sley_worktree::SparseCheckout {
+        patterns,
+        sparse_index: false,
+    };
+    let mode = if cone {
+        sley_worktree::SparseCheckoutMode::Cone
+    } else {
+        sley_worktree::SparseCheckoutMode::Full
+    };
+    Ok(Some(ActiveSparseCheckoutForAdd { sparse, mode }))
 }
 
 fn add_pathspec_needs_status_walk(path: &Path) -> bool {
@@ -2760,6 +2885,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 chmod: None,
                 info_only: false,
                 ignore_skip_worktree_entries: false,
+                allow_skip_worktree_entries: false,
             },
             &config,
         )?;

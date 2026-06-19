@@ -1705,6 +1705,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 chmod,
                 info_only,
                 ignore_skip_worktree_entries,
+                allow_skip_worktree_entries: false,
             },
         )?;
     } else if let Some(index_version) = index_version {
@@ -1751,6 +1752,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 chmod: None,
                 info_only: false,
                 ignore_skip_worktree_entries,
+                allow_skip_worktree_entries: false,
             },
             &config,
             verbose,
