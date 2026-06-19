@@ -229,6 +229,8 @@ pub enum PushRefStatus {
     RejectStale,
     /// `--force-if-includes`: tracking ref was updated but not integrated.
     RejectRemoteUpdated,
+    /// Non-forced tag update where the remote tag already exists.
+    RejectAlreadyExists,
     /// The receive-pack side reported `ng <ref> <message>`.
     RemoteReject(String),
     /// Part of an `--atomic` push that failed because a sibling ref was rejected.
@@ -1021,6 +1023,7 @@ pub fn push_local_with_report(
             PushRefStatus::RejectNonFastForward
                 | PushRefStatus::RejectStale
                 | PushRefStatus::RejectRemoteUpdated
+                | PushRefStatus::RejectAlreadyExists
         )
     });
 
@@ -1203,6 +1206,14 @@ fn classify_push_command(
 
     // Non-fast-forward branch update: rejected unless forced. Creations,
     // deletions, and non-branch refs skip this gate (matching git's send-pack).
+    if !plan.force
+        && command.name.starts_with("refs/tags/")
+        && !command.old_id.is_null()
+        && !command.new_id.is_null()
+    {
+        return Ok(PushRefStatus::RejectAlreadyExists);
+    }
+
     if !plan.force
         && command.name.starts_with("refs/heads/")
         && !command.old_id.is_null()

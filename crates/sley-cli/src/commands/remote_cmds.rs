@@ -3889,6 +3889,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         porcelain: false,
         atomic,
         force_if_includes: false,
+        push_options: &[],
         force_with_lease: &force_with_lease,
         force_with_lease_default: false,
         receive_config_overrides: &receive_config_overrides,
@@ -3933,6 +3934,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut tags = false;
     let mut prune = false;
     let mut receive_pack_command: Option<String> = None;
+    let mut push_options_cmdline: Option<Vec<String>> = None;
     // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
     // bare flag (lease every pushed ref against its remote-tracking ref).
     let mut force_with_lease_default = false;
@@ -3990,8 +3992,22 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 let (_, command) = value.split_once('=').unwrap_or((value, ""));
                 receive_pack_command = Some(command.to_string());
             }
+            "-o" | "--push-option" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command(format!("push {} requires a value", arg.as_str()))
+                })?;
+                push_options_cmdline
+                    .get_or_insert_with(Vec::new)
+                    .push(value.clone());
+            }
+            value if value.starts_with("--push-option=") => {
+                push_options_cmdline
+                    .get_or_insert_with(Vec::new)
+                    .push(value["--push-option=".len()..].to_string());
+            }
             value if value.starts_with("--repo=") => {}
             "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
+            value if value.starts_with("--recurse-submodules=") => {}
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
             // through to the unknown-option path, matching git).
@@ -4139,6 +4155,10 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             || config
                 .get_bool("push", None, "useforceifincludes")
                 .unwrap_or(false);
+        let push_options = match push_options_cmdline.clone() {
+            Some(options) => options,
+            None => push_options_from_config(&config)?,
+        };
         let receive_config_overrides =
             receive_pack_config_overrides(receive_pack_command.as_deref());
         let mut force_with_lease = resolve_force_with_lease(
@@ -4179,6 +4199,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             porcelain,
             atomic,
             force_if_includes,
+            push_options: &push_options,
             force_with_lease: &force_with_lease,
             force_with_lease_default,
             receive_config_overrides: &receive_config_overrides,
@@ -4438,6 +4459,21 @@ fn receive_pack_config_overrides(command: Option<&str>) -> Vec<(String, String)>
     overrides
 }
 
+fn push_options_from_config(config: &GitConfig) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for value in config.get_all("push", None, "pushoption") {
+        match value {
+            Some("") => out.clear(),
+            Some(value) => out.push(value.to_string()),
+            None => {
+                eprintln!("fatal: push.pushOption must have a value");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn default_head_push_destinations(store: &FileRefStore, refspecs: &mut [String]) -> Result<()> {
     for refspec in refspecs {
         let forced = refspec.starts_with('+');
@@ -4519,9 +4555,9 @@ fn run_push(
         }
         return Ok(());
     }
-    run_local_receive_pre_hooks(destination, &plan.commands)?;
+    run_local_receive_pre_hooks(destination, &plan.commands, &[])?;
     let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
-    run_local_receive_post_hooks(destination, &outcome.commands)?;
+    run_local_receive_post_hooks(destination, &outcome.commands, &[])?;
     update_push_remote_tracking_refs(git_dir, format, &config, remote, &outcome.commands)?;
     if options.set_upstream {
         configure_push_upstreams(git_dir, remote, &outcome.commands)?;
@@ -4548,6 +4584,7 @@ struct RunPushLocalReport<'a> {
     porcelain: bool,
     atomic: bool,
     force_if_includes: bool,
+    push_options: &'a [String],
     force_with_lease: &'a [(String, Option<ObjectId>)],
     force_with_lease_default: bool,
     receive_config_overrides: &'a [(String, String)],
@@ -4564,6 +4601,23 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         .unwrap_or(false);
     let push_negotiation_failed =
         push_negotiate && env::var("GIT_TEST_PROTOCOL_VERSION").ok().as_deref() == Some("0");
+    let remote_config = read_repo_config(req.remote_git_dir).unwrap_or_default();
+    if req.atomic
+        && !remote_config
+            .get_bool("receive", None, "advertiseatomic")
+            .unwrap_or(true)
+    {
+        eprintln!("fatal: the receiving end does not support --atomic push");
+        return Err(GitError::Exit(128));
+    }
+    if !req.push_options.is_empty()
+        && !remote_config
+            .get_bool("receive", None, "advertisepushoptions")
+            .unwrap_or(false)
+    {
+        eprintln!("fatal: the receiving end does not support push options");
+        return Err(GitError::Exit(128));
+    }
 
     // First pass: classify every ref WITHOUT applying anything (a dry-run plan).
     // This lets us run the receive-side pre-receive/update hooks before any ref
@@ -4638,14 +4692,14 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     // Run the receive-side pre-receive + update hooks. A failure declines the
     // whole push (git's receive-pack rejects every ref with "pre-receive hook
     // declined"). Skipped under --dry-run.
-    let pre_receive_declined = if !req.options.dry_run && !ok_commands.is_empty() {
-        run_local_receive_pre_hooks(&destination, &ok_commands).is_err()
+    let hook_decline = if !req.options.dry_run && !ok_commands.is_empty() {
+        run_local_receive_pre_hooks_report(&destination, &ok_commands, req.push_options)
     } else {
-        false
+        None
     };
 
     // Second pass: actually apply (unless dry-run or the hook declined).
-    let mut report = if req.options.dry_run || pre_receive_declined {
+    let mut report = if req.options.dry_run || hook_decline.is_some() {
         plan
     } else {
         sley_remote::push_local_with_report(
@@ -4667,7 +4721,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             &config,
         )?
     };
-    if !req.options.dry_run && !pre_receive_declined {
+    if !req.options.dry_run && hook_decline.is_none() {
         trace2_push_pack_objects(req.options.quiet, config.get_bool("push", None, "usebitmaps"));
         if config
             .get_bool("pack", None, "usepathwalk")
@@ -4687,17 +4741,26 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         run_local_receive_pack_auto_gc(req.remote_git_dir);
     }
 
-    if pre_receive_declined {
+    if let Some(decline) = hook_decline {
         for reference in &mut report.refs {
-            if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
-                reference.status = sley_remote::PushRefStatus::RemoteReject(
+            if !matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+                continue;
+            }
+            reference.status = match &decline {
+                ReceiveHookDecline::PreReceive => sley_remote::PushRefStatus::RemoteReject(
                     "pre-receive hook declined".to_string(),
-                );
+                ),
+                ReceiveHookDecline::Update(name) if reference.dst == *name => {
+                    sley_remote::PushRefStatus::RemoteReject("hook declined".to_string())
+                }
+                ReceiveHookDecline::Update(_) if req.atomic => {
+                    sley_remote::PushRefStatus::RemoteReject("atomic push failure".to_string())
+                }
+                ReceiveHookDecline::Update(_) => sley_remote::PushRefStatus::Ok,
             }
         }
     }
 
-    let remote_config = read_repo_config(req.remote_git_dir).unwrap_or_default();
     if !req.options.dry_run
         && push_warns_current_branch(
             &report,
@@ -4735,7 +4798,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 .cloned()
                 .collect();
             if !landed.is_empty() {
-                run_local_receive_post_hooks(&destination, &landed)?;
+                run_local_receive_post_hooks(&destination, &landed, req.push_options)?;
             }
             update_push_remote_tracking_refs(
                 req.git_dir,
@@ -5129,6 +5192,9 @@ fn print_push_ref(
             "[rejected]".to_string(),
             Some("remote ref updated since checkout".to_string()),
         ),
+        PushRefStatus::RejectAlreadyExists => {
+            ('!', "[rejected]".to_string(), Some("already exists".to_string()))
+        }
         PushRefStatus::RemoteReject(message) => {
             ('!', "[remote rejected]".to_string(), Some(message.clone()))
         }
@@ -5143,7 +5209,12 @@ fn print_push_ref(
     // the reject arms) prints the peer_ref `(delete)` (→ `(delete):dst`). A
     // non-delete uses its source ref both ways.
     let from = if reference.is_deletion() {
-        if matches!(reference.status, PushRefStatus::Ok) {
+        if matches!(reference.status, PushRefStatus::Ok)
+            || matches!(
+                &reference.status,
+                PushRefStatus::RemoteReject(message) if message == "atomic push failure"
+            )
+        {
             None
         } else {
             Some("(delete)".to_string())
@@ -5262,6 +5333,7 @@ fn update_push_remote_tracking_refs(
 fn run_local_receive_pre_hooks(
     destination: &sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
+    push_options: &[String],
 ) -> Result<()> {
     let sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
@@ -5271,11 +5343,14 @@ fn run_local_receive_pre_hooks(
         return Ok(());
     };
     let stdin = receive_hook_stdin(push_commands);
+    let push_option_env = push_option_hook_env(push_options);
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "pre-receive",
         commands::hooks::HookRun {
             stdin: Some(stdin),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
             ..commands::hooks::HookRun::default()
         },
     )?;
@@ -5289,6 +5364,8 @@ fn run_local_receive_pre_hooks(
                     command.old_id.to_string(),
                     command.new_id.to_string(),
                 ],
+                env: push_option_env.clone(),
+                cwd: Some(remote_git_dir.to_path_buf()),
                 ..commands::hooks::HookRun::default()
             },
         )?;
@@ -5296,9 +5373,66 @@ fn run_local_receive_pre_hooks(
     Ok(())
 }
 
+enum ReceiveHookDecline {
+    PreReceive,
+    Update(String),
+}
+
+fn run_local_receive_pre_hooks_report(
+    destination: &sley_remote::PushDestination,
+    push_commands: &[ReceivePackCommand],
+    push_options: &[String],
+) -> Option<ReceiveHookDecline> {
+    let sley_remote::PushDestination::Local {
+        git_dir: remote_git_dir,
+        ..
+    } = destination
+    else {
+        return None;
+    };
+    let stdin = receive_hook_stdin(push_commands);
+    let push_option_env = push_option_hook_env(push_options);
+    if commands::hooks::run_traditional_hook_at(
+        remote_git_dir,
+        "pre-receive",
+        commands::hooks::HookRun {
+            stdin: Some(stdin),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
+            ..commands::hooks::HookRun::default()
+        },
+    )
+    .is_err()
+    {
+        return Some(ReceiveHookDecline::PreReceive);
+    }
+    for command in push_commands {
+        if commands::hooks::run_traditional_hook_at(
+            remote_git_dir,
+            "update",
+            commands::hooks::HookRun {
+                args: vec![
+                    command.name.clone(),
+                    command.old_id.to_string(),
+                    command.new_id.to_string(),
+                ],
+                env: push_option_env.clone(),
+                cwd: Some(remote_git_dir.to_path_buf()),
+                ..commands::hooks::HookRun::default()
+            },
+        )
+        .is_err()
+        {
+            return Some(ReceiveHookDecline::Update(command.name.clone()));
+        }
+    }
+    None
+}
+
 fn run_local_receive_post_hooks(
     destination: &sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
+    push_options: &[String],
 ) -> Result<()> {
     let sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
@@ -5308,11 +5442,14 @@ fn run_local_receive_post_hooks(
         return Ok(());
     };
     let stdin = receive_hook_stdin(push_commands);
+    let push_option_env = push_option_hook_env(push_options);
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "post-receive",
         commands::hooks::HookRun {
             stdin: Some(stdin),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
             ..commands::hooks::HookRun::default()
         },
     )?;
@@ -5324,15 +5461,32 @@ fn run_local_receive_post_hooks(
                 .iter()
                 .map(|command| command.name.clone())
                 .collect(),
+            env: push_option_env.clone(),
+            cwd: Some(remote_git_dir.to_path_buf()),
             ..commands::hooks::HookRun::default()
         },
     )?;
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "push-to-checkout",
-        commands::hooks::HookRun::default(),
+        commands::hooks::HookRun {
+            env: push_option_env,
+            cwd: Some(remote_git_dir.to_path_buf()),
+            ..commands::hooks::HookRun::default()
+        },
     )?;
     Ok(())
+}
+
+fn push_option_hook_env(push_options: &[String]) -> Vec<(String, String)> {
+    let mut env = vec![(
+        "GIT_PUSH_OPTION_COUNT".to_string(),
+        push_options.len().to_string(),
+    )];
+    for (index, value) in push_options.iter().enumerate() {
+        env.push((format!("GIT_PUSH_OPTION_{index}"), value.clone()));
+    }
+    env
 }
 
 fn receive_hook_stdin(push_commands: &[ReceivePackCommand]) -> Vec<u8> {

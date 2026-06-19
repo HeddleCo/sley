@@ -20,6 +20,7 @@ struct ScopedSection {
 pub(crate) struct HookRun {
     pub(crate) args: Vec<String>,
     pub(crate) stdin: Option<Vec<u8>>,
+    pub(crate) env: Vec<(String, String)>,
     pub(crate) stdout_to_stderr: bool,
     pub(crate) error_if_missing: bool,
     pub(crate) cwd: Option<PathBuf>,
@@ -31,6 +32,7 @@ impl Default for HookRun {
         Self {
             args: Vec::new(),
             stdin: None,
+            env: Vec::new(),
             stdout_to_stderr: true,
             error_if_missing: false,
             cwd: None,
@@ -135,6 +137,7 @@ pub(crate) fn run_reference_transaction_hook_at(
     let options = HookRun {
         args: vec![phase.to_string()],
         stdin: Some(stdin),
+        env: Vec::new(),
         stdout_to_stderr: false,
         error_if_missing: false,
         cwd: Some(hook_cwd_for_git_dir(git_dir)?),
@@ -292,6 +295,7 @@ fn cmd_hook_run(args: &[String]) -> Result<()> {
         HookRun {
             args: hook_args,
             stdin,
+            env: Vec::new(),
             stdout_to_stderr: true,
             error_if_missing: !ignore_missing,
             cwd: None,
@@ -552,6 +556,9 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::Exi
         command.current_dir(cwd);
     }
     command.args(&options.args);
+    for (key, value) in &options.env {
+        command.env(key, value);
+    }
     if options.stdin.is_some() {
         command.stdin(Stdio::piped());
     } else {
