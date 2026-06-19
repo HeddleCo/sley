@@ -899,6 +899,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 &config,
             )?;
             print_clone_detached_head_advice(revision_oid);
+            run_clone_post_checkout_hook(&git_dir, revision_oid)?;
         } else {
             sley_worktree::checkout_detached(
                 &checkout_destination,
@@ -1001,6 +1002,12 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
     } else if sparse {
         apply_clone_sparse_checkout(&checkout_destination, &git_dir, format)?;
+    }
+    if checkout
+        && !outcome.empty
+        && let Some(new_head) = outcome.branch_oid.as_ref()
+    {
+        run_clone_post_checkout_hook(&git_dir, new_head)?;
     }
     if let Some(separate_git_dir) = separate_git_dir.as_deref() {
         apply_clone_separate_git_dir(&checkout_destination, &git_dir, separate_git_dir)?;
@@ -1232,6 +1239,12 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     } else if options.sparse {
         apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
     }
+    if options.checkout
+        && !empty
+        && let Some(new_head) = outcome.branch_oid.as_ref()
+    {
+        run_clone_post_checkout_hook(&git_dir, new_head)?;
+    }
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
     }
@@ -1420,6 +1433,12 @@ fn clone_network_repository(
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse {
         apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
+    }
+    if options.checkout
+        && !empty
+        && let Some(new_head) = outcome.branch_oid.as_ref()
+    {
+        run_clone_post_checkout_hook(&git_dir, new_head)?;
     }
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
@@ -1968,6 +1987,7 @@ fn apply_clone_config_overrides(git_dir: &Path, overrides: &[GlobalConfigOverrid
 }
 
 fn apply_clone_template(git_dir: &Path, template: Option<&Path>, copy_config: bool) -> Result<()> {
+    fs::create_dir_all(git_dir.join("hooks"))?;
     let Some(template) = template else {
         return Ok(());
     };
@@ -1983,6 +2003,20 @@ fn apply_clone_template(git_dir: &Path, template: Option<&Path>, copy_config: bo
         template_config.sections.extend(current_config.sections);
         write_repo_config(git_dir, &template_config)?;
     }
+    Ok(())
+}
+
+fn run_clone_post_checkout_hook(git_dir: &Path, new_head: &ObjectId) -> Result<()> {
+    let old = ObjectId::null(new_head.format()).to_hex();
+    let new = new_head.to_hex();
+    commands::hooks::run_traditional_hook_at(
+        git_dir,
+        "post-checkout",
+        commands::hooks::HookRun {
+            args: vec![old, new, "1".to_string()],
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
     Ok(())
 }
 

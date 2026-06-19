@@ -2588,6 +2588,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             format,
             &other_oid,
         )?;
+        commands::hooks::run_hook_l("post-merge", &["0"])?;
         if !options.quiet {
             let mut stdout = io::stdout();
             writeln!(

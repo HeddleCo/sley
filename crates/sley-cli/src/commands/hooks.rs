@@ -24,6 +24,7 @@ pub(crate) struct HookRun {
     pub(crate) stdout_to_stderr: bool,
     pub(crate) error_if_missing: bool,
     pub(crate) cwd: Option<PathBuf>,
+    pub(crate) git_dir: Option<PathBuf>,
     pub(crate) normalize_failure: bool,
 }
 
@@ -36,6 +37,7 @@ impl Default for HookRun {
             stdout_to_stderr: true,
             error_if_missing: false,
             cwd: None,
+            git_dir: None,
             normalize_failure: true,
         }
     }
@@ -91,6 +93,13 @@ pub(crate) fn run_hook(hook_name: &str, options: HookRun) -> Result<bool> {
         }
         return Ok(false);
     }
+    let mut options = options;
+    if options.git_dir.is_none()
+        && let Ok(cwd) = env::current_dir()
+        && let Ok(git_dir) = discover_git_dir(cwd)
+    {
+        options.git_dir = Some(git_dir);
+    }
     for hook in runnable {
         let status = spawn_hook(&hook, &options)?;
         if !status.success() {
@@ -141,6 +150,7 @@ pub(crate) fn run_reference_transaction_hook_at(
         stdout_to_stderr: false,
         error_if_missing: false,
         cwd: Some(hook_cwd_for_git_dir(git_dir)?),
+        git_dir: Some(git_dir.to_path_buf()),
         normalize_failure: false,
     };
     let status = spawn_hook(&HookCommand::Traditional(path), &options)?;
@@ -160,6 +170,9 @@ pub(crate) fn run_traditional_hook_at(
     let mut options = options;
     if options.cwd.is_none() {
         options.cwd = Some(hook_cwd_for_git_dir(git_dir)?);
+    }
+    if options.git_dir.is_none() {
+        options.git_dir = Some(git_dir.to_path_buf());
     }
     let status = spawn_hook(&HookCommand::Traditional(path), &options)?;
     if !status.success() {
@@ -299,6 +312,7 @@ fn cmd_hook_run(args: &[String]) -> Result<()> {
             stdout_to_stderr: true,
             error_if_missing: !ignore_missing,
             cwd: None,
+            git_dir: None,
             normalize_failure: false,
         },
     )?;
@@ -554,6 +568,9 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::Exi
     };
     if let Some(cwd) = options.cwd.clone().or_else(default_hook_cwd) {
         command.current_dir(cwd);
+    }
+    if let Some(git_dir) = &options.git_dir {
+        command.env("GIT_DIR", git_dir);
     }
     command.args(&options.args);
     for (key, value) in &options.env {
