@@ -599,7 +599,13 @@ declare -A FLOOR=(
     # wave-1 integration (2026-06-18, integ/wave1): codex/parity-maintenance lifted
     # t7900-maintenance 12->37 (cmd_maintenance gain in pack.rs). Stable 37x3 on the
     # integrated binary.
-    [t7900-maintenance.sh]=37
+    # codex-wave-11 (maintenance task runner): prefetch, commit-graph auto, rerere-gc
+    # auto, worktree-prune expiry/threshold, register/unregister, scheduler lock,
+    # strategy/schedule ordering, post-commit auto-maintenance run path. t7900 37->64.
+    # RE-DISPATCHED off post-worktree-repair main (the first auto-merge regressed
+    # t2406 24->14); rebuilt clean — t2406 HELD at 24. Shared-file floors held:
+    # t7700=29 t5300=46 t5324=11 t1450=96 t2400=214 t5505=126 t5516=72.
+    [t7900-maintenance.sh]=64
     # wave-1 integration (2026-06-18, integ/wave1): NEW floors for the difftool epic
     # (codex/parity-difftool: difftool.rs/mergetool.rs/tool_launch.rs) + status-cache
     # (codex/parity-status-cache: workspace.rs/index.rs). All measured on the integrated
