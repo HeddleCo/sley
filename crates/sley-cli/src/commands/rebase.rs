@@ -1229,6 +1229,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             ctx.reflog("start", Some(&format!("checkout {onto_name}"))),
             committer.clone(),
         )?;
+        run_rebase_post_checkout_hook(&orig_head, &onto)?;
         if !args.quiet {
             println!("Fast-forwarded {branch_name} to {onto_name}.");
         }
@@ -1527,6 +1528,7 @@ fn checkout_onto_for_apply(
         committer,
     )?;
     fs::write(ctx.git_dir.join("ORIG_HEAD"), format!("{orig_head}\n"))?;
+    run_rebase_post_checkout_hook(&old, base)?;
     Ok(())
 }
 
@@ -1622,10 +1624,24 @@ fn is_linear_history(
 
 fn checkout_up_to_date(
     ctx: &Ctx,
-    _db: &FileObjectDatabase,
+    db: &FileObjectDatabase,
     branch: &str,
     oid: &ObjectId,
 ) -> Result<()> {
+    let target_tree = commit_tree_oid(db, ctx.format, oid)?;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &target_tree)?;
+    if !overwritten.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by checkout:"
+        );
+        for path in &overwritten {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you switch branches.");
+        eprintln!("Aborting");
+        eprintln!("error: could not switch to branch '{branch}'");
+        return Err(GitError::Exit(1));
+    }
     sley_worktree::reset_index_and_worktree_to_commit(
         &ctx.worktree_root,
         &ctx.git_dir,
@@ -1647,7 +1663,8 @@ fn checkout_up_to_date(
             message: format!("{}: checkout {branch}", ctx.reflog_action).into_bytes(),
         }),
     });
-    tx.commit()
+    tx.commit()?;
+    run_rebase_post_checkout_hook(&old, oid)
 }
 
 fn move_to_original_branch(
@@ -2567,6 +2584,17 @@ fn complete_action(
         if skipped > 0 {
             let done_text = todo_to_text(&todo.items[..skipped], false, false, db);
             fs::write(ctx.state_path("done"), done_text)?;
+            if todo
+                .items
+                .get(skipped)
+                .is_some_and(|item| item.command.is_fixup())
+            {
+                for item in &todo.items[..skipped] {
+                    if let Some(oid) = item.oid {
+                        record_rewritten(ctx, &oid, Some(TodoCommand::Fixup))?;
+                    }
+                }
+            }
             todo.items.drain(..skipped);
             todo.done_nr = skipped;
         }
@@ -2815,7 +2843,18 @@ fn checkout_onto_base(
         ctx.git_dir.join("ORIG_HEAD"),
         format!("{}\n", opts.orig_head),
     )?;
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    run_rebase_post_checkout_hook(&old, base)?;
+    Ok(())
+}
+
+fn run_rebase_post_checkout_hook(old_head: &ObjectId, new_head: &ObjectId) -> Result<()> {
+    commands::hooks::run_hook(
+        "post-checkout",
+        commands::hooks::HookRun {
+            args: vec![old_head.to_hex(), new_head.to_hex(), "1".to_string()],
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
     Ok(())
 }
 
@@ -3223,6 +3262,7 @@ fn do_merge(
     let merge_tree = commit_tree_oid(db, ctx.format, merge_head)?;
     let overwritten = checkout_would_overwrite_untracked(ctx, db, &merge_tree)?;
     if !overwritten.is_empty() {
+        print_merge_would_overwrite_untracked(&overwritten);
         if let Some(record) = &original {
             fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
         }

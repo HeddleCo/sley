@@ -1010,6 +1010,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )?;
                 }
             }
+            run_post_checkout_hook(&checkout_old_head, &checkout_old_head, false)?;
             return Ok(());
         }
     }
