@@ -1,5 +1,6 @@
 pub mod bisect;
 pub mod graph;
+pub mod revlist;
 mod setup;
 
 use sley_config::GitConfig;

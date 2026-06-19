@@ -1627,14 +1627,6 @@ struct RevListTagObject {
     object: RevListObject,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RevListMissingAction {
-    Error,
-    Print,
-    AllowAny,
-    AllowPromisor,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RevListObjectFilter {
     None,
