@@ -132,6 +132,10 @@ struct DiffTreeOptions {
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<crate::grep_source::Regex>,
+    /// `--max-depth=<n>`: recurse tree diffs only to this many directory
+    /// levels below the matching pathspec and show changed subtrees at the
+    /// boundary. `-1` means unlimited recursion.
+    max_depth: Option<i64>,
     /// `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
     /// `diff.indentHeuristic` config (default git-enabled).
     indent_heuristic: Option<bool>,
@@ -170,6 +174,7 @@ impl Default for DiffTreeOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            max_depth: None,
             indent_heuristic: None,
             setup_args: Vec::new(),
         }
@@ -391,6 +396,16 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,
             "--ignore-cr-at-eol" => options.ws_ignore.cr_at_eol = true,
             "--ignore-blank-lines" => options.ignore_blank_lines = true,
+            "--max-depth" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("--max-depth requires a value".into()))?;
+                options.max_depth = Some(parse_diff_tree_max_depth(value)?);
+            }
+            value if let Some(rest) = value.strip_prefix("--max-depth=") => {
+                options.max_depth = Some(parse_diff_tree_max_depth(rest)?);
+            }
             "-I" | "--ignore-matching-lines" => {
                 idx += 1;
                 let value = args.get(idx).ok_or_else(|| {
@@ -472,12 +487,21 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         )));
     }
 
-    // We do not implement pathspec filtering for diff-tree; reject it clearly so
-    // we never silently ignore a path restriction.
-    if !setup.pathspecs.is_empty() || setup.options.positives.len() > 2 {
+    if setup.options.positives.len() > 2 {
         return Err(GitError::Unsupported(
             "diff-tree pathspec filtering is not supported".into(),
         ));
+    }
+    // Pathspec filtering is currently implemented only for the depth-limited
+    // tree-walk path exercised by `--max-depth`.
+    if !setup.pathspecs.is_empty() && options.max_depth.is_none() {
+        return Err(GitError::Unsupported(
+            "diff-tree pathspec filtering is not supported".into(),
+        ));
+    }
+    if options.max_depth.is_some() && diff_tree_has_wildcard_pathspec(&setup.pathspecs) {
+        eprintln!("fatal: max-depth cannot be used with wildcard pathspecs");
+        return Err(GitError::Exit(128));
     }
     if !setup.options.negatives.is_empty() || !setup.options.symmetric_ranges.is_empty() {
         return Err(GitError::Unsupported(
@@ -514,6 +538,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         format,
         db,
         options: &options,
+        pathspecs: &setup.pathspecs,
         raw_abbrev,
         patch_abbrev,
         indent_heuristic,
@@ -560,6 +585,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
 /// One resolved diff request: a left tree, a right tree, and an optional commit
 /// id to print as the header (present only when the request came from a single
 /// commit / a commit on `--stdin`).
+#[derive(Default)]
 struct DiffRequest {
     /// Left/old tree. `None` selects the empty tree (root-commit-style add diff).
     left: Option<ObjectId>,
@@ -587,18 +613,6 @@ struct CombinedRequest {
     result_tree: ObjectId,
     /// Each parent's tree, in parent order.
     parent_trees: Vec<ObjectId>,
-}
-
-impl Default for DiffRequest {
-    fn default() -> Self {
-        Self {
-            left: None,
-            right: None,
-            header: None,
-            skip: false,
-            combined: None,
-        }
-    }
 }
 
 /// A header line plus whether `--no-commit-id` suppresses it.
@@ -883,6 +897,7 @@ struct DiffRequestContext<'a> {
     format: ObjectFormat,
     db: &'a FileObjectDatabase,
     options: &'a DiffTreeOptions,
+    pathspecs: &'a [String],
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
     /// Resolved `--indent-heuristic` / `diff.indentHeuristic`.
@@ -936,6 +951,7 @@ fn run_diff_request(
         context.format,
         context.db,
         context.options,
+        context.pathspecs,
         request.left.as_ref(),
         &right,
         recursive,
@@ -1147,6 +1163,7 @@ fn run_combined_request(
             format,
             db,
             context.options,
+            context.pathspecs,
             combined.parent_trees.first(),
             &combined.result_tree,
             true,
@@ -1207,10 +1224,20 @@ fn compute_entries(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
+    pathspecs: &[String],
     left: Option<&ObjectId>,
     right: &ObjectId,
     recursive: bool,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    if let Some(max_depth) = options.max_depth {
+        let specs = DiffTreeDepthPathspecs::new(pathspecs);
+        let mut entries = depth_limited_tree_changes(format, db, left, Some(right), &specs, max_depth)?;
+        sort_entries_by_path(&mut entries);
+        if options.reverse {
+            entries = reverse_diff_entries(entries);
+        }
+        return Ok(entries);
+    }
     if recursive {
         let rename_options = sley_diff_merge::RenameDetectionOptions {
             base: sley_diff_merge::DiffNameStatusOptions {
@@ -1266,6 +1293,344 @@ fn compute_entries(
         }
         Ok(entries)
     }
+}
+
+fn parse_diff_tree_max_depth(value: &str) -> Result<i64> {
+    value.parse::<i64>().map_err(|_| {
+        eprintln!("error: option `max-depth' expects a numerical value");
+        GitError::Exit(129)
+    })
+}
+
+fn diff_tree_has_wildcard_pathspec(pathspecs: &[String]) -> bool {
+    pathspecs
+        .iter()
+        .any(|path| sley_worktree::pathspec_is_glob(path.as_bytes()))
+}
+
+#[derive(Debug)]
+struct DiffTreeDepthPathspecs {
+    specs: Vec<Vec<u8>>,
+}
+
+impl DiffTreeDepthPathspecs {
+    fn new(pathspecs: &[String]) -> Self {
+        let specs = pathspecs
+            .iter()
+            .map(|path| {
+                let trimmed = path.trim_end_matches('/');
+                if trimmed == "." {
+                    Vec::new()
+                } else {
+                    trimmed.as_bytes().to_vec()
+                }
+            })
+            .collect();
+        Self { specs }
+    }
+
+    fn relative_depth(&self, path: &[u8]) -> Option<i64> {
+        if self.specs.is_empty() {
+            return Some(path_slash_depth(path));
+        }
+        self.specs
+            .iter()
+            .filter_map(|spec| relative_depth_from_spec(spec, path))
+            .min()
+    }
+
+    fn is_ancestor_of_spec(&self, path: &[u8]) -> bool {
+        self.specs.iter().any(|spec| {
+            !path.is_empty()
+                && spec.len() > path.len()
+                && spec.starts_with(path)
+                && spec.get(path.len()) == Some(&b'/')
+        })
+    }
+}
+
+fn relative_depth_from_spec(spec: &[u8], path: &[u8]) -> Option<i64> {
+    if spec.is_empty() {
+        return Some(path_slash_depth(path));
+    }
+    if path == spec {
+        return Some(0);
+    }
+    if path.len() > spec.len()
+        && path.starts_with(spec)
+        && path.get(spec.len()) == Some(&b'/')
+    {
+        return Some(path_component_count(&path[spec.len() + 1..]));
+    }
+    None
+}
+
+fn path_slash_depth(path: &[u8]) -> i64 {
+    path.iter().filter(|byte| **byte == b'/').count() as i64
+}
+
+fn path_component_count(path: &[u8]) -> i64 {
+    if path.is_empty() {
+        0
+    } else {
+        path.iter().filter(|byte| **byte == b'/').count() as i64 + 1
+    }
+}
+
+fn depth_limited_tree_changes(
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    left: Option<&ObjectId>,
+    right: Option<&ObjectId>,
+    pathspecs: &DiffTreeDepthPathspecs,
+    max_depth: i64,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let mut out = Vec::new();
+    let context = DepthLimitedTreeContext {
+        format,
+        db,
+        pathspecs,
+        max_depth,
+    };
+    collect_depth_limited_tree_changes(
+        &context,
+        left,
+        right,
+        Vec::new(),
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+struct DepthLimitedTreeContext<'a> {
+    format: ObjectFormat,
+    db: &'a FileObjectDatabase,
+    pathspecs: &'a DiffTreeDepthPathspecs,
+    max_depth: i64,
+}
+
+fn collect_depth_limited_tree_changes(
+    context: &DepthLimitedTreeContext<'_>,
+    left_tree: Option<&ObjectId>,
+    right_tree: Option<&ObjectId>,
+    prefix: Vec<u8>,
+    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+) -> Result<()> {
+    let left_map = match left_tree {
+        Some(oid) => top_level_entries(context.format, context.db, oid)?,
+        None => BTreeMap::new(),
+    };
+    let right_map = match right_tree {
+        Some(oid) => top_level_entries(context.format, context.db, oid)?,
+        None => BTreeMap::new(),
+    };
+    let mut names = BTreeSet::new();
+    names.extend(left_map.keys().cloned());
+    names.extend(right_map.keys().cloned());
+
+    for name in names {
+        let left = left_map.get(&name);
+        let right = right_map.get(&name);
+        if left == right {
+            continue;
+        }
+        let path = join_diff_tree_path(&prefix, &name);
+        let left_is_tree = left.is_some_and(|entry| entry.mode == 0o040000);
+        let right_is_tree = right.is_some_and(|entry| entry.mode == 0o040000);
+
+        match (left_is_tree, right_is_tree) {
+            (true, true) => {
+                handle_depth_limited_tree_pair(
+                    context,
+                    left,
+                    right,
+                    path,
+                    out,
+                )?;
+            }
+            (true, false) => {
+                handle_depth_limited_tree_side(
+                    context,
+                    left,
+                    None,
+                    path.clone(),
+                    out,
+                )?;
+                if let Some(right) = right {
+                    maybe_push_depth_limited_blob_change(
+                        out,
+                        path,
+                        None,
+                        Some(right),
+                        context.pathspecs,
+                        context.max_depth,
+                    );
+                }
+            }
+            (false, true) => {
+                if let Some(left) = left {
+                    maybe_push_depth_limited_blob_change(
+                        out,
+                        path.clone(),
+                        Some(left),
+                        None,
+                        context.pathspecs,
+                        context.max_depth,
+                    );
+                }
+                handle_depth_limited_tree_side(
+                    context,
+                    None,
+                    right,
+                    path,
+                    out,
+                )?;
+            }
+            (false, false) => {
+                maybe_push_depth_limited_blob_change(
+                    out,
+                    path,
+                    left,
+                    right,
+                    context.pathspecs,
+                    context.max_depth,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_depth_limited_tree_pair(
+    context: &DepthLimitedTreeContext<'_>,
+    left: Option<&TopEntry>,
+    right: Option<&TopEntry>,
+    path: Vec<u8>,
+    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+) -> Result<()> {
+    let left_oid = left.map(|entry| entry.oid);
+    let right_oid = right.map(|entry| entry.oid);
+    if context.max_depth < 0 || context.pathspecs.is_ancestor_of_spec(&path) {
+        return collect_depth_limited_tree_changes(
+            context,
+            left_oid.as_ref(),
+            right_oid.as_ref(),
+            path,
+            out,
+        );
+    }
+    let Some(depth) = context.pathspecs.relative_depth(&path) else {
+        return Ok(());
+    };
+    if depth >= context.max_depth {
+        push_depth_limited_tree_change(out, path, left, right);
+    } else {
+        collect_depth_limited_tree_changes(
+            context,
+            left_oid.as_ref(),
+            right_oid.as_ref(),
+            path,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_depth_limited_tree_side(
+    context: &DepthLimitedTreeContext<'_>,
+    left: Option<&TopEntry>,
+    right: Option<&TopEntry>,
+    path: Vec<u8>,
+    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+) -> Result<()> {
+    if context.max_depth < 0 || context.pathspecs.is_ancestor_of_spec(&path) {
+        return collect_depth_limited_tree_changes(
+            context,
+            left.map(|entry| &entry.oid),
+            right.map(|entry| &entry.oid),
+            path,
+            out,
+        );
+    }
+    let Some(depth) = context.pathspecs.relative_depth(&path) else {
+        return Ok(());
+    };
+    if depth >= context.max_depth {
+        push_depth_limited_tree_change(out, path, left, right);
+    } else {
+        collect_depth_limited_tree_changes(
+            context,
+            left.map(|entry| &entry.oid),
+            right.map(|entry| &entry.oid),
+            path,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+fn maybe_push_depth_limited_blob_change(
+    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    path: Vec<u8>,
+    left: Option<&TopEntry>,
+    right: Option<&TopEntry>,
+    pathspecs: &DiffTreeDepthPathspecs,
+    max_depth: i64,
+) {
+    let Some(depth) = pathspecs.relative_depth(&path) else {
+        return;
+    };
+    if max_depth >= 0 && depth > max_depth {
+        return;
+    }
+    let status = match (left, right) {
+        (None, Some(_)) => sley_diff_merge::NameStatus::Added,
+        (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
+        (Some(_), Some(_)) => sley_diff_merge::NameStatus::Modified,
+        (None, None) => return,
+    };
+    out.push(sley_diff_merge::NameStatusEntry {
+        status,
+        path: BString::from(path),
+        old_path: None,
+        old_mode: left.map(|entry| entry.mode),
+        new_mode: right.map(|entry| entry.mode),
+        old_oid: left.map(|entry| entry.oid),
+        new_oid: right.map(|entry| entry.oid),
+    });
+}
+
+fn push_depth_limited_tree_change(
+    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    path: Vec<u8>,
+    left: Option<&TopEntry>,
+    right: Option<&TopEntry>,
+) {
+    let status = match (left, right) {
+        (None, Some(_)) => sley_diff_merge::NameStatus::Added,
+        (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
+        (Some(_), Some(_)) => sley_diff_merge::NameStatus::Modified,
+        (None, None) => return,
+    };
+    out.push(sley_diff_merge::NameStatusEntry {
+        status,
+        path: BString::from(path),
+        old_path: None,
+        old_mode: left.map(|entry| entry.mode),
+        new_mode: right.map(|entry| entry.mode),
+        old_oid: left.map(|entry| entry.oid),
+        new_oid: right.map(|entry| entry.oid),
+    });
+}
+
+fn join_diff_tree_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+    path.extend_from_slice(prefix);
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path
 }
 
 /// A single tree entry (mode + oid), keyed by name within its tree.
