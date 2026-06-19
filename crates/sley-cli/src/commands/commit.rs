@@ -1047,7 +1047,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks))
         });
     let all_index_snapshot = if all {
-        read_index_snapshot(&git_dir)?
+        Some(read_index_snapshot(&git_dir)?)
     } else {
         None
     };
@@ -1189,7 +1189,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     message = fs::read(&editmsg)?;
     message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose > 0);
     if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
-        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
@@ -1229,7 +1229,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         );
     }
     if !allow_empty_message && empty_before_signoff && !use_editor {
-        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
@@ -1239,7 +1239,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 && cleanup_mode_strips_comments(cleanup_mode)
                 && commit_message_lacks_non_trailer_content(&message)))
     {
-        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
@@ -1250,7 +1250,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         && !allow_empty_message
         && commit_message_is_empty(&commit_message_body(&message))
     {
-        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message body.");
         return Err(GitError::Exit(1));
     }
@@ -1261,7 +1261,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         && let Some(template_bytes) = read_commit_template_file(path)?
         && commit_template_lacks_edit_content(&message, &template_bytes, cleanup_mode, &comment_char)
     {
-        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit; you did not edit the message.");
         return Err(GitError::Exit(1));
     }
@@ -1850,6 +1850,13 @@ fn restore_index_snapshot(git_dir: &Path, snapshot: &Option<Vec<u8>>) -> Result<
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         },
+    }
+    Ok(())
+}
+
+fn restore_taken_index_snapshot(git_dir: &Path, snapshot: &Option<Option<Vec<u8>>>) -> Result<()> {
+    if let Some(snapshot) = snapshot {
+        restore_index_snapshot(git_dir, snapshot)?;
     }
     Ok(())
 }
