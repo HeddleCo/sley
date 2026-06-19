@@ -649,6 +649,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut line_log_args: Vec<crate::commands::line_log::LineLogArg> = Vec::new();
     // `--follow` (incompatible with `-L`).
     let mut saw_follow = false;
+    let mut follow_explicit = false;
+    let mut follow_config_allowed = true;
     // Whether a diff *output format* was explicitly requested (`-p`/`-s`/
     // `--stat`/`--raw`/...). Mirrors git's `revs->diffopt.output_format`: `-L`
     // forces `DIFF_FORMAT_PATCH` only when this is still unset at setup time, so
@@ -1572,6 +1574,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_opts.raw = true;
                 diff_format_explicit = true;
             }
+            "--name-only" => {
+                diff_opts.name_only = true;
+                diff_format_explicit = true;
+            }
+            "--name-status" => {
+                diff_opts.name_status = true;
+                diff_format_explicit = true;
+            }
             "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
             // `-c`/`--cc` select combined merge output and imply a *global*
             // patch (git's `merges_imply_patch` sets `output_format=PATCH`, so
@@ -1595,8 +1605,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
-            "--follow" => saw_follow = true,
-            "--no-follow" => saw_follow = false,
+            "--follow" => {
+                saw_follow = true;
+                follow_explicit = true;
+            }
+            "--no-follow" => {
+                saw_follow = false;
+                follow_explicit = true;
+            }
             // `-L<range>:<file>` (attached) or `-L <range>:<file>` (separate).
             "-L" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1622,11 +1638,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 if ignored_missing_input {
                     revision_input_with_ignore_missing = true;
                 }
-                if saw_follow
-                    && let Some(unsupported) = log_follow_unsupported_pathspec_magic(value)
-                {
-                    eprintln!("fatal: pathspec magic not supported by --follow: {unsupported}");
-                    return Err(GitError::Exit(128));
+                if let Some(unsupported) = log_follow_unsupported_pathspec_magic(value) {
+                    if saw_follow {
+                        eprintln!("fatal: pathspec magic not supported by --follow: {unsupported}");
+                        return Err(GitError::Exit(128));
+                    }
+                    follow_config_allowed = false;
                 }
                 if let Some((_, path)) = log_pathspec_magic(value) {
                     setup_args.push(path.to_string());
@@ -1790,6 +1807,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     };
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
+    if !follow_explicit
+        && !saw_follow
+        && follow_config_allowed
+        && pathspecs.len() == 1
+        && config.get_bool("log", None, "follow").unwrap_or(false)
+    {
+        saw_follow = true;
+    }
     let full_history = revision_options.full_history;
     if graph && reverse {
         eprintln!("fatal: options '--reverse' and '--graph' cannot be used together");
@@ -1926,14 +1951,24 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // `log.decorate` config sets the default decoration mode when no
     // `--decorate*` flag was given. Resolve it before compiling presets such as
     // `--oneline`, which bake `%d` into the format when decoration is active.
-    if !decoration_explicit
-        && let Some(value) = config.get("log", None, "decorate")
-    {
-        match value.trim().to_ascii_lowercase().as_str() {
+    if !decoration_explicit {
+        let decorate_config = config
+            .get("log", None, "decorate")
+            .map(str::to_string)
+            .or_else(|| {
+                matches!(
+                    config.get_all("log", None, "decorate").last(),
+                    Some(None)
+                )
+                .then(|| "true".to_string())
+            });
+        if let Some(value) = decorate_config {
+            match value.trim().to_ascii_lowercase().as_str() {
             "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
             "full" => decoration = LogDecorationMode::Full,
             "no" | "false" | "off" | "0" | "auto" => decoration = LogDecorationMode::Off,
             _ => decoration = LogDecorationMode::Short,
+            }
         }
     }
     // Resolve the captured `--pretty=`/`--format=` spec now that config (and its
@@ -1943,6 +1978,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         match resolve_pretty_spec(&spec, format_kind, &config)? {
             ResolvedPretty::Oneline => preset_oneline = Some(true),
             ResolvedPretty::Default => output = LogOutput::Default(LogDefaultKind::Medium),
+            ResolvedPretty::Fuller => output = LogOutput::Default(LogDefaultKind::Fuller),
             ResolvedPretty::Raw => output = LogOutput::Default(LogDefaultKind::Raw),
             ResolvedPretty::Reference => {
                 // reference defaults the date to short; an explicit --date wins.
@@ -1981,7 +2017,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 true => !abbrev_commit,
                 false => abbrev_len.is_none(),
             };
-            let compiled = if show_source {
+            let compiled = if walk_reflogs {
+                let oid = if use_full_oid { "%H" } else { "%h" };
+                CompiledLogFormat::compile(
+                    &format!("{oid} %gD: %gs"),
+                    LogFormatDialect::Log,
+                )?
+            } else if show_source {
                 let oid = if use_full_oid { "%H" } else { "%h" };
                 let parents = if show_parents { " %P" } else { "" };
                 let decorations = if decoration != LogDecorationMode::Off {
@@ -2042,6 +2084,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         regexp_ignore_case,
         "command line",
     )?;
+    let grep_colors = LogGrepColors::from_config(&config, color_always);
     if walk_reflogs {
         let reflog_revisions = revision_options
             .positives
@@ -2052,10 +2095,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &git_dir,
             format,
             &reflog_revisions,
-            max_count,
-            skip,
-            &output,
-            reverse,
+            ReflogWalkOptions {
+                max_count,
+                skip,
+                output: &output,
+                reverse,
+                date_mode: &date_mode,
+            },
         );
     }
     let log_format_source = if !revision_options.had_ref_selector
@@ -2538,10 +2584,20 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         );
         selected.retain(|r| on_path.contains(&r.oid));
     }
+    let follow_applied = saw_follow && pathspecs.len() == 1 && !full_history && !revision_options.simplify_merges;
+    if follow_applied {
+        selected = log_follow_single_path(
+            &db,
+            format,
+            selected,
+            pathspecs[0].as_bytes(),
+            true,
+        )?;
+    }
     // Pathspec-limited / --full-history simplification (TREESAME prune + parent
     // rewriting). Owned binding outlives `selected` (a Vec of references).
     let simplified_storage;
-    if !pathspecs.is_empty() || full_history || revision_options.simplify_merges {
+    if (!pathspecs.is_empty() && !follow_applied) || full_history || revision_options.simplify_merges {
         let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
@@ -2834,22 +2890,49 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             record.parents.iter().map(format_log_abbrev_oid).collect();
                         writeln!(msg, "Merge: {}", merged.join(" ")).map_err(io::Error::from)?;
                     }
-                    writeln!(
-                        msg,
-                        "Author: {}",
-                        commit_identity_mailmapped(
-                            &record.commit.author,
-                            use_mailmap.then_some(&mailmap)
-                        )
-                    )
-                    .map_err(io::Error::from)?;
-                    if *kind == LogDefaultKind::Medium {
+                    if *kind == LogDefaultKind::Fuller {
                         writeln!(
                             msg,
-                            "Date:   {}",
+                            "Author:     {}",
+                            commit_identity_mailmapped(
+                                &record.commit.author,
+                                use_mailmap.then_some(&mailmap)
+                            )
+                        )?;
+                        writeln!(
+                            msg,
+                            "AuthorDate: {}",
                             commit_identity_date(&record.commit.author, &date_mode)
-                        )
-                        .map_err(io::Error::from)?;
+                        )?;
+                        writeln!(
+                            msg,
+                            "Commit:     {}",
+                            commit_identity_mailmapped(
+                                &record.commit.committer,
+                                use_mailmap.then_some(&mailmap)
+                            )
+                        )?;
+                        writeln!(
+                            msg,
+                            "CommitDate: {}",
+                            commit_identity_date(&record.commit.committer, &date_mode)
+                        )?;
+                    } else {
+                        writeln!(
+                            msg,
+                            "Author: {}",
+                            commit_identity_mailmapped(
+                                &record.commit.author,
+                                use_mailmap.then_some(&mailmap)
+                            )
+                        )?;
+                        if *kind == LogDefaultKind::Medium {
+                            writeln!(
+                                msg,
+                                "Date:   {}",
+                                commit_identity_date(&record.commit.author, &date_mode)
+                            )?;
+                        }
                     }
                     msg.push(b'\n');
                     for line in String::from_utf8_lossy(&record.commit.message).lines() {
@@ -2942,10 +3025,50 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         record.parents.iter().map(format_log_abbrev_oid).collect();
                     println!("Merge: {}", merged.join(" "));
                 }
-                println!(
-                    "Author: {}",
-                    commit_identity_mailmapped(&record.commit.author, use_mailmap.then_some(&mailmap))
-                );
+                if kind == LogDefaultKind::Fuller {
+                    let author = commit_identity_mailmapped(
+                        &record.commit.author,
+                        use_mailmap.then_some(&mailmap),
+                    );
+                    print!("Author:     ");
+                    io::stdout().write_all(&log_highlight_matches(
+                        author.as_bytes(),
+                        author_filters.as_ref(),
+                        &grep_colors,
+                    ))?;
+                    println!();
+                    println!(
+                        "AuthorDate: {}",
+                        commit_identity_date(&record.commit.author, &date_mode)
+                    );
+                    let committer = commit_identity_mailmapped(
+                        &record.commit.committer,
+                        use_mailmap.then_some(&mailmap),
+                    );
+                    print!("Commit:     ");
+                    io::stdout().write_all(&log_highlight_matches(
+                        committer.as_bytes(),
+                        committer_filters.as_ref(),
+                        &grep_colors,
+                    ))?;
+                    println!();
+                    println!(
+                        "CommitDate: {}",
+                        commit_identity_date(&record.commit.committer, &date_mode)
+                    );
+                } else {
+                    let author = commit_identity_mailmapped(
+                        &record.commit.author,
+                        use_mailmap.then_some(&mailmap),
+                    );
+                    print!("Author: ");
+                    io::stdout().write_all(&log_highlight_matches(
+                        author.as_bytes(),
+                        author_filters.as_ref(),
+                        &grep_colors,
+                    ))?;
+                    println!();
+                }
                 if kind == LogDefaultKind::Medium {
                     println!(
                         "Date:   {}",
@@ -2954,7 +3077,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 }
                 println!();
                 for line in String::from_utf8_lossy(&record.commit.message).lines() {
-                    println!("    {line}");
+                    print!("    ");
+                    io::stdout().write_all(&log_highlight_matches(
+                        line.as_bytes(),
+                        grep_filters.as_ref(),
+                        &grep_colors,
+                    ))?;
+                    println!();
                 }
                 if !display_notes_refs.is_empty() {
                     let notes = render_notes_block(
@@ -3531,17 +3660,24 @@ fn render_line_log_patch(
     Ok(())
 }
 
+struct ReflogWalkOptions<'a> {
+    max_count: Option<usize>,
+    skip: usize,
+    output: &'a LogOutput,
+    reverse: bool,
+    date_mode: &'a DateMode,
+}
+
 fn log_walk_reflogs(
     git_dir: &Path,
     format: ObjectFormat,
     revisions: &[String],
-    max_count: Option<usize>,
-    skip: usize,
-    output: &LogOutput,
-    reverse: bool,
+    opts: ReflogWalkOptions<'_>,
 ) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let decorations = HashMap::new();
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
     let mut stdout = io::stdout();
     let references = if revisions.is_empty() {
         vec![reflog_reference_name(None)?]
@@ -3558,19 +3694,19 @@ fn log_walk_reflogs(
         let full_display_reference = reflog_walk_display_reference(&reference);
         let mut entries = store.read_reflog(&reference)?;
         entries.reverse();
-        if reverse {
+        if opts.reverse {
             entries.reverse();
         }
         for (index, entry) in entries.iter().enumerate() {
-            if skipped < skip {
+            if skipped < opts.skip {
                 skipped += 1;
                 continue;
             }
-            if max_count.is_some_and(|max_count| emitted >= max_count) {
+            if opts.max_count.is_some_and(|max_count| emitted >= max_count) {
                 stdout.flush()?;
                 return Ok(());
             }
-            match output {
+            match opts.output {
                 LogOutput::Compiled {
                     compiled,
                     final_newline,
@@ -3583,6 +3719,9 @@ fn log_walk_reflogs(
                         format,
                         display_reference: &display_reference,
                         full_reference: &full_display_reference,
+                        date_mode: opts.date_mode,
+                        decorations: &decorations,
+                        mailmap: &mailmap,
                     };
                     emit_compiled_reflog_walk_format(
                         &mut ctx,
@@ -3635,6 +3774,73 @@ fn compile_log_filter_matcher(
         error_context,
     )
     .map(Some)
+}
+
+struct LogGrepColors {
+    enabled: bool,
+    selected: String,
+    matched: String,
+    reset: String,
+}
+
+impl LogGrepColors {
+    fn from_config(config: &GitConfig, enabled: bool) -> Self {
+        let selected = config
+            .get("color", Some("grep"), "selected")
+            .map(|spec| git_color_spec_to_ansi(spec, enabled))
+            .unwrap_or_default();
+        let matched_spec = config
+            .get("color", Some("grep"), "matchSelected")
+            .or_else(|| config.get("color", Some("grep"), "match"))
+            .unwrap_or("bold red");
+        Self {
+            enabled,
+            selected,
+            matched: git_color_spec_to_ansi(matched_spec, enabled),
+            reset: git_color_spec_to_ansi("reset", enabled),
+        }
+    }
+}
+
+fn log_highlight_matches(
+    text: &[u8],
+    matcher: Option<&crate::grep_source::GrepMatcher>,
+    colors: &LogGrepColors,
+) -> Vec<u8> {
+    let Some(matcher) = matcher.filter(|_| colors.enabled && !colors.matched.is_empty()) else {
+        return text.to_vec();
+    };
+    let spans = matcher.match_spans_expr(None, text);
+    if spans.is_empty() {
+        return text.to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len() + spans.len() * 16);
+    let mut pos = 0usize;
+    if !colors.selected.is_empty() {
+        out.extend_from_slice(colors.selected.as_bytes());
+    }
+    for (start, end) in spans {
+        if start > pos {
+            out.extend_from_slice(&text[pos..start]);
+        }
+        if !colors.selected.is_empty() {
+            out.extend_from_slice(colors.reset.as_bytes());
+        }
+        out.extend_from_slice(colors.matched.as_bytes());
+        out.extend_from_slice(&text[start..end]);
+        out.extend_from_slice(colors.reset.as_bytes());
+        if !colors.selected.is_empty() {
+            out.extend_from_slice(colors.selected.as_bytes());
+        }
+        pos = end;
+    }
+    if pos < text.len() {
+        out.extend_from_slice(&text[pos..]);
+    }
+    if !colors.selected.is_empty() {
+        out.extend_from_slice(colors.reset.as_bytes());
+    }
+    out
 }
 
 fn log_author_matcher_matches(
@@ -3707,6 +3913,9 @@ struct ReflogWalkFormatContext<'a> {
     format: ObjectFormat,
     display_reference: &'a str,
     full_reference: &'a str,
+    date_mode: &'a DateMode,
+    decorations: &'a HashMap<ObjectId, Vec<String>>,
+    mailmap: &'a commands::utility::Mailmap,
 }
 
 fn emit_compiled_reflog_walk_format(
@@ -3716,49 +3925,39 @@ fn emit_compiled_reflog_walk_format(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
-    let reflog_timestamp = commit_identity_timestamp(&entry.committer);
+    let commit_record = reflog_walk_commit_record(ctx.db, ctx.format, entry)?;
+    let commit_identity = commit_record.as_ref().map(|record| {
+        let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
+        let (committer_name, committer_email) = commit_identity_name_email(&record.commit.committer);
+        let author_timestamp = commit_identity_timestamp(&record.commit.author);
+        let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
+        (
+            author_name,
+            author_email,
+            committer_name,
+            committer_email,
+            author_timestamp,
+            committer_timestamp,
+        )
+    });
+    let log_context = LogFormatContext {
+        abbrev_len: Some(7),
+        decorations: ctx.decorations,
+        marker: '>',
+        dialect: LogFormatDialect::Log,
+        source: None,
+        date_mode: ctx.date_mode,
+        source_oid: None,
+        describe: None,
+        color: false,
+        output_encoding: "UTF-8",
+        mailmap: ctx.mailmap,
+        use_mailmap: true,
+    };
     for token in &ctx.compiled.tokens {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
-            FormatToken::CommitterName | FormatToken::CommitterNameMapped => {
-                out.extend_from_slice(reflog_name.as_bytes())
-            }
-            FormatToken::CommitterEmail | FormatToken::CommitterEmailMapped => {
-                out.extend_from_slice(reflog_email.as_bytes())
-            }
-            FormatToken::CommitterEmailLocal | FormatToken::CommitterEmailLocalMapped => {
-                out.extend_from_slice(log_email_local_part(&reflog_email).as_bytes())
-            }
-            FormatToken::CommitterTimestamp => out.extend_from_slice(reflog_timestamp.as_bytes()),
-            FormatToken::CommitterDate => {
-                write!(out, "{}", commit_identity_date(&entry.committer, &DateMode::Default))
-                    .map_err(io::Error::from)?
-            }
-            FormatToken::CommitterDateIso => {
-                write!(out, "{}", commit_identity_date(&entry.committer, &DateMode::Iso))
-                    .map_err(io::Error::from)?
-            }
-            FormatToken::CommitterDateIsoStrict => {
-                write!(
-                    out,
-                    "{}",
-                    commit_identity_date(&entry.committer, &DateMode::IsoStrict)
-                )
-                .map_err(io::Error::from)?
-            }
-            FormatToken::CommitterDateShort => {
-                write!(out, "{}", commit_identity_date(&entry.committer, &DateMode::Short))
-                    .map_err(io::Error::from)?
-            }
-            FormatToken::CommitterDateRfc2822 => {
-                write!(
-                    out,
-                    "{}",
-                    commit_identity_date(&entry.committer, &DateMode::Rfc2822)
-                )
-                .map_err(io::Error::from)?
-            }
             FormatToken::ReflogGs => {
                 out.extend_from_slice(&reflog_walk_subject(ctx.db, ctx.format, entry)?);
             }
@@ -3772,10 +3971,43 @@ fn emit_compiled_reflog_walk_format(
             FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
-            _ => {}
+            _ => {
+                if let (Some(record), Some(identity)) = (commit_record.as_ref(), commit_identity.as_ref()) {
+                    emit_log_one_token(
+                        token,
+                        record,
+                        &log_context,
+                        out,
+                        &identity.0,
+                        &identity.1,
+                        &identity.2,
+                        &identity.3,
+                        &identity.4,
+                        &identity.5,
+                    )?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn reflog_walk_commit_record(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+) -> Result<Option<sley_rev::CommitRecord>> {
+    let object = match db.read_object(&entry.new_oid) {
+        Ok(object) if object.object_type == ObjectType::Commit => object,
+        Ok(_) => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(Some(sley_rev::CommitRecord {
+        oid: entry.new_oid,
+        parents: commit.parents.clone(),
+        commit,
+    }))
 }
 
 fn reflog_walk_subject(
@@ -3805,6 +4037,7 @@ fn reflog_walk_subject(
 enum ResolvedPretty {
     Oneline,
     Default,
+    Fuller,
     Raw,
     /// `--pretty=reference`: `%C(auto)%h (%s, %ad)` with a default short date
     /// that an explicit `--date=` overrides (but `log.date` config does not).
@@ -3848,6 +4081,7 @@ fn resolve_pretty_spec(
         match current.as_str() {
             "oneline" => return Ok(ResolvedPretty::Oneline),
             "short" | "medium" => return Ok(ResolvedPretty::Default),
+            "fuller" => return Ok(ResolvedPretty::Fuller),
             "raw" => return Ok(ResolvedPretty::Raw),
             "reference" => {
                 return Ok(ResolvedPretty::Reference);
@@ -3964,6 +4198,8 @@ struct LogDiffOptions {
     patch: bool,
     stat: bool,
     raw: bool,
+    name_only: bool,
+    name_status: bool,
     numstat: bool,
     shortstat: bool,
     summary: bool,
@@ -3996,6 +4232,8 @@ impl Default for LogDiffOptions {
             patch: false,
             stat: false,
             raw: false,
+            name_only: false,
+            name_status: false,
             numstat: false,
             shortstat: false,
             summary: false,
@@ -4043,6 +4281,8 @@ impl LogDiffOptions {
         self.patch
             || self.stat
             || self.raw
+            || self.name_only
+            || self.name_status
             || self.numstat
             || self.shortstat
             || self.summary
@@ -4223,6 +4463,75 @@ fn diff_filter_commit_matches(
     Ok(entries
         .iter()
         .any(|entry| diff_filter_entry_bit(entry) & status_mask != 0))
+}
+
+fn log_follow_single_path<'a>(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    selected: Vec<&'a sley_rev::CommitRecord>,
+    start_path: &[u8],
+    detect_renames: bool,
+) -> Result<Vec<&'a sley_rev::CommitRecord>> {
+    let mut path = start_path.to_vec();
+    let mut kept = Vec::new();
+    for record in selected {
+        let parent_tree = match record.commit.parents.first() {
+            Some(parent) => {
+                let object = db.read_object(parent)?;
+                Some(Commit::parse_ref(format, &object.body)?.tree)
+            }
+            None => None,
+        };
+        let base = sley_diff_merge::DiffNameStatusOptions {
+            detect_renames,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
+        };
+        let entries = match (&parent_tree, detect_renames) {
+            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+                db,
+                format,
+                parent,
+                &record.commit.tree,
+                sley_diff_merge::RenameDetectionOptions {
+                    base,
+                    detect_inexact: true,
+                    rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                    copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                },
+            )?,
+            (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
+                db,
+                format,
+                parent,
+                &record.commit.tree,
+                base,
+            )?,
+            (None, _) => sley_diff_merge::diff_name_status_empty_tree_with_options(
+                db,
+                format,
+                &record.commit.tree,
+                base,
+            )?,
+        };
+        let mut matched = false;
+        for entry in entries {
+            if entry.path.as_bytes() == path.as_slice() {
+                matched = true;
+                if matches!(entry.status, sley_diff_merge::NameStatus::Renamed(_))
+                    && let Some(old_path) = entry.old_path
+                {
+                    path = old_path.as_bytes().to_vec();
+                }
+                break;
+            }
+        }
+        if matched {
+            kept.push(record);
+        }
+    }
+    Ok(kept)
 }
 
 /// Whether a commit's diff (against its first parent, or the empty tree for a
@@ -4557,6 +4866,20 @@ impl LogDiffContext<'_> {
                 write_diff_raw_entry(&mut out, entry, false, false, self.raw_abbrev, self.format)?;
             }
         }
+        if opts.name_status {
+            for entry in &entries {
+                writeln!(out, "{}", entry.line())?;
+            }
+        }
+        if opts.name_only {
+            for entry in &entries {
+                writeln!(
+                    out,
+                    "{}",
+                    String::from_utf8_lossy(entry.path.as_bytes())
+                )?;
+            }
+        }
         if opts.numstat {
             for entry in &entries {
                 write_diff_numstat_entry(&mut out, entry, false, self.db, None, false)?;
@@ -4590,6 +4913,8 @@ impl LogDiffContext<'_> {
         }
         if patch {
             if opts.raw
+                || opts.name_status
+                || opts.name_only
                 || opts.numstat
                 || opts.stat
                 || opts.compact_summary
@@ -4655,7 +4980,14 @@ impl LogDiffContext<'_> {
 
         // Stat family is computed against the first parent (STAT_FORMAT_MASK).
         let stat_active =
-            opts.raw || opts.numstat || opts.stat || opts.compact_summary || opts.shortstat || opts.summary;
+            opts.raw
+                || opts.name_status
+                || opts.name_only
+                || opts.numstat
+                || opts.stat
+                || opts.compact_summary
+                || opts.shortstat
+                || opts.summary;
         let first_parent_entries = if stat_active {
             let base = sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: self.detect_renames,
@@ -4686,6 +5018,20 @@ impl LogDiffContext<'_> {
             let render_ctx = self.combined_ctx(dense);
             for path in &paths {
                 commands::combined::write_combined_raw(&mut out, &render_ctx, path, false)?;
+            }
+        }
+        if opts.name_status {
+            for path in &paths {
+                commands::combined::write_combined_name_status(&mut out, path, false)?;
+            }
+        }
+        if opts.name_only {
+            for path in &paths {
+                writeln!(
+                    out,
+                    "{}",
+                    String::from_utf8_lossy(&path.path)
+                )?;
             }
         }
         if opts.numstat {
@@ -4942,6 +5288,8 @@ enum LogDefaultKind {
     Medium,
     /// `--pretty=short`: omits the `Date:` line.
     Short,
+    /// `--pretty=fuller`: author and committer identities with dates.
+    Fuller,
     /// `--pretty=raw`: full object headers and raw identity lines.
     Raw,
 }
