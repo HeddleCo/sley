@@ -5489,9 +5489,11 @@ impl StatusPathspec {
         let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
         let cwd_depth = path_component_count(&prefix);
         let mut filters = Vec::new();
+        let magic = effective_pathspec_flags();
         for arg in path_args {
-            let filter_path = normalize_ls_files_pathspec(&prefix, arg)?;
-            let is_glob = sley_worktree::pathspec_is_glob(&filter_path);
+            let element = parse_normalized_pathspec_element(&prefix, arg, magic)?;
+            let is_glob =
+                !element.magic().literal && sley_worktree::pathspec_is_glob(element.pattern());
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -5500,9 +5502,9 @@ impl StatusPathspec {
             };
             filters.push(LsFilesPathFilter {
                 original: arg.clone(),
-                path: filter_path,
                 recursive: arg == "." || arg.ends_with('/') || absolute.is_dir(),
                 is_glob,
+                element,
                 matched: Cell::new(false),
             });
         }
@@ -5535,10 +5537,7 @@ impl StatusPathspec {
     }
 
     fn matches(&self, path: &[u8]) -> bool {
-        let magic = effective_pathspec_flags();
-        self.filters
-            .iter()
-            .any(|filter| filter.matches(path, magic))
+        pathspec_filters_match(&self.filters, path)
     }
 }
 

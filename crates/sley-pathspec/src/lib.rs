@@ -45,6 +45,15 @@ pub struct PathspecElement {
     /// pathspec carrying them round-trips and the consumer can reject/honor
     /// them explicitly rather than silently dropping them.
     attrs: Vec<Vec<u8>>,
+    attr_requirements: Vec<PathspecAttrRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathspecAttrRequirement {
+    Set(Vec<u8>),
+    Unset(Vec<u8>),
+    Unspecified(Vec<u8>),
+    Value { name: Vec<u8>, value: Vec<u8> },
 }
 
 impl PathspecElement {
@@ -62,6 +71,7 @@ impl PathspecElement {
         let mut glob = defaults.glob;
         let mut top = false;
         let mut attrs: Vec<Vec<u8>> = Vec::new();
+        let mut attr_requirements: Vec<PathspecAttrRequirement> = Vec::new();
 
         let rest = if let Some(after) = arg.strip_prefix(b":(") {
             // Long form: :(magic[,magic...])pattern
@@ -79,7 +89,11 @@ impl PathspecElement {
                     b"top" => top = true,
                     other => {
                         if let Some(attr) = other.strip_prefix(b"attr:") {
+                            if !attrs.is_empty() {
+                                return Err(PathspecParseError::MultipleAttrMagic);
+                            }
                             attrs.push(attr.to_vec());
+                            attr_requirements = parse_attr_requirements(attr)?;
                         } else if other.is_empty() {
                             // Empty magic word (e.g. trailing comma) — ignore,
                             // matching git's lenient split.
@@ -119,6 +133,7 @@ impl PathspecElement {
             glob,
             top,
             attrs,
+            attr_requirements,
         })
     }
 
@@ -137,6 +152,10 @@ impl PathspecElement {
         &self.attrs
     }
 
+    pub fn attr_requirements(&self) -> &[PathspecAttrRequirement] {
+        &self.attr_requirements
+    }
+
     /// Whether this element carries case-insensitive matching.
     pub fn is_icase(&self) -> bool {
         self.icase
@@ -153,7 +172,7 @@ impl PathspecElement {
     }
 
     /// The [`PathspecMatchMagic`] this element matches under.
-    fn magic(&self) -> PathspecMatchMagic {
+    pub fn magic(&self) -> PathspecMatchMagic {
         PathspecMatchMagic {
             literal: self.literal,
             glob: self.glob,
@@ -164,8 +183,13 @@ impl PathspecElement {
     /// Whether `name` (a repo-relative path, no leading slash) is selected by
     /// this single element, ignoring its exclude polarity. Use
     /// [`Pathspec::matches`] for the combined include/exclude semantics.
-    pub fn matches_path(&self, name: &[u8]) -> bool {
+pub fn matches_path(&self, name: &[u8]) -> bool {
         pathspec_item_matches(&self.pattern, name, self.magic())
+    }
+
+    pub fn with_pattern(mut self, pattern: Vec<u8>) -> Self {
+        self.pattern = pattern;
+        self
     }
 }
 
@@ -194,6 +218,10 @@ impl Pathspec {
             elements.push(PathspecElement::parse(arg.as_ref(), defaults)?);
         }
         Ok(Pathspec { elements })
+    }
+
+    pub fn from_elements(elements: Vec<PathspecElement>) -> Self {
+        Self { elements }
     }
 
     /// An empty pathspec matches every path.
@@ -236,7 +264,101 @@ impl Pathspec {
 
 /// Split a `:(...)` magic body on commas (git's `parse_long_magic` separator).
 fn split_magic(body: &[u8]) -> Vec<Vec<u8>> {
-    body.split(|&c| c == b',').map(|w| w.to_vec()).collect()
+    let mut words = Vec::new();
+    let mut word = Vec::new();
+    let mut escaped = false;
+    for &byte in body {
+        if escaped {
+            word.push(byte);
+            escaped = false;
+        } else if byte == b'\\' {
+            word.push(byte);
+            escaped = true;
+        } else if byte == b',' {
+            words.push(std::mem::take(&mut word));
+        } else {
+            word.push(byte);
+        }
+    }
+    words.push(word);
+    words
+}
+
+fn parse_attr_requirements(body: &[u8]) -> Result<Vec<PathspecAttrRequirement>, PathspecParseError> {
+    if body.is_empty() {
+        return Err(PathspecParseError::EmptyAttrMagic);
+    }
+    let mut requirements = Vec::new();
+    for raw in body.split(|byte| byte.is_ascii_whitespace()) {
+        if raw.is_empty() {
+            continue;
+        }
+        requirements.push(parse_attr_requirement(raw)?);
+    }
+    if requirements.is_empty() {
+        return Err(PathspecParseError::EmptyAttrMagic);
+    }
+    Ok(requirements)
+}
+
+fn parse_attr_requirement(raw: &[u8]) -> Result<PathspecAttrRequirement, PathspecParseError> {
+    if let Some(rest) = raw.strip_prefix(b"-") {
+        if rest.contains(&b'=') {
+            return Err(PathspecParseError::InvalidAttrSpec(raw.to_vec()));
+        }
+        validate_attr_name(rest)?;
+        return Ok(PathspecAttrRequirement::Unset(rest.to_vec()));
+    }
+    if let Some(rest) = raw.strip_prefix(b"!") {
+        if rest.contains(&b'=') {
+            return Err(PathspecParseError::InvalidAttrSpec(raw.to_vec()));
+        }
+        validate_attr_name(rest)?;
+        return Ok(PathspecAttrRequirement::Unspecified(rest.to_vec()));
+    }
+    if let Some(equal) = raw.iter().position(|byte| *byte == b'=') {
+        let name = &raw[..equal];
+        let value = unescape_attr_value(&raw[equal + 1..])?;
+        validate_attr_name(name)?;
+        return Ok(PathspecAttrRequirement::Value {
+            name: name.to_vec(),
+            value,
+        });
+    }
+    validate_attr_name(raw)?;
+    Ok(PathspecAttrRequirement::Set(raw.to_vec()))
+}
+
+fn validate_attr_name(name: &[u8]) -> Result<(), PathspecParseError> {
+    if name.is_empty()
+        || !name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.'))
+    {
+        return Err(PathspecParseError::InvalidAttrSpec(name.to_vec()));
+    }
+    Ok(())
+}
+
+fn unescape_attr_value(value: &[u8]) -> Result<Vec<u8>, PathspecParseError> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut idx = 0usize;
+    while idx < value.len() {
+        if value[idx] != b'\\' {
+            out.push(value[idx]);
+            idx += 1;
+            continue;
+        }
+        let Some(&next) = value.get(idx + 1) else {
+            return Err(PathspecParseError::AttrValueTrailingBackslash);
+        };
+        if next != b',' {
+            return Err(PathspecParseError::AttrValueUnsupportedBackslash);
+        }
+        out.push(next);
+        idx += 2;
+    }
+    Ok(out)
 }
 
 /// Error parsing a pathspec magic prefix.
@@ -248,6 +370,11 @@ pub enum PathspecParseError {
     UnknownMagic(Vec<u8>),
     /// `:(glob)` and `:(literal)` were both requested.
     GlobLiteralConflict,
+    EmptyAttrMagic,
+    MultipleAttrMagic,
+    InvalidAttrSpec(Vec<u8>),
+    AttrValueTrailingBackslash,
+    AttrValueUnsupportedBackslash,
 }
 
 impl core::fmt::Display for PathspecParseError {
@@ -265,6 +392,21 @@ impl core::fmt::Display for PathspecParseError {
             }
             PathspecParseError::GlobLiteralConflict => {
                 write!(f, "'literal' and 'glob' are incompatible")
+            }
+            PathspecParseError::EmptyAttrMagic => write!(f, "empty attr magic is not allowed"),
+            PathspecParseError::MultipleAttrMagic => {
+                write!(f, "Only one 'attr:' specification is allowed")
+            }
+            PathspecParseError::InvalidAttrSpec(spec) => write!(
+                f,
+                "invalid attribute specification '{}'",
+                String::from_utf8_lossy(spec)
+            ),
+            PathspecParseError::AttrValueTrailingBackslash => {
+                write!(f, "Escape character '\\' not allowed as last character in attr value")
+            }
+            PathspecParseError::AttrValueUnsupportedBackslash => {
+                write!(f, "Only '\\,' is supported for value matching")
             }
         }
     }

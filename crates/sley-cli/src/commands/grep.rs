@@ -901,7 +901,10 @@ fn grep_tree_source(
     let mut any = false;
     let mut printed_file = false;
     for (path, oid) in entries {
-        if !plan.pathspec.matches(&path) {
+        if !plan
+            .pathspec
+            .matches_tree(&path, source.db, source.format, source.tree_oid)?
+        {
             continue;
         }
         if !plan.pathspec.within_max_depth(&path, plan.opts.max_depth) {
@@ -1473,7 +1476,7 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 
 struct GrepPathFilter {
     original: String,
-    normalized: Vec<u8>,
+    element: sley_pathspec::PathspecElement,
     /// Whether this pathspec is a bare directory-restricting spec (used by
     /// `--max-depth`, where depth is measured relative to the spec's directory).
     is_dir_spec: bool,
@@ -1485,6 +1488,8 @@ struct GrepPathspec {
     cwd_depth: usize,
     full_name: bool,
     filters: Vec<GrepPathFilter>,
+    attributes: Option<sley_worktree::StandardAttributeMatcher>,
+    worktree_root: Option<PathBuf>,
 }
 
 impl GrepPathspec {
@@ -1509,36 +1514,102 @@ impl GrepPathspec {
             .filter(|component| !component.is_empty())
             .count();
         let mut filters = Vec::new();
+        let magic = effective_pathspec_flags();
         for spec in pathspecs {
-            let normalized = normalize_grep_pathspec(&prefix, spec)?;
-            let is_dir_spec = !spec.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
+            let element = parse_normalized_pathspec_element(&prefix, spec, magic)?;
+            let is_dir_spec = !element
+                .pattern()
+                .iter()
+                .any(|b| matches!(b, b'*' | b'?' | b'['));
             filters.push(GrepPathFilter {
                 original: spec.clone(),
-                normalized,
+                element,
                 is_dir_spec,
                 matched: Cell::new(false),
             });
         }
+        let needs_attrs = filters
+            .iter()
+            .any(|filter| !filter.element.attr_requirements().is_empty());
+        let attributes = if needs_attrs {
+            worktree_root
+                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .transpose()?
+        } else {
+            None
+        };
         Ok(Self {
             prefix,
             cwd_depth,
             full_name,
             filters,
+            attributes,
+            worktree_root: worktree_root.map(Path::to_path_buf),
         })
     }
 
     fn matches(&self, path: &[u8]) -> bool {
+        self.matches_inner(path, |filter, path| {
+            grep_pathspec_match(&filter.element, path)
+                && pathspec_attrs_match_with(&filter.element, |requested| {
+                    self.attributes
+                        .as_ref()
+                        .map(|matcher| matcher.attributes_for_path(path, requested, false))
+                        .unwrap_or_default()
+                })
+        })
+    }
+
+    fn matches_tree(
+        &self,
+        path: &[u8],
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+        tree_oid: &ObjectId,
+    ) -> Result<bool> {
+        let Some(root) = self.worktree_root.as_deref() else {
+            return Ok(self.matches(path));
+        };
+        Ok(self.matches_inner(path, |filter, path| {
+            grep_pathspec_match(&filter.element, path)
+                && pathspec_attrs_match_with(&filter.element, |requested| {
+                    sley_worktree::standard_attributes_for_path_from_tree(
+                        root, db, format, tree_oid, path, requested, false,
+                    )
+                    .unwrap_or_default()
+                })
+        }))
+    }
+
+    fn matches_inner(
+        &self,
+        path: &[u8],
+        mut matches: impl FnMut(&GrepPathFilter, &[u8]) -> bool,
+    ) -> bool {
         if self.filters.is_empty() {
             return self.prefix.is_empty() || path_under_prefix(path, &self.prefix);
         }
-        let mut matched = false;
+        let mut have_include = false;
+        let mut included = false;
         for filter in &self.filters {
-            if grep_pathspec_match(&filter.normalized, path) {
-                filter.matched.set(true);
-                matched = true;
+            if filter.element.is_exclude() {
+                if matches(filter, path) {
+                    filter.matched.set(true);
+                    return false;
+                }
+            } else {
+                have_include = true;
+                if matches(filter, path) {
+                    filter.matched.set(true);
+                    included = true;
+                }
             }
         }
-        matched
+        if have_include {
+            included
+        } else {
+            self.prefix.is_empty() || path_under_prefix(path, &self.prefix)
+        }
     }
 
     /// `--max-depth N`: limit the search to files at most N directory levels below
@@ -1564,17 +1635,17 @@ impl GrepPathspec {
         }
         // For each matching filter, measure depth relative to that filter's base.
         for filter in &self.filters {
-            if !grep_pathspec_match(&filter.normalized, path) {
+            if filter.element.is_exclude() || !grep_pathspec_match(&filter.element, path) {
                 continue;
             }
             if !filter.is_dir_spec {
                 // Glob pathspec: no depth limit.
                 return true;
             }
-            let base = &filter.normalized;
+            let base = filter.element.pattern();
             let rest = if base.is_empty() {
                 path
-            } else if path == base.as_slice() {
+            } else if path == base {
                 return true;
             } else {
                 match strip_dir_prefix(path, base) {
@@ -1607,7 +1678,7 @@ impl GrepPathspec {
     fn report_unmatched(&self) -> Result<()> {
         let mut unmatched = false;
         for filter in &self.filters {
-            if !filter.matched.get() {
+            if !filter.element.is_exclude() && !filter.matched.get() {
                 eprintln!(
                     "error: pathspec '{}' did not match any file(s) known to git",
                     filter.original
@@ -1640,164 +1711,9 @@ fn strip_dir_prefix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if rest.is_empty() { None } else { Some(rest) }
 }
 
-fn normalize_grep_pathspec(prefix: &[u8], arg: &str) -> Result<Vec<u8>> {
-    let mut components: Vec<Vec<u8>> = prefix
-        .split(|byte| *byte == b'/')
-        .filter(|component| !component.is_empty())
-        .map(Vec::from)
-        .collect();
-    for component in Path::new(arg).components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                components.pop().ok_or_else(|| {
-                    GitError::InvalidPath(format!("{arg}: '{arg}' is outside repository"))
-                })?;
-            }
-            std::path::Component::Normal(name) => {
-                components.push(name.to_string_lossy().as_bytes().to_vec());
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(GitError::Unsupported(
-                    "grep pathspecs currently support relative paths".into(),
-                ));
-            }
-        }
-    }
-    Ok(components.join(&b'/'))
+fn grep_pathspec_match(spec: &sley_pathspec::PathspecElement, path: &[u8]) -> bool {
+    spec.matches_path(path)
 }
-
-fn grep_pathspec_match(spec: &[u8], path: &[u8]) -> bool {
-    if spec.is_empty() {
-        return true;
-    }
-    if path == spec {
-        return true;
-    }
-    if let Some(rest) = path.strip_prefix(spec)
-        && rest.first() == Some(&b'/')
-    {
-        return true;
-    }
-    if spec.iter().any(|b| matches!(b, b'*' | b'?' | b'[')) {
-        return wildmatch(spec, path);
-    }
-    false
-}
-
-fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
-    fn rec(pattern: &[u8], text: &[u8]) -> bool {
-        let mut pi = 0;
-        let mut ti = 0;
-        while pi < pattern.len() {
-            match pattern[pi] {
-                b'*' => {
-                    while pi < pattern.len() && pattern[pi] == b'*' {
-                        pi += 1;
-                    }
-                    if pi == pattern.len() {
-                        return true;
-                    }
-                    let mut k = ti;
-                    loop {
-                        if rec(&pattern[pi..], &text[k..]) {
-                            return true;
-                        }
-                        if k >= text.len() {
-                            return false;
-                        }
-                        k += 1;
-                    }
-                }
-                b'?' => {
-                    if ti >= text.len() {
-                        return false;
-                    }
-                    pi += 1;
-                    ti += 1;
-                }
-                b'[' => {
-                    if ti >= text.len() {
-                        return false;
-                    }
-                    match match_bracket(&pattern[pi..], text[ti]) {
-                        BracketOutcome::Match(consumed) => {
-                            pi += consumed;
-                            ti += 1;
-                        }
-                        BracketOutcome::NoMatch => return false,
-                        BracketOutcome::Malformed => {
-                            if text[ti] != b'[' {
-                                return false;
-                            }
-                            pi += 1;
-                            ti += 1;
-                        }
-                    }
-                }
-                b'\\' if pi + 1 < pattern.len() => {
-                    if ti >= text.len() || text[ti] != pattern[pi + 1] {
-                        return false;
-                    }
-                    pi += 2;
-                    ti += 1;
-                }
-                literal => {
-                    if ti >= text.len() || text[ti] != literal {
-                        return false;
-                    }
-                    pi += 1;
-                    ti += 1;
-                }
-            }
-        }
-        ti == text.len()
-    }
-    rec(pattern, text)
-}
-
-enum BracketOutcome {
-    Match(usize),
-    NoMatch,
-    Malformed,
-}
-
-fn match_bracket(pattern: &[u8], ch: u8) -> BracketOutcome {
-    let mut i = 1;
-    let negate = matches!(pattern.get(i), Some(b'!') | Some(b'^'));
-    if negate {
-        i += 1;
-    }
-    let mut matched = false;
-    let mut first = true;
-    while i < pattern.len() {
-        let c = pattern[i];
-        if c == b']' && !first {
-            let hit = matched != negate;
-            return if hit {
-                BracketOutcome::Match(i + 1)
-            } else {
-                BracketOutcome::NoMatch
-            };
-        }
-        first = false;
-        if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
-            let lo = c;
-            let hi = pattern[i + 2];
-            if lo <= ch && ch <= hi {
-                matched = true;
-            }
-            i += 3;
-        } else {
-            if c == ch {
-                matched = true;
-            }
-            i += 1;
-        }
-    }
-    BracketOutcome::Malformed
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -1913,17 +1829,31 @@ mod tests {
 
     #[test]
     fn wildmatch_crosses_slash() {
-        assert!(wildmatch(b"*.txt", b"sub/c.txt"));
-        assert!(wildmatch(b"sub/*", b"sub/c.txt"));
-        assert!(!wildmatch(b"*.rs", b"sub/c.txt"));
-        assert!(wildmatch(b"a?c", b"abc"));
+        assert!(grep_test_pathspec(b"*.txt").matches_path(b"sub/c.txt"));
+        assert!(grep_test_pathspec(b"sub/*").matches_path(b"sub/c.txt"));
+        assert!(!grep_test_pathspec(b"*.rs").matches_path(b"sub/c.txt"));
+        assert!(grep_test_pathspec(b"a?c").matches_path(b"abc"));
     }
 
     #[test]
     fn pathspec_dir_prefix_matches() {
-        assert!(grep_pathspec_match(b"sub", b"sub/c.txt"));
-        assert!(grep_pathspec_match(b"sub/c.txt", b"sub/c.txt"));
-        assert!(!grep_pathspec_match(b"sub", b"submarine"));
+        assert!(grep_pathspec_match(
+            &grep_test_pathspec(b"sub"),
+            b"sub/c.txt"
+        ));
+        assert!(grep_pathspec_match(
+            &grep_test_pathspec(b"sub/c.txt"),
+            b"sub/c.txt"
+        ));
+        assert!(!grep_pathspec_match(
+            &grep_test_pathspec(b"sub"),
+            b"submarine"
+        ));
+    }
+
+    fn grep_test_pathspec(pattern: &[u8]) -> sley_pathspec::PathspecElement {
+        sley_pathspec::PathspecElement::parse(pattern, sley_pathspec::PathspecMatchMagic::default())
+            .expect("test pathspec parses")
     }
 
     #[test]
