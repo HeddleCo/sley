@@ -141,6 +141,13 @@ pub struct CloneOutcome {
 pub struct CloneRequest<'a> {
     /// Destination worktree/repository path.
     pub destination: &'a Path,
+    /// Explicit destination git directory, used by `GIT_WORK_TREE git clone`
+    /// where the command-line directory is the repository admin dir and the
+    /// worktree lives elsewhere.
+    pub git_dir_override: Option<&'a Path>,
+    /// Value to write as `core.worktree` when `git_dir_override` separates the
+    /// admin dir from the checkout root.
+    pub core_worktree: Option<&'a str>,
     /// Destination repository object format.
     pub format: ObjectFormat,
     /// Already-resolved clone source.
@@ -189,8 +196,8 @@ pub struct CloneServices<'a> {
 /// turns an explicit `--branch` miss into its own message).
 pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<CloneOutcome> {
     let layout = RepositoryBootstrap::init(InitOptions {
-        git_dir_override: None,
-        core_worktree: None,
+        git_dir_override: request.git_dir_override.map(Path::to_path_buf),
+        core_worktree: request.core_worktree.map(str::to_string),
         worktree: request.destination.to_path_buf(),
         object_format: request.format,
         object_format_explicit: false,
