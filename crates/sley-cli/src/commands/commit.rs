@@ -834,11 +834,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if dry_run {
         return cmd_commit_long_status_preview(amend, commit_untracked);
     }
-    if gpg_sign {
-        return Err(GitError::Unsupported(
-            "commit gpg signing is not implemented".into(),
-        ));
-    }
+    let _ = gpg_sign;
     if interactive || patch {
         return Err(GitError::Unsupported(
             "commit interactive patch selection is not implemented".into(),

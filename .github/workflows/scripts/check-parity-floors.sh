@@ -769,6 +769,19 @@ declare -A FLOOR=(
     [t5704-protocol-violations.sh]=3
     [t5705-session-id-in-capabilities.sh]=17
     [t5802-connect-helper.sh]=8
+    # wave-18 (2026-06-19, integ/wave18 onto 9168c416): unblock + greenfield. The 7696-line
+    # workspace.rs god-module was decomposed → commit.rs/status.rs/checkout.rs/reset.rs
+    # (behavior-neutral; porcelain floors held EXACTLY t7501=54/t7507=45/t7500=57/t7508=49/
+    # t7102=37/t2020=17 — UNBLOCKS wave-19 porcelain parallelism). + 3 greenfield commands
+    # + split-index. MY measurements of the integ binary: last-modified 1->28 FULL,
+    # filter-branch 9->36, split-index/racy 1->31 FULL, fmt-merge-msg 4->37 FULL. Integration
+    # hazard handled: fmtmergemsg's cmd_commit gpg_sign edit (needed by t6200's signed-commit
+    # setup) was relocated workspace.rs->commit.rs after the decompose conflict (t6200 26->37,
+    # t7510-signed unchanged 2/28). cargo test --workspace green.
+    [t8020-last-modified.sh]=28
+    [t7003-filter-branch.sh]=36
+    [t1701-racy-split-index.sh]=31
+    [t6200-fmt-merge-msg.sh]=37
 )
 
 fail=0
