@@ -7361,16 +7361,22 @@ impl LsFilesPathspec {
 
     fn matches(&self, path: &[u8]) -> bool {
         if self.filters.is_empty() {
-            return self.prefix.is_empty()
-                || path
-                    .strip_prefix(self.prefix.as_slice())
-                    .and_then(|rest| rest.strip_prefix(b"/"))
-                    .is_some_and(|rest| !rest.is_empty());
+            return self.path_in_default_scope(path);
         }
         let attrs = self.attributes.as_ref();
-        pathspec_filters_match_with(&self.filters, path, |filter, path| {
+        let matched = pathspec_filters_match_with(&self.filters, path, |filter, path| {
             filter.matches(path) && filter.matches_attrs(path, attrs)
-        })
+        });
+        matched && (pathspec_filters_have_include(&self.filters) || self.path_in_default_scope(path))
+    }
+
+    fn path_in_default_scope(&self, path: &[u8]) -> bool {
+        self.full_name
+            || self.prefix.is_empty()
+            || path
+                .strip_prefix(self.prefix.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"/"))
+                .is_some_and(|rest| !rest.is_empty())
     }
 
     fn exit_if_unmatched(&self) -> Result<()> {
@@ -7429,6 +7435,10 @@ impl LsFilesPathFilter {
 
 fn pathspec_filters_match(filters: &[LsFilesPathFilter], path: &[u8]) -> bool {
     pathspec_filters_match_with(filters, path, |filter, path| filter.matches(path))
+}
+
+fn pathspec_filters_have_include(filters: &[LsFilesPathFilter]) -> bool {
+    filters.iter().any(|filter| !filter.is_exclude())
 }
 
 fn pathspec_filters_match_with(

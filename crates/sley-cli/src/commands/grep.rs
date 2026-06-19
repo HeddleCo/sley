@@ -1605,7 +1605,11 @@ impl GrepPathspec {
                 }
             }
         }
-        !have_include || included
+        if have_include {
+            included
+        } else {
+            self.prefix.is_empty() || path_under_prefix(path, &self.prefix)
+        }
     }
 
     /// `--max-depth N`: limit the search to files at most N directory levels below
@@ -1825,17 +1829,31 @@ mod tests {
 
     #[test]
     fn wildmatch_crosses_slash() {
-        assert!(wildmatch(b"*.txt", b"sub/c.txt"));
-        assert!(wildmatch(b"sub/*", b"sub/c.txt"));
-        assert!(!wildmatch(b"*.rs", b"sub/c.txt"));
-        assert!(wildmatch(b"a?c", b"abc"));
+        assert!(grep_test_pathspec(b"*.txt").matches_path(b"sub/c.txt"));
+        assert!(grep_test_pathspec(b"sub/*").matches_path(b"sub/c.txt"));
+        assert!(!grep_test_pathspec(b"*.rs").matches_path(b"sub/c.txt"));
+        assert!(grep_test_pathspec(b"a?c").matches_path(b"abc"));
     }
 
     #[test]
     fn pathspec_dir_prefix_matches() {
-        assert!(grep_pathspec_match(b"sub", b"sub/c.txt"));
-        assert!(grep_pathspec_match(b"sub/c.txt", b"sub/c.txt"));
-        assert!(!grep_pathspec_match(b"sub", b"submarine"));
+        assert!(grep_pathspec_match(
+            &grep_test_pathspec(b"sub"),
+            b"sub/c.txt"
+        ));
+        assert!(grep_pathspec_match(
+            &grep_test_pathspec(b"sub/c.txt"),
+            b"sub/c.txt"
+        ));
+        assert!(!grep_pathspec_match(
+            &grep_test_pathspec(b"sub"),
+            b"submarine"
+        ));
+    }
+
+    fn grep_test_pathspec(pattern: &[u8]) -> sley_pathspec::PathspecElement {
+        sley_pathspec::PathspecElement::parse(pattern, sley_pathspec::PathspecMatchMagic::default())
+            .expect("test pathspec parses")
     }
 
     #[test]
