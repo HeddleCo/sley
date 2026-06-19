@@ -508,7 +508,7 @@ declare -A FLOOR=(
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
-    [t4015-diff-whitespace.sh]=105
+    [t4015-diff-whitespace.sh]=114
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=67
     [t4019-diff-wserror.sh]=19
@@ -715,6 +715,20 @@ declare -A FLOOR=(
     # t5601 72->73, t5516 74->92, t4202 101->110, t3404 80->89, t1092 29->32,
     # t3430 17->19. NEW: t3206-range-diff (native range-diff command, 2->45).
     [t3206-range-diff.sh]=45
+    # wave-14 (2026-06-19, integ/wave14 onto 382ffcd4): 5 parity + 2 behavior-neutral
+    # consolidation refactors. All measured at the integ tip against one binary;
+    # cargo test --workspace green; foundational ref guards held/gained (t0610 72->73,
+    # t1400 271->275 NOT banked — flake-avoidance, incidental); consolidation neutral
+    # (t3206=45/t3430=19/t5520=75 held EXACTLY); diff/format guards held (t4013=191,
+    # t4014=202). t4015 105->114.
+    [t5526-fetch-submodules.sh]=39
+    [t2204-add-ignored.sh]=47
+    [t6020-bundle-misc.sh]=28
+    [t4068-diff-symmetric-merge-base.sh]=36
+    [t1423-ref-backend.sh]=25
+    # t1460-refs-migrate NOT floored: migrate works for its 34 numbered assertions
+    # (1->34) but `git refs migrate` HANGS on a tail case (harness TIMEOUT after ok=34).
+    # New command (no regression); follow-up fix needed before enrolling. Code lands.
 )
 
 fail=0

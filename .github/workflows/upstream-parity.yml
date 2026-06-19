@@ -138,6 +138,11 @@ jobs:
             t3404-rebase-interactive.sh
             t3430-rebase-merges.sh
             t3206-range-diff.sh
+            t5526-fetch-submodules.sh
+            t2204-add-ignored.sh
+            t6020-bundle-misc.sh
+            t4068-diff-symmetric-merge-base.sh
+            t1423-ref-backend.sh
             t3406-rebase-message.sh
             t3418-rebase-continue.sh
             t3420-rebase-autostash.sh
