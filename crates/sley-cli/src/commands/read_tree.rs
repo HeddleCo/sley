@@ -1519,6 +1519,9 @@ fn write_blob_to_worktree(
     // exactly as git's `write_entry` S_IFGITLINK arm and `materialize_tree_entry`.
     if sley_index::is_gitlink(mode) {
         create_leading_directories(worktree_root, &file_path)?;
+        if fs::symlink_metadata(&file_path).is_ok_and(|md| !md.is_dir()) {
+            remove_path_in_the_way(&file_path)?;
+        }
         fs::create_dir_all(&file_path)?;
         return Ok(None);
     }

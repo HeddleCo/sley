@@ -41,6 +41,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut abbrev_ref = false;
     let mut symbolic_full_name = false;
+    let mut revs_only = false;
     let mut path_format = RevParsePathFormat::Default;
     // Pseudo-ref options (`--all`, `--glob=`, `--branches[=]`, `--exclude=`, …)
     // resolve refs and print their OIDs interleaved with positional args, the
@@ -151,6 +152,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--short" => short = repository_abbrev(&git_dir, format)?,
             "--verify" => verify = true,
             "--quiet" | "-q" => quiet = true,
+            "--revs-only" => revs_only = true,
             "--abbrev-ref" | "--abbrev-ref=strict" | "--abbrev-ref=loose" => abbrev_ref = true,
             "--symbolic-full-name" => symbolic_full_name = true,
             "--bisect" => rev_parse_bisect(&git_dir, format, symbolic_full_name)?,
@@ -226,6 +228,10 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                 }
                 let oid = match resolve_revision(&git_dir, format, rev) {
                     Ok(oid) => oid,
+                    Err(_) if revs_only => {
+                        idx += 1;
+                        continue;
+                    }
                     Err(_) if verify && quiet => return Err(GitError::Exit(1)),
                     Err(_) if verify => {
                         return rev_parse_needed_single_revision(false);
