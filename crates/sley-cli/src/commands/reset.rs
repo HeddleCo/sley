@@ -618,10 +618,10 @@ fn reset_intent_to_add_candidates(
     let index = Index::parse(&fs::read(&index_path)?, format)?;
     let target_tree = sley_rev::peel_to_tree(db, format, target_commit)?;
     let target_index = sley_worktree::index_from_tree(db, format, &target_tree)?;
-    let target_paths: std::collections::BTreeSet<BString> = target_index
+    let target_paths: std::collections::BTreeSet<&BString> = target_index
         .entries
         .iter()
-        .map(|entry| entry.path.clone())
+        .map(|entry| &entry.path)
         .collect();
     Ok(index
         .entries
@@ -643,16 +643,14 @@ fn apply_reset_intent_to_add(
 ) -> Result<()> {
     let index_path = sley_worktree::repository_index_path(git_dir);
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
-    let existing: std::collections::BTreeSet<BString> =
-        index.entries.iter().map(|entry| entry.path.clone()).collect();
-    for path in paths {
-        if existing.contains(path) {
-            continue;
-        }
-        index
-            .entries
-            .push(IndexEntry::intent_to_add(format, path.clone()));
-    }
+    let existing: std::collections::BTreeSet<&BString> =
+        index.entries.iter().map(|entry| &entry.path).collect();
+    let additions = paths
+        .iter()
+        .filter(|path| !existing.contains(*path))
+        .map(|path| IndexEntry::intent_to_add(format, path.clone()))
+        .collect::<Vec<_>>();
+    index.entries.extend(additions);
     index.entries.sort_by(|left, right| left.path.cmp(&right.path));
     // intent-to-add entries carry extended flags, which the v2 index writer cannot
     // encode; bump to v3 when needed (mirrors `git add -N`'s index upgrade).

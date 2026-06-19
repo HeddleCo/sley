@@ -810,9 +810,14 @@ fn print_status_porcelain_v2(
         // Porcelain v2 submodule field (wt-status.c wt_porcelain_v2_*):
         // "N..." for an ordinary path; "S<C><M><U>" for a submodule, with C
         // for new commits, M for modified content, U for untracked content.
-        let sub = match entry.submodule {
-            Some(submodule) => format!(
-                "S{}{}{}",
+        write!(
+            stdout,
+            "1 {index}{worktree} ",
+        )?;
+        match entry.submodule {
+            Some(submodule) => write!(
+                stdout,
+                "S{}{}{} ",
                 if submodule.new_commits { 'C' } else { '.' },
                 if submodule.modified_content { 'M' } else { '.' },
                 if submodule.untracked_content {
@@ -820,15 +825,15 @@ fn print_status_porcelain_v2(
                 } else {
                     '.'
                 },
-            ),
+            )?,
             None if entry.index_mode.is_some_and(sley_index::is_gitlink) || entry.worktree_mode.is_some_and(sley_index::is_gitlink) => {
-                "S...".to_string()
+                stdout.write_all(b"S... ")?;
             }
-            None => "N...".to_string(),
-        };
+            None => stdout.write_all(b"N... ")?,
+        }
         write!(
             stdout,
-            "1 {index}{worktree} {sub} {:06o} {:06o} {:06o} {} {} ",
+            "{:06o} {:06o} {:06o} {} {} ",
             entry.head_mode.unwrap_or(0),
             entry.index_mode.unwrap_or(0),
             entry.worktree_mode.unwrap_or(0),
@@ -1250,6 +1255,8 @@ fn render_one_submodule(
     old_oid: Option<ObjectId>,
     new_oid: Option<ObjectId>,
 ) -> Result<Option<String>> {
+    use std::fmt::Write as _;
+
     let Ok(path_str) = std::str::from_utf8(path) else {
         return Ok(None);
     };
@@ -1322,7 +1329,7 @@ fn render_one_submodule(
         marked.len()
     };
     for (marker, subject) in marked.iter().take(shown) {
-        body.push_str(&format!("  {marker} {subject}\n"));
+        writeln!(body, "  {marker} {subject}").expect("writing to String cannot fail");
     }
     Ok(Some(body))
 }

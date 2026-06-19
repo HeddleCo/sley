@@ -9169,6 +9169,7 @@ struct AttributeMatcher {
 struct AttributePattern {
     base: Vec<u8>,
     pattern: Vec<u8>,
+    ignore_case_pattern: Option<Vec<u8>>,
     anchored: bool,
     has_slash: bool,
     assignments: Vec<AttributeAssignment>,
@@ -9601,6 +9602,7 @@ fn push_attribute_pattern(
     matcher.patterns.push(AttributePattern {
         base: base.to_vec(),
         pattern: pattern.to_vec(),
+        ignore_case_pattern: matcher.ignore_case.then(|| ascii_lowercase(pattern)),
         anchored,
         has_slash: pattern.contains(&b'/'),
         assignments,
@@ -9808,12 +9810,17 @@ impl AttributePattern {
                 None => return false,
             }
         };
-        let pattern;
+        let folded_pattern;
         let folded_path;
         let (pattern_ref, path_ref) = if ignore_case {
-            pattern = ascii_lowercase(&self.pattern);
             folded_path = ascii_lowercase(path);
-            (pattern.as_slice(), folded_path.as_slice())
+            let pattern_ref = if let Some(pattern) = self.ignore_case_pattern.as_deref() {
+                pattern
+            } else {
+                folded_pattern = ascii_lowercase(&self.pattern);
+                folded_pattern.as_slice()
+            };
+            (pattern_ref, folded_path.as_slice())
         } else {
             (self.pattern.as_slice(), path)
         };

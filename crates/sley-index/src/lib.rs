@@ -1613,7 +1613,7 @@ fn merge_split_index_entries(
     delta_entries: Vec<IndexEntry>,
     link: &SplitIndexLink,
 ) -> Result<Vec<IndexEntry>> {
-    let mut replacement_iter = delta_entries.iter();
+    let mut replacement_iter = delta_entries.into_iter();
     for position in &link.replace_positions {
         let position = *position as usize;
         if position >= base_entries.len() {
@@ -1624,7 +1624,7 @@ fn merge_split_index_entries(
         let Some(replacement) = replacement_iter.next() else {
             return Err(GitError::InvalidFormat("too few replacement entries".into()));
         };
-        let mut replacement = replacement.clone();
+        let mut replacement = replacement;
         if replacement.path.is_empty() {
             replacement.path = base_entries[position].path.clone();
             replacement.refresh_name_length();
@@ -1654,7 +1654,7 @@ fn merge_split_index_entries(
                 "corrupt link extension replacement/addition ordering".into(),
             ));
         }
-        base_entries.push(entry.clone());
+        base_entries.push(entry);
     }
     base_entries.sort_by(|left, right| {
         left.path
