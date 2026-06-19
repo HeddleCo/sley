@@ -524,8 +524,8 @@ declare -A FLOOR=(
     # 88->113; side gain t7406 54->57. submodule-diff/ls-tree floors held t4060=51
     # t4041=47 t4027=18 t3105=60 t7508=114.
     [t7400-submodule-basic.sh]=113
-    [t7506-status-submodule.sh]=28
-    [t7508-status.sh]=114
+    [t7506-status-submodule.sh]=34
+    [t7508-status.sh]=119
     [t4027-diff-submodule.sh]=18
     [t7102-reset.sh]=37
     # blame scoreboard wave (blame.c pass_blame/blame_chunk port + annotate-compat
@@ -590,7 +590,7 @@ declare -A FLOOR=(
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
     [t5611-clone-config.sh]=13
     [t5603-clone-dirname.sh]=39
-    [t7502-commit-porcelain.sh]=75
+    [t7502-commit-porcelain.sh]=77
     # codex-wave-1 (2026-06-17): config stop-at-non-option (+3) + commit SQUASH_MSG (+2),
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
     # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
@@ -788,13 +788,23 @@ declare -A FLOOR=(
     # 52->56 + t7509 9->12 FULL, sparse-compat t1092 32->34, attrs t0003 28->51. Cross-guards
     # held EXACTLY (t7501=54, t7507=45, t7500=57, t7102=37, t2020=17, t1091=53, t4015=114,
     # t6200=37) — the attrs<->sparse sley-worktree/lib.rs auto-merge is behaviorally safe.
-    # NOTE: t7508 and t7502 floors below are STALE-HIGH (114/75) vs the hermetic reality
-    # (54/56) — pre-existing, predates wave-19; weekly gate red since 6/18. Left untouched
-    # pending maintainer decision (correct-to-hermetic vs regression-hunt); wave-19 RAISED
-    # both over their true base. New floors enrolled in upstream-parity.yml.
     [t7512-status-help.sh]=36
     [t7509-commit-authorship.sh]=12
     [t0003-attributes.sh]=51
+    # statusreg fix (2026-06-19, fix 7c64536d onto 928204fc): NOT a stale floor — a REAL
+    # regression. A bisect proved t7508=114/t7502=75 were hermetically real (held through
+    # parent f1e672fa); commit d3f746e6 "Improve commit porcelain parity" dropped t7508 114->49
+    # + t7502 75->52 because its all_index_snapshot used None ambiguously for both "no --all
+    # snapshot" and "snapshot of missing index" — the empty-message commit-abort path then
+    # restore_index_snapshot(&None)'d a normal commit and DELETED .git/index, so status saw
+    # tracked files as staged-deleted+untracked. Fix lifts the distinction into the type
+    # (Option<Option<Vec<u8>>>), restoring only when a snapshot was taken. Recovery measured vs
+    # the fix binary: t7508 49->119 (RAISED 114->119, wave-19 status work stacks on top), t7502
+    # 52->77 (75->77), blast-radius t7506-status-submodule 28->34. t7060/t7064 newly floored.
+    # All cross-guards held. LESSON: commit-porcelain slices MUST floor-guard t7508 (commit
+    # --status renders the status template) — this regression was masked because they weren't.
+    [t7064-wtstatus-pv2.sh]=21
+    [t7060-wtstatus.sh]=7
 )
 
 fail=0
