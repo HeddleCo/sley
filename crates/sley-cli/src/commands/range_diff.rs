@@ -1,11 +1,10 @@
 //! `git range-diff` — compare two commit series by patch similarity.
 
 use crate::*;
+use sley_diff_merge::range::{PatchRef, assign_patch_series};
 use sley_notes::{NotesRef, read_note_bytes};
 
 const DEFAULT_CREATION_FACTOR: i32 = 60;
-const COST_MAX: i32 = i32::MAX / 4;
-type AssignmentMemo = HashMap<(usize, u64), (i32, Vec<(usize, usize)>)>;
 
 #[derive(Clone)]
 struct RangeDiffOptions {
@@ -56,14 +55,6 @@ impl PatchRecord {
     fn diff(&self) -> &[u8] {
         &self.patch[self.diff_offset..]
     }
-}
-
-struct AssignmentCtx<'a> {
-    left_ids: &'a [usize],
-    right_ids: &'a [usize],
-    left: &'a [PatchRecord],
-    right: &'a [PatchRecord],
-    creation_factor: i32,
 }
 
 pub(crate) fn cmd_range_diff(args: &[String]) -> Result<()> {
@@ -160,8 +151,7 @@ fn render_range_diff(
 ) -> Result<Vec<u8>> {
     let mut left = read_patches(repo, &parsed.range1, &parsed.pathspecs, options, notes_refs)?;
     let mut right = read_patches(repo, &parsed.range2, &parsed.pathspecs, options, notes_refs)?;
-    find_exact_matches(&mut left, &mut right);
-    get_correspondences(&mut left, &mut right, options.creation_factor);
+    assign_correspondences(&mut left, &mut right, options.creation_factor);
     let mut out = Vec::new();
     output_range_diff(&mut out, repo, &mut left, &mut right, options)?;
     Ok(out)
@@ -689,114 +679,32 @@ fn render_range_diff_notes(
     Ok(out)
 }
 
-fn find_exact_matches(left: &mut [PatchRecord], right: &mut [PatchRecord]) {
-    let mut used = HashSet::new();
-    for (i, left_patch) in left.iter_mut().enumerate() {
-        for (j, right_patch) in right.iter_mut().enumerate() {
-            if used.contains(&j) {
-                continue;
-            }
-            if left_patch.diff() == right_patch.diff() {
-                left_patch.matching = Some(j);
-                right_patch.matching = Some(i);
-                used.insert(j);
-                break;
-            }
-        }
-    }
-}
-
-fn get_correspondences(left: &mut [PatchRecord], right: &mut [PatchRecord], creation_factor: i32) {
-    let left_unmatched: Vec<usize> = left
+fn assign_correspondences(
+    left: &mut [PatchRecord],
+    right: &mut [PatchRecord],
+    creation_factor: i32,
+) {
+    let left_refs = left
         .iter()
-        .enumerate()
-        .filter_map(|(idx, patch)| patch.matching.is_none().then_some(idx))
-        .collect();
-    let right_unmatched: Vec<usize> = right
+        .map(|patch| PatchRef {
+            subject: &patch.subject,
+            diff: patch.diff(),
+            diff_size: patch.diff_size,
+        })
+        .collect::<Vec<_>>();
+    let right_refs = right
         .iter()
-        .enumerate()
-        .filter_map(|(idx, patch)| patch.matching.is_none().then_some(idx))
-        .collect();
-    if left_unmatched.is_empty() || right_unmatched.len() > 62 {
-        return;
-    }
-    let mut memo = HashMap::new();
-    let ctx = AssignmentCtx {
-        left_ids: &left_unmatched,
-        right_ids: &right_unmatched,
-        left,
-        right,
-        creation_factor,
-    };
-    let (_, pairs) = assignment_dp(0, 0, &ctx, &mut memo);
+        .map(|patch| PatchRef {
+            subject: &patch.subject,
+            diff: patch.diff(),
+            diff_size: patch.diff_size,
+        })
+        .collect::<Vec<_>>();
+    let pairs = assign_patch_series(&left_refs, &right_refs, creation_factor);
     for (li, rj) in pairs {
         left[li].matching = Some(rj);
         right[rj].matching = Some(li);
     }
-}
-
-fn assignment_dp(
-    pos: usize,
-    used: u64,
-    ctx: &AssignmentCtx<'_>,
-    memo: &mut AssignmentMemo,
-) -> (i32, Vec<(usize, usize)>) {
-    if let Some(value) = memo.get(&(pos, used)) {
-        return value.clone();
-    }
-    if pos == ctx.left_ids.len() {
-        let mut cost = 0;
-        for (bit, &rid) in ctx.right_ids.iter().enumerate() {
-            if used & (1u64 << bit) == 0 {
-                cost = saturating_cost(cost, ctx.right[rid].diff_size * ctx.creation_factor / 100);
-            }
-        }
-        return (cost, Vec::new());
-    }
-    let li = ctx.left_ids[pos];
-    let delete_cost = ctx.left[li].diff_size * ctx.creation_factor / 100;
-    let (tail_cost, tail_pairs) = assignment_dp(pos + 1, used, ctx, memo);
-    let mut best = (saturating_cost(delete_cost, tail_cost), tail_pairs);
-
-    for (bit, &rj) in ctx.right_ids.iter().enumerate() {
-        if used & (1u64 << bit) != 0 {
-            continue;
-        }
-        let match_cost = if ctx.left[li].subject == ctx.right[rj].subject {
-            diff_size(ctx.left[li].diff(), ctx.right[rj].diff()) / 2
-        } else {
-            diff_size(ctx.left[li].diff(), ctx.right[rj].diff())
-        };
-        let (tail_cost, mut pairs) = assignment_dp(
-            pos + 1,
-            used | (1u64 << bit),
-            ctx,
-            memo,
-        );
-        let cost = saturating_cost(match_cost, tail_cost);
-        if cost < best.0 {
-            pairs.push((li, rj));
-            best = (cost, pairs);
-        }
-    }
-    memo.insert((pos, used), best.clone());
-    best
-}
-
-fn saturating_cost(a: i32, b: i32) -> i32 {
-    a.saturating_add(b).min(COST_MAX)
-}
-
-fn diff_size(left: &[u8], right: &[u8]) -> i32 {
-    let mut rendered = Vec::new();
-    let mut heading = section_heading_classifier();
-    let mut opts = sley_diff_merge::render::HunkRenderOptions {
-        context: 3,
-        heading: Some(&mut heading),
-        ..Default::default()
-    };
-    sley_diff_merge::render::render_hunks(&mut rendered, Some(left), Some(right), &mut opts);
-    rendered.iter().filter(|b| **b == b'\n').count() as i32
 }
 
 fn output_range_diff(

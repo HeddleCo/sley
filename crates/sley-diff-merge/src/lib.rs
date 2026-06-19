@@ -1,5 +1,6 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 
+pub mod range;
 pub mod render;
 pub mod ws;
 
