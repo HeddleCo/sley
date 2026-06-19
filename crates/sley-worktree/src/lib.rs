@@ -2261,6 +2261,11 @@ pub fn set_index_assume_unchanged_paths(
             checksum: None,
         }
     };
+    let sparse = active_sparse_checkout(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if index.is_sparse() {
+        expand_sparse_index(&mut index, &db, format)?;
+    }
     let selected_paths = paths
         .iter()
         .map(|path| {
@@ -2285,6 +2290,12 @@ pub fn set_index_assume_unchanged_paths(
         }
     }
     normalize_index_version_for_extended_flags(&mut index);
+    if let Some((sparse, mode)) = sparse
+        && sparse.sparse_index
+    {
+        let matcher = SparseMatcher::new(&sparse, mode);
+        collapse_to_sparse_index(&mut index, &matcher, &db, format)?;
+    }
     write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -2335,6 +2346,11 @@ pub fn set_index_skip_worktree_paths(
             checksum: None,
         }
     };
+    let sparse = active_sparse_checkout(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if index.is_sparse() {
+        expand_sparse_index(&mut index, &db, format)?;
+    }
     let selected_paths = paths
         .iter()
         .map(|path| {
@@ -2363,6 +2379,12 @@ pub fn set_index_skip_worktree_paths(
         }
     }
     normalize_index_version_for_extended_flags(&mut index);
+    if let Some((sparse, mode)) = sparse
+        && sparse.sparse_index
+    {
+        let matcher = SparseMatcher::new(&sparse, mode);
+        collapse_to_sparse_index(&mut index, &matcher, &db, format)?;
+    }
     write_repository_index(git_dir, format, index.clone())?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -11379,10 +11401,14 @@ fn restore_index_paths_from_entries(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
-    index: Index,
+    mut index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
+    let sparse = active_sparse_checkout(git_dir)?;
+    if index.is_sparse() {
+        expand_sparse_index(&mut index, db, format)?;
+    }
     let index_version = index.version;
     let extensions = index_extensions_without_cache_tree(&index.extensions);
     let mut index_entries = index
@@ -11458,6 +11484,12 @@ fn restore_index_paths_from_entries(
         checksum: None,
     };
     invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
+    if let Some((sparse, mode)) = sparse
+        && sparse.sparse_index
+    {
+        let matcher = SparseMatcher::new(&sparse, mode);
+        collapse_to_sparse_index(&mut index, &matcher, db, format)?;
+    }
     write_repository_index(git_dir, format, index.clone())?;
     Ok(RestoreResult {
         restored: restored.len(),
@@ -12076,6 +12108,53 @@ pub fn path_in_sparse_checkout(path: &[u8], sparse: &SparseCheckout, mode: Spars
     SparseMatcher::new(sparse, mode).includes_file(path)
 }
 
+fn active_sparse_checkout(
+    git_dir: &Path,
+) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
+    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let sparse_enabled = worktree_config
+        .get_bool("core", None, "sparseCheckout")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return Ok(None);
+    }
+    let sparse_file = git_dir.join("info").join("sparse-checkout");
+    if !sparse_file.exists() {
+        return Ok(None);
+    }
+    let cone = worktree_config
+        .get_bool("core", None, "sparseCheckoutCone")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
+        .unwrap_or(false);
+    let sparse_index = cone
+        && worktree_config
+            .get_bool("index", None, "sparse")
+            .or_else(|| repo_config.get_bool("index", None, "sparse"))
+            .unwrap_or(false);
+    let bytes = fs::read(sparse_file)?;
+    let mut patterns = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if patterns.last().map(Vec::is_empty) == Some(true) {
+        patterns.pop();
+    }
+    let mode = if cone {
+        SparseCheckoutMode::Cone
+    } else {
+        SparseCheckoutMode::Full
+    };
+    Ok(Some((
+        SparseCheckout {
+            patterns,
+            sparse_index,
+        },
+        mode,
+    )))
+}
+
 /// Conflicted entries (stage != 0) are never given the skip-worktree bit and
 /// are left alone, matching upstream Git. The index is rewritten in place.
 pub fn apply_sparse_checkout(
@@ -12198,6 +12277,9 @@ pub fn expand_sparse_index(
         // Still strip a stray `sdir` marker so the written index is recorded full.
         let had_marker = index.is_sparse();
         index.clear_sparse_extension()?;
+        if had_marker {
+            sley_core::trace2::region("index", "ensure_full_index");
+        }
         return Ok(had_marker);
     }
     let mut expanded: Vec<IndexEntry> = Vec::with_capacity(index.entries.len());
@@ -12222,6 +12304,7 @@ pub fn expand_sparse_index(
     index.entries = expanded;
     index.clear_sparse_extension()?;
     normalize_index_version_for_extended_flags(index);
+    sley_core::trace2::region("index", "ensure_full_index");
     Ok(true)
 }
 
@@ -12382,6 +12465,7 @@ fn collapse_to_sparse_index(
     index.entries = new_entries;
     index.set_sparse_extension();
     normalize_index_version_for_extended_flags(index);
+    sley_core::trace2::region("index", "convert_to_sparse");
     Ok(())
 }
 
