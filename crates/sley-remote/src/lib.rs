@@ -568,6 +568,8 @@ mod tests {
         let outcome = clone(
             CloneRequest {
                 destination: &destination,
+                git_dir_override: None,
+                core_worktree: None,
                 format: ObjectFormat::Sha1,
                 source: &CloneSource::Http(RemoteUrl { ..remote }),
                 options: &options,
