@@ -15,6 +15,7 @@ use crate::grep_source::{
     Expr, ExprToken, GrepCompileConfig, GrepMatcher, PatternKind, PatternTypeOption,
     RegexDiagnosticVerbosity,
 };
+use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
 
 /// Parsed command-line options for `git grep`.
@@ -1552,10 +1553,12 @@ impl GrepPathspec {
         self.matches_inner(path, |filter, path| {
             grep_pathspec_match(&filter.element, path)
                 && pathspec_attrs_match_with(&filter.element, |requested| {
-                    self.attributes
-                        .as_ref()
-                        .map(|matcher| matcher.attributes_for_path(path, requested, false))
-                        .unwrap_or_default()
+                    attribute_checks_for_matching(
+                        self.attributes
+                            .as_ref()
+                            .map(|matcher| matcher.attributes_for_path(path, requested, false))
+                            .unwrap_or_default(),
+                    )
                 })
         })
     }
@@ -1573,10 +1576,12 @@ impl GrepPathspec {
         Ok(self.matches_inner(path, |filter, path| {
             grep_pathspec_match(&filter.element, path)
                 && pathspec_attrs_match_with(&filter.element, |requested| {
-                    sley_worktree::standard_attributes_for_path_from_tree(
-                        root, db, format, tree_oid, path, requested, false,
+                    attribute_checks_for_matching(
+                        sley_worktree::standard_attributes_for_path_from_tree(
+                            root, db, format, tree_oid, path, requested, false,
+                        )
+                        .unwrap_or_default(),
                     )
-                    .unwrap_or_default()
                 })
         }))
     }

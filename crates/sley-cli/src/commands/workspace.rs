@@ -3,6 +3,9 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_pathspec::{
+    LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match,
+};
 
 /// git's `git reset --help`-derived usage block, printed after an `error:` line
 /// when parse-options rejects an argument (matches builtin/reset.c's usage).

@@ -6,10 +6,11 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use sley_core::{GitError, Result};
+use sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{
-    RepositoryContext, check_ignore_tracked_paths, normalize_ls_files_pathspec, resolve_cli_path,
-    require_work_tree, worktree_prefix, write_check_attr_state,
+    RepositoryContext, check_ignore_tracked_paths, resolve_cli_path, require_work_tree,
+    worktree_prefix, write_check_attr_state,
 };
 
 pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {

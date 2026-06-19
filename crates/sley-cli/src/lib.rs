@@ -15,6 +15,11 @@ use sley_odb::{
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use sley_pathspec::{
+    LsFilesPathFilter, PathspecAttributeCheck, PathspecAttributeState,
+    parse_normalized_pathspec_element, pathspec_attrs_match_with,
+    pathspec_filters_have_include, pathspec_filters_match, pathspec_filters_match_with,
+};
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
     RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, read_fetch_head,
@@ -721,6 +726,24 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
         glob: flags.glob && !flags.literal,
         icase: flags.icase,
     }
+}
+
+pub(crate) fn attribute_checks_for_matching(
+    checks: Vec<sley_worktree::AttributeCheck>,
+) -> Vec<PathspecAttributeCheck> {
+    checks
+        .into_iter()
+        .map(|check| PathspecAttributeCheck {
+            attribute: check.attribute,
+            state: check.state.map(|state| match state {
+                sley_worktree::AttributeState::Set => PathspecAttributeState::Set,
+                sley_worktree::AttributeState::Unset => PathspecAttributeState::Unset,
+                sley_worktree::AttributeState::Value(value) => {
+                    PathspecAttributeState::Value(value)
+                }
+            }),
+        })
+        .collect()
 }
 
 fn git_env_bool(name: &str) -> bool {
@@ -7393,7 +7416,14 @@ impl LsFilesPathspec {
         }
         let attrs = self.attributes.as_ref();
         let matched = pathspec_filters_match_with(&self.filters, path, |filter, path| {
-            filter.matches(path) && filter.matches_attrs(path, attrs)
+            filter.matches(path)
+                && pathspec_attrs_match_with(&filter.element, |requested| {
+                    attribute_checks_for_matching(
+                        attrs
+                            .map(|matcher| matcher.attributes_for_path(path, requested, false))
+                            .unwrap_or_default(),
+                    )
+                })
         });
         matched && (pathspec_filters_have_include(&self.filters) || self.path_in_default_scope(path))
     }
@@ -7424,191 +7454,6 @@ impl LsFilesPathspec {
         }
         Ok(())
     }
-}
-
-struct LsFilesPathFilter {
-    original: String,
-    recursive: bool,
-    is_glob: bool,
-    element: sley_pathspec::PathspecElement,
-    matched: Cell<bool>,
-}
-
-impl LsFilesPathFilter {
-    fn is_exclude(&self) -> bool {
-        self.element.is_exclude()
-    }
-
-    fn matches(&self, path: &[u8]) -> bool {
-        // Byte-exact git `match_pathspec_item` for the tracked-index path. Handles
-        // exact / directory-prefix / wildcard matching under the active magic.
-        let path_no_slash = path.strip_suffix(b"/").unwrap_or(path);
-        self.element.matches_path(path)
-            || (path_no_slash.len() != path.len()
-                && self.element.matches_path(path_no_slash))
-    }
-
-    fn matches_attrs(
-        &self,
-        path: &[u8],
-        attributes: Option<&sley_worktree::StandardAttributeMatcher>,
-    ) -> bool {
-        pathspec_attrs_match_with(&self.element, |requested| {
-            attributes
-                .map(|matcher| matcher.attributes_for_path(path, requested, false))
-                .unwrap_or_default()
-        })
-    }
-}
-
-fn pathspec_filters_match(filters: &[LsFilesPathFilter], path: &[u8]) -> bool {
-    pathspec_filters_match_with(filters, path, |filter, path| filter.matches(path))
-}
-
-fn pathspec_filters_have_include(filters: &[LsFilesPathFilter]) -> bool {
-    filters.iter().any(|filter| !filter.is_exclude())
-}
-
-fn pathspec_filters_match_with(
-    filters: &[LsFilesPathFilter],
-    path: &[u8],
-    mut matches: impl FnMut(&LsFilesPathFilter, &[u8]) -> bool,
-) -> bool {
-    let mut have_include = false;
-    let mut included = false;
-    for filter in filters {
-        if filter.is_exclude() {
-            if matches(filter, path) {
-                filter.matched.set(true);
-                return false;
-            }
-        } else {
-            have_include = true;
-            if matches(filter, path) {
-                filter.matched.set(true);
-                included = true;
-            }
-        }
-    }
-    !have_include || included
-}
-
-fn pathspec_attrs_match_with(
-    element: &sley_pathspec::PathspecElement,
-    checks: impl FnOnce(&[Vec<u8>]) -> Vec<sley_worktree::AttributeCheck>,
-) -> bool {
-    let requirements = element.attr_requirements();
-    if requirements.is_empty() {
-        return true;
-    }
-    let requested = requirements
-        .iter()
-        .map(|requirement| match requirement {
-            sley_pathspec::PathspecAttrRequirement::Set(name)
-            | sley_pathspec::PathspecAttrRequirement::Unset(name)
-            | sley_pathspec::PathspecAttrRequirement::Unspecified(name) => name.clone(),
-            sley_pathspec::PathspecAttrRequirement::Value { name, .. } => name.clone(),
-        })
-        .collect::<Vec<_>>();
-    let checks = checks(&requested);
-    requirements.iter().all(|requirement| {
-        let (name, expected) = match requirement {
-            sley_pathspec::PathspecAttrRequirement::Set(name) => {
-                (name, AttrRequirementKind::Set)
-            }
-            sley_pathspec::PathspecAttrRequirement::Unset(name) => {
-                (name, AttrRequirementKind::Unset)
-            }
-            sley_pathspec::PathspecAttrRequirement::Unspecified(name) => {
-                (name, AttrRequirementKind::Unspecified)
-            }
-            sley_pathspec::PathspecAttrRequirement::Value { name, value } => {
-                (name, AttrRequirementKind::Value(value))
-            }
-        };
-        let state = checks
-            .iter()
-            .find(|check| &check.attribute == name)
-            .and_then(|check| check.state.as_ref());
-        match expected {
-            AttrRequirementKind::Set => matches!(state, Some(sley_worktree::AttributeState::Set)),
-            AttrRequirementKind::Unset => {
-                matches!(state, Some(sley_worktree::AttributeState::Unset))
-            }
-            AttrRequirementKind::Unspecified => state.is_none(),
-            AttrRequirementKind::Value(value) => {
-                matches!(state, Some(sley_worktree::AttributeState::Value(actual)) if actual == value)
-            }
-        }
-    })
-}
-
-enum AttrRequirementKind<'a> {
-    Set,
-    Unset,
-    Unspecified,
-    Value(&'a [u8]),
-}
-
-fn parse_normalized_pathspec_element(
-    prefix: &[u8],
-    arg: &str,
-    magic: sley_pathspec::PathspecMatchMagic,
-) -> Result<sley_pathspec::PathspecElement> {
-    let element = sley_pathspec::PathspecElement::parse(arg.as_bytes(), magic)
-        .map_err(|err| GitError::Command(format!("bad pathspec: {err}")))?;
-    let base = if element.is_top() { b"".as_slice() } else { prefix };
-    let pattern = normalize_ls_files_pathspec(base, &String::from_utf8_lossy(element.pattern()))?;
-    Ok(element.with_pattern(pattern))
-}
-
-fn normalized_revwalk_pathspec(
-    cwd: &Path,
-    worktree_root: Option<&Path>,
-    pathspecs: &[String],
-) -> Result<sley_rev::Pathspec> {
-    let prefix = if let Some(root) = worktree_root {
-        let root = fs::canonicalize(root)?;
-        let cwd = fs::canonicalize(cwd)?;
-        cwd.strip_prefix(&root)
-            .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let magic = effective_pathspec_flags();
-    let elements = pathspecs
-        .iter()
-        .map(|spec| parse_normalized_pathspec_element(&prefix, spec, magic))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(sley_rev::Pathspec::from_elements(elements))
-}
-
-fn normalize_ls_files_pathspec(prefix: &[u8], arg: &str) -> Result<Vec<u8>> {
-    let mut components = prefix
-        .split(|byte| *byte == b'/')
-        .filter(|component| !component.is_empty())
-        .map(Vec::from)
-        .collect::<Vec<_>>();
-    for component in Path::new(arg).components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                components.pop().ok_or_else(|| {
-                    GitError::InvalidPath(format!("pathspec {arg} is outside worktree"))
-                })?;
-            }
-            std::path::Component::Normal(name) => {
-                components.push(name.to_string_lossy().as_bytes().to_vec());
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(GitError::Unsupported(
-                    "ls-files pathspecs currently support relative paths".into(),
-                ));
-            }
-        }
-    }
-    Ok(components.join(&b'/'))
 }
 
 fn path_component_count(path: &[u8]) -> usize {

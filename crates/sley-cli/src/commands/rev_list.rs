@@ -3,6 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_pathspec::normalized_revwalk_pathspec;
 
 pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut setup_args = Vec::new();
@@ -894,7 +895,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     // owned binding so `selected` (a Vec of references) can borrow from it.
     let simplified_storage;
     if !pathspecs.is_empty() || full_history || revision_options.simplify_merges {
-        let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
+        let pathspec = normalized_revwalk_pathspec(
+            &cwd,
+            worktree_root.as_deref(),
+            &pathspecs,
+            effective_pathspec_flags(),
+        )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
         // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for

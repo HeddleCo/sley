@@ -3,6 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_pathspec::normalized_revwalk_pathspec;
 use sley_notes::{NotesRef, read_note_bytes};
 
 /// Tracks `git log`'s notes-display state (`--notes`, `--show-notes[=ref]`,
@@ -2585,7 +2586,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         selected.retain(|r| on_path.contains(&r.oid));
     }
     if saw_follow && !pathspecs.is_empty() {
-        let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
+        let pathspec = normalized_revwalk_pathspec(
+            &cwd,
+            worktree_root.as_deref(),
+            &pathspecs,
+            effective_pathspec_flags(),
+        )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> = commits.clone();
         let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
         let _ = sley_rev::simplify_history_with_bottoms(
@@ -2621,7 +2627,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // rewriting). Owned binding outlives `selected` (a Vec of references).
     let simplified_storage;
     if (!pathspecs.is_empty() && !follow_applied) || full_history || revision_options.simplify_merges {
-        let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
+        let pathspec = normalized_revwalk_pathspec(
+            &cwd,
+            worktree_root.as_deref(),
+            &pathspecs,
+            effective_pathspec_flags(),
+        )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
         // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for
