@@ -1057,13 +1057,15 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     // Emptiness is judged before the signoff trailer is added (git aborts
     // `commit -m "" -s`).
     let empty_before_signoff =
-        commit_message_is_empty(&commit_message_with_trailers(message.clone(), &trailers));
+        commit_message_is_empty(&commit_message_with_trailers(&message, &trailers));
     let mut message = if signoff {
         commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
     } else {
         message
     };
-    message = commit_message_with_trailers(message, &trailers);
+    if !trailers.is_empty() {
+        message = commit_message_with_trailers(&message, &trailers).into_owned();
+    }
     // Editor flow: a commit without an explicit message source launches the
     // editor over COMMIT_EDITMSG (the in-merge / rebase conclude paths keep
     // their historical no-editor behavior).
@@ -1084,13 +1086,27 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         && (edit_flag == Some(true)
             || (edit_flag != Some(false)
                 && (!had_message_source || reedit_message || fixup_uses_editor || squash_uses_editor)));
-    let partial_index_snapshot = if !pathspec_args.is_empty() {
+    let partial_head_tree = if !pathspec_args.is_empty() {
+        let refs = FileRefStore::new(&git_dir, format);
+        let head = commands::merge_rebase::head_commit_oid(&refs)?;
+        let tree_map = match &head {
+            Some(oid) => {
+                let tree = commands::merge_rebase::commit_tree_oid(&commit_odb, format, oid)?;
+                stash_tree_entry_map(&commit_odb, format, &tree)?
+            }
+            None => BTreeMap::new(),
+        };
+        Some((head, tree_map))
+    } else {
+        None
+    };
+    let partial_index_snapshot = if partial_head_tree.is_some() {
         Some(read_index_snapshot(&git_dir)?)
     } else {
         None
     };
-    if partial_index_snapshot.is_some()
-        && let Err(err) = stage_partial_commit_paths(&git_dir, format, &pathspec_args)
+    if let Some((_, tree_map)) = &partial_head_tree
+        && let Err(err) = stage_partial_commit_paths(&git_dir, format, &pathspec_args, tree_map)
     {
         if let Some(snapshot) = &partial_index_snapshot {
             let _ = restore_index_snapshot(&git_dir, snapshot);
@@ -1266,10 +1282,13 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     if !pathspec_args.is_empty() {
+        let (head, tree_map) = partial_head_tree.expect("partial commit precomputed HEAD tree");
         return commit_partial_paths(
             &git_dir,
             format,
             &pathspec_args,
+            head,
+            tree_map,
             author,
             committer,
             message,
@@ -1291,9 +1310,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         None
     };
     // Retain copies for the post-commit summary (the options struct moves them).
-    let summary_author = author.clone();
-    let summary_committer = committer.clone();
-    let summary_message = message.clone();
+    let summary = if quiet {
+        None
+    } else {
+        Some((author.clone(), committer.clone(), message.clone()))
+    };
     let options = sley_sequencer::CommitIndexOptions {
         author,
         committer,
@@ -1311,7 +1332,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
     remove_commit_state_files(&git_dir);
-    if !quiet {
+    if let Some((summary_author, summary_committer, summary_message)) = summary {
         print_commit_summary(
             &git_dir,
             format,
@@ -1509,12 +1530,17 @@ fn write_commit_summary_entry(
 ///
 /// Commit messages are UTF-8 in practice; we losslessly round-trip via
 /// `from_utf8_lossy` so non-UTF-8 bytes don't crash the (text-oriented) engine.
-fn commit_message_with_trailers(message: Vec<u8>, trailers: &[String]) -> Vec<u8> {
+fn commit_message_with_trailers<'a>(
+    message: &'a [u8],
+    trailers: &[String],
+) -> std::borrow::Cow<'a, [u8]> {
     if trailers.is_empty() {
-        return message;
+        return std::borrow::Cow::Borrowed(message);
     }
-    let text = String::from_utf8_lossy(&message);
-    commands::interpret_trailers::apply_trailers_to_message(&text, trailers).into_bytes()
+    let text = String::from_utf8_lossy(message);
+    std::borrow::Cow::Owned(
+        commands::interpret_trailers::apply_trailers_to_message(&text, trailers).into_bytes(),
+    )
 }
 
 /// Conclude an in-progress cherry-pick / revert via `git commit`: commit the
@@ -1634,6 +1660,8 @@ fn commit_partial_paths(
     git_dir: &Path,
     format: ObjectFormat,
     paths: &[String],
+    head: Option<ObjectId>,
+    mut tree_map: BTreeMap<Vec<u8>, (u32, ObjectId)>,
     author: Vec<u8>,
     committer: Vec<u8>,
     message: Vec<u8>,
@@ -1641,15 +1669,7 @@ fn commit_partial_paths(
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
-    let head = commands::merge_rebase::head_commit_oid(&refs)?;
-    let mut tree_map = match &head {
-        Some(oid) => {
-            let tree = commands::merge_rebase::commit_tree_oid(&db, format, oid)?;
-            stash_tree_entry_map(&db, format, &tree)?
-        }
-        None => BTreeMap::new(),
-    };
-    let rel_paths = stage_partial_commit_paths(git_dir, format, paths)?;
+    let rel_paths = stage_partial_commit_paths(git_dir, format, paths, &tree_map)?;
     let index_path = sley_worktree::repository_index_path(git_dir);
     // Overlay the staged state of the matched paths onto HEAD's tree.
     let updated_index = Index::parse(&fs::read(&index_path)?, format)?;
@@ -1712,19 +1732,10 @@ fn stage_partial_commit_paths(
     git_dir: &Path,
     format: ObjectFormat,
     paths: &[String],
+    head_tree_map: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
 ) -> Result<Vec<Vec<u8>>> {
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let cwd = env::current_dir()?;
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let refs = FileRefStore::new(git_dir, format);
-    let head = commands::merge_rebase::head_commit_oid(&refs)?;
-    let tree_map = match &head {
-        Some(oid) => {
-            let tree = commands::merge_rebase::commit_tree_oid(&db, format, oid)?;
-            stash_tree_entry_map(&db, format, &tree)?
-        }
-        None => BTreeMap::new(),
-    };
     let index_path = sley_worktree::repository_index_path(git_dir);
     let index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
@@ -1740,7 +1751,7 @@ fn stage_partial_commit_paths(
         .entries
         .iter()
         .map(|entry| entry.path.clone().into_bytes())
-        .chain(tree_map.keys().cloned())
+        .chain(head_tree_map.keys().cloned())
         .collect();
 
     // Expand the pathspecs over the tracked entries (directories and `.`
@@ -1894,21 +1905,31 @@ fn write_entry_map_level(
     } else {
         prefix.len() + 1
     };
-    for (path, (mode, oid)) in entries {
-        if !prefix.is_empty()
-            && (!path.starts_with(prefix) || path.get(prefix.len()) != Some(&b'/'))
-        {
-            continue;
+    if prefix.is_empty() {
+        for (path, (mode, oid)) in entries {
+            add_entry_map_tree_item(
+                &mut tree_entries,
+                &mut subdirs,
+                &path[prefix_len..],
+                *mode,
+                *oid,
+            );
         }
-        let rel = &path[prefix_len..];
-        if let Some(slash) = rel.iter().position(|b| *b == b'/') {
-            subdirs.insert(rel[..slash].to_vec());
-        } else {
-            tree_entries.push(sley_object::TreeEntry {
-                mode: *mode,
-                name: BString::from(rel.to_vec()),
-                oid: *oid,
-            });
+    } else {
+        for (path, (mode, oid)) in entries.range(prefix.to_vec()..) {
+            if !path.starts_with(prefix) {
+                break;
+            }
+            if path.get(prefix.len()) != Some(&b'/') {
+                continue;
+            }
+            add_entry_map_tree_item(
+                &mut tree_entries,
+                &mut subdirs,
+                &path[prefix_len..],
+                *mode,
+                *oid,
+            );
         }
     }
     for dir in subdirs {
@@ -1939,6 +1960,24 @@ fn write_entry_map_level(
         }
         .write(),
     ))
+}
+
+fn add_entry_map_tree_item(
+    tree_entries: &mut Vec<sley_object::TreeEntry>,
+    subdirs: &mut BTreeSet<Vec<u8>>,
+    rel: &[u8],
+    mode: u32,
+    oid: ObjectId,
+) {
+    if let Some(slash) = rel.iter().position(|b| *b == b'/') {
+        subdirs.insert(rel[..slash].to_vec());
+    } else {
+        tree_entries.push(sley_object::TreeEntry {
+            mode,
+            name: BString::from(rel.to_vec()),
+            oid,
+        });
+    }
 }
 
 enum CommitFixup {
