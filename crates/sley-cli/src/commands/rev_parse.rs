@@ -12,6 +12,9 @@ enum RevParsePathFormat {
 }
 
 pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "--parseopt") {
+        return rev_parse_parseopt(&args[1..]);
+    }
     if rev_parse_args_need_no_repository(args)? {
         return Ok(());
     }
@@ -264,6 +267,10 @@ fn rev_parse_args_need_no_repository(args: &[String]) -> Result<bool> {
     let mut handled = false;
     while idx < args.len() {
         match args[idx].as_str() {
+            "--parseopt" => {
+                rev_parse_parseopt(&args[idx + 1..])?;
+                return Ok(true);
+            }
             "--sq-quote" => {
                 print_rev_parse_sq_quote(&args[idx + 1..])?;
                 return Ok(true);
@@ -285,6 +292,570 @@ fn rev_parse_args_need_no_repository(args: &[String]) -> Result<bool> {
         idx += 1;
     }
     Ok(handled)
+}
+
+#[derive(Clone, Debug)]
+struct RevParseParseOptSpec {
+    short: Option<char>,
+    long: Option<String>,
+    help: String,
+    arg_hint: Option<String>,
+    takes_arg: bool,
+    optional_arg: bool,
+    no_neg: bool,
+    hidden: bool,
+    group: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevParseParseOptFlags {
+    keep_dashdash: bool,
+    stop_at_non_option: bool,
+    stuck_long: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevParseParseOptMatch {
+    spec_index: usize,
+    unset: bool,
+}
+
+fn rev_parse_parseopt(args: &[String]) -> Result<()> {
+    let mut flags = RevParseParseOptFlags {
+        keep_dashdash: false,
+        stop_at_non_option: false,
+        stuck_long: false,
+    };
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--" => {
+                idx += 1;
+                break;
+            }
+            "--keep-dashdash" => flags.keep_dashdash = true,
+            "--stop-at-non-option" => flags.stop_at_non_option = true,
+            "--stuck-long" => flags.stuck_long = true,
+            "-h" | "--help" => {
+                print_rev_parse_parseopt_usage_stdout();
+                return Err(GitError::Exit(129));
+            }
+            other => {
+                eprintln!("error: unknown option `{}`", other.trim_start_matches("--"));
+                print_rev_parse_parseopt_usage_stderr();
+                return Err(GitError::Exit(129));
+            }
+        }
+        idx += 1;
+    }
+    if idx == 0 || args.get(idx.saturating_sub(1)).map(String::as_str) != Some("--") {
+        print_rev_parse_parseopt_usage_stderr();
+        return Err(GitError::Exit(129));
+    }
+
+    let script_args = &args[idx..];
+    let (usage, specs) = read_rev_parse_parseopt_spec()?;
+    match parse_rev_parse_parseopt_args(script_args, &specs, flags) {
+        Ok((parsed, rest)) => {
+            let mut out = parsed;
+            out.push_str(" --");
+            for arg in rest {
+                out.push(' ');
+                push_shell_sq_quote(&mut out, arg);
+            }
+            println!("{out}");
+            Ok(())
+        }
+        Err(RevParseParseOptError::Help { full }) => {
+            print!("{}", render_rev_parse_parseopt_usage(&usage, &specs, full, true));
+            Err(GitError::Exit(129))
+        }
+        Err(RevParseParseOptError::Usage { message }) => {
+            eprintln!("error: {message}");
+            eprint!("{}", render_rev_parse_parseopt_usage(&usage, &specs, false, false));
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+fn print_rev_parse_parseopt_usage_stdout() {
+    print!(
+        "usage: git rev-parse --parseopt [<options>] -- [<args>...]\n\n    --[no-]keep-dashdash    keep the `--` passed as an arg\n    --[no-]stop-at-non-option\n                          stop parsing after the first non-option argument\n    --[no-]stuck-long      output in stuck long form\n\n"
+    );
+}
+
+fn print_rev_parse_parseopt_usage_stderr() {
+    eprint!(
+        "usage: git rev-parse --parseopt [<options>] -- [<args>...]\n\n    --[no-]keep-dashdash    keep the `--` passed as an arg\n    --[no-]stop-at-non-option\n                          stop parsing after the first non-option argument\n    --[no-]stuck-long      output in stuck long form\n\n"
+    );
+}
+
+fn read_rev_parse_parseopt_spec() -> Result<(Vec<String>, Vec<RevParseParseOptSpec>)> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let mut lines = input.lines();
+    let mut usage = Vec::new();
+    loop {
+        let Some(line) = lines.next() else {
+            eprintln!("fatal: premature end of input");
+            return Err(GitError::Exit(128));
+        };
+        if line == "--" {
+            if usage.is_empty() {
+                eprintln!("fatal: no usage string given before the `--' separator");
+                return Err(GitError::Exit(128));
+            }
+            break;
+        }
+        usage.push(line.to_string());
+    }
+
+    let mut specs = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        specs.push(parse_rev_parse_parseopt_spec_line(line)?);
+    }
+    Ok((usage, specs))
+}
+
+fn parse_rev_parse_parseopt_spec_line(line: &str) -> Result<RevParseParseOptSpec> {
+    let Some(help_start) = line.find(char::is_whitespace) else {
+        return Ok(RevParseParseOptSpec {
+            short: None,
+            long: None,
+            help: line.trim_start().to_string(),
+            arg_hint: None,
+            takes_arg: false,
+            optional_arg: false,
+            no_neg: false,
+            hidden: false,
+            group: true,
+        });
+    };
+    if help_start == 0 {
+        return Ok(RevParseParseOptSpec {
+            short: None,
+            long: None,
+            help: line.trim_start().to_string(),
+            arg_hint: None,
+            takes_arg: false,
+            optional_arg: false,
+            no_neg: false,
+            hidden: false,
+            group: true,
+        });
+    }
+
+    let mut spec = RevParseParseOptSpec {
+        short: None,
+        long: None,
+        help: line[help_start..].trim_start().to_string(),
+        arg_hint: None,
+        takes_arg: false,
+        optional_arg: false,
+        no_neg: false,
+        hidden: false,
+        group: false,
+    };
+    let optspec = &line[..help_start];
+    let flags_start = optspec.find(['*', '=', '?', '!']).unwrap_or(optspec.len());
+    if flags_start == 0 {
+        eprintln!("fatal: missing opt-spec before option flags");
+        return Err(GitError::Exit(128));
+    }
+    let names = &optspec[..flags_start];
+    if names.chars().count() == 1 {
+        spec.short = names.chars().next();
+    } else if names.as_bytes().get(1) != Some(&b',') {
+        spec.long = Some(names.to_string());
+    } else {
+        spec.short = names.chars().next();
+        spec.long = Some(names[2..].to_string());
+    }
+
+    let mut flags = &optspec[flags_start..];
+    while let Some(ch) = flags.chars().next() {
+        match ch {
+            '=' => spec.takes_arg = true,
+            '?' => {
+                spec.takes_arg = true;
+                spec.optional_arg = true;
+            }
+            '!' => spec.no_neg = true,
+            '*' => spec.hidden = true,
+            _ => break,
+        }
+        flags = &flags[ch.len_utf8()..];
+    }
+    if !flags.is_empty() {
+        spec.arg_hint = Some(flags.to_string());
+    }
+    Ok(spec)
+}
+
+enum RevParseParseOptError {
+    Help { full: bool },
+    Usage { message: String },
+}
+
+fn parse_rev_parse_parseopt_args<'a>(
+    args: &'a [String],
+    specs: &[RevParseParseOptSpec],
+    flags: RevParseParseOptFlags,
+) -> std::result::Result<(String, Vec<&'a str>), RevParseParseOptError> {
+    let mut parsed = String::from("set --");
+    let mut positionals = Vec::new();
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx).map(String::as_str) {
+        if arg == "--" {
+            let start = if flags.keep_dashdash { idx } else { idx + 1 };
+            positionals.extend(args[start..].iter().map(String::as_str));
+            return Ok((parsed, positionals));
+        }
+        if arg == "-h" || arg == "--help" {
+            return Err(RevParseParseOptError::Help { full: false });
+        }
+        if arg == "--help-all" {
+            return Err(RevParseParseOptError::Help { full: true });
+        }
+        if let Some(rest) = arg.strip_prefix("--") {
+            let (name, attached) = match rest.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (rest, None),
+            };
+            let matched = resolve_rev_parse_parseopt_long(name, specs)?;
+            dump_rev_parse_parseopt_match(&mut parsed, specs, matched, attached, flags)?;
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            parse_rev_parse_parseopt_short_bundle(&mut parsed, args, &mut idx, specs, flags)?;
+            idx += 1;
+            continue;
+        }
+        if flags.stop_at_non_option {
+            positionals.extend(args[idx..].iter().map(String::as_str));
+            return Ok((parsed, positionals));
+        }
+        positionals.push(arg);
+        idx += 1;
+    }
+    Ok((parsed, positionals))
+}
+
+fn parse_rev_parse_parseopt_short_bundle<'a>(
+    parsed: &mut String,
+    args: &'a [String],
+    idx: &mut usize,
+    specs: &[RevParseParseOptSpec],
+    flags: RevParseParseOptFlags,
+) -> std::result::Result<(), RevParseParseOptError> {
+    let mut rest = args[*idx]
+        .strip_prefix('-')
+        .expect("caller checked leading dash");
+    while let Some(short) = rest.chars().next() {
+        rest = &rest[short.len_utf8()..];
+        let Some(spec_index) = specs
+            .iter()
+            .position(|spec| !spec.group && spec.short == Some(short))
+        else {
+            return Err(RevParseParseOptError::Usage {
+                message: format!("unknown switch `{short}'"),
+            });
+        };
+        let spec = &specs[spec_index];
+        let matched = RevParseParseOptMatch {
+            spec_index,
+            unset: false,
+        };
+        if spec.takes_arg {
+            if !rest.is_empty() {
+                dump_rev_parse_parseopt_match(parsed, specs, matched, Some(rest), flags)?;
+            } else if spec.optional_arg {
+                dump_rev_parse_parseopt_match(parsed, specs, matched, None, flags)?;
+            } else {
+                *idx += 1;
+                let Some(value) = args.get(*idx).map(String::as_str) else {
+                    return Err(RevParseParseOptError::Usage {
+                        message: format!("switch `{short}' requires a value"),
+                    });
+                };
+                dump_rev_parse_parseopt_match(parsed, specs, matched, Some(value), flags)?;
+            }
+            return Ok(());
+        }
+        dump_rev_parse_parseopt_match(parsed, specs, matched, None, flags)?;
+    }
+    Ok(())
+}
+
+fn resolve_rev_parse_parseopt_long(
+    name: &str,
+    specs: &[RevParseParseOptSpec],
+) -> std::result::Result<RevParseParseOptMatch, RevParseParseOptError> {
+    let mut candidates = Vec::new();
+    for (spec_index, spec) in specs.iter().enumerate() {
+        let Some(long) = spec.long.as_deref() else {
+            continue;
+        };
+        candidates.push((long.to_string(), spec_index, false));
+        if !spec.no_neg {
+            candidates.push((format!("no-{long}"), spec_index, true));
+            if let Some(positive) = long.strip_prefix("no-") {
+                candidates.push((positive.to_string(), spec_index, true));
+            }
+        }
+    }
+
+    for (candidate, spec_index, unset) in &candidates {
+        if candidate == name {
+            return Ok(RevParseParseOptMatch {
+                spec_index: *spec_index,
+                unset: *unset,
+            });
+        }
+    }
+
+    let matches: Vec<_> = candidates
+        .iter()
+        .filter(|(candidate, _, _)| candidate.starts_with(name))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(RevParseParseOptError::Usage {
+            message: format!("unknown option `{name}'"),
+        }),
+        [(candidate, spec_index, unset)] => {
+            let spec = &specs[*spec_index];
+            if name.starts_with("no-") && *unset && spec.no_neg {
+                return Err(RevParseParseOptError::Usage {
+                    message: format!("unknown option `{name}'"),
+                });
+            }
+            let _ = candidate;
+            Ok(RevParseParseOptMatch {
+                spec_index: *spec_index,
+                unset: *unset,
+            })
+        }
+        [first, second, ..] => Err(RevParseParseOptError::Usage {
+            message: format!(
+                "ambiguous option: {name} (could be --{} or --{})",
+                first.0, second.0
+            ),
+        }),
+    }
+}
+
+fn dump_rev_parse_parseopt_match(
+    out: &mut String,
+    specs: &[RevParseParseOptSpec],
+    matched: RevParseParseOptMatch,
+    attached: Option<&str>,
+    flags: RevParseParseOptFlags,
+) -> std::result::Result<(), RevParseParseOptError> {
+    let spec = &specs[matched.spec_index];
+    if matched.unset && attached.is_some() {
+        let long = spec.long.as_deref().unwrap_or_default();
+        return Err(RevParseParseOptError::Usage {
+            message: format!("option `no-{long}' takes no value"),
+        });
+    }
+    if attached.is_some() && !spec.takes_arg {
+        let name = spec
+            .long
+            .as_deref()
+            .map(|long| format!("option `{long}'"))
+            .or_else(|| spec.short.map(|short| format!("switch `{short}'")))
+            .unwrap_or_else(|| "option".to_string());
+        return Err(RevParseParseOptError::Usage {
+            message: format!("{name} takes no value"),
+        });
+    }
+    if !matched.unset && spec.takes_arg && !spec.optional_arg && attached.is_none() {
+        let name = spec
+            .long
+            .as_deref()
+            .map(|long| format!("option `{long}'"))
+            .or_else(|| spec.short.map(|short| format!("switch `{short}'")))
+            .unwrap_or_else(|| "option".to_string());
+        return Err(RevParseParseOptError::Usage {
+            message: format!("{name} requires a value"),
+        });
+    }
+
+    if matched.unset {
+        out.push_str(" --no-");
+        out.push_str(spec.long.as_deref().unwrap_or_default());
+    } else if let Some(short) = spec.short
+        && (spec.long.is_none() || !flags.stuck_long)
+    {
+        out.push_str(" -");
+        out.push(short);
+    } else if let Some(long) = spec.long.as_deref() {
+        out.push_str(" --");
+        out.push_str(long);
+    }
+
+    if let Some(value) = attached {
+        if !flags.stuck_long {
+            out.push(' ');
+        } else if spec.long.is_some() {
+            out.push('=');
+        }
+        push_shell_sq_quote(out, value);
+    }
+    Ok(())
+}
+
+fn render_rev_parse_parseopt_usage(
+    usage: &[String],
+    specs: &[RevParseParseOptSpec],
+    full: bool,
+    shell_eval: bool,
+) -> String {
+    let mut out = String::new();
+    if shell_eval {
+        out.push_str("cat <<\\EOF\n");
+    }
+    let mut saw_empty_line = false;
+    let mut first_usage = true;
+    for usage_line in usage {
+        if !saw_empty_line && usage_line.is_empty() {
+            saw_empty_line = true;
+        }
+        if saw_empty_line {
+            if usage_line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str("    ");
+                out.push_str(usage_line);
+                out.push('\n');
+            }
+        } else if first_usage {
+            out.push_str("usage: ");
+            out.push_str(usage_line);
+            out.push('\n');
+        } else {
+            out.push_str("   or: ");
+            out.push_str(usage_line);
+            out.push('\n');
+        }
+        first_usage = false;
+    }
+
+    let mut need_newline = true;
+    for spec in specs {
+        if spec.group {
+            out.push('\n');
+            need_newline = false;
+            if !spec.help.is_empty() {
+                out.push_str(&spec.help);
+                out.push('\n');
+            }
+            continue;
+        }
+        if spec.hidden && !full {
+            continue;
+        }
+        if need_newline {
+            out.push('\n');
+            need_newline = false;
+        }
+        let option = rev_parse_parseopt_usage_option(spec);
+        out.push_str(&option);
+        usage_padding_string(&mut out, option.chars().count());
+        out.push_str(&spec.help);
+        out.push('\n');
+
+        if !spec.no_neg
+            && let Some(long) = spec.long.as_deref()
+            && let Some(positive) = long.strip_prefix("no-")
+            && !specs
+                .iter()
+                .any(|candidate| candidate.long.as_deref() == Some(positive))
+        {
+            let opposite = format!("    --{positive}");
+            out.push_str(&opposite);
+            usage_padding_string(&mut out, opposite.chars().count());
+            out.push_str("opposite of --");
+            out.push_str(long);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    if shell_eval {
+        out.push_str("EOF\n");
+    }
+    out
+}
+
+fn rev_parse_parseopt_usage_option(spec: &RevParseParseOptSpec) -> String {
+    let mut out = String::from("    ");
+    if let Some(short) = spec.short {
+        out.push('-');
+        out.push(short);
+    }
+    if let Some(long) = spec.long.as_deref() {
+        if spec.short.is_some() {
+            out.push_str(", ");
+        }
+        if spec.no_neg || long.starts_with("no-") {
+            out.push_str("--");
+            out.push_str(long);
+        } else {
+            out.push_str("--[no-]");
+            out.push_str(long);
+        }
+    }
+    if spec.takes_arg || spec.arg_hint.is_some() {
+        out.push_str(&rev_parse_parseopt_arg_hint(spec));
+    }
+    out
+}
+
+fn rev_parse_parseopt_arg_hint(spec: &RevParseParseOptSpec) -> String {
+    let hint = spec.arg_hint.as_deref().unwrap_or("...");
+    let literal = spec.arg_hint.is_none() || hint.chars().any(|ch| "()<>[]|".contains(ch));
+    if spec.optional_arg {
+        if spec.long.is_some() {
+            if literal {
+                format!("[={hint}]")
+            } else {
+                format!("[=<{hint}>]")
+            }
+        } else if literal {
+            format!("[{hint}]")
+        } else {
+            format!("[<{hint}>]")
+        }
+    } else if literal {
+        format!(" {hint}")
+    } else {
+        format!(" <{hint}>")
+    }
+}
+
+fn usage_padding_string(out: &mut String, width: usize) {
+    if width < 26 {
+        out.push_str(&" ".repeat(26 - width));
+    } else {
+        out.push('\n');
+        out.push_str(&" ".repeat(26));
+    }
+}
+
+fn push_shell_sq_quote(out: &mut String, value: &str) {
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
 }
 
 fn print_rev_parse_sq_quote(args: &[String]) -> Result<()> {
