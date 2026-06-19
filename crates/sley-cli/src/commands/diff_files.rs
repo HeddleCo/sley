@@ -398,6 +398,20 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
             value if let Some(value) = value.strip_prefix("--diff-filter=") => {
                 o.diff_filter = parse_diff_filter(value)?;
             }
+            "--max-depth" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("--max-depth requires a value".into()))?;
+                if value != "-1" {
+                    return Err(diff_files_usage_error());
+                }
+            }
+            value if let Some(value) = value.strip_prefix("--max-depth=") => {
+                if value != "-1" {
+                    return Err(diff_files_usage_error());
+                }
+            }
             value
                 if value.starts_with("--stat=")
                     || value.starts_with("--stat-width=")
@@ -610,15 +624,17 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         render_diff_files_entries(
             &entries,
             &o,
-            db,
-            worktree_root,
-            raw_abbrev,
-            patch_abbrev,
-            format,
-            context,
-            interhunk,
-            diff_algorithm,
-            indent_heuristic,
+            DiffFilesRenderContext {
+                db,
+                worktree_root,
+                raw_abbrev,
+                patch_abbrev,
+                format,
+                patch_context: context,
+                interhunk,
+                diff_algorithm,
+                indent_heuristic,
+            },
         )?;
     }
     if (o.quiet || o.exit_code) && has_differences {
@@ -630,18 +646,22 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
 /// Emit the selected output mode(s) for the diffed entries. The new side is
 /// always the working tree, so OIDs for it are reported as zeros in raw mode and
 /// blob content is read from disk for patch/stat/numstat.
-fn render_diff_files_entries(
-    entries: &[sley_diff_merge::NameStatusEntry],
-    o: &DiffFilesOptions,
-    db: &FileObjectDatabase,
-    worktree_root: &Path,
+struct DiffFilesRenderContext<'a> {
+    db: &'a FileObjectDatabase,
+    worktree_root: &'a Path,
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
     format: ObjectFormat,
-    context: usize,
+    patch_context: usize,
     interhunk: usize,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
+}
+
+fn render_diff_files_entries(
+    entries: &[sley_diff_merge::NameStatusEntry],
+    o: &DiffFilesOptions,
+    context: DiffFilesRenderContext<'_>,
 ) -> Result<()> {
     let mut stdout = io::stdout();
     // diff-files always compares the working tree, so the new-side object is the
@@ -649,7 +669,7 @@ fn render_diff_files_entries(
     // its bytes from disk.
     let zero_worktree_oids = true;
     let use_worktree_new = true;
-    let worktree_root = Some(worktree_root);
+    let worktree_root = Some(context.worktree_root);
 
     let show_raw = o.raw && !o.name_only && !o.name_status;
     let show_numstat = o.numstat && !o.name_only && !o.name_status;
@@ -676,8 +696,8 @@ fn render_diff_files_entries(
                 entry,
                 o.z,
                 zero_worktree_oids,
-                raw_abbrev,
-                format,
+                context.raw_abbrev,
+                context.format,
             )?;
         }
     }
@@ -687,7 +707,7 @@ fn render_diff_files_entries(
     // --no-refresh`-restored file: shown `M` in raw/name-status, empty in stat)
     // must be excluded. The raw and name output keep the full set.
     let content_entries = if show_numstat || show_stat || show_shortstat {
-        collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?
+        collect_diff_stat_entries(entries, context.db, worktree_root, use_worktree_new)?
             .into_iter()
             .filter(diff_files_stat_entry_has_content_change)
             .collect::<Vec<_>>()
@@ -726,14 +746,14 @@ fn render_diff_files_entries(
         }
         for entry in entries {
             let patch_options = DiffPatchOptions {
-                db,
+                db: context.db,
                 worktree_root,
                 use_worktree_new,
-                format,
-                abbrev: patch_abbrev,
+                format: context.format,
+                abbrev: context.patch_abbrev,
                 src_prefix: &o.src_prefix,
                 dst_prefix: &o.dst_prefix,
-                context,
+                context: context.patch_context,
                 userdiff: None,
                 colors: None,
                 word_diff: None,
@@ -741,13 +761,13 @@ fn render_diff_files_entries(
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 ws_error_rule: None,
-                interhunk,
+                interhunk: context.interhunk,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm,
+                diff_algorithm: context.diff_algorithm,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
-                indent_heuristic,
+                indent_heuristic: context.indent_heuristic,
             };
             write_diff_patch_entry(&mut stdout, entry, patch_options)?;
         }

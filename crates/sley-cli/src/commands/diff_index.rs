@@ -184,6 +184,18 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             value if let Some(value) = value.strip_prefix("--diff-filter=") => {
                 diff_filter = parse_diff_filter(value)?;
             }
+            "--max-depth" => {
+                idx += 1;
+                let value = take_value(args, idx, "--max-depth")?;
+                if value != "-1" {
+                    return diff_index_usage_error();
+                }
+            }
+            value if let Some(value) = value.strip_prefix("--max-depth=") => {
+                if value != "-1" {
+                    return diff_index_usage_error();
+                }
+            }
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
                 abbrev = AbbrevRequest::Width(parse_diff_index_abbrev(value)?);
             }
@@ -389,7 +401,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         let check_failed = commands::diff::run_diff_check(
             &entries,
             db,
-            worktree_root.as_deref(),
+            worktree_root,
             !cached,
             &resolver,
         )?;

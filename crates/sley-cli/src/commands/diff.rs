@@ -265,12 +265,334 @@ fn check_one_diff(
     Ok(status)
 }
 
+#[derive(Clone)]
+struct ExternalDiffCommand {
+    command: String,
+    trust_exit_code: bool,
+}
+
+struct ExternalDiffRunOptions<'a> {
+    quiet: bool,
+    exit_code: bool,
+    output: Option<&'a str>,
+    autocrlf: bool,
+}
+
+fn global_external_diff_command(config: Option<&GitConfig>) -> Option<ExternalDiffCommand> {
+    if let Ok(command) = env::var("GIT_EXTERNAL_DIFF")
+        && !command.is_empty()
+    {
+        let trust_exit_code = env::var("GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE")
+            .ok()
+            .and_then(|value| sley_config::parse_config_bool(&value))
+            .unwrap_or(false);
+        return Some(ExternalDiffCommand {
+            command,
+            trust_exit_code,
+        });
+    }
+    let config = config?;
+    let command = config.get("diff", None, "external")?.to_string();
+    let trust_exit_code = config
+        .get_bool("diff", None, "trustexitcode")
+        .unwrap_or(false);
+    Some(ExternalDiffCommand {
+        command,
+        trust_exit_code,
+    })
+}
+
+fn run_external_diff_entries(
+    entries: &[sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    userdiff: &commands::userdiff::UserdiffResolver,
+    global: Option<&ExternalDiffCommand>,
+    options: ExternalDiffRunOptions<'_>,
+) -> Result<Option<i32>> {
+    let mut handled = false;
+    let mut found_changes = false;
+    let mut output_file = match options.output {
+        Some(path) if !options.quiet => Some(
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        ),
+        _ => None,
+    };
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let command = external_diff_for_entry(entry, userdiff, global)?;
+        let Some(command) = command else {
+            continue;
+        };
+        handled = true;
+        if options.quiet && !command.trust_exit_code {
+            found_changes = true;
+            continue;
+        }
+        let mut context = ExternalDiffProcessContext {
+            db,
+            worktree_root,
+            use_worktree_new,
+            autocrlf: options.autocrlf,
+            quiet: options.quiet,
+            output_file: output_file.as_mut(),
+        };
+        let rc = run_one_external_diff(
+            entry,
+            &command,
+            idx + 1,
+            entries.len(),
+            &mut context,
+        )?;
+        match (command.trust_exit_code, rc) {
+            (false, 0) => found_changes = true,
+            (true, 0) => {}
+            (true, 1) => found_changes = true,
+            _ => {
+                let path = String::from_utf8_lossy(&entry.path);
+                eprintln!("fatal: external diff died, stopping at {path}");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+
+    if !handled {
+        return Ok(None);
+    }
+    let code = if (options.quiet || options.exit_code) && found_changes {
+        1
+    } else {
+        0
+    };
+    Ok(Some(code))
+}
+
+fn external_diff_for_entry(
+    entry: &sley_diff_merge::NameStatusEntry,
+    userdiff: &commands::userdiff::UserdiffResolver,
+    global: Option<&ExternalDiffCommand>,
+) -> Result<Option<ExternalDiffCommand>> {
+    let attr_path = entry.old_path.as_deref().unwrap_or(&entry.path);
+    if let Some(driver) = userdiff.driver_for_path(attr_path)?
+        && let Some(external) = &driver.external
+    {
+        return Ok(Some(ExternalDiffCommand {
+            command: external.command.clone(),
+            trust_exit_code: external.trust_exit_code,
+        }));
+    }
+    Ok(global.cloned())
+}
+
+struct ExternalDiffProcessContext<'a> {
+    db: &'a FileObjectDatabase,
+    worktree_root: Option<&'a Path>,
+    use_worktree_new: bool,
+    autocrlf: bool,
+    quiet: bool,
+    output_file: Option<&'a mut fs::File>,
+}
+
+fn run_one_external_diff(
+    entry: &sley_diff_merge::NameStatusEntry,
+    command: &ExternalDiffCommand,
+    counter: usize,
+    total: usize,
+    context: &mut ExternalDiffProcessContext<'_>,
+) -> Result<i32> {
+    let old_file =
+        prepare_external_diff_file(
+            entry,
+            context.db,
+            context.worktree_root,
+            context.use_worktree_new,
+            false,
+            context.autocrlf,
+        )?;
+    let new_file =
+        prepare_external_diff_file(
+            entry,
+            context.db,
+            context.worktree_root,
+            context.use_worktree_new,
+            true,
+            context.autocrlf,
+        )?;
+    let path = String::from_utf8_lossy(&entry.path).into_owned();
+    let old_hex = external_diff_oid(entry.old_oid.as_ref(), context.db.object_format(), false);
+    let new_hex = external_diff_oid(
+        entry.new_oid.as_ref(),
+        context.db.object_format(),
+        context.use_worktree_new,
+    );
+    let old_mode = external_diff_mode(entry.old_mode);
+    let new_mode = external_diff_mode(entry.new_mode);
+    let args = [
+        path,
+        old_file.path.to_string_lossy().into_owned(),
+        old_hex,
+        old_mode,
+        new_file.path.to_string_lossy().into_owned(),
+        new_hex,
+        new_mode,
+    ];
+    let shell_command = format!("{} \"$@\"", command.command);
+    let mut child = ProcessCommand::new("sh");
+    child
+        .arg("-c")
+        .arg(shell_command)
+        .arg(&command.command)
+        .args(args)
+        .env("GIT_DIFF_PATH_COUNTER", counter.to_string())
+        .env("GIT_DIFF_PATH_TOTAL", total.to_string());
+    if context.quiet {
+        child.stdout(std::process::Stdio::null());
+    } else if let Some(file) = context.output_file.as_mut() {
+        child.stdout(file.try_clone()?);
+    }
+    let status = child.status()?;
+    Ok(status.code().unwrap_or(128))
+}
+
+fn external_diff_oid(oid: Option<&ObjectId>, format: ObjectFormat, zero: bool) -> String {
+    if zero {
+        ObjectId::null(format).to_hex()
+    } else {
+        oid.copied()
+            .unwrap_or_else(|| ObjectId::null(format))
+            .to_hex()
+    }
+}
+
+fn external_diff_mode(mode: Option<u32>) -> String {
+    format!("{:06o}", mode.unwrap_or(0))
+}
+
+struct ExternalDiffFile {
+    path: PathBuf,
+    temp_dir: Option<PathBuf>,
+}
+
+impl Drop for ExternalDiffFile {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.temp_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn prepare_external_diff_file(
+    entry: &sley_diff_merge::NameStatusEntry,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    new_side: bool,
+    autocrlf: bool,
+) -> Result<ExternalDiffFile> {
+    if new_side
+        && use_worktree_new
+        && entry.new_mode != Some(0o160000)
+        && let Some(root) = worktree_root
+    {
+        let absolute = root.join(repo_path_to_path(&entry.path));
+        if absolute.exists() {
+            return Ok(ExternalDiffFile {
+                path: repo_path_to_path(&entry.path),
+                temp_dir: None,
+            });
+        }
+    }
+    let content = if new_side {
+        diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?
+    } else {
+        diff_entry_old_content(entry, db)?
+    };
+    let Some(content) = content else {
+        return Ok(ExternalDiffFile {
+            path: PathBuf::from("/dev/null"),
+            temp_dir: None,
+        });
+    };
+    let temp_dir = unique_external_diff_temp_dir()?;
+    let repo_path = if new_side {
+        &entry.path
+    } else {
+        entry.old_path.as_ref().unwrap_or(&entry.path)
+    };
+    let path = temp_dir.join(repo_path_to_path(repo_path));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = if autocrlf && external_temp_should_crlf(entry, new_side, &content) {
+        lf_to_crlf(&content)
+    } else {
+        content
+    };
+    fs::write(&path, content)?;
+    Ok(ExternalDiffFile {
+        path,
+        temp_dir: Some(temp_dir),
+    })
+}
+
+fn external_temp_should_crlf(
+    entry: &sley_diff_merge::NameStatusEntry,
+    new_side: bool,
+    content: &[u8],
+) -> bool {
+    let mode = if new_side {
+        entry.new_mode
+    } else {
+        entry.old_mode
+    };
+    mode == Some(0o100644) && !content.contains(&0)
+}
+
+fn lf_to_crlf(content: &[u8]) -> Vec<u8> {
+    let extra = content.iter().filter(|byte| **byte == b'\n').count();
+    let mut out = Vec::with_capacity(content.len() + extra);
+    let mut previous = None;
+    for byte in content {
+        if *byte == b'\n' && previous != Some(b'\r') {
+            out.push(b'\r');
+        }
+        out.push(*byte);
+        previous = Some(*byte);
+    }
+    out
+}
+
+fn unique_external_diff_temp_dir() -> Result<PathBuf> {
+    for attempt in 0..1000u32 {
+        let dir = env::temp_dir().join(format!(
+            "sley-extdiff-{}-{}",
+            std::process::id(),
+            attempt
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(GitError::Command(
+        "unable to create external diff temporary directory".into(),
+    ))
+}
+
 pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let commands::diff_options::DiffOptions {
         output_format,
         cached,
         quiet,
         exit_code,
+        allow_external,
+        output,
         compact_summary,
         stat_count,
         stat_widths,
@@ -899,6 +1221,41 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(code));
         }
         return Ok(());
+    }
+    let show_patch_for_external = !name_only && !name_status && (patch || no_output_mode);
+    if allow_external && show_patch_for_external && !no_patch {
+        let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
+            .ok()
+            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .transpose()?;
+        let config = read_repo_config(&git_dir).ok();
+        let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+            userdiff_attributes,
+            config.clone(),
+        );
+        let global_external = global_external_diff_command(config.as_ref());
+        if let Some(code) = run_external_diff_entries(
+            &entries,
+            &db,
+            worktree_root.as_deref(),
+            use_worktree_new,
+            &userdiff,
+            global_external.as_ref(),
+            ExternalDiffRunOptions {
+                quiet,
+                exit_code,
+                output: output.as_deref(),
+                autocrlf: config
+                    .as_ref()
+                    .and_then(|config| config.get_bool("core", None, "autocrlf"))
+                    .unwrap_or(false),
+            },
+        )? {
+            if code != 0 {
+                return Err(GitError::Exit(code));
+            }
+            return Ok(());
+        }
     }
     if !quiet && !no_patch {
         let mut stdout = io::stdout();

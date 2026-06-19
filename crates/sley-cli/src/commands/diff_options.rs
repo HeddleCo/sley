@@ -60,6 +60,8 @@ pub(crate) struct DiffOptions {
     pub(crate) cached: bool,
     pub(crate) quiet: bool,
     pub(crate) exit_code: bool,
+    pub(crate) allow_external: bool,
+    pub(crate) output: Option<String>,
     pub(crate) compact_summary: bool,
     pub(crate) stat_count: Option<usize>,
     pub(crate) stat_widths: DiffStatWidths,
@@ -132,6 +134,8 @@ impl Default for DiffOptions {
             cached: false,
             quiet: false,
             exit_code: false,
+            allow_external: true,
+            output: None,
             compact_summary: false,
             stat_count: None,
             stat_widths: DiffStatWidths::terminal(),
@@ -419,6 +423,13 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
             Some("ext-diff"),
             OptFlags::NONE,
             "allow external diff helper",
+        ),
+        opt_str(
+            None,
+            Some("output"),
+            "<file>",
+            OptFlags::NONEG,
+            "output to a specific file",
         ),
         opt_bool(
             None,
@@ -866,6 +877,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("cached" | "staged")) => options.cached = true,
         (_, Some("quiet")) => options.quiet = bool_value(option),
         (_, Some("exit-code")) => options.exit_code = bool_value(option),
+        (_, Some("output")) => options.output = Some(str_value(option).to_string()),
         (_, Some("summary")) => options
             .output_format
             .bitop(DiffOutputFormat::SUMMARY, DiffOutputFormat::NO_OUTPUT),
@@ -958,9 +970,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         }
         (Some('a'), Some("text")) => {}
         (_, Some("ext-diff")) => {
-            if bool_value(option) {
-                options.diff_driver_control = true;
-            }
+            options.allow_external = bool_value(option);
         }
         (_, Some("textconv")) => {
             if bool_value(option) {

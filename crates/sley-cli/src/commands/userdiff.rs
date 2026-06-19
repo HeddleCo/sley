@@ -303,9 +303,16 @@ pub(crate) fn default_funcname_heading(line: &[u8]) -> Option<Vec<u8>> {
 pub(crate) struct ResolvedDriver {
     pub(crate) funcname: Option<CompiledFuncname>,
     pub(crate) word_regex: Option<Vec<u8>>,
+    pub(crate) external: Option<ExternalDiffCommand>,
     /// `Some(true)` = `-diff` / binary=true; `Some(false)` = `diff` set /
     /// binary=false; `None` = auto-detect.
     pub(crate) binary: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalDiffCommand {
+    pub(crate) command: String,
+    pub(crate) trust_exit_code: bool,
 }
 
 /// Resolves the userdiff driver for paths in one repository: `.gitattributes`
@@ -354,6 +361,7 @@ impl UserdiffResolver {
                 Ok(Some(Rc::new(ResolvedDriver {
                     funcname: None,
                     word_regex: None,
+                    external: None,
                     binary: Some(false),
                 })))
             }
@@ -362,6 +370,7 @@ impl UserdiffResolver {
                 Ok(Some(Rc::new(ResolvedDriver {
                     funcname: None,
                     word_regex: None,
+                    external: None,
                     binary: Some(true),
                 })))
             }
@@ -400,6 +409,7 @@ impl UserdiffResolver {
         Ok(Some(Rc::new(ResolvedDriver {
             funcname,
             word_regex: builtin.word_regex.map(<[u8]>::to_vec),
+            external: None,
             binary: None,
         })))
     }
@@ -418,6 +428,8 @@ impl UserdiffResolver {
         let mut any = false;
         let mut funcname_spec: Option<(Vec<u8>, bool)> = None; // (spec, extended)
         let mut word_regex: Option<Vec<u8>> = None;
+        let mut command: Option<String> = None;
+        let mut trust_exit_code = false;
         let mut binary: Option<bool> = None;
         for section in &config.sections {
             if !section.name.eq_ignore_ascii_case("diff")
@@ -454,7 +466,19 @@ impl UserdiffResolver {
                             None => Some(true),
                         };
                     }
-                    "command" | "trustexitcode" | "textconv" | "cachetextconv" | "algorithm" => {
+                    "command" => {
+                        any = true;
+                        command = entry.value.clone();
+                    }
+                    "trustexitcode" => {
+                        any = true;
+                        trust_exit_code = entry
+                            .value
+                            .as_deref()
+                            .and_then(sley_config::parse_config_bool)
+                            .unwrap_or(true);
+                    }
+                    "textconv" | "cachetextconv" | "algorithm" => {
                         any = true;
                     }
                     _ => {}
@@ -470,6 +494,10 @@ impl UserdiffResolver {
         Ok(Some(ResolvedDriver {
             funcname,
             word_regex,
+            external: command.map(|command| ExternalDiffCommand {
+                command,
+                trust_exit_code,
+            }),
             binary,
         }))
     }
