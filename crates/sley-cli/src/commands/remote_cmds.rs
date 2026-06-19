@@ -5551,15 +5551,23 @@ fn transport_policy_config_for_cwd() -> Result<GitConfig> {
 
 fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
     let mut config = transport_policy_config_for_cwd()?;
+    let repo_config = read_repo_config(git_dir)?;
     let cwd = env::current_dir()?;
     if let Ok(current_git_dir) = discover_git_dir(&cwd) {
         let current_common = common_git_dir_for_git_dir(&current_git_dir)?;
         let requested_common = common_git_dir_for_git_dir(git_dir)?;
         if current_common == requested_common {
+            for section in repo_config.sections {
+                if section.name == "remote"
+                    && let Some(name) = section.subsection.as_deref()
+                    && !remote_exists(&config, name)
+                {
+                    config.sections.push(section);
+                }
+            }
             return Ok(config);
         }
     }
-    let repo_config = read_repo_config(git_dir)?;
     config.sections.extend(repo_config.sections);
     Ok(config)
 }
