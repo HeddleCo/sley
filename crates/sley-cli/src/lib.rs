@@ -2063,11 +2063,45 @@ fn commit_cleanup_message(
     }
     match mode {
         CommitCleanupMode::Verbatim => message,
-        CommitCleanupMode::Strip => commands::tag::tag_stripspace_message(&message, true),
+        CommitCleanupMode::Strip => commit_stripspace_message(&message, Some(comment_char)),
         CommitCleanupMode::Whitespace | CommitCleanupMode::Scissors => {
-            tag_stripspace_message(&message, false)
+            commit_stripspace_message(&message, None)
         }
     }
+}
+
+fn commit_stripspace_message(message: &[u8], comment_char: Option<&str>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pending_blank = false;
+    let comment = comment_char.map(str::as_bytes);
+    for raw_line in message.split(|byte| *byte == b'\n') {
+        let line = commit_trim_trailing_space(raw_line);
+        if comment.is_some_and(|prefix| line.starts_with(prefix)) {
+            continue;
+        }
+        if line.is_empty() {
+            if !out.is_empty() {
+                pending_blank = true;
+            }
+            continue;
+        }
+        if pending_blank {
+            out.push(b'\n');
+            pending_blank = false;
+        }
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out
+}
+
+fn commit_trim_trailing_space(line: &[u8]) -> &[u8] {
+    let end = line
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    &line[..end]
 }
 
 /// git's `wt_status_locate_end` over a byte message: the offset of the scissors
