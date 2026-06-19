@@ -10,6 +10,7 @@ use sley_formats::{
 };
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -505,6 +506,7 @@ impl<'a> RefTransaction<'a> {
 pub struct FileRefStore {
     git_dir: PathBuf,
     common_dir: PathBuf,
+    storage_dir: PathBuf,
     format: ObjectFormat,
     reftable_lock_timeout_millis: Option<u64>,
 }
@@ -552,13 +554,67 @@ pub struct AppliedBundleRefUpdate {
     pub new_oid: ObjectId,
 }
 
+fn configured_ref_storage_dir(common_dir: &Path) -> Option<PathBuf> {
+    if let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
+        && let Ok((_, Some(path))) = parse_ref_storage_backend_value(&value)
+    {
+        return Some(ref_storage_path_from_config(common_dir, path));
+    }
+    let config = GitConfig::read(common_dir.join("config")).ok()?;
+    let value = config.get("extensions", None, "refStorage")?;
+    parse_ref_storage_backend_value(value)
+        .ok()
+        .and_then(|(_, path)| path)
+        .map(|path| ref_storage_path_from_config(common_dir, path))
+}
+
+fn ref_storage_path_from_config(common_dir: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        common_dir.join(path)
+    }
+}
+
+fn parse_ref_storage_backend_value(value: &str) -> Result<(RefBackendKind, Option<PathBuf>)> {
+    let (backend, path) = if let Some((backend, path)) = value.split_once("://") {
+        if path.is_empty() {
+            return Err(GitError::InvalidFormat(format!(
+                "invalid value for 'extensions.refstorage': '{value}'"
+            )));
+        }
+        (backend, Some(PathBuf::from(path)))
+    } else {
+        (value, None)
+    };
+    let kind = match backend {
+        "files" => RefBackendKind::Files,
+        "reftable" => RefBackendKind::Reftable,
+        _ => {
+            return Err(GitError::InvalidFormat(format!(
+                "invalid value for 'extensions.refstorage': '{value}'"
+            )));
+        }
+    };
+    Ok((kind, path))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefBackendKind {
+    Files,
+    Reftable,
+}
+
 impl FileRefStore {
     pub fn new(git_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
         let git_dir = git_dir.into();
         let common_dir = repository_common_dir(&git_dir);
+        let storage_dir =
+            configured_ref_storage_dir(&common_dir).unwrap_or_else(|| common_dir.clone());
         Self {
             git_dir,
             common_dir,
+            storage_dir,
             format,
             reftable_lock_timeout_millis: None,
         }
@@ -664,6 +720,60 @@ impl FileRefStore {
         write_locked(&path, &bytes)
     }
 
+    pub fn import_snapshot(
+        &self,
+        refs: &[Ref],
+        reflogs: &[(String, Vec<ReflogEntry>)],
+        pack_files_refs: bool,
+    ) -> Result<()> {
+        if self.uses_reftable()? {
+            let ref_records = refs
+                .iter()
+                .map(|reference| ReftableRefRecord {
+                    name: reference.name.clone(),
+                    update_index: 0,
+                    value: reftable_value_from_ref_target(&reference.target),
+                })
+                .collect::<Vec<_>>();
+            let mut log_records = Vec::new();
+            let mut update_index = 1u64;
+            for (name, entries) in reflogs {
+                for entry in entries {
+                    log_records.push(ReftableLogRecord {
+                        refname: name.clone(),
+                        update_index,
+                        value: ReftableLogValue::Update(reftable_update_from_reflog(entry)?),
+                    });
+                    update_index = update_index.checked_add(1).ok_or_else(|| {
+                        GitError::InvalidFormat("reftable update index overflow".into())
+                    })?;
+                }
+            }
+            if !ref_records.is_empty() || !log_records.is_empty() {
+                self.append_reftable_table_spanning(ref_records, log_records)?;
+            }
+            return Ok(());
+        }
+
+        let mut tx = self.transaction();
+        for reference in refs {
+            tx.update(RefUpdate {
+                name: reference.name.clone(),
+                expected: None,
+                new: reference.target.clone(),
+                reflog: None,
+            });
+        }
+        tx.commit()?;
+        for (name, entries) in reflogs {
+            self.write_reflog(name, entries)?;
+        }
+        if pack_files_refs {
+            let _ = self.pack_refs(true)?;
+        }
+        Ok(())
+    }
+
     pub fn expire_reflog_older_than(&self, name: &str, cutoff_seconds: i64) -> Result<usize> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
@@ -763,13 +873,13 @@ impl FileRefStore {
             return self.list_reftable_refs();
         }
         let mut refs = Vec::new();
-        let packed_path = self.common_dir.join("packed-refs");
+        let packed_path = self.storage_dir.join("packed-refs");
         if packed_path.exists() {
             for packed in parse_packed_refs(self.format, &fs::read(packed_path)?)? {
                 refs.push(packed.reference);
             }
         }
-        let refs_dir = self.common_dir.join("refs");
+        let refs_dir = self.storage_dir.join("refs");
         let mut loose_refs = BTreeMap::new();
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
@@ -782,6 +892,45 @@ impl FileRefStore {
         Ok(refs)
     }
 
+    pub fn list_all_refs(&self) -> Result<Vec<Ref>> {
+        let mut refs = self.list_refs()?;
+        let mut seen = refs
+            .iter()
+            .map(|reference| reference.name.clone())
+            .collect::<BTreeSet<_>>();
+        for reference in self.list_root_refs()? {
+            if seen.insert(reference.name.clone()) {
+                refs.push(reference);
+            }
+        }
+        refs.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(refs)
+    }
+
+    pub fn list_reflog_names(&self) -> Result<Vec<String>> {
+        let mut names = BTreeSet::new();
+        if self.uses_reftable()? {
+            for table in self.reftables()? {
+                for record in table.logs {
+                    names.insert(record.refname);
+                }
+            }
+            let mut live = Vec::new();
+            for name in names {
+                if !self.read_reftable_logs(&name)?.is_empty() {
+                    live.push(name);
+                }
+            }
+            return Ok(live);
+        }
+        self.collect_reflog_names(&self.storage_dir.join("logs"), "logs", &mut names)?;
+        let worktree_logs = self.git_dir.join("logs");
+        if worktree_logs != self.storage_dir.join("logs") {
+            self.collect_reflog_names(&worktree_logs, "logs", &mut names)?;
+        }
+        Ok(names.into_iter().collect())
+    }
+
     pub fn has_refs_with_prefix(&self, prefix: &str) -> Result<bool> {
         if self.uses_reftable()? {
             return Ok(self
@@ -789,7 +938,7 @@ impl FileRefStore {
                 .iter()
                 .any(|reference| reference.name.starts_with(prefix)));
         }
-        let packed_path = self.common_dir.join("packed-refs");
+        let packed_path = self.storage_dir.join("packed-refs");
         if packed_path.exists()
             && packed_refs_have_prefix(self.format, &fs::read(&packed_path)?, prefix)?
         {
@@ -847,7 +996,7 @@ impl FileRefStore {
             return Ok(Vec::new());
         }
         let mut packed_refs = BTreeMap::new();
-        let packed_path = self.common_dir.join("packed-refs");
+        let packed_path = self.storage_dir.join("packed-refs");
         if packed_path.exists() {
             for packed in parse_packed_refs(self.format, &fs::read(&packed_path)?)? {
                 packed_refs.insert(packed.reference.name.clone(), packed);
@@ -855,7 +1004,7 @@ impl FileRefStore {
         }
 
         let mut loose_refs = BTreeMap::new();
-        let refs_dir = self.common_dir.join("refs");
+        let refs_dir = self.storage_dir.join("refs");
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
         }
@@ -907,7 +1056,7 @@ impl FileRefStore {
             return Ok(true);
         }
         let mut loose_refs = BTreeMap::new();
-        let refs_dir = self.common_dir.join("refs");
+        let refs_dir = self.storage_dir.join("refs");
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
         }
@@ -917,11 +1066,11 @@ impl FileRefStore {
             .filter(|reference| matches!(reference.target, RefTarget::Direct(_)))
             .filter(|reference| should_pack(&reference.name))
             .count();
-        pack_refs_auto_required_for(&self.common_dir.join("packed-refs"), count)
+        pack_refs_auto_required_for(&self.storage_dir.join("packed-refs"), count)
     }
 
     fn packed_refs_write_path(&self) -> Result<PathBuf> {
-        let path = self.common_dir.join("packed-refs");
+        let path = self.storage_dir.join("packed-refs");
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let target = fs::read_link(&path)?;
@@ -1278,7 +1427,7 @@ impl FileRefStore {
     }
 
     fn delete_packed_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
-        let path = self.common_dir.join("packed-refs");
+        let path = self.storage_dir.join("packed-refs");
         if !path.exists() {
             return Err(GitError::reference_not_found(format!(
                 "{kind} {short_name}"
@@ -1342,7 +1491,7 @@ impl FileRefStore {
         };
         let loose_lock = DeleteLock::acquire(loose_lock_path)?;
 
-        let packed_path = self.common_dir.join("packed-refs");
+        let packed_path = self.storage_dir.join("packed-refs");
         let packed_lock_path =
             lock_path_for(&packed_path).map_err(|_| RefDeleteError::InvalidName)?;
         let mut packed_lock = DeleteLock::acquire(packed_lock_path)?;
@@ -1420,7 +1569,7 @@ impl FileRefStore {
     }
 
     fn read_packed_ref(&self, name: &str) -> Result<Option<PackedRef>> {
-        let path = self.common_dir.join("packed-refs");
+        let path = self.storage_dir.join("packed-refs");
         if !path.exists() {
             return Ok(None);
         }
@@ -1464,8 +1613,57 @@ impl FileRefStore {
         Ok(refs.into_values().collect())
     }
 
+    fn list_root_refs(&self) -> Result<Vec<Ref>> {
+        if self.uses_reftable()? {
+            let mut refs = BTreeMap::<String, Ref>::new();
+            for table in self.reftables()? {
+                for record in table.refs {
+                    if record.name.starts_with("refs/") || !is_root_ref_syntax(&record.name) {
+                        continue;
+                    }
+                    match reftable_ref_target(record.value)? {
+                        Some(target) => {
+                            refs.insert(
+                                record.name.clone(),
+                                Ref {
+                                    name: record.name,
+                                    target,
+                                },
+                            );
+                        }
+                        None => {
+                            refs.remove(&record.name);
+                        }
+                    }
+                }
+            }
+            return Ok(refs.into_values().collect());
+        }
+
+        let mut refs = Vec::new();
+        for entry in fs::read_dir(&self.git_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_root_ref_syntax(&name)
+                || (name != "HEAD" && !name.ends_with("_HEAD"))
+                || name == "FETCH_HEAD"
+                || name == "MERGE_HEAD"
+            {
+                continue;
+            }
+            if let Ok(reference) = parse_loose_ref(self.format, name, &fs::read(entry.path())?) {
+                refs.push(reference);
+            }
+        }
+        refs.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(refs)
+    }
+
     fn reftables(&self) -> Result<Vec<Reftable>> {
-        let reftable_dir = self.common_dir.join("reftable");
+        let reftable_dir = self.storage_dir.join("reftable");
         let tables_list = reftable_dir.join("tables.list");
         if !tables_list.exists() {
             return Ok(Vec::new());
@@ -1499,15 +1697,18 @@ impl FileRefStore {
     }
 
     pub fn uses_reftable(&self) -> Result<bool> {
+        if let Ok(value) = env::var("GIT_REFERENCE_BACKEND") {
+            return Ok(parse_ref_storage_backend_value(&value)?.0 == RefBackendKind::Reftable);
+        }
         let config_path = self.common_dir.join("config");
         if !config_path.exists() {
             return Ok(false);
         }
         let config = GitConfig::parse(&fs::read(config_path)?)?;
-        Ok(matches!(
-            config.get("extensions", None, "refStorage"),
-            Some(value) if value.eq_ignore_ascii_case("reftable")
-        ))
+        let Some(value) = config.get("extensions", None, "refStorage") else {
+            return Ok(false);
+        };
+        Ok(parse_ref_storage_backend_value(value)?.0 == RefBackendKind::Reftable)
     }
 
     pub fn reftable_table_count(&self) -> Result<usize> {
@@ -1523,7 +1724,7 @@ impl FileRefStore {
     }
 
     fn next_reftable_update_index(&self, table_names: &[String]) -> Result<u64> {
-        let reftable_dir = self.common_dir.join("reftable");
+        let reftable_dir = self.storage_dir.join("reftable");
         let mut max_update_index = 0;
         for name in table_names {
             let table = Reftable::parse(&fs::read(reftable_dir.join(name))?)?;
@@ -1536,7 +1737,7 @@ impl FileRefStore {
 
     /// Read the table list (file names) backing the reftable stack, oldest first.
     fn reftable_table_names(&self) -> Result<Vec<String>> {
-        self.reftable_table_names_from(&self.common_dir.join("reftable").join("tables.list"))
+        self.reftable_table_names_from(&self.storage_dir.join("reftable").join("tables.list"))
     }
 
     fn reftable_table_names_from(&self, tables_list: &Path) -> Result<Vec<String>> {
@@ -1580,7 +1781,7 @@ impl FileRefStore {
         mut refs: Vec<ReftableRefRecord>,
         mut logs: Vec<ReftableLogRecord>,
     ) -> Result<u64> {
-        let reftable_dir = self.common_dir.join("reftable");
+        let reftable_dir = self.storage_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
         let list_path = reftable_dir.join("tables.list");
         let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
@@ -1622,7 +1823,7 @@ impl FileRefStore {
         end: usize,
         fail_on_locked_table: bool,
     ) -> Result<()> {
-        let reftable_dir = self.common_dir.join("reftable");
+        let reftable_dir = self.storage_dir.join("reftable");
         let list_path = reftable_dir.join("tables.list");
         let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
         let old_names = self.reftable_table_names_from(&list_path)?;
@@ -1754,7 +1955,7 @@ impl FileRefStore {
         if names.len() <= 1 {
             return Ok(());
         }
-        let reftable_dir = self.common_dir.join("reftable");
+        let reftable_dir = self.storage_dir.join("reftable");
         let start = names
             .iter()
             .rposition(|name| reftable_dir.join(format!("{name}.lock")).exists())
@@ -1818,6 +2019,28 @@ impl FileRefStore {
             } else if !name.ends_with(".lock") {
                 let reference = parse_loose_ref(self.format, name.clone(), &fs::read(path)?)?;
                 refs.insert(name, reference);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_reflog_names(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        names: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+            if path.is_dir() {
+                self.collect_reflog_names(&path, &name, names)?;
+            } else if let Some(name) = name.strip_prefix("logs/") {
+                names.insert(name.to_string());
             }
         }
         Ok(())
@@ -1992,7 +2215,6 @@ impl FileRefStore {
             .append(true)
             .open(path)?;
         file.write_all(&entry.to_line())?;
-        file.sync_all()?;
         Ok(())
     }
 
@@ -2096,7 +2318,7 @@ impl FileRefStore {
         mut refs: Vec<ReftableRefRecord>,
         logs: Vec<ReftableLogRecord>,
     ) -> Result<u64> {
-        let reftable_dir = self.common_dir.join("reftable");
+        let reftable_dir = self.storage_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
         let list_path = reftable_dir.join("tables.list");
         let list_lock = self.acquire_reftable_list_lock(list_path.clone())?;
@@ -2140,6 +2362,9 @@ impl FileRefStore {
     }
 
     fn ref_base_dir(&self, name: &str) -> &Path {
+        if self.storage_dir != self.common_dir {
+            return &self.storage_dir;
+        }
         if is_root_ref_syntax(name)
             || name.starts_with("refs/worktree/")
             || name.starts_with("refs/rewritten/")
@@ -2150,22 +2375,6 @@ impl FileRefStore {
         }
     }
 
-    fn check_ref_directory_conflict(&self, name: &str) -> Result<()> {
-        let components = name.split('/').collect::<Vec<_>>();
-        for index in 1..components.len() {
-            let ancestor = components[..index].join("/");
-            if self.read_ref_unchecked(&ancestor)?.is_some() {
-                return Err(ref_directory_conflict_error(name, &ancestor));
-            }
-        }
-        let child_prefix = format!("{name}/");
-        for reference in self.list_refs()? {
-            if reference.name.starts_with(&child_prefix) {
-                return Err(ref_directory_conflict_error(name, &reference.name));
-            }
-        }
-        Ok(())
-    }
 }
 
 fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
@@ -2733,12 +2942,31 @@ impl FileRefStore {
         let has_delete = changes
             .iter()
             .any(|change| matches!(change, CoalescedRefChange::Delete(_)));
+        let conflict_names = if changes
+            .iter()
+            .any(|change| matches!(change, CoalescedRefChange::Update(_)))
+        {
+            let mut names = self
+                .list_refs()?
+                .into_iter()
+                .map(|reference| reference.name)
+                .collect::<BTreeSet<_>>();
+            for change in &changes {
+                if let CoalescedRefChange::Update(update) = change {
+                    names.insert(update.name.clone());
+                }
+            }
+            Some(names)
+        } else {
+            None
+        };
         let mut pending = Vec::with_capacity(changes.len() + usize::from(has_delete));
         // Acquire every lock first; bail (releasing what we hold) on any failure.
         for change in &changes {
             let name = change.name();
             if matches!(change, CoalescedRefChange::Update(_))
-                && let Err(err) = self.check_ref_directory_conflict(name)
+                && let Some(conflict_names) = conflict_names.as_ref()
+                && let Err(err) = check_ref_directory_conflict_in_names(name, conflict_names)
             {
                 release_pending_locks(&pending);
                 return Err(err);
@@ -2790,7 +3018,7 @@ impl FileRefStore {
             });
         }
 
-        let packed_path = self.common_dir.join("packed-refs");
+        let packed_path = self.storage_dir.join("packed-refs");
         let mut packed_refs = Vec::new();
         if has_delete {
             let packed_lock_path = match lock_path_for(&packed_path) {
@@ -3416,7 +3644,6 @@ fn stage_lock_file(lock_path: &Path, contents: &[u8]) -> Result<()> {
         .truncate(true)
         .open(lock_path)?;
     file.write_all(contents)?;
-    file.sync_all()?;
     Ok(())
 }
 
@@ -4302,6 +4529,23 @@ fn ref_directory_conflict_error(new_ref: &str, existing_ref: &str) -> GitError {
     GitError::Transaction(format!(
         "cannot lock ref '{new_ref}': '{existing_ref}' exists; cannot create '{new_ref}'"
     ))
+}
+
+fn check_ref_directory_conflict_in_names(name: &str, names: &BTreeSet<String>) -> Result<()> {
+    let components = name.split('/').collect::<Vec<_>>();
+    for index in 1..components.len() {
+        let ancestor = components[..index].join("/");
+        if names.contains(&ancestor) {
+            return Err(ref_directory_conflict_error(name, &ancestor));
+        }
+    }
+    let child_prefix = format!("{name}/");
+    if let Some(existing) = names.range(child_prefix.clone()..).next()
+        && existing.starts_with(&child_prefix)
+    {
+        return Err(ref_directory_conflict_error(name, existing));
+    }
+    Ok(())
 }
 
 fn parent_to_ref_name(base: &Path, parent: &Path) -> String {

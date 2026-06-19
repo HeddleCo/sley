@@ -11,6 +11,7 @@
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -2522,6 +2523,43 @@ pub struct RepositoryLayout {
 
 pub struct RepositoryBootstrap;
 
+struct ReferenceBackendEnv {
+    raw: String,
+    format: RefStorageFormat,
+    path: PathBuf,
+}
+
+fn reference_backend_env() -> Result<Option<ReferenceBackendEnv>> {
+    let Ok(raw) = env::var("GIT_REFERENCE_BACKEND") else {
+        return Ok(None);
+    };
+    let Some((backend, path)) = raw.split_once("://") else {
+        return Err(GitError::Command(format!(
+            "invalid value for 'extensions.refstorage': '{raw}'"
+        )));
+    };
+    if path.is_empty() {
+        return Err(GitError::Command(format!(
+            "invalid value for 'extensions.refstorage': '{raw}'"
+        )));
+    }
+    let format = match backend {
+        "files" => RefStorageFormat::Files,
+        "reftable" => RefStorageFormat::Reftable,
+        _ => {
+            return Err(GitError::Command(format!(
+                "invalid value for 'extensions.refstorage': '{raw}'"
+            )));
+        }
+    };
+    let path = PathBuf::from(path);
+    Ok(Some(ReferenceBackendEnv {
+        raw,
+        format,
+        path,
+    }))
+}
+
 impl RepositoryBootstrap {
     pub fn init(options: InitOptions) -> Result<RepositoryLayout> {
         if options.bare && options.separate_git_dir.is_some() {
@@ -2606,6 +2644,11 @@ impl RepositoryBootstrap {
         // defaults that disagree. A defaulted format never rewrites an existing repo, so
         // the effective formats below drive both the on-disk layout and the returned
         // `RepositoryLayout`.
+        let alt_ref_storage = if reinitialized {
+            None
+        } else {
+            reference_backend_env()?
+        };
         let (object_format, ref_storage) = if reinitialized {
             let existing = read_existing_repository_formats(&git_dir)?;
             if options.object_format_explicit && options.object_format != existing.0 {
@@ -2621,8 +2664,18 @@ impl RepositoryBootstrap {
             }
             existing
         } else {
-            (options.object_format, options.ref_storage)
+            (
+                options.object_format,
+                alt_ref_storage
+                    .as_ref()
+                    .map(|backend| backend.format)
+                    .unwrap_or(options.ref_storage),
+            )
         };
+        let ref_storage_dir = alt_ref_storage
+            .as_ref()
+            .map(|backend| backend.path.clone())
+            .unwrap_or_else(|| git_dir.clone());
 
         create_shared_dir(&git_dir, options.shared_repository.as_deref())?;
         create_shared_dir(
@@ -2636,22 +2689,42 @@ impl RepositoryBootstrap {
 
         if ref_storage == RefStorageFormat::Files {
             create_shared_dir(
-                git_dir.join("refs/heads"),
+                ref_storage_dir.join("refs/heads"),
                 options.shared_repository.as_deref(),
             )?;
             create_shared_dir(
-                git_dir.join("refs/tags"),
+                ref_storage_dir.join("refs/tags"),
                 options.shared_repository.as_deref(),
             )?;
         } else {
             create_shared_dir(
-                git_dir.join("reftable"),
+                ref_storage_dir.join("reftable"),
                 options.shared_repository.as_deref(),
             )?;
         }
 
         let head_path = git_dir.join("HEAD");
-        if ref_storage == RefStorageFormat::Files {
+        if let Some(backend) = alt_ref_storage.as_ref() {
+            fs::create_dir_all(git_dir.join("refs"))?;
+            fs::write(git_dir.join("refs").join("heads"), b"repository uses alternate refs storage\n")?;
+            if !head_path.exists() {
+                fs::write(&head_path, b"ref: refs/heads/.invalid\n")?;
+            }
+            if ref_storage == RefStorageFormat::Files {
+                fs::write(
+                    ref_storage_dir.join("HEAD"),
+                    format!("ref: refs/heads/{}\n", options.initial_branch),
+                )?;
+            } else {
+                write_initial_reftable(
+                    &ref_storage_dir,
+                    object_format,
+                    &options.initial_branch,
+                    options.shared_repository.as_deref(),
+                )?;
+            }
+            let _ = backend;
+        } else if ref_storage == RefStorageFormat::Files {
             if !head_path.exists() {
                 fs::write(
                     &head_path,
@@ -2661,7 +2734,7 @@ impl RepositoryBootstrap {
         } else if !head_path.exists() {
             fs::write(&head_path, b"ref: refs/heads/.invalid\n")?;
             write_initial_reftable(
-                &git_dir,
+                &ref_storage_dir,
                 object_format,
                 &options.initial_branch,
                 options.shared_repository.as_deref(),
@@ -2677,6 +2750,7 @@ impl RepositoryBootstrap {
                     options.bare,
                     &options.shared_repository,
                     ref_storage,
+                    alt_ref_storage.as_ref().map(|backend| backend.raw.as_str()),
                     options.core_worktree.as_deref(),
                 )
                 .to_canonical_bytes(),
@@ -2767,10 +2841,13 @@ fn build_init_config(
     bare: bool,
     shared_repository: &Option<String>,
     ref_storage: RefStorageFormat,
+    ref_storage_value: Option<&str>,
     core_worktree: Option<&str>,
 ) -> GitConfig {
     let uses_extensions =
-        object_format == ObjectFormat::Sha256 || ref_storage == RefStorageFormat::Reftable;
+        object_format == ObjectFormat::Sha256
+            || ref_storage == RefStorageFormat::Reftable
+            || ref_storage_value.is_some();
     let mut core_entries = vec![
         ConfigEntry::new(
             "repositoryformatversion",
@@ -2798,7 +2875,9 @@ fn build_init_config(
     if object_format == ObjectFormat::Sha256 {
         extension_entries.push(ConfigEntry::new("objectformat", Some("sha256".into())));
     }
-    if ref_storage == RefStorageFormat::Reftable {
+    if let Some(value) = ref_storage_value {
+        extension_entries.push(ConfigEntry::new("refStorage", Some(value.into())));
+    } else if ref_storage == RefStorageFormat::Reftable {
         extension_entries.push(ConfigEntry::new("refStorage", Some("reftable".into())));
     }
     if !extension_entries.is_empty() {
