@@ -9,8 +9,8 @@
 use crate::commands::merge_rebase::{
     MergePathResult, commit_tree_oid, head_commit_oid, merge_bases, merge_index_entry,
     merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
-    print_branch_commit_summary, print_commit_shortstat_between_trees, three_way_merge_trees,
-    three_way_merge_trees_with_favor,
+    merge_favor_from_strategy_opts, print_branch_commit_summary,
+    print_commit_shortstat_between_trees, three_way_merge_trees, three_way_merge_trees_with_favor,
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
@@ -3248,7 +3248,7 @@ fn do_merge(
         &theirs_map,
         "HEAD",
         label,
-        strategy_favor(opts),
+        merge_favor_from_strategy_opts(&opts.strategy_opts),
     )?;
 
     let message = merge_todo_message(ctx, item, original.as_ref(), &labels, oneline.as_deref())?;
@@ -3686,7 +3686,7 @@ fn pick_one_commit(
         &theirs_map,
         "HEAD",
         &theirs_label,
-        strategy_favor(opts),
+        merge_favor_from_strategy_opts(&opts.strategy_opts),
     )?;
 
     // Compose the message (fixup/squash machinery).
@@ -3882,18 +3882,6 @@ fn command_reflog_name(command: TodoCommand) -> &'static str {
         TodoCommand::Squash => "squash",
         _ => "pick",
     }
-}
-
-fn strategy_favor(opts: &MachineOpts) -> sley_diff_merge::MergeFavor {
-    let mut favor = sley_diff_merge::MergeFavor::None;
-    for opt in &opts.strategy_opts {
-        match opt.as_str() {
-            "ours" => favor = sley_diff_merge::MergeFavor::Ours,
-            "theirs" => favor = sley_diff_merge::MergeFavor::Theirs,
-            _ => {}
-        }
-    }
-    favor
 }
 
 fn next_is_fixup(todo: &TodoList) -> bool {
