@@ -3020,6 +3020,7 @@ impl FileRefStore {
 
         let packed_path = self.storage_dir.join("packed-refs");
         let mut packed_refs = Vec::new();
+        let mut use_packed_snapshot = false;
         if has_delete {
             let packed_lock_path = match lock_path_for(&packed_path) {
                 Ok(lock_path) => lock_path,
@@ -3056,6 +3057,7 @@ impl FileRefStore {
                 },
                 None => Vec::new(),
             };
+            use_packed_snapshot = true;
             pending.push(PendingPathChange {
                 name: "packed-refs".into(),
                 path: packed_path.clone(),
@@ -3063,7 +3065,19 @@ impl FileRefStore {
                 original: packed_original,
                 action: PendingPathAction::ReleaseLock,
             });
+        } else if packed_path.exists() {
+            packed_refs = parse_packed_refs(self.format, &fs::read(&packed_path)?)?;
+            use_packed_snapshot = true;
         }
+        let packed_ref_targets = packed_refs
+            .iter()
+            .map(|reference| {
+                (
+                    reference.reference.name.clone(),
+                    reference.reference.target.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         // Verify expectations under lock, then capture prior on-disk state for
         // rollback. Mixed transactions read packed refs from the snapshot held
@@ -3073,8 +3087,10 @@ impl FileRefStore {
         for index in 0..changes.len() {
             match &changes[index] {
                 CoalescedRefChange::Update(update) => {
-                    let current = if has_delete {
-                        match self.read_ref_from_locked_packed(&update.name, &packed_refs) {
+                    let current = if use_packed_snapshot {
+                        match self
+                            .read_ref_from_packed_snapshot(&update.name, &packed_ref_targets)
+                        {
                             Ok(current) => current,
                             Err(err) => {
                                 release_pending_locks(&pending);
@@ -3115,7 +3131,7 @@ impl FileRefStore {
                     }
                 }
                 CoalescedRefChange::Delete(delete) => {
-                    let state = match self.read_locked_ref_state(&delete.name, &packed_refs) {
+                    let state = match self.read_locked_ref_state(&delete.name, &packed_ref_targets) {
                         Ok(state) => state,
                         Err(err) => {
                             release_pending_locks(&pending);
@@ -3228,10 +3244,10 @@ impl FileRefStore {
         Ok(())
     }
 
-    fn read_ref_from_locked_packed(
+    fn read_ref_from_packed_snapshot(
         &self,
         name: &str,
-        packed_refs: &[PackedRef],
+        packed_refs: &HashMap<String, RefTarget>,
     ) -> Result<Option<RefTarget>> {
         let state = self.read_locked_ref_state(name, packed_refs)?;
         Ok(state.current)
@@ -3240,16 +3256,13 @@ impl FileRefStore {
     fn read_locked_ref_state(
         &self,
         name: &str,
-        packed_refs: &[PackedRef],
+        packed_refs: &HashMap<String, RefTarget>,
     ) -> Result<LockedRefState> {
         let loose = self.read_loose_ref(name)?;
-        let packed_index = packed_refs
-            .iter()
-            .position(|reference| reference.reference.name == name);
         let current = if let Some(reference) = loose.as_ref() {
             Some(reference.target.clone())
         } else {
-            packed_index.map(|index| packed_refs[index].reference.target.clone())
+            packed_refs.get(name).cloned()
         };
         Ok(LockedRefState {
             current,

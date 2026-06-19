@@ -382,6 +382,12 @@ struct ReflogExpireOptions {
     explicit_expire_unreachable: bool,
 }
 
+#[derive(Debug)]
+struct ReflogExpireRunContext {
+    config: GitConfig,
+    reachable_by_tip: HashMap<ObjectId, HashSet<ObjectId>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReflogDropOptions {
     all: bool,
@@ -761,7 +767,8 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
-    apply_reflog_expire_config(&git_dir, &mut options)?;
+    let config = load_reflog_expire_config(&git_dir)?;
+    apply_reflog_expire_config_from(&config, &mut options)?;
     let mut targets: BTreeSet<(PathBuf, String)> = BTreeSet::new();
     // References discovered via `--all` silently skip an empty/missing reflog
     // (git's `reflog expire --all` only walks reflogs that exist); explicit
@@ -787,6 +794,10 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
         targets.insert((git_dir.clone(), reference));
     }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let mut context = ReflogExpireRunContext {
+        config,
+        reachable_by_tip: HashMap::new(),
+    };
     let mut exit_code = 0;
     for (target_git_dir, reference) in targets {
         let target_store = if target_git_dir == git_dir {
@@ -800,7 +811,7 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
             continue;
         }
         let mut target_options = options;
-        apply_reflog_expire_pattern_config(&git_dir, &reference, &mut target_options)?;
+        apply_reflog_expire_pattern_config_from(&context.config, &reference, &mut target_options)?;
         if let Err(GitError::Exit(code)) =
             expire_reflog_entries(
                 &target_store,
@@ -809,6 +820,7 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
                 format,
                 &reference,
                 target_options,
+                &mut context,
             )
         {
             exit_code = code;
@@ -828,32 +840,49 @@ fn expire_reflog_entries(
     format: ObjectFormat,
     reference: &str,
     options: ReflogExpireOptions,
+    context: &mut ReflogExpireRunContext,
 ) -> Result<()> {
     let mut entries = store.read_reflog(reference)?;
     if entries.is_empty() {
         eprintln!("error: reflog could not be found: '{reference}'");
         return Err(GitError::Exit(255));
     }
-    let reachable = reflog_reachable_oids(store, db, git_dir, format, reference, options)?;
     let zero = zero_oid(format)?;
     let mut retained = Vec::new();
     let mut last_kept = zero.clone();
+    let mut reachable = None::<Option<HashSet<ObjectId>>>;
+    let mut rewrote_old_oid = false;
     for entry in &entries {
         let mut entry = entry.clone();
         if options.rewrite {
             entry.old_oid = last_kept;
+            rewrote_old_oid = true;
         }
         let timestamp = entry.timestamp_seconds()?;
-        let reachable_from_tip = reachable.as_ref().is_none_or(|commits| {
-            reflog_oid_is_reachable_or_non_commit(db, &entry.old_oid, &zero, commits)
-                && reflog_oid_is_reachable_or_non_commit(db, &entry.new_oid, &zero, commits)
-        });
         let stale = options.stale_fix
             && (!reflog_oid_has_complete_commit(db, format, &entry.old_oid, &zero)
                 || !reflog_oid_has_complete_commit(db, format, &entry.new_oid, &zero));
-        let prune = timestamp < options.expire
-            || stale
-            || (!reachable_from_tip && timestamp < options.expire_unreachable);
+        let mut prune = timestamp < options.expire || stale;
+        if !prune && timestamp < options.expire_unreachable {
+            if reachable.is_none() {
+                reachable = Some(reflog_reachable_oids(
+                    store, db, git_dir, format, reference, options, context,
+                )?);
+            }
+            let reachable_from_tip = reachable
+                .as_ref()
+                .and_then(|value| value.as_ref())
+                .is_none_or(|commits| {
+                    reflog_oid_is_reachable_or_non_commit(db, &entry.old_oid, &zero, commits)
+                        && reflog_oid_is_reachable_or_non_commit(
+                            db,
+                            &entry.new_oid,
+                            &zero,
+                            commits,
+                        )
+                });
+            prune = !reachable_from_tip;
+        }
         if options.verbose {
             let action = if prune {
                 if options.dry_run {
@@ -872,6 +901,9 @@ fn expire_reflog_entries(
         }
     }
     if options.dry_run {
+        return Ok(());
+    }
+    if retained.len() == entries.len() && !rewrote_old_oid {
         return Ok(());
     }
     let old_tip = entries.last().map(|entry| entry.new_oid);
@@ -909,13 +941,19 @@ fn resolve_reflog_name(store: &FileRefStore, name: &str) -> Result<String> {
     Ok(direct)
 }
 
-fn apply_reflog_expire_config(git_dir: &Path, options: &mut ReflogExpireOptions) -> Result<()> {
+fn load_reflog_expire_config(git_dir: &Path) -> Result<GitConfig> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
         repo_current_branch_name(git_dir),
     );
-    let config = sley_config::load_effective_config(&common_git_dir, &context)?;
+    sley_config::load_effective_config(&common_git_dir, &context)
+}
+
+fn apply_reflog_expire_config_from(
+    config: &GitConfig,
+    options: &mut ReflogExpireOptions,
+) -> Result<()> {
     if !options.explicit_expire
         && let Some(value) = config.get("gc", None, "reflogExpire")
     {
@@ -930,8 +968,8 @@ fn apply_reflog_expire_config(git_dir: &Path, options: &mut ReflogExpireOptions)
     Ok(())
 }
 
-fn apply_reflog_expire_pattern_config(
-    git_dir: &Path,
+fn apply_reflog_expire_pattern_config_from(
+    config: &GitConfig,
     reference: &str,
     options: &mut ReflogExpireOptions,
 ) -> Result<()> {
@@ -946,13 +984,6 @@ fn apply_reflog_expire_pattern_config(
             options.expire_unreachable = i64::MIN;
         }
     }
-
-    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let context = sley_config::ConfigIncludeContext::new(
-        Some(common_git_dir.clone()),
-        repo_current_branch_name(git_dir),
-    );
-    let config = sley_config::load_effective_config(&common_git_dir, &context)?;
     for section in config.sections.iter().rev() {
         if !section.name.eq_ignore_ascii_case("gc") {
             continue;
@@ -998,6 +1029,7 @@ fn reflog_reachable_oids(
     format: ObjectFormat,
     reference: &str,
     options: ReflogExpireOptions,
+    context: &mut ReflogExpireRunContext,
 ) -> Result<Option<HashSet<ObjectId>>> {
     if options.expire_unreachable <= options.expire {
         return Ok(Some(HashSet::new()));
@@ -1009,6 +1041,8 @@ fn reflog_reachable_oids(
                 starts.push(oid);
             }
         }
+    } else if let Some(tip) = resolve_ref_to_oid(store, reference)? {
+        starts.push(tip);
     } else if let Ok(tip) = resolve_revision(git_dir, format, reference) {
         starts.push(tip);
     } else {
@@ -1016,8 +1050,15 @@ fn reflog_reachable_oids(
     }
     let mut reachable = HashSet::new();
     for start in starts {
-        if let Ok(depths) = ancestor_depths(db, format, &start) {
-            reachable.extend(depths.into_keys());
+        if !context.reachable_by_tip.contains_key(&start) {
+            let tip_reachable = match ancestor_depths(db, format, &start) {
+                Ok(depths) => depths.into_keys().collect(),
+                Err(_) => HashSet::new(),
+            };
+            context.reachable_by_tip.insert(start, tip_reachable);
+        }
+        if let Some(tip_reachable) = context.reachable_by_tip.get(&start) {
+            reachable.extend(tip_reachable.iter().copied());
         }
     }
     Ok(Some(reachable))
@@ -1464,6 +1505,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             batch_updates,
             message,
             oid_cache: RefCell::new(HashMap::new()),
+            object_type_cache: RefCell::new(HashMap::new()),
         };
         return update_ref_stdin(stdin_context, deref, nul);
     }
@@ -1612,6 +1654,7 @@ struct UpdateRefStdinContext<'a> {
     message: Vec<u8>,
     batch_updates: bool,
     oid_cache: RefCell<HashMap<String, ObjectId>>,
+    object_type_cache: RefCell<HashMap<ObjectId, ObjectType>>,
 }
 
 struct UpdateRefStdinWriteRequest<'a> {
@@ -2275,19 +2318,6 @@ fn dispatch_ref_stdin_command(
     }
 }
 
-/// True when two ref names directory/file-conflict: one is a strict
-/// path-component prefix of the other (e.g. `a/b` and `a/b/c`). Equal names and
-/// names that merely share a textual prefix without a `/` boundary
-/// (`a/bc` vs `a/b`) do not conflict.
-fn ref_names_df_conflict(a: &str, b: &str) -> bool {
-    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
-    if short.len() == long.len() {
-        return false;
-    }
-    long.strip_prefix(short)
-        .is_some_and(|rest| rest.starts_with('/'))
-}
-
 /// Pull `(new_ref, existing_ref)` out of the backend's D/F-conflict message
 /// `cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'`.
 fn parse_df_conflict_message(message: &str) -> Option<(String, String)> {
@@ -2304,6 +2334,7 @@ struct UpdateRefStdinTransaction {
     closed: bool,
     applied: bool,
     originals: BTreeMap<String, Option<RefTarget>>,
+    ref_snapshot: Option<HashMap<String, RefTarget>>,
     duplicate: Option<String>,
     duplicate_message: Option<String>,
     locks: Vec<PathBuf>,
@@ -2319,6 +2350,7 @@ impl Default for UpdateRefStdinTransaction {
             closed: false,
             applied: false,
             originals: BTreeMap::new(),
+            ref_snapshot: None,
             duplicate: None,
             duplicate_message: None,
             locks: Vec::new(),
@@ -2349,34 +2381,45 @@ impl UpdateRefStdinTransaction {
     /// `'<other>' exists; cannot create '<name>'` (the delete's old value still
     /// existed at batch start). Returns the failure if a conflict exists.
     fn check_batch_df_against_queued(&self, requested: &str, name: &str) -> Option<GitError> {
-        for other in self.originals.keys() {
-            if other == name {
-                continue;
+        let mut prefix = name;
+        while let Some((parent, _)) = prefix.rsplit_once('/') {
+            if self.originals.contains_key(parent) {
+                return Some(self.batch_df_conflict_error(requested, name, parent));
             }
-            if !ref_names_df_conflict(name, other) {
-                continue;
-            }
-            // Order parent (shorter) before child to match git's sorted output.
-            let (parent, child) = if other.len() <= name.len() {
-                (other.as_str(), name)
-            } else {
-                (name, other.as_str())
-            };
-            if self.is_batch_create(other) {
-                eprintln!("fatal: cannot process '{parent}' and '{child}' at the same time");
-            } else {
-                // `other` existed at batch start (a delete of a real ref): git
-                // reports it as an existing-ref conflict against the new name.
-                // The lock-ref prefix names the *requested* ref (the symref for
-                // an indirect update), while `cannot create` names the effective
-                // target.
-                eprintln!(
-                    "fatal: cannot lock ref '{requested}': '{other}' exists; cannot create '{name}'"
-                );
-            }
-            return Some(GitError::Exit(128));
+            prefix = parent;
+        }
+        let child_prefix = format!("{name}/");
+        if let Some(other) = self
+            .originals
+            .range(child_prefix.clone()..)
+            .map(|(other, _)| other.as_str())
+            .find(|other| other.starts_with(&child_prefix))
+        {
+            return Some(self.batch_df_conflict_error(requested, name, other));
         }
         None
+    }
+
+    fn batch_df_conflict_error(&self, requested: &str, name: &str, other: &str) -> GitError {
+        // Order parent (shorter) before child to match git's sorted output.
+        let (parent, child) = if other.len() <= name.len() {
+            (other, name)
+        } else {
+            (name, other)
+        };
+        if self.is_batch_create(other) {
+            eprintln!("fatal: cannot process '{parent}' and '{child}' at the same time");
+        } else {
+            // `other` existed at batch start (a delete of a real ref): git
+            // reports it as an existing-ref conflict against the new name.
+            // The lock-ref prefix names the *requested* ref (the symref for
+            // an indirect update), while `cannot create` names the effective
+            // target.
+            eprintln!(
+                "fatal: cannot lock ref '{requested}': '{other}' exists; cannot create '{name}'"
+            );
+        }
+        GitError::Exit(128)
     }
 
     /// Reshape a backend D/F-conflict error into the git-shaped `fatal:` exit-128
@@ -2444,8 +2487,23 @@ impl UpdateRefStdinTransaction {
                 }
                 return Ok(true);
             }
-            self.originals
-                .insert(name.to_string(), store.read_ref(name)?);
+            let original = if name == "HEAD" || !name.starts_with("refs/") {
+                store.read_ref(name)?
+            } else {
+                if self.ref_snapshot.is_none() {
+                    self.ref_snapshot = Some(
+                        store
+                            .list_refs()?
+                            .into_iter()
+                            .map(|reference| (reference.name, reference.target))
+                            .collect(),
+                    );
+                }
+                self.ref_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(name).cloned())
+            };
+            self.originals.insert(name.to_string(), original);
         }
         Ok(false)
     }
@@ -2493,6 +2551,7 @@ impl UpdateRefStdinTransaction {
         self.closed = false;
         self.applied = false;
         self.staged.clear();
+        self.ref_snapshot = None;
         writeln!(stdout, "start: ok")?;
         Ok(())
     }
@@ -2534,6 +2593,7 @@ impl UpdateRefStdinTransaction {
         self.closed = true;
         self.release_locks();
         self.originals.clear();
+        self.ref_snapshot = None;
         self.duplicate_message = None;
         self.duplicate = None;
         writeln!(stdout, "commit: ok")?;
@@ -2560,6 +2620,7 @@ impl UpdateRefStdinTransaction {
         self.active = false;
         self.prepared = false;
         self.originals.clear();
+        self.ref_snapshot = None;
         self.duplicate_message = None;
         self.closed = false;
         self.applied = false;
@@ -2583,6 +2644,7 @@ impl UpdateRefStdinTransaction {
         if !self.applied {
             self.originals.clear();
         }
+        self.ref_snapshot = None;
         self.staged.clear();
         self.explicit = false;
         self.prepared = false;
@@ -2645,8 +2707,24 @@ impl UpdateRefStdinTransaction {
 
     fn release_locks(&mut self) {
         for lock in mem::take(&mut self.locks) {
-            let _ = fs::remove_file(lock);
+            let _ = fs::remove_file(&lock);
+            prune_empty_ref_lock_dirs(&lock);
         }
+    }
+}
+
+fn prune_empty_ref_lock_dirs(lock_path: &Path) {
+    let Some(mut dir) = lock_path.parent() else {
+        return;
+    };
+    while dir.file_name().is_some_and(|name| name != "refs") {
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        dir = parent;
     }
 }
 
@@ -2716,11 +2794,17 @@ fn update_ref_stdin_commit_staged(
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
     let mut tx = context.store.transaction().with_hook(&hook);
     let mut requested_by_name = BTreeMap::new();
+    let current_refs = context
+        .store
+        .list_refs()?
+        .into_iter()
+        .map(|reference| (reference.name, reference.target))
+        .collect::<HashMap<_, _>>();
     for change in staged {
         match change {
             UpdateRefStdinStagedChange::Write(write) => {
                 requested_by_name.insert(write.name.clone(), write.requested.clone());
-                let current = context.store.read_ref(&write.name)?;
+                let current = current_refs.get(&write.name).cloned();
                 if let Some(expected_oid) = write.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
                         context.store,
@@ -2741,12 +2825,7 @@ fn update_ref_stdin_commit_staged(
                     }
                     continue;
                 }
-                check_update_ref_new_value(
-                    context.git_dir,
-                    context.format,
-                    &write.name,
-                    &write.new_oid,
-                )
+                check_update_ref_new_value_cached(context, &write.name, &write.new_oid)
                 .map_err(|reason| {
                     eprintln!("fatal: cannot update ref '{}': {reason}", write.name);
                     GitError::Exit(128)
@@ -2772,7 +2851,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::Delete(delete) => {
                 requested_by_name.insert(delete.name.clone(), delete.requested.clone());
-                let current = context.store.read_ref(&delete.name)?;
+                let current = current_refs.get(&delete.name).cloned();
                 if let Some(expected_oid) = delete.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
                         context.store,
@@ -3176,6 +3255,38 @@ fn check_update_ref_new_value(
     Ok(())
 }
 
+fn check_update_ref_new_value_cached(
+    context: &UpdateRefStdinContext<'_>,
+    name: &str,
+    new_oid: &ObjectId,
+) -> std::result::Result<(), String> {
+    if new_oid == &zero_oid(context.format).map_err(|err| err.to_string())? {
+        return Ok(());
+    }
+    let object_type = if let Some(object_type) = context.object_type_cache.borrow().get(new_oid) {
+        *object_type
+    } else {
+        let db = FileObjectDatabase::from_git_dir(context.git_dir, context.format);
+        let object = db.read_object(new_oid).map_err(|err| match err {
+            GitError::NotFound(_) => {
+                format!("trying to write ref '{name}' with nonexistent object {new_oid}")
+            }
+            err => err.to_string(),
+        })?;
+        context
+            .object_type_cache
+            .borrow_mut()
+            .insert(*new_oid, object.object_type);
+        object.object_type
+    };
+    if update_ref_requires_commit(name) && object_type != ObjectType::Commit {
+        return Err(format!(
+            "trying to write non-commit object {new_oid} to branch '{name}'"
+        ));
+    }
+    Ok(())
+}
+
 fn update_ref_requires_commit(name: &str) -> bool {
     name == "HEAD" || name.starts_with("refs/heads/")
 }
@@ -3201,12 +3312,9 @@ fn update_ref_stdin_write_batch(
     if request.new_oid == zero_oid(context.format)? {
         return update_ref_delete_stdin(context.store, context.format, &request.name, None);
     }
-    if let Err(reason) = check_update_ref_new_value(
-        context.git_dir,
-        context.format,
-        &request.name,
-        &request.new_oid,
-    ) {
+    if let Err(reason) =
+        check_update_ref_new_value_cached(context, &request.name, &request.new_oid)
+    {
         writeln!(
             stdout,
             "rejected {} {} {} invalid new value provided",
@@ -3291,12 +3399,7 @@ fn update_ref_stdin_write(
             None,
         );
     }
-    check_update_ref_new_value(
-        context.git_dir,
-        context.format,
-        &request.name,
-        &request.new_oid,
-    )
+    check_update_ref_new_value_cached(context, &request.name, &request.new_oid)
     .map_err(|reason| {
         eprintln!("fatal: cannot update ref '{}': {reason}", request.name);
         GitError::Exit(128)
