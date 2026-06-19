@@ -114,16 +114,20 @@ pub fn resolve_remote_fetch_url(config: &GitConfig, remote: &str) -> String {
 }
 
 /// Resolve a push URL for `remote`, preferring `pushurl` over `url` when
-/// configured, then applying `pushInsteadOf`/`insteadOf` rewriting.
+/// configured. An explicit `pushurl` is not rewritten by `pushInsteadOf`
+/// (matching git's `remote.c`); it still gets regular `insteadOf` rewriting.
+/// When falling back to `url` or a literal remote argument, `pushInsteadOf`
+/// participates in the rewrite.
 pub fn resolve_remote_push_url(config: &GitConfig, remote: &str) -> String {
-    let url = remote_config_values(config, remote, "pushurl")
+    if let Some(url) = remote_config_values(config, remote, "pushurl")
         .into_iter()
         .next()
-        .or_else(|| {
-            remote_config_values(config, remote, "url")
-                .into_iter()
-                .next()
-        })
+    {
+        return rewrite_url_with_config(config, &url, false);
+    }
+    let url = remote_config_values(config, remote, "url")
+        .into_iter()
+        .next()
         .unwrap_or_else(|| remote.to_string());
     rewrite_url_with_config(config, &url, true)
 }
@@ -639,7 +643,7 @@ mod tests {
         );
         assert_eq!(
             resolve_remote_push_url(&config, "origin"),
-            "ssh://push.example/push.git"
+            "https://fetch.example/push.git"
         );
     }
 
