@@ -731,6 +731,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--branches" | "--tags" | "--remotes" | "--no-ignore-missing" => {
                 setup_args.push(arg.clone())
             }
+            "--boundary" => {}
             "--ignore-missing" => {
                 ignored_missing_input = true;
                 setup_args.push(arg.clone());
