@@ -4006,7 +4006,11 @@ fn apply_merge_results(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(db, oid)?;
+                    let content = if sley_index::is_gitlink(*mode) {
+                        Vec::new()
+                    } else {
+                        merge_read_blob(db, oid)?
+                    };
                     merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
                 }
             }
@@ -4793,7 +4797,7 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     });
     let has_unstaged = status
         .iter()
-        .any(|entry| entry.worktree != b' ' && entry.worktree != b'?');
+        .any(|entry| entry.worktree != b' ' && entry.worktree != b'?' && !is_submodule_only_status(entry));
     if unmerged || has_unstaged {
         println!("You must edit all merge conflicts and then");
         println!("mark them as resolved using git add");
@@ -4816,6 +4820,13 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     let _ = fs::remove_file(ctx.state_path("stopped-sha"));
 
     pick_commits(ctx, &db, &opts, &mut todo)
+}
+
+fn is_submodule_only_status(entry: &sley_worktree::ShortStatusEntry) -> bool {
+    entry.submodule.is_some()
+        && entry.index == b' '
+        && entry.worktree == b'M'
+        && entry.index_mode.is_some_and(sley_index::is_gitlink)
 }
 
 fn record_stopped_sha_rewritten(ctx: &Ctx, todo: &TodoList) -> Result<()> {
