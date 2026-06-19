@@ -8,7 +8,7 @@ use super::status::{StatusLineSink, status_long_tracking_lines};
 pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut force = false;
-    let mut recurse_submodules = false;
+    let mut recurse_submodules = None;
     let mut patch = false;
     let mut no_auto_advance = false;
     let mut unified_context = false;
@@ -68,8 +68,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 inter_hunk_context = true;
             }
             "--progress" | "--no-progress" | "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
-            "--recurse-submodules" => recurse_submodules = true,
-            "--no-recurse-submodules" => recurse_submodules = false,
+            "--recurse-submodules" => recurse_submodules = Some(true),
+            "--no-recurse-submodules" => recurse_submodules = Some(false),
             "--guess" => guess = Some(true),
             "--no-guess" => guess = Some(false),
             "-t" | "--track" | "--track=direct" => {
@@ -142,6 +142,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let checkout_config = read_repo_config(&git_dir)?;
+    let recurse_submodules = recurse_submodules.unwrap_or_else(|| {
+        checkout_config
+            .get_bool("submodule", None, "recurse")
+            .unwrap_or(false)
+    });
     let guess = guess.unwrap_or_else(|| {
         checkout_config
             .get_bool("checkout", None, "guess")
@@ -375,21 +380,40 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let config = read_repo_config(&git_dir)?;
             let subject = detached_checkout_subject(&git_dir, format, &target_oid);
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
-            match sley_worktree::checkout_detached_filtered(
-                &worktree_root,
-                &git_dir,
-                format,
-                &target_oid,
-                commit_identity_from_env("COMMITTER")?,
-                message.clone(),
-                &config,
-            ) {
-                Ok(_) => {}
-                Err(err) if checkout_is_dirty_tree_error(&err) => {
-                    checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid), recurse_submodules)?;
-                    detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+            if recurse_submodules {
+                checkout_twoway_dirty(
+                    &git_dir,
+                    &worktree_root,
+                    format,
+                    Some(&target_oid),
+                    recurse_submodules,
+                    force,
+                )?;
+                detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+            } else {
+                match sley_worktree::checkout_detached_filtered(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &target_oid,
+                    commit_identity_from_env("COMMITTER")?,
+                    message.clone(),
+                    &config,
+                ) {
+                    Ok(_) => {}
+                    Err(err) if checkout_is_dirty_tree_error(&err) => {
+                        checkout_twoway_dirty(
+                            &git_dir,
+                            &worktree_root,
+                            format,
+                            Some(&target_oid),
+                            recurse_submodules,
+                            force,
+                        )?;
+                        detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
@@ -429,21 +453,40 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 let subject = detached_checkout_subject(&git_dir, format, &target_oid);
                 let from = checkout_reflog_from_name(&store);
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
-                match sley_worktree::checkout_detached_filtered(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &target_oid,
-                    commit_identity_from_env("COMMITTER")?,
-                    message.clone(),
-                    &config,
-                ) {
-                    Ok(_) => {}
-                    Err(err) if checkout_is_dirty_tree_error(&err) => {
-                        checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid), recurse_submodules)?;
-                        detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                if recurse_submodules {
+                    checkout_twoway_dirty(
+                        &git_dir,
+                        &worktree_root,
+                        format,
+                        Some(&target_oid),
+                        recurse_submodules,
+                        force,
+                    )?;
+                    detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                } else {
+                    match sley_worktree::checkout_detached_filtered(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &target_oid,
+                        commit_identity_from_env("COMMITTER")?,
+                        message.clone(),
+                        &config,
+                    ) {
+                        Ok(_) => {}
+                        Err(err) if checkout_is_dirty_tree_error(&err) => {
+                            checkout_twoway_dirty(
+                                &git_dir,
+                                &worktree_root,
+                                format,
+                                Some(&target_oid),
+                                recurse_submodules,
+                                force,
+                            )?;
+                            detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
                 }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
@@ -586,24 +629,45 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             )?;
         }
     }
-    match sley_worktree::checkout_branch_filtered(
-        &worktree_root,
-        git_dir.clone(),
-        format,
-        branch,
-        commit_identity_from_env("COMMITTER")?,
-        &config,
-    ) {
-        Ok(_) => {}
-        Err(err) if checkout_is_dirty_tree_error(&err) => {
-            let store = FileRefStore::new(&git_dir, format);
-            let from = checkout_reflog_from_name(&store);
-            let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
-                .ok_or_else(|| GitError::reference_not_found("branch"))?;
-            checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target), recurse_submodules)?;
-            switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
+    if recurse_submodules {
+        let from = checkout_reflog_from_name(&store);
+        let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
+        checkout_twoway_dirty(
+            &git_dir,
+            &worktree_root,
+            format,
+            Some(&target),
+            recurse_submodules,
+            force,
+        )?;
+        switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
+    } else {
+        match sley_worktree::checkout_branch_filtered(
+            &worktree_root,
+            git_dir.clone(),
+            format,
+            branch,
+            commit_identity_from_env("COMMITTER")?,
+            &config,
+        ) {
+            Ok(_) => {}
+            Err(err) if checkout_is_dirty_tree_error(&err) => {
+                let store = FileRefStore::new(&git_dir, format);
+                let from = checkout_reflog_from_name(&store);
+                let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
+                    .ok_or_else(|| GitError::reference_not_found("branch"))?;
+                checkout_twoway_dirty(
+                    &git_dir,
+                    &worktree_root,
+                    format,
+                    Some(&target),
+                    recurse_submodules,
+                    force,
+                )?;
+                switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => return Err(err),
     }
     sley_sequencer::replay::remove_branch_state(&git_dir);
     let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
@@ -832,7 +896,7 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
         let git_dir = discover_git_dir(&cwd)?;
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
-        checkout_twoway_dirty(&git_dir, &worktree_root, format, None, false)?;
+        checkout_twoway_dirty(&git_dir, &worktree_root, format, None, false, false)?;
         checkout_switch_to_unborn_branch(&git_dir, branch)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !args.iter().any(|arg| arg == "-q" || arg == "--quiet") {
@@ -1305,6 +1369,7 @@ fn checkout_twoway_dirty(
     format: ObjectFormat,
     target: Option<&ObjectId>,
     recurse_submodules: bool,
+    overwrite_untracked: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
 
@@ -1332,6 +1397,7 @@ fn checkout_twoway_dirty(
         &target_tree,
         commands::read_tree::UnpackPorcelain::Checkout,
         recurse_submodules,
+        overwrite_untracked,
     )
 }
 

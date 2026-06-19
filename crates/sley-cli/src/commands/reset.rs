@@ -16,7 +16,7 @@ usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
 pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut positionals = Vec::new();
     let mut quiet = false;
-    let mut recurse_submodules = false;
+    let mut recurse_submodules = None;
     let mut mode = ResetMode::Mixed;
     let mut parsing_options = true;
     let mut saw_separator = false;
@@ -102,8 +102,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             // stat-dirty so diff-files reports them `M` (t7102 cell 28).
             "--refresh" => refresh = true,
             "--no-refresh" => refresh = false,
-            "--recurse-submodules" => recurse_submodules = true,
-            "--no-recurse-submodules" => recurse_submodules = false,
+            "--recurse-submodules" => recurse_submodules = Some(true),
+            "--no-recurse-submodules" => recurse_submodules = Some(false),
             "--mixed" => mode = ResetMode::Mixed,
             "--soft" => mode = ResetMode::Soft,
             "--hard" => mode = ResetMode::Hard,
@@ -208,6 +208,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     }
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let reset_config = read_repo_config(&git_dir)?;
+    let recurse_submodules = recurse_submodules.unwrap_or_else(|| {
+        reset_config
+            .get_bool("submodule", None, "recurse")
+            .unwrap_or(false)
+    });
     let pathspec_from_file_provided = pathspec_from_file.is_some();
     if mode == ResetMode::Merge {
         if pathspec_from_file_provided || (saw_separator && !positionals.is_empty()) {
@@ -289,6 +295,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             &target_tree,
             commands::read_tree::UnpackPorcelain::ReadTree,
             recurse_submodules,
+            false,
         )?;
         // git's second pass: `if (reset_type == KEEP && !err) reset_index(MIXED)`
         // — an index-only reset to the target tree, so the resulting index
@@ -378,12 +385,22 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if mode == ResetMode::Hard {
-            sley_worktree::reset_index_and_worktree_to_commit(
-                worktree_root.clone(),
-                git_dir.clone(),
-                format,
-                &target_commit,
-            )?;
+            if recurse_submodules {
+                commands::read_tree::reset_index_and_worktree_to_commit(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &target_commit,
+                    true,
+                )?;
+            } else {
+                sley_worktree::reset_index_and_worktree_to_commit(
+                    worktree_root.clone(),
+                    git_dir.clone(),
+                    format,
+                    &target_commit,
+                )?;
+            }
         }
         update_reset_head_ref(
             &git_dir,

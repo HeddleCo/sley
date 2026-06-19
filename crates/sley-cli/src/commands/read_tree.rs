@@ -52,7 +52,7 @@ enum ReadTreeMode {
 struct ReadTreeArgs {
     mode: ReadTreeMode,
     update_worktree: bool,
-    recurse_submodules: bool,
+    recurse_submodules: Option<bool>,
     sparse_checkout: bool,
     empty: bool,
     /// git's `-n` / `--dry-run`: compute (and validate) the merge without
@@ -83,6 +83,11 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
+    let recurse_submodules = parsed.recurse_submodules.unwrap_or_else(|| {
+        repo.config()
+            .get_bool("submodule", None, "recurse")
+            .unwrap_or(false)
+    });
 
     // `--empty` (and the deprecated no-argument spelling) just clears the index.
     if parsed.empty {
@@ -128,7 +133,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     db,
                     repo.config(),
                     &mut entries,
-                    parsed.recurse_submodules,
+                    recurse_submodules,
                 )?;
             }
             if !parsed.dry_run {
@@ -150,7 +155,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     db,
                     repo.config(),
                     &mut entries,
-                    parsed.recurse_submodules,
+                    recurse_submodules,
                 )?;
             }
             if !parsed.dry_run {
@@ -172,7 +177,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 repo.config(),
                 &tree_oids,
                 apply_worktree,
-                parsed.recurse_submodules,
+                recurse_submodules,
             )?;
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
@@ -236,7 +241,7 @@ fn apply_read_tree_sparse_checkout(git_dir: &Path, format: ObjectFormat) -> Resu
 fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     let mut mode: Option<ReadTreeMode> = None;
     let mut update_worktree = false;
-    let mut recurse_submodules = false;
+    let mut recurse_submodules = None;
     let mut sparse_checkout = true;
     let mut empty = false;
     let mut dry_run = false;
@@ -257,8 +262,8 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             "-i" => {} // "don't check the working tree" — we already skip those checks.
             "--empty" => empty = true,
             "--no-empty" => empty = false,
-            "--recurse-submodules" => recurse_submodules = true,
-            "--no-recurse-submodules" => recurse_submodules = false,
+            "--recurse-submodules" => recurse_submodules = Some(true),
+            "--no-recurse-submodules" => recurse_submodules = Some(false),
             "--prefix" => {
                 let value = iter.next().ok_or_else(|| {
                     eprintln!("error: option `prefix' requires a value");
@@ -985,6 +990,7 @@ pub(crate) fn checkout_two_way_engine(
     new_tree: &ObjectId,
     porcelain: UnpackPorcelain,
     recurse_submodules: bool,
+    overwrite_untracked: bool,
 ) -> Result<()> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
 
@@ -1007,6 +1013,9 @@ pub(crate) fn checkout_two_way_engine(
     // the new tree rather than its "deletion was staged" arm dropping it.
     opts.initial_checkout = index.is_empty();
     opts.index_only = false;
+    if overwrite_untracked {
+        opts.reset = sley_unpack_trees::ResetType::OverwriteUntracked;
+    }
 
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(worktree_root),
@@ -1047,6 +1056,32 @@ pub(crate) fn checkout_two_way_engine(
         })
         .collect();
     write_paired_entries(git_dir, format, pairs)
+}
+
+/// Reset both index and worktree to `commit`, using the recursive gitlink writer
+/// when requested. This is the reset/read-tree equivalent of git's
+/// `read-tree -u --reset --recurse-submodules <commit>`.
+pub(crate) fn reset_index_and_worktree_to_commit(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    commit: &ObjectId,
+    recurse_submodules: bool,
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    let tree = commands::merge_rebase::commit_tree_oid(&db, format, commit)?;
+    let mut entries = read_tree_overlay(&db, format, &config, &[tree])?;
+    reset_worktree_to_entries(
+        worktree_root,
+        git_dir,
+        format,
+        &db,
+        &config,
+        &mut entries,
+        recurse_submodules,
+    )?;
+    write_paired_entries(git_dir, format, entries)
 }
 
 /// Perform git's trivial fast-forward / two-way / three-way merge of the listed
@@ -1464,7 +1499,11 @@ fn reset_worktree_to_entries(
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         for entry in &index.entries {
             if !target.iter().any(|p| p.as_slice() == entry.path.as_bytes()) {
-                remove_worktree_path(worktree_root, &entry.path)?;
+                if recurse_submodules && sley_index::is_gitlink(entry.mode) {
+                    remove_submodule_worktree(worktree_root, git_dir, &entry.path)?;
+                } else {
+                    remove_worktree_path(worktree_root, &entry.path)?;
+                }
             }
         }
     }
@@ -1643,11 +1682,27 @@ fn write_tree_entry_to_worktree(
     oid: &ObjectId,
     recurse_submodules: bool,
 ) -> Result<Option<sley_unpack_trees::StatInfo>> {
-    if recurse_submodules && sley_index::is_gitlink(mode) {
+    if recurse_submodules
+        && sley_index::is_gitlink(mode)
+        && gitlink_should_recurse(worktree_root, config, path)
+    {
         checkout_submodule_to_commit(worktree_root, git_dir, format, path, oid)?;
         return Ok(None);
     }
     write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, mode, oid)
+}
+
+fn gitlink_should_recurse(worktree_root: &Path, repo_config: &GitConfig, path: &[u8]) -> bool {
+    let Ok(path_str) = std::str::from_utf8(path) else {
+        return false;
+    };
+    let Some(submodules) = load_superproject_submodules(worktree_root) else {
+        return false;
+    };
+    let Some(submodule) = submodules.from_path(path_str) else {
+        return false;
+    };
+    is_submodule_active(repo_config, &submodule.name, path_str)
 }
 
 fn checkout_submodule_to_commit(
@@ -1661,10 +1716,22 @@ fn checkout_submodule_to_commit(
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    let sub_git_dir = submodule_admin_git_dir(git_dir, &path_str);
+    let (submodule_name, submodule_url) =
+        submodule_name_and_url_for_path(worktree_root, &path_str)
+            .unwrap_or_else(|| (path_str.to_string(), None));
+    let sub_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
     if !sub_git_dir.is_dir() {
         if sub_root.join(".git").is_dir() {
             copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
+        } else if let Some(url) = submodule_url {
+            clone_submodule_for_checkout(
+                worktree_root,
+                git_dir,
+                &sub_root,
+                &sub_git_dir,
+                &path_str,
+                &url,
+            )?;
         } else {
             eprintln!("fatal: could not get a repository handle for submodule '{path_str}'");
             return Err(GitError::Exit(128));
@@ -1709,6 +1776,39 @@ fn checkout_submodule_to_commit(
     Ok(())
 }
 
+fn submodule_name_and_url_for_path(
+    worktree_root: &Path,
+    path: &str,
+) -> Option<(String, Option<String>)> {
+    let config = GitConfig::read(worktree_root.join(".gitmodules")).ok()?;
+    let set = sley_submodule::SubmoduleConfigSet::parse(&config);
+    let submodule = set.from_path(path)?;
+    Some((submodule.name.clone(), submodule.url.clone()))
+}
+
+fn clone_submodule_for_checkout(
+    worktree_root: &Path,
+    git_dir: &Path,
+    sub_root: &Path,
+    sub_git_dir: &Path,
+    path: &str,
+    url: &str,
+) -> Result<()> {
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    let base = config.get("remote", Some("origin"), "url");
+    let fallback = worktree_root.to_string_lossy();
+    let resolved = sley_submodule::resolve_relative_url(url, base, &fallback, None);
+    let args = vec![
+        "--separate-git-dir".to_string(),
+        sub_git_dir.display().to_string(),
+        resolved,
+        sub_root.display().to_string(),
+    ];
+    super::remote_cmds::cmd_clone(&args)?;
+    connect_submodule_worktree(sub_root, sub_git_dir, path)?;
+    Ok(())
+}
+
 fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) -> Result<()> {
     let Some(sub_root) = safe_worktree_path(worktree_root, path) else {
         return Ok(());
@@ -1739,16 +1839,28 @@ fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
 fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path, path: &str) -> Result<()> {
     fs::create_dir_all(sub_git_dir)?;
     fs::write(sub_root.join(".git"), format!("gitdir: {}\n", sub_git_dir.display()))?;
-    set_core_worktree(sub_git_dir, &core_worktree_value(sub_root, path))?;
+    set_core_worktree(sub_git_dir, &core_worktree_value(sub_root, sub_git_dir, path))?;
     Ok(())
 }
 
-fn core_worktree_value(sub_root: &Path, path: &str) -> String {
-    if !path.contains('/') {
+fn core_worktree_value(sub_root: &Path, sub_git_dir: &Path, path: &str) -> String {
+    if !path.contains('/') && is_top_level_submodule_gitdir(sub_git_dir) {
         format!("../../../{path}")
     } else {
         sub_root.display().to_string()
     }
+}
+
+fn is_top_level_submodule_gitdir(sub_git_dir: &Path) -> bool {
+    sub_git_dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "modules")
+        && sub_git_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".git")
 }
 
 fn set_core_worktree(git_dir: &Path, value: &str) -> Result<()> {
