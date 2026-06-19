@@ -2525,10 +2525,7 @@ fn complete_action(
             for message in messages {
                 eprintln!("{message}");
             }
-            eprintln!(
-                "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
-            );
-            eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
+            print_edit_todo_recovery_advice();
             checkout_onto(ctx, &opts, onto_name)?;
             return Err(GitError::Exit(1));
         }
@@ -2655,6 +2652,13 @@ fn check_todo_dropped_commits(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn print_edit_todo_recovery_advice() {
+    eprintln!(
+        "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
+    );
+    eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
 }
 
 fn check_todo_dropped_commits_against_backup(
@@ -5061,6 +5065,7 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
         for message in messages {
             eprintln!("{message}");
         }
+        print_edit_todo_recovery_advice();
         return Err(GitError::Exit(1));
     }
     if incorrect {
