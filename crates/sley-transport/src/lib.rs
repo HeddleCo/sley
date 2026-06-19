@@ -615,6 +615,7 @@ fn http_remote_origin(remote: &RemoteUrl) -> Result<String> {
 
 pub fn ssh_service_command(service: GitService, repository_path: &str) -> Result<String> {
     validate_ssh_repository_path(repository_path)?;
+    let repository_path = ssh_service_repository_path(repository_path);
     Ok(format!(
         "{} {}",
         service.as_str(),
@@ -875,10 +876,12 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
         }
         "ssh" | "git+ssh" | "ssh+git" | "git" | "http" | "https" => {
             let is_http = scheme == "http" || scheme == "https";
+            let empty_port_is_absent = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git");
             let (authority, path) = split_remote_authority_and_path(rest)?;
             // Only http(s) userinfo may carry an embedded password; SSH/git keep
             // their authority verbatim so existing behavior does not regress.
-            let (user, password, host, port) = parse_remote_authority(authority, true, is_http)?;
+            let (user, password, host, port) =
+                parse_remote_authority(authority, true, is_http, empty_port_is_absent)?;
             let path = if matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git") {
                 percent_decode_remote_path(&path)?
             } else {
@@ -965,6 +968,7 @@ fn parse_remote_authority(
     value: &str,
     allow_port: bool,
     split_password: bool,
+    empty_port_is_absent: bool,
 ) -> Result<ParsedAuthority> {
     if value.is_empty() {
         return Err(GitError::InvalidFormat(
@@ -996,12 +1000,16 @@ fn parse_remote_authority(
         }
         None => (None, None, value),
     };
-    let (host, port) = parse_remote_host_port(host_port, allow_port)?;
+    let (host, port) = parse_remote_host_port(host_port, allow_port, empty_port_is_absent)?;
     validate_remote_host(&host)?;
     Ok((user, password, host, port))
 }
 
-fn parse_remote_host_port(value: &str, allow_port: bool) -> Result<(String, Option<u16>)> {
+fn parse_remote_host_port(
+    value: &str,
+    allow_port: bool,
+    empty_port_is_absent: bool,
+) -> Result<(String, Option<u16>)> {
     if let Some(rest) = value.strip_prefix('[') {
         let end = rest
             .find(']')
@@ -1013,6 +1021,9 @@ fn parse_remote_host_port(value: &str, allow_port: bool) -> Result<(String, Opti
                 return Err(GitError::InvalidFormat(
                     "remote URL must not include a port".into(),
                 ));
+            }
+            if port.is_empty() && empty_port_is_absent {
+                return Ok((host.to_string(), None));
             }
             Some(parse_remote_port(port)?)
         } else if suffix.is_empty() {
@@ -1034,6 +1045,9 @@ fn parse_remote_host_port(value: &str, allow_port: bool) -> Result<(String, Opti
             return Err(GitError::InvalidFormat(
                 "remote URL IPv6 host must be bracketed".into(),
             ));
+        }
+        if port.is_empty() && empty_port_is_absent {
+            return Ok((host.to_string(), None));
         }
         if port.bytes().all(|byte| byte.is_ascii_digit()) {
             if !allow_port {
@@ -1074,7 +1088,7 @@ fn parse_scp_like_authority(value: &str) -> Result<(Option<String>, String, Opti
         validate_remote_host(&host)?;
         return Ok((user, host, port));
     }
-    let (user, _password, host, port) = parse_remote_authority(value, false, false)?;
+    let (user, _password, host, port) = parse_remote_authority(value, false, false, false)?;
     if port.is_some() {
         return Err(GitError::InvalidFormat(
             "scp-like SSH remote must not include a port".into(),
@@ -1198,6 +1212,14 @@ fn quote_ssh_repository_path(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+fn ssh_service_repository_path(value: &str) -> &str {
+    if value.starts_with("/~") {
+        &value[1..]
+    } else {
+        value
+    }
 }
 
 fn validate_git_protocol_header_parameter(value: &str) -> Result<()> {
