@@ -572,10 +572,12 @@ fn write_section_header(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStatusEn
     let path = status_quote_path(section_path(entry), false);
     match entry.status {
         sley_diff_merge::NameStatus::Added => {
-            out.extend_from_slice(format!("{path} (new)").as_bytes());
+            out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(b" (new)");
         }
         sley_diff_merge::NameStatus::Deleted => {
-            out.extend_from_slice(format!("{path} (deleted)").as_bytes());
+            out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(b" (deleted)");
         }
         sley_diff_merge::NameStatus::Renamed(_) => {
             let old = status_quote_path(entry.old_path.as_deref().unwrap_or(&entry.path), false);
@@ -708,7 +710,7 @@ fn assign_correspondences(
 }
 
 fn output_range_diff(
-    stdout: &mut dyn Write,
+    out: &mut Vec<u8>,
     repo: &RepositoryContext,
     left: &mut [PatchRecord],
     right: &mut [PatchRecord],
@@ -724,21 +726,21 @@ fn output_range_diff(
         }
         if i < left.len() && left[i].matching.is_none() {
             if !options.right_only {
-                write_pair_header(stdout, repo, width, &dashes, Some(&left[i]), None, options)?;
+                write_pair_header(out, repo, width, &dashes, Some(&left[i]), None, options)?;
             }
             i += 1;
             continue;
         }
         while j < right.len() && right[j].matching.is_none() {
             if !options.left_only {
-                write_pair_header(stdout, repo, width, &dashes, None, Some(&right[j]), options)?;
+                write_pair_header(out, repo, width, &dashes, None, Some(&right[j]), options)?;
             }
             j += 1;
         }
         if j < right.len() {
             let li = right[j].matching.expect("matched RHS has LHS");
             write_pair_header(
-                stdout,
+                out,
                 repo,
                 width,
                 &dashes,
@@ -748,9 +750,9 @@ fn output_range_diff(
             )?;
             if left[li].patch != right[j].patch {
                 if options.diff.stat {
-                    write_interdiff_stat(stdout, &left[li].patch, &right[j].patch)?;
+                    write_interdiff_stat(out, &left[li].patch, &right[j].patch)?;
                 } else if options.diff.patch {
-                    write_interdiff(stdout, &left[li].patch, &right[j].patch, options.diff.context)?;
+                    write_interdiff(out, &left[li].patch, &right[j].patch, options.diff.context)?;
                 }
             }
             left[li].shown = true;
@@ -761,7 +763,7 @@ fn output_range_diff(
 }
 
 fn write_pair_header(
-    out: &mut dyn Write,
+    out: &mut Vec<u8>,
     repo: &RepositoryContext,
     width: usize,
     dashes: &str,
@@ -778,29 +780,31 @@ fn write_pair_header(
     };
     let subject = left.or(right).map(|p| p.subject.as_str()).unwrap_or("");
     match left {
-        Some(patch) => write!(
-            out,
-            "{:>width$}:  {} ",
-            patch.index + 1,
-            unique_abbrev(repo.objects(), &patch.oid, options.abbrev)
-        )?,
+        Some(patch) => {
+            write!(out, "{:>width$}:  ", patch.index + 1)?;
+            write_unique_abbrev(out, repo.objects(), &patch.oid, options.abbrev);
+            write!(out, " ")?;
+        }
         None => write!(out, "{:>width$}:  {dashes} ", "-")?,
     }
     write!(out, "{status}")?;
     match right {
-        Some(patch) => write!(
-            out,
-            " {:>width$}:  {}",
-            patch.index + 1,
-            unique_abbrev(repo.objects(), &patch.oid, options.abbrev)
-        )?,
+        Some(patch) => {
+            write!(out, " {:>width$}:  ", patch.index + 1)?;
+            write_unique_abbrev(out, repo.objects(), &patch.oid, options.abbrev);
+        }
         None => write!(out, " {:>width$}:  {dashes}", "-")?,
     }
     writeln!(out, " {subject}")?;
     Ok(())
 }
 
-fn unique_abbrev(db: &FileObjectDatabase, oid: &ObjectId, width: usize) -> String {
+fn write_unique_abbrev(
+    out: &mut Vec<u8>,
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    width: usize,
+) {
     let hex = oid.to_hex();
     let mut len = width.min(hex.len());
     while len < hex.len() {
@@ -809,11 +813,11 @@ fn unique_abbrev(db: &FileObjectDatabase, oid: &ObjectId, width: usize) -> Strin
             _ => break,
         }
     }
-    hex[..len].to_string()
+    out.extend_from_slice(hex[..len].as_bytes());
 }
 
 fn decimal_width(value: usize) -> usize {
-    value.to_string().len()
+    value.checked_ilog10().unwrap_or(0) as usize + 1
 }
 
 fn write_interdiff(
