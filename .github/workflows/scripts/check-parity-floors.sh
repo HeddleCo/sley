@@ -464,7 +464,7 @@ declare -A FLOOR=(
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=55
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
-    [t4202-log.sh]=101
+    [t4202-log.sh]=110
     # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
     # confusing-path rejection (.git/HFS/NTFS/backslash/NUL) 4->28 FULL PASS (safe trees still load).
     [t4201-shortlog.sh]=21
@@ -485,7 +485,7 @@ declare -A FLOOR=(
     # pathspec staging before pre-commit, post-commit on replay/start, rebase-vs-
     # cherry-pick error precedence. t3404 63->80. Neighbors held: t3400=19,
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
-    [t3404-rebase-interactive.sh]=80
+    [t3404-rebase-interactive.sh]=89
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=12
     [t3420-rebase-autostash.sh]=40
@@ -575,9 +575,9 @@ declare -A FLOOR=(
     # side gain t5516-fetch-push 63->72. remote/tracking floors held t5505=126
     # t5520=38 t6040=44 t3200=134.
     [t5528-push-default.sh]=31
-    [t5516-fetch-push.sh]=74
+    [t5516-fetch-push.sh]=92
     [t5520-pull.sh]=75
-    [t5601-clone.sh]=72
+    [t5601-clone.sh]=73
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
     # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's
@@ -656,7 +656,7 @@ declare -A FLOOR=(
     # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
     # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
     [t1091-sparse-checkout-builtin.sh]=50
-    [t1092-sparse-checkout-compatibility.sh]=29
+    [t1092-sparse-checkout-compatibility.sh]=32
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
@@ -699,15 +699,22 @@ declare -A FLOOR=(
     [t6132-pathspec-exclude.sh]=23
     [t6135-pathspec-with-attrs.sh]=27
     [t6022-rev-list-missing.sh]=13
-    [t1013-read-tree-submodule.sh]=23
-    [t2013-checkout-submodule.sh]=23
-    [t7112-reset-submodule.sh]=25
+    [t1013-read-tree-submodule.sh]=32
+    [t2013-checkout-submodule.sh]=28
+    [t7112-reset-submodule.sh]=37
     [t6438-submodule-directory-file-conflicts.sh]=32
     # wave-12 Batch B (rebasemerges, integ/wave12B onto 81856328): --rebase-merges
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
     # t3404 held 80, t3418 11->12; cross-guard t5520-pull held 75 (pull-rebase now
     # routes through the rewritten rebase.rs) and t6132 held 23 (log.rs/lib.rs merge).
-    [t3430-rebase-merges.sh]=17
+    [t3430-rebase-merges.sh]=19
+    # wave-13 (2026-06-19, integ/wave13A onto f3eeb950): 6-slice batch, all
+    # measured at the integ tip against one binary, cargo test --workspace green,
+    # cross-guards held (t4014=202 t4013=191 t4205=110 t5505=126 t5520=75 t2007=2).
+    # diff/log/clone/rebase raises: t1013 23->32, t2013 23->28, t7112 25->37,
+    # t5601 72->73, t5516 74->92, t4202 101->110, t3404 80->89, t1092 29->32,
+    # t3430 17->19. NEW: t3206-range-diff (native range-diff command, 2->45).
+    [t3206-range-diff.sh]=45
 )
 
 fail=0
