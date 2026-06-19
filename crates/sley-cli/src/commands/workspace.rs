@@ -2283,7 +2283,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut trailers: Vec<String> = Vec::new();
     let mut reset_author = false;
     let mut amend = false;
-    let mut verbose = false;
+    let mut verbose: i32 = -1;
     // `--status` / `--no-status` (and `commit.status` config) control whether the
     // working-tree status block is appended to the editor template (COMMIT_EDITMSG).
     // `None` = unset on the command line, so `commit.status` config (default true)
@@ -2371,15 +2371,25 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 let Some(path) = iter.next() else {
                     return commit_tree_file_requires_value_error();
                 };
-                file_message = Some(read_porcelain_commit_message_file(path)?);
+                file_message = Some(if fixup_commit.is_some() {
+                    Vec::new()
+                } else {
+                    read_porcelain_commit_message_file(path)?
+                });
             }
             value if value.starts_with("-F") && value.len() > 2 => {
-                file_message = Some(read_porcelain_commit_message_file(&value[2..])?);
+                file_message = Some(if fixup_commit.is_some() {
+                    Vec::new()
+                } else {
+                    read_porcelain_commit_message_file(&value[2..])?
+                });
             }
             value if value.starts_with("--file=") => {
-                file_message = Some(read_porcelain_commit_message_file(
-                    &value["--file=".len()..],
-                )?);
+                file_message = Some(if fixup_commit.is_some() {
+                    Vec::new()
+                } else {
+                    read_porcelain_commit_message_file(&value["--file=".len()..])?
+                });
             }
             "--no-file" => {}
             value if value.starts_with("--no-file=") => {
@@ -2723,8 +2733,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
-            "-v" | "--verbose" => verbose = true,
-            "--no-verbose" => verbose = false,
+            "-v" | "--verbose" => verbose = verbose.max(0).saturating_add(1),
+            "--no-verbose" => verbose = 0,
             value if value.starts_with("--verbose=") => {
                 return commit_option_takes_no_value_error("verbose");
             }
@@ -2901,6 +2911,23 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("fatal: options '--squash' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if let Some(fixup) = &fixup_commit
+        && fixup.is_reword()
+    {
+        if !pathspec_args.is_empty() {
+            eprintln!(
+                "fatal: reword option of '--fixup' and path '{}' cannot be used together",
+                pathspec_args[0]
+            );
+            return Err(GitError::Exit(128));
+        }
+        if all || include_without_paths || only_without_paths || interactive || patch {
+            eprintln!(
+                "fatal: reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
     if fixup_commit.is_some() && file_message.is_some() {
         eprintln!("fatal: options '-F' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
@@ -2916,6 +2943,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if (include_without_paths || only_without_paths)
         && pathspec_args.is_empty()
         && pathspec_from_file.is_none()
+        && !fixup_commit
+            .as_ref()
+            .is_some_and(CommitFixup::is_amend_style)
     {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));
@@ -2975,6 +3005,23 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
+    let repo_config = read_repo_config(&git_dir).ok();
+    if template_file.is_none()
+        && file_message.is_none()
+        && message_chunks.is_empty()
+        && reuse_message.is_none()
+        && fixup_commit.is_none()
+    {
+        template_file = repo_config
+            .as_ref()
+            .and_then(|config| config.get("commit", None, "template").map(str::to_string));
+    }
+    if verbose < 0 {
+        verbose = repo_config
+            .as_ref()
+            .and_then(|config| commit_verbose_config(config.get("commit", None, "verbose")))
+            .unwrap_or(0);
+    }
     let commit_odb = FileObjectDatabase::from_git_dir(&git_dir, format);
     let in_merge = git_dir.join("MERGE_HEAD").is_file();
     let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
@@ -3037,7 +3084,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         .as_ref()
         .map(|fixup| read_fixup_commit_message(&git_dir, format, fixup))
         .transpose()?;
-    let fixup_reword_tree = if fixup_commit.as_ref().is_some_and(CommitFixup::is_reword) {
+    let fixup_reword_tree = if fixup_commit.as_ref().is_some_and(|fixup| {
+        fixup.is_reword() || (fixup.is_amend_style() && only_without_paths)
+    }) {
         let Some(commit) = read_head_commit(&git_dir, format)? else {
             eprintln!("fatal: You have nothing to amend.");
             return Err(GitError::Exit(128));
@@ -3068,11 +3117,28 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
     };
     let had_file_message = file_message.is_some();
+    let template_message_source = file_message.is_none()
+        && message_chunks.is_empty()
+        && reuse_message.is_none()
+        && fixup_commit.is_none()
+        && squash_commit.is_none()
+        && !amend
+        && !in_merge
+        && !in_cherry_pick
+        && !in_revert
+        && !git_dir.join("SQUASH_MSG").is_file()
+        && template_file.is_some();
     let message = reused_commit
         .as_ref()
         .map(|commit| {
             if let Some(squash_message) = &squash_message {
-                commit_squash_message(squash_message, Some(&commit.message), None, &[])
+                if squash_commit.as_deref() == reuse_message.as_deref() {
+                    let mut message = b"squash! ".to_vec();
+                    message.extend_from_slice(&commit.message);
+                    message
+                } else {
+                    commit_squash_message(squash_message, Some(&commit.message), None, &[])
+                }
             } else {
                 commit.message.clone()
             }
@@ -3145,6 +3211,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                     .transpose()
                     .ok()
                     .flatten()
+                    .flatten()
             } else {
                 None
             }
@@ -3152,6 +3219,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         .unwrap_or_else(|| {
             file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks))
         });
+    let all_index_snapshot = if all {
+        read_index_snapshot(&git_dir)?
+    } else {
+        None
+    };
     if all {
         commit_stage_tracked_changes(&git_dir, format)?;
     }
@@ -3173,9 +3245,18 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         || reuse_message.is_some()
         || fixup_commit.is_some()
         || squash_commit.is_some();
+    let fixup_uses_editor = fixup_commit
+        .as_ref()
+        .is_some_and(CommitFixup::is_amend_style);
+    let squash_uses_editor = squash_commit.is_some()
+        && !had_file_message
+        && message_chunks.is_empty()
+        && reuse_message.is_none();
     let use_editor = !in_rebase
         && !in_merge
-        && (edit_flag == Some(true) || (edit_flag != Some(false) && !had_message_source));
+        && (edit_flag == Some(true)
+            || (edit_flag != Some(false)
+                && (!had_message_source || reedit_message || fixup_uses_editor || squash_uses_editor)));
     let partial_index_snapshot = if !pathspec_args.is_empty() {
         Some(read_index_snapshot(&git_dir)?)
     } else {
@@ -3239,6 +3320,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         })?;
         template.extend_from_slice(&block);
     }
+    if use_editor && verbose > 0 {
+        append_commit_verbose_diff(&git_dir, format, amend, verbose as u8, &comment_char, &mut template)?;
+    }
     fs::write(&editmsg, &template)?;
     let editmsg_arg = editmsg.to_string_lossy().into_owned();
     let mut prepare_args = vec![editmsg_arg.as_str()];
@@ -3268,8 +3352,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
     }
     message = fs::read(&editmsg)?;
-    message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose);
+    message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose > 0);
     if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
+        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
@@ -3309,11 +3394,37 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         );
     }
     if !allow_empty_message && empty_before_signoff && !use_editor {
+        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
-    if !allow_empty_message && commit_message_is_empty(&message) {
+    if !allow_empty_message
+        && (commit_message_is_empty(&message)
+            || (template_message_source && commit_message_lacks_non_trailer_content(&message)))
+    {
+        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
+    if fixup_commit
+        .as_ref()
+        .is_some_and(CommitFixup::is_amend_style)
+        && message.starts_with(b"amend! ")
+        && !allow_empty_message
+        && commit_message_is_empty(&commit_message_body(&message))
+    {
+        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        eprintln!("Aborting commit due to empty commit message body.");
+        return Err(GitError::Exit(1));
+    }
+    if let Some(path) = template_file.as_deref()
+        && !allow_empty_message
+        && template_message_source
+        && let Some(template_bytes) = read_commit_template_file(path)?
+        && commit_template_lacks_edit_content(&message, &template_bytes, cleanup_mode, &comment_char)
+    {
+        let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
+        eprintln!("Aborting commit; you did not edit the message.");
         return Err(GitError::Exit(1));
     }
     if !pathspec_args.is_empty() {
@@ -4237,6 +4348,35 @@ fn commit_message_is_empty(message: &[u8]) -> bool {
     message.iter().all(u8::is_ascii_whitespace)
 }
 
+fn commit_message_lacks_non_trailer_content(message: &[u8]) -> bool {
+    !message_has_non_trailer_content(message, "#")
+}
+
+fn message_has_non_trailer_content(message: &[u8], comment_char: &str) -> bool {
+    let text = String::from_utf8_lossy(message);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(comment_char) {
+            continue;
+        }
+        if !is_commit_trailer_line(line) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_commit_trailer_line(line: &str) -> bool {
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && !value.trim().is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Validate a `--cleanup`/`commit.cleanup` mode string. git's `get_cleanup_mode`
 /// `die`s on an unknown value (exit 128); the concrete mode is resolved later by
 /// [`resolve_commit_cleanup_mode`] once `use_editor` is known.
@@ -4261,7 +4401,12 @@ fn read_fixup_commit_message(
         CommitFixup::Plain(_) => Ok(format!("fixup! {subject}\n").into_bytes()),
         CommitFixup::Amend { .. } => {
             let mut message = format!("amend! {subject}\n\n").into_bytes();
-            message.extend_from_slice(&commit.message);
+            let body = if commit.message.starts_with(b"amend! ") {
+                commit_message_body(&commit.message)
+            } else {
+                commit.message
+            };
+            message.extend_from_slice(&body);
             Ok(message)
         }
     }
@@ -4355,7 +4500,7 @@ fn commit_squash_message(
     message_chunks: &[Vec<u8>],
 ) -> Vec<u8> {
     let body = reused_message
-        .map(commit_message_body)
+        .map(<[u8]>::to_vec)
         .or_else(|| file_message.map(<[u8]>::to_vec))
         .unwrap_or_else(|| commit_message_from_prepared_chunks(message_chunks));
     if body.is_empty() {
@@ -4553,11 +4698,157 @@ fn commit_index_tree_if_changed(
 /// Read a `-t <file>` / `--template <file>` template body. The path is relative
 /// to the current working directory (git resolves it via the prefix). git reads
 /// it verbatim (no whitespace cleanup).
-fn read_commit_template_file(path: &str) -> Result<Vec<u8>> {
-    fs::read(path).map_err(|err| {
-        eprintln!("fatal: could not read '{path}': {err}");
-        GitError::Exit(128)
-    })
+fn read_commit_template_file(path: &str) -> Result<Option<Vec<u8>>> {
+    let (optional, path) = match path.strip_prefix(":(optional)") {
+        Some(path) => (true, path),
+        None => (false, path),
+    };
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if optional && err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            eprintln!("fatal: could not read '{path}': {err}");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn commit_verbose_config(value: Option<&str>) -> Option<i32> {
+    let value = value?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(1),
+        "false" | "no" | "off" => Some(0),
+        value => value.parse::<i32>().ok().map(|v| v.max(0)),
+    }
+}
+
+fn commit_template_lacks_edit_content(
+    message: &[u8],
+    template: &[u8],
+    cleanup_mode: CommitCleanupMode,
+    comment_char: &str,
+) -> bool {
+    let cleaned_template =
+        commit_cleanup_message(template.to_vec(), cleanup_mode, comment_char, false);
+    if cleaned_template == message {
+        return true;
+    }
+    let Some(extra) = message.strip_prefix(cleaned_template.as_slice()) else {
+        return false;
+    };
+    !message_has_non_trailer_content(extra, comment_char)
+}
+
+fn append_commit_verbose_diff(
+    git_dir: &Path,
+    format: ObjectFormat,
+    amend: bool,
+    verbose: u8,
+    comment_char: &str,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    append_scissors_cut_line(out, comment_char);
+    if verbose == 1 {
+        append_commit_diff_index_patch(git_dir, format, amend, "a/", "b/", false, out)?;
+    } else {
+        out.extend_from_slice(b"Changes to be committed:\n");
+        append_commit_diff_index_patch(git_dir, format, amend, "c/", "i/", false, out)?;
+        out.extend_from_slice(b"--------------------------------------------------\n");
+        out.extend_from_slice(b"Changes not staged for commit:\n");
+        append_commit_diff_index_patch(git_dir, format, amend, "i/", "w/", true, out)?;
+    }
+    Ok(())
+}
+
+fn append_commit_diff_index_patch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    amend: bool,
+    src_prefix: &str,
+    dst_prefix: &str,
+    worktree: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let base_tree = commit_verbose_base_tree(git_dir, format, amend)?;
+    let entries = if worktree {
+        sley_diff_merge::diff_name_status_index_worktree(
+            &worktree_root,
+            git_dir,
+            format,
+        )?
+    } else {
+        sley_diff_merge::diff_name_status_tree_index_with_options(
+            git_dir,
+            format,
+            &base_tree,
+            sley_diff_merge::DiffNameStatusOptions::default(),
+        )?
+    };
+    let abbrev = repository_abbrev(git_dir, format)?.unwrap_or(format.hex_len());
+    for entry in entries {
+        if entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000) {
+            continue;
+        }
+        write_diff_patch_entry(
+            out,
+            &entry,
+            DiffPatchOptions {
+                db: &db,
+                worktree_root: worktree.then_some(worktree_root.as_path()),
+                use_worktree_new: worktree,
+                format,
+                abbrev,
+                src_prefix,
+                dst_prefix,
+                context: 3,
+                userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
+                ws_error: None,
+                interhunk: 0,
+                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ignore_blank_lines: false,
+                ignore_regexes: &[],
+                line_ranges: None,
+                indent_heuristic: true,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn commit_verbose_base_tree(
+    git_dir: &Path,
+    format: ObjectFormat,
+    amend: bool,
+) -> Result<ObjectId> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let store = FileRefStore::new(git_dir, format);
+    let head = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
+        direct => direct,
+    };
+    let Some(RefTarget::Direct(head)) = head else {
+        return Ok(ObjectId::empty_tree(format));
+    };
+    let commit = Commit::parse(format, &db.read_object(&head)?.body)?;
+    if !amend {
+        return Ok(commit.tree);
+    }
+    let Some(parent) = commit.parents.first() else {
+        return Ok(ObjectId::empty_tree(format));
+    };
+    let parent_commit = Commit::parse(format, &db.read_object(parent)?.body)?;
+    Ok(parent_commit.tree)
 }
 
 /// Inputs for [`build_commit_editor_template_block`].
@@ -4798,13 +5089,8 @@ fn render_commit_template_status(
 }
 
 fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {
-    let store = FileRefStore::new(git_dir, format);
-    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")?
-        && let Some(branch) = target.strip_prefix("refs/heads/")
-    {
-        println!("On branch {branch}");
-    }
-    println!("nothing to commit, working tree clean");
+    let _ = (git_dir, format);
+    let _ = cmd_commit_long_status_preview(false, None);
     Ok(())
 }
 
@@ -6278,7 +6564,7 @@ fn commit_comment_string(git_dir: &Path) -> String {
     read_repo_config(git_dir)
         .ok()
         .and_then(|c| {
-            c.get("core", None, "commentChar")
+            c.get("core", None, "commentchar")
                 .filter(|value| !value.is_empty() && *value != "auto")
                 .map(str::to_string)
         })
@@ -6294,7 +6580,7 @@ fn status_comment_prefix(config: &GitConfig) -> Option<String> {
         return None;
     }
     let comment_char = config
-        .get("core", None, "commentChar")
+        .get("core", None, "commentchar")
         .filter(|value| !value.is_empty() && *value != "auto")
         .unwrap_or("#");
     Some(comment_char.to_string())

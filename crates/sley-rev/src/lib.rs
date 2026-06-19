@@ -505,6 +505,9 @@ fn resolve_at_selector(
     };
     // `inner` still has the `<base>@{` prefix; keep only what is inside the braces.
     let inner = &inner[open + 2..];
+    if inner.contains('}') {
+        return Ok(None);
+    }
     let base = &rev[..open];
 
     // `@{-N}` is special: it names a previously checked-out branch and ignores
@@ -6104,6 +6107,11 @@ mod tests {
             resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{0}~1")
                 .expect("test operation should succeed"),
             parent
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{0}^{tree}")
+                .expect("test operation should succeed"),
+            tree
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
