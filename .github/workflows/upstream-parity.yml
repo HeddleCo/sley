@@ -223,6 +223,15 @@ jobs:
             t5516-fetch-push.sh
             t5528-push-default.sh
             t5520-pull.sh
+            t4020-diff-external.sh
+            t4072-diff-max-depth.sh
+            t6132-pathspec-exclude.sh
+            t6135-pathspec-with-attrs.sh
+            t6022-rev-list-missing.sh
+            t1013-read-tree-submodule.sh
+            t2013-checkout-submodule.sh
+            t7112-reset-submodule.sh
+            t6438-submodule-directory-file-conflicts.sh
             t5601-clone.sh
             t5616-partial-clone.sh
             t5603-clone-dirname.sh

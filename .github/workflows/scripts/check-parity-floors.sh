@@ -575,8 +575,8 @@ declare -A FLOOR=(
     # side gain t5516-fetch-push 63->72. remote/tracking floors held t5505=126
     # t5520=38 t6040=44 t3200=134.
     [t5528-push-default.sh]=31
-    [t5516-fetch-push.sh]=72
-    [t5520-pull.sh]=38
+    [t5516-fetch-push.sh]=74
+    [t5520-pull.sh]=75
     [t5601-clone.sh]=72
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
@@ -687,6 +687,22 @@ declare -A FLOOR=(
     [t6500-gc.sh]=14
     [t0610-reftable-basics.sh]=72
     [t4061-diff-indent.sh]=21
+    # wave-12 (2026-06-19, integ/wave12A onto bd53260f): 4-slice disjoint batch.
+    # diff-external driver + max-depth (t4020 24->72 full, t4072 2->50); pull
+    # reconcile + FETCH_HEAD for-merge (t5520 38->75, t5516 72->74, t5515 held 65);
+    # pathspec exclude/attr + rev-list --missing (t6132 2->23, t6135 5->27,
+    # t6022 4->13); submodule gitlink core in read-tree/checkout/reset (t1013
+    # 0->23, t2013 3->23, t7112 0->25, t6438 0->32). All measured at the integ
+    # tip against the same binary; floor-guards (t4013=191 t7810=235) held.
+    [t4020-diff-external.sh]=72
+    [t4072-diff-max-depth.sh]=50
+    [t6132-pathspec-exclude.sh]=23
+    [t6135-pathspec-with-attrs.sh]=27
+    [t6022-rev-list-missing.sh]=13
+    [t1013-read-tree-submodule.sh]=23
+    [t2013-checkout-submodule.sh]=23
+    [t7112-reset-submodule.sh]=25
+    [t6438-submodule-directory-file-conflicts.sh]=32
 )
 
 fail=0
