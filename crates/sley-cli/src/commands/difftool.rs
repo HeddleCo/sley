@@ -67,7 +67,7 @@ pub(crate) fn cmd_difftool(args: &[String]) -> Result<()> {
         }
         let status = run_difftool_command(&options, &tool, entry, &materialized)?;
         if status >= 126 {
-            return Err(GitError::Exit(status));
+            return Err(GitError::Exit(128));
         }
         if status != 0 && tool.trust_exit_code {
             return Err(GitError::Exit(status));
@@ -95,7 +95,7 @@ fn parse_difftool_args(args: &[String]) -> Result<DifftoolOptions> {
             }
             "--tool-help" => {
                 print_tool_help(ToolMode::Diff);
-                return Ok(options);
+                return Err(GitError::Exit(0));
             }
             "--" => {
                 passthrough = true;
@@ -327,21 +327,20 @@ fn run_difftool_command(
     envs: &ToolEnvironment,
 ) -> Result<i32> {
     if let Some(extcmd) = &options.extcmd {
-        let merged = shell_quote(&envs.merged.to_string_lossy());
+        let merged_path = String::from_utf8_lossy(&entry.path);
+        let merged = shell_quote(&merged_path);
         let local = shell_quote(&envs.local.to_string_lossy());
         let remote = shell_quote(&envs.remote.to_string_lossy());
-        let command = if extcmd.trim_start().starts_with("sh -c ") {
-            format!("{extcmd} {merged} {local} {remote}")
-        } else {
-            format!("{extcmd} {local} {remote}")
-        };
+        let extcmd = shell_quote(extcmd);
+        let command = format!(
+            "GIT_DIFFTOOL_EXTCMD={extcmd}; set -- {merged} {local} {remote}; eval $GIT_DIFFTOOL_EXTCMD '\"$LOCAL\"' '\"$REMOTE\"'"
+        );
         return run_tool_shell(&command, envs);
     }
     let mut envs = envs.clone();
     if tool.command.contains("$BASE") {
         envs.base = envs.merged.clone();
     }
-    let _ = entry;
     run_tool_shell(&tool.command, &envs)
 }
 
@@ -413,7 +412,7 @@ fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
     if paths.len() < 2 {
         return Err(GitError::Exit(129));
     }
-    let config = GitConfig::default();
+    let config = load_no_index_difftool_config()?;
     let tool = resolve_difftool_tool(&config, options, false)?;
     let envs = ToolEnvironment {
         local: PathBuf::from(paths[0]),
@@ -435,7 +434,32 @@ fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
         },
         &envs,
     )?;
-    if status == 0 { Ok(()) } else { Err(GitError::Exit(status)) }
+    if status == 0 {
+        Err(GitError::Exit(1))
+    } else {
+        Err(GitError::Exit(status))
+    }
+}
+
+fn load_no_index_difftool_config() -> Result<GitConfig> {
+    if let Ok(repo) = RepositoryContext::discover_current() {
+        return Ok(repo.config().clone());
+    }
+
+    let context = sley_config::ConfigIncludeContext::default();
+    let mut config = sley_config::load_pre_dispatch_config(None, &context)?;
+    if let Ok(parameters) =
+        sley_config::injected_config_parameters(effective_config_parameters_env().as_deref())
+    {
+        let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            &base,
+        )?;
+    }
+    Ok(config)
 }
 
 fn display_tool_name<'a>(options: &'a DifftoolOptions, tool: &'a ToolCommand) -> &'a str {
