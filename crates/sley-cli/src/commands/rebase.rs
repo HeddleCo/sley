@@ -4162,31 +4162,36 @@ fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
     // carrying the comment prefix.
     let kept_first = format!("{comment_str} This is the 1st commit message:");
     let skip_first = format!("{comment_str} The 1st commit message will be skipped:");
+    let max_message = msg.iter().filter(|&&b| b == b'\n').count() + 2;
+    let nth_markers = (2..=max_message)
+        .map(|n| {
+            (
+                format!("{comment_str} This is the commit message #{n}:"),
+                format!("{comment_str} The commit message #{n} will be skipped:"),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut out = Vec::with_capacity(msg.len());
     let mut commenting = false;
     let mut idx = 1usize;
-    // Build the "This is the commit message #N:" / "...#N will be skipped:"
-    // markers lazily as we walk.
-    let kept_nth = |n: usize| format!("{comment_str} This is the commit message #{n}:");
-    let skip_nth = |n: usize| format!("{comment_str} The commit message #{n} will be skipped:");
     for line in msg.split_inclusive(|&b| b == b'\n') {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let text = String::from_utf8_lossy(body);
-        if text == kept_first {
+        let (kept_nth, skip_nth) = &nth_markers[idx - 1];
+        if body == kept_first.as_bytes() {
             out.extend_from_slice(skip_first.as_bytes());
             out.push(b'\n');
             commenting = true;
             continue;
         }
-        if text == kept_nth(idx + 1) {
-            out.extend_from_slice(skip_nth(idx + 1).as_bytes());
+        if body == kept_nth.as_bytes() {
+            out.extend_from_slice(skip_nth.as_bytes());
             out.push(b'\n');
             idx += 1;
             commenting = true;
             continue;
         }
-        if text == skip_first || text == skip_nth(idx + 1) {
-            if text == skip_nth(idx + 1) {
+        if body == skip_first.as_bytes() || body == skip_nth.as_bytes() {
+            if body == skip_nth.as_bytes() {
                 idx += 1;
             }
             out.extend_from_slice(line);
