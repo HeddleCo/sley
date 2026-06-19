@@ -1578,7 +1578,14 @@ impl GrepPathspec {
                 && pathspec_attrs_match_with(&filter.element, |requested| {
                     attribute_checks_for_matching(
                         sley_worktree::standard_attributes_for_path_from_tree(
-                            root, db, format, tree_oid, path, requested, false,
+                            root,
+                            root.join(".git"),
+                            db,
+                            format,
+                            tree_oid,
+                            path,
+                            requested,
+                            false,
                         )
                         .unwrap_or_default(),
                     )

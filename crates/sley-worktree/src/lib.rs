@@ -5961,8 +5961,39 @@ impl StandardAttributeMatcher {
     }
 }
 
+pub fn standard_attributes_for_path_in_repo(
+    attr_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    path: &[u8],
+    requested: &[Vec<u8>],
+    all: bool,
+    include_worktree_attributes: bool,
+    ignore_case: bool,
+) -> Result<Vec<AttributeCheck>> {
+    let attr_root = attr_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let mut matcher = AttributeMatcher::default();
+    matcher.configure_case_sensitivity(git_dir);
+    matcher.ignore_case = ignore_case;
+    if !matcher.read_configured_attributes(attr_root, git_dir) {
+        matcher.read_default_global_attributes();
+    }
+    if include_worktree_attributes {
+        collect_attribute_patterns(attr_root, attr_root, &mut matcher)?;
+    }
+    read_attribute_patterns(
+        git_dir.join("info").join("attributes"),
+        &mut matcher,
+        &[],
+        b"info/attributes",
+        false,
+    );
+    Ok(matcher.attributes_for_path(path, requested, all))
+}
+
 pub fn standard_attributes_for_path_from_tree(
     worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
@@ -5972,15 +6003,18 @@ pub fn standard_attributes_for_path_from_tree(
 ) -> Result<Vec<AttributeCheck>> {
     let mut matcher = AttributeMatcher::default();
     let worktree_root = worktree_root.as_ref();
-    if !matcher.read_configured_attributes(worktree_root) {
+    let git_dir = git_dir.as_ref();
+    matcher.configure_case_sensitivity(git_dir);
+    if !matcher.read_configured_attributes(worktree_root, git_dir) {
         matcher.read_default_global_attributes();
     }
     collect_attribute_patterns_from_tree(db, format, tree_oid, Vec::new(), &mut matcher)?;
     read_attribute_patterns(
-        worktree_root.join(".git").join("info").join("attributes"),
+        git_dir.join("info").join("attributes"),
         &mut matcher,
         &[],
-        b".git/info/attributes",
+        b"info/attributes",
+        false,
     );
     Ok(matcher.attributes_for_path(path, requested, all))
 }
@@ -5996,16 +6030,18 @@ pub fn standard_attributes_for_path_from_index(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let mut matcher = AttributeMatcher::default();
-    if !matcher.read_configured_attributes(worktree_root) {
+    matcher.configure_case_sensitivity(git_dir);
+    if !matcher.read_configured_attributes(worktree_root, git_dir) {
         matcher.read_default_global_attributes();
     }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     collect_attribute_patterns_from_index(git_dir, format, &db, &mut matcher)?;
     read_attribute_patterns(
-        worktree_root.join(".git").join("info").join("attributes"),
+        git_dir.join("info").join("attributes"),
         &mut matcher,
         &[],
-        b".git/info/attributes",
+        b"info/attributes",
+        false,
     );
     Ok(matcher.attributes_for_path(path, requested, all))
 }
@@ -8951,6 +8987,7 @@ struct AttributeMatcher {
     patterns: Vec<AttributePattern>,
     attribute_order: BTreeMap<Vec<u8>, usize>,
     macros: BTreeMap<Vec<u8>, Vec<AttributeAssignment>>,
+    ignore_case: bool,
 }
 
 #[derive(Debug)]
@@ -8971,15 +9008,18 @@ struct AttributeAssignment {
 impl AttributeMatcher {
     fn from_worktree_root(root: &Path) -> Result<Self> {
         let mut matcher = Self::default();
-        if !matcher.read_configured_attributes(root) {
+        let git_dir = root.join(".git");
+        matcher.configure_case_sensitivity(&git_dir);
+        if !matcher.read_configured_attributes(root, &git_dir) {
             matcher.read_default_global_attributes();
         }
         collect_attribute_patterns(root, root, &mut matcher)?;
         read_attribute_patterns(
-            root.join(".git").join("info").join("attributes"),
+            git_dir.join("info").join("attributes"),
             &mut matcher,
             &[],
             b".git/info/attributes",
+            false,
         );
         Ok(matcher)
     }
@@ -8994,14 +9034,17 @@ impl AttributeMatcher {
     /// matching git's lookup order.
     fn from_worktree_base(root: &Path) -> Self {
         let mut matcher = Self::default();
-        if !matcher.read_configured_attributes(root) {
+        let git_dir = root.join(".git");
+        matcher.configure_case_sensitivity(&git_dir);
+        if !matcher.read_configured_attributes(root, &git_dir) {
             matcher.read_default_global_attributes();
         }
         read_attribute_patterns(
-            root.join(".git").join("info").join("attributes"),
+            git_dir.join("info").join("attributes"),
             &mut matcher,
             &[],
             b".git/info/attributes",
+            false,
         );
         matcher
     }
@@ -9014,11 +9057,11 @@ impl AttributeMatcher {
     ) -> Vec<AttributeCheck> {
         let mut states = BTreeMap::<Vec<u8>, Option<AttributeState>>::new();
         for pattern in &self.patterns {
-            if !pattern.matches(path) {
+            if !pattern.matches(path, self.ignore_case) {
                 continue;
             }
             for assignment in &pattern.assignments {
-                states.insert(assignment.attribute.clone(), assignment.state.clone());
+                self.apply_attribute_assignment(&mut states, assignment);
             }
         }
         if all {
@@ -9054,15 +9097,47 @@ impl AttributeMatcher {
             .or_insert(next);
     }
 
-    fn read_configured_attributes(&mut self, root: &Path) -> bool {
-        let Ok(config) = sley_config::read_repo_config(&root.join(".git"), None) else {
+    fn apply_attribute_assignment(
+        &self,
+        states: &mut BTreeMap<Vec<u8>, Option<AttributeState>>,
+        assignment: &AttributeAssignment,
+    ) {
+        let mut stack = vec![assignment.clone()];
+        let mut expanded = 0usize;
+        while let Some(assignment) = stack.pop() {
+            states.insert(assignment.attribute.clone(), assignment.state.clone());
+            if assignment.state != Some(AttributeState::Set) {
+                continue;
+            }
+            let Some(macro_assignments) = self.macros.get(&assignment.attribute) else {
+                continue;
+            };
+            expanded += 1;
+            if expanded > 10000 {
+                break;
+            }
+            for macro_assignment in macro_assignments.iter().rev() {
+                stack.push(macro_assignment.clone());
+            }
+        }
+    }
+
+    fn configure_case_sensitivity(&mut self, git_dir: &Path) {
+        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+            return;
+        };
+        self.ignore_case = config.get_bool("core", None, "ignorecase").unwrap_or(false);
+    }
+
+    fn read_configured_attributes(&mut self, root: &Path, git_dir: &Path) -> bool {
+        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
             return false;
         };
         let Some(value) = config.get("core", None, "attributesFile") else {
             return false;
         };
         let path = expand_core_excludes_file(root, value);
-        read_attribute_patterns(path, self, &[], value.as_bytes());
+        read_attribute_patterns(path, self, &[], value.as_bytes(), false);
         true
     }
 
@@ -9072,7 +9147,7 @@ impl AttributeMatcher {
         {
             let path = PathBuf::from(config_home).join("git").join("attributes");
             let source = path.to_string_lossy().into_owned();
-            read_attribute_patterns(path, self, &[], source.as_bytes());
+            read_attribute_patterns(path, self, &[], source.as_bytes(), false);
             return;
         }
         if let Some(home) = std::env::var_os("HOME") {
@@ -9081,7 +9156,7 @@ impl AttributeMatcher {
                 .join("git")
                 .join("attributes");
             let source = path.to_string_lossy().into_owned();
-            read_attribute_patterns(path, self, &[], source.as_bytes());
+            read_attribute_patterns(path, self, &[], source.as_bytes(), false);
         }
     }
 }
@@ -9124,7 +9199,7 @@ fn read_dir_attribute_patterns_for_base(
         source.push(b'/');
     }
     source.extend_from_slice(b".gitattributes");
-    read_attribute_patterns(dir.join(".gitattributes"), matcher, base, &source);
+    read_attribute_patterns(dir.join(".gitattributes"), matcher, base, &source, true);
     Ok(())
 }
 
@@ -9153,21 +9228,38 @@ fn read_attribute_patterns(
     path: impl AsRef<Path>,
     matcher: &mut AttributeMatcher,
     base: &[u8],
-    _source: &[u8],
+    source: &[u8],
+    nofollow: bool,
 ) {
+    let path = path.as_ref();
+    if nofollow
+        && let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        eprintln!(
+            "warning: unable to access '{}': Too many levels of symbolic links",
+            String::from_utf8_lossy(source)
+        );
+        return;
+    }
     let Ok(contents) = fs::read(path) else {
         return;
     };
-    read_attribute_patterns_from_bytes(&contents, matcher, base);
+    read_attribute_patterns_from_bytes(&contents, matcher, base, source);
 }
 
 fn read_attribute_patterns_from_bytes(
     contents: &[u8],
     matcher: &mut AttributeMatcher,
     base: &[u8],
+    source: &[u8],
 ) {
-    for raw in contents.split(|byte| *byte == b'\n') {
-        push_attribute_pattern(matcher, raw, base);
+    for (index, raw) in contents.split(|byte| *byte == b'\n').enumerate() {
+        if raw.len() >= 2048 {
+            eprintln!("warning: ignoring overly long attributes line {}", index + 1);
+            continue;
+        }
+        push_attribute_pattern(matcher, raw, base, source, index + 1);
     }
 }
 
@@ -9188,7 +9280,8 @@ fn collect_attribute_patterns_from_tree(
                 expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob)
             })?;
             if object.object_type == ObjectType::Blob {
-                read_attribute_patterns_from_bytes(&object.body, matcher, &base);
+                let source = attribute_source_for_base(&base);
+                read_attribute_patterns_from_bytes(&object.body, matcher, &base, &source);
             }
         }
     }
@@ -9236,35 +9329,55 @@ fn collect_attribute_patterns_from_index(
             .read_object(&entry.oid)
             .map_err(|err| expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob))?;
         if object.object_type == ObjectType::Blob {
-            read_attribute_patterns_from_bytes(&object.body, matcher, &base);
+            read_attribute_patterns_from_bytes(&object.body, matcher, &base, entry.path.as_bytes());
         }
     }
     Ok(())
 }
 
-fn push_attribute_pattern(matcher: &mut AttributeMatcher, raw: &[u8], base: &[u8]) {
+fn attribute_source_for_base(base: &[u8]) -> Vec<u8> {
+    let mut source = base.to_vec();
+    if !source.is_empty() {
+        source.push(b'/');
+    }
+    source.extend_from_slice(b".gitattributes");
+    source
+}
+
+fn push_attribute_pattern(
+    matcher: &mut AttributeMatcher,
+    raw: &[u8],
+    base: &[u8],
+    source: &[u8],
+    line_number: usize,
+) {
     let line = raw.strip_suffix(b"\r").unwrap_or(raw);
     let line = trim_ascii_whitespace(line);
     if line.is_empty() || line.starts_with(b"#") {
         return;
     }
-    let mut fields = line
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty());
-    let Some(raw_pattern) = fields.next() else {
+    let Some((raw_pattern, fields)) = split_attribute_line(line) else {
         return;
     };
     if let Some(macro_name) = raw_pattern.strip_prefix(b"[attr]") {
         if macro_name.is_empty() {
             return;
         }
-        let mut assignments = vec![AttributeAssignment {
-            attribute: macro_name.to_vec(),
-            state: Some(AttributeState::Set),
-        }];
-        for field in fields {
-            push_attribute_assignments(&mut assignments, field, &matcher.macros);
+        if is_reserved_attribute_name(macro_name) {
+            report_invalid_attribute_name(macro_name, source, line_number);
+            return;
         }
+        let mut assignments = Vec::new();
+        for field in fields {
+            push_attribute_assignments(
+                &mut assignments,
+                &field,
+                &matcher.macros,
+                source,
+                line_number,
+            );
+        }
+        matcher.push_attribute_order(macro_name);
         for assignment in &assignments {
             matcher.push_attribute_order(&assignment.attribute);
         }
@@ -9273,7 +9386,13 @@ fn push_attribute_pattern(matcher: &mut AttributeMatcher, raw: &[u8], base: &[u8
     }
     let mut assignments = Vec::new();
     for field in fields {
-        push_attribute_assignments(&mut assignments, field, &matcher.macros);
+        push_attribute_assignments(
+            &mut assignments,
+            &field,
+            &matcher.macros,
+            source,
+            line_number,
+        );
     }
     if assignments.is_empty() {
         return;
@@ -9281,10 +9400,25 @@ fn push_attribute_pattern(matcher: &mut AttributeMatcher, raw: &[u8], base: &[u8
     for assignment in &assignments {
         matcher.push_attribute_order(&assignment.attribute);
     }
+    if raw_pattern.starts_with(b"!") {
+        eprintln!(
+            "warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation."
+        );
+        return;
+    }
+    let raw_pattern = raw_pattern
+        .strip_prefix(br"\!")
+        .map(|pattern| {
+            let mut literal = Vec::with_capacity(pattern.len() + 1);
+            literal.push(b'!');
+            literal.extend_from_slice(pattern);
+            literal
+        })
+        .unwrap_or(raw_pattern);
     let (anchored, pattern) = if let Some(pattern) = raw_pattern.strip_prefix(b"/") {
         (true, pattern)
     } else {
-        (false, raw_pattern)
+        (false, raw_pattern.as_slice())
     };
     if pattern.is_empty() {
         return;
@@ -9302,8 +9436,14 @@ fn push_attribute_assignments(
     assignments: &mut Vec<AttributeAssignment>,
     field: &[u8],
     macros: &BTreeMap<Vec<u8>, Vec<AttributeAssignment>>,
+    source: &[u8],
+    line_number: usize,
 ) {
     if let Some(macro_assignments) = macros.get(field) {
+        assignments.push(AttributeAssignment {
+            attribute: field.to_vec(),
+            state: Some(AttributeState::Set),
+        });
         assignments.extend(macro_assignments.iter().cloned());
         return;
     }
@@ -9328,6 +9468,10 @@ fn push_attribute_assignments(
     }
     if let Some(attribute) = field.strip_prefix(b"-") {
         if !attribute.is_empty() {
+            if is_reserved_attribute_name(attribute) {
+                report_invalid_attribute_name(attribute, source, line_number);
+                return;
+            }
             assignments.push(AttributeAssignment {
                 attribute: attribute.to_vec(),
                 state: Some(AttributeState::Unset),
@@ -9337,6 +9481,10 @@ fn push_attribute_assignments(
     }
     if let Some(attribute) = field.strip_prefix(b"!") {
         if !attribute.is_empty() {
+            if is_reserved_attribute_name(attribute) {
+                report_invalid_attribute_name(attribute, source, line_number);
+                return;
+            }
             assignments.push(AttributeAssignment {
                 attribute: attribute.to_vec(),
                 state: None,
@@ -9348,6 +9496,10 @@ fn push_attribute_assignments(
         let attribute = &field[..equal];
         let value = &field[equal + 1..];
         if !attribute.is_empty() {
+            if is_reserved_attribute_name(attribute) {
+                report_invalid_attribute_name(attribute, source, line_number);
+                return;
+            }
             assignments.push(AttributeAssignment {
                 attribute: attribute.to_vec(),
                 state: Some(AttributeState::Value(value.to_vec())),
@@ -9355,10 +9507,94 @@ fn push_attribute_assignments(
         }
         return;
     }
+    if is_reserved_attribute_name(field) {
+        report_invalid_attribute_name(field, source, line_number);
+        return;
+    }
     assignments.push(AttributeAssignment {
         attribute: field.to_vec(),
         state: Some(AttributeState::Set),
     });
+}
+
+fn split_attribute_line(line: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut index = 0;
+    while line.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if index == line.len() || line[index] == b'#' {
+        return None;
+    }
+    let pattern = if line[index] == b'"' {
+        match c_unquote_prefix(&line[index..]) {
+            Some((pattern, consumed)) => {
+                index += consumed;
+                pattern
+            }
+            None => {
+                let start = index;
+                while index < line.len() && !line[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                line[start..index].to_vec()
+            }
+        }
+    } else {
+        let start = index;
+        while index < line.len() && !line[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        line[start..index].to_vec()
+    };
+    let fields = line[index..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .map(Vec::from)
+        .collect();
+    Some((pattern, fields))
+}
+
+fn c_unquote_prefix(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if input.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut index = 1;
+    while index < input.len() {
+        match input[index] {
+            b'"' => return Some((out, index + 1)),
+            b'\\' if index + 1 < input.len() => {
+                index += 1;
+                let byte = match input[index] {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    other => other,
+                };
+                out.push(byte);
+            }
+            byte => out.push(byte),
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_reserved_attribute_name(attribute: &[u8]) -> bool {
+    attribute.starts_with(b"builtin_")
+}
+
+fn report_invalid_attribute_name(attribute: &[u8], source: &[u8], line_number: usize) {
+    eprintln!(
+        "{} is not a valid attribute name: {}:{}",
+        String::from_utf8_lossy(attribute),
+        String::from_utf8_lossy(source),
+        line_number
+    );
 }
 
 fn attribute_all_rank(
@@ -9388,25 +9624,49 @@ fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
 }
 
 impl AttributePattern {
-    fn matches(&self, path: &[u8]) -> bool {
+    fn matches(&self, path: &[u8], ignore_case: bool) -> bool {
         let path = if self.base.is_empty() {
             path
         } else {
-            let Some(rest) = path
-                .strip_prefix(self.base.as_slice())
-                .and_then(|rest| rest.strip_prefix(b"/"))
-            else {
-                return false;
-            };
-            rest
+            match strip_attribute_base(path, &self.base, ignore_case) {
+                Some(rest) => rest,
+                None => return false,
+            }
+        };
+        let pattern;
+        let folded_path;
+        let (pattern_ref, path_ref) = if ignore_case {
+            pattern = ascii_lowercase(&self.pattern);
+            folded_path = ascii_lowercase(path);
+            (pattern.as_slice(), folded_path.as_slice())
+        } else {
+            (self.pattern.as_slice(), path)
         };
         if self.anchored || self.has_slash {
-            return wildcard_path_matches(&self.pattern, path);
+            return wildcard_path_matches(pattern_ref, path_ref);
         }
-        path.rsplit(|byte| *byte == b'/')
+        path_ref
+            .rsplit(|byte| *byte == b'/')
             .next()
-            .is_some_and(|basename| wildcard_path_matches(&self.pattern, basename))
+            .is_some_and(|basename| wildcard_path_matches(pattern_ref, basename))
     }
+}
+
+fn strip_attribute_base<'a>(path: &'a [u8], base: &[u8], ignore_case: bool) -> Option<&'a [u8]> {
+    if path.len() <= base.len() || path.get(base.len()) != Some(&b'/') {
+        return None;
+    }
+    let prefix = &path[..base.len()];
+    let matches = if ignore_case {
+        prefix.eq_ignore_ascii_case(base)
+    } else {
+        prefix == base
+    };
+    matches.then_some(&path[base.len() + 1..])
+}
+
+fn ascii_lowercase(value: &[u8]) -> Vec<u8> {
+    value.iter().map(u8::to_ascii_lowercase).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -9980,16 +10240,19 @@ impl TreeAttributes {
         tree_oid: &ObjectId,
     ) -> Result<Self> {
         let attr_root = attr_root.as_ref();
+        let git_dir = git_dir.as_ref();
         let mut matcher = AttributeMatcher::default();
-        if !matcher.read_configured_attributes(attr_root) {
+        matcher.configure_case_sensitivity(git_dir);
+        if !matcher.read_configured_attributes(attr_root, git_dir) {
             matcher.read_default_global_attributes();
         }
         collect_attribute_patterns_from_tree(db, format, tree_oid, Vec::new(), &mut matcher)?;
         read_attribute_patterns(
-            git_dir.as_ref().join("info").join("attributes"),
+            git_dir.join("info").join("attributes"),
             &mut matcher,
             &[],
             b"info/attributes",
+            false,
         );
         Ok(Self { matcher })
     }
@@ -10230,7 +10493,9 @@ fn run_driver<'a>(
 fn filter_attribute_checks(worktree_root: &Path, path: &[u8]) -> Result<Vec<AttributeCheck>> {
     let requested = filter_attribute_names();
     let mut matcher = AttributeMatcher::default();
-    if !matcher.read_configured_attributes(worktree_root) {
+    let git_dir = worktree_root.join(".git");
+    matcher.configure_case_sensitivity(&git_dir);
+    if !matcher.read_configured_attributes(worktree_root, &git_dir) {
         matcher.read_default_global_attributes();
     }
     read_dir_attribute_patterns_for_base(worktree_root, &[], &mut matcher)?;
@@ -10252,6 +10517,7 @@ fn filter_attribute_checks(worktree_root: &Path, path: &[u8]) -> Result<Vec<Attr
         &mut matcher,
         &[],
         b".git/info/attributes",
+        false,
     );
     Ok(matcher.attributes_for_path(path, &requested, false))
 }
@@ -10277,7 +10543,8 @@ fn smudge_attribute_checks_from_index(
 ) -> Result<Vec<AttributeCheck>> {
     let requested = filter_attribute_names();
     let mut matcher = AttributeMatcher::default();
-    if !matcher.read_configured_attributes(worktree_root) {
+    matcher.configure_case_sensitivity(git_dir);
+    if !matcher.read_configured_attributes(worktree_root, git_dir) {
         matcher.read_default_global_attributes();
     }
 
@@ -10307,6 +10574,7 @@ fn smudge_attribute_checks_from_index(
         &mut matcher,
         &[],
         b".git/info/attributes",
+        false,
     );
     Ok(matcher.attributes_for_path(path, &requested, false))
 }
@@ -10322,12 +10590,13 @@ fn fold_checkout_attribute_frame(
     matcher: &mut AttributeMatcher,
 ) -> Result<()> {
     let worktree_file = dir.join(".gitattributes");
+    let source = attribute_source_for_base(base);
     if let Ok(contents) = fs::read(&worktree_file) {
         // A worktree `.gitattributes` exists at this level: it wins outright
         // (git only consults the index when the worktree file is absent).
-        read_attribute_patterns_from_bytes(&contents, matcher, base);
+        read_attribute_patterns_from_bytes(&contents, matcher, base, &source);
     } else if let Some(contents) = index_attributes.get(base) {
-        read_attribute_patterns_from_bytes(contents, matcher, base);
+        read_attribute_patterns_from_bytes(contents, matcher, base, &source);
     }
     Ok(())
 }
@@ -11071,7 +11340,9 @@ fn build_tree_attribute_matcher(
     tree_oid: &ObjectId,
 ) -> Result<AttributeMatcher> {
     let mut matcher = AttributeMatcher::default();
-    if !matcher.read_configured_attributes(worktree_root) {
+    let git_dir = worktree_root.join(".git");
+    matcher.configure_case_sensitivity(&git_dir);
+    if !matcher.read_configured_attributes(worktree_root, &git_dir) {
         matcher.read_default_global_attributes();
     }
     collect_attribute_patterns_from_tree(db, format, tree_oid, Vec::new(), &mut matcher)?;
@@ -11080,6 +11351,7 @@ fn build_tree_attribute_matcher(
         &mut matcher,
         &[],
         b".git/info/attributes",
+        false,
     );
     Ok(matcher)
 }
@@ -15976,7 +16248,12 @@ mod tests {
             let checks = match attrline {
                 Some(line) => {
                     let mut matcher = AttributeMatcher::default();
-                    read_attribute_patterns_from_bytes(line, &mut matcher, &[]);
+                    read_attribute_patterns_from_bytes(
+                        line,
+                        &mut matcher,
+                        &[],
+                        b".gitattributes",
+                    );
                     matcher.attributes_for_path(b"f.txt", &filter_attribute_names(), false)
                 }
                 None => Vec::new(),

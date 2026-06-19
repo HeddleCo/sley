@@ -57,6 +57,7 @@ use std::sync::{Arc, Mutex};
 static CMDLINE_CONFIG_PARAMETERS: Mutex<String> = Mutex::new(String::new());
 static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static GLOBAL_ATTR_SOURCE: Mutex<Option<String>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
 /// Default pathspec magic set by the global `--{glob,noglob,icase,literal}-pathspecs`
@@ -148,6 +149,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // config read; no separate global-override store is needed.
     set_global_git_dir(global.git_dir.clone());
     set_global_work_tree(global.work_tree);
+    set_global_attr_source(global.attr_source);
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
     set_global_pathspec_flags(global.pathspec_flags);
@@ -193,6 +195,9 @@ fn dispatch_with_aliases(
                     }
                     if nested.work_tree.is_some() {
                         set_global_work_tree(nested.work_tree);
+                    }
+                    if nested.attr_source.is_some() {
+                        set_global_attr_source(nested.attr_source);
                     }
                     if nested.bare {
                         set_global_bare(true);
@@ -392,6 +397,7 @@ struct GlobalOptions<'a> {
     config: Vec<GlobalConfigOverride>,
     git_dir: Option<PathBuf>,
     work_tree: Option<PathBuf>,
+    attr_source: Option<String>,
     bare: bool,
     replace_objects: bool,
     pathspec_flags: PathspecFlags,
@@ -408,6 +414,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
     let mut config = Vec::new();
     let mut git_dir = None;
     let mut work_tree = None;
+    let mut attr_source = None;
     let mut bare = false;
     let mut replace_objects = env::var_os("GIT_NO_REPLACE_OBJECTS").is_none();
     let mut pathspec_flags = PathspecFlags::default();
@@ -498,12 +505,24 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
                 work_tree = Some(PathBuf::from(path));
                 index += 2;
             }
+            "--attr-source" => {
+                let Some(source) = args.get(index + 1) else {
+                    eprintln!("error: option `attr-source' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                attr_source = Some(source.clone());
+                index += 2;
+            }
             value if value.starts_with("--git-dir=") => {
                 git_dir = Some(PathBuf::from(&value["--git-dir=".len()..]));
                 index += 1;
             }
             value if value.starts_with("--work-tree=") => {
                 work_tree = Some(PathBuf::from(&value["--work-tree=".len()..]));
+                index += 1;
+            }
+            value if value.starts_with("--attr-source=") => {
+                attr_source = Some(value["--attr-source=".len()..].to_string());
                 index += 1;
             }
             value if value.starts_with("--config-env=") => {
@@ -522,6 +541,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
         config,
         git_dir,
         work_tree,
+        attr_source,
         bare,
         replace_objects,
         pathspec_flags,
@@ -686,6 +706,12 @@ fn set_global_work_tree(work_tree: Option<PathBuf>) {
     }
 }
 
+fn set_global_attr_source(attr_source: Option<String>) {
+    if let Ok(mut value) = GLOBAL_ATTR_SOURCE.lock() {
+        *value = attr_source;
+    }
+}
+
 fn set_global_bare(bare: bool) {
     if let Ok(mut value) = GLOBAL_BARE.lock() {
         *value = bare;
@@ -763,6 +789,10 @@ fn global_git_dir() -> Option<PathBuf> {
 
 fn global_work_tree() -> Option<PathBuf> {
     GLOBAL_WORK_TREE.lock().ok()?.clone()
+}
+
+pub(crate) fn global_attr_source() -> Option<String> {
+    GLOBAL_ATTR_SOURCE.lock().ok()?.clone()
 }
 
 fn environment_git_dir() -> Option<PathBuf> {

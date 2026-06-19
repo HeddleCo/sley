@@ -3,14 +3,15 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sley_core::{GitError, Result};
+use sley_object::tree_entry_object_type;
 use sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{
-    RepositoryContext, check_ignore_tracked_paths, resolve_cli_path, require_work_tree,
-    worktree_prefix, write_check_attr_state,
+    RepositoryContext, check_ignore_tracked_paths, global_attr_source, resolve_cli_path,
+    require_work_tree, status_quote_path, worktree_prefix, write_check_attr_state,
 };
 
 pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
@@ -366,6 +367,9 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
             "check-attr requires --all or at least one attribute".into(),
         ));
     }
+    if requested.iter().any(|attribute| attribute.is_empty()) {
+        return Err(GitError::Command("check-attr: empty attribute name".into()));
+    }
     if read_stdin && !path_args.is_empty() {
         return Err(GitError::Command(
             "check-attr --stdin cannot be combined with path arguments".into(),
@@ -381,11 +385,31 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
-    let worktree_root = repo.worktree_root()?;
-    let prefix = worktree_prefix(cwd, git_dir)?;
-    let source_tree = if let Some(source) = source.as_deref() {
-        let oid = repo.resolve_revision(source)?;
+    let worktree_root = repo
+        .worktree_root()
+        .ok()
+        .map(Path::to_path_buf)
+        .or(sley_worktree::worktree_root_for_git_dir(git_dir)?);
+    let attr_root = worktree_root.as_deref().unwrap_or(git_dir);
+    let prefix = if worktree_root.is_some() {
+        worktree_prefix(cwd, git_dir).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let attr_source = source
+        .or_else(global_attr_source)
+        .or_else(|| std::env::var("GIT_ATTR_SOURCE").ok());
+    let attr_tree_config = repo.config().get("attr", None, "tree").map(str::to_string);
+    let source_tree = if let Some(source) = attr_source.as_deref() {
+        let Some(oid) = resolve_attr_source_or_die(&repo, source, false)? else {
+            unreachable!("explicit attr source resolution either returns an oid or exits");
+        };
         Some(sley_rev::peel_to_tree(repo.objects(), format, &oid)?)
+    } else if let Some(source) = attr_tree_config.as_deref() {
+        match resolve_attr_source_or_die(&repo, source, true)? {
+            Some(oid) => Some(sley_rev::peel_to_tree(repo.objects(), format, &oid)?),
+            None => None,
+        }
     } else {
         None
     };
@@ -396,9 +420,9 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
      -> Result<()> {
         let path_arg = String::from_utf8_lossy(&display_path);
         let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
-        let checks = if cached {
+        let mut checks = if cached {
             sley_worktree::standard_attributes_for_path_from_index(
-                worktree_root,
+                attr_root,
                 git_dir,
                 format,
                 &git_path,
@@ -407,7 +431,8 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
             )?
         } else if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::standard_attributes_for_path_from_tree(
-                worktree_root,
+                attr_root,
+                git_dir,
                 repo.objects(),
                 format,
                 tree_oid,
@@ -416,8 +441,28 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
                 all,
             )?
         } else {
-            sley_worktree::standard_attributes_for_path(worktree_root, &git_path, &requested, all)?
+            sley_worktree::standard_attributes_for_path_in_repo(
+                attr_root,
+                git_dir,
+                &git_path,
+                &requested,
+                all,
+                worktree_root.is_some(),
+                repo.config()
+                    .get_bool("core", None, "ignorecase")
+                    .unwrap_or(false),
+            )?
         };
+        if !all {
+            fill_builtin_object_mode(
+                &mut checks,
+                worktree_root.as_deref(),
+                git_dir,
+                format,
+                &git_path,
+                cached,
+            )?;
+        }
         for check in checks {
             if z {
                 stdout.write_all(&display_path)?;
@@ -427,7 +472,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
                 write_check_attr_state(&mut stdout, check.state.as_ref())?;
                 stdout.write_all(&[0])?;
             } else {
-                stdout.write_all(&display_path)?;
+                stdout.write_all(status_quote_path(&display_path, false).as_bytes())?;
                 stdout.write_all(b": ")?;
                 stdout.write_all(&check.attribute)?;
                 stdout.write_all(b": ")?;
@@ -458,4 +503,115 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn resolve_attr_source_or_die(
+    repo: &RepositoryContext,
+    source: &str,
+    ignore_bad: bool,
+) -> Result<Option<sley_core::ObjectId>> {
+    match repo.resolve_revision(source) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(_) if ignore_bad => Ok(None),
+        Err(_) => {
+            eprintln!("fatal: bad --attr-source or GIT_ATTR_SOURCE");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn fill_builtin_object_mode(
+    checks: &mut [sley_worktree::AttributeCheck],
+    worktree_root: Option<&Path>,
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    path: &[u8],
+    cached: bool,
+) -> Result<()> {
+    for check in checks {
+        if check.attribute != b"builtin_objectmode" {
+            continue;
+        }
+        check.state = builtin_object_mode(worktree_root, git_dir, format, path, cached)?
+            .map(sley_worktree::AttributeState::Value);
+    }
+    Ok(())
+}
+
+fn builtin_object_mode(
+    worktree_root: Option<&Path>,
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    path: &[u8],
+    cached: bool,
+) -> Result<Option<Vec<u8>>> {
+    if cached {
+        return cached_object_mode(git_dir, format, path);
+    }
+    let Some(worktree_root) = worktree_root else {
+        return Ok(None);
+    };
+    let filesystem_path = worktree_root.join(repo_path_to_path_buf(path));
+    let Ok(metadata) = fs::symlink_metadata(&filesystem_path) else {
+        return Ok(None);
+    };
+    let mode = if metadata.file_type().is_symlink() {
+        0o120000
+    } else if metadata.is_dir() {
+        if filesystem_path.join(".git").exists() {
+            0o160000
+        } else {
+            0o040000
+        }
+    } else if is_executable(&metadata) {
+        0o100755
+    } else {
+        0o100644
+    };
+    Ok(Some(format!("{mode:06o}").into_bytes()))
+}
+
+fn cached_object_mode(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    path: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let index = sley_index::Index::parse(&fs::read(index_path)?, format)?;
+    for entry in index.entries {
+        if entry.path.as_bytes() == path && index_entry_stage(&entry) == 0 {
+            if tree_entry_object_type(entry.mode) == sley_object::ObjectType::Blob
+                || tree_entry_object_type(entry.mode) == sley_object::ObjectType::Tree
+                || sley_index::is_gitlink(entry.mode)
+            {
+                return Ok(Some(format!("{:06o}", entry.mode).into_bytes()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
+    (entry.flags >> 12) & 0x3
+}
+
+fn repo_path_to_path_buf(path: &[u8]) -> PathBuf {
+    path.split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
 }
