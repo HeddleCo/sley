@@ -757,6 +757,27 @@ fn rebase_config_bool(ctx: &Ctx, section: &str, key: &str) -> Option<bool> {
     }
 }
 
+fn warn_comment_char_auto(ctx: &Ctx) {
+    if !rebase_config_value(ctx, "core", "commentChar")
+        .is_some_and(|value| value.eq_ignore_ascii_case("auto"))
+    {
+        return;
+    }
+    eprintln!(
+        "warning: Support for 'core.commentChar=auto' is deprecated and will be removed in Git 3.0"
+    );
+    eprintln!("hint: ");
+    eprintln!("hint: To use the default comment string (#) please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config unset core.commentChar");
+    eprintln!("hint: ");
+    eprintln!("hint: To set a custom comment string please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config set core.commentChar <comment string>");
+    eprintln!("hint: ");
+    eprintln!("hint: where '<comment string>' is the string you wish to use.");
+}
+
 fn rebase_merges_config(ctx: &Ctx) -> Option<RebaseMergesMode> {
     let value = rebase_config_value(ctx, "rebase", "rebaseMerges")?;
     match value.to_ascii_lowercase().as_str() {
@@ -2453,6 +2474,8 @@ fn complete_action(
         }
         None => shorthead,
     };
+
+    warn_comment_char_auto(ctx);
 
     write_todo_file(
         ctx,
