@@ -1112,7 +1112,7 @@ fn classify_push_command(
         return Ok(PushRefStatus::UpToDate);
     }
 
-    if receive_denies_current_branch(format, command, config, remote_git_dir)? {
+    if !request.dry_run && receive_denies_current_branch(format, command, config, remote_git_dir)? {
         return Ok(PushRefStatus::RemoteReject(
             "branch is currently checked out".to_string(),
         ));
@@ -1347,7 +1347,10 @@ fn add_revision_push_sources(
     for refspec in refspecs {
         let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
         let src = refspec.split_once(':').map_or(refspec, |(src, _)| src);
-        if src.is_empty() || src == "HEAD" || src.starts_with("refs/") {
+        if src.is_empty() || src == "HEAD" {
+            continue;
+        }
+        if src.starts_with("refs/") && local_refs.iter().any(|reference| reference.name == src) {
             continue;
         }
         if local_refs.iter().any(|reference| {
