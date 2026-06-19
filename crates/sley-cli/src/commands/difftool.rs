@@ -366,12 +366,12 @@ fn run_dir_difftool(
     fs::create_dir_all(&right)?;
     for entry in entries {
         let rel = repo_path_to_path(&entry.path);
-        write_materialized(
+        write_dir_materialized(
             &left.join(&rel),
             diff_entry_old_content(entry, repo.objects())?.as_deref(),
             entry.old_mode,
         )?;
-        write_materialized(
+        write_dir_materialized(
             &right.join(&rel),
             diff_entry_new_content(entry, repo.objects(), Some(repo.worktree_root()?), entry.new_oid.is_none())?
                 .as_deref(),
@@ -410,6 +410,13 @@ fn run_dir_difftool(
         }
     }
     Ok(())
+}
+
+fn write_dir_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>) -> Result<()> {
+    let Some(content) = content else {
+        return Ok(());
+    };
+    write_materialized(path, Some(content), mode)
 }
 
 fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
