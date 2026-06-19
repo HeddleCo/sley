@@ -135,7 +135,8 @@ pub(crate) use commands::remote_cmds::{
     read_repo_config, remote_exists, remote_names, repo_current_branch_name, write_repo_config,
 };
 use commands::tag::tag_stripspace_message;
-pub(crate) use commands::workspace::{cmd_checkout, cmd_status};
+pub(crate) use commands::checkout::cmd_checkout;
+pub(crate) use commands::status::cmd_status;
 pub(crate) use repo_path::RepoPathBuf;
 pub(crate) use repository::RepositoryContext;
 
@@ -240,7 +241,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "index-pack" => commands::pack::cmd_index_pack(&args[1..]),
         "pack-objects" => commands::pack_objects::cmd_pack_objects(&args[1..]),
         "cat-file" => commands::cat_file::cmd_cat_file(&args[1..]),
-        "checkout" => commands::workspace::cmd_checkout(&args[1..]),
+        "checkout" => commands::checkout::cmd_checkout(&args[1..]),
         "check-attr" => commands::attrs::cmd_check_attr(&args[1..]),
         "check-ignore" => commands::attrs::cmd_check_ignore(&args[1..]),
         "check-mailmap" => commands::utility::cmd_check_mailmap(&args[1..]),
@@ -254,7 +255,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "repack" => commands::pack::cmd_repack(&args[1..]),
         "repo" => commands::utility::cmd_repo(&args[1..]),
         "apply" => commands::plumbing::cmd_apply(&args[1..]),
-        "commit" => commands::workspace::cmd_commit(&args[1..]),
+        "commit" => commands::commit::cmd_commit(&args[1..]),
         "commit-graph" => commands::plumbing::cmd_commit_graph(&args[1..]),
         "commit-tree" => commands::plumbing::cmd_commit_tree(&args[1..]),
         "diff" => commands::diff::cmd_diff(&args[1..]),
@@ -310,8 +311,8 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "remote" => commands::remote_cmds::cmd_remote(&args[1..]),
         "replace" => commands::plumbing::cmd_replace(&args[1..]),
         "rerere" => commands::plumbing::cmd_rerere(&args[1..]),
-        "reset" => commands::workspace::cmd_reset(&args[1..]),
-        "restore" => commands::workspace::cmd_restore(&args[1..]),
+        "reset" => commands::reset::cmd_reset(&args[1..]),
+        "restore" => commands::checkout::cmd_restore(&args[1..]),
         "rm" => commands::plumbing::cmd_rm(&args[1..]),
         "show-ref" => commands::refs::cmd_show_ref(&args[1..]),
         "show-index" => commands::utility::cmd_show_index(&args[1..]),
@@ -319,8 +320,8 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "stash" => commands::stash::cmd_stash(&args[1..]),
         "submodule" => commands::submodule::cmd_submodule(&args[1..]),
         "symbolic-ref" => commands::refs::cmd_symbolic_ref(&args[1..]),
-        "status" => commands::workspace::cmd_status(&args[1..]),
-        "switch" => commands::workspace::cmd_switch(&args[1..]),
+        "status" => commands::status::cmd_status(&args[1..]),
+        "switch" => commands::checkout::cmd_switch(&args[1..]),
         "tag" => commands::tag::cmd_tag(&args[1..]),
         "testkit" => commands::utility::cmd_testkit(&args[1..]),
         "unpack-file" => commands::utility::cmd_unpack_file(&args[1..]),
