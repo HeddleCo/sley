@@ -127,6 +127,7 @@ pub struct UpdateIndexOptions {
     pub chmod: Option<bool>,
     pub info_only: bool,
     pub ignore_skip_worktree_entries: bool,
+    pub allow_skip_worktree_entries: bool,
 }
 
 impl UpdateIndexOptions {
@@ -810,6 +811,7 @@ pub fn add_paths_to_index(
             chmod: None,
             info_only: false,
             ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: false,
         },
     )
 }
@@ -940,6 +942,7 @@ pub fn add_paths_to_index_filtered(
             chmod: None,
             info_only: false,
             ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: false,
         },
         config,
     )
@@ -1697,6 +1700,9 @@ fn update_index_paths_impl(
 ) -> Result<UpdateIndexResult> {
     let index_path = repository_index_path(git_dir);
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    if options.allow_skip_worktree_entries {
+        expand_sparse_index(&mut index, &odb, format)?;
+    }
     // For small batches, read only each path's `.gitattributes` chain; a
     // whole-worktree matcher can dominate `add -u` when only a few files are
     // dirty in a huge checkout. Large batches still amortize the full matcher.
@@ -1741,7 +1747,8 @@ fn update_index_paths_impl(
             continue;
         }
         let existing_range = index_entries_path_range(&index.entries, &git_path);
-        if index.entries[existing_range.clone()]
+        if !options.allow_skip_worktree_entries
+            && index.entries[existing_range.clone()]
             .iter()
             .any(index_entry_skip_worktree)
         {
@@ -2002,8 +2009,6 @@ pub fn refresh_index_paths(
         if index_entry_stage(entry) != 0 {
             continue;
         }
-        let selected_for_update =
-            !selected_paths.is_empty() && selected_paths.contains(entry.path.as_bytes());
         if entry.flags & INDEX_FLAG_ASSUME_UNCHANGED != 0 {
             if !really_refresh {
                 continue;
@@ -2067,7 +2072,10 @@ pub fn refresh_index_paths(
                 print_update_index_needs_update(entry.path.as_bytes());
             }
             needs_update = true;
-            if selected_for_update {
+            if really_refresh
+                && !selected_paths.is_empty()
+                && selected_paths.contains(entry.path.as_bytes())
+            {
                 let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
                 if updated_entry != *entry {
                     *entry = updated_entry;

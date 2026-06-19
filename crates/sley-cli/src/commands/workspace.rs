@@ -2913,7 +2913,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if include_without_paths || only_without_paths {
+    if (include_without_paths || only_without_paths)
+        && pathspec_args.is_empty()
+        && pathspec_from_file.is_none()
+    {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));
     }
@@ -3872,6 +3875,7 @@ fn stage_partial_commit_paths(
             chmod: None,
             info_only: false,
             ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: false,
         },
         &config,
         false,
@@ -4517,6 +4521,7 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
             chmod: None,
             info_only: false,
             ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: false,
         },
         &config,
     )?;
@@ -6800,14 +6805,7 @@ fn status_sparse_footer(git_dir: &Path, format: ObjectFormat) -> Result<Option<S
     if !sparse_enabled {
         return Ok(None);
     }
-    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
-    if worktree_config
-        .get_bool("index", None, "sparse")
-        .unwrap_or(false)
-    {
-        return Ok(Some(StatusSparseFooter::SparseIndex));
-    }
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(mut index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
     };
     if index.is_sparse()
@@ -6816,7 +6814,11 @@ fn status_sparse_footer(git_dir: &Path, format: ObjectFormat) -> Result<Option<S
             .iter()
             .any(|entry| entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
     {
-        return Ok(Some(StatusSparseFooter::SparseIndex));
+        if !status_sparse_index_has_materialized_sparse_dir(git_dir, &index)? {
+            return Ok(Some(StatusSparseFooter::SparseIndex));
+        }
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        sley_worktree::expand_sparse_index(&mut index, &db, format)?;
     }
     let total = index
         .entries
@@ -6833,6 +6835,23 @@ fn status_sparse_footer(git_dir: &Path, format: ObjectFormat) -> Result<Option<S
         .count();
     let percent = ((present * 100) / total).min(100) as u8;
     Ok(Some(StatusSparseFooter::Percentage(percent)))
+}
+
+fn status_sparse_index_has_materialized_sparse_dir(git_dir: &Path, index: &Index) -> Result<bool> {
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        let path_bytes = entry.path.as_bytes();
+        let path_bytes = path_bytes.strip_suffix(b"/").unwrap_or(path_bytes);
+        let path = String::from_utf8_lossy(path_bytes);
+        if !path.is_empty() && worktree_root.join(path.as_ref()).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn status_suppress_staged_unstage_hint(git_dir: &Path) -> bool {

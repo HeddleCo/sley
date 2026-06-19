@@ -415,6 +415,7 @@ fn stage_worktree_path(repo: &RepositoryContext, path: &[u8]) -> Result<()> {
             chmod: None,
             info_only: false,
             ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: false,
         },
         &config,
         false,
