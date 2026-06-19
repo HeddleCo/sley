@@ -1,8 +1,10 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use std::fs;
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
@@ -65,6 +67,9 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     if args.first().is_some_and(|arg| arg == "expire") {
         return cmd_reflog_expire(&args[1..]);
     }
+    if args.len() == 1 && args[0] == "--all" {
+        return cmd_reflog_all();
+    }
     let options = parse_reflog_show_options(args)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -124,6 +129,30 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
                     print!("{}", String::from_utf8_lossy(&entry.message));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_reflog_all() -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let abbrev_len = repository_abbrev(&git_dir, format)?;
+    let store = FileRefStore::new(&git_dir, format);
+    let mut names = store.list_reflog_names()?;
+    names.sort();
+    for name in names {
+        let mut entries = store.read_reflog(&name)?;
+        entries.reverse();
+        for (shown, entry) in entries.iter().enumerate() {
+            println!(
+                "{} {}@{{{}}}: {}",
+                format_log_oid(&entry.new_oid, abbrev_len),
+                name,
+                shown,
+                String::from_utf8_lossy(&entry.message)
+            );
         }
     }
     Ok(())
@@ -1434,6 +1463,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             create_reflog,
             batch_updates,
             message,
+            oid_cache: RefCell::new(HashMap::new()),
         };
         return update_ref_stdin(stdin_context, deref, nul);
     }
@@ -1581,6 +1611,7 @@ struct UpdateRefStdinContext<'a> {
     create_reflog: bool,
     message: Vec<u8>,
     batch_updates: bool,
+    oid_cache: RefCell<HashMap<String, ObjectId>>,
 }
 
 struct UpdateRefStdinWriteRequest<'a> {
@@ -1862,9 +1893,7 @@ fn dispatch_ref_stdin_command(
 
             let new_oid = match new {
                 Some(v) => resolve_stdin_oid(
-                    context.git_dir,
-                    context.format,
-                    context.store,
+                    context,
                     "update",
                     &raw_name,
                     "<new-oid>",
@@ -1876,9 +1905,7 @@ fn dispatch_ref_stdin_command(
                 OldOid::Absent => None,
                 OldOid::Zero => Some(zero_oid(context.format)?),
                 OldOid::Value(v) => Some(resolve_stdin_oid(
-                    context.git_dir,
-                    context.format,
-                    context.store,
+                    context,
                     "update",
                     &raw_name,
                     "<old-oid>",
@@ -1948,9 +1975,7 @@ fn dispatch_ref_stdin_command(
 
             let new_oid = match new {
                 Some(v) => resolve_stdin_oid(
-                    context.git_dir,
-                    context.format,
-                    context.store,
+                    context,
                     "create",
                     &raw_name,
                     "<new-oid>",
@@ -2025,9 +2050,7 @@ fn dispatch_ref_stdin_command(
                 OldOid::Zero => return update_ref_stdin_delete_zero(&raw_name),
                 OldOid::Value(v) => {
                     let oid = resolve_stdin_oid(
-                        context.git_dir,
-                        context.format,
-                        context.store,
+                        context,
                         "delete",
                         &raw_name,
                         "<old-oid>",
@@ -2088,9 +2111,7 @@ fn dispatch_ref_stdin_command(
 
             let expected = match old {
                 Some(v) => resolve_stdin_oid(
-                    context.git_dir,
-                    context.format,
-                    context.store,
+                    context,
                     "verify",
                     &raw_name,
                     "<old-oid>",
@@ -3567,21 +3588,28 @@ fn parse_update_ref_expected(
 /// `parse_next_oid` produces these, distinct from the generic resolver's
 /// message.
 fn resolve_stdin_oid(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
+    context: &UpdateRefStdinContext<'_>,
     command: &str,
     refname: &str,
     field: &str,
     value: &str,
 ) -> Result<ObjectId> {
-    match parse_update_ref_oidish(git_dir, format, store, value) {
+    if let Some(oid) = context.oid_cache.borrow().get(value).copied() {
+        return Ok(oid);
+    }
+    match parse_update_ref_oidish(context.git_dir, context.format, context.store, value) {
         Some(oid) => Ok(oid),
         None => {
             eprintln!("fatal: {command} {refname}: invalid {field}: {value}");
             Err(GitError::Exit(128))
         }
     }
+    .inspect(|oid| {
+        context
+            .oid_cache
+            .borrow_mut()
+            .insert(value.to_string(), *oid);
+    })
 }
 
 fn check_update_ref_expected(
@@ -4212,6 +4240,7 @@ pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
     match subcommand {
         "list" => commands::for_each_ref::for_each_ref_core(&args[1..], "git refs list"),
         "exists" => cmd_refs_exists(&args[1..]),
+        "migrate" => cmd_refs_migrate(&args[1..]),
         "optimize" => commands::pack::cmd_pack_refs(&args[1..]),
         "-h" | "--help" => {
             print_refs_usage();
@@ -4223,6 +4252,332 @@ pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
             Err(GitError::Exit(129))
         }
     }
+}
+
+fn cmd_refs_migrate(args: &[String]) -> Result<()> {
+    let mut target_format = None::<RefStorageFormat>;
+    let mut dry_run = false;
+    let mut include_reflogs = true;
+    let mut positionals = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "--reflog" => include_reflogs = true,
+            "--no-reflog" => include_reflogs = false,
+            "--ref-format" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("usage: missing --ref-format=<format>");
+                    return Err(GitError::Exit(129));
+                };
+                target_format = Some(parse_refs_migrate_ref_format(value)?);
+            }
+            value if value.starts_with("--ref-format=") => {
+                let value = value.strip_prefix("--ref-format=").ok_or_else(|| {
+                    GitError::Command("--ref-format requires a value".into())
+                })?;
+                target_format = Some(parse_refs_migrate_ref_format(value)?);
+            }
+            "--" => {
+                positionals.extend(iter.cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                print_refs_usage();
+                return Err(GitError::Exit(129));
+            }
+            value => positionals.push(value.to_string()),
+        }
+    }
+
+    if !positionals.is_empty() {
+        eprintln!("usage: too many arguments");
+        return Err(GitError::Exit(129));
+    }
+    let Some(target_format) = target_format else {
+        eprintln!("usage: missing --ref-format=<format>");
+        return Err(GitError::Exit(129));
+    };
+
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&git_dir)?;
+    let current_format = refs_migrate_current_format(&common_git_dir)?;
+    if current_format == target_format {
+        eprintln!(
+            "error: repository already uses '{}' format",
+            current_format.name()
+        );
+        return Err(GitError::Exit(1));
+    }
+    if refs_migrate_has_linked_worktrees(&common_git_dir) {
+        eprintln!("error: migrating repositories with worktrees is not supported yet");
+        return Err(GitError::Exit(1));
+    }
+
+    let source = FileRefStore::new(&git_dir, format);
+    let refs = source.list_all_refs()?;
+    let reflogs = if include_reflogs {
+        let mut names = source.list_reflog_names()?;
+        for reference in &refs {
+            if !names.iter().any(|name| name == &reference.name) {
+                names.push(reference.name.clone());
+            }
+        }
+        names.sort();
+        names.dedup();
+        let mut reflogs = Vec::new();
+        for name in names {
+            let entries = source.read_reflog(&name)?;
+            if !entries.is_empty() {
+                reflogs.push((name, entries));
+            }
+        }
+        reflogs
+    } else {
+        Vec::new()
+    };
+
+    let migration_dir = create_ref_migration_dir(&common_git_dir)?;
+    write_migrated_ref_store(&migration_dir, format, target_format, &refs, &reflogs)?;
+    if dry_run {
+        println!(
+            "Finished dry-run migration of refs, the result can be found at '{}'",
+            refs_migrate_display_path(&git_dir, &common_git_dir, &migration_dir)
+        );
+        return Ok(());
+    }
+
+    install_migrated_ref_store(
+        &git_dir,
+        &common_git_dir,
+        &migration_dir,
+        target_format,
+        &refs,
+    )?;
+    update_ref_storage_config(&common_git_dir, target_format)?;
+    let _ = fs::remove_dir_all(&migration_dir);
+    Ok(())
+}
+
+fn parse_refs_migrate_ref_format(value: &str) -> Result<RefStorageFormat> {
+    match RefStorageFormat::parse(value) {
+        Ok(format) => Ok(format),
+        Err(_) => {
+            eprintln!("error: unknown ref storage format '{value}'");
+            Err(GitError::Exit(1))
+        }
+    }
+}
+
+fn refs_migrate_current_format(common_git_dir: &Path) -> Result<RefStorageFormat> {
+    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+        return Ok(RefStorageFormat::Files);
+    };
+    Ok(match config.get("extensions", None, "refStorage") {
+        Some("reftable") => RefStorageFormat::Reftable,
+        Some(value) if value.starts_with("reftable://") => RefStorageFormat::Reftable,
+        _ => RefStorageFormat::Files,
+    })
+}
+
+fn refs_migrate_has_linked_worktrees(common_git_dir: &Path) -> bool {
+    fs::read_dir(common_git_dir.join("worktrees"))
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false)
+}
+
+fn create_ref_migration_dir(common_git_dir: &Path) -> Result<PathBuf> {
+    for attempt in 0..1000u32 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = common_git_dir.join(format!(
+            "ref_migration.{:x}{:x}",
+            std::process::id(),
+            nanos + u128::from(attempt)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(GitError::Io(
+        "unable to create temporary ref migration directory".into(),
+    ))
+}
+
+fn write_migrated_ref_store(
+    migration_dir: &Path,
+    format: ObjectFormat,
+    target_format: RefStorageFormat,
+    refs: &[Ref],
+    reflogs: &[(String, Vec<ReflogEntry>)],
+) -> Result<()> {
+    if target_format == RefStorageFormat::Reftable {
+        write_ref_migration_config(migration_dir, target_format)?;
+    } else {
+        fs::write(
+            migration_dir.join("HEAD"),
+            b"ref: refs/heads/__sley_migration_placeholder__\n",
+        )?;
+    }
+    let store = FileRefStore::new(migration_dir, format);
+    store.import_snapshot(refs, reflogs, target_format == RefStorageFormat::Files)?;
+    Ok(())
+}
+
+fn write_ref_migration_config(git_dir: &Path, target_format: RefStorageFormat) -> Result<()> {
+    let mut config = GitConfig::default();
+    refs_migrate_set_config_value(&mut config, "core", "repositoryformatversion", "1");
+    if target_format == RefStorageFormat::Reftable {
+        refs_migrate_set_config_value(&mut config, "extensions", "refStorage", "reftable");
+    }
+    fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
+    Ok(())
+}
+
+fn install_migrated_ref_store(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    migration_dir: &Path,
+    target_format: RefStorageFormat,
+    refs: &[Ref],
+) -> Result<()> {
+    match target_format {
+        RefStorageFormat::Files => {
+            remove_path_if_exists(&common_git_dir.join("reftable"))?;
+            remove_path_if_exists(&common_git_dir.join("refs"))?;
+            remove_path_if_exists(&common_git_dir.join("logs"))?;
+            remove_path_if_exists(&common_git_dir.join("packed-refs"))?;
+            move_path_if_exists(&migration_dir.join("HEAD"), &git_dir.join("HEAD"))?;
+            for reference in refs {
+                if !reference.name.starts_with("refs/") && reference.name != "HEAD" {
+                    move_path_if_exists(
+                        &migration_dir.join(&reference.name),
+                        &git_dir.join(&reference.name),
+                    )?;
+                }
+            }
+            move_path_if_exists(&migration_dir.join("refs"), &common_git_dir.join("refs"))?;
+            fs::create_dir_all(common_git_dir.join("refs").join("heads"))?;
+            fs::create_dir_all(common_git_dir.join("refs").join("tags"))?;
+            move_path_if_exists(&migration_dir.join("logs"), &common_git_dir.join("logs"))?;
+            move_path_if_exists(
+                &migration_dir.join("packed-refs"),
+                &common_git_dir.join("packed-refs"),
+            )?;
+        }
+        RefStorageFormat::Reftable => {
+            remove_path_if_exists(&common_git_dir.join("reftable"))?;
+            remove_path_if_exists(&common_git_dir.join("refs"))?;
+            remove_path_if_exists(&common_git_dir.join("logs"))?;
+            remove_path_if_exists(&common_git_dir.join("packed-refs"))?;
+            for reference in refs {
+                if !reference.name.starts_with("refs/")
+                    && reference.name != "HEAD"
+                    && reference.name != "FETCH_HEAD"
+                    && reference.name != "MERGE_HEAD"
+                {
+                    remove_path_if_exists(&git_dir.join(&reference.name))?;
+                }
+            }
+            move_path_if_exists(
+                &migration_dir.join("reftable"),
+                &common_git_dir.join("reftable"),
+            )?;
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")?;
+            fs::create_dir_all(common_git_dir.join("refs"))?;
+            fs::write(
+                common_git_dir.join("refs").join("heads"),
+                b"this repository uses the reftable format\n",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+fn move_path_if_exists(from: &Path, to: &Path) -> Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_exists(to)?;
+    fs::rename(from, to)?;
+    Ok(())
+}
+
+fn update_ref_storage_config(common_git_dir: &Path, target_format: RefStorageFormat) -> Result<()> {
+    let config_path = common_git_dir.join("config");
+    let mut config = GitConfig::read(&config_path).unwrap_or_default();
+    refs_migrate_set_config_value(&mut config, "core", "repositoryformatversion", "1");
+    refs_migrate_set_config_value(
+        &mut config,
+        "extensions",
+        "refStorage",
+        target_format.name(),
+    );
+    fs::write(config_path, config.to_canonical_bytes())?;
+    Ok(())
+}
+
+fn refs_migrate_set_config_value(
+    config: &mut GitConfig,
+    section_name: &str,
+    key_name: &str,
+    value: &str,
+) {
+    let section_idx = config
+        .sections
+        .iter()
+        .rposition(|section| section.name.eq_ignore_ascii_case(section_name))
+        .unwrap_or_else(|| {
+            config
+                .sections
+                .push(ConfigSection::new(section_name.to_string(), None, Vec::new()));
+            config.sections.len() - 1
+        });
+    let section = &mut config.sections[section_idx];
+    if let Some(entry) = section
+        .entries
+        .iter_mut()
+        .find(|entry| entry.key.eq_ignore_ascii_case(key_name))
+    {
+        entry.key = key_name.to_string();
+        entry.value = Some(value.to_string());
+        return;
+    }
+    section
+        .entries
+        .push(ConfigEntry::new(key_name.to_string(), Some(value.to_string())));
+}
+
+fn refs_migrate_display_path(git_dir: &Path, common_git_dir: &Path, path: &Path) -> String {
+    if let Ok(worktree) = worktree_root_for_git_dir(git_dir) {
+        let dot_git = worktree.join(".git");
+        if paths_refer_to_same_dir(common_git_dir, &dot_git)
+            && let Ok(relative) = path.strip_prefix(common_git_dir)
+        {
+            return Path::new(".git").join(relative).display().to_string();
+        }
+    }
+    path.display().to_string()
 }
 
 /// `git refs exists <ref>` — exit 0 if the raw ref exists, 2 if it does not
