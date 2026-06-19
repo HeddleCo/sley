@@ -18,6 +18,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
     // git validates branch.autosetuprebase up front, so even a plain listing
     // fails on a malformed value (t3200 #145/#146).
     validate_autosetuprebase(&read_repo_config(git_dir)?)?;
+    if let Some(option) = args
+        .iter()
+        .find_map(|arg| matches!(arg.as_str(), "--no-remotes" | "--no-all").then_some(arg))
+    {
+        eprintln!("error: unknown option `{}`", option.trim_start_matches("--"));
+        return Err(GitError::Exit(129));
+    }
+    if let Some(format_options) = parse_branch_format_list_options(git_dir, format, args)? {
+        return run_branch_format_list_options(git_dir, format, store, format_options);
+    }
     if let Some(show_current) = parse_branch_show_current_options(args)? {
         if show_current {
             if let Some(branch) = store.current_branch()? {
@@ -72,37 +82,37 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag] if flag == "-a" || flag == "--all" => print_branch_list(store, BranchListMode::All),
         [flag] if flag == "--color" || flag == "--color=always" => {
-            print_branch_list_colored(store, BranchListMode::Local)
+            print_branch_list_colored(git_dir, store, BranchListMode::Local)
         }
         [color, no_color] if branch_color_always_flag(color) && no_color == "--no-color" => {
             print_branch_list(store, BranchListMode::Local)
         }
         [no_color, color] if no_color == "--no-color" && branch_color_always_flag(color) => {
-            print_branch_list_colored(store, BranchListMode::Local)
+            print_branch_list_colored(git_dir, store, BranchListMode::Local)
         }
         [flag, color]
             if (flag == "-r" || flag == "--remotes")
                 && (color == "--color" || color == "--color=always") =>
         {
-            print_branch_list_colored(store, BranchListMode::Remote)
+            print_branch_list_colored(git_dir, store, BranchListMode::Remote)
         }
         [color, flag]
             if (flag == "-r" || flag == "--remotes")
                 && (color == "--color" || color == "--color=always") =>
         {
-            print_branch_list_colored(store, BranchListMode::Remote)
+            print_branch_list_colored(git_dir, store, BranchListMode::Remote)
         }
         [flag, color]
             if (flag == "-a" || flag == "--all")
                 && (color == "--color" || color == "--color=always") =>
         {
-            print_branch_list_colored(store, BranchListMode::All)
+            print_branch_list_colored(git_dir, store, BranchListMode::All)
         }
         [color, flag]
             if (flag == "-a" || flag == "--all")
                 && (color == "--color" || color == "--color=always") =>
         {
-            print_branch_list_colored(store, BranchListMode::All)
+            print_branch_list_colored(git_dir, store, BranchListMode::All)
         }
         [flag, color, no_color]
             if branch_remote_or_all_mode(flag).is_some()
@@ -118,7 +128,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_color_always_flag(color) =>
         {
             let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list_colored(store, mode)
+            print_branch_list_colored(git_dir, store, mode)
         }
         [flag, display_flag]
             if branch_remote_or_all_mode(flag).is_some()
@@ -763,10 +773,10 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             print_branch_list_points_at(store, BranchListMode::Local, &oid)
         }
         [flag, color] if flag == "--list" && (color == "--color" || color == "--color=always") => {
-            print_branch_list_colored(store, BranchListMode::Local)
+            print_branch_list_colored(git_dir, store, BranchListMode::Local)
         }
         [color, flag] if flag == "--list" && (color == "--color" || color == "--color=always") => {
-            print_branch_list_colored(store, BranchListMode::Local)
+            print_branch_list_colored(git_dir, store, BranchListMode::Local)
         }
         [list, color, no_color]
             if list == "--list" && branch_color_always_flag(color) && no_color == "--no-color" =>
@@ -786,7 +796,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         [list, no_color, color]
             if list == "--list" && no_color == "--no-color" && branch_color_always_flag(color) =>
         {
-            print_branch_list_colored(store, BranchListMode::Local)
+            print_branch_list_colored(git_dir, store, BranchListMode::Local)
         }
         [list, no_color, color, patterns @ ..]
             if list == "--list" && no_color == "--no-color" && branch_color_always_flag(color) =>
@@ -5981,6 +5991,7 @@ struct BranchVerboseListOptions {
     patterns: Vec<String>,
     ignore_case: bool,
     verbosity: usize,
+    abbrev: Option<Option<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6008,6 +6019,17 @@ enum BranchSort {
     Date(ForEachRefDateSortField, bool),
     Upstream(bool),
     Push(bool),
+    AheadBehind(ObjectId, bool),
+}
+
+struct BranchFormatListOptions {
+    mode: BranchListMode,
+    patterns: Vec<String>,
+    ignore_case: bool,
+    color: bool,
+    sort: Option<BranchSort>,
+    format_spec: String,
+    omit_empty: bool,
 }
 
 const BRANCH_USAGE_LINES: [&str; 8] = [
@@ -6231,7 +6253,7 @@ fn parse_branch_general_list_options(
                 let Some(value) = args.get(idx) else {
                     return Err(GitError::Command("--sort requires a value".into()));
                 };
-                sort = Some(branch_sort_from_key(value)?);
+                sort = Some(branch_sort_from_key(git_dir, repository_object_format(git_dir)?, value)?);
                 explicit_no_sort = false;
                 saw_list_control = true;
             }
@@ -6239,7 +6261,7 @@ fn parse_branch_general_list_options(
                 let value = value
                     .strip_prefix("--sort=")
                     .expect("prefix checked by match guard");
-                sort = Some(branch_sort_from_key(value)?);
+                sort = Some(branch_sort_from_key(git_dir, repository_object_format(git_dir)?, value)?);
                 explicit_no_sort = false;
                 saw_list_control = true;
             }
@@ -6266,7 +6288,7 @@ fn parse_branch_general_list_options(
         && !explicit_no_sort
         && let Some(config_sort) = config.get("branch", None, "sort")
     {
-        sort = Some(branch_sort_from_key(config_sort)?);
+        sort = Some(branch_sort_from_key(git_dir, repository_object_format(git_dir)?, config_sort)?);
         saw_list_control = true;
     }
     if column.is_none()
@@ -6289,7 +6311,86 @@ fn parse_branch_general_list_options(
     }))
 }
 
-fn branch_sort_from_key(key: &str) -> Result<BranchSort> {
+fn parse_branch_format_list_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    args: &[String],
+) -> Result<Option<BranchFormatListOptions>> {
+    if !args
+        .iter()
+        .any(|arg| arg == "--format" || arg.starts_with("--format="))
+    {
+        return Ok(None);
+    }
+
+    let mut mode = BranchListMode::Local;
+    let mut patterns = Vec::new();
+    let mut ignore_case = false;
+    let mut color = false;
+    let mut sort = None;
+    let mut format_spec = None;
+    let mut omit_empty = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-l" | "--list" => {}
+            "-r" | "--remotes" => mode = BranchListMode::Remote,
+            "-a" | "--all" => mode = BranchListMode::All,
+            "-i" | "--ignore-case" => ignore_case = true,
+            "--no-ignore-case" => ignore_case = false,
+            "--color" | "--color=always" => color = true,
+            "--no-color" | "--color=never" | "--color=auto" => color = false,
+            "--omit-empty" => omit_empty = true,
+            "--no-omit-empty" => omit_empty = false,
+            "--no-format" => format_spec = None,
+            "--format" => {
+                idx += 1;
+                let Some(value) = args.get(idx) else {
+                    return Err(GitError::Command("branch --format requires a value".into()));
+                };
+                format_spec = Some(value.to_string());
+            }
+            value if value.starts_with("--format=") => {
+                format_spec = Some(
+                    value
+                        .strip_prefix("--format=")
+                        .expect("prefix checked by match guard")
+                        .to_string(),
+                );
+            }
+            "--sort" => {
+                idx += 1;
+                let Some(value) = args.get(idx) else {
+                    return Err(GitError::Command("--sort requires a value".into()));
+                };
+                sort = Some(branch_sort_from_key(git_dir, format, value)?);
+            }
+            value if value.starts_with("--sort=") => {
+                let value = value
+                    .strip_prefix("--sort=")
+                    .expect("prefix checked by match guard");
+                sort = Some(branch_sort_from_key(git_dir, format, value)?);
+            }
+            "--no-sort" => sort = None,
+            value if value.starts_with('-') => return Ok(None),
+            value => patterns.push(value.to_string()),
+        }
+        idx += 1;
+    }
+
+    Ok(format_spec.map(|format_spec| BranchFormatListOptions {
+        mode,
+        patterns,
+        ignore_case,
+        color,
+        sort,
+        format_spec,
+        omit_empty,
+    }))
+}
+
+fn branch_sort_from_key(git_dir: &Path, format: ObjectFormat, key: &str) -> Result<BranchSort> {
+    let key = key.strip_prefix("--sort=").unwrap_or(key);
     match key {
         "refname" => Ok(BranchSort::Refname(false)),
         "-refname" => Ok(BranchSort::Refname(true)),
@@ -6316,6 +6417,12 @@ fn branch_sort_from_key(key: &str) -> Result<BranchSort> {
         value if branch_push_sort_value(value).is_some() => Ok(BranchSort::Push(
             branch_push_sort_value(value).expect("checked branch push sort"),
         )),
+        value if branch_ahead_behind_sort_value(value).is_some() => {
+            let (rev, descending) =
+                branch_ahead_behind_sort_value(value).expect("checked ahead-behind sort");
+            let oid = resolve_revision(git_dir, format, rev)?;
+            Ok(BranchSort::AheadBehind(oid, descending))
+        }
         _ => {
             eprintln!("fatal: unknown field name: {key}");
             Err(GitError::Exit(128))
@@ -6363,6 +6470,7 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
     let mut explicit_list = false;
     let mut mode = BranchListMode::Local;
     let mut ignore_case = false;
+    let mut abbrev = None;
     let mut saw_verbose = false;
     let mut saw_column = false;
     let specs = branch_verbose_list_option_specs();
@@ -6391,6 +6499,22 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
             _ => {}
         }
     }
+    for arg in args {
+        match arg.as_str() {
+            "--abbrev" => abbrev = None,
+            "--no-abbrev" => abbrev = Some(None),
+            value if value.starts_with("--abbrev=") => {
+                let value = value
+                    .strip_prefix("--abbrev=")
+                    .expect("prefix checked by match guard");
+                let width = value
+                    .parse::<usize>()
+                    .map_err(|_| GitError::Command(format!("invalid abbrev length {value}")))?;
+                abbrev = if width == 0 { Some(None) } else { Some(Some(width)) };
+            }
+            _ => {}
+        }
+    }
     if !saw_verbose {
         return Ok(None);
     }
@@ -6409,6 +6533,7 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
         patterns: branch_positionals(&parsed),
         ignore_case,
         verbosity,
+        abbrev,
     }))
 }
 
@@ -6557,14 +6682,59 @@ fn run_branch_move_options(
     match options.kind {
         BranchMoveKind::Rename => {
             let committer = branch_reflog_committer_identity(store, &old_branch)?;
+            let head_was_old = store.current_branch_ref()?.as_deref() == Some(old_ref.as_str());
+            let old_oid = match store.read_ref(&old_ref)? {
+                Some(RefTarget::Direct(oid)) => oid,
+                _ => zero_oid(repository_object_format(git_dir)?)?,
+            };
+            let head_reflog = ReflogEntry {
+                old_oid,
+                new_oid: old_oid,
+                committer: committer.clone(),
+                message: format!("Branch: renamed {old_ref} to {new_ref}").into_bytes(),
+            };
             store.move_branch(&old_branch, &new_branch, options.force, committer)?;
+            let linked_update = update_linked_worktree_heads(git_dir, &old_ref, &new_ref);
+            if head_was_old {
+                store.append_reflog("HEAD", &head_reflog)?;
+            }
             rename_branch_config(git_dir, &old_branch, &new_branch)?;
+            linked_update?;
         }
         BranchMoveKind::Copy => {
             let committer = branch_reflog_committer_identity(store, &old_branch)?;
             store.copy_branch(&old_branch, &new_branch, options.force, committer)?;
             copy_branch_config(git_dir, &old_branch, &new_branch)?;
         }
+    }
+    Ok(())
+}
+
+fn update_linked_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) -> Result<()> {
+    let worktrees_dir = common_git_dir_for_git_dir(git_dir)?.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees_dir) else {
+        return Ok(());
+    };
+    let mut failed = false;
+    for entry in entries {
+        let entry = entry?;
+        let admin_dir = entry.path();
+        let head_path = admin_dir.join("HEAD");
+        let Ok(head) = fs::read_to_string(&head_path) else {
+            continue;
+        };
+        if head.trim().strip_prefix("ref: ") != Some(old_ref) {
+            continue;
+        }
+        if admin_dir.join("HEAD.lock").exists() {
+            failed = true;
+            continue;
+        }
+        fs::write(head_path, format!("ref: {new_ref}\n"))?;
+    }
+    if failed {
+        eprintln!("error: could not update one or more linked worktree HEADs");
+        return Err(GitError::Exit(1));
     }
     Ok(())
 }
@@ -7650,7 +7820,9 @@ fn validate_branch_creation_name(branch: &str) -> Result<String> {
         print_branch_ref_syntax_hint();
         return Err(GitError::Exit(128));
     }
-    match branch_ref_name(branch) {
+    match branch_ref_name(branch)
+        .and_then(|refname| sley_refs::check_refname_format(&refname, false).map(|()| refname))
+    {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
             eprintln!("fatal: '{branch}' is not a valid branch name");
@@ -7899,13 +8071,20 @@ fn delete_merged_branches(
         return Err(GitError::Exit(128));
     }
 
-    let head = resolve_revision(git_dir, format, "HEAD")?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let reachable =
-        sley_rev::walk_commits(&db, format, [sley_rev::peel_to_commit(&db, format, &head)?])?
-            .into_iter()
-            .map(|record| record.oid)
-            .collect::<HashSet<_>>();
+    let config = read_repo_config(git_dir)?;
+    let head_reachable = resolve_revision(git_dir, format, "HEAD")
+        .ok()
+        .and_then(|head| sley_rev::peel_to_commit(&db, format, &head).ok())
+        .map(|head| {
+            sley_rev::walk_commits(&db, format, [head]).map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| record.oid)
+                    .collect::<HashSet<_>>()
+            })
+        })
+        .transpose()?;
 
     let mut failed = false;
     for branch in branches {
@@ -7938,7 +8117,15 @@ fn delete_merged_branches(
             failed = true;
             continue;
         };
-        if !reachable.contains(&tip) {
+        let reachable = branch_delete_reachable_base(
+            store,
+            &db,
+            format,
+            &config,
+            &name,
+            head_reachable.as_ref(),
+        )?;
+        if !reachable.is_some_and(|reachable| reachable.contains(&tip)) {
             eprintln!("error: the branch '{branch}' is not fully merged");
             eprintln!("hint: If you are sure you want to delete it, run 'git branch -D {branch}'");
             eprintln!(
@@ -7961,6 +8148,34 @@ fn delete_merged_branches(
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn branch_delete_reachable_base<'a>(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    config: &GitConfig,
+    refname: &str,
+    head_reachable: Option<&'a HashSet<ObjectId>>,
+) -> Result<Option<Cow<'a, HashSet<ObjectId>>>> {
+    if let Some(upstream) = for_each_ref_upstream(config, refname)
+        && let Some(target) = store.read_ref(&upstream.refname)?
+    {
+        let upstream_ref = sley_refs::Ref {
+            name: upstream.refname,
+            target,
+        };
+        if let Some((oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)?
+            && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+        {
+            let reachable = sley_rev::walk_commits(db, format, [commit])?
+                .into_iter()
+                .map(|record| record.oid)
+                .collect::<HashSet<_>>();
+            return Ok(Some(Cow::Owned(reachable)));
+        }
+    }
+    Ok(head_reachable.map(Cow::Borrowed))
 }
 
 #[derive(Clone, Copy)]
@@ -8077,22 +8292,50 @@ fn run_branch_general_list_options(
     store: &FileRefStore,
     options: BranchGeneralListOptions,
 ) -> Result<()> {
-    let refs = branch_sorted_refs(git_dir, format, store, options.sort)?;
+    let mut refs = branch_sorted_refs(git_dir, format, store, options.sort)?;
+    if options.ignore_case {
+        match options.sort.unwrap_or(BranchSort::Refname(false)) {
+            BranchSort::Refname(descending) => {
+                refs.sort_by(|left, right| {
+                    let left_key = left.name.to_ascii_lowercase();
+                    let right_key = right.name.to_ascii_lowercase();
+                    left_key.cmp(&right_key).then_with(|| left.name.cmp(&right.name))
+                });
+                if descending {
+                    refs.reverse();
+                }
+            }
+            _ => {}
+        }
+    }
     if let Some(style) = options.column {
+        let show_detached = options.patterns.is_empty();
         let rows = collect_branch_rows(
             refs,
             store.current_branch_ref()?.as_deref(),
             options.mode,
             false,
+            show_detached,
             |_, name| branch_list_patterns_match(&options.patterns, name, options.ignore_case),
         )?;
         return print_branch_columns(&rows, style);
     }
+    let show_detached = options.patterns.is_empty();
+    let worktree_paths = if options.color {
+        Some(for_each_ref_worktree_paths(
+            git_dir,
+            store.current_branch_ref()?.as_deref(),
+        )?)
+    } else {
+        None
+    };
     print_branch_refs(
         refs,
         store.current_branch_ref()?.as_deref(),
         options.mode,
         options.color,
+        show_detached,
+        worktree_paths.as_ref(),
         |_, name| branch_list_patterns_match(&options.patterns, name, options.ignore_case),
     )
 }
@@ -8216,11 +8459,60 @@ fn branch_sorted_refs(
             });
             Ok(refs)
         }
+        BranchSort::AheadBehind(target, descending) => {
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            let mut keyed = refs
+                .into_iter()
+                .map(|reference| {
+                    let key = branch_ref_ahead_behind_sort_key(store, &db, format, &reference, &target)?;
+                    Ok::<_, GitError>((reference, key))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            keyed.sort_by(|(left, left_key), (right, right_key)| {
+                let ahead_order = if descending {
+                    right_key.cmp(left_key)
+                } else {
+                    left_key.cmp(right_key)
+                };
+                ahead_order.then_with(|| left.name.cmp(&right.name))
+            });
+            Ok(keyed.into_iter().map(|(reference, _)| reference).collect())
+        }
     }
 }
 
-fn print_branch_list_colored(store: &FileRefStore, mode: BranchListMode) -> Result<()> {
-    print_branch_list_filtered_with_color(store, mode, true, |_, _| true)
+fn branch_ref_ahead_behind_sort_key(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    reference: &sley_refs::Ref,
+    target: &ObjectId,
+) -> Result<(usize, usize)> {
+    let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
+        return Ok((0, 0));
+    };
+    let Some(track) = for_each_ref_ahead_behind(db, format, &oid, target)? else {
+        return Ok((0, 0));
+    };
+    Ok((track.ahead, track.behind))
+}
+
+fn print_branch_list_colored(
+    git_dir: &Path,
+    store: &FileRefStore,
+    mode: BranchListMode,
+) -> Result<()> {
+    let current = store.current_branch_ref()?;
+    let worktree_paths = for_each_ref_worktree_paths(git_dir, current.as_deref())?;
+    print_branch_refs(
+        store.list_refs()?,
+        current.as_deref(),
+        mode,
+        true,
+        true,
+        Some(&worktree_paths),
+        |_, _| true,
+    )
 }
 
 fn print_branch_list_points_at(
@@ -8237,7 +8529,7 @@ fn print_branch_list_points_at_matching(
     oid: &ObjectId,
     patterns: &[String],
 ) -> Result<()> {
-    print_branch_list_filtered(store, mode, |reference, name| {
+    print_branch_list_filtered_detached(store, mode, false, |reference, name| {
         matches!(&reference.target, RefTarget::Direct(target) if target == oid)
             && branch_list_patterns_match(patterns, name, false)
     })
@@ -8713,8 +9005,8 @@ fn branch_objectname_sort_value(value: &str) -> Option<bool> {
 
 fn branch_objecttype_sort_value(value: &str) -> Option<bool> {
     match value {
-        "--sort=objecttype" | "objecttype" => Some(false),
-        "--sort=-objecttype" | "-objecttype" => Some(true),
+        "--sort=objecttype" | "--sort=type" | "objecttype" | "type" => Some(false),
+        "--sort=-objecttype" | "--sort=-type" | "-objecttype" | "-type" => Some(true),
         _ => None,
     }
 }
@@ -8757,6 +9049,13 @@ fn branch_push_sort_value(value: &str) -> Option<bool> {
         "--sort=-push" | "-push" => Some(true),
         _ => None,
     }
+}
+
+fn branch_ahead_behind_sort_value(value: &str) -> Option<(&str, bool)> {
+    value
+        .strip_prefix("ahead-behind:")
+        .map(|rev| (rev, false))
+        .or_else(|| value.strip_prefix("-ahead-behind:").map(|rev| (rev, true)))
 }
 
 fn branch_non_refname_sort_value(value: &str) -> bool {
@@ -8822,6 +9121,46 @@ fn print_branch_list_format_omit_empty(
     store: &FileRefStore,
     options: BranchFormatPrintOptions<'_>,
 ) -> Result<()> {
+    print_branch_list_format_omit_empty_with_sort_color(
+        git_dir,
+        format,
+        store,
+        options,
+        None,
+        false,
+    )
+}
+
+fn run_branch_format_list_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    options: BranchFormatListOptions,
+) -> Result<()> {
+    print_branch_list_format_omit_empty_with_sort_color(
+        git_dir,
+        format,
+        store,
+        BranchFormatPrintOptions {
+            mode: options.mode,
+            patterns: &options.patterns,
+            ignore_case: options.ignore_case,
+            format_spec: &options.format_spec,
+            omit_empty: options.omit_empty,
+        },
+        options.sort,
+        options.color,
+    )
+}
+
+fn print_branch_list_format_omit_empty_with_sort_color(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    options: BranchFormatPrintOptions<'_>,
+    sort: Option<BranchSort>,
+    color: bool,
+) -> Result<()> {
     let format_spec = ForEachRefFormat::parse(options.format_spec)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir)?;
@@ -8830,7 +9169,7 @@ fn print_branch_list_format_omit_empty(
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
     let deltabase = zero_oid(format)?;
     let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
-    let all_refs = store.list_refs()?;
+    let all_refs = branch_sorted_refs(git_dir, format, store, sort)?;
     let ref_names: std::collections::HashSet<String> = all_refs
         .iter()
         .map(|reference| reference.name.clone())
@@ -8839,6 +9178,41 @@ fn print_branch_list_format_omit_empty(
         .get_bool("core", None, "warnambiguousrefs")
         .unwrap_or(true);
     let mut stdout = io::stdout().lock();
+    if matches!(options.mode, BranchListMode::Local | BranchListMode::All)
+        && head_ref.is_none()
+        && options.patterns.is_empty()
+        && let Some(refname) = detached_head_branch_line()
+        && let Some((oid, _)) = resolve_for_each_ref_target(
+            store,
+            &sley_refs::Ref {
+                name: "HEAD".into(),
+                target: store.read_ref("HEAD")?.unwrap_or(RefTarget::Direct(zero_oid(format)?)),
+            },
+        )?
+    {
+        print_branch_format_reference(
+            &mut stdout,
+            &format_spec,
+            git_dir,
+            format,
+            store,
+            &db,
+            &config,
+            &refname,
+            oid,
+            None,
+            true,
+            None,
+            &deltabase,
+            objectname_abbrev,
+            &objectname_candidates,
+            &mailmap,
+            &ref_names,
+            warn_ambiguous_refs,
+            color,
+            options.omit_empty,
+        )?;
+    }
     for reference in all_refs.iter() {
         if !branch_ref_matches_mode(&reference.name, options.mode) {
             continue;
@@ -8857,64 +9231,111 @@ fn print_branch_list_format_omit_empty(
         {
             continue;
         }
-        let RefTarget::Direct(oid) = &reference.target else {
+        let Some((oid, symref)) = resolve_for_each_ref_target(store, reference)? else {
             continue;
         };
-        let upstream = for_each_ref_upstream(&config, &reference.name);
-        let push = for_each_ref_push(&config, &reference.name);
-        let upstream_track = upstream
-            .as_ref()
-            .map(|upstream| for_each_ref_upstream_track(store, &db, format, oid, &upstream.refname))
-            .transpose()?
-            .flatten();
-        let push_track = push
-            .as_ref()
-            .and_then(|push| push.refname.as_deref())
-            .map(|push_ref| for_each_ref_upstream_track(store, &db, format, oid, push_ref))
-            .transpose()?
-            .flatten();
-        let object = db.read_object(oid)?;
-        let object_disk_size = for_each_ref_loose_object_disk_size(git_dir, oid)?;
         let worktree_path =
             for_each_ref_worktree_path(git_dir, head_ref.as_deref(), &reference.name)?;
-        let contents = for_each_ref_contents(format, &object)?;
-        let context = ForEachRefFormatContext {
+        print_branch_format_reference(
+            &mut stdout,
+            &format_spec,
             git_dir,
-            db: &db,
             format,
-            refname: &reference.name,
+            store,
+            &db,
+            &config,
+            &reference.name,
             oid,
-            deltabase: &deltabase,
-            object_type: object.object_type,
-            object_body: &object.body,
-            object_size: object.body.len(),
-            object_disk_size,
-            color: false,
-            quote: ForEachRefQuoteMode::None,
+            symref,
+            head_ref.as_deref() == Some(reference.name.as_str()),
+            worktree_path.as_deref(),
+            &deltabase,
             objectname_abbrev,
-            objectname_candidates: &objectname_candidates,
-            worktree_path: worktree_path.as_deref(),
-            is_head: head_ref.as_deref() == Some(reference.name.as_str()),
-            symref: None,
-            upstream,
-            push,
-            upstream_track,
-            push_track,
-            contents,
-            peeled_object: None,
-            mailmap: &mailmap,
-            ref_names: &ref_names,
+            &objectname_candidates,
+            &mailmap,
+            &ref_names,
             warn_ambiguous_refs,
-        };
-        let mut line = Vec::new();
-        print_for_each_ref_format(&mut line, &format_spec, &context)?;
-        if options.omit_empty && line.is_empty() {
-            continue;
-        }
-        stdout.write_all(&line)?;
-        stdout.write_all(b"\n")?;
+            color,
+            options.omit_empty,
+        )?;
     }
     stdout.flush()?;
+    Ok(())
+}
+
+fn print_branch_format_reference(
+    stdout: &mut impl Write,
+    format_spec: &ForEachRefFormat,
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    refname: &str,
+    oid: ObjectId,
+    symref: Option<String>,
+    is_head: bool,
+    worktree_path: Option<&str>,
+    deltabase: &ObjectId,
+    objectname_abbrev: Option<usize>,
+    objectname_candidates: &[ObjectId],
+    mailmap: &commands::utility::Mailmap,
+    ref_names: &std::collections::HashSet<String>,
+    warn_ambiguous_refs: bool,
+    color: bool,
+    omit_empty: bool,
+) -> Result<()> {
+    let upstream = for_each_ref_upstream(config, refname);
+    let push = for_each_ref_push(config, refname);
+    let upstream_track = upstream
+        .as_ref()
+        .map(|upstream| for_each_ref_upstream_track(store, db, format, &oid, &upstream.refname))
+        .transpose()?
+        .flatten();
+    let push_track = push
+        .as_ref()
+        .and_then(|push| push.refname.as_deref())
+        .map(|push_ref| for_each_ref_upstream_track(store, db, format, &oid, push_ref))
+        .transpose()?
+        .flatten();
+    let object = db.read_object(&oid)?;
+    let object_disk_size = for_each_ref_loose_object_disk_size(git_dir, &oid)?;
+    let contents = for_each_ref_contents(format, &object)?;
+    let context = ForEachRefFormatContext {
+        git_dir,
+        db,
+        format,
+        refname,
+        oid: &oid,
+        deltabase,
+        object_type: object.object_type,
+        object_body: &object.body,
+        object_size: object.body.len(),
+        object_disk_size,
+        color,
+        quote: ForEachRefQuoteMode::None,
+        objectname_abbrev,
+        objectname_candidates,
+        worktree_path,
+        is_head,
+        symref: symref.as_deref(),
+        upstream,
+        push,
+        upstream_track,
+        push_track,
+        contents,
+        peeled_object: None,
+        mailmap,
+        ref_names,
+        warn_ambiguous_refs,
+    };
+    let mut line = Vec::new();
+    print_for_each_ref_format(&mut line, format_spec, &context)?;
+    if omit_empty && line.is_empty() {
+        return Ok(());
+    }
+    stdout.write_all(&line)?;
+    stdout.write_all(b"\n")?;
     Ok(())
 }
 
@@ -8942,6 +9363,22 @@ fn print_branch_list_filtered(
     })
 }
 
+fn print_branch_list_filtered_detached(
+    store: &FileRefStore,
+    mode: BranchListMode,
+    show_detached: bool,
+    mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+) -> Result<()> {
+    print_branch_list_filtered_sorted_with_color_detached(
+        store,
+        mode,
+        false,
+        false,
+        show_detached,
+        |reference, name| include(reference, name),
+    )
+}
+
 fn print_branch_list_filtered_with_color(
     store: &FileRefStore,
     mode: BranchListMode,
@@ -8958,12 +9395,30 @@ fn print_branch_list_filtered_sorted_with_color(
     descending: bool,
     include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
+    print_branch_list_filtered_sorted_with_color_detached(
+        store,
+        mode,
+        color,
+        descending,
+        true,
+        include,
+    )
+}
+
+fn print_branch_list_filtered_sorted_with_color_detached(
+    store: &FileRefStore,
+    mode: BranchListMode,
+    color: bool,
+    descending: bool,
+    show_detached: bool,
+    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+) -> Result<()> {
     let current = store.current_branch_ref()?;
     let mut refs = store.list_refs()?;
     if descending {
         refs.reverse();
     }
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, show_detached, None, include)
 }
 
 fn print_branch_list_filtered_version_sorted_with_color(
@@ -8979,7 +9434,7 @@ fn print_branch_list_filtered_version_sorted_with_color(
     if descending {
         refs.reverse();
     }
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn print_branch_list_filtered_objectname_sorted_with_color(
@@ -9001,7 +9456,7 @@ fn print_branch_list_filtered_objectname_sorted_with_color(
         };
         object_order.then_with(|| left.name.cmp(&right.name))
     });
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn branch_ref_objectname_sort_key(reference: &sley_refs::Ref) -> String {
@@ -9039,7 +9494,7 @@ fn print_branch_list_filtered_objecttype_sorted_with_color(
         .into_iter()
         .map(|(reference, _)| reference)
         .collect::<Vec<_>>();
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn branch_ref_objecttype_sort_key(
@@ -9081,7 +9536,7 @@ fn print_branch_list_filtered_objectsize_sorted_with_color(
         .into_iter()
         .map(|(reference, _)| reference)
         .collect::<Vec<_>>();
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn branch_ref_objectsize_sort_key(
@@ -9124,7 +9579,7 @@ fn print_branch_list_filtered_date_sorted_with_color(
         .into_iter()
         .map(|(reference, _)| reference)
         .collect::<Vec<_>>();
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn branch_ref_date_sort_key(
@@ -9163,7 +9618,7 @@ fn print_branch_list_filtered_upstream_sorted_with_color(
         };
         upstream_order.then_with(|| left.name.cmp(&right.name))
     });
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn branch_ref_upstream_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
@@ -9193,7 +9648,7 @@ fn print_branch_list_filtered_push_sorted_with_color(
         };
         push_order.then_with(|| left.name.cmp(&right.name))
     });
-    print_branch_refs(refs, current.as_deref(), mode, color, include)
+    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
 fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
@@ -9229,10 +9684,47 @@ fn detached_head_branch_line() -> Option<String> {
             return Some(format!("(no branch, rebasing {branch})"));
         }
     }
-    Some(format!(
-        "(HEAD detached at {})",
-        format_log_abbrev_oid(&oid)
-    ))
+    Some(detached_head_description(&store).unwrap_or_else(|| {
+        format!("(HEAD detached at {})", format_log_abbrev_oid(&oid))
+    }))
+}
+
+fn detached_head_description(store: &FileRefStore) -> Option<String> {
+    let entries = store.read_reflog("HEAD").ok()?;
+    let (idx, checkout) = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, entry)| {
+            let message = std::str::from_utf8(&entry.message).ok()?;
+            let destination = message
+                .strip_prefix("checkout: moving from ")?
+                .rsplit_once(" to ")?
+                .1;
+            Some((idx, (entry, destination)))
+        })?;
+    let label = detached_checkout_label(checkout.1, &checkout.0.new_oid);
+    let moved_after_checkout = entries[idx + 1..]
+        .iter()
+        .any(|entry| entry.old_oid != entry.new_oid);
+    if moved_after_checkout {
+        Some(format!("(HEAD detached from {label})"))
+    } else {
+        Some(format!("(HEAD detached at {label})"))
+    }
+}
+
+fn detached_checkout_label(destination: &str, oid: &ObjectId) -> String {
+    if destination == "HEAD"
+        || destination.starts_with("HEAD^")
+        || destination.starts_with("HEAD~")
+        || destination == oid.to_hex()
+        || oid.to_hex().starts_with(destination)
+    {
+        format_log_abbrev_oid(oid)
+    } else {
+        destination.to_string()
+    }
 }
 
 fn print_branch_refs(
@@ -9240,10 +9732,13 @@ fn print_branch_refs(
     current: Option<&str>,
     mode: BranchListMode,
     color: bool,
+    show_detached: bool,
+    worktree_paths: Option<&HashMap<String, String>>,
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
+        && show_detached
         && let Some(line) = detached_head_branch_line()
     {
         if color {
@@ -9263,15 +9758,37 @@ fn print_branch_refs(
             if !include(&reference, name) {
                 continue;
             }
+            let linked_worktree = worktree_paths
+                .and_then(|paths| paths.get(&reference.name))
+                .is_some();
             let marker = if Some(reference.name.as_str()) == current {
                 '*'
+            } else if linked_worktree {
+                '+'
             } else {
                 ' '
             };
+            let target = local_symbolic_branch_target(&reference);
             if color && marker == '*' {
-                println!("{marker} \x1b[32m{name}\x1b[m");
+                print!("{marker} \x1b[32m{name}\x1b[m");
+                if let Some(target) = target {
+                    print!(" -> {target}");
+                }
+                println!();
+            } else if color && marker == '+' {
+                print!("{marker} \x1b[36m{name}\x1b[m");
+                if let Some(target) = target {
+                    print!(" -> {target}");
+                }
+                println!();
             } else if color {
-                println!("{marker} {name}\x1b[m");
+                print!("{marker} {name}\x1b[m");
+                if let Some(target) = target {
+                    print!(" -> {target}");
+                }
+                println!();
+            } else if let Some(target) = target {
+                println!("{marker} {name} -> {target}");
             } else {
                 println!("{marker} {name}");
             }
@@ -9302,11 +9819,13 @@ fn collect_branch_rows(
     current: Option<&str>,
     mode: BranchListMode,
     color: bool,
+    show_detached: bool,
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<Vec<String>> {
     let mut rows = Vec::new();
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
+        && show_detached
         && let Some(line) = detached_head_branch_line()
     {
         if color {
@@ -9331,10 +9850,21 @@ fn collect_branch_rows(
             } else {
                 ' '
             };
+            let target = local_symbolic_branch_target(&reference);
             if color && marker == '*' {
-                rows.push(format!("{marker} \x1b[32m{name}\x1b[m"));
+                let mut row = format!("{marker} \x1b[32m{name}\x1b[m");
+                if let Some(target) = target {
+                    row.push_str(&format!(" -> {target}"));
+                }
+                rows.push(row);
             } else if color {
-                rows.push(format!("{marker} {name}\x1b[m"));
+                let mut row = format!("{marker} {name}\x1b[m");
+                if let Some(target) = target {
+                    row.push_str(&format!(" -> {target}"));
+                }
+                rows.push(row);
+            } else if let Some(target) = target {
+                rows.push(format!("{marker} {name} -> {target}"));
             } else {
                 rows.push(format!("{marker} {name}"));
             }
@@ -9360,6 +9890,16 @@ fn collect_branch_rows(
     Ok(rows)
 }
 
+fn local_symbolic_branch_target(reference: &sley_refs::Ref) -> Option<String> {
+    let RefTarget::Symbolic(target) = &reference.target else {
+        return None;
+    };
+    target
+        .strip_prefix("refs/heads/")
+        .or_else(|| target.strip_prefix("refs/remotes/"))
+        .map(str::to_string)
+}
+
 fn remote_symbolic_ref_is_dangling(
     reference: &sley_refs::Ref,
     ref_names: &HashSet<String>,
@@ -9382,12 +9922,7 @@ fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchLis
     let Some(target_name) = target.strip_prefix("refs/remotes/") else {
         return display;
     };
-    let target_display = if matches!(mode, BranchListMode::All) {
-        format!("remotes/{target_name}")
-    } else {
-        target_name.to_string()
-    };
-    format!("{display} -> {target_display}")
+    format!("{display} -> {target_name}")
 }
 
 fn print_branch_columns(rows: &[String], style: BranchColumnStyle) -> Result<()> {
@@ -9450,9 +9985,35 @@ fn print_branch_list_verbose(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir)?;
     let current = store.current_branch_ref()?;
-    let objectname_abbrev = repository_abbrev(git_dir, format)?;
+    let objectname_abbrev = options
+        .abbrev
+        .map(|abbrev| abbrev.map(|width| width.min(format.hex_len())))
+        .unwrap_or(repository_abbrev(git_dir, format)?);
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
+    let worktree_paths = for_each_ref_worktree_paths(git_dir, current.as_deref())?;
     let mut rows = Vec::new();
+    if matches!(options.mode, BranchListMode::Local | BranchListMode::All)
+        && current.is_none()
+        && options.patterns.is_empty()
+        && let Some(display) = detached_head_branch_line()
+        && let Some((oid, _)) = resolve_for_each_ref_target(
+            store,
+            &sley_refs::Ref {
+                name: "HEAD".into(),
+                target: store.read_ref("HEAD")?.unwrap_or(RefTarget::Direct(zero_oid(format)?)),
+            },
+        )?
+    {
+        rows.push(BranchVerboseRow {
+            display,
+            oid: for_each_ref_abbrev_oid(&oid, objectname_abbrev, &objectname_candidates),
+            subject: branch_verbose_subject(&db, format, &oid)?,
+            is_head: true,
+            worktree_path: None,
+            upstream: None,
+            upstream_track: None,
+        });
+    }
     for reference in store.list_refs()? {
         let Some((display, pattern_name)) =
             branch_verbose_display_name(&reference.name, options.mode)
@@ -9462,30 +10023,43 @@ fn print_branch_list_verbose(
         if !branch_list_patterns_match(&options.patterns, &pattern_name, options.ignore_case) {
             continue;
         }
-        let RefTarget::Direct(oid) = &reference.target else {
+        let Some((oid, _)) = resolve_for_each_ref_target(store, &reference)? else {
             continue;
         };
-        let subject = branch_verbose_subject(&db, format, oid)?;
+        let subject = branch_verbose_subject(&db, format, &oid)?;
         let upstream = for_each_ref_upstream(&config, &reference.name);
         let upstream_track = upstream
             .as_ref()
-            .map(|upstream| for_each_ref_upstream_track(store, &db, format, oid, &upstream.refname))
+            .map(|upstream| for_each_ref_upstream_track(store, &db, format, &oid, &upstream.refname))
             .transpose()?
             .flatten();
         rows.push(BranchVerboseRow {
             display,
-            oid: for_each_ref_abbrev_oid(oid, objectname_abbrev, &objectname_candidates),
+            oid: for_each_ref_abbrev_oid(&oid, objectname_abbrev, &objectname_candidates),
             subject,
             is_head: current.as_deref() == Some(reference.name.as_str()),
+            worktree_path: worktree_paths.get(&reference.name).cloned(),
             upstream,
             upstream_track,
         });
     }
     let width = rows.iter().map(|row| row.display.len()).max().unwrap_or(0);
     for row in rows {
-        let marker = if row.is_head { '*' } else { ' ' };
-        let tracking =
+        let marker = if row.is_head {
+            '*'
+        } else if row.worktree_path.is_some() {
+            '+'
+        } else {
+            ' '
+        };
+        let mut tracking =
             branch_verbose_tracking(row.upstream.as_ref(), row.upstream_track, options.verbosity);
+        if options.verbosity >= 2
+            && !row.is_head
+            && let Some(worktree_path) = &row.worktree_path
+        {
+            tracking.push_str(&format!(" ({worktree_path})"));
+        }
         println!(
             "{marker} {:width$} {}{} {}",
             row.display,
@@ -9503,6 +10077,7 @@ struct BranchVerboseRow {
     oid: String,
     subject: String,
     is_head: bool,
+    worktree_path: Option<String>,
     upstream: Option<ForEachRefUpstream>,
     upstream_track: Option<ForEachRefTrack>,
 }
