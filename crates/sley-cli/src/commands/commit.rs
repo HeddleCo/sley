@@ -168,14 +168,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 let Some(message) = iter.next() else {
                     return commit_message_requires_value_error();
                 };
-                let mut chunk = message.as_bytes().to_vec();
-                chunk.push(b'\n');
-                message_chunks.push(chunk);
+                message_chunks.push(commit_message_arg_chunk(message));
             }
             value if value.starts_with("-m") && value.len() > 2 => {
-                let mut chunk = value.as_bytes()[2..].to_vec();
-                chunk.push(b'\n');
-                message_chunks.push(chunk);
+                message_chunks.push(commit_message_arg_chunk(&value[2..]));
             }
             value if value.starts_with("-am") => {
                 all = true;
@@ -187,22 +183,16 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                     };
                     message
                 };
-                let mut chunk = message.as_bytes().to_vec();
-                chunk.push(b'\n');
-                message_chunks.push(chunk);
+                message_chunks.push(commit_message_arg_chunk(message));
             }
             "--message" => {
                 let Some(message) = iter.next() else {
                     return commit_message_requires_value_error();
                 };
-                let mut chunk = message.as_bytes().to_vec();
-                chunk.push(b'\n');
-                message_chunks.push(chunk);
+                message_chunks.push(commit_message_arg_chunk(message));
             }
             value if value.starts_with("--message=") => {
-                let mut chunk = value.as_bytes()["--message=".len()..].to_vec();
-                chunk.push(b'\n');
-                message_chunks.push(chunk);
+                message_chunks.push(commit_message_arg_chunk(&value["--message=".len()..]));
             }
             "--no-message" => message_chunks.clear(),
             value if value.starts_with("--no-message=") => {
@@ -773,10 +763,6 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-F' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if reset_author && reuse_message.is_none() && !amend {
-        eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
-        return Err(GitError::Exit(128));
-    }
     if file_message.is_some() && !message_chunks.is_empty() {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
@@ -864,6 +850,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
     let in_revert = git_dir.join("REVERT_HEAD").is_file();
     let in_rebase = rebase_in_progress(&git_dir);
+    if reset_author && reuse_message.is_none() && !amend && !in_cherry_pick && !in_rebase {
+        eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
+        return Err(GitError::Exit(128));
+    }
     if !pathspec_args.is_empty() {
         if in_rebase {
             eprintln!("fatal: cannot do a partial commit during a rebase.");
@@ -1136,7 +1126,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             .and_then(|c| c.get_bool("commit", None, "status"))
             .unwrap_or(true)
     });
-    let mut template = message.clone();
+    let mut template = if cleanup_mode == CommitCleanupMode::Verbatim {
+        message.clone()
+    } else {
+        commit_stripspace_message(&message, None)
+    };
     if use_editor && include_status_resolved {
         // `author_date_is_interesting()` = `--date` given or author reused from
         // another commit (`-C`/`-c`/amend); env GIT_AUTHOR_DATE alone does not
@@ -1180,7 +1174,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         prepare_args.push("template");
     }
     commands::hooks::run_hook_l("prepare-commit-msg", &prepare_args)?;
-    if use_editor && let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg) {
+    let has_unmerged_index_entries = commit_index_has_unmerged_entries(&git_dir, format)?;
+    if use_editor
+        && !has_unmerged_index_entries
+        && let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg)
+    {
         eprintln!("error: {err}");
         eprintln!("Please supply the message using either -m or -F option.");
         return Err(GitError::Exit(1));
@@ -1237,7 +1235,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     if !allow_empty_message
         && (commit_message_is_empty(&message)
-            || (template_message_source && commit_message_lacks_non_trailer_content(&message)))
+            || (template_message_source
+                && cleanup_mode_strips_comments(cleanup_mode)
+                && commit_message_lacks_non_trailer_content(&message)))
     {
         let _ = restore_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
@@ -1257,6 +1257,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if let Some(path) = template_file.as_deref()
         && !allow_empty_message
         && template_message_source
+        && cleanup_mode_strips_comments(cleanup_mode)
         && let Some(template_bytes) = read_commit_template_file(path)?
         && commit_template_lacks_edit_content(&message, &template_bytes, cleanup_mode, &comment_char)
     {
@@ -2167,6 +2168,14 @@ fn commit_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
+fn commit_message_arg_chunk(message: &str) -> Vec<u8> {
+    let mut chunk = message.as_bytes().to_vec();
+    if !chunk.ends_with(b"\n") {
+        chunk.push(b'\n');
+    }
+    chunk
+}
+
 fn read_porcelain_commit_message_file(path: &str) -> Result<Vec<u8>> {
     let mut message = read_commit_message_file(path)?;
     if !message.is_empty() && !message.ends_with(b"\n") {
@@ -2181,6 +2190,10 @@ fn commit_message_is_empty(message: &[u8]) -> bool {
 
 fn commit_message_lacks_non_trailer_content(message: &[u8]) -> bool {
     !message_has_non_trailer_content(message, "#")
+}
+
+fn cleanup_mode_strips_comments(mode: CommitCleanupMode) -> bool {
+    matches!(mode, CommitCleanupMode::Strip | CommitCleanupMode::Scissors)
 }
 
 fn message_has_non_trailer_content(message: &[u8], comment_char: &str) -> bool {
@@ -2398,6 +2411,7 @@ fn build_reused_commit_author_identity(
     date: Option<&str>,
 ) -> Result<Vec<u8>> {
     if author.is_none() && date.is_none() {
+        validate_reused_commit_author_identity(reused_author)?;
         return Ok(reused_author.to_vec());
     }
     let (reused_name, reused_email, reused_date) = parse_commit_identity_parts(reused_author)?;
@@ -2413,6 +2427,14 @@ fn build_reused_commit_author_identity(
         None => reused_date,
     };
     sley_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+fn validate_reused_commit_author_identity(identity: &[u8]) -> Result<()> {
+    if parse_commit_identity_parts(identity).is_ok() {
+        return Ok(());
+    }
+    eprintln!("fatal: empty ident name (for <>) not allowed");
+    Err(GitError::Exit(128))
 }
 
 fn parse_commit_identity_parts(identity: &[u8]) -> Result<(String, String, String)> {
@@ -2484,6 +2506,18 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
         &config,
     )?;
     Ok(())
+}
+
+fn commit_index_has_unmerged_entries(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let Ok(bytes) = fs::read(&index_path) else {
+        return Ok(false);
+    };
+    let index = Index::parse(&bytes, format)?;
+    Ok(index
+        .entries
+        .iter()
+        .any(|entry| index_entry_stage(entry) > 0))
 }
 
 fn commit_index_tree_if_changed(
@@ -2563,7 +2597,9 @@ fn append_commit_verbose_diff(
     if !out.ends_with(b"\n") {
         out.push(b'\n');
     }
-    append_scissors_cut_line(out, comment_char);
+    if !message_has_scissors_cut_line(out, comment_char) {
+        append_scissors_cut_line(out, comment_char);
+    }
     if verbose == 1 {
         append_commit_diff_index_patch(git_dir, format, amend, "a/", "b/", false, out)?;
     } else {
@@ -2829,6 +2865,10 @@ fn append_scissors_cut_line(out: &mut Vec<u8>, comment_char: &str) {
         comment_char,
         "Do not modify or remove the line above.\nEverything below it will be ignored.",
     );
+}
+
+fn message_has_scissors_cut_line(message: &[u8], comment_char: &str) -> bool {
+    commit_locate_scissors(message, comment_char) < message.len()
 }
 
 /// Whether the committer identity was explicitly supplied (vs guessed from the
