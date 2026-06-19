@@ -358,7 +358,7 @@ fn parse_todo_line(
     let arg = tail.trim_start_matches([' ', '\t']).to_string();
     match resolve(object_name) {
         TodoOidLookup::Commit { oid, parents } => {
-            if parents > 1 && command != TodoCommand::Merge {
+            if parents > 1 && !matches!(command, TodoCommand::Merge | TodoCommand::Drop) {
                 push_merge_commit_messages(command, messages);
                 return Err(());
             }

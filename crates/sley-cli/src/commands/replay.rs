@@ -1778,9 +1778,11 @@ pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
 }
 
 pub(crate) fn comment_char(git_dir: &Path) -> u8 {
-    config_value(git_dir, "core", "commentChar")
-        .and_then(|value| value.bytes().next())
-        .unwrap_or(b'#')
+    match config_value(git_dir, "core", "commentChar").as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("auto") => b'#',
+        Some(value) => value.bytes().next().unwrap_or(b'#'),
+        None => b'#',
+    }
 }
 
 pub(crate) fn strip_comment_lines(message: &[u8], comment: u8) -> Vec<u8> {

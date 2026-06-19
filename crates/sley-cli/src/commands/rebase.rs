@@ -10,6 +10,7 @@ use crate::commands::merge_rebase::{
     MergePathResult, commit_tree_oid, head_commit_oid, merge_bases, merge_index_entry,
     merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
     print_branch_commit_summary, print_commit_shortstat_between_trees, three_way_merge_trees,
+    three_way_merge_trees_with_favor,
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
@@ -755,6 +756,27 @@ fn rebase_config_bool(ctx: &Ctx, section: &str, key: &str) -> Option<bool> {
         "false" | "no" | "off" | "0" | "" => Some(false),
         _ => None,
     }
+}
+
+fn warn_comment_char_auto(ctx: &Ctx) {
+    if !rebase_config_value(ctx, "core", "commentChar")
+        .is_some_and(|value| value.eq_ignore_ascii_case("auto"))
+    {
+        return;
+    }
+    eprintln!(
+        "warning: Support for 'core.commentChar=auto' is deprecated and will be removed in Git 3.0"
+    );
+    eprintln!("hint: ");
+    eprintln!("hint: To use the default comment string (#) please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config unset core.commentChar");
+    eprintln!("hint: ");
+    eprintln!("hint: To set a custom comment string please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config set core.commentChar <comment string>");
+    eprintln!("hint: ");
+    eprintln!("hint: where '<comment string>' is the string you wish to use.");
 }
 
 fn rebase_merges_config(ctx: &Ctx) -> Option<RebaseMergesMode> {
@@ -2454,6 +2476,8 @@ fn complete_action(
         None => shorthead,
     };
 
+    warn_comment_char_auto(ctx);
+
     write_todo_file(
         ctx,
         &todo_path,
@@ -2501,10 +2525,7 @@ fn complete_action(
             for message in messages {
                 eprintln!("{message}");
             }
-            eprintln!(
-                "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
-            );
-            eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
+            print_edit_todo_recovery_advice();
             checkout_onto(ctx, &opts, onto_name)?;
             return Err(GitError::Exit(1));
         }
@@ -2633,6 +2654,13 @@ fn check_todo_dropped_commits(
     Ok(false)
 }
 
+fn print_edit_todo_recovery_advice() {
+    eprintln!(
+        "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
+    );
+    eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
+}
+
 fn check_todo_dropped_commits_against_backup(
     ctx: &Ctx,
     db: &FileObjectDatabase,
@@ -2727,6 +2755,15 @@ fn checkout_would_overwrite_untracked(
     }
     overwritten.sort();
     Ok(overwritten)
+}
+
+fn print_merge_would_overwrite_untracked(paths: &[Vec<u8>]) {
+    eprintln!("error: The following untracked working tree files would be overwritten by merge:");
+    for path in paths {
+        eprintln!("\t{}", String::from_utf8_lossy(path));
+    }
+    eprintln!("Please move or remove them before you merge.");
+    eprintln!("Aborting");
 }
 
 fn checkout_onto_base(
@@ -3203,7 +3240,7 @@ fn do_merge(
     let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(db, ctx.format, &merge_tree)?;
     let write_db = ctx.db();
-    let (results, conflicts) = three_way_merge_trees(
+    let (results, conflicts) = three_way_merge_trees_with_favor(
         &write_db,
         ctx.format,
         &base_map,
@@ -3211,6 +3248,7 @@ fn do_merge(
         &theirs_map,
         "HEAD",
         label,
+        strategy_favor(opts),
     )?;
 
     let message = merge_todo_message(ctx, item, original.as_ref(), &labels, oneline.as_deref())?;
@@ -3553,6 +3591,14 @@ fn pick_one_commit(
 
     // Fast-forward when the pick's parent is exactly HEAD.
     if opts.allow_ff && !create_root && !is_fixup && parent == Some(head) {
+        let target_tree = commit_tree_oid(db, ctx.format, &oid)?;
+        let overwritten = checkout_would_overwrite_untracked(ctx, db, &target_tree)?;
+        if !overwritten.is_empty() {
+            print_merge_would_overwrite_untracked(&overwritten);
+            fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+            reschedule_current(ctx, db, todo, item)?;
+            return Ok(PickOutcome::Fail(1));
+        }
         sley_worktree::reset_index_and_worktree_to_commit(
             &ctx.worktree_root,
             &ctx.git_dir,
@@ -3614,6 +3660,13 @@ fn pick_one_commit(
     };
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
     let theirs_tree = record.commit.tree;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &theirs_tree)?;
+    if !overwritten.is_empty() {
+        print_merge_would_overwrite_untracked(&overwritten);
+        fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+        reschedule_current(ctx, db, todo, item)?;
+        return Ok(PickOutcome::Fail(1));
+    }
     let base_map = stash_tree_entry_map(db, ctx.format, &parent_tree)?;
     let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
@@ -3625,7 +3678,7 @@ fn pick_one_commit(
         find_unique_abbrev_hex(db, &record.oid),
         commit_subject(&record.commit.message)
     );
-    let (results, conflicts) = three_way_merge_trees(
+    let (results, conflicts) = three_way_merge_trees_with_favor(
         &write_db,
         ctx.format,
         &base_map,
@@ -3633,6 +3686,7 @@ fn pick_one_commit(
         &theirs_map,
         "HEAD",
         &theirs_label,
+        strategy_favor(opts),
     )?;
 
     // Compose the message (fixup/squash machinery).
@@ -3828,6 +3882,18 @@ fn command_reflog_name(command: TodoCommand) -> &'static str {
         TodoCommand::Squash => "squash",
         _ => "pick",
     }
+}
+
+fn strategy_favor(opts: &MachineOpts) -> sley_diff_merge::MergeFavor {
+    let mut favor = sley_diff_merge::MergeFavor::None;
+    for opt in &opts.strategy_opts {
+        match opt.as_str() {
+            "ours" => favor = sley_diff_merge::MergeFavor::Ours,
+            "theirs" => favor = sley_diff_merge::MergeFavor::Theirs,
+            _ => {}
+        }
+    }
+    favor
 }
 
 fn next_is_fixup(todo: &TodoList) -> bool {
@@ -4999,6 +5065,7 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
         for message in messages {
             eprintln!("{message}");
         }
+        print_edit_todo_recovery_advice();
         return Err(GitError::Exit(1));
     }
     if incorrect {
