@@ -359,11 +359,12 @@ fn run_dir_difftool(
     if entries.is_empty() {
         return Ok(());
     }
-    let temp = TempDir::new("sley-difftool-dir")?;
+    let mut temp = TempDir::new("sley-difftool-dir")?;
     let left = temp.path.join("left");
     let right = temp.path.join("right");
     fs::create_dir_all(&left)?;
     fs::create_dir_all(&right)?;
+    let mut snapshots = Vec::new();
     for entry in entries {
         let rel = repo_path_to_path(&entry.path);
         write_dir_materialized(
@@ -371,12 +372,25 @@ fn run_dir_difftool(
             diff_entry_old_content(entry, repo.objects())?.as_deref(),
             entry.old_mode,
         )?;
-        write_dir_materialized(
-            &right.join(&rel),
-            diff_entry_new_content(entry, repo.objects(), Some(repo.worktree_root()?), entry.new_oid.is_none())?
-                .as_deref(),
-            entry.new_mode,
-        )?;
+        let right_path = right.join(&rel);
+        let mut right_was_symlink = false;
+        if options.symlinks && can_symlink_right_side(repo, entry)? {
+            symlink_worktree_file(repo.worktree_root()?.join(&rel), &right_path)?;
+            right_was_symlink = true;
+        } else {
+            write_dir_materialized(
+                &right_path,
+                dir_diff_new_content(repo, entry)?.as_deref(),
+                entry.new_mode,
+            )?;
+        }
+        let worktree_path = repo.worktree_root()?.join(&rel);
+        snapshots.push(DirDiffSnapshot {
+            rel,
+            right: (!right_was_symlink).then(|| fs::read(&right_path).ok()).flatten(),
+            worktree: fs::read(worktree_path).ok(),
+            right_was_symlink,
+        });
     }
     let envs = ToolEnvironment {
         local: left.clone(),
@@ -387,29 +401,60 @@ fn run_dir_difftool(
     let status = if let Some(extcmd) = &options.extcmd {
         let command = format!(
             "{} {} {}",
-            extcmd,
+            shell_quote(extcmd),
             shell_quote(&left.to_string_lossy()),
             shell_quote(&right.to_string_lossy())
         );
-        run_tool_shell(&command, &envs)?
+        run_tool_shell_in_dir(&command, &envs, repo.cwd())?
     } else {
-        run_tool_shell(&tool.command, &envs)?
+        run_tool_shell_in_dir(&tool.command, &envs, repo.cwd())?
     };
     if status >= 126 || (status != 0 && tool.trust_exit_code) {
         return Err(GitError::Exit(status));
     }
-    for entry in entries {
-        let rel = repo_path_to_path(&entry.path);
-        let changed = right.join(&rel);
+    let mut conflict = false;
+    for snapshot in &snapshots {
+        let changed = right.join(&snapshot.rel);
+        if snapshot.right_was_symlink {
+            continue;
+        }
         if changed.is_file() {
-            let wt = repo.worktree_root()?.join(&rel);
+            let changed_content = fs::read(&changed)?;
+            if snapshot.right.as_ref() == Some(&changed_content) {
+                continue;
+            }
+            let wt = repo.worktree_root()?.join(&snapshot.rel);
+            if fs::read(&wt).ok() != snapshot.worktree {
+                eprintln!(
+                    "warning: both files modified: '{}' and '{}'.",
+                    wt.display(),
+                    changed.display()
+                );
+                eprintln!("warning: working tree file has been left.");
+                eprintln!("warning: ");
+                conflict = true;
+                continue;
+            }
             if let Some(parent) = wt.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(changed, wt)?;
         }
     }
+    if conflict {
+        eprintln!("warning: temporary files exist in '{}'.", temp.path.display());
+        eprintln!("warning: you may want to cleanup or recover these.");
+        temp.keep();
+        return Err(GitError::Exit(1));
+    }
     Ok(())
+}
+
+struct DirDiffSnapshot {
+    rel: PathBuf,
+    right: Option<Vec<u8>>,
+    worktree: Option<Vec<u8>>,
+    right_was_symlink: bool,
 }
 
 fn write_dir_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>) -> Result<()> {
@@ -417,6 +462,84 @@ fn write_dir_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>
         return Ok(());
     };
     write_materialized(path, Some(content), mode)
+}
+
+fn dir_diff_new_content(
+    repo: &RepositoryContext,
+    entry: &sley_diff_merge::NameStatusEntry,
+) -> Result<Option<Vec<u8>>> {
+    if entry.new_mode == Some(0o120000) && entry.new_oid.is_none() {
+        let path = repo.worktree_root()?.join(repo_path_to_path(&entry.path));
+        return Ok(Some(
+            fs::read_link(path)?
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec(),
+        ));
+    }
+    diff_entry_new_content(
+        entry,
+        repo.objects(),
+        Some(repo.worktree_root()?),
+        entry.new_oid.is_none(),
+    )
+}
+
+fn can_symlink_right_side(
+    repo: &RepositoryContext,
+    entry: &sley_diff_merge::NameStatusEntry,
+) -> Result<bool> {
+    if !is_regular_file_mode(entry.new_mode) {
+        return Ok(false);
+    }
+    let Some(oid) = entry.new_oid.as_ref() else {
+        return Ok(false);
+    };
+    let worktree_path = repo.worktree_root()?.join(repo_path_to_path(&entry.path));
+    let Ok(metadata) = fs::symlink_metadata(&worktree_path) else {
+        return Ok(false);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    Ok(read_blob(repo.objects(), oid)? == fs::read(worktree_path)?)
+}
+
+fn is_regular_file_mode(mode: Option<u32>) -> bool {
+    mode.is_some_and(|mode| mode & 0o170000 == 0o100000)
+}
+
+#[cfg(unix)]
+fn symlink_worktree_file(target: PathBuf, link: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(link);
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+fn run_tool_shell_in_dir(command: &str, envs: &ToolEnvironment, cwd: &Path) -> Result<i32> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .env("LOCAL", &envs.local)
+        .env("REMOTE", &envs.remote)
+        .env("MERGED", &envs.merged)
+        .env("BASE", &envs.base)
+        .status()
+        .map_err(|err| GitError::Command(format!("failed to run tool: {err}")))?;
+    Ok(status.code().unwrap_or(128))
+}
+
+#[cfg(not(unix))]
+fn symlink_worktree_file(target: PathBuf, link: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(target, link)?;
+    Ok(())
 }
 
 fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
@@ -497,6 +620,7 @@ fn shell_quote(value: &str) -> String {
 
 struct TempDir {
     path: PathBuf,
+    keep: bool,
 }
 
 impl TempDir {
@@ -516,12 +640,18 @@ impl TempDir {
         );
         path.push(unique);
         fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        Ok(Self { path, keep: false })
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
     }
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
