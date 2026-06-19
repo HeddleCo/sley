@@ -6363,7 +6363,8 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
     let options = parse_bundle_revision_args(&rev_args)?;
     let selection = bundle_create_selection(&git_dir, format, &db, &options)?;
     if selection.references.is_empty() {
-        return Err(GitError::Command("Refusing to create empty bundle.".into()));
+        eprintln!("fatal: Refusing to create empty bundle.");
+        return Err(GitError::Exit(128));
     }
     let Some(pack) =
         build_reachable_pack(&db, format, selection.starts, &selection.excluded_objects)?
