@@ -297,6 +297,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             format,
             &target_commit,
         )?;
+        refresh_reset_index(&worktree_root, &git_dir, format)?;
         update_reset_head_ref(
             &git_dir,
             format,
