@@ -42,10 +42,13 @@ pub(crate) fn cmd_difftool(args: &[String]) -> Result<()> {
     let gui = options
         .gui
         .unwrap_or_else(|| gui_default(config, ToolMode::Diff));
-    let tool = resolve_difftool_tool(config, &options, gui)?;
-    let prompt = should_prompt(config, &options);
     let diffs = collect_difftool_entries(&repo, &options)?;
     let diffs = order_difftool_entries(diffs, options.rotate_to.as_deref(), options.skip_to.as_deref())?;
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    let tool = resolve_difftool_tool(config, &options, gui)?;
+    let prompt = should_prompt(config, &options);
     if options.dir_diff {
         return run_dir_difftool(&repo, &options, &tool, &diffs);
     }
@@ -198,7 +201,7 @@ fn collect_difftool_entries(
         DiffPathspec::new(cwd, worktree_root, &paths)?
     };
     let base_options = sley_diff_merge::DiffNameStatusOptions::default();
-    let entries = match (options.cached, revs.as_slice()) {
+    let mut entries = match (options.cached, revs.as_slice()) {
         (true, []) => sley_diff_merge::diff_name_status_head_index(git_dir, format)?,
         (true, [tree]) => {
             sley_diff_merge::diff_name_status_tree_index_with_options(git_dir, format, tree, base_options)?
@@ -220,6 +223,9 @@ fn collect_difftool_entries(
         }
         _ => Vec::new(),
     };
+    if options.cached {
+        entries.retain(|entry| entry.status != sley_diff_merge::NameStatus::Unmerged);
+    }
     Ok(apply_diff_pathspec(entries, &pathspec))
 }
 
@@ -350,6 +356,9 @@ fn run_dir_difftool(
     tool: &ToolCommand,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     let temp = TempDir::new("sley-difftool-dir")?;
     let left = temp.path.join("left");
     let right = temp.path.join("right");
@@ -485,7 +494,11 @@ struct TempDir {
 
 impl TempDir {
     fn new(prefix: &str) -> Result<Self> {
-        let mut path = env::temp_dir();
+        let mut root = env::temp_dir().to_string_lossy().into_owned();
+        while root.len() > 1 && root.ends_with(std::path::MAIN_SEPARATOR) {
+            root.pop();
+        }
+        let mut path = PathBuf::from(root);
         let unique = format!(
             "{prefix}-{}-{}",
             std::process::id(),
