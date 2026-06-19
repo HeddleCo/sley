@@ -640,7 +640,21 @@ fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
             && bytes[0] == b'-'
             && bytes[1..]
                 .iter()
-                .all(|&ch| matches!(ch, b'a' | b'A' | b'b' | b'd' | b'f' | b'F' | b'l' | b'm' | b'n' | b'q'))
+                .all(|&ch| {
+                    matches!(
+                        ch,
+                        b'a' | b'A'
+                            | b'b'
+                            | b'd'
+                            | b'f'
+                            | b'F'
+                            | b'k'
+                            | b'l'
+                            | b'm'
+                            | b'n'
+                            | b'q'
+                    )
+                })
         {
             expanded.extend(bytes[1..].iter().map(|&ch| format!("-{}", ch as char)));
         } else {
@@ -1330,6 +1344,7 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             "--cruft" => cruft_flag = Some(true),
             "--no-cruft" => cruft_flag = Some(false),
             "--prune" => prune_override = Some(Some("2.weeks.ago".to_string())),
@@ -1612,8 +1627,9 @@ fn maintenance_select_tasks(
     }
     let strategy = config
         .get("maintenance", None, "strategy")
-        .unwrap_or(if schedule.is_some() { "none" } else { "gc" });
-    let mut selected = match strategy.to_ascii_lowercase().as_str() {
+        .unwrap_or(if schedule.is_some() { "none" } else { "geometric" });
+    let strategy_name = strategy.to_ascii_lowercase();
+    let mut selected = match strategy_name.as_str() {
         "none" => Vec::new(),
         "gc" => vec!["gc"],
         "incremental" if schedule.is_some() => vec![
@@ -1655,8 +1671,9 @@ fn maintenance_select_tasks(
         selected.retain(|task| {
             let default_schedule = match task.as_str() {
                 "commit-graph" | "prefetch" => "hourly",
-                "loose-objects" | "incremental-repack" | "geometric-repack" | "gc"
-                | "pack-refs" => "daily",
+                "loose-objects" | "incremental-repack" | "geometric-repack" | "gc" => "daily",
+                "pack-refs" if strategy_name == "incremental" => "weekly",
+                "pack-refs" => "daily",
                 _ => "weekly",
             };
             let task_schedule = config
@@ -1666,20 +1683,31 @@ fn maintenance_select_tasks(
         });
     }
 
-    selected.sort_by_key(|task| {
-        MAINTENANCE_TASKS
-            .iter()
-            .position(|known| known.eq_ignore_ascii_case(task))
-            .unwrap_or(usize::MAX)
-    });
+    selected.sort_by_key(|task| maintenance_run_order(task));
     Ok(selected)
+}
+
+fn maintenance_run_order(task: &str) -> usize {
+    match task {
+        "pack-refs" => 0,
+        "reflog-expire" => 1,
+        "gc" => 2,
+        "prefetch" => 3,
+        "loose-objects" => 4,
+        "incremental-repack" => 5,
+        "geometric-repack" => 6,
+        "commit-graph" => 7,
+        "worktree-prune" => 8,
+        "rerere-gc" => 9,
+        _ => usize::MAX,
+    }
 }
 
 fn maintenance_schedule_rank(value: &str) -> Result<u8> {
     match validate_maintenance_schedule(value)?.to_ascii_lowercase().as_str() {
-        "hourly" => Ok(1),
+        "weekly" => Ok(1),
         "daily" => Ok(2),
-        "weekly" => Ok(3),
+        "hourly" => Ok(3),
         _ => Ok(0),
     }
 }
@@ -1754,6 +1782,8 @@ fn maintenance_run_one(
         }
         "rerere-gc" => run_sley_child(&["rerere", "gc"], None),
         "gc" => {
+            run_sley_child(&["pack-refs", "--all", "--prune"], None)?;
+            run_sley_child(&["reflog", "expire", "--all"], None)?;
             let mut args = vec!["gc"];
             if auto {
                 args.push("--auto");
@@ -1802,7 +1832,7 @@ fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: &str
             config,
             "commit-graph",
             100,
-            count_reachable_commits(common_git_dir)?,
+            count_reachable_commits_not_in_graph(common_git_dir)?,
         )?,
         "loose-objects" => maintenance_limit_satisfied(
             config,
@@ -1813,13 +1843,8 @@ fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: &str
         "incremental-repack" | "geometric-repack" => {
             maintenance_limit_satisfied(config, task, 10, count_pack_files(common_git_dir)?)?
         }
-        "worktree-prune" => maintenance_limit_satisfied(
-            config,
-            "worktree-prune",
-            1,
-            count_dir_entries(&common_git_dir.join("worktrees"))?,
-        )?,
-        "rerere-gc" => count_dir_entries(&common_git_dir.join("rr-cache"))? > 0,
+        "worktree-prune" => worktree_prune_needed(common_git_dir, config)?,
+        "rerere-gc" => rerere_gc_needed(common_git_dir, config)?,
         "reflog-expire" => maintenance_limit_satisfied(
             config,
             "reflog-expire",
@@ -1917,7 +1942,7 @@ fn run_sley_child(args: &[&str], stdin_data: Option<&str>) -> Result<()> {
     }
 }
 
-fn trace2_child_start(args: &[&str]) {
+pub(crate) fn trace2_child_start(args: &[&str]) {
     let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
     };
@@ -1928,13 +1953,14 @@ fn trace2_child_start(args: &[&str]) {
         .map(|arg| format!("\"{}\"", json_escape(arg)))
         .collect::<Vec<_>>()
         .join(",");
-    let line = format!("{{\"event\":\"child_start\",\"sid\":\"sley\",\"argv\":[{argv}]}}\n");
+    let line =
+        format!("{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
 }
 
-fn trace2_touch() {
+pub(crate) fn trace2_touch() {
     let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
     };
@@ -2125,6 +2151,155 @@ fn count_reachable_commits(common_git_dir: &Path) -> Result<usize> {
     Ok(seen.len())
 }
 
+fn count_reachable_commits_not_in_graph(common_git_dir: &Path) -> Result<usize> {
+    let format = repository_object_format(common_git_dir)?;
+    let graph_oids = commit_graph_oids(common_git_dir, format)?;
+    if graph_oids.is_empty() {
+        return count_reachable_commits(common_git_dir);
+    }
+    let refs = FileRefStore::new(common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut seen = HashSet::new();
+    let mut missing = 0;
+    let mut stack = Vec::new();
+    for reference in refs.list_refs()? {
+        if let RefTarget::Direct(oid) = reference.target
+            && db.read_object(&oid).is_ok()
+        {
+            stack.push(oid);
+        }
+    }
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if graph_oids.contains(&oid) {
+            continue;
+        }
+        let object = match db.read_object(&oid) {
+            Ok(object) if object.object_type == ObjectType::Commit => object,
+            _ => continue,
+        };
+        missing += 1;
+        if let Ok(text) = std::str::from_utf8(&object.body) {
+            for line in text.lines() {
+                if let Some(parent) = line.strip_prefix("parent ")
+                    && let Ok(parent) = ObjectId::from_hex(format, parent)
+                {
+                    stack.push(parent);
+                }
+            }
+        }
+    }
+    Ok(missing)
+}
+
+fn commit_graph_oids(common_git_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+    let info = repository_objects_dir(common_git_dir).join("info");
+    let single = info.join("commit-graph");
+    let mut oids = HashSet::new();
+    if single.exists() {
+        let bytes = fs::read(single)?;
+        let graph = CommitGraph::parse(&bytes, format)?;
+        oids.extend(graph.commits.into_iter().map(|entry| entry.oid));
+        return Ok(oids);
+    }
+    let graphs = info.join("commit-graphs");
+    let chain = graphs.join("commit-graph-chain");
+    let Ok(contents) = fs::read_to_string(chain) else {
+        return Ok(oids);
+    };
+    for line in contents.lines() {
+        let hash = line.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        let bytes = fs::read(graphs.join(format!("graph-{hash}.graph")))?;
+        let graph = CommitGraph::parse(&bytes, format)?;
+        oids.extend(graph.commits.into_iter().map(|entry| entry.oid));
+    }
+    Ok(oids)
+}
+
+fn rerere_gc_needed(common_git_dir: &Path, config: &GitConfig) -> Result<bool> {
+    let limit = config
+        .get("maintenance", Some("rerere-gc"), "auto")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1);
+    if limit <= 0 {
+        return Ok(limit < 0);
+    }
+    Ok(count_dir_entries(&common_git_dir.join("rr-cache"))? > 0)
+}
+
+fn worktree_prune_needed(common_git_dir: &Path, config: &GitConfig) -> Result<bool> {
+    let limit = config
+        .get("maintenance", Some("worktree-prune"), "auto")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1);
+    if limit <= 0 {
+        return Ok(limit < 0);
+    }
+
+    let expire = config
+        .get("gc", None, "worktreePruneExpire")
+        .unwrap_or("3.months.ago");
+    let expire_time = parse_prune_expire(expire, "--expire")?;
+    let worktrees = common_git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(&worktrees) else {
+        return Ok(false);
+    };
+    let mut prunable = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() || linked_worktree_admin_is_prunable(&path, expire_time)? {
+            prunable += 1;
+        }
+        if prunable >= limit as usize {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn linked_worktree_admin_is_prunable(admin_dir: &Path, expire_time: i64) -> Result<bool> {
+    if admin_dir.join("locked").exists() {
+        return Ok(false);
+    }
+    let gitdir_file = admin_dir.join("gitdir");
+    if !gitdir_file.is_file() {
+        return Ok(true);
+    }
+    let value = fs::read_to_string(&gitdir_file)?;
+    let gitdir = resolve_worktree_admin_path(admin_dir, value.trim());
+    if gitdir.exists() {
+        return Ok(false);
+    }
+    if expire_time == i64::MIN {
+        return Ok(false);
+    }
+    if expire_time == i64::MAX {
+        return Ok(true);
+    }
+    let modified = fs::metadata(admin_dir)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    Ok(modified <= expire_time)
+}
+
+fn resolve_worktree_admin_path(admin_dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        admin_dir.join(path)
+    }
+}
+
 fn count_dir_entries(path: &Path) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -2154,7 +2329,7 @@ fn cmd_maintenance_register(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
 
-    report_missing_maintenance_repo(&common_git_dir);
+    let _ = report_missing_maintenance_repo(&common_git_dir);
     commands::config_cmd::cmd_config(&[
         "set".to_string(),
         "maintenance.auto".to_string(),
@@ -2181,7 +2356,10 @@ fn cmd_maintenance_unregister(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
-    report_missing_maintenance_repo(&common_git_dir);
+    let missing_repo_value = report_missing_maintenance_repo(&common_git_dir);
+    if missing_repo_value && !force {
+        return Err(GitError::Exit(128));
+    }
     let file = config_file.unwrap_or(maintenance_global_config_path()?);
     if !config_remove_value(&file, "maintenance", "repo", &repo)? && !force {
         eprintln!("fatal: repository '{repo}' is not registered");
@@ -2272,14 +2450,17 @@ fn maintenance_global_config_path() -> Result<PathBuf> {
     Ok(user)
 }
 
-fn report_missing_maintenance_repo(common_git_dir: &Path) {
+fn report_missing_maintenance_repo(common_git_dir: &Path) -> bool {
+    let mut missing = false;
     if let Ok(config) = GitConfig::read(common_git_dir.join("config")) {
         for value in config.get_all("maintenance", None, "repo") {
             if value.is_none() {
                 eprintln!("error: missing value for 'maintenance.repo'");
+                missing = true;
             }
         }
     }
+    missing
 }
 
 fn config_add_value_if_missing(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
@@ -2360,7 +2541,6 @@ fn cmd_maintenance_start(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let scheduler = scheduler.unwrap_or(MaintenanceScheduler::Systemd);
-    validate_scheduler_available(scheduler)?;
     update_background_schedule(&common_git_dir, Some(scheduler))?;
     cmd_maintenance_register(&[])
 }
@@ -2489,6 +2669,12 @@ fn update_background_schedule(common_git_dir: &Path, enable: Option<MaintenanceS
             "error: Another scheduled git-maintenance(1) process seems to be running"
         );
         return Err(GitError::Exit(128));
+    }
+    if let Some(scheduler) = enable
+        && let Err(err) = validate_scheduler_available(scheduler)
+    {
+        let _ = fs::remove_file(lock);
+        return Err(err);
     }
     for scheduler in [
         MaintenanceScheduler::Cron,

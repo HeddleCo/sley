@@ -3368,6 +3368,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    run_auto_maintenance_after_commit(&git_dir)?;
     if amend
         && !no_post_rewrite
         && let Some(old_oid) = amended_old_oid
@@ -3381,6 +3382,28 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             },
         )?;
     }
+    Ok(())
+}
+
+fn run_auto_maintenance_after_commit(git_dir: &Path) -> Result<()> {
+    commands::pack::trace2_touch();
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let config = read_repo_config(&common_git_dir)?;
+    if !config.get_bool("maintenance", None, "auto").unwrap_or(true) {
+        return Ok(());
+    }
+    let detach = config
+        .get_bool("maintenance", None, "autoDetach")
+        .or_else(|| config.get_bool("gc", None, "autoDetach"))
+        .unwrap_or(true);
+    let detach_arg = if detach { "--detach" } else { "--no-detach" };
+    let trace_args = ["maintenance", "run", "--auto", "--quiet", detach_arg];
+    commands::pack::trace2_child_start(&trace_args);
+    let run_args = ["run", "--auto", "--quiet", detach_arg]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let _ = commands::pack::cmd_maintenance(&run_args);
     Ok(())
 }
 

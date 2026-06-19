@@ -2616,6 +2616,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;
+    let mut prefetch = false;
     // `git fetch --all`: fetch from every configured remote in turn.
     let mut fetch_all_remotes = false;
     let mut iter = args.iter();
@@ -2623,8 +2624,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "--all" if source.is_none() => fetch_all_remotes = true,
             "--no-all" if source.is_none() => fetch_all_remotes = false,
-            "-q" | "--quiet" if source.is_none() => options.quiet = true,
-            "--no-quiet" if source.is_none() => options.quiet = false,
+            "-q" | "--quiet" => options.quiet = true,
+            "--no-quiet" => options.quiet = false,
             "--write-fetch-head" => options.write_fetch_head = true,
             "--no-write-fetch-head" => options.write_fetch_head = false,
             "--append" | "-a" => options.append = true,
@@ -2683,6 +2684,14 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             }
             "--refetch" => options.refetch = true,
             "--no-refetch" => options.refetch = false,
+            "--prefetch" => prefetch = true,
+            "--no-prefetch" => prefetch = false,
+            "--recurse-submodules"
+            | "--no-recurse-submodules"
+            | "--recurse-submodules-default" => {}
+            value
+                if value.starts_with("--recurse-submodules=")
+                    || value.starts_with("--recurse-submodules-default=") => {}
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
@@ -2767,11 +2776,22 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             if !filter_option_explicit {
                 apply_configured_partial_clone_filter(&config, &remote, &mut remote_options);
             }
-            if refspecs.is_empty() {
+            if refspecs.is_empty() && !prefetch {
                 remote_options.merge_srcs =
                     current_branch_merge_for_remote(&git_dir, format, &remote);
             }
-            fetch_one_source(&git_dir, format, &remote, &refspecs, remote_options)?;
+            let effective_refspecs = if prefetch {
+                prefetch_refspecs(&config, &remote, &refspecs)
+            } else {
+                refspecs.clone()
+            };
+            fetch_one_source(
+                &git_dir,
+                format,
+                &remote,
+                &effective_refspecs,
+                remote_options,
+            )?;
         }
         if options.refetch {
             trace2_fetch_refetch_maintenance();
@@ -2790,7 +2810,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     // the branch's `branch.<name>.merge` ref(s) as the FETCH_HEAD for-merge
     // entries (`add_merge_config`). Resolve those so the configured-refspec fetch
     // marks them correctly (and `pull` can find its merge target).
-    if refspecs.is_empty() {
+    if refspecs.is_empty() && !prefetch {
         options.merge_srcs = current_branch_merge_for_remote(&git_dir, format, &source);
     }
     if unshallow {
@@ -2808,11 +2828,17 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         apply_configured_partial_clone_filter(&config, &source, &mut options);
     }
-    if fetch_raw_oid_refspecs(&git_dir, format, &source, &refspecs, &options)? {
+    let config = read_repo_config(&git_dir)?;
+    let effective_refspecs = if prefetch {
+        prefetch_refspecs(&config, &source, &refspecs)
+    } else {
+        refspecs.clone()
+    };
+    if fetch_raw_oid_refspecs(&git_dir, format, &source, &effective_refspecs, &options)? {
         return Ok(());
     }
     let refetch = options.refetch;
-    let result = fetch_one_source(&git_dir, format, &source, &refspecs, options);
+    let result = fetch_one_source(&git_dir, format, &source, &effective_refspecs, options);
     if result.is_ok() && refetch {
         trace2_fetch_refetch_maintenance();
     }
@@ -2821,6 +2847,42 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
     pack_filter_from_spec(spec)
+}
+
+fn prefetch_refspecs(config: &GitConfig, remote: &str, refspecs: &[String]) -> Vec<String> {
+    let effective = if refspecs.is_empty() {
+        remote_config_values(config, remote, "fetch")
+    } else {
+        refspecs.to_vec()
+    };
+    effective
+        .into_iter()
+        .map(|refspec| prefetch_refspec(&refspec))
+        .collect()
+}
+
+fn prefetch_refspec(refspec: &str) -> String {
+    if refspec.starts_with('^') {
+        return refspec.to_string();
+    }
+    let (force, body) = refspec
+        .strip_prefix('+')
+        .map_or(("", refspec), |stripped| ("+", stripped));
+    let Some((src, dst)) = body.split_once(':') else {
+        let dst = prefetch_destination(body);
+        return format!("{force}{body}:{dst}");
+    };
+    if dst.is_empty() {
+        return refspec.to_string();
+    }
+    format!("{force}{src}:{}", prefetch_destination(dst))
+}
+
+fn prefetch_destination(dst: &str) -> String {
+    match dst.strip_prefix("refs/") {
+        Some(rest) => format!("refs/prefetch/{rest}"),
+        None => format!("refs/prefetch/{dst}"),
+    }
 }
 
 fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {

@@ -3967,7 +3967,30 @@ pub(crate) fn cmd_prune_packed(args: &[String]) -> Result<()> {
         if dry_run {
             println!("rm -f {}", prune_packed_display_path(&path)?);
         } else {
-            fs::remove_file(path)?;
+            fs::remove_file(&path)?;
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+    if !dry_run {
+        prune_empty_loose_object_dirs(&objects_dir)?;
+    }
+    Ok(())
+}
+
+fn prune_empty_loose_object_dirs(objects_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let _ = fs::remove_dir(entry.path());
         }
     }
     Ok(())
@@ -3993,6 +4016,7 @@ struct MergeRrEntry {
 enum RerereSubcommand {
     Clear,
     Forget,
+    Gc,
     Status,
 }
 
@@ -4010,6 +4034,7 @@ pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
         Some(RerereSubcommand::Status) => rerere_status(&git_dir),
         Some(RerereSubcommand::Clear) => rerere_clear(&git_dir),
         Some(RerereSubcommand::Forget) => rerere_forget(&git_dir, &options.paths),
+        Some(RerereSubcommand::Gc) => rerere_gc(&git_dir),
     }
 }
 
@@ -4041,6 +4066,7 @@ fn parse_rerere_options(args: &[String]) -> Result<RerereOptions> {
             }
             "clear" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Clear),
             "forget" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Forget),
+            "gc" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Gc),
             "status" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Status),
             _ if subcommand.is_none() => return rerere_usage(),
             value => paths.push(value.to_string()),
@@ -4164,6 +4190,42 @@ pub(crate) fn rerere_clear(git_dir: &Path) -> Result<()> {
     let merge_rr = git_dir.join("MERGE_RR");
     if merge_rr.is_file() {
         fs::remove_file(merge_rr)?;
+    }
+    Ok(())
+}
+
+fn rerere_gc(git_dir: &Path) -> Result<()> {
+    let rr_cache = git_dir.join("rr-cache");
+    if !rr_cache.exists() {
+        return Ok(());
+    }
+    rerere_gc_dir(&rr_cache, true)
+}
+
+fn rerere_gc_dir(path: &Path, keep_root: bool) -> Result<()> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let child = entry.path();
+        if child.is_dir() {
+            rerere_gc_dir(&child, false)?;
+        } else {
+            match fs::remove_file(&child) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    if !keep_root {
+        match fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }

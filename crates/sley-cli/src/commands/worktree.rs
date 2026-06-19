@@ -346,6 +346,7 @@ pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    prune_invalid_worktree_admin_entries(&common_git_dir, &options)?;
     for admin in collect_linked_worktree_admins(&common_git_dir)? {
         if admin.locked_reason.is_some() {
             continue;
@@ -360,7 +361,47 @@ pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
             fs::remove_dir_all(&admin.admin_dir)?;
         }
     }
+    remove_empty_worktrees_dir(&common_git_dir);
     Ok(())
+}
+
+fn prune_invalid_worktree_admin_entries(
+    common_git_dir: &Path,
+    options: &WorktreePruneOptions,
+) -> Result<()> {
+    let worktrees_dir = common_git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(&worktrees_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("gitdir").is_file() {
+            continue;
+        }
+        if path.is_dir() && path.join("locked").exists() {
+            continue;
+        }
+        if options.dry_run || options.verbose {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            eprintln!("Removing worktrees/{name}: invalid worktree administrative entry");
+        }
+        if !options.dry_run {
+            if path.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_worktrees_dir(common_git_dir: &Path) {
+    let _ = fs::remove_dir(common_git_dir.join("worktrees"));
 }
 
 pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
