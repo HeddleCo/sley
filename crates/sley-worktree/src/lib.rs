@@ -11553,7 +11553,7 @@ fn materialize_tree_entry(
 ) -> Result<IndexEntry> {
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, path)?;
-        fs::create_dir_all(&dir_path)?;
+        materialize_gitlink_dir(worktree_root, &dir_path)?;
         return Ok(IndexEntry {
             ctime_seconds: 0,
             ctime_nanoseconds: 0,
@@ -11576,6 +11576,15 @@ fn materialize_tree_entry(
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
     Ok(index_entry)
+}
+
+fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> Result<()> {
+    prepare_blob_parent_dirs(worktree_root, dir_path)?;
+    if fs::symlink_metadata(dir_path).is_ok_and(|metadata| !metadata.is_dir()) {
+        remove_existing_worktree_path(dir_path)?;
+    }
+    fs::create_dir_all(dir_path)?;
+    Ok(())
 }
 
 fn materialize_tree_entry_filtered(
@@ -12399,8 +12408,7 @@ fn materialize_index_entry_file(
     // sparse re-materialization of a submodule path would fail with "not found:
     // blob object <commit-oid>".
     if sley_index::is_gitlink(entry.mode) {
-        prepare_blob_parent_dirs(worktree_root, file_path)?;
-        fs::create_dir_all(file_path)?;
+        materialize_gitlink_dir(worktree_root, file_path)?;
         return Ok(());
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
@@ -13227,7 +13235,7 @@ fn restore_index_entry(
     // update` territory. Single gitlink rule via `sley_index::is_gitlink`.
     if sley_index::is_gitlink(entry.mode) {
         let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
-        fs::create_dir_all(&dir_path)?;
+        materialize_gitlink_dir(worktree_root, &dir_path)?;
         return Ok(None);
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
