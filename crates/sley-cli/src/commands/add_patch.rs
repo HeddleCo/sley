@@ -498,16 +498,11 @@ fn parse_range(s: &str) -> (i64, i64) {
     (off, cnt)
 }
 
-/// `splittable_into`: mirrors add-patch.c, which zero-initializes the counter
-/// and does `splittable_into++` on each transition from a change line (`+`/`-`)
-/// to a context line (` `). A hunk is splittable when the counter exceeds 1,
-/// i.e. there are at least two change groups each terminated by context. The
-/// trailing context after the final change group only yields one increment, so
-/// a single change-block followed by context is NOT splittable (matches git).
+/// Count distinct change groups. A hunk is splittable when it contains at least
+/// two separated runs of `+`/`-` lines; a final run followed only by
+/// `\ No newline` still counts as a group.
 fn count_splittable(body: &[String]) -> usize {
     let mut count = 0usize;
-    // git seeds `marker` from the `@@` header line, which is neither '+' nor
-    // '-', so the first body line never triggers an increment on its own.
     let mut marker = b'@';
     for l in body {
         let mut ch = l.as_bytes().first().copied().unwrap_or(b' ');
@@ -515,7 +510,7 @@ fn count_splittable(body: &[String]) -> usize {
         if ch == b'\\' {
             ch = marker;
         }
-        if (marker == b'-' || marker == b'+') && ch == b' ' {
+        if (ch == b'-' || ch == b'+') && marker != b'-' && marker != b'+' {
             count += 1;
         }
         if ch != b'\\' {
@@ -1359,13 +1354,15 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
         let _ = std::fs::remove_file(&edit_path);
 
         // Strip comment lines; collect the remaining body (drop the `@@` header if
-        // present — the prototype keeps the header separate).
-        let stripped = super::replay::strip_comment_lines(&edited, comment);
+        // present -- the prototype keeps the header separate). Do not use the
+        // commit-message stripspace helper here: whitespace-only lines are
+        // meaningful empty context lines in an edited patch.
+        let stripped = strip_hunk_edit_comments(&edited, comment);
         let text = String::from_utf8_lossy(&stripped);
         let mut new_body: Vec<String> = Vec::new();
         let mut saw_content = false;
-        let mut saw_invalid_content = false;
-        for line in text.split('\n') {
+        let edit_lines: Vec<&str> = text.split('\n').collect();
+        for (line_index, line) in edit_lines.iter().enumerate() {
             if line.starts_with("@@ ") {
                 // Header line in the edited buffer: ignore (we recount ourselves).
                 continue;
@@ -1374,19 +1371,30 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
             if matches!(first, Some(b' ') | Some(b'+') | Some(b'-') | Some(b'\\')) {
                 new_body.push(line.to_string());
                 saw_content = true;
+            } else if line.is_empty() && line_index + 1 < edit_lines.len() {
+                // Manual editing permits users/editors to strip the single
+                // marker space from empty context lines. Treat non-final empty
+                // lines as " " context; the final split artifact is skipped.
+                new_body.push(" ".to_string());
+                saw_content = true;
             } else if line.is_empty() {
-                // trailing blank from the split — skip.
+                // trailing blank from the split -- skip.
             } else {
-                saw_invalid_content = true;
+                // Editors can strip the marker space from context lines. Keep
+                // the line as tentative context; validation below rejects it if
+                // the old-side text does not match the index.
+                new_body.push(format!(" {line}"));
+                saw_content = true;
             }
         }
-        if !saw_content && !saw_invalid_content {
+        if !saw_content {
             // The user deleted everything → abort, keep original.
             return EditResult::Abandoned;
         }
 
         // Recount the header from the edited body.
         let (old_count, new_count) = recount_body(&new_body);
+        let splittable_into = count_splittable(&new_body);
         let mut candidate = Hunk {
             old_offset: fd.hunks[hunk_index].old_offset,
             old_count,
@@ -1397,13 +1405,13 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
             display_header: None,
             display_body: Vec::new(),
             use_hunk: HunkUse::Use,
-            splittable_into: 1,
+            splittable_into,
             is_mode_change: false,
         };
 
         // Validate: reassemble a patch (file header + just this candidate hunk) and
         // run `sley apply --cached --check`. On success, commit the edit.
-        if !saw_invalid_content && edited_hunk_applies(fd, &candidate) {
+        if edited_hunk_applies(fd, &candidate) {
             std::mem::swap(&mut fd.hunks[hunk_index], &mut candidate);
             return EditResult::Applied;
         }
@@ -1426,6 +1434,17 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
             None => return EditResult::Eof,
         }
     }
+}
+
+fn strip_hunk_edit_comments(message: &[u8], comment: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(message.len());
+    for line in message.split_inclusive(|&b| b == b'\n') {
+        if line.first() == Some(&comment) {
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    out
 }
 
 /// Recount the `old`/`new` line counts of an edited hunk body.
@@ -1795,6 +1814,7 @@ fn refresh_index() {
 fn apply_hunks(base: &str, fd: &FileDiff) -> String {
     // base lines (preserve trailing newline behavior).
     let had_final_nl = base.ends_with('\n');
+    let mut result_had_final_nl = had_final_nl;
     let mut base_lines: Vec<&str> = base.split('\n').collect();
     if had_final_nl {
         base_lines.pop(); // drop the empty trailing element
@@ -1819,22 +1839,43 @@ fn apply_hunks(base: &str, fd: &FileDiff) -> String {
             cursor += 1;
         }
         // Walk the hunk body.
+        let mut old_pos = start;
+        let mut previous_marker = b'@';
         for line in &h.body {
             let marker = line.as_bytes().first().copied().unwrap_or(b' ');
             let rest = &line[1.min(line.len())..];
             match marker {
                 b' ' => {
+                    if old_pos < cursor {
+                        old_pos += 1;
+                        previous_marker = marker;
+                        continue;
+                    }
                     out.push(rest.to_string());
                     cursor += 1;
+                    old_pos += 1;
                 }
                 b'-' => {
+                    if old_pos < cursor {
+                        old_pos += 1;
+                        previous_marker = marker;
+                        continue;
+                    }
                     cursor += 1;
+                    old_pos += 1;
                 }
                 b'+' => {
                     out.push(rest.to_string());
                 }
-                b'\\' => { /* "\ No newline at end of file" */ }
+                b'\\' => {
+                    if previous_marker != b'-' {
+                        result_had_final_nl = false;
+                    }
+                }
                 _ => {}
+            }
+            if marker != b'\\' {
+                previous_marker = marker;
             }
         }
     }
@@ -1844,9 +1885,9 @@ fn apply_hunks(base: &str, fd: &FileDiff) -> String {
         cursor += 1;
     }
     let mut result = out.join("\n");
-    if had_final_nl && !result.is_empty() {
+    if result_had_final_nl && !result.is_empty() {
         result.push('\n');
-    } else if had_final_nl && result.is_empty() {
+    } else if result_had_final_nl && result.is_empty() {
         // keep empty
     }
     result
