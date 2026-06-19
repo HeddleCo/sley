@@ -1342,6 +1342,11 @@ fn normalize_push_refspec_for_sources(
     let normalized = if let Some((src, dst)) = refspec.split_once(':') {
         let (src, src_kind) = normalize_push_source_refname(src, local_refs);
         let dst = normalize_push_destination_refname(dst, src_kind, remote_refs)?;
+        if !src.is_empty() && push_destination_is_onelevel_under_refs(&dst) {
+            return Err(GitError::Command(format!(
+                "destination refspec {dst} is not a valid ref"
+            )));
+        }
         format!("{src}:{dst}")
     } else {
         let (name, _) = normalize_push_source_refname(refspec, local_refs);
@@ -1508,6 +1513,11 @@ fn normalize_push_destination_refname(
             ))),
         },
     }
+}
+
+fn push_destination_is_onelevel_under_refs(name: &str) -> bool {
+    name.strip_prefix("refs/")
+        .is_some_and(|rest| !rest.contains('/'))
 }
 
 /// The planned commands, dropping the per-command force flags.
