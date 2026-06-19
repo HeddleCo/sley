@@ -514,14 +514,14 @@ fn merge_octopus(
     // head) + MERGE_MSG, but do not create the commit or advance HEAD.
     if options.no_commit {
         sync_octopus_worktree()?;
-        let mut merge_head = String::new();
-        for (_, oid) in &reduced {
-            merge_head.push_str(&format!("{oid}\n"));
-        }
-        fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
-        fs::write(git_dir.join("MERGE_MSG"), merge_msg_file_contents(&message))?;
-        write_merge_mode(git_dir, options)?;
-        fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
+        let other_oids = reduced.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
+        write_merge_state(
+            git_dir,
+            &other_oids,
+            merge_msg_file_contents(&message),
+            options,
+            Some(&head_oid),
+        )?;
         if !options.quiet {
             println!("Automatic merge went well; stopped before committing as requested");
         }
@@ -2761,9 +2761,13 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             &[(target.clone(), other_oid)],
         )?;
         if options.no_commit {
-            fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-            fs::write(git_dir.join("MERGE_MSG"), merge_msg_file_contents(&message))?;
-            write_merge_mode(&git_dir, &options)?;
+            write_merge_state(
+                &git_dir,
+                &[other_oid],
+                merge_msg_file_contents(&message),
+                &options,
+                None,
+            )?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
@@ -3053,9 +3057,13 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         }
 
         if options.no_commit {
-            fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-            fs::write(git_dir.join("MERGE_MSG"), merge_msg_file_contents(&message))?;
-            write_merge_mode(&git_dir, &options)?;
+            write_merge_state(
+                &git_dir,
+                &[other_oid],
+                merge_msg_file_contents(&message),
+                &options,
+                None,
+            )?;
             if merge_autostash {
                 write_merge_autostash_marker(&git_dir)?;
             }
@@ -3078,10 +3086,13 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             stdout.flush()?;
         }
         if options.edit == Some(true) {
-            fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-            fs::write(git_dir.join("MERGE_MSG"), merge_msg_file_contents(&message))?;
-            write_merge_mode(&git_dir, &options)?;
-            fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
+            write_merge_state(
+                &git_dir,
+                &[other_oid],
+                merge_msg_file_contents(&message),
+                &options,
+                Some(&head_oid),
+            )?;
             if merge_autostash {
                 write_merge_autostash_marker(&git_dir)?;
             }
@@ -3249,12 +3260,13 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
-    fs::write(git_dir.join("MERGE_HEAD"), format!("{other_oid}\n"))?;
-    fs::write(
-        git_dir.join("MERGE_MSG"),
+    write_merge_state(
+        &git_dir,
+        &[other_oid],
         format!("{message}\n{merge_msg_conflicts_block}"),
+        &options,
+        None,
     )?;
-    write_merge_mode(&git_dir, &options)?;
     write_rerere_merge_rr(&git_dir, &conflicts)?;
     if merge_autostash {
         write_merge_autostash_marker(&git_dir)?;
@@ -4019,6 +4031,26 @@ fn apply_or_save_merge_autostash(git_dir: &Path, format: ObjectFormat, attempt_a
 fn write_merge_mode(git_dir: &Path, options: &MergeOptions) -> Result<()> {
     let body = if options.no_ff() { "no-ff" } else { "" };
     fs::write(git_dir.join("MERGE_MODE"), body)?;
+    Ok(())
+}
+
+fn write_merge_state(
+    git_dir: &Path,
+    other_oids: &[ObjectId],
+    message: impl AsRef<[u8]>,
+    options: &MergeOptions,
+    orig_head: Option<&ObjectId>,
+) -> Result<()> {
+    let mut merge_head = String::new();
+    for oid in other_oids {
+        merge_head.push_str(&format!("{oid}\n"));
+    }
+    fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+    fs::write(git_dir.join("MERGE_MSG"), message)?;
+    write_merge_mode(git_dir, options)?;
+    if let Some(orig_head) = orig_head {
+        fs::write(git_dir.join("ORIG_HEAD"), format!("{orig_head}\n"))?;
+    }
     Ok(())
 }
 
