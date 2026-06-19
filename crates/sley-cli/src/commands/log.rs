@@ -2541,11 +2541,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // rewriting). Owned binding outlives `selected` (a Vec of references).
     let simplified_storage;
     if !pathspecs.is_empty() || full_history || revision_options.simplify_merges {
-        let pathspec = sley_rev::Pathspec::parse(
-            pathspecs.iter().map(|p| p.as_bytes()),
-            sley_rev::PathspecMatchMagic::default(),
-        )
-        .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
+        let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
         // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for

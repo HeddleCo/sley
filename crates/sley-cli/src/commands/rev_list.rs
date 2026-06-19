@@ -374,6 +374,11 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             setup_args.push(format!("^{}", good.to_hex()));
         }
     }
+    if !matches!(missing_action, RevListMissingAction::Error)
+        && !setup_args.iter().any(|arg| arg == "--ignore-missing")
+    {
+        setup_args.push("--ignore-missing".to_string());
+    }
     let setup = sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {
@@ -471,10 +476,26 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut left_right_sides = HashMap::new();
     for range in &revision_options.symmetric_ranges {
         if (left_right || side_filter.is_some()) && !range.negated {
-            for record in rev_list_walk_commits(&db, format, [range.left], first_parent)? {
+            for record in
+                rev_list_walk_commits_with_missing(
+                    &db,
+                    format,
+                    [range.left],
+                    first_parent,
+                    missing_action,
+                )?
+            {
                 left_right_sides.entry(record.oid).or_insert('<');
             }
-            for record in rev_list_walk_commits(&db, format, [range.right], first_parent)? {
+            for record in
+                rev_list_walk_commits_with_missing(
+                    &db,
+                    format,
+                    [range.right],
+                    first_parent,
+                    missing_action,
+                )?
+            {
                 left_right_sides.entry(record.oid).or_insert('>');
             }
         }
@@ -611,7 +632,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
 
     let mut excluded = HashSet::new();
     for oid in &exclude_tip_oids {
-        for record in rev_list_walk_commits(&db, format, [*oid], first_parent)? {
+        for record in
+            rev_list_walk_commits_with_missing(&db, format, [*oid], first_parent, missing_action)?
+        {
             excluded.insert(record.oid);
         }
     }
@@ -789,7 +812,15 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let commits = match walk_mode {
-        RevListWalkMode::Walk => rev_list_walk_commits(&db, format, include_commits, first_parent)?,
+        RevListWalkMode::Walk => {
+            rev_list_walk_commits_with_missing(
+                &db,
+                format,
+                include_commits,
+                first_parent,
+                missing_action,
+            )?
+        }
         RevListWalkMode::NoWalkSorted | RevListWalkMode::NoWalkUnsorted => {
             rev_list_no_walk_commits(&db, format, include_commits)?
         }
@@ -863,11 +894,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     // owned binding so `selected` (a Vec of references) can borrow from it.
     let simplified_storage;
     if !pathspecs.is_empty() || full_history || revision_options.simplify_merges {
-        let pathspec = sley_rev::Pathspec::parse(
-            pathspecs.iter().map(|p| p.as_bytes()),
-            sley_rev::PathspecMatchMagic::default(),
-        )
-        .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
+        let pathspec = normalized_revwalk_pathspec(&cwd, worktree_root.as_deref(), &pathspecs)?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
         // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for
@@ -1601,7 +1628,7 @@ struct RevListTagObject {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RevListMissingAction {
+pub(crate) enum RevListMissingAction {
     Error,
     Print,
     AllowAny,
