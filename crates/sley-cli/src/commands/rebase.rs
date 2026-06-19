@@ -39,6 +39,18 @@ enum EmptyMode {
     Stop,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RebaseMergesMode {
+    NoRebaseCousins,
+    RebaseCousins,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RebaseMergesArg {
+    Disabled,
+    Enabled(RebaseMergesMode),
+}
+
 struct RebaseArgs {
     action: RebaseAction,
     interactive: bool,
@@ -67,7 +79,7 @@ struct RebaseArgs {
     fork_point: Option<bool>,
     reapply_cherry_picks: Option<bool>,
     update_refs: Option<bool>,
-    rebase_merges: Option<bool>,
+    rebase_merges: Option<RebaseMergesArg>,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
     gpg_sign: Option<String>,
@@ -140,6 +152,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             "--keep-base" => out.keep_base = true,
             "-i" | "--interactive" => out.interactive = true,
+            "-ir" | "-ri" => {
+                out.interactive = true;
+                out.rebase_merges =
+                    Some(RebaseMergesArg::Enabled(RebaseMergesMode::NoRebaseCousins));
+            }
             "-ix" | "-xi" => {
                 out.interactive = true;
                 index += 1;
@@ -284,9 +301,25 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                 }
                 out.whitespace = Some(value.to_string());
             }
-            "--rebase-merges" | "-r" => out.rebase_merges = Some(true),
-            "--no-rebase-merges" => out.rebase_merges = Some(false),
-            _ if arg.starts_with("--rebase-merges=") => out.rebase_merges = Some(true),
+            "--rebase-merges" | "-r" => {
+                out.rebase_merges =
+                    Some(RebaseMergesArg::Enabled(RebaseMergesMode::NoRebaseCousins))
+            }
+            "--no-rebase-merges" => out.rebase_merges = Some(RebaseMergesArg::Disabled),
+            _ if arg.starts_with("--rebase-merges=") => {
+                out.rebase_merges = match &arg["--rebase-merges=".len()..] {
+                    "no-rebase-cousins" => Some(RebaseMergesArg::Enabled(
+                        RebaseMergesMode::NoRebaseCousins,
+                    )),
+                    "rebase-cousins" => {
+                        Some(RebaseMergesArg::Enabled(RebaseMergesMode::RebaseCousins))
+                    }
+                    other => {
+                        eprintln!("fatal: Unknown mode: {other}");
+                        return Err(GitError::Exit(128));
+                    }
+                };
+            }
             "--" => {
                 out.positional.extend(args[index + 1..].iter().cloned());
                 break;
@@ -393,6 +426,8 @@ struct MachineOpts {
     committer_date_is_author_date: bool,
     ignore_date: bool,
     gpg_sign: Option<String>,
+    strategy: Option<String>,
+    strategy_opts: Vec<String>,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
@@ -447,6 +482,12 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         };
         fs::write(dir.join("gpg_sign_opt"), format!("{opt}\n"))?;
     }
+    if let Some(strategy) = &opts.strategy {
+        fs::write(dir.join("strategy"), format!("{strategy}\n"))?;
+    }
+    if !opts.strategy_opts.is_empty() {
+        fs::write(dir.join("strategy_opts"), opts.strategy_opts.join("\n") + "\n")?;
+    }
     Ok(())
 }
 
@@ -471,6 +512,10 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
     let signoff = exists("signoff");
     let gpg_sign = seq::read_state_line(&ctx.git_dir, "gpg_sign_opt")
         .and_then(|value| value.strip_prefix("-S").map(str::to_string));
+    let strategy = seq::read_state_line(&ctx.git_dir, "strategy");
+    let strategy_opts = fs::read_to_string(ctx.state_path("strategy_opts"))
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default();
     Ok(MachineOpts {
         quiet: exists("quiet"),
         verbose: exists("verbose"),
@@ -482,6 +527,8 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         committer_date_is_author_date: exists("cdate_is_adate"),
         ignore_date: exists("ignore_date"),
         gpg_sign,
+        strategy,
+        strategy_opts,
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -710,6 +757,18 @@ fn rebase_config_bool(ctx: &Ctx, section: &str, key: &str) -> Option<bool> {
     }
 }
 
+fn rebase_merges_config(ctx: &Ctx) -> Option<RebaseMergesMode> {
+    let value = rebase_config_value(ctx, "rebase", "rebaseMerges")?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" | "no-rebase-cousins" => {
+            Some(RebaseMergesMode::NoRebaseCousins)
+        }
+        "rebase-cousins" => Some(RebaseMergesMode::RebaseCousins),
+        "false" | "no" | "off" | "0" | "" => None,
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -839,9 +898,11 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     let refs = ctx.refs();
 
     let interactive_explicit = args.interactive;
-    let config_rebase_merges = args
-        .rebase_merges
-        .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "rebaseMerges").unwrap_or(false));
+    let rebase_merges = match args.rebase_merges {
+        Some(RebaseMergesArg::Disabled) => None,
+        Some(RebaseMergesArg::Enabled(mode)) => Some(mode),
+        None => rebase_merges_config(ctx),
+    };
     let config_update_refs = args
         .update_refs
         .unwrap_or_else(|| rebase_config_bool(ctx, "rebase", "updateRefs").unwrap_or(false));
@@ -862,7 +923,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         || args.keep_empty
         || args.reapply_cherry_picks.is_some()
         || (args.root && args.onto_name.is_none())
-        || config_rebase_merges
+        || rebase_merges.is_some()
         || config_update_refs
         || args.strategy.is_some()
         || !other_strategy_opts.is_empty();
@@ -873,7 +934,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     let use_apply_backend =
         args.apply_backend || args.whitespace.is_some() || args.context_lines.is_some();
     if use_apply_backend && implied_merge {
-        if args.rebase_merges.is_none() && config_rebase_merges {
+        if args.rebase_merges.is_none() && rebase_merges.is_some() {
             eprintln!(
                 "fatal: apply options are incompatible with rebase.rebaseMerges; use --no-rebase-merges"
             );
@@ -1183,6 +1244,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         committer_date_is_author_date: args.committer_date_is_author_date,
         ignore_date: args.ignore_date,
         gpg_sign: args.gpg_sign.clone(),
+        strategy: args.strategy.clone(),
+        strategy_opts: args.strategy_opts.clone(),
         head_name: head_name.clone(),
         onto,
         orig_head,
@@ -1190,24 +1253,37 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     };
 
     // Generate the todo list.
-    let records = make_script_commits(
-        ctx,
-        &db,
-        upstream.as_ref(),
-        &orig_head,
-        args.keep_empty,
-        args.reapply_cherry_picks.unwrap_or(false),
-    )?;
-    let mut items: Vec<RebaseTodoItem> = records
-        .iter()
-        .map(|record| RebaseTodoItem {
-            command: TodoCommand::Pick,
-            flags: 0,
-            oid: Some(record.oid),
-            arg: format!("# {}", commit_subject(&record.commit.message)),
-            raw: String::new(),
-        })
-        .collect();
+    let mut items: Vec<RebaseTodoItem> = if let Some(mode) = rebase_merges {
+        make_script_with_merges(
+            ctx,
+            &db,
+            upstream.as_ref(),
+            &orig_head,
+            args.keep_empty,
+            args.reapply_cherry_picks.unwrap_or(false),
+            mode,
+            args.root && args.onto_name.is_some(),
+        )?
+    } else {
+        let records = make_script_commits(
+            ctx,
+            &db,
+            upstream.as_ref(),
+            &orig_head,
+            args.keep_empty,
+            args.reapply_cherry_picks.unwrap_or(false),
+        )?;
+        records
+            .iter()
+            .map(|record| RebaseTodoItem {
+                command: TodoCommand::Pick,
+                flags: 0,
+                oid: Some(record.oid),
+                arg: format!("# {}", commit_subject(&record.commit.message)),
+                raw: String::new(),
+            })
+            .collect()
+    };
 
     write_basic_state(ctx, &opts)?;
     let _ = fs::remove_file(ctx.git_dir.join("REBASE_HEAD"));
@@ -1791,6 +1867,363 @@ fn make_script_commits(
         out.push(record);
     }
     Ok(out)
+}
+
+fn make_script_with_merges(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    upstream: Option<&ObjectId>,
+    orig_head: &ObjectId,
+    keep_empty: bool,
+    reapply_cherry_picks: bool,
+    mode: RebaseMergesMode,
+    root_with_onto: bool,
+) -> Result<Vec<RebaseTodoItem>> {
+    let mut excluded = std::collections::HashSet::new();
+    if let Some(upstream) = upstream {
+        let mut queue = vec![*upstream];
+        while let Some(oid) = queue.pop() {
+            if !excluded.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            queue.extend(record.parents.iter().copied());
+        }
+    }
+
+    let upstream_patch_ids: std::collections::HashSet<Vec<u8>> = if reapply_cherry_picks {
+        std::collections::HashSet::new()
+    } else if let Some(upstream) = upstream {
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
+        let mut base_reachable = std::collections::HashSet::new();
+        let mut bq: Vec<ObjectId> = bases.clone();
+        while let Some(oid) = bq.pop() {
+            if !base_reachable.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            bq.extend(record.parents.iter().copied());
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut uq = vec![*upstream];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(oid) = uq.pop() {
+            if base_reachable.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            uq.extend(record.parents.iter().copied());
+            if record.parents.len() > 1 {
+                continue;
+            }
+            if let Some(id) = commit_patch_id(db, ctx.format, &record)? {
+                ids.insert(id);
+            }
+        }
+        ids
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let mut records: BTreeMap<ObjectId, sley_rev::CommitRecord> = BTreeMap::new();
+    let mut queue = vec![*orig_head];
+    while let Some(oid) = queue.pop() {
+        if excluded.contains(&oid) || records.contains_key(&oid) {
+            continue;
+        }
+        let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+        queue.extend(record.parents.iter().copied());
+        records.insert(oid, record);
+    }
+
+    let mut indegree: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    let mut children: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+    for (oid, record) in &records {
+        indegree.entry(*oid).or_insert(0);
+        for parent in &record.parents {
+            if records.contains_key(parent) {
+                *indegree.entry(*oid).or_insert(0) += 1;
+                children.entry(*parent).or_default().push(*oid);
+            }
+        }
+    }
+    let mut ready: Vec<ObjectId> = indegree
+        .iter()
+        .filter(|&(_, &deg)| deg == 0)
+        .map(|(oid, _)| *oid)
+        .collect();
+    let mut sorted = Vec::new();
+    while let Some(oid) = ready.pop() {
+        sorted.push(oid);
+        if let Some(kids) = children.get(&oid) {
+            for kid in kids.clone() {
+                let deg = indegree.get_mut(&kid).expect("child has indegree");
+                *deg -= 1;
+                if *deg == 0 {
+                    ready.push(kid);
+                }
+            }
+        }
+    }
+
+    let branch_labels = branch_labels_by_oid(ctx)?;
+    let mut used_labels = std::collections::HashSet::new();
+    used_labels.insert("onto".to_string());
+    let mut labels: BTreeMap<ObjectId, String> = BTreeMap::new();
+    let mut commit_todo: BTreeMap<ObjectId, RebaseTodoItem> = BTreeMap::new();
+    let mut tips = Vec::new();
+
+    for oid in &sorted {
+        let record = records.get(oid).expect("sorted record exists");
+        let parent_tree = match record.parents.first() {
+            Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
+            None => ObjectId::empty_tree(ctx.format),
+        };
+        let is_empty = record.commit.tree == parent_tree;
+        if is_empty && !keep_empty {
+            continue;
+        }
+        if record.parents.len() <= 1
+            && !upstream_patch_ids.is_empty()
+            && !is_empty
+            && let Some(id) = commit_patch_id(db, ctx.format, record)?
+            && upstream_patch_ids.contains(&id)
+        {
+            continue;
+        }
+
+        if record.parents.len() > 1 {
+            let message_label = merge_label_from_message(&record.commit.message);
+            let mut arg = String::new();
+            for parent in record.parents.iter().skip(1) {
+                if !arg.is_empty() {
+                    arg.push(' ');
+                }
+                let label = if records.contains_key(parent) {
+                    let base = branch_labels
+                        .get(parent)
+                        .cloned()
+                        .unwrap_or_else(|| message_label.clone());
+                    let label = ensure_label(parent, &base, &mut labels, &mut used_labels, db);
+                    if !tips.contains(parent) {
+                        tips.push(*parent);
+                    }
+                    label
+                } else {
+                    label_for_oid(parent, &mut labels, &mut used_labels, db)
+                };
+                arg.push_str(&label);
+            }
+            arg.push_str(" # ");
+            arg.push_str(&commit_subject(&record.commit.message));
+            commit_todo.insert(
+                *oid,
+                RebaseTodoItem {
+                    command: TodoCommand::Merge,
+                    flags: 0,
+                    oid: Some(*oid),
+                    arg,
+                    raw: String::new(),
+                },
+            );
+        } else {
+            commit_todo.insert(
+                *oid,
+                RebaseTodoItem {
+                    command: TodoCommand::Pick,
+                    flags: 0,
+                    oid: Some(*oid),
+                    arg: format!("# {}", commit_subject(&record.commit.message)),
+                    raw: String::new(),
+                },
+            );
+        }
+    }
+
+    let mut child_seen = std::collections::HashSet::new();
+    for oid in &sorted {
+        let record = records.get(oid).expect("sorted record exists");
+        for parent in &record.parents {
+            if !records.contains_key(parent) {
+                continue;
+            }
+            if !child_seen.insert(*parent) {
+                ensure_label(
+                    parent,
+                    "branch-point",
+                    &mut labels,
+                    &mut used_labels,
+                    db,
+                );
+            }
+        }
+    }
+    if !tips.contains(orig_head) {
+        tips.push(*orig_head);
+    }
+
+    let mut out = vec![RebaseTodoItem {
+        command: TodoCommand::Label,
+        flags: 0,
+        oid: None,
+        arg: "onto".to_string(),
+        raw: String::new(),
+    }];
+    let mut shown = std::collections::HashSet::new();
+    for tip in tips {
+        if shown.contains(&tip) {
+            continue;
+        }
+        let Some(mut current) = Some(tip) else {
+            continue;
+        };
+        let branch_label = labels.get(&tip).cloned();
+        out.push(RebaseTodoItem::comment(""));
+        if let Some(label) = branch_label {
+            out.push(RebaseTodoItem::comment(&format!("# Branch {label}")));
+        }
+
+        let mut list = Vec::new();
+        let stop = loop {
+            if !records.contains_key(&current) || shown.contains(&current) {
+                break Some(current);
+            }
+            list.push(current);
+            let record = records.get(&current).expect("record exists");
+            let Some(parent) = record.parents.first().copied() else {
+                break None;
+            };
+            current = parent;
+        };
+        list.reverse();
+
+        let reset_arg = match stop {
+            None => {
+                if mode == RebaseMergesMode::RebaseCousins || root_with_onto {
+                    "onto".to_string()
+                } else {
+                    "[new root]".to_string()
+                }
+            }
+            Some(oid) => {
+                if let Some(label) = labels.get(&oid) {
+                    format!("{label} # {}", commit_subject(&records[&oid].commit.message))
+                } else {
+                    "onto".to_string()
+                }
+            }
+        };
+        out.push(RebaseTodoItem {
+            command: TodoCommand::Reset,
+            flags: 0,
+            oid: None,
+            arg: reset_arg,
+            raw: String::new(),
+        });
+
+        for oid in list {
+            if let Some(item) = commit_todo.get(&oid) {
+                out.push(item.clone());
+            }
+            if let Some(label) = labels.get(&oid) {
+                out.push(RebaseTodoItem {
+                    command: TodoCommand::Label,
+                    flags: 0,
+                    oid: None,
+                    arg: label.clone(),
+                    raw: String::new(),
+                });
+            }
+            shown.insert(oid);
+        }
+    }
+    Ok(out)
+}
+
+fn branch_labels_by_oid(ctx: &Ctx) -> Result<BTreeMap<ObjectId, String>> {
+    let refs = ctx.refs();
+    let mut out = BTreeMap::new();
+    for reference in refs.list_refs()? {
+        if let Some(short) = reference.name.strip_prefix("refs/heads/")
+            && let RefTarget::Direct(oid) = reference.target
+        {
+            out.entry(oid).or_insert_with(|| short.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn ensure_label(
+    oid: &ObjectId,
+    base: &str,
+    labels: &mut BTreeMap<ObjectId, String>,
+    used: &mut std::collections::HashSet<String>,
+    db: &FileObjectDatabase,
+) -> String {
+    if let Some(label) = labels.get(oid) {
+        return label.clone();
+    }
+    let mut label = sanitize_label(base);
+    if label.is_empty() {
+        label = find_unique_abbrev_hex(db, oid);
+    }
+    let original = label.clone();
+    let mut n = 2usize;
+    while used.contains(&label) {
+        label = format!("{original}-{n}");
+        n += 1;
+    }
+    used.insert(label.clone());
+    labels.insert(*oid, label.clone());
+    label
+}
+
+fn label_for_oid(
+    oid: &ObjectId,
+    labels: &mut BTreeMap<ObjectId, String>,
+    used: &mut std::collections::HashSet<String>,
+    db: &FileObjectDatabase,
+) -> String {
+    ensure_label(oid, &find_unique_abbrev_hex(db, oid), labels, used, db)
+}
+
+fn sanitize_label(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in input.trim().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with(['-', '.']) {
+        out.pop();
+    }
+    if out == "onto" {
+        out.push_str("-2");
+    }
+    out
+}
+
+fn merge_label_from_message(message: &[u8]) -> String {
+    let subject = commit_subject(message);
+    if let Some(rest) = subject.strip_prefix("Merge ")
+        && let Some(start) = rest.find('\'')
+    {
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('\'') {
+            return after[..end].to_string();
+        }
+    }
+    if let Some(rest) = subject.strip_prefix("Merge pull request ")
+        && let Some((_, name)) = rest.split_once(" from ")
+    {
+        return name.to_string();
+    }
+    subject
 }
 
 /// Patch-id of a single (non-merge) commit's diff against its first parent, for
@@ -2435,7 +2868,10 @@ fn pick_commits(
                 do_label(ctx, &item.arg)?;
             }
             TodoCommand::Reset => {
-                do_reset(ctx, db, &item.arg)?;
+                if let Err(err) = do_reset(ctx, db, opts, &item.arg) {
+                    reschedule_current(ctx, db, todo, &item)?;
+                    return Err(err);
+                }
             }
             TodoCommand::Merge => {
                 let stop = do_merge(ctx, db, opts, todo, &item)?;
@@ -2449,7 +2885,11 @@ fn pick_commits(
             TodoCommand::Noop | TodoCommand::Drop | TodoCommand::Comment | TodoCommand::Revert => {}
         }
 
-        todo.current += 1;
+        if todo.current == usize::MAX {
+            todo.current = 0;
+        } else {
+            todo.current += 1;
+        }
     }
 
     finish_rebase(ctx, opts)
@@ -2565,17 +3005,45 @@ fn do_label(ctx: &Ctx, name: &str) -> Result<()> {
     tx.commit()
 }
 
-fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Result<()> {
-    let name = name.trim();
+fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) -> Result<()> {
+    let name = todo_arg_before_comment(name);
     let target = {
-        let refname = format!("refs/rewritten/{name}");
-        let refs = ctx.refs();
-        match refs.read_ref(&refname)? {
-            Some(RefTarget::Direct(oid)) => oid,
-            _ => resolve_revision(&ctx.git_dir, ctx.format, name)
-                .and_then(|oid| sley_rev::peel_to_commit(db, ctx.format, &oid))?,
+        if name == "[new root]" {
+            match opts.squash_onto {
+                Some(oid) => oid,
+                None => {
+                    let oid = create_squash_onto(ctx)?;
+                    fs::write(ctx.state_path("squash-onto"), format!("{oid}\n"))?;
+                    oid
+                }
+            }
+        } else {
+            let refname = format!("refs/rewritten/{name}");
+            let refs = ctx.refs();
+            match refs.read_ref(&refname)? {
+                Some(RefTarget::Direct(oid)) => oid,
+                _ if name.starts_with("refs/") || looks_like_object_name(name) || name.contains('^') => {
+                    resolve_reset_target(ctx, db, name)?
+                }
+                _ => {
+                    eprintln!("error: could not resolve '{name}'");
+                    return Err(GitError::Exit(1));
+                }
+            }
         }
     };
+    let target_tree = commit_tree_oid(db, ctx.format, &target)?;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &target_tree)?;
+    if !overwritten.is_empty() {
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by reset:"
+        );
+        for path in &overwritten {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please move or remove them before you reset.");
+        return Err(GitError::Exit(1));
+    }
     sley_worktree::reset_index_and_worktree_to_commit(
         &ctx.worktree_root,
         &ctx.git_dir,
@@ -2589,14 +3057,459 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Result<()> {
 }
 
 fn do_merge(
-    _ctx: &Ctx,
-    _db: &FileObjectDatabase,
-    _opts: &MachineOpts,
-    _todo: &mut TodoList,
-    _item: &RebaseTodoItem,
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    opts: &MachineOpts,
+    todo: &mut TodoList,
+    item: &RebaseTodoItem,
 ) -> Result<PickOutcome> {
-    eprintln!("error: 'merge' todo commands are not implemented by sley rebase yet");
-    Ok(PickOutcome::Fail(1))
+    let (labels, oneline) = parse_merge_todo_arg(&item.arg);
+    if labels.is_empty() {
+        eprintln!("error: nothing to merge: '{}'", item.arg);
+        return Ok(PickOutcome::Fail(1));
+    }
+    let mut merge_heads = Vec::new();
+    for label in &labels {
+        match resolve_merge_label(ctx, db, label)? {
+            Some(oid) => merge_heads.push((label.clone(), oid)),
+            None => {
+                eprintln!("error: unable to parse '{label}'");
+                return Ok(PickOutcome::Fail(1));
+            }
+        }
+    }
+
+    let refs = ctx.refs();
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
+    let original = match item.oid {
+        Some(oid) => Some(read_rev_list_commit_record(db, ctx.format, oid)?),
+        None => None,
+    };
+
+    if opts.squash_onto == Some(head) && merge_heads.len() == 1 {
+        let target = merge_heads[0].1;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &ctx.worktree_root,
+            &ctx.git_dir,
+            ctx.format,
+            &target,
+        )?;
+        let committer = commit_identity_from_env("COMMITTER")?;
+        detach_head_with_reflog(ctx, head, target, ctx.reflog("merge", None), committer)?;
+        return Ok(PickOutcome::Continue);
+    }
+
+    if opts.allow_ff
+        && let Some(record) = &original
+        && record.parents.first() == Some(&head)
+        && record.parents[1..]
+            .iter()
+            .copied()
+            .eq(merge_heads.iter().map(|(_, oid)| *oid))
+    {
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &ctx.worktree_root,
+            &ctx.git_dir,
+            ctx.format,
+            &record.oid,
+        )?;
+        let committer = commit_identity_from_env("COMMITTER")?;
+        detach_head_with_reflog(
+            ctx,
+            head,
+            record.oid,
+            format!("{}: fast-forward", ctx.reflog_action).into_bytes(),
+            committer,
+        )?;
+        record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+        if item.flags & seq::FLAG_EDIT_MERGE_MSG != 0 {
+            let result = machine_commit(
+                ctx,
+                db,
+                opts,
+                MachineCommit {
+                    amend: true,
+                    edit: true,
+                    cleanup_message: true,
+                    allow_empty: true,
+                    create_root: false,
+                    message_file: None,
+                    reflog_sub: "merge",
+                    original: Some(record),
+                },
+            )?;
+            if let CommitOutcome::Failed(code) = result {
+                return Ok(PickOutcome::Fail(code));
+            }
+            reread_todo_if_changed(ctx, db, todo)?;
+        }
+        return Ok(PickOutcome::Continue);
+    }
+
+    if merge_heads.len() > 1 {
+        return do_octopus_merge_commit(
+            ctx,
+            db,
+            opts,
+            todo,
+            item,
+            &merge_heads,
+            original.as_ref(),
+            oneline,
+        );
+    }
+
+    let (label, merge_head) = &merge_heads[0];
+    if sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, merge_head, &head)? {
+        return Ok(PickOutcome::Continue);
+    }
+
+    if let Some(strategy) = &opts.strategy
+        && !matches!(strategy.as_str(), "ort" | "recursive" | "resolve")
+    {
+        return do_custom_strategy_merge(
+            ctx,
+            db,
+            opts,
+            todo,
+            item,
+            original.as_ref(),
+            &labels,
+            oneline.as_deref(),
+            head,
+            *merge_head,
+            strategy,
+        );
+    }
+
+    let merge_tree = commit_tree_oid(db, ctx.format, merge_head)?;
+    let overwritten = checkout_would_overwrite_untracked(ctx, db, &merge_tree)?;
+    if !overwritten.is_empty() {
+        if let Some(record) = &original {
+            fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
+        }
+        reschedule_current(ctx, db, todo, item)?;
+        return Ok(PickOutcome::Fail(1));
+    }
+
+    let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, &head, merge_head)?;
+    let base_tree = match bases.first() {
+        Some(base) => commit_tree_oid(db, ctx.format, base)?,
+        None => ObjectId::empty_tree(ctx.format),
+    };
+    let head_tree = commit_tree_oid(db, ctx.format, &head)?;
+    let base_map = stash_tree_entry_map(db, ctx.format, &base_tree)?;
+    let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
+    let theirs_map = stash_tree_entry_map(db, ctx.format, &merge_tree)?;
+    let write_db = ctx.db();
+    let (results, conflicts) = three_way_merge_trees(
+        &write_db,
+        ctx.format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        "HEAD",
+        label,
+    )?;
+
+    let message = merge_todo_message(ctx, item, original.as_ref(), &labels, oneline.as_deref())?;
+    fs::write(ctx.git_dir.join("MERGE_MSG"), &message)?;
+    fs::write(ctx.state_path("message"), &message)?;
+    fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
+
+    apply_merge_results(ctx, db, &results, &ours_map, !conflicts.is_empty())?;
+    if !conflicts.is_empty() {
+        let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+        fs::write(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
+        for path in &conflicts {
+            let display = String::from_utf8_lossy(path);
+            println!("Auto-merging {display}");
+            println!("CONFLICT (content): Merge conflict in {display}");
+        }
+        print_conflict_hints();
+        if let Some(record) = &original {
+            return stop_with_patch(ctx, db, opts, record, item, 1, false);
+        }
+        return Ok(PickOutcome::Fail(1));
+    }
+
+    let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    create_merge_commit_from_index(
+        ctx,
+        original.as_ref(),
+        tree,
+        vec![head, *merge_head],
+        &message,
+    )?;
+    if let Some(record) = &original {
+        record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+    }
+    if item.flags & seq::FLAG_EDIT_MERGE_MSG != 0 {
+        let result = machine_commit(
+            ctx,
+            db,
+            opts,
+            MachineCommit {
+                amend: true,
+                edit: true,
+                cleanup_message: true,
+                allow_empty: true,
+                create_root: false,
+                message_file: None,
+                reflog_sub: "merge",
+                original: original.as_ref(),
+            },
+        )?;
+        if let CommitOutcome::Failed(code) = result {
+            return Ok(PickOutcome::Fail(code));
+        }
+        reread_todo_if_changed(ctx, db, todo)?;
+    }
+    Ok(PickOutcome::Continue)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_custom_strategy_merge(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    opts: &MachineOpts,
+    todo: &mut TodoList,
+    item: &RebaseTodoItem,
+    original: Option<&sley_rev::CommitRecord>,
+    labels: &[String],
+    oneline: Option<&str>,
+    head: ObjectId,
+    merge_head: ObjectId,
+    strategy: &str,
+) -> Result<PickOutcome> {
+    let message = merge_todo_message(ctx, item, original, labels, oneline)?;
+    fs::write(ctx.git_dir.join("MERGE_MSG"), &message)?;
+    fs::write(ctx.state_path("message"), &message)?;
+    fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
+
+    let args = opts
+        .strategy_opts
+        .iter()
+        .map(|opt| format!("--{opt}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = if args.is_empty() {
+        format!("git-merge-{strategy}")
+    } else {
+        format!("git-merge-{strategy} {args}")
+    };
+    let status = commands::tool_launch::run_tool_shell(
+        &command,
+        &commands::tool_launch::ToolEnvironment::default(),
+    )?;
+    if status != 0 {
+        return Ok(PickOutcome::Fail(status));
+    }
+
+    let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    create_merge_commit_from_index(ctx, original, tree, vec![head, merge_head], &message)?;
+    if let Some(record) = original {
+        record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+    }
+    if item.flags & seq::FLAG_EDIT_MERGE_MSG != 0 {
+        let result = machine_commit(
+            ctx,
+            db,
+            opts,
+            MachineCommit {
+                amend: true,
+                edit: true,
+                cleanup_message: true,
+                allow_empty: true,
+                create_root: false,
+                message_file: None,
+                reflog_sub: "merge",
+                original,
+            },
+        )?;
+        if let CommitOutcome::Failed(code) = result {
+            return Ok(PickOutcome::Fail(code));
+        }
+        reread_todo_if_changed(ctx, db, todo)?;
+    }
+    Ok(PickOutcome::Continue)
+}
+
+fn todo_arg_before_comment(arg: &str) -> &str {
+    arg.split_once(" # ")
+        .map(|(left, _)| left.trim())
+        .unwrap_or_else(|| arg.trim())
+}
+
+fn looks_like_object_name(name: &str) -> bool {
+    name.len() >= 7 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn resolve_reset_target(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Result<ObjectId> {
+    let oid = match resolve_revision(&ctx.git_dir, ctx.format, name) {
+        Ok(oid) => oid,
+        Err(err) => return Err(err),
+    };
+    match sley_rev::peel_to_commit(db, ctx.format, &oid) {
+        Ok(commit) => Ok(commit),
+        Err(_) => {
+            if let Ok(object) = db.read_object(&oid) {
+                eprintln!("error: object {oid} is a {}", object.object_type.as_str());
+                return Err(GitError::Exit(1));
+            }
+            Err(GitError::InvalidObject(format!("{name} does not point to a commit")))
+        }
+    }
+}
+
+fn parse_merge_todo_arg(arg: &str) -> (Vec<String>, Option<String>) {
+    let (left, oneline) = match arg.split_once(" # ") {
+        Some((left, right)) => (left, Some(right.trim().to_string())),
+        None => (arg, None),
+    };
+    (
+        left.split_whitespace().map(str::to_string).collect(),
+        oneline,
+    )
+}
+
+fn resolve_merge_label(ctx: &Ctx, db: &FileObjectDatabase, label: &str) -> Result<Option<ObjectId>> {
+    let refs = ctx.refs();
+    let rewritten = format!("refs/rewritten/{label}");
+    if let Some(RefTarget::Direct(oid)) = refs.read_ref(&rewritten)? {
+        return Ok(Some(oid));
+    }
+    match resolve_revision(&ctx.git_dir, ctx.format, label)
+        .and_then(|oid| sley_rev::peel_to_commit(db, ctx.format, &oid))
+    {
+        Ok(oid) => Ok(Some(oid)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn merge_todo_message(
+    ctx: &Ctx,
+    item: &RebaseTodoItem,
+    original: Option<&sley_rev::CommitRecord>,
+    labels: &[String],
+    oneline: Option<&str>,
+) -> Result<Vec<u8>> {
+    if let Some(record) = original {
+        if let Some(script) = seq::format_author_script(&record.commit.author) {
+            fs::write(ctx.state_path("author-script"), script)?;
+        }
+        return Ok(record.commit.message.clone());
+    }
+    if let Some(oneline) = oneline {
+        let mut message = oneline.as_bytes().to_vec();
+        message.push(b'\n');
+        return Ok(message);
+    }
+    let message = if labels.len() > 1 {
+        format!("Merge branches '{}'\n", labels.join(" "))
+    } else {
+        format!("Merge branch '{}'\n", labels[0])
+    };
+    let _ = item;
+    Ok(message.into_bytes())
+}
+
+fn create_merge_commit_from_index(
+    ctx: &Ctx,
+    original: Option<&sley_rev::CommitRecord>,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    message: &[u8],
+) -> Result<()> {
+    let refs = ctx.refs();
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let author = match read_author_script_identity(ctx)? {
+        Some(identity) => identity,
+        None => match original {
+            Some(record) => record.commit.author.clone(),
+            None => commit_identity_from_env("AUTHOR")?,
+        },
+    };
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let mut writer = ctx.db();
+    let new_oid = sley_sequencer::create_commit(
+        &mut writer,
+        sley_sequencer::CommitCreate {
+            tree,
+            parents,
+            author,
+            committer: committer.clone(),
+            message: strip_comment_lines(message, comment_char(&ctx.git_dir)),
+            encoding: None,
+        },
+    )?;
+    let subject = commit_subject(message);
+    detach_head_with_reflog(ctx, head, new_oid, ctx.reflog("merge", Some(&subject)), committer)?;
+    let _ = fs::remove_file(ctx.git_dir.join("MERGE_HEAD"));
+    let _ = fs::remove_file(ctx.git_dir.join("MERGE_MODE"));
+    let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    Ok(())
+}
+
+fn do_octopus_merge_commit(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    _opts: &MachineOpts,
+    todo: &mut TodoList,
+    item: &RebaseTodoItem,
+    merge_heads: &[(String, ObjectId)],
+    original: Option<&sley_rev::CommitRecord>,
+    oneline: Option<String>,
+) -> Result<PickOutcome> {
+    let refs = ctx.refs();
+    let head =
+        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
+    let mut merged_tree = commit_tree_oid(db, ctx.format, &head)?;
+    let mut parents = vec![head];
+    for (label, oid) in merge_heads {
+        if sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, oid, &head)? {
+            continue;
+        }
+        let base = merge_bases(&ctx.common_git_dir, db, ctx.format, &head, oid)?
+            .first()
+            .copied()
+            .map(|base| commit_tree_oid(db, ctx.format, &base))
+            .transpose()?
+            .unwrap_or_else(|| ObjectId::empty_tree(ctx.format));
+        let base_map = stash_tree_entry_map(db, ctx.format, &base)?;
+        let ours_map = stash_tree_entry_map(db, ctx.format, &merged_tree)?;
+        let theirs_tree = commit_tree_oid(db, ctx.format, oid)?;
+        let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
+        let write_db = ctx.db();
+        let (results, conflicts) = three_way_merge_trees(
+            &write_db,
+            ctx.format,
+            &base_map,
+            &ours_map,
+            &theirs_map,
+            "HEAD",
+            label,
+        )?;
+        apply_merge_results(ctx, db, &results, &ours_map, !conflicts.is_empty())?;
+        if !conflicts.is_empty() {
+            return Ok(PickOutcome::Fail(1));
+        }
+        merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+        parents.push(*oid);
+    }
+    if parents.len() == 1 {
+        return Ok(PickOutcome::Continue);
+    }
+    let labels: Vec<String> = merge_heads.iter().map(|(label, _)| label.clone()).collect();
+    let message = merge_todo_message(ctx, item, original, &labels, oneline.as_deref())?;
+    create_merge_commit_from_index(ctx, original, merged_tree, parents, &message)?;
+    if let Some(record) = original {
+        record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+    }
+    Ok(PickOutcome::Continue)
 }
 
 // ---------------------------------------------------------------------------
@@ -3672,6 +4585,7 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     run_post_rewrite_hook(ctx)?;
 
     apply_autostash(ctx);
+    cleanup_rewritten_refs(ctx);
 
     if !opts.quiet {
         eprintln!("Successfully rebased and updated {head_name_display}.");
@@ -3748,7 +4662,20 @@ fn finish_rebase_cleanup(ctx: &Ctx) {
     let _ = fs::remove_file(ctx.git_dir.join("REBASE_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("AUTO_MERGE"));
     apply_autostash(ctx);
+    cleanup_rewritten_refs(ctx);
     seq::remove_merge_state(&ctx.git_dir);
+}
+
+fn cleanup_rewritten_refs(ctx: &Ctx) {
+    let refs = ctx.refs();
+    let Ok(all_refs) = refs.list_refs() else {
+        return;
+    };
+    for reference in all_refs {
+        if reference.name.starts_with("refs/rewritten/") {
+            let _ = refs.delete_ref(&reference.name);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4024,6 +4951,7 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
 
 fn rebase_quit(ctx: &Ctx) -> Result<()> {
     save_autostash(ctx);
+    cleanup_rewritten_refs(ctx);
     seq::remove_merge_state(&ctx.git_dir);
     let _ = fs::remove_file(ctx.git_dir.join("REBASE_HEAD"));
     Ok(())

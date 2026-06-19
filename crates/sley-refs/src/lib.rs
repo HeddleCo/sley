@@ -2140,7 +2140,10 @@ impl FileRefStore {
     }
 
     fn ref_base_dir(&self, name: &str) -> &Path {
-        if is_root_ref_syntax(name) || name.starts_with("refs/worktree/") {
+        if is_root_ref_syntax(name)
+            || name.starts_with("refs/worktree/")
+            || name.starts_with("refs/rewritten/")
+        {
             &self.git_dir
         } else {
             &self.common_dir
@@ -4210,6 +4213,7 @@ fn packable_loose_ref_name(name: &str) -> bool {
     name.starts_with("refs/")
         && !name.starts_with("refs/bisect/")
         && !name.starts_with("refs/worktree/")
+        && !name.starts_with("refs/rewritten/")
 }
 
 fn pack_refs_auto_required_for(packed_path: &Path, loose_count: usize) -> Result<bool> {

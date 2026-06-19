@@ -1455,6 +1455,8 @@ fn checkout_create_or_reset_branch(
         }
         Err(err) => return Err(err),
     };
+    let db = FileObjectDatabase::from_git_dir(start_git_dir, format);
+    let start_oid = sley_rev::peel_to_commit(&db, format, &start_oid)?;
     if let Some(existing) = existing {
         let old_oid = match existing {
             RefTarget::Direct(oid) => oid,
