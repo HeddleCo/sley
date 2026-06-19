@@ -3487,6 +3487,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut mirror = false;
     let mut all_refs = false;
     let mut tags = false;
+    let mut prune = false;
     // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
     // bare flag (lease every pushed ref against its remote-tracking ref).
     let mut force_with_lease_default = false;
@@ -3511,6 +3512,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             "--atomic" => atomic = true,
             "--no-atomic" => atomic = false,
             "--mirror" => mirror = true,
+            "--prune" => prune = true,
+            "--no-prune" => prune = false,
             "--all" | "--branches" => all_refs = true,
             "--tags" => tags = true,
             "--force-with-lease" => force_with_lease_default = true,
@@ -3657,7 +3660,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     } = &destination
     {
         // `--mirror` also deletes remote refs the local repo no longer has.
-        if mirror {
+        if mirror || prune {
             let remote_advertisements =
                 sley_remote::local_fetch_advertisements(remote_git_dir, format)?;
             let local_names: std::collections::HashSet<String> = store
@@ -3665,12 +3668,16 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 .into_iter()
                 .map(|reference| reference.name)
                 .collect();
-            for advertisement in &remote_advertisements {
-                if advertisement.name.starts_with("refs/")
-                    && !local_names.contains(&advertisement.name)
-                {
-                    refspecs.push(format!(":{}", advertisement.name));
+            if mirror {
+                for advertisement in &remote_advertisements {
+                    if advertisement.name.starts_with("refs/")
+                        && !local_names.contains(&advertisement.name)
+                    {
+                        refspecs.push(format!(":{}", advertisement.name));
+                    }
                 }
+            } else {
+                append_push_prune_refspecs(&mut refspecs, &remote_advertisements, &local_names);
             }
         }
         let force_with_lease =
@@ -3700,6 +3707,49 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         &refspecs,
         options,
     )
+}
+
+fn append_push_prune_refspecs(
+    refspecs: &mut Vec<String>,
+    remote_advertisements: &[sley_protocol::RefAdvertisement],
+    local_names: &std::collections::HashSet<String>,
+) {
+    let mut deletes = std::collections::BTreeSet::new();
+    for refspec in refspecs.iter() {
+        let body = refspec.strip_prefix('+').unwrap_or(refspec);
+        if body == ":" {
+            for advertisement in remote_advertisements {
+                if advertisement.name.starts_with("refs/heads/")
+                    && !local_names.contains(&advertisement.name)
+                {
+                    deletes.insert(advertisement.name.clone());
+                }
+            }
+            continue;
+        }
+        let Some((src, dst)) = body.split_once(':') else {
+            continue;
+        };
+        let (Some((src_prefix, src_suffix)), Some((dst_prefix, dst_suffix))) =
+            (src.split_once('*'), dst.split_once('*'))
+        else {
+            continue;
+        };
+        for advertisement in remote_advertisements {
+            let Some(stem) = advertisement
+                .name
+                .strip_prefix(dst_prefix)
+                .and_then(|rest| rest.strip_suffix(dst_suffix))
+            else {
+                continue;
+            };
+            let source = format!("{src_prefix}{stem}{src_suffix}");
+            if !local_names.contains(&source) {
+                deletes.insert(advertisement.name.clone());
+            }
+        }
+    }
+    refspecs.extend(deletes.into_iter().map(|name| format!(":{name}")));
 }
 
 /// Resolve the remote argument for `--mirror`/`--all`/`--tags`: the lone
