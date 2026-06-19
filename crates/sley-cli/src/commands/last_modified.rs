@@ -44,6 +44,27 @@ struct CommitInfo {
     parents: Vec<ObjectId>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct LastModifiedQueueEntry {
+    timestamp: i64,
+    hex: String,
+    oid: ObjectId,
+}
+
+impl Ord for LastModifiedQueueEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| other.hex.cmp(&self.hex))
+    }
+}
+
+impl PartialOrd for LastModifiedQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub(crate) fn cmd_last_modified(args: &[String]) -> Result<()> {
     let options = parse_last_modified_args(args)?;
     let repo = RepositoryContext::discover_current()?;
@@ -263,13 +284,14 @@ fn run_last_modified_walk(
     state: &mut LastModifiedState,
     start_commit: ObjectId,
 ) -> Result<()> {
-    let mut queue = vec![start_commit];
+    let mut queue = std::collections::BinaryHeap::new();
     let mut queued = HashSet::from([start_commit]);
     let mut date_cache = HashMap::new();
+    push_last_modified_commit(&mut queue, db, format, &mut date_cache, start_commit)?;
     let mut popped = 0usize;
 
-    while let Some(commit_oid) = pop_last_modified_commit(&mut queue, db, format, &mut date_cache)?
-    {
+    while let Some(entry) = queue.pop() {
+        let commit_oid = entry.oid;
         queued.remove(&commit_oid);
         let active = state.active.remove(&commit_oid).unwrap_or_default();
         let active: HashSet<usize> = active
@@ -314,7 +336,7 @@ fn run_last_modified_walk(
                 let parent_active = state.active.entry(*parent).or_default();
                 parent_active.extend(passed.iter().copied());
                 if queued.insert(*parent) {
-                    queue.push(*parent);
+                    push_last_modified_commit(&mut queue, db, format, &mut date_cache, *parent)?;
                 }
                 for idx in passed {
                     current_active.remove(&idx);
@@ -362,8 +384,10 @@ fn mark_active_paths(
     boundary: bool,
     active: &HashSet<usize>,
 ) {
-    for idx in 0..state.paths.len() {
-        if active.contains(&idx) && state.remaining.remove(&idx) {
+    let mut active = active.iter().copied().collect::<Vec<_>>();
+    active.sort_unstable();
+    for idx in active {
+        if state.remaining.remove(&idx) {
             state.emitted.push(LastModifiedOutput {
                 commit: *commit_oid,
                 boundary,
@@ -373,32 +397,29 @@ fn mark_active_paths(
     }
 }
 
-fn pop_last_modified_commit(
-    queue: &mut Vec<ObjectId>,
+fn push_last_modified_commit(
+    queue: &mut std::collections::BinaryHeap<LastModifiedQueueEntry>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     date_cache: &mut HashMap<ObjectId, i64>,
-) -> Result<Option<ObjectId>> {
-    if queue.is_empty() {
-        return Ok(None);
-    }
-    for oid in queue.iter() {
-        if !date_cache.contains_key(oid) {
-            let object = db.read_object(oid)?;
+    oid: ObjectId,
+) -> Result<()> {
+    let timestamp = match date_cache.get(&oid).copied() {
+        Some(timestamp) => timestamp,
+        None => {
+            let object = db.read_object(&oid)?;
             let commit = Commit::parse(format, &object.body)?;
-            let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
-            date_cache.insert(*oid, ts);
+            let timestamp = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
+            date_cache.insert(oid, timestamp);
+            timestamp
         }
-    }
-    let mut best = 0usize;
-    for idx in 1..queue.len() {
-        let current = date_cache.get(&queue[idx]).copied().unwrap_or(0);
-        let chosen = date_cache.get(&queue[best]).copied().unwrap_or(0);
-        if current > chosen || (current == chosen && queue[idx].to_hex() < queue[best].to_hex()) {
-            best = idx;
-        }
-    }
-    Ok(Some(queue.swap_remove(best)))
+    };
+    queue.push(LastModifiedQueueEntry {
+        timestamp,
+        hex: oid.to_hex(),
+        oid,
+    });
+    Ok(())
 }
 
 fn excluded_ancestors(
@@ -554,51 +575,34 @@ fn changed_paths_between_trees(
     right_tree: &ObjectId,
 ) -> Result<HashSet<Vec<u8>>> {
     let mut out = HashSet::new();
-    collect_changed_paths_inner(db, format, Some(left_tree), Some(right_tree), Vec::new(), &mut out)?;
+    let changes = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        left_tree,
+        right_tree,
+        sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: false,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
+        },
+    )?;
+    for entry in changes {
+        insert_changed_path_and_parents(&mut out, entry.path.as_bytes());
+    }
     Ok(out)
 }
 
-fn collect_changed_paths_inner(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    left_tree: Option<&ObjectId>,
-    right_tree: Option<&ObjectId>,
-    prefix: Vec<u8>,
+fn insert_changed_path_and_parents(
     out: &mut HashSet<Vec<u8>>,
-) -> Result<()> {
-    let left = match left_tree {
-        Some(oid) => read_tree_map(db, format, oid)?,
-        None => BTreeMap::new(),
-    };
-    let right = match right_tree {
-        Some(oid) => read_tree_map(db, format, oid)?,
-        None => BTreeMap::new(),
-    };
-    let mut names = BTreeSet::new();
-    names.extend(left.keys().cloned());
-    names.extend(right.keys().cloned());
-    for name in names {
-        let path = join_tree_path(&prefix, &name);
-        let l = left.get(&name).copied();
-        let r = right.get(&name).copied();
-        if l == r {
-            continue;
-        }
-        out.insert(path.clone());
-        match (l, r) {
-            (Some(l), Some(r)) if l.mode == 0o040000 && r.mode == 0o040000 => {
-                collect_changed_paths_inner(db, format, Some(&l.oid), Some(&r.oid), path, out)?;
-            }
-            (Some(l), None) if l.mode == 0o040000 => {
-                collect_changed_paths_inner(db, format, Some(&l.oid), None, path, out)?;
-            }
-            (None, Some(r)) if r.mode == 0o040000 => {
-                collect_changed_paths_inner(db, format, None, Some(&r.oid), path, out)?;
-            }
-            _ => {}
+    path: &[u8],
+) {
+    out.insert(path.to_vec());
+    for idx in 0..path.len() {
+        if path[idx] == b'/' {
+            out.insert(path[..idx].to_vec());
         }
     }
-    Ok(())
 }
 
 fn collect_all_tree_entries(
