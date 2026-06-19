@@ -172,12 +172,14 @@ impl LogDiffContext<'_> {
         &self,
         record: &sley_rev::CommitRecord,
         line_prefix_width: i64,
-    ) -> Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        out.clear();
         // An explicit non-off --diff-merges without any diff-output option
         // shows patches for merge commits only.
         let merges_only = !self.opts.any();
         if merges_only && (record.commit.parents.len() <= 1 || self.merges == LogDiffMerges::Off) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let parents = &record.commit.parents;
         // A combined merge takes a separate render path (the result diffed
@@ -185,18 +187,18 @@ impl LogDiffContext<'_> {
         if parents.len() > 1
             && let LogDiffMerges::Combined { dense } = self.merges
         {
-            return self.render_combined_merge(record, dense, line_prefix_width);
+            return self.render_combined_merge(record, dense, line_prefix_width, out);
         }
         let parent_tree = match parents.len() {
             0 => {
                 if !self.show_root {
-                    return Ok(Vec::new());
+                    return Ok(());
                 }
                 None
             }
             1 => Some(self.parent_tree(&parents[0])?),
             _ => match self.merges {
-                LogDiffMerges::Off => return Ok(Vec::new()),
+                LogDiffMerges::Off => return Ok(()),
                 LogDiffMerges::FirstParent => Some(self.parent_tree(&parents[0])?),
                 // Handled above.
                 LogDiffMerges::Combined { .. } => unreachable!(),
@@ -241,15 +243,14 @@ impl LogDiffContext<'_> {
             None => entries,
         };
         if entries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut out: Vec<u8> = Vec::new();
         let opts = self.opts;
         let patch = opts.patch || merges_only;
         if opts.raw {
             for entry in &entries {
-                write_diff_raw_entry(&mut out, entry, false, false, self.raw_abbrev, self.format)?;
+                write_diff_raw_entry(out, entry, false, false, self.raw_abbrev, self.format)?;
             }
         }
         if opts.name_status {
@@ -268,7 +269,7 @@ impl LogDiffContext<'_> {
         }
         if opts.numstat {
             for entry in &entries {
-                write_diff_numstat_entry(&mut out, entry, false, self.db, None, false)?;
+                write_diff_numstat_entry(out, entry, false, self.db, None, false)?;
             }
         }
         if opts.stat || opts.compact_summary {
@@ -276,7 +277,7 @@ impl LogDiffContext<'_> {
             widths.resolve_config(self.config);
             widths.line_prefix_width = line_prefix_width;
             write_diff_stat_with_widths(
-                &mut out,
+                out,
                 &entries,
                 self.db,
                 None,
@@ -290,11 +291,11 @@ impl LogDiffContext<'_> {
             )?;
         }
         if opts.shortstat {
-            write_diff_shortstat(&mut out, &entries, self.db, None, false)?;
+            write_diff_shortstat(out, &entries, self.db, None, false)?;
         }
         if opts.summary {
             for entry in &entries {
-                write_diff_summary_entry(&mut out, entry)?;
+                write_diff_summary_entry(out, entry)?;
             }
         }
         if patch {
@@ -311,7 +312,7 @@ impl LogDiffContext<'_> {
             }
             for entry in &entries {
                 write_diff_patch_entry(
-                    &mut out,
+                    out,
                     entry,
                     DiffPatchOptions {
                         db: self.db,
@@ -340,7 +341,7 @@ impl LogDiffContext<'_> {
                 )?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Render the combined merge diff (`log -c`/`--cc`) for one merge commit:
@@ -352,7 +353,8 @@ impl LogDiffContext<'_> {
         record: &sley_rev::CommitRecord,
         dense: bool,
         line_prefix_width: i64,
-    ) -> Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let opts = self.opts;
         let merges_only = !opts.any();
         let patch = opts.patch || merges_only;
@@ -395,20 +397,19 @@ impl LogDiffContext<'_> {
         let paths =
             commands::combined::combined_paths(self.db, self.format, result_tree, &parent_trees)?;
         if paths.is_empty() && first_parent_entries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut out: Vec<u8> = Vec::new();
         if opts.raw {
             // git shows combined raw (`::`) for log --raw on a combined merge.
             let render_ctx = self.combined_ctx(dense);
             for path in &paths {
-                commands::combined::write_combined_raw(&mut out, &render_ctx, path, false)?;
+                commands::combined::write_combined_raw(out, &render_ctx, path, false)?;
             }
         }
         if opts.name_status {
             for path in &paths {
-                commands::combined::write_combined_name_status(&mut out, path, false)?;
+                commands::combined::write_combined_name_status(out, path, false)?;
             }
         }
         if opts.name_only {
@@ -422,7 +423,7 @@ impl LogDiffContext<'_> {
         }
         if opts.numstat {
             for entry in &first_parent_entries {
-                write_diff_numstat_entry(&mut out, entry, false, self.db, None, false)?;
+                write_diff_numstat_entry(out, entry, false, self.db, None, false)?;
             }
         }
         if opts.stat || opts.compact_summary {
@@ -430,7 +431,7 @@ impl LogDiffContext<'_> {
             widths.resolve_config(self.config);
             widths.line_prefix_width = line_prefix_width;
             write_diff_stat_with_widths(
-                &mut out,
+                out,
                 &first_parent_entries,
                 self.db,
                 None,
@@ -444,11 +445,11 @@ impl LogDiffContext<'_> {
             )?;
         }
         if opts.shortstat {
-            write_diff_shortstat(&mut out, &first_parent_entries, self.db, None, false)?;
+            write_diff_shortstat(out, &first_parent_entries, self.db, None, false)?;
         }
         if opts.summary {
             for entry in &first_parent_entries {
-                write_diff_summary_entry(&mut out, entry)?;
+                write_diff_summary_entry(out, entry)?;
             }
         }
         if patch && !paths.is_empty() {
@@ -457,10 +458,10 @@ impl LogDiffContext<'_> {
             }
             let render_ctx = self.combined_ctx(dense);
             for path in &paths {
-                commands::combined::write_combined_patch(&mut out, &render_ctx, path)?;
+                commands::combined::write_combined_patch(out, &render_ctx, path)?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Build the shared combined-render context for this log invocation.

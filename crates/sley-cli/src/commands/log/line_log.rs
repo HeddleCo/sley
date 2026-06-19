@@ -208,6 +208,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     let eff_dst_prefix = dst_prefix.unwrap_or("b/");
 
     let mut stdout = io::stdout();
+    let mut patch_block = Vec::new();
     let mut printed_entries = 0usize;
     for record in &selected {
         // `-S`/`-G`/`--find-object`: suppress this commit's diff pairs when its
@@ -297,9 +298,9 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     }
                 }
                 if diff_opts.patch {
-                    let mut block = Vec::new();
+                    patch_block.clear();
                     render_line_log_patch(
-                        &mut block,
+                        &mut patch_block,
                         db,
                         format,
                         files,
@@ -308,9 +309,9 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         eff_src_prefix,
                         eff_dst_prefix,
                     )?;
-                    if !block.is_empty() {
+                    if !patch_block.is_empty() {
                         stdout.write_all(diff_opts.block_separator())?;
-                        stdout.write_all(&block)?;
+                        stdout.write_all(&patch_block)?;
                     }
                 }
             }
@@ -351,9 +352,9 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     stdout.write_all(b"\n")?;
                 }
                 if diff_opts.patch {
-                    let mut block = Vec::new();
+                    patch_block.clear();
                     render_line_log_patch(
-                        &mut block,
+                        &mut patch_block,
                         db,
                         format,
                         files,
@@ -362,11 +363,11 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         eff_src_prefix,
                         eff_dst_prefix,
                     )?;
-                    if !block.is_empty() {
+                    if !patch_block.is_empty() {
                         if !*final_newline {
                             stdout.write_all(b"\n")?;
                         }
-                        stdout.write_all(&block)?;
+                        stdout.write_all(&patch_block)?;
                     }
                 }
             }

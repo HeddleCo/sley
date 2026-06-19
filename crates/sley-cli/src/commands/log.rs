@@ -2824,6 +2824,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         // Whether the previous entry's message ended without a newline
         // (upstream `opt->missing_newline`), for the separator decision.
         let mut prev_missing_newline = false;
+        let mut diff_block = Vec::new();
         for (index, record) in selected.iter().enumerate() {
             let mut interesting: Vec<ObjectId> = record
                 .parents
@@ -2880,12 +2881,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         graph_state.padding_line(&mut padding);
                         let prefix_width =
                             log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
-                        let block = log_diff.render(record, prefix_width)?;
-                        if !block.is_empty() {
+                        log_diff.render(record, prefix_width, &mut diff_block)?;
+                        if !diff_block.is_empty() {
                             if msg.last() != Some(&b'\n') {
                                 msg.push(b'\n');
                             }
-                            msg.extend_from_slice(&block);
+                            msg.extend_from_slice(&diff_block);
                         }
                     }
                     graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
@@ -2916,10 +2917,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             graph_state.padding_line(&mut padding);
                             let prefix_width =
                                 log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
-                            let block = log_diff.render(record, prefix_width)?;
-                            if !block.is_empty() {
+                            log_diff.render(record, prefix_width, &mut diff_block)?;
+                            if !diff_block.is_empty() {
                                 msg.extend_from_slice(diff_opts.block_separator_for(record));
-                                msg.extend_from_slice(&block);
+                                msg.extend_from_slice(&diff_block);
                             }
                         }
                         graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
@@ -3018,10 +3019,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         graph_state.padding_line(&mut padding);
                         let prefix_width =
                             log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
-                        let block = log_diff.render(record, prefix_width)?;
-                        if !block.is_empty() {
+                        log_diff.render(record, prefix_width, &mut diff_block)?;
+                        if !diff_block.is_empty() {
                             msg.extend_from_slice(diff_opts.block_separator_for(record));
-                            msg.extend_from_slice(&block);
+                            msg.extend_from_slice(&diff_block);
                         }
                     }
                     graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
@@ -3033,27 +3034,33 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         return Ok(());
     }
 
+    let stdout = io::stdout();
+    let mut default_out = if matches!(output, LogOutput::Default(_)) {
+        Some(io::BufWriter::new(stdout.lock()))
+    } else {
+        None
+    };
+    let mut diff_block = Vec::new();
     let mut printed_entries = 0usize;
     for (index, record) in selected.iter().enumerate() {
         match output {
             LogOutput::Default(kind) => {
+                let out = default_out.as_mut().expect("default output buffer");
                 // The diff block is rendered up front: whatchanged
                 // (always_show_header = 0) omits the whole entry when the
                 // commit's diff comes out empty.
-                let diff_block = match &log_diff {
-                    Some(log_diff) => {
-                        let prefix_width =
-                            log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
-                        log_diff.render(record, prefix_width)?
-                    }
-                    None => Vec::new(),
-                };
+                diff_block.clear();
+                if let Some(log_diff) = &log_diff {
+                    let prefix_width =
+                        log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
+                    log_diff.render(record, prefix_width, &mut diff_block)?;
+                }
                 if whatchanged && log_diff.is_some() && diff_block.is_empty() {
                     continue;
                 }
                 if kind == LogDefaultKind::Raw {
                     if printed_entries > 0 {
-                        println!();
+                        writeln!(out)?;
                     }
                     printed_entries += 1;
                     let mut raw = render_log_raw_pretty(record);
@@ -3061,17 +3068,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         raw.extend_from_slice(diff_opts.block_separator_for(record));
                         raw.extend_from_slice(&diff_block);
                     }
-                    io::stdout().write_all(&raw)?;
+                    out.write_all(&raw)?;
                     continue;
                 }
                 if printed_entries > 0 {
-                    println!();
+                    writeln!(out)?;
                 }
                 printed_entries += 1;
-                print!(
+                write!(
+                    out,
                     "commit {}",
                     format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
-                );
+                )?;
                 if show_source
                     && let Some(source) = log_source_label(
                         &record.oid,
@@ -3079,79 +3087,87 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         source_labels.as_ref(),
                     )
                 {
-                    print!("\t{source}");
+                    write!(out, "\t{source}")?;
                 }
-                print_log_decorations(&record.oid, &decorations);
-                print_log_selected_parent_oids(
-                    record,
-                    show_parents,
-                    abbrev_commit.then_some(abbrev_len).flatten(),
-                );
-                println!();
+                if let Some(labels) = decorations.get(&record.oid)
+                    && !labels.is_empty()
+                {
+                    write!(out, " ({})", labels.join(", "))?;
+                }
+                if show_parents {
+                    let parent_abbrev = abbrev_commit.then_some(abbrev_len).flatten();
+                    for parent in &record.parents {
+                        write!(out, " {}", format_log_oid(parent, parent_abbrev))?;
+                    }
+                }
+                writeln!(out)?;
                 if record.parents.len() > 1 {
                     let merged: Vec<String> =
                         record.parents.iter().map(format_log_abbrev_oid).collect();
-                    println!("Merge: {}", merged.join(" "));
+                    writeln!(out, "Merge: {}", merged.join(" "))?;
                 }
                 if kind == LogDefaultKind::Fuller {
                     let author = commit_identity_mailmapped(
                         &record.commit.author,
                         use_mailmap.then_some(&mailmap),
                     );
-                    print!("Author:     ");
-                    io::stdout().write_all(&log_highlight_matches(
+                    write!(out, "Author:     ")?;
+                    out.write_all(&log_highlight_matches(
                         author.as_bytes(),
                         author_filters.as_ref(),
                         &grep_colors,
                     ))?;
-                    println!();
-                    println!(
+                    writeln!(out)?;
+                    writeln!(
+                        out,
                         "AuthorDate: {}",
                         commit_identity_date(&record.commit.author, &date_mode)
-                    );
+                    )?;
                     let committer = commit_identity_mailmapped(
                         &record.commit.committer,
                         use_mailmap.then_some(&mailmap),
                     );
-                    print!("Commit:     ");
-                    io::stdout().write_all(&log_highlight_matches(
+                    write!(out, "Commit:     ")?;
+                    out.write_all(&log_highlight_matches(
                         committer.as_bytes(),
                         committer_filters.as_ref(),
                         &grep_colors,
                     ))?;
-                    println!();
-                    println!(
+                    writeln!(out)?;
+                    writeln!(
+                        out,
                         "CommitDate: {}",
                         commit_identity_date(&record.commit.committer, &date_mode)
-                    );
+                    )?;
                 } else {
                     let author = commit_identity_mailmapped(
                         &record.commit.author,
                         use_mailmap.then_some(&mailmap),
                     );
-                    print!("Author: ");
-                    io::stdout().write_all(&log_highlight_matches(
+                    write!(out, "Author: ")?;
+                    out.write_all(&log_highlight_matches(
                         author.as_bytes(),
                         author_filters.as_ref(),
                         &grep_colors,
                     ))?;
-                    println!();
+                    writeln!(out)?;
                 }
                 if kind == LogDefaultKind::Medium {
-                    println!(
+                    writeln!(
+                        out,
                         "Date:   {}",
                         commit_identity_date(&record.commit.author, &date_mode)
-                    );
+                    )?;
                 }
-                println!();
+                writeln!(out)?;
                 for line in String::from_utf8_lossy(&record.commit.message).lines() {
-                    print!("    ");
-                    io::stdout().write_all(&log_highlight_matches(
+                    write!(out, "    ")?;
+                    out.write_all(&log_highlight_matches(
                         line.as_bytes(),
                         grep_filters.as_ref(),
                         &grep_colors,
                     ))?;
-                    println!();
+                    writeln!(out)?;
                 }
                 if !display_notes_refs.is_empty() {
                     let notes = render_notes_block(
@@ -3161,12 +3177,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         &display_notes_refs,
                         &record.oid,
                     )?;
-                    io::stdout().write_all(&notes)?;
+                    out.write_all(&notes)?;
                 }
                 if !diff_block.is_empty() {
-                    let mut stdout = io::stdout();
-                    stdout.write_all(diff_opts.block_separator_for(record))?;
-                    stdout.write_all(&diff_block)?;
+                    out.write_all(diff_opts.block_separator_for(record))?;
+                    out.write_all(&diff_block)?;
                 }
             }
             LogOutput::Compiled {
@@ -3261,22 +3276,22 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     // entry, with no separating blank line. `--line-prefix`
                     // narrows the stat budget and prefixes every diff line.
                     let prefix = line_prefix.as_deref().unwrap_or("");
-                    let block = log_diff.render(record, log_prefix_display_width(prefix))?;
-                    if !block.is_empty() {
+                    log_diff.render(record, log_prefix_display_width(prefix), &mut diff_block)?;
+                    if !diff_block.is_empty() {
                         let mut stdout = io::stdout();
                         stdout.write_all(b"\n")?;
                         if prefix.is_empty() {
-                            stdout.write_all(&block)?;
+                            stdout.write_all(&diff_block)?;
                         } else {
                             let mut start = 0usize;
-                            while start < block.len() {
-                                let end = block[start..]
+                            while start < diff_block.len() {
+                                let end = diff_block[start..]
                                     .iter()
                                     .position(|&byte| byte == b'\n')
                                     .map(|pos| start + pos + 1)
-                                    .unwrap_or(block.len());
+                                    .unwrap_or(diff_block.len());
                                 stdout.write_all(prefix.as_bytes())?;
-                                stdout.write_all(&block[start..end])?;
+                                stdout.write_all(&diff_block[start..end])?;
                                 start = end;
                             }
                         }
@@ -3284,6 +3299,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 }
             }
         }
+    }
+    if let Some(mut out) = default_out {
+        out.flush()?;
     }
     Ok(())
 }
@@ -3497,18 +3515,6 @@ fn log_age_filters_match(
     }
     let timestamp = commit_identity_timestamp_i64(&record.commit.committer)?;
     Ok(max_age.is_none_or(|age| timestamp >= age) && min_age.is_none_or(|age| timestamp <= age))
-}
-
-fn print_log_selected_parent_oids(
-    record: &sley_rev::CommitRecord,
-    show_parents: bool,
-    abbrev_len: Option<usize>,
-) {
-    if show_parents {
-        for parent in &record.parents {
-            print!(" {}", format_log_oid(parent, abbrev_len));
-        }
-    }
 }
 
 fn print_log_selected_child_oids(
