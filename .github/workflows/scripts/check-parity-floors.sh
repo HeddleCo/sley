@@ -513,7 +513,7 @@ declare -A FLOOR=(
     [t4124-apply-ws-rule.sh]=67
     [t4019-diff-wserror.sh]=19
     [t4034-diff-words.sh]=64
-    [t5407-post-rewrite-hook.sh]=10
+    [t5407-post-rewrite-hook.sh]=17
     [t5500-fetch-pack.sh]=359
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
@@ -632,9 +632,9 @@ declare -A FLOOR=(
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
     # codex-wave-9 dir-rename engine side-gain: 34->35.
     [t6402-merge-rename.sh]=35
-    [t5400-send-pack.sh]=12
+    [t5400-send-pack.sh]=17
     [t5404-tracking-branches.sh]=6
-    [t5543-atomic-push.sh]=7
+    [t5543-atomic-push.sh]=11
     [t5548-push-porcelain.sh]=11
     [t6430-merge-recursive.sh]=23
     [t5702-protocol-v2.sh]=5
@@ -744,6 +744,20 @@ declare -A FLOOR=(
     [t7507-commit-verbose.sh]=45
     [t7500-commit-template-squash-signoff.sh]=57
     [t3203-branch-output.sh]=41
+    # wave-16 (2026-06-19, integ/wave16 onto b194b618): hard wire tail (push + protocol).
+    # NOTE this batch had recurring codex kills + TWO confabulations — every value below
+    # is MY measurement of the integ binary, not the agents' claimed numbers (see
+    # [[codex-exec-resume-on-kill]]): protoallowrest no-op'd then re-ran real (t5813/t5814
+    # restored to their stale-high floors 81/27); clienthooks claimed t5402=7 but binary=3.
+    # cargo test --workspace green; triple remote_cmds.rs merge clean; cross-guards held
+    # (t5505=126 t5516=92 t5520=75 t3404=89 t7600=83). Raises: t5400 12->17, t5543 7->11,
+    # t5407 10->17. NEW (measured): push features + post-checkout/merge hooks.
+    [t5533-push-cas.sh]=23
+    [t5408-send-pack-stdin.sh]=10
+    [t5545-push-options.sh]=9
+    [t5523-push-upstream.sh]=16
+    [t5403-post-checkout-hook.sh]=14
+    [t5402-post-merge-hook.sh]=3
 )
 
 fail=0
