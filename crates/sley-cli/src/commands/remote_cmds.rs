@@ -704,6 +704,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         _ => remote_head_branch(&remote_common_git_dir, format)?,
     };
     let alternates = clone_alternates(&remote_git_dir, shared, &reference_alternates)?;
+    let source_alternates_git_dir = remote_common_git_dir.clone();
     let revision_oid = revision
         .as_deref()
         .map(|rev| resolve_revision(&remote_common_git_dir, format, rev))
@@ -837,6 +838,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 template_config,
                 bundle_uri: bundle_uri.as_ref(),
                 alternates: &alternates,
+                copy_source_alternates: local_source,
                 dissociate,
                 config_overrides: &config_overrides,
                 submodule_active: &submodule_active,
@@ -856,6 +858,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         |git_dir: &Path, fetch_refspec: Option<String>| -> Result<GitConfig> {
             apply_clone_template(git_dir, template.as_deref(), template_config)?;
             apply_clone_alternates(git_dir, &alternates, dissociate)?;
+            if local_source {
+                apply_clone_source_alternates(git_dir, &source_alternates_git_dir)?;
+            }
             configure_clone_remote(
                 git_dir,
                 &origin,
@@ -1803,6 +1808,7 @@ struct CloneLocalOptions<'a> {
     template_config: bool,
     bundle_uri: Option<&'a CloneBundleUri>,
     alternates: &'a [PathBuf],
+    copy_source_alternates: bool,
     dissociate: bool,
     config_overrides: &'a [GlobalConfigOverride],
     submodule_active: &'a [String],
@@ -1838,6 +1844,10 @@ fn clone_bare_or_mirror_local_repository(
     let git_dir = layout.git_dir;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     apply_clone_alternates(&git_dir, options.alternates, options.dissociate)?;
+    if options.copy_source_alternates {
+        let source_git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?;
+        apply_clone_source_alternates(&git_dir, &source_git_dir)?;
+    }
     let remote_refspec = options.mirror.then(|| "+refs/*:refs/*".to_string());
     let remote_tag_opt = if options.mirror {
         Some("--no-tags")
@@ -2087,6 +2097,70 @@ fn apply_clone_alternates(git_dir: &Path, alternates: &[PathBuf], dissociate: bo
     }
     fs::write(alternates_path, contents)?;
     Ok(())
+}
+
+fn apply_clone_source_alternates(git_dir: &Path, source_git_dir: &Path) -> Result<()> {
+    let source_alternates = source_git_dir.join("objects/info/alternates");
+    let Ok(contents) = fs::read_to_string(source_alternates) else {
+        return Ok(());
+    };
+
+    let mut resolved = Vec::new();
+    for raw in contents.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let path = Path::new(line);
+        if path.is_absolute() {
+            resolved.push(path.to_path_buf());
+        } else if let Some(normalized) =
+            normalize_clone_alternate_path(&source_git_dir.join("objects").join(path))
+        {
+            resolved.push(normalized);
+        } else {
+            eprintln!(
+                "warning: skipping invalid relative alternate: {}/{}",
+                source_git_dir.display(),
+                line
+            );
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(());
+    }
+
+    let alternates_path = git_dir.join("objects/info/alternates");
+    if let Some(parent) = alternates_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(alternates_path)?;
+    use std::io::Write as _;
+    for alternate in resolved {
+        writeln!(file, "{}", alternate.display())?;
+    }
+    Ok(())
+}
+
+fn normalize_clone_alternate_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(Path::new("/")),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    Some(normalized)
 }
 
 fn copy_local_revision_objects(
