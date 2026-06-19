@@ -773,10 +773,6 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-F' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if reset_author && reuse_message.is_none() && !amend {
-        eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
-        return Err(GitError::Exit(128));
-    }
     if file_message.is_some() && !message_chunks.is_empty() {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
@@ -864,6 +860,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
     let in_revert = git_dir.join("REVERT_HEAD").is_file();
     let in_rebase = rebase_in_progress(&git_dir);
+    if reset_author && reuse_message.is_none() && !amend && !in_cherry_pick && !in_rebase {
+        eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
+        return Err(GitError::Exit(128));
+    }
     if !pathspec_args.is_empty() {
         if in_rebase {
             eprintln!("fatal: cannot do a partial commit during a rebase.");
@@ -2398,6 +2398,7 @@ fn build_reused_commit_author_identity(
     date: Option<&str>,
 ) -> Result<Vec<u8>> {
     if author.is_none() && date.is_none() {
+        validate_reused_commit_author_identity(reused_author)?;
         return Ok(reused_author.to_vec());
     }
     let (reused_name, reused_email, reused_date) = parse_commit_identity_parts(reused_author)?;
@@ -2413,6 +2414,14 @@ fn build_reused_commit_author_identity(
         None => reused_date,
     };
     sley_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+fn validate_reused_commit_author_identity(identity: &[u8]) -> Result<()> {
+    if parse_commit_identity_parts(identity).is_ok() {
+        return Ok(());
+    }
+    eprintln!("fatal: empty ident name (for <>) not allowed");
+    Err(GitError::Exit(128))
 }
 
 fn parse_commit_identity_parts(identity: &[u8]) -> Result<(String, String, String)> {
