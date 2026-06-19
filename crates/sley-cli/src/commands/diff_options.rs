@@ -83,6 +83,7 @@ pub(crate) struct DiffOptions {
     pub(crate) diff_hunk_control: bool,
     pub(crate) interhunk: Option<usize>,
     pub(crate) diff_whitespace_control: bool,
+    pub(crate) ws_error_highlight: Option<String>,
     /// CLI `--indent-heuristic` / `--no-indent-heuristic`: `Some(true)` /
     /// `Some(false)` when given, `None` to fall back to `diff.indentHeuristic`
     /// config (which itself defaults to git's enabled-by-default behavior).
@@ -158,6 +159,7 @@ impl Default for DiffOptions {
             diff_hunk_control: false,
             interhunk: None,
             diff_whitespace_control: false,
+            ws_error_highlight: None,
             indent_heuristic: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             ignore_blank_lines: false,
@@ -1029,7 +1031,9 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             options.interhunk = Some(parse_unified_count(value));
         }
         (_, Some("ws-error-highlight")) => {
-            log_validate_ws_error_highlight(str_value(option))?;
+            let value = str_value(option);
+            log_validate_ws_error_highlight(value)?;
+            options.ws_error_highlight = Some(value.to_string());
             options.diff_whitespace_control = true;
         }
         (_, Some("ignore-all-space")) => options.ws_ignore.all_space = true,

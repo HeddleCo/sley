@@ -995,7 +995,8 @@ fn run_diff_request(
     // `--check`: report whitespace errors in place of the normal diff body.
     if context.options.check {
         if let Some(resolver) = &context.ws_resolver {
-            let failed = commands::diff::run_diff_check(&entries, context.db, None, false, resolver)?;
+            let failed =
+                commands::diff::run_diff_check(&entries, context.db, None, false, false, resolver)?;
             if failed {
                 context.check_failed.set(true);
             }
@@ -1113,7 +1114,7 @@ fn run_diff_request(
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
-                ws_error_rule: None,
+                ws_error: None,
                 interhunk: 0,
                 ws_ignore: context.options.ws_ignore,
                 diff_algorithm: context.options.diff_algorithm,

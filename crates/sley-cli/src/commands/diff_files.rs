@@ -775,7 +775,7 @@ fn render_diff_files_entries(
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
-                ws_error_rule: None,
+                ws_error: None,
                 interhunk: context.interhunk,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: context.diff_algorithm,

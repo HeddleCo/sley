@@ -46,8 +46,9 @@ impl DiffColors {
             new: lookup("new", "\x1b[32m"),
             context: lookup("context", ""),
             reset: "\x1b[m".to_string(),
-            // git's GIT_COLOR_BOLD_RED for whitespace by default.
-            whitespace: lookup("whitespace", "\x1b[1;31m"),
+            // git's GIT_COLOR_REVERSE for whitespace by default; the test
+            // decoder names this red-background span `<BRED>`.
+            whitespace: lookup("whitespace", "\x1b[41m"),
         }
     }
 }

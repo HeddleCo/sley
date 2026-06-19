@@ -411,6 +411,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             &entries,
             db,
             worktree_root,
+            false,
             !cached,
             &resolver,
         )?;
@@ -605,7 +606,7 @@ fn render(
                 no_index_contents: None,
                 submodule_format: ctx.submodule_format,
                 submodule_dirt: Some(ctx.submodule_dirt),
-                ws_error_rule: None,
+                ws_error: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
