@@ -656,7 +656,7 @@ declare -A FLOOR=(
     # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
     # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
     [t1091-sparse-checkout-builtin.sh]=50
-    [t1092-sparse-checkout-compatibility.sh]=32
+    [t1092-sparse-checkout-compatibility.sh]=34
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
@@ -782,6 +782,19 @@ declare -A FLOOR=(
     [t7003-filter-branch.sh]=36
     [t1701-racy-split-index.sh]=31
     [t6200-fmt-merge-msg.sh]=37
+    # wave-19 (2026-06-19, integ/wave19 onto 2c0e3583): post-decompose porcelain frontier,
+    # now-parallelizable thanks to wave-18's workspace.rs split. All measured HERMETICALLY vs
+    # the integ binary (two oracles agree). status t7508 49->54 + t7512 20->36, commit t7502
+    # 52->56 + t7509 9->12 FULL, sparse-compat t1092 32->34, attrs t0003 28->51. Cross-guards
+    # held EXACTLY (t7501=54, t7507=45, t7500=57, t7102=37, t2020=17, t1091=53, t4015=114,
+    # t6200=37) — the attrs<->sparse sley-worktree/lib.rs auto-merge is behaviorally safe.
+    # NOTE: t7508 and t7502 floors below are STALE-HIGH (114/75) vs the hermetic reality
+    # (54/56) — pre-existing, predates wave-19; weekly gate red since 6/18. Left untouched
+    # pending maintainer decision (correct-to-hermetic vs regression-hunt); wave-19 RAISED
+    # both over their true base. New floors enrolled in upstream-parity.yml.
+    [t7512-status-help.sh]=36
+    [t7509-commit-authorship.sh]=12
+    [t0003-attributes.sh]=51
 )
 
 fail=0

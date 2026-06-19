@@ -162,6 +162,9 @@ jobs:
             t7003-filter-branch.sh
             t1701-racy-split-index.sh
             t6200-fmt-merge-msg.sh
+            t7512-status-help.sh
+            t7509-commit-authorship.sh
+            t0003-attributes.sh
             t3406-rebase-message.sh
             t3418-rebase-continue.sh
             t3420-rebase-autostash.sh
