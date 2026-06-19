@@ -412,7 +412,7 @@ declare -A FLOOR=(
     [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
     [t7004-tag.sh]=228
-    [t3200-branch.sh]=134
+    [t3200-branch.sh]=145
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
     # readdir + checkout-- stat-refresh SCOPED to the call site (R4: reset's tree-sourced entries
@@ -437,7 +437,7 @@ declare -A FLOOR=(
     # false dir-renames), rename/rename(1to2) split higher-stages, transitive dest
     # remapping for rename/delete. t6423 34->41 (raw 41/82, 2 known breakages).
     # Side gains banked: t6402 34->35, t6422 NEW@6.
-    [t6423-merge-rename-directories.sh]=41
+    [t6423-merge-rename-directories.sh]=52
     [t6422-merge-rename-corner-cases.sh]=6
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
@@ -459,7 +459,7 @@ declare -A FLOOR=(
     [t6003-rev-list-topo-order.sh]=36
     [t6012-rev-list-simplify.sh]=36
     [t4205-log-pretty-formats.sh]=108
-    [t4216-log-bloom.sh]=142
+    [t4216-log-bloom.sh]=161
     [t5318-commit-graph.sh]=93
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=55
@@ -615,7 +615,7 @@ declare -A FLOOR=(
     # Neighbor watch-set measured base-2730844 vs integrated, ALL identical (zero
     # interaction regression): t4015=102, t4013=172, t7600=50, t5304=13, t6500-gc=14,
     # t7700-repack=17, t5319=77, t5324=11, t7508=114, t2107=10, t7008=5.
-    [t7800-difftool.sh]=69
+    [t7800-difftool.sh]=91
     [t7610-mergetool.sh]=5
     # codex-wave-10 (untracked-cache UNTR extension): native read/write, update-index
     # toggles, status create/remove/keep, -uall/-unormal bypass, exclude-OID hashing,
@@ -733,6 +733,17 @@ declare -A FLOOR=(
     # update-ref-stdin pathology (now cached/hash-based, also a perf win). t1460 now
     # PASS 37/37 (no timeout) -> floored; t1423 25->27.
     [t1460-refs-migrate.sh]=37
+    # wave-15 (2026-06-19, integ/wave15 onto f1e672fa): 5-slice mid-band harvest.
+    # NOTE all 5 codex sessions were KILLED mid-work by a transient infra event and
+    # RESUMED from on-disk WIP (see [[codex-exec-resume-on-kill]]) — recovered fully.
+    # Measured at the integ tip; cargo test --workspace green; cross-guards held
+    # EXACTLY (t4205=110 t6022=13 t3206=45 t7600=83 — incl the commitporcelain↔logbloom
+    # sley-rev/lib.rs overlap). Raises: t6423 41->52, t3200 134->145, t7800 69->91,
+    # t4216 142->161.
+    [t7501-commit-basic-functionality.sh]=54
+    [t7507-commit-verbose.sh]=45
+    [t7500-commit-template-squash-signoff.sh]=57
+    [t3203-branch-output.sh]=41
 )
 
 fail=0

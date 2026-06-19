@@ -144,6 +144,10 @@ jobs:
             t4068-diff-symmetric-merge-base.sh
             t1423-ref-backend.sh
             t1460-refs-migrate.sh
+            t7501-commit-basic-functionality.sh
+            t7507-commit-verbose.sh
+            t7500-commit-template-squash-signoff.sh
+            t3203-branch-output.sh
             t3406-rebase-message.sh
             t3418-rebase-continue.sh
             t3420-rebase-autostash.sh
