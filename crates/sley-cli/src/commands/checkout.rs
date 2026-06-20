@@ -14,6 +14,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut unified_context = false;
     let mut inter_hunk_context = false;
     let mut guess = None::<bool>;
+    let mut path_merge = false;
+    let mut conflict_implies_merge = false;
+    let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
+    let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut positional = Vec::new();
@@ -25,6 +29,29 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
+            "-m" | "--merge" => path_merge = true,
+            "--no-merge" => {
+                path_merge = false;
+                conflict_implies_merge = false;
+            }
+            "--conflict" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command("checkout --conflict requires a value".into()));
+                };
+                conflict_style = Some(checkout_conflict_style(value)?);
+                conflict_implies_merge = true;
+            }
+            value if value.starts_with("--conflict=") => {
+                let value = &value["--conflict=".len()..];
+                conflict_style = Some(checkout_conflict_style(value)?);
+                conflict_implies_merge = true;
+            }
+            "--no-conflict" => {
+                conflict_style = None;
+                conflict_implies_merge = false;
+            }
+            "--ours" => checkout_stage = Some(sley_worktree::CheckoutStage::Ours),
+            "--theirs" => checkout_stage = Some(sley_worktree::CheckoutStage::Theirs),
             "-p" | "--patch" => patch = true,
             "--no-patch" => patch = false,
             "--no-auto-advance" => no_auto_advance = true,
@@ -261,6 +288,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 .collect();
             match source {
                 Some(rev) => {
+                    if path_merge || conflict_implies_merge {
+                        eprintln!("fatal: '--merge' cannot be used when checking out paths from a tree");
+                        return Err(GitError::Exit(128));
+                    }
                     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
                     let oid = resolve_revision(&git_dir, format, rev)?;
                     let tree = sley_rev::peel_to_tree(&db, format, &oid)?;
@@ -274,12 +305,26 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 None => {
                     let config = read_repo_config(&git_dir)?;
-                    sley_worktree::restore_worktree_paths_filtered(
+                    let conflict_style = conflict_style.unwrap_or_else(|| {
+                        match checkout_config.get("merge", None, "conflictstyle") {
+                            Some("diff3") | Some("zdiff3") => {
+                                sley_worktree::CheckoutConflictStyle::Diff3
+                            }
+                            _ => sley_worktree::CheckoutConflictStyle::Merge,
+                        }
+                    });
+                    sley_worktree::checkout_index_paths(
                         worktree_root,
                         &git_dir,
                         format,
                         &resolved_paths,
-                        &config,
+                        sley_worktree::CheckoutIndexPathOptions {
+                            force,
+                            merge: path_merge || conflict_implies_merge,
+                            stage: checkout_stage,
+                            conflict_style,
+                            smudge_config: Some(&config),
+                        },
                     )?;
                 }
             }
@@ -417,6 +462,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
+                checkout_print_detached_head_advice(&config, target);
                 eprintln!(
                     "HEAD is now at {} {}",
                     format_log_abbrev_oid(&target_oid),
@@ -433,10 +479,18 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
         CheckoutBranchMode::Existing => {
             let [branch] = positional.as_slice() else {
+                if checkout_stage.is_some() {
+                    eprintln!("fatal: '--ours/--theirs' needs the paths to check out");
+                    return Err(GitError::Exit(128));
+                }
                 return Err(GitError::Command(
                     "checkout currently supports: checkout [-q] <branch> or checkout [-q] -b|-B <branch> [<start>]".into(),
                 ));
             };
+            if checkout_stage.is_some() {
+                eprintln!("fatal: '--ours/--theirs' cannot be used with switching branches");
+                return Err(GitError::Exit(128));
+            }
             // A target that is not an existing branch but resolves to a commit-ish
             // (e.g. `A^0`, a tag, a raw oid) is a *detached HEAD* checkout, not a
             // branch switch. git detaches HEAD at the resolved commit; treating it
@@ -490,6 +544,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
+                    checkout_print_detached_head_advice(&config, branch);
                     eprintln!(
                         "HEAD is now at {} {}",
                         format_log_abbrev_oid(&target_oid),
@@ -578,6 +633,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
             let store = FileRefStore::new(&git_dir, format);
+            if matches!(track, Some(crate::commands::branch::BranchTrackMode::Direct))
+                && !checkout_start_is_trackable_branch(&store, &checkout_config, start)?
+            {
+                eprintln!("fatal: cannot set up tracking information; starting point '{start}' is not a branch");
+                return Err(GitError::Exit(128));
+            }
             let was_reset = checkout_create_or_reset_branch(
                 &git_dir,
                 &git_dir,
@@ -702,8 +763,51 @@ fn run_post_checkout_hook(
     Ok(())
 }
 
+fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflictStyle> {
+    match value {
+        "merge" => Ok(sley_worktree::CheckoutConflictStyle::Merge),
+        "diff3" | "zdiff3" => Ok(sley_worktree::CheckoutConflictStyle::Diff3),
+        other => {
+            eprintln!("error: unknown conflict style '{other}'");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+fn checkout_print_detached_head_advice(config: &GitConfig, target: &str) {
+    if !config
+        .get_bool("advice", None, "detachedHead")
+        .unwrap_or(true)
+    {
+        return;
+    }
+    eprintln!("Note: switching to '{target}'.");
+    eprintln!();
+    eprintln!("You are in 'detached HEAD' state. You can look around, make experimental");
+    eprintln!("changes and commit them, and you can discard any commits you make in this");
+    eprintln!("state without impacting any branches by switching back to a branch.");
+    eprintln!();
+    eprintln!("If you want to create a new branch to retain commits you create, you may");
+    eprintln!("do so (now or later) by using -c with the switch command. Example:");
+    eprintln!();
+    eprintln!("  git switch -c <new-branch-name>");
+    eprintln!();
+    eprintln!("Or undo this operation with:");
+    eprintln!();
+    eprintln!("  git switch -");
+    eprintln!();
+    eprintln!("Turn off this advice by setting config variable advice.detachedHead to false");
+    eprintln!();
+}
+
 fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<String> {
     if let Some(rest) = upstream.strip_prefix("refs/remotes/")
+        && let Some((_, branch)) = rest.split_once('/')
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
+    if let Some(rest) = upstream.strip_prefix("remotes/")
         && let Some((_, branch)) = rest.split_once('/')
         && !branch.is_empty()
     {
@@ -729,6 +833,8 @@ fn checkout_tracking_start_ref(store: &FileRefStore, start: &str) -> Option<Stri
         vec!["HEAD".to_string()]
     } else if start.starts_with("refs/") {
         vec![start.to_string()]
+    } else if let Some(rest) = start.strip_prefix("remotes/") {
+        vec![format!("refs/remotes/{rest}")]
     } else {
         vec![
             format!("refs/{start}"),
@@ -761,6 +867,42 @@ fn checkout_tracking_direct_ref(store: &FileRefStore, name: &str) -> Option<Stri
             RefTarget::Symbolic(next) => current = next,
         }
     }
+}
+
+fn checkout_start_is_trackable_branch(
+    store: &FileRefStore,
+    config: &GitConfig,
+    start: &str,
+) -> Result<bool> {
+    if start == "HEAD" {
+        return Ok(store.current_branch()?.is_some());
+    }
+    if !start.contains('/')
+        && store.read_ref(&format!("refs/tags/{start}"))?.is_some()
+    {
+        return Ok(false);
+    }
+    if let Ok(local_ref) = branch_ref_name(start)
+        && store.read_ref(&local_ref)?.is_some()
+    {
+        return Ok(true);
+    }
+    if start.starts_with("refs/heads/") || start.starts_with("refs/remotes/") {
+        return Ok(store.read_ref(start)?.is_some());
+    }
+    if let Some(rest) = start.strip_prefix("remotes/") {
+        return Ok(store.read_ref(&format!("refs/remotes/{rest}"))?.is_some());
+    }
+    for remote in checkout_config_remote_names(config) {
+        let Some(branch) = start.strip_prefix(&format!("{remote}/")) else {
+            continue;
+        };
+        let remote_ref = format!("refs/remotes/{remote}/{branch}");
+        if store.read_ref(&remote_ref)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 struct CheckoutDwimRemoteBranch {

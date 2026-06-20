@@ -597,6 +597,27 @@ pub struct RestoreResult {
     pub restored: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutStage {
+    Ours,
+    Theirs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutConflictStyle {
+    Merge,
+    Diff3,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CheckoutIndexPathOptions<'a> {
+    pub force: bool,
+    pub merge: bool,
+    pub stage: Option<CheckoutStage>,
+    pub conflict_style: CheckoutConflictStyle,
+    pub smudge_config: Option<&'a GitConfig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveResult {
     pub removed: Vec<Vec<u8>>,
@@ -11811,6 +11832,241 @@ fn restore_worktree_paths_inner(
     Ok(RestoreResult {
         restored: restored.len(),
     })
+}
+
+pub fn checkout_index_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: CheckoutIndexPathOptions<'_>,
+) -> Result<RestoreResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Err(GitError::Exit(1));
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let selected = checkout_selected_index_paths(worktree_root, &index, paths)?;
+
+    if options.stage.is_none() && !options.merge && !options.force {
+        for path in &selected {
+            if checkout_path_is_unmerged(&index, path) {
+                eprintln!("error: path '{}' is unmerged", String::from_utf8_lossy(path));
+                return Err(GitError::Exit(1));
+            }
+        }
+    }
+
+    let mut refreshed = BTreeMap::new();
+    let mut restored = BTreeSet::new();
+    for path in selected {
+        let positions = index
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| (entry.path.as_bytes() == path).then_some(position))
+            .collect::<Vec<_>>();
+        let stage0 = positions
+            .iter()
+            .copied()
+            .find(|position| index.entries[*position].stage() == Stage::Normal);
+        let is_unmerged = positions
+            .iter()
+            .any(|position| index.entries[*position].stage() != Stage::Normal);
+
+        if is_unmerged {
+            if let Some(stage) = options.stage {
+                let wanted = match stage {
+                    CheckoutStage::Ours => Stage::Ours,
+                    CheckoutStage::Theirs => Stage::Theirs,
+                };
+                let Some(position) = positions
+                    .iter()
+                    .copied()
+                    .find(|position| index.entries[*position].stage() == wanted)
+                else {
+                    eprintln!(
+                        "error: path '{}' does not have {} version",
+                        String::from_utf8_lossy(&path),
+                        match stage {
+                            CheckoutStage::Ours => "our",
+                            CheckoutStage::Theirs => "their",
+                        }
+                    );
+                    return Err(GitError::Exit(1));
+                };
+                checkout_write_index_entry_to_worktree(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    &db,
+                    &index.entries[position],
+                    options.smudge_config,
+                )?;
+                restored.insert(path);
+                continue;
+            }
+            if options.merge {
+                checkout_merge_unmerged_path(
+                    worktree_root,
+                    &db,
+                    &index,
+                    &positions,
+                    options.conflict_style,
+                )?;
+                restored.insert(path);
+                continue;
+            }
+            if options.force {
+                continue;
+            }
+        }
+
+        if let Some(position) = stage0 {
+            if let Some(updated) = checkout_write_index_entry_to_worktree(
+                worktree_root,
+                git_dir,
+                format,
+                &db,
+                &index.entries[position],
+                options.smudge_config,
+            )? {
+                refreshed.insert(position, updated);
+            }
+            restored.insert(path);
+        }
+    }
+
+    for (position, entry) in refreshed {
+        index.entries[position] = entry;
+    }
+    if !index.entries.is_empty() {
+        write_repository_index_ref(git_dir, format, &index)?;
+    }
+    Ok(RestoreResult {
+        restored: restored.len(),
+    })
+}
+
+fn checkout_selected_index_paths(
+    worktree_root: &Path,
+    index: &Index,
+    paths: &[PathBuf],
+) -> Result<BTreeSet<Vec<u8>>> {
+    let index_paths = index
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let mut selected = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        let recursive = path == Path::new(".")
+            || path.to_string_lossy().ends_with('/')
+            || absolute.is_dir()
+            || index_paths
+                .iter()
+                .any(|entry| index_entry_is_under_path(entry, &git_path));
+        let matched = index_paths
+            .iter()
+            .filter(|entry| {
+                entry.as_slice() == git_path.as_slice()
+                    || (recursive && index_entry_is_under_path(entry, &git_path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            eprintln!(
+                "error: pathspec '{}' did not match any file(s) known to git",
+                path.display()
+            );
+            return Err(GitError::Exit(1));
+        }
+        selected.extend(matched);
+    }
+    Ok(selected)
+}
+
+fn checkout_path_is_unmerged(index: &Index, path: &[u8]) -> bool {
+    index
+        .entries
+        .iter()
+        .any(|entry| entry.path.as_bytes() == path && entry.stage() != Stage::Normal)
+}
+
+fn checkout_write_index_entry_to_worktree(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    entry: &IndexEntry,
+    smudge_config: Option<&GitConfig>,
+) -> Result<Option<IndexEntry>> {
+    restore_index_entry(worktree_root, git_dir, format, db, entry, smudge_config)
+}
+
+fn checkout_merge_unmerged_path(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    index: &Index,
+    positions: &[usize],
+    style: CheckoutConflictStyle,
+) -> Result<()> {
+    let mut base = None;
+    let mut ours = None;
+    let mut theirs = None;
+    for position in positions {
+        let entry = &index.entries[*position];
+        match entry.stage() {
+            Stage::Base => base = Some(entry),
+            Stage::Ours => ours = Some(entry),
+            Stage::Theirs => theirs = Some(entry),
+            Stage::Normal => {}
+        }
+    }
+    let Some(ours) = ours else {
+        return Ok(());
+    };
+    let Some(theirs) = theirs else {
+        return Ok(());
+    };
+    let base_body = match base {
+        Some(entry) => read_expected_object(db, &entry.oid, ObjectType::Blob)?.body.clone(),
+        None => Vec::new(),
+    };
+    let ours_body = read_expected_object(db, &ours.oid, ObjectType::Blob)?.body.clone();
+    let theirs_body = read_expected_object(db, &theirs.oid, ObjectType::Blob)?.body.clone();
+    let result = sley_diff_merge::merge_blobs(
+        &base_body,
+        &ours_body,
+        &theirs_body,
+        &sley_diff_merge::MergeBlobOptions {
+            ours_label: "ours",
+            theirs_label: "theirs",
+            base_label: "base",
+            style: match style {
+                CheckoutConflictStyle::Merge => sley_diff_merge::ConflictStyle::Merge,
+                CheckoutConflictStyle::Diff3 => sley_diff_merge::ConflictStyle::Diff3,
+            },
+        },
+    );
+    let file_path = worktree_path(worktree_root, ours.path.as_bytes())?;
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
+    fs::write(&file_path, result.content)?;
+    set_worktree_file_mode(&file_path, ours.mode)?;
+    Ok(())
 }
 
 pub fn restore_index_paths_from_head(
