@@ -17,9 +17,11 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     let mut format_name: Option<String> = None;
     let mut prefix = Vec::new();
     let mut output: Option<String> = None;
+    let mut remote: Option<String> = None;
     let mut treeish = None;
     let mut pathspecs = Vec::new();
     let mut list = false;
+    let mut verbose = false;
     let mut mtime_option: Option<String> = None;
     let mut compression_level: Option<u32> = None;
     let mut extra_files: Vec<ArchiveExtraFile> = Vec::new();
@@ -38,6 +40,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             "--" => positional_only = true,
             "--end-of-options" => positional_only = true,
             "-l" | "--list" => list = true,
+            "-v" | "--verbose" => verbose = true,
             "--format" => {
                 format_name = Some(
                     iter.next()
@@ -58,6 +61,13 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 mtime_option = Some(
                     iter.next()
                         .ok_or_else(|| GitError::Command("archive --mtime requires a value".into()))?
+                        .clone(),
+                );
+            }
+            "--remote" => {
+                remote = Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command("archive --remote requires a value".into()))?
                         .clone(),
                 );
             }
@@ -93,6 +103,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             value if value.starts_with("--mtime=") => {
                 mtime_option = Some(value["--mtime=".len()..].to_string());
             }
+            value if value.starts_with("--remote=") => {
+                remote = Some(value["--remote=".len()..].to_string());
+            }
             value if value.starts_with("--output=") => {
                 output = Some(value["--output=".len()..].to_string());
             }
@@ -124,51 +137,54 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         if treeish.is_some() || !pathspecs.is_empty() {
             return Err(GitError::Exit(128));
         }
+        let cwd = env::current_dir()?;
+        let config = archive_config_for_list(remote.as_deref(), &cwd).unwrap_or_default();
         let stdout = io::stdout();
         let mut lock = stdout.lock();
-        for name in ["tar", "tgz", "tar.gz", "zip"] {
+        for name in archive_list_formats(&config, remote.is_some()) {
             writeln!(lock, "{name}")?;
         }
         lock.flush()?;
         return Ok(());
     }
 
-    // Format resolution: explicit `--format`, else inferred from the `--output`
-    // filename extension, else `tar` (upstream `archive_format_from_filename`).
-    let format_name = match format_name {
-        Some(name) => name,
-        None => output
-            .as_deref()
-            .and_then(archive_format_from_filename)
-            .unwrap_or("tar")
-            .to_string(),
-    };
-    let archive_format = match format_name.as_str() {
-        "tar" => ArchiveFormatKind::Tar,
-        "zip" => ArchiveFormatKind::Zip,
-        // `tgz` and `tar.gz` are the internal-gzip tar filter (git's
-        // `internal_gzip_command`): the tar stream wrapped in gzip.
-        "tgz" | "tar.gz" => ArchiveFormatKind::TarGz,
-        other => {
-            return Err(GitError::Command(format!(
-                "archive does not support --format={other}"
-            )));
-        }
-    };
-
     let treeish = treeish.ok_or_else(|| GitError::Command("archive requires a tree-ish".into()))?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let local_git_dir = discover_git_dir(&cwd).ok();
+    let git_dir = if let Some(remote) = remote.as_deref() {
+        archive_remote_git_dir(remote, &cwd, local_git_dir.as_deref())?
+    } else {
+        discover_git_dir(&cwd)?
+    };
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     // A bare repo has no worktree, so the "current prefix" is empty (we are at
     // the repository root); upstream `git archive` works in a bare repo.
-    let current_prefix = match sley_worktree::worktree_root_for_git_dir(&git_dir)? {
-        Some(_) => worktree_prefix(&cwd, &git_dir)?.into_bytes(),
-        None => Vec::new(),
+    let current_prefix = if remote.is_some() {
+        Vec::new()
+    } else {
+        match sley_worktree::worktree_root_for_git_dir(&git_dir)? {
+            Some(_) => worktree_prefix(&cwd, &git_dir)?.into_bytes(),
+            None => Vec::new(),
+        }
     };
-    let pathspecs = archive_pathspecs_for_current_prefix(&current_prefix, pathspecs);
+    let pathspecs = match archive_pathspecs_for_current_prefix(&current_prefix, pathspecs) {
+        Ok(pathspecs) => pathspecs,
+        Err(GitError::InvalidPath(message))
+            if message.contains("outside the current directory") =>
+        {
+            eprintln!("fatal: {message}");
+            return Err(GitError::Exit(128));
+        }
+        Err(err) => return Err(err),
+    };
     let oid = resolve_revision(&git_dir, format, &treeish)?;
+    let config = read_repo_config(&git_dir)?;
+    if remote.is_some()
+        && !archive_remote_object_allowed(&git_dir, &db, format, &oid, &treeish, &config)?
+    {
+        return Err(GitError::Exit(128));
+    }
     let object = db.read_object(&oid)?;
     let (tree_oid, default_mtime, commit_id, commit_record) = match object.object_type {
         ObjectType::Commit => {
@@ -208,7 +224,29 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     // attribute root is the worktree (when non-bare) or the git dir (bare); the
     // git dir locates `info/attributes`. TODO(convert): `--worktree-attributes`
     // (read live `.gitattributes`) and the `ident` filter are not wired yet.
-    let config = read_repo_config(&git_dir)?;
+    // Format resolution: explicit `--format`, else inferred from the `--output`
+    // filename extension, else `tar` (upstream `archive_format_from_filename`).
+    let format_name = match format_name {
+        Some(name) => name,
+        None => output
+            .as_deref()
+            .and_then(|name| archive_format_from_filename_with_config(name, &config, remote.is_some()))
+            .unwrap_or_else(|| "tar".to_string()),
+    };
+    let filter_command = archive_filter_command(&config, &format_name, remote.is_some())?;
+    let archive_format = match format_name.as_str() {
+        "tar" => ArchiveFormatKind::Tar,
+        "zip" => ArchiveFormatKind::Zip,
+        // `tgz` and `tar.gz` are the internal-gzip tar filter (git's
+        // `internal_gzip_command`): the tar stream wrapped in gzip.
+        "tgz" | "tar.gz" if filter_command.is_none() => ArchiveFormatKind::TarGz,
+        _ if filter_command.is_some() => ArchiveFormatKind::TarFilter,
+        other => {
+            return Err(GitError::Command(format!(
+                "archive does not support --format={other}"
+            )));
+        }
+    };
     let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.to_path_buf());
     let mut convert = sley_archive::ArchiveConvert::from_tree(
@@ -250,6 +288,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 mtime,
                 commit_id,
                 pathspecs,
+                verbose,
             };
             with_archive_writer(output, |writer| {
                 handle_archive_result(sley_archive::write_tar_archive_full(
@@ -264,6 +303,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 mtime,
                 commit_id,
                 pathspecs,
+                verbose,
             };
             with_archive_writer(output, |writer| {
                 handle_archive_result(sley_archive::write_tar_gz_archive_full(
@@ -277,6 +317,26 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                     // git defaults tgz to the zlib default level (6).
                     compression_level.unwrap_or(6),
                 ))
+            })
+        }
+        ArchiveFormatKind::TarFilter => {
+            let options = sley_archive::TarArchiveOptions {
+                prefix,
+                strip_prefix: current_prefix,
+                mtime,
+                commit_id,
+                pathspecs,
+                verbose,
+            };
+            let command = filter_command.expect("tar filter arm has a command");
+            with_archive_writer(output, |writer| {
+                let mut tar = Vec::new();
+                handle_archive_result(sley_archive::write_tar_archive_full(
+                    &mut tar, &db, format, &tree_oid, options, &convert, &extra,
+                ))?;
+                let filtered = run_archive_filter(&command, &tar)?;
+                writer.write_all(&filtered)?;
+                Ok(())
             })
         }
         ArchiveFormatKind::Zip => {
@@ -301,6 +361,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
 enum ArchiveFormatKind {
     Tar,
     TarGz,
+    TarFilter,
     Zip,
 }
 
@@ -324,13 +385,16 @@ fn with_archive_writer(
 /// Infer the archive format from an `--output` filename, mirroring upstream
 /// `archive_format_from_filename` / `match_extension`: the extension must follow
 /// a non-empty basename and a literal `.`.
-fn archive_format_from_filename(filename: &str) -> Option<&'static str> {
-    for name in ["tar", "tgz", "tar.gz", "zip"] {
-        if archive_match_extension(filename, name) {
-            return Some(name);
-        }
-    }
-    None
+fn archive_format_from_filename_with_config(
+    filename: &str,
+    config: &GitConfig,
+    is_remote: bool,
+) -> Option<String> {
+    let mut formats = archive_list_formats(config, is_remote);
+    formats.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    formats
+        .into_iter()
+        .find(|name| archive_match_extension(filename, name))
 }
 
 fn archive_match_extension(filename: &str, ext: &str) -> bool {
@@ -342,6 +406,169 @@ fn archive_match_extension(filename: &str, ext: &str) -> bool {
         return false;
     }
     &filename[prefix_len..] == ext
+}
+
+fn archive_config_for_list(remote: Option<&str>, cwd: &Path) -> Result<GitConfig> {
+    let local_git_dir = discover_git_dir(cwd).ok();
+    let git_dir = if let Some(remote) = remote {
+        archive_remote_git_dir(remote, cwd, local_git_dir.as_deref())?
+    } else {
+        local_git_dir.ok_or_else(|| GitError::Command("not a git repository".into()))?
+    };
+    read_repo_config(&git_dir)
+}
+
+fn archive_remote_git_dir(remote: &str, cwd: &Path, local_git_dir: Option<&Path>) -> Result<PathBuf> {
+    let (path, base) = if archive_remote_looks_like_path(remote) {
+        (PathBuf::from(remote), cwd.to_path_buf())
+    } else {
+        let git_dir = local_git_dir
+            .ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
+        let config = read_repo_config(git_dir)?;
+        let url = config
+            .get("remote", Some(remote), "url")
+            .ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
+        let base = sley_worktree::worktree_root_for_git_dir(git_dir)?
+            .unwrap_or_else(|| git_dir.to_path_buf());
+        (PathBuf::from(url), base)
+    };
+    let repo = if path.is_absolute() { path } else { base.join(path) };
+    discover_git_dir(&repo)
+}
+
+fn archive_remote_looks_like_path(remote: &str) -> bool {
+    remote == "."
+        || remote == ".."
+        || remote.starts_with('/')
+        || remote.starts_with("./")
+        || remote.starts_with("../")
+        || remote.contains('/')
+}
+
+fn archive_remote_object_allowed(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    treeish: &str,
+    config: &GitConfig,
+) -> Result<bool> {
+    if config
+        .get_bool("uploadarchive", None, "allowUnreachable")
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    if ObjectId::from_hex(format, treeish).is_ok() {
+        return Ok(false);
+    }
+    let target = match sley_rev::peel_to_commit(db, format, oid) {
+        Ok(target) => target,
+        Err(_) => return Ok(false),
+    };
+    let store = sley_refs::FileRefStore::new(git_dir, format);
+    let mut roots = Vec::new();
+    if let Some(head) = sley_refs::resolve_ref_peeled(&store, "HEAD")? {
+        roots.push(head);
+    }
+    for reference in store.list_refs()? {
+        if let sley_refs::RefTarget::Direct(oid) = reference.target {
+            roots.push(oid);
+        }
+    }
+    if roots.is_empty() {
+        return Ok(false);
+    }
+    Ok(sley_rev::walk_commits(db, format, roots)?
+        .iter()
+        .any(|record| record.oid == target))
+}
+
+fn archive_list_formats(config: &GitConfig, is_remote: bool) -> Vec<String> {
+    let mut formats = vec![
+        "tar".to_string(),
+        "tgz".to_string(),
+        "tar.gz".to_string(),
+        "zip".to_string(),
+    ];
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("tar") {
+            continue;
+        }
+        let Some(name) = section.subsection.as_deref() else {
+            continue;
+        };
+        let has_command = section
+            .entries
+            .iter()
+            .any(|entry| entry.key.eq_ignore_ascii_case("command"));
+        if !has_command {
+            continue;
+        }
+        if is_remote && !config.get_bool("tar", Some(name), "remote").unwrap_or(false) {
+            continue;
+        }
+        if !formats.iter().any(|format| format == name) {
+            formats.push(name.to_string());
+        }
+    }
+    formats
+}
+
+fn archive_filter_command(
+    config: &GitConfig,
+    format_name: &str,
+    is_remote: bool,
+) -> Result<Option<String>> {
+    if is_remote {
+        let remote_allowed = match format_name {
+            "tar" | "tgz" | "tar.gz" | "zip" => config
+                .get_bool("tar", Some(format_name), "remote")
+                .unwrap_or(true),
+            _ => config
+                .get_bool("tar", Some(format_name), "remote")
+                .unwrap_or(false),
+        };
+        if !remote_allowed {
+            return Err(GitError::Exit(128));
+        }
+    }
+    let Some(command) = config.get("tar", Some(format_name), "command") else {
+        return Ok(None);
+    };
+    if command.is_empty() {
+        eprintln!("fatal: empty tar filter command for '{format_name}'");
+        return Err(GitError::Exit(128));
+    }
+    Ok(Some(command.to_string()))
+}
+
+fn run_archive_filter(command: &str, input: &[u8]) -> Result<Vec<u8>> {
+    let input_path = env::temp_dir().join(format!(
+        "sley-archive-filter-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    {
+        let mut file = fs::File::create(&input_path)?;
+        file.write_all(input)?;
+    }
+    let input_file = fs::File::open(&input_path)?;
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::from(input_file))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    let _ = fs::remove_file(&input_path);
+    if !output.status.success() {
+        return Err(GitError::Exit(output.status.code().unwrap_or(128)));
+    }
+    Ok(output.stdout)
 }
 
 /// Build an extra-file entry from a disk path: output path is
@@ -441,6 +668,10 @@ fn handle_archive_result(result: Result<()>) -> Result<()> {
             eprintln!("fatal: {message}");
             Err(GitError::Exit(128))
         }
+        Err(GitError::InvalidPath(message)) if message.contains("outside the current directory") => {
+            eprintln!("fatal: {message}");
+            Err(GitError::Exit(128))
+        }
         Err(err) => Err(err),
     }
 }
@@ -448,27 +679,53 @@ fn handle_archive_result(result: Result<()>) -> Result<()> {
 fn archive_pathspecs_for_current_prefix(
     current_prefix: &[u8],
     pathspecs: Vec<Vec<u8>>,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     if current_prefix.is_empty() {
-        return pathspecs;
+        return Ok(pathspecs);
     }
     if pathspecs.is_empty() {
-        return vec![
+        return Ok(vec![
             current_prefix
                 .strip_suffix(b"/")
                 .unwrap_or(current_prefix)
                 .to_vec(),
-        ];
+        ]);
     }
+    let current_components = archive_path_components(current_prefix);
     pathspecs
         .into_iter()
         .map(|pathspec| {
-            let pathspec = pathspec.strip_prefix(b"./").unwrap_or(&pathspec);
-            let mut full = Vec::with_capacity(current_prefix.len() + pathspec.len());
-            full.extend_from_slice(current_prefix);
-            full.extend_from_slice(pathspec);
-            full
+            if pathspec.starts_with(b":") {
+                return Ok(pathspec);
+            }
+            let mut components = current_components.clone();
+            for component in pathspec.split(|byte| *byte == b'/') {
+                match component {
+                    b"" | b"." => {}
+                    b".." => {
+                        components.pop().ok_or_else(|| {
+                            GitError::InvalidPath(
+                                "pathspec is outside the current directory".into(),
+                            )
+                        })?;
+                    }
+                    other => components.push(other.to_vec()),
+                }
+            }
+            if !components.starts_with(&current_components) {
+                return Err(GitError::InvalidPath(
+                    "pathspec is outside the current directory".into(),
+                ));
+            }
+            Ok(components.join(&b'/'))
         })
+        .collect()
+}
+
+fn archive_path_components(path: &[u8]) -> Vec<Vec<u8>> {
+    path.split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .map(Vec::from)
         .collect()
 }
 

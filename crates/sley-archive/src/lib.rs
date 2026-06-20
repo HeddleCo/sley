@@ -4,6 +4,10 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{ObjectType, TreeEntries, tree_entry_object_type};
 use sley_odb::ObjectReader;
+use sley_pathspec::{
+    PathspecAttributeCheck, PathspecAttributeState, PathspecElement, PathspecMatchMagic,
+    pathspec_attrs_match_with, pathspec_item_matches,
+};
 use sley_worktree::TreeAttributes;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -183,6 +187,7 @@ pub struct TarArchiveOptions {
     pub mtime: u64,
     pub commit_id: Option<ObjectId>,
     pub pathspecs: Vec<Vec<u8>>,
+    pub verbose: bool,
 }
 
 /// A single `--add-file` / `--add-virtual-file` entry: the (already
@@ -264,6 +269,16 @@ pub(crate) enum ArchiveEntry<'a> {
         target: &'a [u8],
         oid: ObjectId,
     },
+}
+
+impl ArchiveEntry<'_> {
+    fn path(&self) -> &[u8] {
+        match self {
+            ArchiveEntry::Directory { path }
+            | ArchiveEntry::File { path, .. }
+            | ArchiveEntry::Symlink { path, .. } => path,
+        }
+    }
 }
 
 /// Format-specific archive serializer. The tree walk
@@ -389,7 +404,7 @@ where
     // Validate pathspecs before writing any output, matching git's
     // `parse_pathspec_arg`: an unmatched pathspec must `die()` with no archive
     // bytes on the stream (not even the pax global header).
-    validate_archive_pathspecs(reader, format, tree_oid, &options.pathspecs)?;
+    validate_archive_pathspecs(reader, format, tree_oid, &options.pathspecs, convert)?;
     let mut writer = CountingWriter::new(writer);
     // The global header writes first and clamps a far-future mtime; every entry
     // uses the clamped value (upstream sets `args->time = USTAR_MAX_MTIME`).
@@ -400,6 +415,7 @@ where
     let mut sink = TarSink {
         writer: &mut writer,
         mtime: entry_mtime,
+        verbose: options.verbose,
     };
     write_archive_entries(
         &mut sink,
@@ -421,10 +437,14 @@ where
 struct TarSink<'a, 'w, W: Write + ?Sized> {
     writer: &'a mut CountingWriter<'w, W>,
     mtime: u64,
+    verbose: bool,
 }
 
 impl<W: Write + ?Sized> ArchiveSink for TarSink<'_, '_, W> {
     fn emit(&mut self, entry: ArchiveEntry<'_>) -> Result<()> {
+        if self.verbose {
+            eprintln!("{}", String::from_utf8_lossy(entry.path()));
+        }
         match entry {
             ArchiveEntry::Directory { path } => {
                 write_directory_entry(self.writer, &path, self.mtime)
@@ -464,11 +484,12 @@ pub(crate) fn validate_archive_pathspecs<R>(
     format: ObjectFormat,
     tree_oid: &ObjectId,
     pathspecs: &[Vec<u8>],
+    convert: Option<&ArchiveConvert<'_>>,
 ) -> Result<()>
 where
     R: ObjectReader,
 {
-    let pathspecs = normalize_pathspecs(pathspecs)?;
+    let pathspecs = parse_archive_pathspecs(pathspecs)?;
     if pathspecs.is_empty() {
         return Ok(());
     }
@@ -480,6 +501,7 @@ where
         b"",
         &pathspecs,
         false,
+        convert,
         &mut matched,
     )?;
     if let Some(pathspec) = pathspecs
@@ -489,7 +511,7 @@ where
     {
         return Err(GitError::InvalidPath(format!(
             "pathspec '{}' did not match any files",
-            String::from_utf8_lossy(pathspec)
+            String::from_utf8_lossy(&pathspec.original)
         )));
     }
     Ok(())
@@ -509,7 +531,7 @@ where
     R: ObjectReader,
     S: ArchiveSink + ?Sized,
 {
-    let pathspecs = normalize_pathspecs(pathspecs)?;
+    let pathspecs = parse_archive_pathspecs(pathspecs)?;
     // Pathspec match validation runs in `validate_archive_pathspecs`, called by
     // the archive writers before any output byte is emitted (so an unmatched
     // pathspec produces no partial archive). Here we only recompute the per-spec
@@ -522,6 +544,7 @@ where
         b"",
         &pathspecs,
         false,
+        convert,
         &mut matched,
     )?;
     let mut emitted_directories = HashSet::new();
@@ -555,8 +578,9 @@ fn mark_archive_pathspec_matches<R>(
     format: ObjectFormat,
     tree_oid: &ObjectId,
     relative_prefix: &[u8],
-    pathspecs: &[Vec<u8>],
+    pathspecs: &[ArchivePathspec],
     force_include: bool,
+    convert: Option<&ArchiveConvert<'_>>,
     matched: &mut [bool],
 ) -> Result<()>
 where
@@ -588,7 +612,7 @@ where
                 if !selection.descend {
                     continue;
                 }
-                mark_exact_pathspec_matches(&relative_path, pathspecs, matched);
+                mark_exact_pathspec_matches(&relative_path, pathspecs, convert, matched);
                 let relative_directory = ensure_trailing_slash(&relative_path);
                 mark_archive_pathspec_matches(
                     reader,
@@ -597,11 +621,12 @@ where
                     &relative_directory,
                     pathspecs,
                     force_include || selection.full_subtree,
+                    convert,
                     matched,
                 )?;
             }
             ObjectType::Blob => {
-                archive_blob_selected(&relative_path, pathspecs, force_include, matched);
+                archive_blob_selected(&relative_path, pathspecs, force_include, convert, matched);
             }
             _ => {}
         }
@@ -614,7 +639,7 @@ struct ArchiveWriteContext<'a, R> {
     format: ObjectFormat,
     prefix: &'a [u8],
     strip_prefix: &'a [u8],
-    pathspecs: &'a [Vec<u8>],
+    pathspecs: &'a [ArchivePathspec],
     /// Smudge conversion, when archiving with `--convert` semantics; `None`
     /// emits raw blob bytes.
     convert: Option<&'a ArchiveConvert<'a>>,
@@ -666,8 +691,9 @@ where
                 {
                     continue;
                 }
-                if let Some(output_relative_path) =
-                    strip_archive_prefix(&relative_path, context.strip_prefix)
+                if selection.full_subtree
+                    && let Some(output_relative_path) =
+                        strip_archive_prefix(&relative_path, context.strip_prefix)
                     && !output_relative_path.is_empty()
                 {
                     let directory =
@@ -676,7 +702,12 @@ where
                         sink.emit(ArchiveEntry::Directory { path: directory })?;
                     }
                 }
-                mark_exact_pathspec_matches(&relative_path, context.pathspecs, matched);
+                mark_exact_pathspec_matches(
+                    &relative_path,
+                    context.pathspecs,
+                    context.convert,
+                    matched,
+                );
                 write_tree_entries(
                     sink,
                     context,
@@ -688,7 +719,13 @@ where
                 )?;
             }
             ObjectType::Blob => {
-                if !archive_blob_selected(&relative_path, context.pathspecs, force_include, matched)
+                if !archive_blob_selected(
+                    &relative_path,
+                    context.pathspecs,
+                    force_include,
+                    context.convert,
+                    matched,
+                )
                 {
                     continue;
                 }
@@ -706,6 +743,7 @@ where
                     continue;
                 };
                 let path = join_path(context.prefix, output_relative_path);
+                emit_parent_directories(sink, &path, emitted_directories)?;
                 let object = context.reader.read_object(&entry.oid)?;
                 if object.object_type != ObjectType::Blob {
                     return Err(GitError::InvalidObject(format!(
@@ -767,13 +805,103 @@ fn strip_archive_prefix<'a>(path: &'a [u8], strip_prefix: &[u8]) -> Option<&'a [
     path.strip_prefix(strip_prefix)
 }
 
+fn emit_parent_directories<S>(
+    sink: &mut S,
+    path: &[u8],
+    emitted_directories: &mut HashSet<Vec<u8>>,
+) -> Result<()>
+where
+    S: ArchiveSink + ?Sized,
+{
+    let mut offset = 0;
+    while let Some(index) = path[offset..].iter().position(|byte| *byte == b'/') {
+        offset += index + 1;
+        let directory = path[..offset].to_vec();
+        if emitted_directories.insert(directory.clone()) {
+            sink.emit(ArchiveEntry::Directory { path: directory })?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ArchivePathspec {
+    original: Vec<u8>,
+    element: PathspecElement,
+}
+
+impl ArchivePathspec {
+    fn needs_full_descent(&self) -> bool {
+        !self.element.attrs().is_empty()
+            || sley_pathspec::pathspec_is_glob(self.element.pattern())
+            || self.element.is_glob()
+    }
+}
+
+fn parse_archive_pathspecs(pathspecs: &[Vec<u8>]) -> Result<Vec<ArchivePathspec>> {
+    let mut parsed = Vec::with_capacity(pathspecs.len());
+    for pathspec in pathspecs {
+        if pathspec.is_empty() {
+            return Err(GitError::InvalidPath(format!(
+                "invalid archive pathspec {}",
+                String::from_utf8_lossy(pathspec)
+            )));
+        }
+        let element = PathspecElement::parse(pathspec, PathspecMatchMagic::default())
+            .map_err(|err| GitError::InvalidPath(format!("invalid archive pathspec: {err}")))?;
+        let pattern = if element.pattern().is_empty() {
+            Vec::new()
+        } else {
+            normalize_pathspec_component(element.pattern())?
+        };
+        parsed.push(ArchivePathspec {
+            original: pathspec.clone(),
+            element: element.with_pattern(pattern),
+        });
+    }
+    Ok(parsed)
+}
+
+fn archive_pathspec_matches_path(
+    pathspec: &ArchivePathspec,
+    path: &[u8],
+    convert: Option<&ArchiveConvert<'_>>,
+) -> bool {
+    if !pathspec_item_matches(pathspec.element.pattern(), path, pathspec.element.magic()) {
+        return false;
+    }
+    if pathspec.element.attrs().is_empty() {
+        return true;
+    }
+    let Some(convert) = convert else {
+        return false;
+    };
+    pathspec_attrs_match_with(&pathspec.element, |requested| {
+        convert
+            .attributes
+            .attributes_for_path(path, requested)
+            .into_iter()
+            .map(|check| PathspecAttributeCheck {
+                attribute: check.attribute,
+                state: check.state.map(|state| match state {
+                    sley_worktree::AttributeState::Set => PathspecAttributeState::Set,
+                    sley_worktree::AttributeState::Unset => PathspecAttributeState::Unset,
+                    sley_worktree::AttributeState::Value(value) => {
+                        PathspecAttributeState::Value(value)
+                    }
+                }),
+            })
+            .collect()
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ArchiveTreeSelection {
     descend: bool,
     full_subtree: bool,
 }
 
-fn archive_tree_selection(relative_path: &[u8], pathspecs: &[Vec<u8>]) -> ArchiveTreeSelection {
+fn archive_tree_selection(relative_path: &[u8], pathspecs: &[ArchivePathspec]) -> ArchiveTreeSelection {
     if pathspecs.is_empty() {
         return ArchiveTreeSelection {
             descend: true,
@@ -783,13 +911,15 @@ fn archive_tree_selection(relative_path: &[u8], pathspecs: &[Vec<u8>]) -> Archiv
     let directory = ensure_trailing_slash(relative_path);
     let mut descendant = false;
     for pathspec in pathspecs {
-        if pathspec == relative_path || *pathspec == directory {
+        if archive_pathspec_matches_path(pathspec, relative_path, None)
+            || archive_pathspec_matches_path(pathspec, &directory, None)
+        {
             return ArchiveTreeSelection {
                 descend: true,
                 full_subtree: true,
             };
         }
-        if pathspec.starts_with(&directory) {
+        if pathspec.needs_full_descent() || pathspec.element.pattern().starts_with(&directory) {
             descendant = true;
         }
     }
@@ -801,8 +931,9 @@ fn archive_tree_selection(relative_path: &[u8], pathspecs: &[Vec<u8>]) -> Archiv
 
 fn archive_blob_selected(
     relative_path: &[u8],
-    pathspecs: &[Vec<u8>],
+    pathspecs: &[ArchivePathspec],
     force_include: bool,
+    convert: Option<&ArchiveConvert<'_>>,
     matched: &mut [bool],
 ) -> bool {
     if pathspecs.is_empty() {
@@ -810,7 +941,7 @@ fn archive_blob_selected(
     }
     let mut selected = false;
     for (index, pathspec) in pathspecs.iter().enumerate() {
-        if pathspec == relative_path {
+        if archive_pathspec_matches_path(pathspec, relative_path, convert) {
             matched[index] = true;
             selected = true;
         }
@@ -818,10 +949,17 @@ fn archive_blob_selected(
     selected || force_include
 }
 
-fn mark_exact_pathspec_matches(relative_path: &[u8], pathspecs: &[Vec<u8>], matched: &mut [bool]) {
+fn mark_exact_pathspec_matches(
+    relative_path: &[u8],
+    pathspecs: &[ArchivePathspec],
+    convert: Option<&ArchiveConvert<'_>>,
+    matched: &mut [bool],
+) {
     let directory = ensure_trailing_slash(relative_path);
     for (index, pathspec) in pathspecs.iter().enumerate() {
-        if pathspec == relative_path || *pathspec == directory {
+        if archive_pathspec_matches_path(pathspec, relative_path, convert)
+            || archive_pathspec_matches_path(pathspec, &directory, convert)
+        {
             matched[index] = true;
         }
     }
@@ -1136,20 +1274,6 @@ pub(crate) fn normalize_strip_prefix(prefix: &[u8]) -> Result<Vec<u8>> {
     normalize_pathspec_component(prefix).map(|prefix| ensure_trailing_slash(&prefix))
 }
 
-fn normalize_pathspecs(pathspecs: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
-    let mut normalized = Vec::with_capacity(pathspecs.len());
-    for pathspec in pathspecs {
-        if pathspec.is_empty() {
-            return Err(GitError::InvalidPath(format!(
-                "invalid archive pathspec {}",
-                String::from_utf8_lossy(pathspec)
-            )));
-        }
-        normalized.push(normalize_pathspec_component(pathspec)?);
-    }
-    Ok(normalized)
-}
-
 fn normalize_pathspec_component(pathspec: &[u8]) -> Result<Vec<u8>> {
     let pathspec = pathspec.strip_prefix(b"./").unwrap_or(pathspec);
     if pathspec.starts_with(b"/")
@@ -1257,6 +1381,7 @@ mod tests {
                 mtime: 1_700_000_000,
                 commit_id: None,
                 pathspecs: Vec::new(),
+                verbose: false,
             },
         )
         .expect("test operation should succeed");
