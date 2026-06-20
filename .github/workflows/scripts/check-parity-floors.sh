@@ -419,7 +419,10 @@ declare -A FLOOR=(
     # codex-wave-4: merge-tree --write-tree t4301 enroll@18; blame siblings t8001 99->110/t8002 117->128/t8012 98->109; sparse t1091 40->45.
     [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
-    [t7004-tag.sh]=228
+    # 2026-06-20 recover: --merged/--no-merged/--contains/--no-contains + tag-msg-file unlink + version-sort
+    # cluster (cells 222-231) had silently regressed below this floor (main 219 < 228, weekly-gate-hidden);
+    # restored to 229 (stable 3x, installed oracle). Residual fails: ahead-behind %(...) format + double-sig verify.
+    [t7004-tag.sh]=229
     # signed-commit slice (2026-06-20): OpenPGP commit/tag signing + verify (t7510 2->28) and a real
     # gpg.format=ssh signing engine via ssh-keygen + x509 via gpgsm (t7528 6->27, t7031 2->13, t7030 4->10).
     # All enrolled here, stable 3x on the installed oracle. Restores+raises t4202 (signature cells) below.
