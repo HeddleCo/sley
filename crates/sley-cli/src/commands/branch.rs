@@ -63,7 +63,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             eprintln!("fatal: cannot use -a with -d");
             Err(GitError::Exit(128))
         } else if force {
-            force_delete_branches(git_dir, store, &branches, quiet)
+            force_delete_branches(git_dir, format, store, &branches, quiet)
         } else {
             delete_merged_branches(git_dir, format, store, &branches, quiet)
         };
@@ -5933,16 +5933,18 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             create_branch_from_start(git_dir, format, store, branch, Some(start))
         }
         [flag] if flag == "-f" || flag == "--force" => print_branch_list(store, BranchListMode::Local),
-        [flag, branches @ ..] if flag == "-D" => force_delete_branches(git_dir, store, branches, false),
+        [flag, branches @ ..] if flag == "-D" => {
+            force_delete_branches(git_dir, format, store, branches, false)
+        }
         [flag, force, branches @ ..]
             if (flag == "-d" || flag == "--delete") && (force == "-f" || force == "--force") =>
         {
-            force_delete_branches(git_dir, store, branches, false)
+            force_delete_branches(git_dir, format, store, branches, false)
         }
         [force, flag, branches @ ..]
             if (force == "-f" || force == "--force") && (flag == "-d" || flag == "--delete") =>
         {
-            force_delete_branches(git_dir, store, branches, false)
+            force_delete_branches(git_dir, format, store, branches, false)
         }
         [flag, branches @ ..] if flag == "-d" || flag == "--delete" => {
             delete_merged_branches(git_dir, format, store, branches, false)
@@ -6985,7 +6987,8 @@ fn set_branch_upstream(
     upstream: &str,
 ) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
-    let Some(upstream) = resolve_branch_upstream(store, &config, upstream)? else {
+    let format = repository_object_format(git_dir)?;
+    let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &config, upstream)? else {
         eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
         eprintln!("hint:");
         eprintln!("hint: If you are planning on basing your work on an upstream");
@@ -7031,10 +7034,20 @@ struct ResolvedBranchUpstream {
 }
 
 fn resolve_branch_upstream(
+    git_dir: &Path,
+    format: ObjectFormat,
     store: &FileRefStore,
     config: &GitConfig,
     upstream: &str,
 ) -> Result<Option<ResolvedBranchUpstream>> {
+    let resolved_upstream = if upstream.contains("@{") {
+        sley_rev::resolve_revision_symbolic_full_name(git_dir, format, upstream)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let upstream = resolved_upstream.as_deref().unwrap_or(upstream);
     let local_branch = upstream.strip_prefix("refs/heads/").unwrap_or(upstream);
     if let Ok(local_ref) = branch_ref_name(local_branch)
         && store.read_ref(&local_ref)?.is_some()
@@ -7558,7 +7571,8 @@ fn set_branch_upstream_quiet(
     quiet: bool,
 ) -> Result<()> {
     let config = read_repo_config(git_dir)?;
-    let Some(upstream) = resolve_branch_upstream(store, &config, upstream)? else {
+    let format = repository_object_format(git_dir)?;
+    let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &config, upstream)? else {
         eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
         return Err(GitError::Exit(128));
     };
@@ -7949,6 +7963,7 @@ fn branch_checked_out_worktree_path(
 
 fn force_delete_branches(
     git_dir: &Path,
+    format: ObjectFormat,
     store: &FileRefStore,
     branches: &[String],
     quiet: bool,
@@ -7959,7 +7974,8 @@ fn force_delete_branches(
     }
     let mut failed = false;
     for branch in branches {
-        let name = format!("refs/heads/{branch}");
+        let (branch, name) =
+            branch_delete_resolve_local_branch_arg(git_dir, format, store, branch)?;
         if store.read_ref(&name)?.is_none() {
             eprintln!("error: branch '{branch}' not found");
             failed = true;
@@ -7973,13 +7989,13 @@ fn force_delete_branches(
             failed = true;
             continue;
         }
-        if try_delete_symref_branch(store, &name, branch, quiet)?.is_some() {
+        if try_delete_symref_branch(store, &name, &branch, quiet)?.is_some() {
             continue;
         }
-        let deleted = store.delete_branch(branch)?;
-        remove_branch_config(git_dir, branch)?;
+        let deleted = store.delete_branch(&branch)?;
+        remove_branch_config(git_dir, &branch)?;
         if !quiet {
-            let deleted_display = branch_delete_display(branch, &name, &deleted.oid);
+            let deleted_display = branch_delete_display(&branch, &name, &deleted.oid);
             println!(
                 "Deleted branch {branch} (was {deleted_display})."
             );
@@ -7989,6 +8005,23 @@ fn force_delete_branches(
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn branch_delete_resolve_local_branch_arg(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    branch: &str,
+) -> Result<(String, String)> {
+    if branch.contains("@{")
+        && let Ok(Some(refname)) =
+            sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)
+        && let Some(local) = refname.strip_prefix("refs/heads/")
+        && store.read_ref(&refname)?.is_some()
+    {
+        return Ok((local.to_string(), refname));
+    }
+    Ok((branch.to_string(), format!("refs/heads/{branch}")))
 }
 
 fn delete_remote_tracking_branches(
@@ -8044,6 +8077,11 @@ fn force_update_branch(
         Some(RefTarget::Direct(oid)) => oid,
         _ => zero_oid(format)?,
     };
+    let message = if old_oid == zero_oid(format)? {
+        format!("branch: Created from {start}")
+    } else {
+        format!("branch: Reset to {start}")
+    };
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name,
@@ -8053,7 +8091,7 @@ fn force_update_branch(
             old_oid,
             new_oid,
             committer: commit_identity_from_env("COMMITTER")?,
-            message: format!("branch: Reset to {start}").into_bytes(),
+            message: message.into_bytes(),
         }),
     });
     tx.commit()
@@ -8088,7 +8126,8 @@ fn delete_merged_branches(
 
     let mut failed = false;
     for branch in branches {
-        let name = format!("refs/heads/{branch}");
+        let (branch, name) =
+            branch_delete_resolve_local_branch_arg(git_dir, format, store, branch)?;
         let Some(target) = store.read_ref(&name)? else {
             eprintln!("error: branch '{branch}' not found");
             failed = true;
@@ -8104,7 +8143,7 @@ fn delete_merged_branches(
         }
         // A symbolic-ref branch is deleted without a merge check (git resolves
         // it with RESOLVE_REF_NO_RECURSE); the symref itself is removed.
-        if try_delete_symref_branch(store, &name, branch, quiet)?.is_some() {
+        if try_delete_symref_branch(store, &name, &branch, quiet)?.is_some() {
             continue;
         }
         let RefTarget::Direct(oid) = target else {
@@ -8134,10 +8173,10 @@ fn delete_merged_branches(
             failed = true;
             continue;
         }
-        let deleted = store.delete_branch(branch)?;
-        remove_branch_config(git_dir, branch)?;
+        let deleted = store.delete_branch(&branch)?;
+        remove_branch_config(git_dir, &branch)?;
         if !quiet {
-            let deleted_display = branch_delete_display(branch, &name, &deleted.oid);
+            let deleted_display = branch_delete_display(&branch, &name, &deleted.oid);
             println!(
                 "Deleted branch {branch} (was {deleted_display})."
             );

@@ -502,6 +502,16 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
                 .is_some();
             if !is_branch
+                && branch.contains("@{")
+                && let Ok(Some(refname)) =
+                    sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, branch)
+                && let Some(local_branch) = refname.strip_prefix("refs/heads/")
+                && store.read_ref(&refname)?.is_some()
+            {
+                CheckoutMessage::Existing {
+                    branch: local_branch.to_string(),
+                }
+            } else if !is_branch
                 && let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, branch)
             {
                 let config = read_repo_config(&git_dir)?;
@@ -559,8 +569,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 )?;
                 checkout_show_local_changes(&git_dir, &target_oid, quiet, force)?;
                 return Ok(());
-            }
-            if !is_branch {
+            } else if !is_branch {
                 let branch_name = branch.clone();
                 if guess
                     && let Some(dwim) = checkout_dwim_remote_branch(
@@ -651,7 +660,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             )?;
             let tracking_start = positional
                 .first()
-                .map(|start| checkout_tracking_start_ref(&store, start).unwrap_or_else(|| start.clone()));
+                .map(|start| {
+                    if start.contains("@{") {
+                        sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, start)
+                            .ok()
+                            .flatten()
+                            .or_else(|| checkout_tracking_start_ref(&store, start))
+                            .unwrap_or_else(|| start.clone())
+                    } else {
+                        checkout_tracking_start_ref(&store, start).unwrap_or_else(|| start.clone())
+                    }
+                });
             crate::commands::branch::branch_create_set_tracking(
                 &git_dir,
                 &store,

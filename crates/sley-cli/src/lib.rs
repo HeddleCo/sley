@@ -1290,6 +1290,11 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
     if let Ok(git_dir) = discover_git_dir(env::current_dir()?)
         && let Ok(format) = repository_object_format(&git_dir)
     {
+        if let Ok(Some(refname)) =
+            sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, value)
+        {
+            return Ok(refname);
+        }
         let store = FileRefStore::new(&git_dir, format);
         if store.read_ref(&format!("refs/{value}"))?.is_some() {
             return Ok(format!("refs/{value}"));
@@ -10376,25 +10381,7 @@ fn rev_parse_symbolic_full_name(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<Option<String>> {
-    if rev.len() == format.hex_len() && rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Ok(None);
-    }
-    let store = FileRefStore::new(git_dir, format);
-    if rev == "HEAD" {
-        return store.current_branch_ref();
-    }
-    if rev.starts_with("refs/") {
-        return Ok(store.read_ref(rev)?.map(|_| rev.to_string()));
-    }
-    let head = format!("refs/heads/{rev}");
-    if store.read_ref(&head)?.is_some() {
-        return Ok(Some(head));
-    }
-    let tag = format!("refs/tags/{rev}");
-    if store.read_ref(&tag)?.is_some() {
-        return Ok(Some(tag));
-    }
-    Err(GitError::not_found(format!("revision {rev}")))
+    sley_rev::resolve_revision_symbolic_full_name(git_dir, format, rev)
 }
 
 /// `git rev-parse --bisect`: emit the `refs/bisect/bad*` refs as positive
