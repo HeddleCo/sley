@@ -614,6 +614,7 @@ fn count_commands(items: &[RebaseTodoItem]) -> usize {
 }
 
 fn serialize_item(
+    ctx: &Ctx,
     item: &RebaseTodoItem,
     short: bool,
     abbreviate: bool,
@@ -621,7 +622,11 @@ fn serialize_item(
 ) -> String {
     let oid_text = item.oid.as_ref().map(|oid| {
         if short {
-            find_unique_abbrev_hex(db, oid)
+            if abbreviate {
+                find_unique_abbrev_hex_with_width(db, oid, 7)
+            } else {
+                find_unique_abbrev_hex(ctx, db, oid)
+            }
         } else {
             oid.to_hex()
         }
@@ -637,9 +642,22 @@ fn serialize_item(
     text
 }
 
-fn find_unique_abbrev_hex(db: &FileObjectDatabase, oid: &ObjectId) -> String {
+fn find_unique_abbrev_hex(ctx: &Ctx, db: &FileObjectDatabase, oid: &ObjectId) -> String {
     let hex = oid.to_hex();
-    let mut width = 7usize.min(hex.len());
+    let configured = repository_abbrev(&ctx.git_dir, ctx.format)
+        .ok()
+        .flatten()
+        .unwrap_or(hex.len());
+    find_unique_abbrev_hex_with_width(db, oid, configured.min(hex.len()))
+}
+
+fn find_unique_abbrev_hex_with_width(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    width: usize,
+) -> String {
+    let hex = oid.to_hex();
+    let mut width = width.min(hex.len());
     while width < hex.len() {
         match db.resolve_prefix(&hex[..width]) {
             Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
@@ -650,6 +668,7 @@ fn find_unique_abbrev_hex(db: &FileObjectDatabase, oid: &ObjectId) -> String {
 }
 
 fn todo_to_text(
+    ctx: &Ctx,
     items: &[RebaseTodoItem],
     short: bool,
     abbreviate: bool,
@@ -657,7 +676,7 @@ fn todo_to_text(
 ) -> String {
     let mut out = String::new();
     for item in items {
-        out.push_str(&serialize_item(item, short, abbreviate, db));
+        out.push_str(&serialize_item(ctx, item, short, abbreviate, db));
         out.push('\n');
     }
     out
@@ -676,7 +695,7 @@ fn write_todo_file(
 ) -> Result<()> {
     let abbreviate =
         help && rebase_config_bool(ctx, "rebase", "abbreviateCommands").unwrap_or(false);
-    let mut buf = todo_to_text(items, short, abbreviate, db);
+    let mut buf = todo_to_text(ctx, items, short, abbreviate, db);
     if help {
         let comment = comment_char(&ctx.git_dir) as char;
         let check_error = missing_commit_check_level(ctx) == MissingCommitCheck::Error;
@@ -708,10 +727,10 @@ fn save_todo(ctx: &Ctx, todo: &TodoList, db: &FileObjectDatabase, reschedule: bo
     };
     fs::write(
         ctx.state_path("git-rebase-todo"),
-        todo_to_text(tail, false, false, db),
+        todo_to_text(ctx, tail, false, false, db),
     )?;
     if !reschedule && next > 0 {
-        let line = serialize_item(&todo.items[next - 1], false, false, db);
+        let line = serialize_item(ctx, &todo.items[next - 1], false, false, db);
         let done_path = ctx.state_path("done");
         let mut existing = fs::read(&done_path).unwrap_or_default();
         existing.extend_from_slice(line.as_bytes());
@@ -2059,13 +2078,13 @@ fn make_script_with_merges(
                         .get(parent)
                         .cloned()
                         .unwrap_or_else(|| message_label.clone());
-                    let label = ensure_label(parent, &base, &mut labels, &mut used_labels, db);
+                    let label = ensure_label(ctx, parent, &base, &mut labels, &mut used_labels, db);
                     if !tips.contains(parent) {
                         tips.push(*parent);
                     }
                     label
                 } else {
-                    label_for_oid(parent, &mut labels, &mut used_labels, db)
+                    label_for_oid(ctx, parent, &mut labels, &mut used_labels, db)
                 };
                 arg.push_str(&label);
             }
@@ -2104,6 +2123,7 @@ fn make_script_with_merges(
             }
             if !child_seen.insert(*parent) {
                 ensure_label(
+                    ctx,
                     parent,
                     "branch-point",
                     &mut labels,
@@ -2209,6 +2229,7 @@ fn branch_labels_by_oid(ctx: &Ctx) -> Result<BTreeMap<ObjectId, String>> {
 }
 
 fn ensure_label(
+    ctx: &Ctx,
     oid: &ObjectId,
     base: &str,
     labels: &mut BTreeMap<ObjectId, String>,
@@ -2220,7 +2241,7 @@ fn ensure_label(
     }
     let mut label = sanitize_label(base);
     if label.is_empty() {
-        label = find_unique_abbrev_hex(db, oid);
+        label = find_unique_abbrev_hex(ctx, db, oid);
     }
     let original = label.clone();
     let mut n = 2usize;
@@ -2234,12 +2255,13 @@ fn ensure_label(
 }
 
 fn label_for_oid(
+    ctx: &Ctx,
     oid: &ObjectId,
     labels: &mut BTreeMap<ObjectId, String>,
     used: &mut std::collections::HashSet<String>,
     db: &FileObjectDatabase,
 ) -> String {
-    ensure_label(oid, &find_unique_abbrev_hex(db, oid), labels, used, db)
+    ensure_label(ctx, oid, &find_unique_abbrev_hex(ctx, db, oid), labels, used, db)
 }
 
 fn sanitize_label(input: &str) -> String {
@@ -2499,11 +2521,11 @@ fn complete_action(
     let todo_path = ctx.state_path("git-rebase-todo");
     let backup_path = ctx.state_path("git-rebase-todo.backup");
 
-    let shortonto = find_unique_abbrev_hex(db, &opts.onto);
-    let shorthead = find_unique_abbrev_hex(db, &opts.orig_head);
+    let shortonto = find_unique_abbrev_hex(ctx, db, &opts.onto);
+    let shorthead = find_unique_abbrev_hex(ctx, db, &opts.orig_head);
     let shortrevisions = match upstream {
         Some(upstream) => {
-            let shortrev = find_unique_abbrev_hex(db, upstream);
+            let shortrev = find_unique_abbrev_hex(ctx, db, upstream);
             format!("{shortrev}..{shorthead}")
         }
         None => shorthead,
@@ -2598,7 +2620,7 @@ fn complete_action(
             skipped += 1;
         }
         if skipped > 0 {
-            let done_text = todo_to_text(&todo.items[..skipped], false, false, db);
+            let done_text = todo_to_text(ctx, &todo.items[..skipped], false, false, db);
             fs::write(ctx.state_path("done"), done_text)?;
             if todo
                 .items
@@ -2676,7 +2698,7 @@ fn check_todo_dropped_commits(
         {
             missing.push(format!(
                 " - {} {}",
-                find_unique_abbrev_hex(db, oid),
+                find_unique_abbrev_hex(ctx, db, oid),
                 item.arg
             ));
         }
@@ -2998,7 +3020,7 @@ fn reschedule_current(
 ) -> Result<()> {
     eprintln!("hint: Could not execute the todo command");
     eprintln!("hint: ");
-    eprintln!("hint:     {}", serialize_item(item, false, false, db));
+    eprintln!("hint:     {}", serialize_item(ctx, item, false, false, db));
     eprintln!("hint: ");
     eprintln!("hint: It has been rescheduled; To edit the command before continuing, please");
     eprintln!("hint: edit the todo list first:");
@@ -3014,7 +3036,7 @@ fn reschedule_current(
 
 fn reread_todo_if_changed(ctx: &Ctx, db: &FileObjectDatabase, todo: &mut TodoList) -> Result<()> {
     let on_disk = fs::read_to_string(ctx.state_path("git-rebase-todo")).unwrap_or_default();
-    let expected = todo_to_text(&todo.items[todo.current + 1..], false, false, db);
+    let expected = todo_to_text(ctx, &todo.items[todo.current + 1..], false, false, db);
     if on_disk != expected {
         let mut reloaded = read_populate_todo(ctx, db)?;
         reloaded.done_nr = todo.done_nr;
@@ -3033,7 +3055,7 @@ fn stopped_at_head(ctx: &Ctx, db: &FileObjectDatabase) {
             Ok(record) => {
                 eprintln!(
                     "Stopped at {}...  {}",
-                    find_unique_abbrev_hex(db, &oid),
+                    find_unique_abbrev_hex(ctx, db, &oid),
                     commit_subject(&record.commit.message)
                 );
             }
@@ -3680,7 +3702,7 @@ fn pick_one_commit(
             TodoCommand::Edit => {
                 eprintln!(
                     "Stopped at {}...  {}",
-                    find_unique_abbrev_hex(db, &oid),
+                    find_unique_abbrev_hex(ctx, db, &oid),
                     item.arg
                 );
                 return stop_with_patch(ctx, db, opts, &record, item, 0, true);
@@ -3714,7 +3736,7 @@ fn pick_one_commit(
     // "<short-oid> (<subject>)" (sequencer.c get_message), not the bare subject.
     let theirs_label = format!(
         "{} ({})",
-        find_unique_abbrev_hex(db, &record.oid),
+        find_unique_abbrev_hex(ctx, db, &record.oid),
         commit_subject(&record.commit.message)
     );
     let (results, conflicts) = three_way_merge_trees_with_favor(
@@ -3799,7 +3821,7 @@ fn pick_one_commit(
 
         eprintln!(
             "error: could not apply {}... {}",
-            find_unique_abbrev_hex(db, &oid),
+            find_unique_abbrev_hex(ctx, db, &oid),
             commit_subject(&record.commit.message)
         );
         print_conflict_hints();
@@ -3899,7 +3921,7 @@ fn pick_one_commit(
         let new_head = head_commit_oid(&ctx.refs())?.expect("just committed");
         eprintln!(
             "Stopped at {}...  {}",
-            find_unique_abbrev_hex(db, &oid),
+            find_unique_abbrev_hex(ctx, db, &oid),
             item.arg
         );
         let _ = new_head;
@@ -4104,7 +4126,7 @@ fn stop_with_patch(
         // prefix `pick <oid> # <subject>`).
         eprintln!(
             "Could not apply {}... {}",
-            find_unique_abbrev_hex(db, &record.oid),
+            find_unique_abbrev_hex(ctx, db, &record.oid),
             commit_subject(&record.commit.message)
         );
         return Ok(PickOutcome::Fail(exit_code));
@@ -5146,7 +5168,7 @@ fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("autostash"), oid.to_hex())?;
     let db = ctx.db();
-    println!("Created autostash: {}", find_unique_abbrev_hex(&db, &oid));
+    println!("Created autostash: {}", find_unique_abbrev_hex(ctx, &db, &oid));
     let refs = ctx.refs();
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
