@@ -2616,6 +2616,13 @@ fn complete_action(
         }
     }
 
+    let already_on_rebased_head = head_commit_oid(&ctx.refs())? == Some(opts.orig_head);
+    if todo.items.is_empty() && already_on_rebased_head && base == opts.orig_head {
+        fs::write(ctx.state_path("git-rebase-todo"), b"")?;
+        fs::write(ctx.state_path("end"), format!("{}\n", todo.done_nr))?;
+        return finish_rebase(ctx, &opts);
+    }
+
     write_todo_file(ctx, &todo_path, &todo.items, false, false, None, None, db)?;
     todo.total_nr = todo.done_nr + count_commands(&todo.items);
     fs::write(ctx.state_path("end"), format!("{}\n", todo.total_nr))?;
