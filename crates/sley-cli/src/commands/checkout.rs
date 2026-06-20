@@ -442,9 +442,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             // branch switch. git detaches HEAD at the resolved commit; treating it
             // as a branch name would mint a bogus `refs/heads/A^0` symref.
             let store = FileRefStore::new(&git_dir, format);
-            let is_branch = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)
+            let is_branch = branch_ref_name(branch)
                 .ok()
-                .flatten()
+                .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
                 .is_some();
             if !is_branch
                 && let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, branch)

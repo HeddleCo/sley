@@ -4295,7 +4295,11 @@ fn update_symbolic_ref(
         return Err(GitError::Exit(128));
     }
     let old_oid = resolve_symbolic_ref_oid(store, format, name)?;
-    let new_oid = resolve_symbolic_ref_oid(store, format, target)?;
+    let new_oid = if sley_refs::validate_ref_name_for_read(target).is_ok() {
+        resolve_symbolic_ref_oid(store, format, target)?
+    } else {
+        zero_oid(format)?
+    };
     let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
         old_oid,
         new_oid,

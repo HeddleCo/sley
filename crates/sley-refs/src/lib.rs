@@ -4509,7 +4509,12 @@ pub fn resolve_ref_peeled(store: &FileRefStore, name: &str) -> Result<Option<Obj
     for _ in 0..16 {
         match store.read_ref(&current)? {
             Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
-            Some(RefTarget::Symbolic(next)) => current = next,
+            Some(RefTarget::Symbolic(next)) => {
+                if validate_ref_name_for_read(&next).is_err() {
+                    return Ok(None);
+                }
+                current = next;
+            }
             None => return Ok(None),
         }
     }
