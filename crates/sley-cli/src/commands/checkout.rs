@@ -14,6 +14,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut unified_context = false;
     let mut inter_hunk_context = false;
     let mut guess = None::<bool>;
+    let mut path_merge = false;
+    let mut conflict_implies_merge = false;
+    let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
+    let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut positional = Vec::new();
@@ -25,6 +29,29 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
+            "-m" | "--merge" => path_merge = true,
+            "--no-merge" => {
+                path_merge = false;
+                conflict_implies_merge = false;
+            }
+            "--conflict" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command("checkout --conflict requires a value".into()));
+                };
+                conflict_style = Some(checkout_conflict_style(value)?);
+                conflict_implies_merge = true;
+            }
+            value if value.starts_with("--conflict=") => {
+                let value = &value["--conflict=".len()..];
+                conflict_style = Some(checkout_conflict_style(value)?);
+                conflict_implies_merge = true;
+            }
+            "--no-conflict" => {
+                conflict_style = None;
+                conflict_implies_merge = false;
+            }
+            "--ours" => checkout_stage = Some(sley_worktree::CheckoutStage::Ours),
+            "--theirs" => checkout_stage = Some(sley_worktree::CheckoutStage::Theirs),
             "-p" | "--patch" => patch = true,
             "--no-patch" => patch = false,
             "--no-auto-advance" => no_auto_advance = true,
@@ -274,12 +301,26 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 None => {
                     let config = read_repo_config(&git_dir)?;
-                    sley_worktree::restore_worktree_paths_filtered(
+                    let conflict_style = conflict_style.unwrap_or_else(|| {
+                        match checkout_config.get("merge", None, "conflictstyle") {
+                            Some("diff3") | Some("zdiff3") => {
+                                sley_worktree::CheckoutConflictStyle::Diff3
+                            }
+                            _ => sley_worktree::CheckoutConflictStyle::Merge,
+                        }
+                    });
+                    sley_worktree::checkout_index_paths(
                         worktree_root,
                         &git_dir,
                         format,
                         &resolved_paths,
-                        &config,
+                        sley_worktree::CheckoutIndexPathOptions {
+                            force,
+                            merge: path_merge || conflict_implies_merge,
+                            stage: checkout_stage,
+                            conflict_style,
+                            smudge_config: Some(&config),
+                        },
                     )?;
                 }
             }
@@ -433,10 +474,18 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
         CheckoutBranchMode::Existing => {
             let [branch] = positional.as_slice() else {
+                if checkout_stage.is_some() {
+                    eprintln!("fatal: '--ours/--theirs' needs the paths to check out");
+                    return Err(GitError::Exit(128));
+                }
                 return Err(GitError::Command(
                     "checkout currently supports: checkout [-q] <branch> or checkout [-q] -b|-B <branch> [<start>]".into(),
                 ));
             };
+            if checkout_stage.is_some() {
+                eprintln!("fatal: '--ours/--theirs' cannot be used with switching branches");
+                return Err(GitError::Exit(128));
+            }
             // A target that is not an existing branch but resolves to a commit-ish
             // (e.g. `A^0`, a tag, a raw oid) is a *detached HEAD* checkout, not a
             // branch switch. git detaches HEAD at the resolved commit; treating it
@@ -700,6 +749,17 @@ fn run_post_checkout_hook(
         ],
     )?;
     Ok(())
+}
+
+fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflictStyle> {
+    match value {
+        "merge" => Ok(sley_worktree::CheckoutConflictStyle::Merge),
+        "diff3" | "zdiff3" => Ok(sley_worktree::CheckoutConflictStyle::Diff3),
+        other => {
+            eprintln!("error: unknown conflict style '{other}'");
+            Err(GitError::Exit(129))
+        }
+    }
 }
 
 fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<String> {
