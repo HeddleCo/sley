@@ -4829,13 +4829,17 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let path_base = match cwd.strip_prefix(&worktree_root) {
+        Ok(_) => cwd.as_path(),
+        Err(_) => worktree_root.as_path(),
+    };
     let resolved_paths = paths
         .into_iter()
         .map(|path| {
             if path.is_absolute() {
                 path
             } else {
-                cwd.join(path)
+                path_base.join(path)
             }
         })
         .collect::<Vec<_>>();
@@ -4857,7 +4861,12 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     if !quiet {
         let mut stdout = io::stdout().lock();
         for path in result.removed {
-            writeln!(stdout, "rm '{}'", String::from_utf8_lossy(&path))?;
+            if let Err(err) = writeln!(stdout, "rm '{}'", String::from_utf8_lossy(&path)) {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    std::process::exit(141);
+                }
+                return Err(err.into());
+            }
         }
     }
     Ok(())

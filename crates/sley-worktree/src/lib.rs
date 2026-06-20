@@ -4291,7 +4291,7 @@ fn status_submodule_from_entries(
     index_entry: &TrackedEntry,
     worktree_entry: Option<&TrackedEntry>,
     submodule_dirt_map: &BTreeMap<Vec<u8>, u8>,
-    untracked_mode: StatusUntrackedMode,
+    _untracked_mode: StatusUntrackedMode,
 ) -> Option<SubmoduleStatus> {
     let worktree_entry = worktree_entry?;
     if !sley_index::is_gitlink(index_entry.mode) || !sley_index::is_gitlink(worktree_entry.mode) {
@@ -4301,8 +4301,7 @@ fn status_submodule_from_entries(
     Some(SubmoduleStatus {
         new_commits: index_entry.oid != worktree_entry.oid,
         modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
-            && !matches!(untracked_mode, StatusUntrackedMode::None),
+        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0,
     })
 }
 
@@ -5815,7 +5814,7 @@ fn tracked_only_submodule_status(
     path: &[u8],
     index_entry: &TrackedEntry,
     worktree_entry: Option<&TrackedEntry>,
-    untracked_mode: StatusUntrackedMode,
+    _untracked_mode: StatusUntrackedMode,
 ) -> Result<Option<SubmoduleStatus>> {
     let Some(worktree_entry) = worktree_entry else {
         return Ok(None);
@@ -5832,8 +5831,7 @@ fn tracked_only_submodule_status(
     Ok(Some(SubmoduleStatus {
         new_commits: index_entry.oid != worktree_entry.oid,
         modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
-            && !matches!(untracked_mode, StatusUntrackedMode::None),
+        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0,
     }))
 }
 
@@ -13591,7 +13589,7 @@ pub fn remove_index_and_worktree_paths(
     let rm_stat_cache = sley_index::IndexStatCache::from_index(&index, &index_path);
     let Index {
         version: index_version,
-        entries: index_entry_list,
+        entries: mut index_entry_list,
         extensions: index_extensions,
         ..
     } = index;
@@ -13614,11 +13612,29 @@ pub fn remove_index_and_worktree_paths(
     // submodule setups. Use the single `sley_index::is_gitlink` rule — no new
     // predicate. (Unmerged gitlinks have no stage-0 entry and are not submodule
     // removals here, matching git, which keys `is_submodule` off the matched ce.)
-    let gitlink_paths: BTreeSet<Vec<u8>> = index_entry_list
+    let stage0_gitlink_paths: BTreeSet<Vec<u8>> = index_entry_list
         .iter()
         .filter(|entry| entry.stage() == Stage::Normal && sley_index::is_gitlink(entry.mode))
         .map(|entry| entry.path.as_bytes().to_vec())
         .collect();
+    let gitlink_paths: BTreeSet<Vec<u8>> = index_entry_list
+        .iter()
+        .filter(|entry| sley_index::is_gitlink(entry.mode))
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
+    let gitlink_oids_by_path: BTreeMap<Vec<u8>, BTreeSet<ObjectId>> = {
+        let mut by_path: BTreeMap<Vec<u8>, BTreeSet<ObjectId>> = BTreeMap::new();
+        for entry in index_entry_list
+            .iter()
+            .filter(|entry| sley_index::is_gitlink(entry.mode))
+        {
+            by_path
+                .entry(entry.path.as_bytes().to_vec())
+                .or_default()
+                .insert(entry.oid);
+        }
+        by_path
+    };
     // Paths selected for removal. A single selected path removes ALL of its
     // stage entries (so resolving an unmerged path by removal drops stages
     // 1/2/3 together), matching git's name-keyed removal.
@@ -13638,6 +13654,10 @@ pub fn remove_index_and_worktree_paths(
         let has_trailing_slash = path_has_trailing_separator(&absolute);
         let git_path = git_path_bytes(relative)?;
         if !has_trailing_slash && index_paths.contains(&git_path) {
+            selected.insert(git_path);
+            continue;
+        }
+        if has_trailing_slash && gitlink_paths.contains(&git_path) && absolute.is_dir() {
             selected.insert(git_path);
             continue;
         }
@@ -13718,8 +13738,20 @@ pub fn remove_index_and_worktree_paths(
         let mut files_local: Vec<&[u8]> = Vec::new();
         for path in &selected {
             let Some(index_entry) = stage0.get(path.as_slice()) else {
-                // Unmerged path with no stage-0 entry: resolving by removal is
-                // safe and not warning-worthy.
+                // Unmerged ordinary paths are safe to resolve by removal. An
+                // unmerged gitlink still needs submodule dirt checks because
+                // removing its worktree can discard nested changes.
+                if !gitlink_paths.contains(path) {
+                    continue;
+                }
+                if rm_submodule_has_local_changes(
+                    worktree_root,
+                    format,
+                    path,
+                    gitlink_oids_by_path.get(path),
+                ) {
+                    files_local.push(path);
+                }
                 continue;
             };
             let worktree_file = worktree_path(worktree_root, path)?;
@@ -13732,7 +13764,15 @@ pub fn remove_index_and_worktree_paths(
             // for a tracked plain path that is now a directory on disk: git
             // treats that as ENOENT and skips it (the later worktree-removal step
             // is what fails on a non-empty directory).
-            let local_changes = match fs::symlink_metadata(&worktree_file) {
+            let local_changes = if sley_index::is_gitlink(index_entry.mode) {
+                rm_submodule_has_local_changes(
+                    worktree_root,
+                    format,
+                    path,
+                    gitlink_oids_by_path.get(path),
+                )
+            } else {
+                match fs::symlink_metadata(&worktree_file) {
                 Err(err)
                     if matches!(
                         err.kind(),
@@ -13771,6 +13811,7 @@ pub fn remove_index_and_worktree_paths(
                             worktree_oid != index_entry.oid
                         }
                     }
+                }
                 }
             };
             // Is the index different from the HEAD commit? (Before the first
@@ -13830,6 +13871,21 @@ pub fn remove_index_and_worktree_paths(
             removed: selected.into_iter().collect(),
         });
     }
+    let selected_gitlinks = selected
+        .iter()
+        .filter(|path| gitlink_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !options.cached && !selected_gitlinks.is_empty() && !selected.contains(b".gitmodules".as_slice()) {
+        remove_submodule_sections_from_gitmodules(
+            worktree_root,
+            git_dir,
+            format,
+            &mut index_entry_list,
+            &selected_gitlinks,
+            &config_parameters_env,
+        )?;
+    }
     // Mirror builtin/rm.c's ordering: remove the worktree files BEFORE writing
     // the new index. If the very first removal fails (and nothing has been
     // removed yet), abort without committing the index, so a `git rm d` where
@@ -13839,7 +13895,8 @@ pub fn remove_index_and_worktree_paths(
         let mut removed_any = false;
         for path in &selected {
             let is_gitlink = gitlink_paths.contains(path);
-            match remove_tracked_worktree_path(worktree_root, path, is_gitlink)? {
+            let is_stage0_gitlink = stage0_gitlink_paths.contains(path);
+            match remove_tracked_worktree_path(worktree_root, path, is_gitlink, is_stage0_gitlink)? {
                 true => removed_any = true,
                 false if !removed_any => {
                     eprintln!(
@@ -13895,7 +13952,12 @@ pub fn remove_index_and_worktree_paths(
 /// Returns `Ok(true)` when the path was removed, `Ok(false)` when a *plain* path
 /// could not be unlinked because it is a directory (the caller decides whether
 /// that aborts the run). A path that has already vanished is a no-op success.
-fn remove_tracked_worktree_path(root: &Path, path: &[u8], is_gitlink: bool) -> Result<bool> {
+fn remove_tracked_worktree_path(
+    root: &Path,
+    path: &[u8],
+    is_gitlink: bool,
+    is_stage0_gitlink: bool,
+) -> Result<bool> {
     let file = worktree_path(root, path)?;
     match fs::symlink_metadata(&file) {
         Err(err)
@@ -13910,6 +13972,15 @@ fn remove_tracked_worktree_path(root: &Path, path: &[u8], is_gitlink: bool) -> R
         Err(err) => return Err(err.into()),
         Ok(meta) if meta.is_dir() => {
             if is_gitlink {
+                if file.join(".git").is_dir() && !is_stage0_gitlink {
+                    return Ok(false);
+                }
+                if contains_nested_git_dir(&file) {
+                    eprintln!(
+                        "Migrating git directory of '{}' from",
+                        String::from_utf8_lossy(path)
+                    );
+                }
                 // Submodule removal. Mirror builtin/rm.c's `is_submodule` branch:
                 // `remove_dir_recursively(&buf, force ? REMOVE_DIR_PURGE_ORIGINAL_CWD : 0)`.
                 // No `REMOVE_DIR_KEEP_NESTED_GIT` flag, so the whole subtree —
@@ -13930,6 +14001,176 @@ fn remove_tracked_worktree_path(root: &Path, path: &[u8], is_gitlink: bool) -> R
     fs::remove_file(&file)?;
     prune_empty_parents(root, file.parent())?;
     Ok(true)
+}
+
+fn rm_submodule_has_local_changes(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    expected_oids: Option<&BTreeSet<ObjectId>>,
+) -> bool {
+    let Ok(submodule_root) = worktree_path(worktree_root, path) else {
+        return false;
+    };
+    if !submodule_root.is_dir() {
+        return false;
+    }
+    let head_changed = sley_diff_merge::gitlink_head_oid(&submodule_root, format)
+        .zip(expected_oids)
+        .is_some_and(|(head, expected)| !expected.contains(&head));
+    head_changed || submodule_dirt(&submodule_root) != 0
+}
+
+fn remove_submodule_sections_from_gitmodules(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entries: &mut Vec<IndexEntry>,
+    selected_gitlinks: &[Vec<u8>],
+    config_parameters_env: &Option<&str>,
+) -> Result<()> {
+    let gitmodules_path = worktree_root.join(".gitmodules");
+    let Ok(original) = fs::read(&gitmodules_path) else {
+        return Ok(());
+    };
+    let gitmodules_index = index_entries.iter().position(|entry| {
+        entry.stage() == Stage::Normal && entry.path.as_bytes() == b".gitmodules"
+    });
+    if gitmodules_index.is_none() {
+        return Ok(());
+    }
+    let config = GitConfig::parse(&original)?;
+    let selected = selected_gitlinks
+        .iter()
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect::<BTreeSet<_>>();
+    let mut sections = Vec::new();
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("submodule") {
+            continue;
+        }
+        let Some(name) = section.subsection.as_deref() else {
+            continue;
+        };
+        let path = section
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key.eq_ignore_ascii_case("path"))
+            .and_then(|entry| entry.value.as_deref());
+        if path.is_some_and(|path| selected.contains(path)) {
+            sections.push(name.to_string());
+        }
+    }
+    let selected_with_sections = sections
+        .iter()
+        .filter_map(|name| {
+            config
+                .get("submodule", Some(name), "path")
+                .map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    for path in &selected {
+        if !selected_with_sections.contains(path) {
+            eprintln!("warning: Could not find section in .gitmodules where path={path}");
+        }
+    }
+    if sections.is_empty() {
+        return Ok(());
+    }
+    if gitmodules_worktree_differs_from_index(
+        worktree_root,
+        git_dir,
+        format,
+        index_entries,
+        &original,
+        config_parameters_env,
+    )? {
+        eprintln!("error: the following file has local modifications:");
+        eprintln!("    .gitmodules");
+        eprintln!("(use --cached to keep the file, or -f to force removal)");
+        return Err(GitError::Exit(1));
+    }
+    let mut edited = original;
+    for name in sections {
+        let section_name = format!("submodule.{name}");
+        match sley_config::raw_edit::rename_or_remove_section(&edited, &section_name, None) {
+            sley_config::raw_edit::SectionEditOutcome::Changed(out) => edited = out,
+            sley_config::raw_edit::SectionEditOutcome::NotFound => {
+                eprintln!("warning: Could not find section in .gitmodules where path={name}");
+            }
+            sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
+                return Err(GitError::InvalidFormat(format!(
+                    "bad config line {line} in .gitmodules"
+                )));
+            }
+        }
+    }
+    fs::write(&gitmodules_path, &edited)?;
+    stage_gitmodules_after_rm(worktree_root, git_dir, format, index_entries, config_parameters_env)
+}
+
+fn gitmodules_worktree_differs_from_index(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entries: &[IndexEntry],
+    worktree_bytes: &[u8],
+    config_parameters_env: &Option<&str>,
+) -> Result<bool> {
+    let Some(entry) = index_entries
+        .iter()
+        .find(|entry| entry.stage() == Stage::Normal && entry.path.as_bytes() == b".gitmodules")
+    else {
+        return Ok(false);
+    };
+    let config = sley_config::read_repo_config(git_dir, *config_parameters_env).unwrap_or_default();
+    let clean = apply_clean_filter(worktree_root, git_dir, &config, b".gitmodules", worktree_bytes)?;
+    let oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
+    Ok(oid != entry.oid)
+}
+
+fn stage_gitmodules_after_rm(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entries: &mut [IndexEntry],
+    config_parameters_env: &Option<&str>,
+) -> Result<()> {
+    let path = worktree_root.join(".gitmodules");
+    let bytes = fs::read(&path)?;
+    let config = sley_config::read_repo_config(git_dir, *config_parameters_env).unwrap_or_default();
+    let clean = apply_clean_filter(worktree_root, git_dir, &config, b".gitmodules", &bytes)?;
+    let object = EncodedObject::new(ObjectType::Blob, clean);
+    let oid = object.object_id(format)?;
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    odb.write_object(object)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    let mut entry = index_entry_from_metadata(BString::from(b".gitmodules".as_slice()), oid, &metadata);
+    entry.mode = 0o100644;
+    if let Some(slot) = index_entries
+        .iter_mut()
+        .find(|entry| entry.stage() == Stage::Normal && entry.path.as_bytes() == b".gitmodules")
+    {
+        *slot = entry;
+    }
+    Ok(())
+}
+
+fn contains_nested_git_dir(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name() == ".git" && path.is_dir() {
+            return true;
+        }
+        if path.is_dir() && contains_nested_git_dir(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Print one batched `git rm` safety error block (mirrors builtin/rm.c's
