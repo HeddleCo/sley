@@ -143,6 +143,12 @@ struct ShowOptions {
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<crate::grep_source::Regex>,
+    /// `--word-diff` rendering mode.
+    word_diff_mode: Option<commands::diff_words::WordDiffMode>,
+    /// `--word-diff-regex` / `--color-words=<regex>` override.
+    word_diff_regex: Option<String>,
+    /// Force colored patch output for `--word-diff=color` / `--color-words`.
+    color_always: bool,
     /// `--grep=<pattern>` commit-message filters.
     grep_patterns: Vec<String>,
     grep_pattern_kind: crate::grep_source::PatternKind,
@@ -228,6 +234,9 @@ impl Default for ShowOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            word_diff_mode: None,
+            word_diff_regex: None,
+            color_always: false,
             grep_patterns: Vec::new(),
             grep_pattern_kind: crate::grep_source::PatternKind::Basic,
             grep_pattern_kind_explicit: false,
@@ -1271,6 +1280,13 @@ fn write_commit_diff_patch(
         if wrote_prefix {
             writeln!(stdout)?;
         }
+        let colors = options
+            .color_always
+            .then(|| commands::diff_words::DiffColors::enabled(Some(config)));
+        let word_request = options.word_diff_mode.map(|mode| WordDiffRequest {
+            mode,
+            cli_regex: options.word_diff_regex.as_deref(),
+        });
         for entry in entries {
             let patch_options = DiffPatchOptions {
                 db,
@@ -1282,8 +1298,8 @@ fn write_commit_diff_patch(
                 dst_prefix: "b/",
                 context: 3,
                 userdiff,
-                colors: None,
-                word_diff: None,
+                colors: colors.as_ref(),
+                word_diff: word_request.as_ref(),
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
@@ -1604,6 +1620,50 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,
             "--ignore-cr-at-eol" => options.ws_ignore.cr_at_eol = true,
             "--ignore-blank-lines" => options.ignore_blank_lines = true,
+            "--word-diff" => {
+                if options.word_diff_mode.is_none() {
+                    options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+            }
+            value if let Some(mode) = value.strip_prefix("--word-diff=") => {
+                options.word_diff_mode = match mode {
+                    "plain" => Some(commands::diff_words::WordDiffMode::Plain),
+                    "porcelain" => Some(commands::diff_words::WordDiffMode::Porcelain),
+                    "color" => {
+                        options.color_always = true;
+                        Some(commands::diff_words::WordDiffMode::Color)
+                    }
+                    "none" => None,
+                    _ => {
+                        eprintln!("error: bad --word-diff argument: {mode}");
+                        return Err(GitError::Exit(129));
+                    }
+                };
+            }
+            "--word-diff-regex" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--word-diff-regex requires a value".into()))?;
+                options.word_diff_regex = Some(value.clone());
+                if options.word_diff_mode.is_none() {
+                    options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+            }
+            value if let Some(regex) = value.strip_prefix("--word-diff-regex=") => {
+                options.word_diff_regex = Some(regex.to_string());
+                if options.word_diff_mode.is_none() {
+                    options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+            }
+            "--color-words" => {
+                options.color_always = true;
+                options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+            }
+            value if let Some(regex) = value.strip_prefix("--color-words=") => {
+                options.color_always = true;
+                options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+                options.word_diff_regex = Some(regex.to_string());
+            }
             "-I" | "--ignore-matching-lines" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("--ignore-matching-lines requires a value".into())
@@ -1628,10 +1688,18 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             | "--no-ext-diff"
             | "--ext-diff"
             | "--no-textconv"
-            | "--textconv" => {}
+            | "--textconv"
+            | "--color-moved"
+            | "--no-color-moved"
+            | "--color-moved-ws"
+            | "--no-color-moved-ws" => {}
             "--root" => options.show_root = Some(true),
             "--no-root" => options.show_root = Some(false),
             value if value.starts_with("--color=") => {}
+            value if value.starts_with("--color-moved=")
+                || value.starts_with("--color-moved-ws=")
+                || value.starts_with("--no-color-moved=")
+                || value.starts_with("--no-color-moved-ws=") => {}
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
                     "unsupported show option {value}"

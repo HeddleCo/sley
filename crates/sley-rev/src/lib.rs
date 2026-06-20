@@ -1499,7 +1499,7 @@ struct CommitGraphContext<'a> {
 enum DirectCommitGraph {
     Missing,
     Invalid,
-    Raw(RawCommitGraph),
+    Raw(Box<RawCommitGraph>),
 }
 
 struct RawCommitGraph {
@@ -2193,6 +2193,7 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
     };
     warn_invalid_commit_graph_bloom_chunks(bytes.as_ref(), &path, format);
     RawCommitGraph::parse_for_lookup(bytes, format)
+        .map(Box::new)
         .map(DirectCommitGraph::Raw)
         .unwrap_or(DirectCommitGraph::Invalid)
 }
@@ -2395,14 +2396,14 @@ fn warn_invalid_commit_graph_bloom_chunks(
         return;
     }
     let commit_count = commit_graph_view_commit_count(bytes, &chunks, checksum_offset);
-    if let Some(commit_count) = commit_count {
-        if bidx.len() / 4 != commit_count {
-            emit_commit_graph_bloom_warning_once(
-                path,
-                "warning: commit-graph changed-path index chunk is too small".to_string(),
-            );
-            return;
-        }
+    if let Some(commit_count) = commit_count
+        && bidx.len() / 4 != commit_count
+    {
+        emit_commit_graph_bloom_warning_once(
+            path,
+            "warning: commit-graph changed-path index chunk is too small".to_string(),
+        );
+        return;
     }
     let payload_len = bdat.len() - 12;
     let display_path = commit_graph_warning_path(path);
@@ -3017,12 +3018,12 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
 
     fn enqueue_parents(&mut self, metadata: &CommitMetadata) -> Result<()> {
         if self.first_parent {
-            if let Some(parent) = metadata.parents.first().copied() {
-                if self.seen.insert(parent) {
-                    let parent_metadata =
-                        commit_metadata_lookup(&mut self.graph, self.reader, self.format, &parent)?;
-                    self.push(parent_metadata);
-                }
+            if let Some(parent) = metadata.parents.first().copied()
+                && self.seen.insert(parent)
+            {
+                let parent_metadata =
+                    commit_metadata_lookup(&mut self.graph, self.reader, self.format, &parent)?;
+                self.push(parent_metadata);
             }
             return Ok(());
         }
@@ -4074,7 +4075,7 @@ fn simplify_merges_pass(
         let mut seen: HashSet<ObjectId> = HashSet::new();
         let mut stack: Vec<ObjectId> = real_parents
             .get(desc)
-            .map(|ps| ps.clone())
+            .cloned()
             .unwrap_or_default();
         while let Some(oid) = stack.pop() {
             if oid == *anc {

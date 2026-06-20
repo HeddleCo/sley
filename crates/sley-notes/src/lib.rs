@@ -5,6 +5,8 @@
 //! reads any fanout depth and writes either flat trees or Git-compatible
 //! one-level fanout trees once the note count is large enough.
 
+#![allow(clippy::too_many_arguments)]
+
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{
