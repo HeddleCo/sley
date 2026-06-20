@@ -5155,6 +5155,15 @@ pub enum MergeInfoMessage {
         added_in: String,
         dir_renamed_in: String,
     },
+    /// A rename/delete conflict whose conflicted destination was later moved
+    /// aside by directory/file conflict handling. The primary per-path conflict
+    /// remains `FileDirectory`; this preserves git's extra rename/delete line.
+    RenameDeleteConflict {
+        old_path: Vec<u8>,
+        new_path: Vec<u8>,
+        renamed_in: String,
+        deleted_in: String,
+    },
 }
 
 /// Read a tree object (by oid) into a flattened path -> (mode, oid) map,
@@ -5691,32 +5700,31 @@ pub fn merge_entry_maps(
     if !dir_rename_conflict_paths.is_empty() {
         clean = false;
         for (dest, infos) in &dir_rename_conflict_paths {
-            let Some(info) = infos.ours.as_ref().or(infos.theirs.as_ref()) else {
-                continue;
-            };
-            let (added_in, dir_renamed_in) = if info.added_on_ours {
-                // The path was added/renamed by ours, into a dir theirs renamed.
-                (options.ours_label.to_string(), options.theirs_label.to_string())
-            } else {
-                (options.theirs_label.to_string(), options.ours_label.to_string())
-            };
-            if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
-                && slot.conflict.is_none()
-            {
-                slot.conflict = Some(MergeConflictKind::DirRenameLocation {
-                    old_path: info.old_path.clone(),
-                    renamed_from: info.renamed_from.clone(),
-                    added_in,
-                    dir_renamed_in,
-                });
-            } else {
-                info_messages.push(MergeInfoMessage::DirRenameLocationConflict {
-                    old_path: info.old_path.clone(),
-                    new_path: dest.clone(),
-                    renamed_from: info.renamed_from.clone(),
-                    added_in,
-                    dir_renamed_in,
-                });
+            for info in [&infos.ours, &infos.theirs].into_iter().flatten() {
+                let (added_in, dir_renamed_in) = if info.added_on_ours {
+                    // The path was added/renamed by ours, into a dir theirs renamed.
+                    (options.ours_label.to_string(), options.theirs_label.to_string())
+                } else {
+                    (options.theirs_label.to_string(), options.ours_label.to_string())
+                };
+                if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
+                    && slot.conflict.is_none()
+                {
+                    slot.conflict = Some(MergeConflictKind::DirRenameLocation {
+                        old_path: info.old_path.clone(),
+                        renamed_from: info.renamed_from.clone(),
+                        added_in,
+                        dir_renamed_in,
+                    });
+                } else {
+                    info_messages.push(MergeInfoMessage::DirRenameLocationConflict {
+                        old_path: info.old_path.clone(),
+                        new_path: dest.clone(),
+                        renamed_from: info.renamed_from.clone(),
+                        added_in,
+                        dir_renamed_in,
+                    });
+                }
             }
         }
     }
@@ -5736,6 +5744,7 @@ pub fn merge_entry_maps(
         &eff_ours,
         &eff_theirs,
         options,
+        &mut info_messages,
     )?;
 
     let tree = write_merged_tree(db, &leaves)?;
@@ -5799,6 +5808,7 @@ fn resolve_directory_file_conflicts(
     eff_ours: &MergeEntryMap,
     eff_theirs: &MergeEntryMap,
     options: &MergeTreesOptions<'_>,
+    info_messages: &mut Vec<MergeInfoMessage>,
 ) -> Result<()> {
     // A path is a "directory" in the result iff some leaf key has it as a strict
     // `path/` prefix. Collect every such directory prefix once.
@@ -5849,6 +5859,19 @@ fn resolve_directory_file_conflicts(
         // Relocate the path's MergedPath: update its destination and stamp the D/F
         // conflict. If the path had no MergedPath (defensive), synthesize one.
         if let Some(slot) = paths.iter_mut().find(|p| p.path == original) {
+            if let Some(MergeConflictKind::RenameDelete {
+                old_path,
+                renamed_in,
+                deleted_in,
+            }) = &slot.conflict
+            {
+                info_messages.push(MergeInfoMessage::RenameDeleteConflict {
+                    old_path: old_path.clone(),
+                    new_path: original.clone(),
+                    renamed_in: renamed_in.clone(),
+                    deleted_in: deleted_in.clone(),
+                });
+            }
             slot.path = new_path.clone();
             slot.result = Some(entry);
             // Preserve any pre-existing higher-order stages; a clean file leaf has
@@ -6785,7 +6808,14 @@ fn plan_rehome(
         // dir_rename_exclusions: don't apply a rename INTO a directory this side
         // itself renamed; that would cause a spurious rename/rename(1to2). The
         // file instead follows this side's own rename, so leave it.
-        if exclusions.contains(new_dir) {
+        let new_dir_is_exclusion = exclusions.contains(new_dir);
+        let new_dir_inside_exclusion = exclusions
+            .iter()
+            .any(|dir| directory_contains_proper(dir, new_dir));
+        if new_dir_is_exclusion
+            || (new_dir_inside_exclusion
+                && !side_has_pure_add_under_dir(side, base_map, &side_rename_src, old_dir))
+        {
             info_messages.push(MergeInfoMessage::DirRenameSkippedDueToRerename {
                 old_dir: old_dir.to_vec(),
                 path: path.clone(),
@@ -6831,6 +6861,30 @@ fn check_dir_split<'a>(path: &[u8], split_dirs: &'a BTreeSet<Vec<u8>>) -> Option
         }
         dir = parent_dir(dir)?;
     }
+}
+
+fn directory_contains_proper(parent: &[u8], child: &[u8]) -> bool {
+    !parent.is_empty()
+        && child.len() > parent.len()
+        && child.starts_with(parent)
+        && child[parent.len()] == b'/'
+}
+
+fn side_has_pure_add_under_dir(
+    side: &MergeEntryMap,
+    base_map: &MergeEntryMap,
+    side_rename_src: &BTreeMap<&[u8], &[u8]>,
+    dir: &[u8],
+) -> bool {
+    side.keys().any(|path| {
+        path_is_under_dir(path, dir)
+            && !base_map.contains_key(path)
+            && !side_rename_src.contains_key(path.as_slice())
+    })
+}
+
+fn path_is_under_dir(path: &[u8], dir: &[u8]) -> bool {
+    !dir.is_empty() && path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == b'/'
 }
 
 /// Apply a side's planned re-home moves to all three effective maps.

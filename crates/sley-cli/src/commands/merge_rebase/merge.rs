@@ -3368,6 +3368,18 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
                     String::from_utf8_lossy(new_path),
                 ),
             },
+            sley_diff_merge::MergeInfoMessage::RenameDeleteConflict {
+                old_path,
+                new_path,
+                renamed_in,
+                deleted_in,
+            } => {
+                println!(
+                    "CONFLICT (rename/delete): {} renamed to {} in {renamed_in}, but deleted in {deleted_in}.",
+                    String::from_utf8_lossy(old_path),
+                    String::from_utf8_lossy(new_path),
+                );
+            }
         }
     }
 }
@@ -3581,6 +3593,15 @@ fn verify_merge_uptodate(
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
+        if entry.index == b'?' && entry.worktree == b'?' && changed.contains(&entry.path) {
+            eprintln!(
+                "error: The following untracked working tree files would be overwritten by merge:\n\t{}",
+                String::from_utf8_lossy(&entry.path)
+            );
+            eprintln!("Please move or remove them before you merge.");
+            eprintln!("Aborting");
+            return Err(GitError::Exit(1));
+        }
         // A staged change anywhere (index column non-blank, not untracked/ignored)
         // makes the index an unclean merge base.
         if entry.index != b' ' && entry.index != b'?' && entry.index != b'!' {
