@@ -469,7 +469,7 @@ declare -A FLOOR=(
     [t4216-log-bloom.sh]=161
     [t5318-commit-graph.sh]=95
     [t3432-rebase-fast-forward.sh]=219
-    [t3600-rm.sh]=55
+    [t3600-rm.sh]=69
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
     [t4202-log.sh]=124
     # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
