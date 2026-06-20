@@ -98,6 +98,9 @@ struct ShowOptions {
     summary: bool,
     /// `--raw` diff output.
     raw: bool,
+    /// `--patch-with-stat` / `--patch-with-raw`: render the patch after the
+    /// requested prefix output instead of replacing it.
+    patch_with_extra: bool,
     /// Full 40/64-hex `index` lines in patches (`--full-index`).
     patch_full_index: bool,
     /// Explicit patch abbreviation width (`--abbrev=<n>` affects this too).
@@ -196,6 +199,7 @@ impl Default for ShowOptions {
             shortstat: false,
             summary: false,
             raw: false,
+            patch_with_extra: false,
             patch_full_index: false,
             patch_abbrev: None,
             detect_renames: true,
@@ -234,6 +238,10 @@ impl ShowOptions {
             || self.raw
     }
 
+    fn shows_patch_body(&self) -> bool {
+        self.patch_with_extra || !self.has_diff_extras()
+    }
+
     /// `-s` / `--no-patch`: clear every diff-output selection. A later flag such
     /// as `--stat` can re-enable a specific sub-mode, matching real git's
     /// order-dependent behaviour.
@@ -245,6 +253,7 @@ impl ShowOptions {
         self.shortstat = false;
         self.summary = false;
         self.raw = false;
+        self.patch_with_extra = false;
     }
 
     /// Re-enable patch output after a diff sub-mode flag clears the `-s` state.
@@ -335,7 +344,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 
     let mut shown_one = false;
     let mut stdout = io::stdout();
-    let userdiff = if options.diff_mode == ShowDiffMode::Patch && !options.has_diff_extras() {
+    let userdiff = if options.diff_mode == ShowDiffMode::Patch && options.shows_patch_body() {
         let attributes = repo
             .worktree_root()
             .ok()
@@ -691,7 +700,13 @@ fn write_commit_trailer(
         // even for `--oneline` which abuts the diff for ordinary commits. The
         // exception is `--pretty=format:` (text not self-terminated): there the
         // text line's own newline above is the only separator, matching git.
-        if layout.blank_before_diff || (combined_merge && layout.text_self_terminated) {
+        if options.patch_with_extra
+            && (options.stat || options.compact_summary)
+            && layout.blank_before_diff
+            && !combined_merge
+        {
+            writeln!(stdout, "---")?;
+        } else if layout.blank_before_diff || (combined_merge && layout.text_self_terminated) {
             writeln!(stdout)?;
         }
         return if combined_merge {
@@ -854,7 +869,7 @@ fn write_show_combined(
     if stat_active {
         write_merge_stat(stdout, db, context.config, options, entries)?;
     }
-    if options.has_diff_extras() {
+    if options.has_diff_extras() && !options.patch_with_extra {
         return Ok(());
     }
 
@@ -989,7 +1004,7 @@ fn write_commit_diff_patch(
     let color = diff_color_enabled(config);
 
     let show_stat = options.stat || options.compact_summary;
-    let show_patch = !options.has_diff_extras();
+    let show_patch = options.shows_patch_body();
     let mut wrote_prefix = false;
 
     if entries.is_empty() {
@@ -1242,6 +1257,16 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             }
             "--raw" => {
                 options.raw = true;
+                options.restore_patch();
+            }
+            "--patch-with-stat" => {
+                options.stat = true;
+                options.patch_with_extra = true;
+                options.restore_patch();
+            }
+            "--patch-with-raw" => {
+                options.raw = true;
+                options.patch_with_extra = true;
                 options.restore_patch();
             }
             // --- pretty / format -------------------------------------------------
