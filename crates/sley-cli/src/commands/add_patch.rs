@@ -104,6 +104,7 @@ struct Hunk {
     body: Vec<String>,
     display_header: Option<String>,
     display_body: Vec<String>,
+    edited: bool,
     use_hunk: HunkUse,
     /// Number of independent pieces this hunk could split into.
     splittable_into: usize,
@@ -243,6 +244,7 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                     body: mode_lines,
                     display_header: None,
                     display_body: Vec::new(),
+                    edited: false,
                     use_hunk: HunkUse::Undecided,
                     splittable_into: 1,
                     is_mode_change: true,
@@ -268,6 +270,7 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                     body: Vec::new(),
                     display_header: None,
                     display_body: Vec::new(),
+                    edited: false,
                     use_hunk: HunkUse::Undecided,
                     splittable_into: 1,
                     is_mode_change: false,
@@ -282,7 +285,10 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
 }
 
 fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
-    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
     let mut index = 0usize;
     for fd in files {
         if index + fd.header.len() > lines.len() {
@@ -310,8 +316,7 @@ fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
             index += hunk.body.len();
         }
     }
-    let trailing_empty = index + 1 == lines.len() && lines.get(index).is_some_and(|line| line.is_empty());
-    if index != lines.len() && !trailing_empty {
+    if index != lines.len() {
         eprintln!("error: mismatched output from interactive.diffFilter");
         return Err(GitError::Exit(1));
     }
@@ -354,9 +359,10 @@ fn filter_display_diff(filter: &str, input: &str) -> Result<String> {
             GitError::Exit(1)
         })?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|e| GitError::Io(e.to_string()))?;
+        let input = input.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
     }
     let output = child
         .wait_with_output()
@@ -393,7 +399,57 @@ fn display_line(line: &str, cfg: &PatchConfig) -> String {
     } else {
         ""
     };
+    if line.starts_with('+') && !line.starts_with("+++ ") && !color.is_empty() {
+        let (rest, trailing) = split_trailing_spaces(&line[1..]);
+        let mut out = wrap_color(color, &colors.reset, "+");
+        if !rest.is_empty() {
+            out.push_str(&wrap_color(color, &colors.reset, rest));
+        }
+        if !trailing.is_empty() {
+            out.push_str(&wrap_color(&colors.whitespace, &colors.reset, trailing));
+        }
+        return out;
+    }
+    if !line.starts_with('+') && line.ends_with(' ') && !color.is_empty() {
+        let (body, trailing) = split_trailing_spaces(line);
+        let mut out = wrap_color(color, &colors.reset, body);
+        out.push_str(&wrap_color(&colors.whitespace, &colors.reset, trailing));
+        return out;
+    }
     wrap_color(color, &colors.reset, line)
+}
+
+fn display_line_whole(line: &str, cfg: &PatchConfig) -> String {
+    let Some(colors) = cfg.colors.as_ref() else {
+        return line.to_string();
+    };
+    let color = if line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+    {
+        &colors.meta
+    } else if line.starts_with("@@ ") {
+        &colors.frag
+    } else if line.starts_with('-') {
+        &colors.old
+    } else if line.starts_with('+') {
+        &colors.new
+    } else if line.starts_with(' ') {
+        &colors.context
+    } else {
+        ""
+    };
+    wrap_color(color, &colors.reset, line)
+}
+
+fn split_trailing_spaces(line: &str) -> (&str, &str) {
+    let split = line.trim_end_matches(' ').len();
+    line.split_at(split)
 }
 
 fn wrap_color(color: &str, reset: &str, text: &str) -> String {
@@ -465,6 +521,7 @@ fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
             body,
             display_header: None,
             display_body: Vec::new(),
+            edited: false,
             use_hunk: HunkUse::Undecided,
             splittable_into: splittable,
             is_mode_change: false,
@@ -1288,7 +1345,11 @@ fn render_hunk(fd: &FileDiff, hunk_index: usize, _delta: i64, cfg: &PatchConfig)
         }
     } else {
         for line in &h.body {
-            println!("{}", display_line(line, cfg));
+            if h.edited {
+                println!("{}", display_line_whole(line, cfg));
+            } else {
+                println!("{}", display_line(line, cfg));
+            }
         }
     }
 }
@@ -1404,6 +1465,7 @@ fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead
             body: new_body,
             display_header: None,
             display_body: Vec::new(),
+            edited: true,
             use_hunk: HunkUse::Use,
             splittable_into,
             is_mode_change: false,
@@ -1657,6 +1719,7 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
             body: piece.clone(),
             display_header: None,
             display_body: Vec::new(),
+            edited: false,
             use_hunk: HunkUse::Undecided,
             splittable_into: 1,
             is_mode_change: false,
