@@ -6809,7 +6809,14 @@ fn plan_rehome(
         // dir_rename_exclusions: don't apply a rename INTO a directory this side
         // itself renamed; that would cause a spurious rename/rename(1to2). The
         // file instead follows this side's own rename, so leave it.
-        if exclusions.contains(new_dir) {
+        let new_dir_is_exclusion = exclusions.contains(new_dir);
+        let new_dir_inside_exclusion = exclusions
+            .iter()
+            .any(|dir| directory_contains_proper(dir, new_dir));
+        if new_dir_is_exclusion
+            || (new_dir_inside_exclusion
+                && !side_has_pure_add_under_dir(side, base_map, &side_rename_src, old_dir))
+        {
             info_messages.push(MergeInfoMessage::DirRenameSkippedDueToRerename {
                 old_dir: old_dir.to_vec(),
                 path: path.clone(),
@@ -6855,6 +6862,30 @@ fn check_dir_split<'a>(path: &[u8], split_dirs: &'a BTreeSet<Vec<u8>>) -> Option
         }
         dir = parent_dir(dir)?;
     }
+}
+
+fn directory_contains_proper(parent: &[u8], child: &[u8]) -> bool {
+    !parent.is_empty()
+        && child.len() > parent.len()
+        && child.starts_with(parent)
+        && child[parent.len()] == b'/'
+}
+
+fn side_has_pure_add_under_dir(
+    side: &MergeEntryMap,
+    base_map: &MergeEntryMap,
+    side_rename_src: &BTreeMap<&[u8], &[u8]>,
+    dir: &[u8],
+) -> bool {
+    side.keys().any(|path| {
+        path_is_under_dir(path, dir)
+            && !base_map.contains_key(path)
+            && !side_rename_src.contains_key(path.as_slice())
+    })
+}
+
+fn path_is_under_dir(path: &[u8], dir: &[u8]) -> bool {
+    !dir.is_empty() && path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == b'/'
 }
 
 /// Apply a side's planned re-home moves to all three effective maps.
