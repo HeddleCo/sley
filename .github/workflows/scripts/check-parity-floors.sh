@@ -510,7 +510,7 @@ declare -A FLOOR=(
     [t3420-rebase-autostash.sh]=40
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
-    [t4013-diff-various.sh]=205
+    [t4013-diff-various.sh]=206
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
     [t4014-format-patch.sh]=208
     [t4100-apply-stat.sh]=25
@@ -528,7 +528,8 @@ declare -A FLOOR=(
     [t4052-stat-output.sh]=80
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
-    [t4015-diff-whitespace.sh]=114
+    # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
+    [t4015-diff-whitespace.sh]=119
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=67
     [t4019-diff-wserror.sh]=19
@@ -547,6 +548,13 @@ declare -A FLOOR=(
     [t7400-submodule-basic.sh]=111
     [t7506-status-submodule.sh]=34
     [t7508-status.sh]=119
+    # recov-wave (2026-06-20, ENOSPC-recovered 5-slice batch; all guards neutral-or-better, cargo test green):
+    # git clean -d/-x/-X/-e/-ff/nested t7300 34->53; git mv -f/-n/dir/multi/submodule t7001 32->53;
+    # rev-parse @{upstream}/@{push}/@{N} t1507 9->29 FULL; git archive --format=tar t5000 70->86.
+    [t7300-clean.sh]=53
+    [t7001-mv.sh]=53
+    [t1507-rev-parse-upstream.sh]=29
+    [t5000-tar-tree.sh]=86
     [t4027-diff-submodule.sh]=18
     [t7102-reset.sh]=37
     # blame scoreboard wave (blame.c pass_blame/blame_chunk port + annotate-compat

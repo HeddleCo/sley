@@ -244,6 +244,10 @@ jobs:
             t7400-submodule-basic.sh
             t7506-status-submodule.sh
             t7508-status.sh
+            t7300-clean.sh
+            t7001-mv.sh
+            t1507-rev-parse-upstream.sh
+            t5000-tar-tree.sh
             t7063-status-untracked-cache.sh
             t1410-reflog.sh
             t7810-grep.sh
