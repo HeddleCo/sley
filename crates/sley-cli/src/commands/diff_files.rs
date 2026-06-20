@@ -597,6 +597,17 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     )?;
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = apply_diff_max_depth(entries, &pathspec, o.max_depth);
+    let entries = if matches!(
+        o.ignore_submodules,
+        IgnoreSubmodules::Default | IgnoreSubmodules::Dirty
+    ) {
+        entries
+            .into_iter()
+            .filter(|entry| !diff_files_entry_is_dirty_submodule(entry))
+            .collect()
+    } else {
+        entries
+    };
     let entries = if o.ignore_submodules == IgnoreSubmodules::None {
         add_dirty_submodule_entries(entries, worktree_root, git_dir, format)?
     } else {
@@ -809,6 +820,13 @@ fn render_diff_files_entries(
         }
     }
     Ok(())
+}
+
+fn diff_files_entry_is_dirty_submodule(entry: &sley_diff_merge::NameStatusEntry) -> bool {
+    entry.status == sley_diff_merge::NameStatus::Modified
+        && entry.old_mode == Some(sley_index::GITLINK_MODE)
+        && entry.new_mode == Some(sley_index::GITLINK_MODE)
+        && entry.old_oid == entry.new_oid
 }
 
 fn add_dirty_submodule_entries(

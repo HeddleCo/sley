@@ -639,6 +639,18 @@ pub struct MoveDetail {
     pub skipped: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitmodulesMove {
+    source: Vec<u8>,
+    destination: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitlinkGitdirMove {
+    git_dir: PathBuf,
+    destination_root: PathBuf,
+}
+
 pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
     env::var_os("GIT_INDEX_FILE")
         .map(PathBuf::from)
@@ -14157,6 +14169,211 @@ fn stage_gitmodules_after_rm(
     Ok(())
 }
 
+fn prepare_gitmodules_for_moved_gitlinks(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entries: &[IndexEntry],
+    moves: &[GitmodulesMove],
+) -> Result<Option<Vec<u8>>> {
+    if moves.is_empty() {
+        return Ok(None);
+    }
+    let gitmodules_path = worktree_root.join(".gitmodules");
+    let Ok(original) = fs::read(&gitmodules_path) else {
+        return Ok(None);
+    };
+    if !index_entries
+        .iter()
+        .any(|entry| entry.stage() == Stage::Normal && entry.path.as_bytes() == b".gitmodules")
+    {
+        return Ok(None);
+    }
+    let config = GitConfig::parse(&original)?;
+    let mut edits = Vec::new();
+    for gitlink_move in moves {
+        let source = String::from_utf8_lossy(&gitlink_move.source).into_owned();
+        let destination = String::from_utf8_lossy(&gitlink_move.destination).into_owned();
+        let mut matched = false;
+        for section in &config.sections {
+            if !section.name.eq_ignore_ascii_case("submodule") {
+                continue;
+            }
+            let Some(name) = section.subsection.as_deref() else {
+                continue;
+            };
+            let path = section
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.key.eq_ignore_ascii_case("path"))
+                .and_then(|entry| entry.value.as_deref());
+            if path == Some(source.as_str()) {
+                matched = true;
+                edits.push((name.to_string(), destination.clone()));
+            }
+        }
+        if !matched {
+            eprintln!("warning: Could not find section in .gitmodules where path={source}");
+        }
+    }
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    if gitmodules_worktree_differs_from_index(
+        worktree_root,
+        git_dir,
+        format,
+        index_entries,
+        &original,
+        &None,
+    )? {
+        eprintln!("fatal: Please stage your changes to .gitmodules or stash them to proceed");
+        return Err(GitError::Exit(128));
+    }
+    let mut edited = original;
+    for (name, destination) in edits {
+        let mut editor =
+            sley_config::raw_edit::RawConfigEditor::new(edited, "submodule", Some(&name), "path");
+        match editor.set_multivar(Some(&destination), None, None, false) {
+            sley_config::raw_edit::RawEditOutcome::Changed => {}
+            sley_config::raw_edit::RawEditOutcome::NothingSet => {
+                eprintln!("warning: Could not find section in .gitmodules where path={name}");
+            }
+        }
+        edited = editor.into_bytes();
+    }
+    Ok(Some(edited))
+}
+
+fn apply_prepared_gitmodules_move(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entries: &mut [IndexEntry],
+    edited: Vec<u8>,
+) -> Result<()> {
+    fs::write(worktree_root.join(".gitmodules"), edited)?;
+    stage_gitmodules_after_rm(worktree_root, git_dir, format, index_entries, &None)
+}
+
+fn prepare_moved_gitlink_gitdirs(
+    worktree_root: &Path,
+    moves: &[GitmodulesMove],
+) -> Result<Vec<GitlinkGitdirMove>> {
+    let mut gitdir_moves = Vec::new();
+    for gitlink_move in moves {
+        let source_root = worktree_path(worktree_root, &gitlink_move.source)?;
+        if !source_root.join(".git").is_file() {
+            continue;
+        }
+        let Some(git_dir) = sley_diff_merge::gitlink_git_dir(&source_root) else {
+            continue;
+        };
+        gitdir_moves.push(GitlinkGitdirMove {
+            git_dir: normalize_absolute_path_lexically(&git_dir),
+            destination_root: worktree_path(worktree_root, &gitlink_move.destination)?,
+        });
+    }
+    Ok(gitdir_moves)
+}
+
+fn apply_moved_gitlink_gitdirs(moves: &[GitlinkGitdirMove]) -> Result<()> {
+    for gitdir_move in moves {
+        let gitdir_relative =
+            relative_path_between(&gitdir_move.destination_root, &gitdir_move.git_dir);
+        let gitdir_value = gitfile_path_value(&gitdir_relative);
+        fs::write(
+            gitdir_move.destination_root.join(".git"),
+            format!("gitdir: {gitdir_value}\n"),
+        )?;
+
+        let config_path = gitdir_move.git_dir.join("config");
+        let config_bytes = match fs::read(&config_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let worktree_relative =
+            relative_path_between(&gitdir_move.git_dir, &gitdir_move.destination_root);
+        let worktree_value = gitfile_path_value(&worktree_relative);
+        let mut editor =
+            sley_config::raw_edit::RawConfigEditor::new(config_bytes, "core", None, "worktree");
+        match editor.set_multivar(Some(&worktree_value), None, None, false) {
+            sley_config::raw_edit::RawEditOutcome::Changed => {
+                sley_config::raw_edit::write_config_file_locked(
+                    &config_path,
+                    &editor.into_bytes(),
+                    sley_config::raw_edit::ConfigFileWriteOptions::default(),
+                )
+                .map_err(|err| GitError::Io(err.to_string()))?;
+            }
+            sley_config::raw_edit::RawEditOutcome::NothingSet => {}
+        }
+    }
+    Ok(())
+}
+
+fn relative_path_between(from_dir: &Path, to_path: &Path) -> PathBuf {
+    let from = normalize_absolute_path_lexically(from_dir);
+    let to = normalize_absolute_path_lexically(to_path);
+    let from_components = from.components().collect::<Vec<_>>();
+    let to_components = to.components().collect::<Vec<_>>();
+    let mut common = 0usize;
+    while common < from_components.len()
+        && common < to_components.len()
+        && from_components[common] == to_components[common]
+    {
+        common += 1;
+    }
+    if common == 0 {
+        return to;
+    }
+    let mut relative = PathBuf::new();
+    for component in &from_components[common..] {
+        if matches!(component, std::path::Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    for component in &to_components[common..] {
+        match component {
+            std::path::Component::Normal(value) => relative.push(value),
+            std::path::Component::ParentDir => relative.push(".."),
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    relative
+}
+
+fn gitfile_path_value(path: &Path) -> String {
+    let mut parts = Vec::new();
+    let mut absolute = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                parts.push(prefix.as_os_str().to_string_lossy().into_owned());
+            }
+            std::path::Component::RootDir => absolute = true,
+            std::path::Component::CurDir => parts.push(".".to_string()),
+            std::path::Component::ParentDir => parts.push("..".to_string()),
+            std::path::Component::Normal(value) => {
+                parts.push(value.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let path = parts.join("/");
+    if absolute {
+        format!("/{path}")
+    } else {
+        path
+    }
+}
+
 fn contains_nested_git_dir(root: &Path) -> bool {
     let Ok(entries) = fs::read_dir(root) else {
         return false;
@@ -14226,11 +14443,14 @@ pub fn move_index_and_worktree_path(
     } else {
         worktree_root.join(source)
     };
+    let source_absolute = normalize_absolute_path_lexically(&source_absolute);
     let destination_absolute = if destination.is_absolute() {
         destination.to_path_buf()
     } else {
         worktree_root.join(destination)
     };
+    let destination_has_trailing_separator = path_has_trailing_separator(&destination_absolute);
+    let destination_absolute = normalize_absolute_path_lexically(&destination_absolute);
     let mut destination_absolute = if destination_absolute.is_dir() {
         let Some(file_name) = source_absolute.file_name() else {
             return Err(GitError::InvalidPath(format!(
@@ -14263,8 +14483,10 @@ pub fn move_index_and_worktree_path(
         })?;
     let source_path = git_path_bytes(source_relative)?;
     let destination_path = git_path_bytes(destination_relative)?;
-    let destination_has_trailing_separator = path_has_trailing_separator(&destination_absolute);
-    if destination_has_trailing_separator && !destination_absolute.is_dir() {
+    if destination_has_trailing_separator
+        && !destination_absolute.is_dir()
+        && !source_absolute.is_dir()
+    {
         if options.skip_errors {
             return Ok(MoveResult {
                 source: source_path,
@@ -14292,6 +14514,94 @@ pub fn move_index_and_worktree_path(
         eprintln!(
             "fatal: destination directory does not exist, source={}, destination={destination}",
             String::from_utf8_lossy(&source_path),
+        );
+        return Err(GitError::Exit(128));
+    }
+    let directory_prefix = {
+        let mut prefix = source_path.clone();
+        prefix.push(b'/');
+        prefix
+    };
+    let directory_entries: Vec<_> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.path.as_bytes().starts_with(&directory_prefix))
+        .cloned()
+        .collect();
+    let source_is_conflicted = index.entries.iter().any(|entry| {
+        (entry.path.as_bytes() == source_path.as_slice()
+            || entry.path.as_bytes().starts_with(&directory_prefix))
+            && entry.stage() != Stage::Normal
+    });
+    if source_is_conflicted {
+        if options.skip_errors {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: true,
+                fatal: None,
+                details: Vec::new(),
+            });
+        }
+        if options.dry_run {
+            let fatal = format!(
+                "fatal: conflicted, source={}, destination={}",
+                String::from_utf8_lossy(&source_path),
+                String::from_utf8_lossy(&destination_path)
+            );
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: false,
+                fatal: Some(fatal),
+                details: Vec::new(),
+            });
+        }
+        eprintln!(
+            "fatal: conflicted, source={}, destination={}",
+            String::from_utf8_lossy(&source_path),
+            String::from_utf8_lossy(&destination_path)
+        );
+        return Err(GitError::Exit(128));
+    }
+    let source_position = index
+        .entries
+        .iter()
+        .position(|entry| entry.path == source_path && entry.stage() == Stage::Normal);
+    let source_is_tracked = !directory_entries.is_empty() || source_position.is_some();
+    if !source_is_tracked {
+        if options.skip_errors {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: true,
+                fatal: None,
+                details: Vec::new(),
+            });
+        }
+        let source_kind = if source_absolute.exists() {
+            "not under version control"
+        } else {
+            "bad source"
+        };
+        if options.dry_run {
+            let fatal = format!(
+                "fatal: {source_kind}, source={}, destination={}",
+                String::from_utf8_lossy(&source_path),
+                String::from_utf8_lossy(&destination_path)
+            );
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: false,
+                fatal: Some(fatal),
+                details: Vec::new(),
+            });
+        }
+        eprintln!(
+            "fatal: {source_kind}, source={}, destination={}",
+            String::from_utf8_lossy(&source_path),
+            String::from_utf8_lossy(&destination_path)
         );
         return Err(GitError::Exit(128));
     }
@@ -14333,17 +14643,38 @@ pub fn move_index_and_worktree_path(
             fs::remove_file(&destination_absolute)?;
         }
     }
-    let directory_prefix = {
-        let mut prefix = source_path.clone();
-        prefix.push(b'/');
-        prefix
+    let gitlink_moves = if options.dry_run {
+        Vec::new()
+    } else if !directory_entries.is_empty() {
+        directory_entries
+            .iter()
+            .filter(|entry| sley_index::is_gitlink(entry.mode))
+            .map(|entry| {
+                let suffix = &entry.path.as_bytes()[source_path.len()..];
+                let mut destination = destination_path.clone();
+                destination.extend_from_slice(suffix);
+                GitmodulesMove {
+                    source: entry.path.as_bytes().to_vec(),
+                    destination,
+                }
+            })
+            .collect::<Vec<_>>()
+    } else if let Some(position) = source_position {
+        let entry = &index.entries[position];
+        if sley_index::is_gitlink(entry.mode) {
+            vec![GitmodulesMove {
+                source: source_path.clone(),
+                destination: destination_path.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
     };
-    let directory_entries: Vec<_> = index
-        .entries
-        .iter()
-        .filter(|entry| entry.path.as_bytes().starts_with(&directory_prefix))
-        .cloned()
-        .collect();
+    let gitmodules_move =
+        prepare_gitmodules_for_moved_gitlinks(worktree_root, git_dir, format, &index.entries, &gitlink_moves)?;
+    let gitlink_gitdir_moves = prepare_moved_gitlink_gitdirs(worktree_root, &gitlink_moves)?;
     if !directory_entries.is_empty() {
         let details: Vec<_> = directory_entries
             .iter()
@@ -14368,6 +14699,7 @@ pub fn move_index_and_worktree_path(
             });
         }
         fs::rename(&source_absolute, &destination_absolute)?;
+        apply_moved_gitlink_gitdirs(&gitlink_gitdir_moves)?;
         let moved_paths: Vec<_> = details
             .iter()
             .map(|detail| detail.destination.clone())
@@ -14386,6 +14718,9 @@ pub fn move_index_and_worktree_path(
             destination_entry.mode = source_entry.mode;
             index.entries.push(destination_entry);
         }
+        if let Some(edited) = gitmodules_move {
+            apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
+        }
         index
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -14400,46 +14735,7 @@ pub fn move_index_and_worktree_path(
         });
     }
 
-    let Some(position) = index
-        .entries
-        .iter()
-        .position(|entry| entry.path == source_path)
-    else {
-        if options.skip_errors {
-            return Ok(MoveResult {
-                source: source_path,
-                destination: destination_path,
-                skipped: true,
-                fatal: None,
-                details: Vec::new(),
-            });
-        }
-        let source_kind = if source_absolute.exists() {
-            "not under version control"
-        } else {
-            "bad source"
-        };
-        if options.dry_run {
-            let fatal = format!(
-                "fatal: {source_kind}, source={}, destination={}",
-                String::from_utf8_lossy(&source_path),
-                String::from_utf8_lossy(&destination_path)
-            );
-            return Ok(MoveResult {
-                source: source_path,
-                destination: destination_path,
-                skipped: false,
-                fatal: Some(fatal),
-                details: Vec::new(),
-            });
-        }
-        eprintln!(
-            "fatal: {source_kind}, source={}, destination={}",
-            String::from_utf8_lossy(&source_path),
-            String::from_utf8_lossy(&destination_path)
-        );
-        return Err(GitError::Exit(128));
-    };
+    let position = source_position.expect("tracked non-directory source must have an index entry");
     if options.dry_run {
         return Ok(MoveResult {
             source: source_path,
@@ -14468,12 +14764,16 @@ pub fn move_index_and_worktree_path(
         return Err(GitError::Exit(128));
     }
     fs::rename(&source_absolute, &destination_absolute)?;
+    apply_moved_gitlink_gitdirs(&gitlink_gitdir_moves)?;
     let source_entry = index.entries.remove(position);
     let mut destination_entry = source_entry;
     destination_entry.path = destination_path.clone().into();
     destination_entry.refresh_name_length();
     index.entries.retain(|entry| entry.path != destination_path);
     index.entries.push(destination_entry);
+    if let Some(edited) = gitmodules_move {
+        apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
+    }
     index
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -16130,6 +16430,22 @@ fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
         .collect::<Vec<_>>()
         .join("/")
         .into_bytes())
+}
+
+fn normalize_absolute_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {

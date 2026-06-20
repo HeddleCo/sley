@@ -450,6 +450,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut debug = false;
     let mut sparse = false;
     let mut tag = false;
+    let mut format_spec: Option<String> = None;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -516,6 +517,14 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-debug" => debug = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
+            "--format" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command(
+                        "ls-files --format requires a value".into(),
+                    ));
+                };
+                format_spec = Some(value.clone());
+            }
             "-t" => tag = true,
             "--no-t" => tag = false,
             "--recurse-submodules"
@@ -552,6 +561,9 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                     ));
                 };
                 exclude_per_directory.push(name.to_string());
+            }
+            value if let Some(value) = value.strip_prefix("--format=") => {
+                format_spec = Some(value.to_string());
             }
             value if !value.starts_with('-') => path_args.push(arg.clone()),
             value => {
@@ -606,6 +618,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         && !full_name
         && !deduplicate
         && !error_unmatch
+        && format_spec.is_none()
         && !exclude_standard
         && exclude_patterns.is_empty()
         && exclude_from.is_empty()
@@ -637,6 +650,23 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         None
     };
     let eol = eol_context.as_ref();
+    if let Some(format_spec) = format_spec.as_deref() {
+        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+            let index = ls_files_display_index(&git_dir, format, index, sparse)?;
+            write_ls_files_formatted(
+                &mut stdout,
+                index.entries.iter(),
+                format_spec,
+                terminator,
+                &pathspec,
+            )?;
+        }
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
+        }
+        return Ok(());
+    }
     if others {
         let untracked = sley_worktree::untracked_paths_with_options(
             &worktree_root,
@@ -800,6 +830,69 @@ fn write_ls_files_index_root_fast(
         stdout.write_all(&[terminator])?;
         Ok(())
     })
+}
+
+fn write_ls_files_formatted<'a>(
+    stdout: &mut io::Stdout,
+    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
+    format_spec: &str,
+    terminator: u8,
+    pathspec: &LsFilesPathspec,
+) -> Result<()> {
+    for entry in entries {
+        let Some(path) = pathspec.display(&entry.path) else {
+            continue;
+        };
+        write_ls_files_format(stdout, entry, &path, format_spec)?;
+        stdout.write_all(&[terminator])?;
+    }
+    Ok(())
+}
+
+fn write_ls_files_format(
+    stdout: &mut io::Stdout,
+    entry: &sley_index::IndexEntry,
+    display_path: &[u8],
+    format_spec: &str,
+) -> Result<()> {
+    let mut rest = format_spec;
+    while let Some(start) = rest.find('%') {
+        stdout.write_all(rest[..start].as_bytes())?;
+        rest = &rest[start + 1..];
+        if let Some(after_open) = rest.strip_prefix('(') {
+            if let Some(end) = after_open.find(')') {
+                let atom = &after_open[..end];
+                match atom {
+                    "objectmode" => write!(stdout, "{:06o}", entry.mode)?,
+                    "objectname" => write!(stdout, "{}", entry.oid)?,
+                    "stage" => write!(stdout, "{}", index_entry_stage(entry))?,
+                    "path" => stdout.write_all(display_path)?,
+                    _ => {
+                        return Err(GitError::Command(format!(
+                            "unsupported ls-files format atom {atom}"
+                        )));
+                    }
+                }
+                rest = &after_open[end + 1..];
+            } else {
+                stdout.write_all(b"%(")?;
+                rest = after_open;
+            }
+        } else if let Some(hex) = rest.strip_prefix('x').and_then(|value| value.get(..2)) {
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                GitError::Command(format!("invalid ls-files format escape %x{hex}"))
+            })?;
+            stdout.write_all(&[byte])?;
+            rest = &rest[3..];
+        } else if rest.starts_with('%') {
+            stdout.write_all(b"%")?;
+            rest = &rest[1..];
+        } else {
+            stdout.write_all(b"%")?;
+        }
+    }
+    stdout.write_all(rest.as_bytes())?;
+    Ok(())
 }
 
 fn ls_files_display_index(
