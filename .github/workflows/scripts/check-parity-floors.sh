@@ -420,6 +420,13 @@ declare -A FLOOR=(
     [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
     [t7004-tag.sh]=228
+    # signed-commit slice (2026-06-20): OpenPGP commit/tag signing + verify (t7510 2->28) and a real
+    # gpg.format=ssh signing engine via ssh-keygen + x509 via gpgsm (t7528 6->27, t7031 2->13, t7030 4->10).
+    # All enrolled here, stable 3x on the installed oracle. Restores+raises t4202 (signature cells) below.
+    [t7510-signed-commit.sh]=28
+    [t7528-signed-commit-ssh.sh]=27
+    [t7031-verify-tag-signed-ssh.sh]=13
+    [t7030-verify-tag.sh]=10
     [t3200-branch.sh]=145
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
@@ -472,7 +479,8 @@ declare -A FLOOR=(
     [t3432-rebase-fast-forward.sh]=219
     [t3600-rm.sh]=69
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
-    [t4202-log.sh]=124
+    # signed-commit slice (2026-06-20): ssh/x509 signature cells (log --show-signature %G?) 124->131 (stable 3x).
+    [t4202-log.sh]=131
     # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
     # confusing-path rejection (.git/HFS/NTFS/backslash/NUL) 4->28 FULL PASS (safe trees still load).
     [t4201-shortlog.sh]=21

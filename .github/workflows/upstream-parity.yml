@@ -236,6 +236,10 @@ jobs:
             t6422-merge-rename-corner-cases.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
+            t7510-signed-commit.sh
+            t7528-signed-commit-ssh.sh
+            t7031-verify-tag-signed-ssh.sh
+            t7030-verify-tag.sh
             t7102-reset.sh
             t7400-submodule-basic.sh
             t7506-status-submodule.sh
