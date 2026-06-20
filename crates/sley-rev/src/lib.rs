@@ -687,11 +687,7 @@ fn resolve_reflog_date(
             return Ok(entry.new_oid);
         }
     }
-    Err(GitError::not_found(format!(
-        "log for '{}' only goes back to {}",
-        reflog_display_name(base),
-        date
-    )))
+    Ok(entries[0].new_oid)
 }
 
 fn reflog_entry_timestamp(entry: &ReflogEntry) -> Result<i64> {
@@ -699,6 +695,15 @@ fn reflog_entry_timestamp(entry: &ReflogEntry) -> Result<i64> {
 }
 
 fn parse_reflog_selector_date(value: &str) -> Option<i64> {
+    if let Some(years) = value.strip_suffix(".year.ago") {
+        let years = years.parse::<i64>().ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let now = i64::try_from(now).ok()?;
+        return Some(now.saturating_sub(years.saturating_mul(365 * 86_400)));
+    }
     let mut parts = value.split_ascii_whitespace();
     let _weekday = parts.next()?;
     let month = parse_reflog_month(parts.next()?)?;
