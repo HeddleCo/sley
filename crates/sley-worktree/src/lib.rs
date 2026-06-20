@@ -4291,7 +4291,7 @@ fn status_submodule_from_entries(
     index_entry: &TrackedEntry,
     worktree_entry: Option<&TrackedEntry>,
     submodule_dirt_map: &BTreeMap<Vec<u8>, u8>,
-    untracked_mode: StatusUntrackedMode,
+    _untracked_mode: StatusUntrackedMode,
 ) -> Option<SubmoduleStatus> {
     let worktree_entry = worktree_entry?;
     if !sley_index::is_gitlink(index_entry.mode) || !sley_index::is_gitlink(worktree_entry.mode) {
@@ -4301,8 +4301,7 @@ fn status_submodule_from_entries(
     Some(SubmoduleStatus {
         new_commits: index_entry.oid != worktree_entry.oid,
         modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
-            && !matches!(untracked_mode, StatusUntrackedMode::None),
+        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0,
     })
 }
 
@@ -5815,7 +5814,7 @@ fn tracked_only_submodule_status(
     path: &[u8],
     index_entry: &TrackedEntry,
     worktree_entry: Option<&TrackedEntry>,
-    untracked_mode: StatusUntrackedMode,
+    _untracked_mode: StatusUntrackedMode,
 ) -> Result<Option<SubmoduleStatus>> {
     let Some(worktree_entry) = worktree_entry else {
         return Ok(None);
@@ -5832,8 +5831,7 @@ fn tracked_only_submodule_status(
     Ok(Some(SubmoduleStatus {
         new_commits: index_entry.oid != worktree_entry.oid,
         modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
-            && !matches!(untracked_mode, StatusUntrackedMode::None),
+        untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0,
     }))
 }
 
@@ -13656,6 +13654,10 @@ pub fn remove_index_and_worktree_paths(
         let has_trailing_slash = path_has_trailing_separator(&absolute);
         let git_path = git_path_bytes(relative)?;
         if !has_trailing_slash && index_paths.contains(&git_path) {
+            selected.insert(git_path);
+            continue;
+        }
+        if has_trailing_slash && gitlink_paths.contains(&git_path) && absolute.is_dir() {
             selected.insert(git_path);
             continue;
         }
