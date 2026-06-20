@@ -245,7 +245,7 @@ fn update_worktree_after_fetch_moved_head(
         );
         return Err(GitError::Exit(128));
     }
-    verify_fast_forward_untracked_safe(worktree_root, db, format, &orig_tree, &curr_tree)?;
+    verify_fast_forward_untracked_safe(worktree_root, git_dir, db, format, &orig_tree, &curr_tree)?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &curr_head)?;
     Ok(())
 }
@@ -1123,4 +1123,3 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     }
     cmd_merge(&merge_args)
 }
-
