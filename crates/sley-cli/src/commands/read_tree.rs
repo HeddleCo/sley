@@ -816,6 +816,13 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         let Ok(metadata) = fs::symlink_metadata(&file_path) else {
             return Ok(());
         };
+        if sley_worktree::path_matches_standard_ignore(
+            &self.worktree_root,
+            path,
+            metadata.is_dir(),
+        )? {
+            return Ok(());
+        }
         // git's `check_ok_to_remove`: a directory in the way (the D/F dir→file
         // transition) is checked by `verify_clean_subdirectory` — it is only OK
         // to replace when nothing untracked-and-not-ignored lives under it, and
@@ -1820,6 +1827,9 @@ fn checkout_submodule_to_commit(
         }
     }
 
+    if fs::symlink_metadata(&sub_root).is_ok_and(|metadata| !metadata.is_dir()) {
+        remove_path_in_the_way(&sub_root)?;
+    }
     fs::create_dir_all(&sub_root)?;
     connect_submodule_worktree(&sub_root, &sub_git_dir)?;
 
