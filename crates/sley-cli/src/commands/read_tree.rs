@@ -816,6 +816,13 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         let Ok(metadata) = fs::symlink_metadata(&file_path) else {
             return Ok(());
         };
+        if sley_worktree::path_matches_standard_ignore(
+            &self.worktree_root,
+            path,
+            metadata.is_dir(),
+        )? {
+            return Ok(());
+        }
         // git's `check_ok_to_remove`: a directory in the way (the D/F dir→file
         // transition) is checked by `verify_clean_subdirectory` — it is only OK
         // to replace when nothing untracked-and-not-ignored lives under it, and
@@ -1820,6 +1827,9 @@ fn checkout_submodule_to_commit(
         }
     }
 
+    if fs::symlink_metadata(&sub_root).is_ok_and(|metadata| !metadata.is_dir()) {
+        remove_path_in_the_way(&sub_root)?;
+    }
     fs::create_dir_all(&sub_root)?;
     connect_submodule_worktree(&sub_root, &sub_git_dir)?;
 
@@ -1902,7 +1912,7 @@ fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) 
     if sub_root.exists() {
         fs::remove_dir_all(&sub_root)?;
     }
-    unset_core_worktree(&sub_git_dir)?;
+    unset_core_worktree_recursive(&sub_git_dir)?;
     prune_empty_dirs(worktree_root, sub_root.parent());
     Ok(())
 }
@@ -1931,6 +1941,21 @@ fn unset_core_worktree(git_dir: &Path) -> Result<()> {
     };
     remove_config_key_in_place(&mut text, "core", "worktree");
     fs::write(config, text)?;
+    Ok(())
+}
+
+fn unset_core_worktree_recursive(git_dir: &Path) -> Result<()> {
+    unset_core_worktree(git_dir)?;
+    let modules = git_dir.join("modules");
+    let Ok(entries) = fs::read_dir(&modules) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            unset_core_worktree_recursive(&entry.path())?;
+        }
+    }
     Ok(())
 }
 

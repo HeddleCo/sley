@@ -2663,6 +2663,17 @@ pub(crate) fn reset_merge_in(
         if current_entry.as_ref() == target_entry {
             continue;
         }
+        if current.is_some_and(|entry| sley_index::is_gitlink(entry.mode))
+            && target_entry.is_none()
+            && target_map
+                .keys()
+                .any(|candidate| {
+                    candidate.starts_with(path) && candidate.get(path.len()) == Some(&b'/')
+                })
+        {
+            errors.push(path.clone());
+            continue;
+        }
         // The index entry changes: the worktree must match the index.
         if let Some(entry) = current {
             let rel = entry.path.to_string();
@@ -2673,6 +2684,15 @@ pub(crate) fn reset_merge_in(
                     errors.push(path.clone());
                     continue;
                 }
+            }
+        } else if matches!(target_entry, Some((mode, _)) if sley_index::is_gitlink(*mode)) {
+            let Some(rel) = std::str::from_utf8(path).ok() else {
+                continue;
+            };
+            let full = worktree_root.join(rel);
+            if fs::symlink_metadata(&full).is_ok_and(|metadata| !metadata.is_dir()) {
+                errors.push(path.clone());
+                continue;
             }
         }
         match target_entry {
@@ -2720,7 +2740,11 @@ pub(crate) fn reset_merge_in(
     index.upgrade_version_for_flags();
     fs::write(&index_path, index.write(format)?)?;
     for (path, (mode, oid)) in &updates {
-        let content = crate::commands::merge_rebase::merge_read_blob(&db, oid)?;
+        let content = if sley_index::is_gitlink(*mode) {
+            Vec::new()
+        } else {
+            crate::commands::merge_rebase::merge_read_blob(&db, oid)?
+        };
         crate::commands::merge_rebase::merge_write_worktree_file(
             worktree_root,
             path,
@@ -2731,6 +2755,15 @@ pub(crate) fn reset_merge_in(
     for path in &deletions {
         crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
     }
+    sley_worktree::refresh_index_paths(
+        worktree_root,
+        git_dir,
+        format,
+        &[],
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
 
     // Move HEAD (branch tip or detached) when the target differs.
     let refs = FileRefStore::new(git_dir, format);
