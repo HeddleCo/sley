@@ -46,6 +46,11 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     let mut symbolic_full_name = false;
     let mut revs_only = false;
     let mut path_format = RevParsePathFormat::Default;
+    let mut end_of_options = false;
+    let mut seen_path_arg = false;
+    let mut default_rev: Option<String> = None;
+    let mut verified_output: Option<String> = None;
+    let dashdash = args.iter().position(|arg| arg == "--");
     // Pseudo-ref options (`--all`, `--glob=`, `--branches[=]`, `--exclude=`, …)
     // resolve refs and print their OIDs interleaved with positional args, the
     // same way git's `handle_revision_pseudo_opt` feeds `add_pending_object`.
@@ -81,8 +86,21 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             continue;
         }
         match arg.as_str() {
-            "--" => break,
-            "--end-of-options" if verify => {}
+            "--" => {
+                if verify {
+                    break;
+                }
+                println!("--");
+                for path in &args[idx + 1..] {
+                    println!("{path}");
+                }
+                break;
+            }
+            "--end-of-options" if !verify => {
+                println!("--end-of-options");
+                end_of_options = true;
+            }
+            "--end-of-options" if verify => end_of_options = true,
             "--git-dir" => println!("{}", display_git_dir(&cwd, &git_dir, path_format)?),
             "--absolute-git-dir" => println!("{}", fs::canonicalize(&git_dir)?.display()),
             "--git-common-dir" => {
@@ -153,13 +171,21 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--is-bare-repository" => println!("{}", is_bare_repository(&git_dir)?),
             "--is-shallow-repository" => println!("{}", is_shallow_repository(&git_dir)),
             "--short" => short = repository_abbrev(&git_dir, format)?,
+            "--default" => {
+                idx += 1;
+                default_rev = Some(
+                    args.get(idx)
+                        .ok_or_else(|| GitError::Command("--default requires a value".into()))?
+                        .clone(),
+                );
+            }
             "--verify" => verify = true,
             "--quiet" | "-q" => quiet = true,
             "--revs-only" => revs_only = true,
             "--abbrev-ref" | "--abbrev-ref=strict" | "--abbrev-ref=loose" => abbrev_ref = true,
             "--symbolic-full-name" => symbolic_full_name = true,
             "--bisect" => rev_parse_bisect(&git_dir, format, symbolic_full_name)?,
-            value if value.starts_with('-') => {
+            value if value.starts_with('-') && !end_of_options => {
                 if let Some(value) = value.strip_prefix("--short=") {
                     short = Some(parse_abbrev(value)?.max(4));
                     idx += 1;
@@ -216,6 +242,13 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     Some(rest) => (rest, true),
                     None => (rev, false),
                 };
+                if let Some(rendered) = rev_parse_render_range(&git_dir, format, rev, negate)? {
+                    for line in rendered {
+                        println!("{line}");
+                    }
+                    idx += 1;
+                    continue;
+                }
                 if abbrev_ref {
                     let rendered = rev_parse_abbrev_ref(&git_dir, format, rev)?;
                     rev_parse_print_positional(&rendered, negate);
@@ -229,18 +262,59 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     idx += 1;
                     continue;
                 }
-                let oid = match resolve_revision(&git_dir, format, rev) {
+                if seen_path_arg && sley_rev::split_rev_path_spec(rev).is_some() {
+                    println!("{rev}");
+                    rev_parse_no_such_worktree_path(rev);
+                    return Err(GitError::Exit(128));
+                }
+                let normalized_rev = rev_parse_normalize_revision_arg(&cwd, &git_dir, rev)?;
+                let oid = match resolve_revision(&git_dir, format, &normalized_rev) {
                     Ok(oid) => oid,
                     Err(_) if revs_only => {
                         idx += 1;
                         continue;
                     }
                     Err(_) if verify && quiet => return Err(GitError::Exit(1)),
+                    Err(err) if verify && rev_parse_is_selector_error(rev) => {
+                        eprintln!("fatal: {}", rev_parse_error_message(&err));
+                        return Err(GitError::Exit(128));
+                    }
                     Err(_) if verify => {
                         return rev_parse_needed_single_revision(false);
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        if !before_dashdash(dashdash, idx)
+                            && !rev.contains(':')
+                            && rev_parse_path_exists_on_disk(&cwd, &git_dir, rev)?
+                        {
+                            println!("{rev}");
+                            seen_path_arg = true;
+                            idx += 1;
+                            continue;
+                        }
+                        return rev_parse_diagnose_arg_failure(
+                            &cwd,
+                            &git_dir,
+                            format,
+                            rev,
+                            &normalized_rev,
+                            err,
+                            before_dashdash(dashdash, idx),
+                            seen_path_arg,
+                        );
+                    }
                 };
+                if verify {
+                    let oid = oid.to_hex();
+                    let rendered = if let Some(len) = short {
+                        oid[..len.min(oid.len())].to_string()
+                    } else {
+                        oid
+                    };
+                    verified_output = Some(if negate { format!("^{rendered}") } else { rendered });
+                    idx += 1;
+                    continue;
+                }
                 if let Some(len) = short {
                     short_revs += 1;
                     if short_revs > 1 {
@@ -255,10 +329,355 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
         }
         idx += 1;
     }
+    if verify && verified_revs == 0
+        && let Some(default_rev) = default_rev
+    {
+        let oid = match resolve_revision(&git_dir, format, &default_rev) {
+            Ok(oid) => oid,
+            Err(_) if quiet => return Err(GitError::Exit(1)),
+            Err(_) => return rev_parse_needed_single_revision(false),
+        };
+        verified_output = Some(oid.to_hex());
+        verified_revs = 1;
+    }
     if verify && verified_revs != 1 {
         return rev_parse_needed_single_revision(quiet);
     }
+    if verify
+        && let Some(output) = verified_output
+    {
+        println!("{output}");
+    }
     Ok(())
+}
+
+fn before_dashdash(dashdash: Option<usize>, idx: usize) -> bool {
+    dashdash.is_some_and(|dashdash| idx < dashdash)
+}
+
+fn rev_parse_render_range(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    negate: bool,
+) -> Result<Option<Vec<String>>> {
+    let Some((left, right, symmetric)) = rev_parse_split_range(rev) else {
+        return Ok(None);
+    };
+    if left.is_empty() && right.is_empty() {
+        return Ok(Some(vec![rev.to_string()]));
+    }
+    let left = if left.is_empty() { "HEAD" } else { left };
+    let right = if right.is_empty() { "HEAD" } else { right };
+    let left_oid = resolve_revision(git_dir, format, left)?;
+    let right_oid = resolve_revision(git_dir, format, right)?;
+    let mut out = Vec::new();
+    if symmetric {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let left_commit = sley_rev::peel_to_commit(&db, format, &left_oid)?;
+        let right_commit = sley_rev::peel_to_commit(&db, format, &right_oid)?;
+        let bases = sley_rev::merge_bases(git_dir, format, &db, &left_commit, &right_commit)?;
+        if negate {
+            out.push(format!("^{}", left_oid.to_hex()));
+            out.push(format!("^{}", right_oid.to_hex()));
+            out.extend(bases.into_iter().map(|oid| oid.to_hex()));
+        } else {
+            out.push(left_oid.to_hex());
+            out.push(right_oid.to_hex());
+            out.extend(bases.into_iter().map(|oid| format!("^{}", oid.to_hex())));
+        }
+    } else if negate {
+        out.push(format!("^{}", right_oid.to_hex()));
+        out.push(left_oid.to_hex());
+    } else {
+        out.push(right_oid.to_hex());
+        out.push(format!("^{}", left_oid.to_hex()));
+    }
+    Ok(Some(out))
+}
+
+fn rev_parse_split_range(rev: &str) -> Option<(&str, &str, bool)> {
+    if let Some(colon) = rev.find(':') {
+        let dots = rev.find("..")?;
+        if colon < dots {
+            return None;
+        }
+    }
+    if let Some(pos) = rev.find("...") {
+        return Some((&rev[..pos], &rev[pos + 3..], true));
+    }
+    rev.find("..")
+        .map(|pos| (&rev[..pos], &rev[pos + 2..], false))
+}
+
+fn rev_parse_normalize_revision_arg(cwd: &Path, git_dir: &Path, rev: &str) -> Result<String> {
+    if rev.starts_with(":/") {
+        return Ok(rev.to_string());
+    }
+    if let Some(rest) = rev.strip_prefix(':') {
+        let (stage, path) = rev_parse_index_stage_path(rest);
+        let path = rev_parse_normalize_relative_path(cwd, git_dir, path)?;
+        return Ok(match stage {
+            Some(stage) => format!(":{stage}:{path}"),
+            None => format!(":{path}"),
+        });
+    }
+    if let Some((base, path)) = sley_rev::split_rev_path_spec(rev) {
+        let path = rev_parse_normalize_relative_path(cwd, git_dir, path)?;
+        return Ok(format!("{base}:{path}"));
+    }
+    Ok(rev.to_string())
+}
+
+fn rev_parse_index_stage_path(rest: &str) -> (Option<u8>, &str) {
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && matches!(bytes[0], b'0'..=b'3') {
+        return (Some(bytes[0] - b'0'), &rest[2..]);
+    }
+    (None, rest)
+}
+
+fn rev_parse_normalize_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<String> {
+    if !(path.starts_with("./") || path.starts_with("../")) {
+        return Ok(path.to_string());
+    }
+    if !is_inside_work_tree(cwd, git_dir)? {
+        eprintln!("fatal: relative path syntax can't be used outside working tree");
+        return Err(GitError::Exit(128));
+    }
+    let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
+    let cwd = fs::canonicalize(cwd)?;
+    let mut normalized = cwd;
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if normalized == root {
+                    eprintln!("fatal: '{path}' is outside repository at '{}'", root.display());
+                    return Err(GitError::Exit(128));
+                }
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            _ => {}
+        }
+    }
+    if !normalized.starts_with(&root) {
+        eprintln!("fatal: '{path}' is outside repository at '{}'", root.display());
+        return Err(GitError::Exit(128));
+    }
+    let relative = normalized
+        .strip_prefix(&root)
+        .map_err(|err| GitError::InvalidPath(err.to_string()))?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn rev_parse_diagnose_arg_failure(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    normalized_rev: &str,
+    err: GitError,
+    before_dashdash: bool,
+    seen_path_arg: bool,
+) -> Result<()> {
+    if before_dashdash {
+        eprintln!("fatal: bad revision '{rev}'");
+        return Err(GitError::Exit(128));
+    }
+    if rev_parse_has_unescaped_wildcard(rev) {
+        println!("{rev}");
+        return Ok(());
+    }
+    if let Some((base, path)) = sley_rev::split_rev_path_spec(normalized_rev) {
+        println!("{rev}");
+        if let Some((_, original_path)) = sley_rev::split_rev_path_spec(rev) {
+            return rev_parse_tree_path_error(
+                cwd,
+                git_dir,
+                format,
+                base,
+                path,
+                original_path,
+                seen_path_arg,
+                err,
+            );
+        }
+    }
+    if let Some(rest) = normalized_rev.strip_prefix(':')
+        && !normalized_rev.starts_with(":/")
+    {
+        println!("{rev}");
+        let (stage, path) = rev_parse_index_stage_path(rest);
+        return rev_parse_index_path_error(cwd, git_dir, format, stage.unwrap_or(0), path, err);
+    }
+    if rev_parse_is_selector_error(rev) {
+        eprintln!("fatal: {}", rev_parse_error_message(&err));
+        return Err(GitError::Exit(128));
+    }
+    println!("{rev}");
+    Err(sley_rev::ambiguous_argument_error(rev))
+}
+
+fn rev_parse_tree_path_error(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    base: &str,
+    path: &str,
+    original_path: &str,
+    seen_path_arg: bool,
+    err: GitError,
+) -> Result<()> {
+    if rev_parse_error_message(&err).starts_with("revision ") {
+        eprintln!("fatal: invalid object name '{base}'.");
+        return Err(GitError::Exit(128));
+    }
+    if seen_path_arg {
+        rev_parse_no_such_worktree_path(&format!("{base}:{original_path}"));
+        return Err(GitError::Exit(128));
+    }
+    if let Some(prefixed) = rev_parse_prefixed_path(cwd, git_dir, original_path)?
+        && rev_parse_tree_contains(git_dir, format, base, &prefixed)
+    {
+        eprintln!("fatal: path '{prefixed}' exists, but not '{original_path}'");
+        eprintln!("hint: Did you mean '{base}:{prefixed}' aka '{base}:./{original_path}'?");
+        return Err(GitError::Exit(128));
+    }
+    if rev_parse_path_exists_on_disk(cwd, git_dir, original_path)? {
+        eprintln!("fatal: path '{path}' exists on disk, but not in '{base}'");
+    } else {
+        eprintln!("fatal: path '{path}' does not exist in '{base}'");
+    }
+    let _ = format;
+    Err(GitError::Exit(128))
+}
+
+fn rev_parse_index_path_error(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    stage: u8,
+    path: &str,
+    err: GitError,
+) -> Result<()> {
+    if rev_parse_error_message(&err).contains("but not at stage") {
+        eprintln!("fatal: path '{path}' is in the index, but not at stage {stage}");
+        if stage != 0 {
+            eprintln!("hint: Did you mean ':0:{path}'?");
+        }
+        return Err(GitError::Exit(128));
+    }
+    if let Some(prefixed) = rev_parse_prefixed_path(cwd, git_dir, path)?
+        && rev_parse_index_contains(git_dir, format, &prefixed)?
+    {
+        eprintln!("fatal: path '{prefixed}' is in the index, but not '{path}'");
+        eprintln!("hint: Did you mean ':0:{prefixed}' aka ':0:./{path}'?");
+        return Err(GitError::Exit(128));
+    }
+    let in_index = rev_parse_index_contains(git_dir, format, path)?;
+    let on_disk = rev_parse_path_exists_on_disk(cwd, git_dir, path)?;
+    match (on_disk, in_index) {
+        (true, false) => eprintln!("fatal: path '{path}' exists on disk, but not in the index"),
+        (false, false) => {
+            eprintln!("fatal: path '{path}' does not exist (neither on disk nor in the index)")
+        }
+        _ => eprintln!("fatal: path '{path}' is not in the index"),
+    }
+    Err(GitError::Exit(128))
+}
+
+fn rev_parse_no_such_worktree_path(path: &str) {
+    eprintln!("fatal: {path}: no such path in the working tree.");
+    eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
+}
+
+fn rev_parse_path_exists_on_disk(cwd: &Path, git_dir: &Path, path: &str) -> Result<bool> {
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let direct = cwd.join(path);
+    if direct.exists() {
+        return Ok(true);
+    }
+    if let Ok(root) = worktree_root_for_git_dir(git_dir) {
+        return Ok(root.join(path).exists());
+    }
+    Ok(false)
+}
+
+fn rev_parse_prefixed_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<Option<String>> {
+    if path.starts_with("./") || path.starts_with("../") || Path::new(path).is_absolute() {
+        return Ok(None);
+    }
+    if !is_inside_work_tree(cwd, git_dir)? {
+        return Ok(None);
+    }
+    let prefix = worktree_prefix(cwd, git_dir)?;
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!("{prefix}{path}")))
+}
+
+fn rev_parse_tree_contains(git_dir: &Path, format: ObjectFormat, base: &str, path: &str) -> bool {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    sley_rev::resolve_rev_path(git_dir, format, &db, base, path).is_ok()
+}
+
+fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) -> Result<bool> {
+    let bytes = match fs::read(rev_parse_repository_index_path(git_dir)) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let index = sley_index::Index::parse(&bytes, format)?;
+    Ok(index.entries.iter().any(|entry| entry.path == path.as_bytes()))
+}
+
+fn rev_parse_repository_index_path(git_dir: &Path) -> PathBuf {
+    env::var_os("GIT_INDEX_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| git_dir.join("index"))
+}
+
+fn rev_parse_has_unescaped_wildcard(value: &str) -> bool {
+    let mut escaped = false;
+    for byte in value.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(byte, b'*' | b'?' | b'[') {
+            return true;
+        }
+    }
+    false
+}
+
+fn rev_parse_is_selector_error(rev: &str) -> bool {
+    rev.contains("@{")
+}
+
+fn rev_parse_error_message(err: &GitError) -> String {
+    match err {
+        GitError::NotFound(kind) => kind.to_string(),
+        GitError::InvalidFormat(msg)
+        | GitError::InvalidObjectId(msg)
+        | GitError::InvalidObject(msg)
+        | GitError::InvalidPath(msg)
+        | GitError::Unsupported(msg)
+        | GitError::Command(msg)
+        | GitError::Io(msg)
+        | GitError::Transaction(msg)
+        | GitError::Cli(_, msg) => msg.clone(),
+        GitError::Exit(code) => format!("exit {code}"),
+    }
 }
 
 fn rev_parse_args_need_no_repository(args: &[String]) -> Result<bool> {
