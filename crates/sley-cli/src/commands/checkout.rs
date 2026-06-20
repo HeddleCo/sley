@@ -779,6 +779,12 @@ fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<St
     {
         return Ok(branch.to_string());
     }
+    if let Some(rest) = upstream.strip_prefix("remotes/")
+        && let Some((_, branch)) = rest.split_once('/')
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
     if let Some(branch) = upstream.strip_prefix("refs/heads/")
         && !branch.is_empty()
     {
@@ -799,6 +805,8 @@ fn checkout_tracking_start_ref(store: &FileRefStore, start: &str) -> Option<Stri
         vec!["HEAD".to_string()]
     } else if start.starts_with("refs/") {
         vec![start.to_string()]
+    } else if let Some(rest) = start.strip_prefix("remotes/") {
+        vec![format!("refs/remotes/{rest}")]
     } else {
         vec![
             format!("refs/{start}"),
@@ -841,6 +849,11 @@ fn checkout_start_is_trackable_branch(
     if start == "HEAD" {
         return Ok(store.current_branch()?.is_some());
     }
+    if !start.contains('/')
+        && store.read_ref(&format!("refs/tags/{start}"))?.is_some()
+    {
+        return Ok(false);
+    }
     if let Ok(local_ref) = branch_ref_name(start)
         && store.read_ref(&local_ref)?.is_some()
     {
@@ -848,6 +861,9 @@ fn checkout_start_is_trackable_branch(
     }
     if start.starts_with("refs/heads/") || start.starts_with("refs/remotes/") {
         return Ok(store.read_ref(start)?.is_some());
+    }
+    if let Some(rest) = start.strip_prefix("remotes/") {
+        return Ok(store.read_ref(&format!("refs/remotes/{rest}"))?.is_some());
     }
     for remote in checkout_config_remote_names(config) {
         let Some(branch) = start.strip_prefix(&format!("{remote}/")) else {
