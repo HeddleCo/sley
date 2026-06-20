@@ -1912,7 +1912,7 @@ fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) 
     if sub_root.exists() {
         fs::remove_dir_all(&sub_root)?;
     }
-    unset_core_worktree(&sub_git_dir)?;
+    unset_core_worktree_recursive(&sub_git_dir)?;
     prune_empty_dirs(worktree_root, sub_root.parent());
     Ok(())
 }
@@ -1941,6 +1941,21 @@ fn unset_core_worktree(git_dir: &Path) -> Result<()> {
     };
     remove_config_key_in_place(&mut text, "core", "worktree");
     fs::write(config, text)?;
+    Ok(())
+}
+
+fn unset_core_worktree_recursive(git_dir: &Path) -> Result<()> {
+    unset_core_worktree(git_dir)?;
+    let modules = git_dir.join("modules");
+    let Ok(entries) = fs::read_dir(&modules) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            unset_core_worktree_recursive(&entry.path())?;
+        }
+    }
     Ok(())
 }
 
