@@ -1008,6 +1008,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         },
     )?;
     let git_dir = outcome.git_dir;
+    if local_source {
+        copy_local_commit_graph_metadata(&source_alternates_git_dir, &git_dir)?;
+    }
     if outcome.empty {
         warn_cloned_empty_repository();
     } else if !checkout {
@@ -2178,6 +2181,30 @@ fn copy_local_revision_objects(
         std::iter::once(*revision_oid),
     )
     .map(|_| ())
+}
+
+fn copy_local_commit_graph_metadata(remote_git_dir: &Path, git_dir: &Path) -> Result<()> {
+    let source_info = repository_objects_dir(remote_git_dir).join("info");
+    let destination_info = repository_objects_dir(git_dir).join("info");
+    let source_single = source_info.join("commit-graph");
+    if source_single.exists() {
+        fs::create_dir_all(&destination_info)?;
+        fs::copy(&source_single, destination_info.join("commit-graph"))?;
+    }
+    let source_split = source_info.join("commit-graphs");
+    if !source_split.is_dir() {
+        return Ok(());
+    }
+    let destination_split = destination_info.join("commit-graphs");
+    fs::create_dir_all(&destination_split)?;
+    for entry in fs::read_dir(source_split)? {
+        let entry = entry?;
+        let source = entry.path();
+        if source.is_file() {
+            fs::copy(&source, destination_split.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_clone_bundle_uri(

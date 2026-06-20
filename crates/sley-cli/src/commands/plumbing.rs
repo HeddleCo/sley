@@ -5239,7 +5239,27 @@ enum CommitGraphSource {
 enum CommitGraphSplitMode {
     Off,
     Append,
+    NoMerge,
     Replace,
+}
+
+#[derive(Clone, Copy)]
+struct CommitGraphSplitOptions {
+    mode: CommitGraphSplitMode,
+    size_multiple: usize,
+    max_commits: Option<usize>,
+    expire_time: Option<i64>,
+}
+
+impl CommitGraphSplitOptions {
+    fn off() -> Self {
+        Self {
+            mode: CommitGraphSplitMode::Off,
+            size_multiple: 2,
+            max_commits: None,
+            expire_time: None,
+        }
+    }
 }
 
 fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
@@ -5250,7 +5270,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let mut source = CommitGraphSource::AllPacks;
     let mut changed_paths: Option<bool> = None;
     let mut append = false;
-    let mut split = CommitGraphSplitMode::Off;
+    let mut split = CommitGraphSplitOptions::off();
     let mut max_new_filters_arg: Option<usize> = None;
     // git's write progress defaults to isatty(2); the harness redirects stderr,
     // so only an explicit --progress emits the progress lines.
@@ -5262,10 +5282,29 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             "--stdin-packs" => source = CommitGraphSource::StdinPacks,
             "--stdin-commits" => source = CommitGraphSource::StdinCommits,
             "--append" => append = true,
-            "--split" => split = CommitGraphSplitMode::Append,
-            "--split=replace" => split = CommitGraphSplitMode::Replace,
+            "--split" => split.mode = CommitGraphSplitMode::Append,
+            "--split=replace" => split.mode = CommitGraphSplitMode::Replace,
             "--changed-paths" => changed_paths = Some(true),
             "--no-changed-paths" => changed_paths = Some(false),
+            "--max-commits" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--max-commits requires a value".into()))?;
+                split.max_commits = Some(commit_graph_parse_positive_usize(value, "--max-commits")?);
+            }
+            "--size-multiple" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--size-multiple requires a value".into()))?;
+                split.size_multiple =
+                    commit_graph_parse_positive_usize(value, "--size-multiple")?;
+            }
+            "--expire-time" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--expire-time requires a value".into()))?;
+                split.expire_time = Some(commit_graph_parse_expire_time(value)?);
+            }
             "--max-new-filters" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("--max-new-filters requires a value".into())
@@ -5289,11 +5328,29 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--split=") => {
                 let strategy = value.strip_prefix("--split=").unwrap_or_default();
-                split = match strategy {
+                split.mode = match strategy {
                     "replace" => CommitGraphSplitMode::Replace,
-                    "no-merge" | "merge-all" => CommitGraphSplitMode::Append,
+                    "no-merge" => CommitGraphSplitMode::NoMerge,
+                    "merge-all" => CommitGraphSplitMode::Append,
                     _ => CommitGraphSplitMode::Append,
                 };
+            }
+            value if value.starts_with("--max-commits=") => {
+                split.max_commits = Some(commit_graph_parse_positive_usize(
+                    value.strip_prefix("--max-commits=").unwrap_or_default(),
+                    "--max-commits",
+                )?);
+            }
+            value if value.starts_with("--size-multiple=") => {
+                split.size_multiple = commit_graph_parse_positive_usize(
+                    value.strip_prefix("--size-multiple=").unwrap_or_default(),
+                    "--size-multiple",
+                )?;
+            }
+            value if value.starts_with("--expire-time=") => {
+                split.expire_time = Some(commit_graph_parse_expire_time(
+                    value.strip_prefix("--expire-time=").unwrap_or_default(),
+                )?);
             }
             value if value.starts_with("--max-new-filters=") => {
                 max_new_filters_arg = Some(commit_graph_parse_max_new_filters(
@@ -5412,8 +5469,9 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    if split == CommitGraphSplitMode::Off {
+    if split.mode == CommitGraphSplitMode::Off {
         write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+        remove_split_commit_graphs(&object_dir)?;
     } else {
         write_split_commit_graph_file(&object_dir, format, &graph, split)?;
     }
@@ -5470,40 +5528,134 @@ fn commit_graph_parse_max_new_filters(value: &str) -> Result<usize> {
     })
 }
 
+fn commit_graph_parse_positive_usize(value: &str, option: &str) -> Result<usize> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| GitError::Command(format!("bad numeric value '{value}' for '{option}'")))?;
+    if parsed == 0 {
+        return Err(GitError::Command(format!(
+            "bad numeric value '{value}' for '{option}'"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn commit_graph_parse_expire_time(value: &str) -> Result<i64> {
+    crate::commands::approxidate::parse_expiry_date(value)
+        .or_else(|| crate::commands::approxidate::parse_approxidate(value))
+        .ok_or_else(|| GitError::Command(format!("invalid date format: {value}")))
+}
+
+struct CommitGraphLayer {
+    hash: ObjectId,
+    graph: CommitGraph,
+}
+
 fn write_split_commit_graph_file(
     object_dir: &Path,
     format: ObjectFormat,
     graph: &[u8],
-    mode: CommitGraphSplitMode,
+    options: CommitGraphSplitOptions,
 ) -> Result<()> {
     let info = object_dir.join("info");
     let graphs = info.join("commit-graphs");
     fs::create_dir_all(&graphs)?;
     let single = info.join("commit-graph");
     let chain_path = graphs.join("commit-graph-chain");
-    let mut chain = if mode == CommitGraphSplitMode::Replace {
+    let full_graph = CommitGraph::parse(graph, format)?;
+    let mut layers = if options.mode == CommitGraphSplitMode::Replace {
         Vec::new()
     } else {
-        read_commit_graph_chain_hashes(&chain_path, format)?
+        load_commit_graph_layers(object_dir, format)?
     };
-    if chain.is_empty() && single.exists() {
+    if layers.is_empty() && options.mode != CommitGraphSplitMode::Replace && single.exists() {
         let bytes = fs::read(&single)?;
         let hash = graph_file_checksum(&bytes, format)?;
         let path = graphs.join(format!("graph-{hash}.graph"));
         if !path.exists() {
             write_commit_graph_file(&path, &bytes)?;
         }
-        chain.push(hash);
+        layers.push(CommitGraphLayer {
+            hash,
+            graph: CommitGraph::parse(&bytes, format)?,
+        });
     }
-    let hash = graph_file_checksum(graph, format)?;
-    write_commit_graph_file(&graphs.join(format!("graph-{hash}.graph")), graph)?;
+
+    let existing_oids = layers
+        .iter()
+        .flat_map(|layer| layer.graph.commits.iter().map(|entry| entry.oid))
+        .collect::<HashSet<_>>();
+    let mut new_entries = commit_graph_write_entries_from_graph(&full_graph)?
+        .into_iter()
+        .filter(|entry| options.mode == CommitGraphSplitMode::Replace || !existing_oids.contains(&entry.oid))
+        .collect::<Vec<_>>();
+    if new_entries.is_empty() && options.mode != CommitGraphSplitMode::Replace {
+        return Ok(());
+    }
+
+    if options.mode == CommitGraphSplitMode::Append {
+        let mut new_count = new_entries.len();
+        while let Some(top) = layers.last() {
+            let force_by_max = options
+                .max_commits
+                .is_some_and(|max_commits| new_count > max_commits);
+            let merge_by_size = top.graph.commits.len() <= options.size_multiple.saturating_mul(new_count);
+            if !(force_by_max || merge_by_size) {
+                break;
+            }
+            let top = layers.pop().expect("checked last layer");
+            new_count = new_count.saturating_add(top.graph.commits.len());
+            let base_oids = layers
+                .iter()
+                .flat_map(|layer| layer.graph.commits.iter().map(|entry| entry.oid))
+                .collect::<Vec<_>>();
+            new_entries.extend(commit_graph_write_entries_from_graph_with_base(
+                &top.graph,
+                &base_oids,
+            )?);
+        }
+    }
+
+    let base_hashes = layers.iter().map(|layer| layer.hash).collect::<Vec<_>>();
+    let base_oids = layers
+        .iter()
+        .flat_map(|layer| layer.graph.commits.iter().map(|entry| entry.oid))
+        .collect::<Vec<_>>();
+    let write_generation_data = if let Some(top) = layers.last() {
+        commit_graph_has_chunk(&top.graph, *b"GDA2")
+    } else {
+        commit_graph_has_chunk(&full_graph, *b"GDA2")
+    };
+    let bloom_settings = full_graph
+        .bloom_filters
+        .as_ref()
+        .map(|filters| sley_formats::CommitGraphBloomSettings {
+            hash_version: filters.hash_version,
+            hash_count: filters.hash_count,
+            bits_per_entry: filters.bits_per_entry,
+            max_changed_paths: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
+        })
+        .unwrap_or(sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS);
+    let graph = CommitGraph::write_with_base_options(
+        format,
+        &new_entries,
+        bloom_settings,
+        write_generation_data,
+        &base_hashes,
+        &base_oids,
+    )?;
+    let hash = graph_file_checksum(&graph, format)?;
+    let graph_path = graphs.join(format!("graph-{hash}.graph"));
+    write_commit_graph_file(&graph_path, &graph)?;
+
+    let mut chain = base_hashes;
     chain.push(hash);
     let mut chain_text = String::new();
     for hash in &chain {
         chain_text.push_str(&hash.to_hex());
         chain_text.push('\n');
     }
-    fs::write(&chain_path, chain_text)?;
+    write_commit_graph_file(&chain_path, chain_text.as_bytes())?;
     if single.exists() {
         #[cfg(unix)]
         {
@@ -5511,6 +5663,183 @@ fn write_split_commit_graph_file(
             let _ = fs::set_permissions(&single, fs::Permissions::from_mode(0o600));
         }
         let _ = fs::remove_file(&single);
+    }
+    expire_split_commit_graphs(&graphs, &chain, options.expire_time)?;
+    Ok(())
+}
+
+fn load_commit_graph_layers(object_dir: &Path, format: ObjectFormat) -> Result<Vec<CommitGraphLayer>> {
+    let local_chain = object_dir
+        .join("info")
+        .join("commit-graphs")
+        .join("commit-graph-chain");
+    let mut hashes = read_commit_graph_chain_hashes(&local_chain, format)?;
+    if hashes.is_empty() {
+        for alternate in commit_graph_alternate_object_dirs(object_dir)? {
+            let alternate_chain = alternate
+                .join("info")
+                .join("commit-graphs")
+                .join("commit-graph-chain");
+            hashes = read_commit_graph_chain_hashes(&alternate_chain, format)?;
+            if !hashes.is_empty() {
+                break;
+            }
+        }
+    }
+    let mut layers = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        let bytes = fs::read(commit_graph_layer_path(object_dir, &hash)?)?;
+        let graph = CommitGraph::parse(&bytes, format)?;
+        layers.push(CommitGraphLayer { hash, graph });
+    }
+    Ok(layers)
+}
+
+fn commit_graph_layer_path(object_dir: &Path, hash: &ObjectId) -> Result<PathBuf> {
+    let local = object_dir
+        .join("info")
+        .join("commit-graphs")
+        .join(format!("graph-{hash}.graph"));
+    if local.exists() {
+        return Ok(local);
+    }
+    for alternate in commit_graph_alternate_object_dirs(object_dir)? {
+        let path = alternate
+            .join("info")
+            .join("commit-graphs")
+            .join(format!("graph-{hash}.graph"));
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(GitError::InvalidPath(format!(
+        "missing commit-graph layer graph-{hash}.graph"
+    )))
+}
+
+fn commit_graph_alternate_object_dirs(object_dir: &Path) -> Result<Vec<PathBuf>> {
+    let alternates = object_dir.join("info").join("alternates");
+    let contents = match fs::read_to_string(&alternates) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let base = alternates.parent().unwrap_or(object_dir);
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let path = PathBuf::from(line);
+            if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            }
+        })
+        .collect())
+}
+
+fn commit_graph_write_entries_from_graph(graph: &CommitGraph) -> Result<Vec<CommitGraphWriteEntry>> {
+    commit_graph_write_entries_from_graph_with_base(graph, &[])
+}
+
+fn commit_graph_write_entries_from_graph_with_base(
+    graph: &CommitGraph,
+    base_oids: &[ObjectId],
+) -> Result<Vec<CommitGraphWriteEntry>> {
+    let mut entries = Vec::with_capacity(graph.commits.len());
+    for (idx, entry) in graph.commits.iter().enumerate() {
+        let parents = entry
+            .parents
+            .iter()
+            .map(|parent| {
+                let parent = *parent as usize;
+                if parent < base_oids.len() {
+                    Ok(base_oids[parent])
+                } else {
+                    let local = parent - base_oids.len();
+                    graph
+                        .commits
+                        .get(local)
+                        .map(|entry| entry.oid)
+                        .ok_or_else(|| {
+                            GitError::InvalidFormat(
+                                "commit-graph parent points past commit table".into(),
+                            )
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bloom_filter = graph
+            .bloom_filters
+            .as_ref()
+            .and_then(|filters| filters.filter_for_commit(idx).map(|filter| filter.to_vec()));
+        entries.push(CommitGraphWriteEntry {
+            oid: entry.oid,
+            tree: entry.tree,
+            parents,
+            generation: entry.generation,
+            commit_time: entry.commit_time,
+            bloom_filter,
+        });
+    }
+    Ok(entries)
+}
+
+fn commit_graph_has_chunk(graph: &CommitGraph, id: [u8; 4]) -> bool {
+    graph.chunks.iter().any(|chunk| chunk.id == id)
+}
+
+fn expire_split_commit_graphs(
+    graphs: &Path,
+    chain: &[ObjectId],
+    expire_time: Option<i64>,
+) -> Result<()> {
+    let expire_time = expire_time.unwrap_or_else(current_unix_seconds);
+    let keep = chain
+        .iter()
+        .map(|hash| format!("graph-{hash}.graph"))
+        .collect::<HashSet<_>>();
+    let Ok(entries) = fs::read_dir(graphs) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".graph") || keep.contains(name) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(i64::MIN);
+        if modified <= expire_time {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn remove_split_commit_graphs(object_dir: &Path) -> Result<()> {
+    let graphs = object_dir.join("info").join("commit-graphs");
+    let chain = graphs.join("commit-graph-chain");
+    let _ = fs::remove_file(chain);
+    let Ok(entries) = fs::read_dir(&graphs) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("graph") {
+            let _ = fs::remove_file(path);
+        }
     }
     Ok(())
 }
@@ -5547,7 +5876,7 @@ fn write_reachable_commit_graph(
     write_generation_data: bool,
     max_new_filters: Option<usize>,
     existing_filters: &HashMap<ObjectId, Vec<u8>>,
-    split: CommitGraphSplitMode,
+    split: CommitGraphSplitOptions,
     progress: bool,
 ) -> Result<()> {
     let graph = commit_graph_for_reachable_refs(
@@ -5563,8 +5892,9 @@ fn write_reachable_commit_graph(
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    if split == CommitGraphSplitMode::Off {
+    if split.mode == CommitGraphSplitMode::Off {
         write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+        remove_split_commit_graphs(object_dir)?;
     } else {
         write_split_commit_graph_file(object_dir, format, &graph, split)?;
     }

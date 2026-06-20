@@ -11,6 +11,7 @@
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1198,6 +1199,73 @@ impl CommitGraph {
         write_commit_graph_chunks(format, 0, &chunks)
     }
 
+    /// Write an incremental commit-graph layer.
+    ///
+    /// `base_graphs` are the chain layer ids, base first, and `base_oids` are
+    /// the commit ids from those base layers in graph-position order. Parent
+    /// positions in this layer are encoded against `base_oids + entries`, which
+    /// matches Git's split commit-graph addressing model.
+    pub fn write_with_base_options(
+        format: ObjectFormat,
+        entries: &[CommitGraphWriteEntry],
+        bloom_settings: CommitGraphBloomSettings,
+        write_generation_data: bool,
+        base_graphs: &[ObjectId],
+        base_oids: &[ObjectId],
+    ) -> Result<Vec<u8>> {
+        validate_commit_graph_bloom_settings(bloom_settings)?;
+        if base_graphs.len() > u8::MAX as usize {
+            return Err(GitError::InvalidFormat(
+                "too many commit-graph base layers".into(),
+            ));
+        }
+        for oid in base_graphs.iter().chain(base_oids.iter()) {
+            if oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "commit-graph base format does not match graph format".into(),
+                ));
+            }
+        }
+        let mut entries = entries.to_vec();
+        entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+        validate_commit_graph_write_entries(format, &entries)?;
+        let object_ids = entries.iter().map(|entry| entry.oid).collect::<Vec<_>>();
+        let parent_positions = commit_graph_parent_positions(&entries, base_oids)?;
+        let (cdat, edge) = write_commit_graph_commit_data_with_positions(&entries, &parent_positions)?;
+        let mut chunks = vec![
+            (*b"OIDF", write_commit_graph_fanout(&object_ids)?),
+            (*b"OIDL", write_commit_graph_oid_lookup(&object_ids)),
+            (*b"CDAT", cdat),
+        ];
+        if write_generation_data {
+            if base_oids.is_empty() {
+                chunks.push((*b"GDA2", write_commit_graph_generation_data(&entries)?));
+                let gdo2 = write_commit_graph_generation_overflow(&entries)?;
+                if !gdo2.is_empty() {
+                    chunks.push((*b"GDO2", gdo2));
+                }
+            } else {
+                chunks.push((*b"GDA2", vec![0; entries.len() * 4]));
+            }
+        }
+        if !edge.is_empty() {
+            chunks.push((*b"EDGE", edge));
+        }
+        let bloom = write_commit_graph_bloom_filters(&entries, bloom_settings);
+        if let Some((bidx, bdat)) = bloom {
+            chunks.push((*b"BIDX", bidx));
+            chunks.push((*b"BDAT", bdat));
+        }
+        if !base_graphs.is_empty() {
+            let mut base = Vec::with_capacity(base_graphs.len() * format.raw_len());
+            for oid in base_graphs {
+                base.extend_from_slice(oid.as_bytes());
+            }
+            chunks.push((*b"BASE", base));
+        }
+        write_commit_graph_chunks(format, base_graphs.len() as u8, &chunks)
+    }
+
     pub fn parse(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 8 + 12 + hash_len {
@@ -1310,7 +1378,8 @@ impl CommitGraph {
 
         let (fanout, commit_count) = parse_commit_graph_fanout(bytes, &chunks)?;
         let oids = parse_commit_graph_oids(bytes, &chunks, format, commit_count, &fanout)?;
-        let mut commits = parse_commit_graph_commit_data(bytes, &chunks, format, oids)?;
+        let mut commits =
+            parse_commit_graph_commit_data(bytes, &chunks, format, oids, base_graph_count)?;
         apply_commit_graph_generation_data(bytes, &chunks, &mut commits)?;
         let bloom_filters = parse_commit_graph_bloom_filters(bytes, &chunks, commits.len())?;
         let base_graphs =
@@ -1450,6 +1519,41 @@ fn write_commit_graph_oid_lookup(object_ids: &[ObjectId]) -> Vec<u8> {
 }
 
 fn write_commit_graph_commit_data(entries: &[CommitGraphWriteEntry]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let parent_positions = commit_graph_parent_positions(entries, &[])?;
+    write_commit_graph_commit_data_with_positions(entries, &parent_positions)
+}
+
+fn commit_graph_parent_positions(
+    entries: &[CommitGraphWriteEntry],
+    base_oids: &[ObjectId],
+) -> Result<HashMap<ObjectId, u32>> {
+    let mut positions = HashMap::with_capacity(base_oids.len() + entries.len());
+    for (idx, oid) in base_oids.iter().enumerate() {
+        let idx = u32::try_from(idx)
+            .map_err(|_| GitError::InvalidFormat("commit-graph base position overflow".into()))?;
+        positions.entry(*oid).or_insert(idx);
+    }
+    let base_len = u32::try_from(base_oids.len())
+        .map_err(|_| GitError::InvalidFormat("commit-graph base position overflow".into()))?;
+    for (idx, entry) in entries.iter().enumerate() {
+        let idx = u32::try_from(idx)
+            .map_err(|_| GitError::InvalidFormat("commit-graph position overflow".into()))?;
+        let pos = base_len
+            .checked_add(idx)
+            .ok_or_else(|| GitError::InvalidFormat("commit-graph position overflow".into()))?;
+        if positions.insert(entry.oid, pos).is_some() {
+            return Err(GitError::InvalidFormat(
+                "commit-graph contains duplicate object ids".into(),
+            ));
+        }
+    }
+    Ok(positions)
+}
+
+fn write_commit_graph_commit_data_with_positions(
+    entries: &[CommitGraphWriteEntry],
+    parent_positions_by_oid: &HashMap<ObjectId, u32>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut cdat = Vec::new();
     let mut edge = Vec::new();
     for entry in entries {
@@ -1458,14 +1562,11 @@ fn write_commit_graph_commit_data(entries: &[CommitGraphWriteEntry]) -> Result<(
             .parents
             .iter()
             .map(|parent| {
-                entries
-                    .binary_search_by(|entry| entry.oid.as_bytes().cmp(parent.as_bytes()))
-                    .map(|idx| idx as u32)
-                    .map_err(|_| {
-                        GitError::InvalidFormat(format!(
-                            "commit-graph parent {parent} is missing from graph"
-                        ))
-                    })
+                parent_positions_by_oid.get(parent).copied().ok_or_else(|| {
+                    GitError::InvalidFormat(format!(
+                        "commit-graph parent {parent} is missing from graph"
+                    ))
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let first_parent = parent_positions
@@ -1866,6 +1967,7 @@ fn parse_commit_graph_commit_data(
     chunks: &[CommitGraphChunk],
     format: ObjectFormat,
     oids: Vec<ObjectId>,
+    base_graph_count: u8,
 ) -> Result<Vec<CommitGraphEntry>> {
     let data = commit_graph_chunk_data(bytes, chunks, *b"CDAT", true)?
         .ok_or_else(|| GitError::InvalidFormat("commit-graph missing CDAT chunk".into()))?;
@@ -1892,6 +1994,11 @@ fn parse_commit_graph_commit_data(
     }
 
     let commit_count = oids.len();
+    let parent_limit = if base_graph_count == 0 {
+        commit_count
+    } else {
+        usize::MAX
+    };
     let mut entries = Vec::with_capacity(commit_count);
     for (idx, oid) in oids.into_iter().enumerate() {
         let start = idx * entry_len;
@@ -1903,7 +2010,7 @@ fn parse_commit_graph_commit_data(
         let time_low = u32_be(&data[start + format.raw_len() + 12..start + entry_len]);
         let generation = generation_and_time_high >> 2;
         let commit_time = (u64::from(generation_and_time_high & 0x3) << 32) | u64::from(time_low);
-        let parents = commit_graph_parents(parent_one, parent_two, extra_edges, commit_count)?;
+        let parents = commit_graph_parents(parent_one, parent_two, extra_edges, parent_limit)?;
         entries.push(CommitGraphEntry {
             oid,
             tree,
@@ -2054,18 +2161,18 @@ fn commit_graph_parents(
     parent_one: u32,
     parent_two: u32,
     extra_edges: Option<&[u8]>,
-    commit_count: usize,
+    parent_limit: usize,
 ) -> Result<Vec<u32>> {
     let mut parents = Vec::new();
     if parent_one != COMMIT_GRAPH_PARENT_NONE {
-        validate_commit_graph_parent_position(parent_one, commit_count)?;
+        validate_commit_graph_parent_position(parent_one, parent_limit)?;
         parents.push(parent_one);
     }
     if parent_two == COMMIT_GRAPH_PARENT_NONE {
         return Ok(parents);
     }
     if parent_two & COMMIT_GRAPH_EXTRA_EDGE == 0 {
-        validate_commit_graph_parent_position(parent_two, commit_count)?;
+        validate_commit_graph_parent_position(parent_two, parent_limit)?;
         parents.push(parent_two);
         return Ok(parents);
     }
@@ -2090,7 +2197,7 @@ fn commit_graph_parents(
         }
         let edge = u32_be(&extra_edges[start..end]);
         let parent = edge & COMMIT_GRAPH_EXTRA_EDGE_MASK;
-        validate_commit_graph_parent_position(parent, commit_count)?;
+        validate_commit_graph_parent_position(parent, parent_limit)?;
         parents.push(parent);
         if edge & COMMIT_GRAPH_EXTRA_EDGE != 0 {
             return Ok(parents);
