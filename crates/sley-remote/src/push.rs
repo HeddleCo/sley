@@ -1415,7 +1415,7 @@ fn receive_pack_push_options(
 /// forced (the global `force` flag or the refspec's own `+`). Each refspec is
 /// normalized then planned independently so per-refspec force is preserved,
 /// matching the CLI.
-fn plan_push_command_forces(
+pub(crate) fn plan_push_command_forces(
     format: ObjectFormat,
     local_refs: &[PushSourceRef],
     remote_refs: &[RefAdvertisement],
@@ -1501,7 +1501,7 @@ fn push_command_source_name(refspec: &RefSpec, command: &ReceivePackCommand) -> 
     Some(format!("{src_prefix}{stem}{src_suffix}"))
 }
 
-fn add_revision_push_sources(
+pub(crate) fn add_revision_push_sources(
     git_dir: &Path,
     format: ObjectFormat,
     refspecs: &[String],

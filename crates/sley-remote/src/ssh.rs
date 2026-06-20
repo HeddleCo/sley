@@ -33,8 +33,8 @@ use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
-    build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
-    parse_upload_pack_features, plan_push_commands, read_receive_pack_report_status,
+    build_receive_pack_push_request, parse_receive_pack_features, parse_upload_pack_features,
+    read_receive_pack_report_status,
     read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
     read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
@@ -313,6 +313,7 @@ fn spawn_service_process(
     process
         .args(&command.args)
         .envs(command.env)
+        .env_remove("GIT_EXEC_PATH")
         .stdin(if keep_stdin || command.git_request.is_some() {
             Stdio::piped()
         } else {
@@ -436,22 +437,15 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
     }
 
     let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = crate::push::local_push_source_refs(&local_store, format)?;
-    let parsed_refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(&crate::push::normalize_push_refspec(refspec)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut command_forces = Vec::new();
-    for refspec in &parsed_refspecs {
-        for command in plan_push_commands(
-            format,
-            &local_refs,
-            &advertisement_set.refs,
-            std::slice::from_ref(refspec),
-        )? {
-            command_forces.push((command, force || refspec.force));
-        }
-    }
+    let mut local_refs = crate::push::local_push_source_refs(&local_store, format)?;
+    crate::push::add_revision_push_sources(git_dir, format, refspecs, &mut local_refs);
+    let command_forces = crate::push::plan_push_command_forces(
+        format,
+        &local_refs,
+        &advertisement_set.refs,
+        refspecs,
+        force,
+    )?;
     let commands = command_forces
         .iter()
         .map(|(command, _)| command.clone())
