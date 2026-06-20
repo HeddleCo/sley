@@ -16,6 +16,7 @@ sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
+sley-pathspec = { path = "../sley-pathspec" }
 sley-worktree = { path = "../sley-worktree" }
 
 [lints]

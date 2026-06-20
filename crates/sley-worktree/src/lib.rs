@@ -10480,6 +10480,10 @@ impl TreeAttributes {
         apply_smudge_filter_with_attributes(config, &checks, path, content)
     }
 
+    pub fn attributes_for_path(&self, path: &[u8], requested: &[Vec<u8>]) -> Vec<AttributeCheck> {
+        self.matcher.attributes_for_path(path, requested, false)
+    }
+
     /// True when `path` has the `export-subst` attribute set (git's
     /// `check_attr_export_subst`), meaning `git archive` should run
     /// `$Format:…$` keyword substitution on its content.

@@ -1112,6 +1112,7 @@ dependencies = [
  "sley-formats",
  "sley-object",
  "sley-odb",
+ "sley-pathspec",
  "sley-worktree",
 ]
 
