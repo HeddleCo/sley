@@ -15,6 +15,7 @@ name = "sley"
 path = "src/main.rs"
 
 [dependencies]
+encoding_rs = "0.8"
 sley-archive = { path = "../sley-archive" }
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
