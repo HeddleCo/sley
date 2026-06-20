@@ -588,6 +588,7 @@ fn replay_one_commit_to(
             committer: commit_identity_from_env("COMMITTER")?,
             message,
             encoding: commit.encoding.clone(),
+            signature: None,
         },
     )
 }
@@ -2299,6 +2300,7 @@ fn commit_and_advance_head(
             committer: committer.clone(),
             message: message.to_vec(),
             encoding: None,
+            signature: None,
         },
     )?;
     let refs = ctx.refs();

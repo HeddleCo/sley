@@ -150,6 +150,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut interactive = false;
     let mut patch = false;
     let mut gpg_sign = false;
+    let mut gpg_sign_key: Option<String> = None;
+    let mut no_gpg_sign = false;
     let mut unified_context: Option<i64> = None;
     let mut inter_hunk_context: Option<i64> = None;
     let mut pathspec_from_file = None;
@@ -399,14 +401,26 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             value if value.starts_with("--verify=") => {
                 return commit_option_takes_no_value_error("no-no-verify");
             }
-            "-S" | "--gpg-sign" => gpg_sign = true,
+            "-S" | "--gpg-sign" => {
+                gpg_sign = true;
+                gpg_sign_key = None;
+                no_gpg_sign = false;
+            }
             value if value.starts_with("-S") && value.len() > 2 => {
                 gpg_sign = true;
+                gpg_sign_key = Some(value[2..].to_string());
+                no_gpg_sign = false;
             }
             value if value.starts_with("--gpg-sign=") => {
                 gpg_sign = true;
+                gpg_sign_key = Some(value["--gpg-sign=".len()..].to_string());
+                no_gpg_sign = false;
             }
-            "--no-gpg-sign" => gpg_sign = false,
+            "--no-gpg-sign" => {
+                gpg_sign = false;
+                gpg_sign_key = None;
+                no_gpg_sign = true;
+            }
             value if value.starts_with("--no-gpg-sign=") => {
                 return commit_option_takes_no_value_error("no-gpg-sign");
             }
@@ -823,7 +837,6 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if dry_run {
         return cmd_commit_long_status_preview(amend, commit_untracked);
     }
-    let _ = gpg_sign;
     if interactive {
         return Err(GitError::Unsupported(
             "commit interactive patch selection is not implemented".into(),
@@ -847,6 +860,12 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let repo_config = read_repo_config(&git_dir).ok();
+    if !gpg_sign && !no_gpg_sign {
+        gpg_sign = repo_config
+            .as_ref()
+            .and_then(|config| config.get_bool("commit", None, "gpgsign"))
+            .unwrap_or(false);
+    }
     if template_file.is_none()
         && file_message.is_none()
         && message_chunks.is_empty()
@@ -1335,12 +1354,52 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         Some((author.clone(), committer.clone(), message.clone()))
     };
+    let signature = if gpg_sign {
+        let signed_tree = if let Some(tree) = fixup_reword_tree.as_ref() {
+            *tree
+        } else if let Some(tree) = precomputed_index_tree.as_ref() {
+            *tree
+        } else {
+            sley_worktree::write_tree_from_index(&git_dir, format)?
+        };
+        let signed_parents = if amend {
+            amended_commit
+                .as_ref()
+                .map(|commit| commit.parents.clone())
+                .unwrap_or_default()
+        } else {
+            head_commit_oid(&FileRefStore::new(&git_dir, format))?
+                .into_iter()
+                .collect()
+        };
+        let unsigned = Commit {
+            tree: signed_tree,
+            parents: signed_parents,
+            author: author.clone(),
+            committer: committer.clone(),
+            encoding: commit_encoding_header.clone(),
+            message: message.clone(),
+        };
+        let key = commands::signing::signing_key(
+            repo_config.as_ref(),
+            gpg_sign_key.as_deref(),
+            &committer,
+        );
+        Some(commands::signing::sign_payload(
+            repo_config.as_ref(),
+            &unsigned.write(),
+            key.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let options = sley_sequencer::CommitIndexOptions {
         author,
         committer,
         reflog_message: commit_reflog_message(&message, amend),
         message,
         encoding: commit_encoding_header,
+        signature,
     };
     let result = if amend {
         sley_sequencer::amend_index(&git_dir, format, options)
@@ -1644,6 +1703,7 @@ fn conclude_replay_via_commit(
             committer: committer.clone(),
             message: message.clone(),
             encoding: None,
+            signature: None,
         },
     )?;
     let target_ref = match refs.read_ref("HEAD")? {
@@ -1720,6 +1780,7 @@ fn commit_partial_paths(
             committer: committer.clone(),
             message: message.clone(),
             encoding: None,
+            signature: None,
         },
     )?;
     let target_ref = match refs.read_ref("HEAD")? {

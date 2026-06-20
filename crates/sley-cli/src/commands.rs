@@ -70,6 +70,7 @@ pub(crate) mod reset;
 pub(crate) mod rev_list;
 pub(crate) mod rev_parse;
 pub(crate) mod shortlog;
+pub(crate) mod signing;
 pub(crate) mod show;
 pub(crate) mod show_branch;
 pub(crate) mod sparse_checkout;

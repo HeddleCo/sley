@@ -333,6 +333,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     date_mode,
                     source_oid: None,
                     describe: Some(&describe_ctx),
+                signature: None,
                     color: false,
                     output_encoding,
                     mailmap: &mailmap,

@@ -206,9 +206,7 @@ fn verify_one_tag(repo: &RepositoryContext, tag: &str, options: &VerifyTagOption
         return Ok(false);
     }
 
-    // Locate the trailing PGP signature, if any, the way git's signature parser
-    // does: an armor `-----BEGIN ... -----` marker at the start of a line.
-    match tag_signature_offset(&object.body) {
+    match commands::signing::tag_signature_payload(&object.body) {
         None => {
             // An unsigned annotated tag: git echoes the entire raw body under -v,
             // then reports the missing signature on stderr and exits non-zero.
@@ -219,20 +217,19 @@ fn verify_one_tag(repo: &RepositoryContext, tag: &str, options: &VerifyTagOption
             eprintln!("error: no signature found");
             Ok(false)
         }
-        Some(signature_start) => {
-            // sley's tag command writes deterministic in-process signatures for
-            // parity tests. Validate those when present; otherwise treat a
-            // syntactically signed tag as verified because there is no external
-            // GPG backend in this implementation.
+        Some((payload, signature)) => {
             if options.verbose {
-                io::stdout().write_all(&object.body[..signature_start])?;
+                io::stdout().write_all(payload)?;
                 io::stdout().flush()?;
             }
-            let _ = &options.raw;
-            if !tag_signature_is_valid(repo.format(), &object.body)? {
-                return Ok(false);
+            let verification =
+                commands::signing::verify_payload(repo.git_dir(), Some(repo.config()), payload, signature)?;
+            if options.raw {
+                io::stderr().write_all(&verification.status_output)?;
+            } else {
+                io::stderr().write_all(&verification.human_output)?;
             }
-            if env::var_os("GNUPGHOME").is_some_and(|home| !Path::new(&home).exists()) {
+            if !verification.success {
                 return Ok(false);
             }
             if let Some(format) = &options.format {
@@ -261,6 +258,10 @@ fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
 }
 
 fn write_verify_tag_format(format: &str, body: &[u8]) -> Result<()> {
+    if format.contains("%(rest)") {
+        eprintln!("fatal: unknown field name: rest");
+        return Err(GitError::Exit(128));
+    }
     let format = format.replace("%(tag)", &verify_tag_name(body));
     println!("{format}");
     Ok(())

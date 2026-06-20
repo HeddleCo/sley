@@ -84,6 +84,7 @@ struct RebaseArgs {
     strategy: Option<String>,
     strategy_opts: Vec<String>,
     gpg_sign: Option<String>,
+    no_gpg_sign: bool,
     positional: Vec<String>,
     total_args: usize,
     recurse_submodules: bool,
@@ -132,6 +133,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         strategy: None,
         strategy_opts: Vec::new(),
         gpg_sign: None,
+        no_gpg_sign: false,
         positional: Vec::new(),
         total_args: args.len(),
         recurse_submodules: false,
@@ -262,14 +264,22 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             "--no-verify" => out.no_verify = true,
             "--verify" => out.no_verify = false,
-            "-S" | "--gpg-sign" => out.gpg_sign = Some(String::new()),
+            "-S" | "--gpg-sign" => {
+                out.gpg_sign = Some(String::new());
+                out.no_gpg_sign = false;
+            }
             _ if arg.starts_with("-S") && arg.len() > 2 => {
                 out.gpg_sign = Some(arg[2..].to_string());
+                out.no_gpg_sign = false;
             }
             _ if arg.starts_with("--gpg-sign=") => {
                 out.gpg_sign = Some(arg["--gpg-sign=".len()..].to_string());
+                out.no_gpg_sign = false;
             }
-            "--no-gpg-sign" => out.gpg_sign = None,
+            "--no-gpg-sign" => {
+                out.gpg_sign = None;
+                out.no_gpg_sign = true;
+            }
             "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
             "--allow-empty-message" => {}
             "--committer-date-is-author-date" => {
@@ -457,6 +467,7 @@ struct MachineOpts {
     committer_date_is_author_date: bool,
     ignore_date: bool,
     gpg_sign: Option<String>,
+    no_gpg_sign: bool,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
     head_name: Option<String>,
@@ -513,6 +524,9 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         };
         fs::write(dir.join("gpg_sign_opt"), format!("{opt}\n"))?;
     }
+    if opts.no_gpg_sign {
+        fs::write(dir.join("no_gpg_sign"), b"")?;
+    }
     if let Some(strategy) = &opts.strategy {
         fs::write(dir.join("strategy"), format!("{strategy}\n"))?;
     }
@@ -558,6 +572,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         committer_date_is_author_date: exists("cdate_is_adate"),
         ignore_date: exists("ignore_date"),
         gpg_sign,
+        no_gpg_sign: exists("no_gpg_sign"),
         strategy,
         strategy_opts,
         head_name: if head_name.starts_with("refs/") {
@@ -1312,6 +1327,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         committer_date_is_author_date: args.committer_date_is_author_date,
         ignore_date: args.ignore_date,
         gpg_sign: args.gpg_sign.clone(),
+        no_gpg_sign: args.no_gpg_sign,
         strategy: args.strategy.clone(),
         strategy_opts: args.strategy_opts.clone(),
         head_name: head_name.clone(),
@@ -1799,8 +1815,48 @@ fn create_squash_onto(ctx: &Ctx) -> Result<ObjectId> {
             committer: ident,
             message: Vec::new(),
             encoding: None,
+            signature: None,
         },
     )
+}
+
+fn rebase_commit_signature(
+    ctx: &Ctx,
+    opts: &MachineOpts,
+    tree: ObjectId,
+    parents: &[ObjectId],
+    author: &[u8],
+    committer: &[u8],
+    message: &[u8],
+    encoding: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let config = read_repo_config(&ctx.common_git_dir).ok();
+    let sign = if opts.no_gpg_sign {
+        false
+    } else {
+        opts.gpg_sign.is_some()
+            || config
+                .as_ref()
+                .and_then(|config| config.get_bool("commit", None, "gpgsign"))
+                .unwrap_or(false)
+    };
+    if !sign {
+        return Ok(None);
+    }
+    let unsigned = Commit {
+        tree,
+        parents: parents.to_vec(),
+        author: author.to_vec(),
+        committer: committer.to_vec(),
+        encoding,
+        message: message.to_vec(),
+    };
+    let key = commands::signing::signing_key(
+        config.as_ref(),
+        opts.gpg_sign.as_deref(),
+        committer,
+    );
+    commands::signing::sign_payload(config.as_ref(), &unsigned.write(), key.as_deref()).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -3551,6 +3607,7 @@ fn create_merge_commit_from_index(
             committer: committer.clone(),
             message: strip_comment_lines(message, comment_char(&ctx.git_dir)),
             encoding: None,
+            signature: None,
         },
     )?;
     let subject = commit_subject(message);
@@ -4621,6 +4678,17 @@ fn machine_commit(
     } else {
         commit_identity_from_env("COMMITTER")?
     };
+    let encoding = commit_encoding_header_from_config(&ctx.git_dir);
+    let signature = rebase_commit_signature(
+        ctx,
+        opts,
+        tree,
+        &parents,
+        &author,
+        &committer,
+        &message,
+        encoding.clone(),
+    )?;
     let mut writer = ctx.db();
     let new_oid = sley_sequencer::create_commit(
         &mut writer,
@@ -4630,7 +4698,8 @@ fn machine_commit(
             author,
             committer: committer.clone(),
             message: message.clone(),
-            encoding: commit_encoding_header_from_config(&ctx.git_dir),
+            encoding,
+            signature,
         },
     )?;
 

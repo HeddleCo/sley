@@ -84,10 +84,21 @@ fn merge_commit_and_advance(
     other_oid: &ObjectId,
     tree: ObjectId,
     message: Vec<u8>,
+    options: &MergeOptions,
 ) -> Result<ObjectId> {
     commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let signature = merge_commit_signature(
+        git_dir,
+        format,
+        tree,
+        vec![*head_oid, *other_oid],
+        &author,
+        &committer,
+        &message,
+        options,
+    )?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
     let oid = sley_sequencer::create_commit(
         &mut db,
@@ -98,6 +109,7 @@ fn merge_commit_and_advance(
             committer: committer.clone(),
             message,
             encoding: None,
+            signature,
         },
     )?;
     let target_ref = match refs.read_ref("HEAD")? {
@@ -135,10 +147,21 @@ fn merge_ours_commit_and_advance(
     tree: ObjectId,
     target_label: &str,
     message: Vec<u8>,
+    options: &MergeOptions,
 ) -> Result<ObjectId> {
     commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let signature = merge_commit_signature(
+        git_dir,
+        format,
+        tree,
+        vec![*head_oid, *other_oid],
+        &author,
+        &committer,
+        &message,
+        options,
+    )?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
     let oid = sley_sequencer::create_commit(
         &mut db,
@@ -149,6 +172,7 @@ fn merge_ours_commit_and_advance(
             committer: committer.clone(),
             message,
             encoding: None,
+            signature,
         },
     )?;
     let target_ref = match refs.read_ref("HEAD")? {
@@ -171,6 +195,33 @@ fn merge_ours_commit_and_advance(
     tx.commit()?;
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     Ok(oid)
+}
+
+fn merge_commit_signature(
+    git_dir: &Path,
+    format: ObjectFormat,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    author: &[u8],
+    committer: &[u8],
+    message: &[u8],
+    options: &MergeOptions,
+) -> Result<Option<Vec<u8>>> {
+    if !options.gpg_sign {
+        return Ok(None);
+    }
+    let config = read_repo_config(git_dir).ok();
+    let unsigned = Commit {
+        tree,
+        parents,
+        author: author.to_vec(),
+        committer: committer.to_vec(),
+        encoding: None,
+        message: message.to_vec(),
+    };
+    let key =
+        commands::signing::signing_key(config.as_ref(), options.gpg_sign_key.as_deref(), committer);
+    commands::signing::sign_payload(config.as_ref(), &unsigned.write(), key.as_deref()).map(Some)
 }
 
 /// True when `ancestor` is reachable from `of` (an ancestor of, or equal to,
@@ -560,6 +611,7 @@ fn merge_octopus(
             committer: committer.clone(),
             message: prepare_merge_commit_message(git_dir, &message, options)?,
             encoding: None,
+            signature: None,
         },
     )?;
     let target_ref = match refs.read_ref("HEAD")? {
@@ -1127,6 +1179,8 @@ struct MergeOptions {
     recurse_submodules: bool,
     /// `--rerere-autoupdate` / `--no-rerere-autoupdate`.
     rerere_autoupdate: Option<bool>,
+    gpg_sign: bool,
+    gpg_sign_key: Option<String>,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -1161,6 +1215,8 @@ impl Default for MergeOptions {
             into_name: None,
             recurse_submodules: false,
             rerere_autoupdate: None,
+            gpg_sign: false,
+            gpg_sign_key: None,
         }
     }
 }
@@ -2328,6 +2384,22 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--no-allow-unrelated-histories" => options.allow_unrelated_histories = false,
             "-q" | "--quiet" => options.quiet = true,
             "--no-quiet" => options.quiet = false,
+            "-S" | "--gpg-sign" => {
+                options.gpg_sign = true;
+                options.gpg_sign_key = None;
+            }
+            value if value.starts_with("-S") && value.len() > 2 => {
+                options.gpg_sign = true;
+                options.gpg_sign_key = Some(value[2..].to_string());
+            }
+            value if value.starts_with("--gpg-sign=") => {
+                options.gpg_sign = true;
+                options.gpg_sign_key = Some(value["--gpg-sign=".len()..].to_string());
+            }
+            "--no-gpg-sign" => {
+                options.gpg_sign = false;
+                options.gpg_sign_key = None;
+            }
             "-m" | "--message" => {
                 options.message = Some(
                     iter.next()
@@ -2796,6 +2868,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             head_tree,
             &target,
             prepare_merge_commit_message(&git_dir, &message, &options)?,
+            &options,
         )?;
         reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
@@ -3114,6 +3187,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             &other_oid,
             merged_tree,
             prepare_merge_commit_message(&git_dir, &message, &options)?,
+            &options,
         )?;
         if options.edit == Some(true) {
             clear_in_progress_merge_state(&git_dir);
@@ -3942,6 +4016,7 @@ pub(crate) fn conclude_in_progress_merge(
             committer: committer.clone(),
             message: message.clone(),
             encoding: None,
+            signature: None,
         },
     )?;
     update_merge_head_ref(
@@ -4063,6 +4138,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
             committer: committer.clone(),
             message: message.clone(),
             encoding: None,
+            signature: None,
         },
     )?;
     update_detached_head_at(

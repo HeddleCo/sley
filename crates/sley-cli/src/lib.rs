@@ -8896,6 +8896,7 @@ struct LogFormatContext<'a> {
     source_oid: Option<&'a HashMap<ObjectId, String>>,
     /// `git_dir`/db/format for placeholders that need object access (`%(describe)`).
     describe: Option<&'a LogDescribeContext<'a>>,
+    signature: Option<&'a LogSignatureContext<'a>>,
     /// `--color=always`: emit ANSI sequences for `%C(...)`.
     color: bool,
     /// Desired log output encoding (git's `get_log_output_encoding`).
@@ -8914,6 +8915,12 @@ struct LogDescribeContext<'a> {
     git_dir: &'a Path,
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
+}
+
+struct LogSignatureContext<'a> {
+    git_dir: &'a Path,
+    db: &'a FileObjectDatabase,
+    config: &'a GitConfig,
 }
 
 fn print_log_format(
@@ -8960,6 +8967,7 @@ pub(crate) fn format_subst_for_commit(
         date_mode: &date_mode,
         source_oid: None,
         describe: None,
+        signature: None,
         color: false,
         output_encoding: "UTF-8",
         mailmap: &mailmap,
@@ -9095,6 +9103,7 @@ fn emit_log_one_token(
         date_mode,
         source_oid,
         describe,
+        signature,
         color,
         output_encoding,
         ..
@@ -9192,14 +9201,16 @@ fn emit_log_one_token(
                 )
                 .map_err(io::Error::from)?;
             }
-            FormatToken::GRefname => out.push(b'N'),
-            FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
-            FormatToken::GPlaceholder
+            FormatToken::GRefname
+            | FormatToken::GTrailers
+            | FormatToken::GPlaceholder
             | FormatToken::GSignature
             | FormatToken::GKey
             | FormatToken::GFingerprint
-            | FormatToken::GPassthrough
-            | FormatToken::GDate
+            | FormatToken::GPassthrough => {
+                emit_log_signature_atom(out, token, record, signature)?;
+            }
+            FormatToken::GDate
             | FormatToken::GDateShort
             | FormatToken::GDateIso
             | FormatToken::GDateIsoStrict
@@ -9352,6 +9363,51 @@ fn emit_log_one_token(
         }
     }
     Ok(())
+}
+
+fn emit_log_signature_atom(
+    out: &mut Vec<u8>,
+    token: &FormatToken,
+    record: &sley_rev::CommitRecord,
+    context: Option<&LogSignatureContext<'_>>,
+) -> Result<()> {
+    let verification = log_signature_verification(record, context)?;
+    match token {
+        FormatToken::GRefname => out.push(verification.pretty_code()),
+        FormatToken::GTrailers => out.extend_from_slice(verification.trust.as_bytes()),
+        FormatToken::GPlaceholder => {
+            out.extend_from_slice(&commands::signing::bare_signature_output(&verification));
+        }
+        FormatToken::GSignature => out.extend_from_slice(verification.signer.as_bytes()),
+        FormatToken::GKey => out.extend_from_slice(verification.key.as_bytes()),
+        FormatToken::GFingerprint => out.extend_from_slice(verification.fingerprint.as_bytes()),
+        FormatToken::GPassthrough => {
+            out.extend_from_slice(verification.primary_fingerprint.as_bytes());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn log_signature_verification(
+    record: &sley_rev::CommitRecord,
+    context: Option<&LogSignatureContext<'_>>,
+) -> Result<commands::signing::GpgVerification> {
+    let Some(context) = context else {
+        return Ok(commands::signing::GpgVerification {
+            trust: "undefined".to_string(),
+            ..commands::signing::GpgVerification::default()
+        });
+    };
+    let object = context.db.read_object(&record.oid)?;
+    let Some((payload, signature)) = commands::signing::commit_signature_payload(&object.body)
+    else {
+        return Ok(commands::signing::GpgVerification {
+            trust: "undefined".to_string(),
+            ..commands::signing::GpgVerification::default()
+        });
+    };
+    commands::signing::verify_payload(context.git_dir, Some(context.config), &payload, &signature)
 }
 
 /// Port of utf8.c `strbuf_add_indented_text` (the `width <= 0` wrap fallback):

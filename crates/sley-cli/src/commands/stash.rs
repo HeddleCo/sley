@@ -1886,6 +1886,7 @@ fn create_stash_commit(
             committer: committer.clone(),
             message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
             encoding: None,
+            signature: None,
         },
     )?;
     let untracked_commit = if let Some(tree) = untracked_tree {
@@ -1899,6 +1900,7 @@ fn create_stash_commit(
                 message: format!("untracked files on {branch}: {head_name} {head_subject}\n")
                     .into_bytes(),
                 encoding: None,
+            signature: None,
             },
         )?)
     } else {
@@ -1926,6 +1928,7 @@ fn create_stash_commit(
             committer: committer.clone(),
             message: message.as_bytes().to_vec(),
             encoding: None,
+            signature: None,
         },
     )?;
     Ok(Some(CreatedStash {
@@ -4339,6 +4342,7 @@ fn write_stash_export_chain(
             committer: ident.clone(),
             message: Vec::new(),
             encoding: None,
+            signature: None,
         },
     )?;
     for stash_oid in stash_oids {
@@ -4358,6 +4362,7 @@ fn write_stash_export_chain(
                 committer: stash.committer,
                 message,
                 encoding: stash.encoding,
+                signature: None,
             },
         )?;
     }

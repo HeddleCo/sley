@@ -1066,6 +1066,7 @@ fn commit_notes_update_with_parents(
             committer: identity.committer.clone(),
             message: message.to_vec(),
             encoding: None,
+            signature: None,
         },
     )?;
 
@@ -1455,6 +1456,7 @@ mod tests {
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
                 encoding: None,
+            signature: None,
             },
         )
         .expect("commit");
@@ -1517,6 +1519,7 @@ mod tests {
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
                 encoding: None,
+            signature: None,
             },
         )
         .expect("test operation should succeed");
@@ -1641,6 +1644,7 @@ mod tests {
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
                 encoding: None,
+            signature: None,
             },
         )
         .expect("commit");

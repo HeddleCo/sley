@@ -16,6 +16,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut annotated_explicit = false;
     let mut signed = false;
     let mut sign_explicit = false;
+    let mut signing_key: Option<String> = None;
     let mut force = false;
     let mut delete = false;
     let mut verify = false;
@@ -78,7 +79,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 let Some(value) = iter.next() else {
                     return tag_local_user_requires_value_error("u", true);
                 };
-                validate_tag_signing_key(value)?;
+                signing_key = Some(value.to_string());
                 signed = true;
                 sign_explicit = true;
                 annotated = true;
@@ -87,7 +88,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 let Some(value) = iter.next() else {
                     return tag_local_user_requires_value_error("local-user", false);
                 };
-                validate_tag_signing_key(value)?;
+                signing_key = Some(value.to_string());
                 signed = true;
                 sign_explicit = true;
                 annotated = true;
@@ -379,13 +380,13 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 messages.push(value.as_bytes()["--message=".len()..].to_vec());
             }
             value if value.starts_with("-u") && value.len() > 2 => {
-                validate_tag_signing_key(&value[2..])?;
+                signing_key = Some(value[2..].to_string());
                 signed = true;
                 sign_explicit = true;
                 annotated = true;
             }
             value if value.starts_with("--local-user=") => {
-                validate_tag_signing_key(&value["--local-user=".len()..])?;
+                signing_key = Some(value["--local-user=".len()..].to_string());
                 signed = true;
                 sign_explicit = true;
                 annotated = true;
@@ -550,6 +551,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             ));
         }
         return verify_tags(
+            &git_dir,
             &store,
             &FileObjectDatabase::from_git_dir(&git_dir, format),
             format,
@@ -687,15 +689,17 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         }
         let tagger = commit_identity_from_env("COMMITTER")?;
         if signed {
-            validate_tag_signing_config(&config)?;
+            commands::signing::validate_openpgp_format(Some(&config))?;
+            let key =
+                commands::signing::signing_key(Some(&config), signing_key.as_deref(), &tagger);
             message = sign_tag_message(
-                format,
                 &target_oid,
                 target_object.object_type,
                 tag.as_bytes(),
                 &tagger,
                 message,
-                config.get("gpg", None, "format") == Some("ssh"),
+                Some(&config),
+                key.as_deref(),
             )?;
         }
         let tag_oid = sley_sequencer::create_annotated_tag(
@@ -803,6 +807,7 @@ fn delete_tags(store: &FileRefStore, tags: &[String]) -> Result<()> {
 }
 
 fn verify_tags(
+    git_dir: &Path,
     store: &FileRefStore,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -811,7 +816,7 @@ fn verify_tags(
 ) -> Result<()> {
     let mut failed = false;
     for tag in tags {
-        if !verify_tag(store, db, format, format_spec, tag)? {
+        if !verify_tag(git_dir, store, db, format, format_spec, tag)? {
             failed = true;
         }
     }
@@ -822,6 +827,7 @@ fn verify_tags(
 }
 
 fn verify_tag(
+    git_dir: &Path,
     store: &FileRefStore,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -864,10 +870,16 @@ fn verify_tag(
         eprintln!("error: no signature found");
         return Ok(false);
     }
-    if !tag_signature_is_valid(format, &object.body)? {
+    let Some((payload, signature)) = commands::signing::tag_signature_payload(&object.body) else {
         return Ok(false);
+    };
+    let config = read_repo_config(git_dir).ok();
+    let verification =
+        commands::signing::verify_payload(git_dir, config.as_ref(), payload, signature)?;
+    if format_spec.is_none() {
+        io::stderr().write_all(&verification.human_output)?;
     }
-    if env::var_os("GNUPGHOME").is_some_and(|home| !Path::new(&home).exists()) {
+    if !verification.success {
         return Ok(false);
     }
     if let Some(format_spec) = format_spec {
@@ -966,64 +978,27 @@ fn tag_message_has_signature(message: &[u8]) -> bool {
         .any(|window| window == b"-----BEGIN PGP SIGNATURE-----")
 }
 
-fn validate_tag_signing_key(value: &str) -> Result<()> {
-    match value {
-        "committer@example.com" | "CDDE430D" => Ok(()),
-        value if value.contains('/') || value.contains('\\') => Ok(()),
-        _ => {
-            eprintln!("error: gpg failed to sign the data");
-            Err(GitError::Exit(128))
-        }
-    }
-}
-
-fn validate_tag_signing_config(config: &GitConfig) -> Result<()> {
-    if config
-        .get("user", None, "signingkey")
-        .is_some_and(|key| !matches!(key, "committer@example.com" | "CDDE430D"))
-    {
-        eprintln!("error: gpg failed to sign the data");
-        return Err(GitError::Exit(128));
-    }
-    if config
-        .get("gpg", None, "program")
-        .is_some_and(|program| program == "echo")
-        || config
-            .get("gpg", Some("x509"), "program")
-            .is_some_and(|program| program == "echo")
-    {
-        eprintln!("error: gpg failed to sign the data");
-        return Err(GitError::Exit(128));
-    }
-    Ok(())
-}
-
 fn sign_tag_message(
-    format: ObjectFormat,
     object: &ObjectId,
     object_type: ObjectType,
     name: &[u8],
     tagger: &[u8],
     mut message: Vec<u8>,
-    ssh: bool,
+    config: Option<&GitConfig>,
+    key: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let unsigned = tag_object_body(object.clone(), object_type, name.to_vec(), tagger.to_vec(), message.clone());
-    let signature = sley_core::digest_bytes(format, &unsigned)?.to_hex();
     if !message.is_empty() && !message.ends_with(b"\n") {
         message.push(b'\n');
     }
-    if ssh {
-        message.extend_from_slice(b"-----BEGIN SSH SIGNATURE-----\n");
-    } else {
-        message.extend_from_slice(b"-----BEGIN PGP SIGNATURE-----\n");
-    }
-    message.extend_from_slice(b"sley-signature ");
-    message.extend_from_slice(signature.as_bytes());
-    if ssh {
-        message.extend_from_slice(b"\n-----END SSH SIGNATURE-----\n");
-    } else {
-        message.extend_from_slice(b"\n-----END PGP SIGNATURE-----\n");
-    }
+    let unsigned = tag_object_body(
+        *object,
+        object_type,
+        name.to_vec(),
+        tagger.to_vec(),
+        message.clone(),
+    );
+    let signature = commands::signing::sign_payload(config, &unsigned, key)?;
+    message.extend_from_slice(&signature);
     Ok(message)
 }
 
@@ -1070,6 +1045,10 @@ fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
 }
 
 fn write_tag_verify_format(format_spec: &str, tag: &Tag) -> Result<()> {
+    if format_spec.contains("%(rest)") {
+        eprintln!("fatal: unknown field name: rest");
+        return Err(GitError::Exit(128));
+    }
     let format = ForEachRefFormat::parse(format_spec)?;
     let mut stdout = io::stdout();
     write_for_each_ref_format(&mut stdout, &format, ForEachRefQuoteMode::None, false, |out, atom| {

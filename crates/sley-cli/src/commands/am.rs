@@ -2454,6 +2454,7 @@ fn create_am_commit(
             committer: committer.clone(),
             message,
             encoding: None,
+            signature: None,
         },
     )?;
 

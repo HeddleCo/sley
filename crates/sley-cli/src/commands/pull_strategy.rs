@@ -125,6 +125,7 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
             committer: committer.clone(),
             message: format!("Merge branch '{branch}'\n").into_bytes(),
             encoding: None,
+            signature: None,
         },
     )?;
     let target_ref = match store.read_ref("HEAD")? {

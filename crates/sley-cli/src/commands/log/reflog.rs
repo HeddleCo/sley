@@ -289,6 +289,7 @@ fn emit_compiled_reflog_walk_format(
         date_mode: ctx.date_mode,
         source_oid: None,
         describe: None,
+                signature: None,
         color: false,
         output_encoding: "UTF-8",
         mailmap: ctx.mailmap,

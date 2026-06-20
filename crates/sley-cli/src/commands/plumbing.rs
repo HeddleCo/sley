@@ -8406,6 +8406,8 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let mut tree = None;
     let mut parents = Vec::new();
     let mut message_chunks = Vec::new();
+    let mut gpg_sign = false;
+    let mut gpg_sign_key: Option<String> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -8440,7 +8442,22 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             value if value.starts_with("-F") && value.len() > 2 => {
                 message_chunks.push(read_commit_message_file(&value[2..])?);
             }
-            "--no-gpg-sign" => {}
+            "-S" | "--gpg-sign" => {
+                gpg_sign = true;
+                gpg_sign_key = None;
+            }
+            value if value.starts_with("-S") && value.len() > 2 => {
+                gpg_sign = true;
+                gpg_sign_key = Some(value[2..].to_string());
+            }
+            value if value.starts_with("--gpg-sign=") => {
+                gpg_sign = true;
+                gpg_sign_key = Some(value["--gpg-sign=".len()..].to_string());
+            }
+            "--no-gpg-sign" => {
+                gpg_sign = false;
+                gpg_sign_key = None;
+            }
             value if tree.is_none() => tree = Some(value.to_string()),
             value if !value.starts_with('-') => return commit_tree_requires_one_tree_error(),
             value => {
@@ -8490,6 +8507,29 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     };
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let config = read_repo_config(&git_dir).ok();
+    let signature = if gpg_sign {
+        let unsigned = Commit {
+            tree,
+            parents: parents.clone(),
+            author: author.clone(),
+            committer: committer.clone(),
+            encoding: None,
+            message: message.clone(),
+        };
+        let key = commands::signing::signing_key(
+            config.as_ref(),
+            gpg_sign_key.as_deref(),
+            &committer,
+        );
+        Some(commands::signing::sign_payload(
+            config.as_ref(),
+            &unsigned.write(),
+            key.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let oid = sley_sequencer::create_commit(
         &mut db,
@@ -8500,6 +8540,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             committer,
             message,
             encoding: None,
+            signature,
         },
     )?;
     println!("{oid}");

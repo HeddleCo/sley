@@ -730,6 +730,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut show_root_flag: Option<bool> = None;
     let mut line_prefix: Option<String> = None;
     let mut color_always = false;
+    let mut show_signature: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -948,12 +949,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--no-max-parents" => max_parents = None,
             "--use-mailmap" | "--mailmap" => use_mailmap_explicit = Some(true),
             "--no-use-mailmap" | "--no-mailmap" => use_mailmap_explicit = Some(false),
+            "--show-signature" => show_signature = Some(true),
+            "--no-show-signature" => show_signature = Some(false),
             "-q"
             | "--quiet"
             | "--no-quiet"
             | "--unpacked"
-            | "--show-signature"
-            | "--no-show-signature"
             | "--full-diff"
             | "--relative"
             | "--no-relative"
@@ -1792,6 +1793,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // the lower-case `%an`/… atoms); the upper-case `%aN`/… atoms always map.
     let use_mailmap = use_mailmap_explicit
         .unwrap_or_else(|| config.get_bool("log", None, "mailmap").unwrap_or(true));
+    let show_signature = show_signature.unwrap_or_else(|| {
+        config
+            .get_bool("log", None, "showsignature")
+            .or_else(|| config.get_bool("log", None, "showSignature"))
+            .unwrap_or(false)
+    });
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
     let setup = match sley_rev::setup_revisions(
         &setup_args,
@@ -2379,6 +2386,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     date_mode: &date_mode,
                     source_oid: None,
                     describe: None,
+                    signature: None,
                     color: false,
                     output_encoding: &output_encoding,
                     mailmap: &mailmap,
@@ -2444,6 +2452,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             date_mode: &date_mode,
             source_oid: None,
             describe: None,
+                    signature: None,
             color: false,
             output_encoding: &output_encoding,
             mailmap: &mailmap,
@@ -2794,6 +2803,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         db: &db,
         format,
     };
+    let signature_ctx = LogSignatureContext {
+        git_dir: &git_dir,
+        db: &db,
+        config: &config,
+    };
     // `%S` source labels: each commit is tagged with the start ref from which it
     // is reachable; when several starts reach it, the last one (command-line
     // order) wins — matching git's `revision.c` source naming.
@@ -2867,6 +2881,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         date_mode: &date_mode,
                         source_oid: source_labels.as_ref(),
                         describe: Some(&describe_ctx),
+                        signature: Some(&signature_ctx),
                         color: color_always,
                         output_encoding: &output_encoding,
                         mailmap: &mailmap,
@@ -2961,6 +2976,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     out.write_all(b"\n")?;
                     graph_show_oneline(&mut graph_state, prefix, &mut out)?;
                     let mut msg: Vec<u8> = Vec::new();
+                    if show_signature {
+                        msg.extend_from_slice(&log_signature_human_output(
+                            &git_dir,
+                            &db,
+                            &config,
+                            record,
+                        )?);
+                    }
                     if record.parents.len() > 1 {
                         let merged: Vec<String> =
                             record.parents.iter().map(format_log_abbrev_oid).collect();
@@ -3086,6 +3109,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     writeln!(out)?;
                 }
                 printed_entries += 1;
+                if show_signature {
+                    let signature = log_signature_human_output(&git_dir, &db, &config, record)?;
+                    out.write_all(&signature)?;
+                }
                 write!(
                     out,
                     "commit {}",
@@ -3218,6 +3245,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     date_mode: &date_mode,
                     source_oid: source_labels.as_ref(),
                     describe: Some(&describe_ctx),
+                        signature: Some(&signature_ctx),
                     color: false,
                     output_encoding: &output_encoding,
                     mailmap: &mailmap,
@@ -3541,6 +3569,22 @@ fn print_log_selected_child_oids(
             print!(" {}", format_log_oid(child, abbrev_len));
         }
     }
+}
+
+fn log_signature_human_output(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    record: &sley_rev::CommitRecord,
+) -> Result<Vec<u8>> {
+    let object = db.read_object(&record.oid)?;
+    let Some((payload, signature)) = commands::signing::commit_signature_payload(&object.body)
+    else {
+        return Ok(Vec::new());
+    };
+    let verification =
+        commands::signing::verify_payload(git_dir, Some(config), &payload, &signature)?;
+    Ok(verification.human_output)
 }
 
 fn print_log_format_with_children(

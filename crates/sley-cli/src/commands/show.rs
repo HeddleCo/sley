@@ -36,6 +36,8 @@ enum ShowDiffMode {
 enum ShowCommitFormat {
     /// `medium` (the default): `commit`/`Author:`/`Date:` + indented message.
     Medium,
+    /// `--pretty=short`: `commit`/`Author:` + indented message.
+    Short,
     /// `--oneline`: `<abbrev-oid> <subject>`.
     Oneline,
     /// `--pretty=oneline`/`--format=oneline`: `<full-oid> <subject>`.
@@ -153,6 +155,7 @@ struct ShowOptions {
     indent_heuristic: Option<bool>,
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
+    show_signature: Option<bool>,
 }
 
 struct ShowContext<'a> {
@@ -233,6 +236,7 @@ impl Default for ShowOptions {
             grep_invert: false,
             indent_heuristic: None,
             setup_args: Vec::new(),
+            show_signature: None,
         }
     }
 }
@@ -301,13 +305,21 @@ impl super::grep_args::GrepArgOptions for ShowOptions {
 }
 
 pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
-    let options = parse_show_args(args)?;
+    let mut options = parse_show_args(args)?;
 
     let repo = RepositoryContext::discover_current()?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
+    if options.show_signature.is_none() {
+        options.show_signature = Some(
+            config
+                .get_bool("log", None, "showsignature")
+                .or_else(|| config.get_bool("log", None, "showSignature"))
+                .unwrap_or(false),
+        );
+    }
 
     // Ref decorations feed the `commit`/oneline header and the `%d`/`%D`
     // placeholders. `git show` leaves them off unless `--decorate` is given, but a
@@ -535,6 +547,7 @@ fn show_commit(
     let separator_mode = matches!(
         options.commit_format,
         ShowCommitFormat::Medium
+            | ShowCommitFormat::Short
             | ShowCommitFormat::Custom {
                 final_newline: false,
                 ..
@@ -544,6 +557,7 @@ fn show_commit(
     let blank_before_diff = matches!(
         options.commit_format,
         ShowCommitFormat::Medium
+            | ShowCommitFormat::Short
             | ShowCommitFormat::Custom {
                 final_newline: true,
                 ..
@@ -575,8 +589,12 @@ fn show_commit(
         writeln!(stdout)?;
     }
 
+    if options.show_signature == Some(true) {
+        write_show_signature(stdout, context, oid)?;
+    }
+
     match &options.commit_format {
-        ShowCommitFormat::Medium => {
+        ShowCommitFormat::Medium | ShowCommitFormat::Short => {
             write!(
                 stdout,
                 "commit {}",
@@ -599,11 +617,13 @@ fn show_commit(
                 "Author: {}",
                 commit_identity_mailmapped(&commit.author, use_mailmap.then_some(&mailmap))
             )?;
-            writeln!(
-                stdout,
-                "Date:   {}",
-                commit_identity_date(&commit.author, &options.date_mode)
-            )?;
+            if matches!(options.commit_format, ShowCommitFormat::Medium) {
+                writeln!(
+                    stdout,
+                    "Date:   {}",
+                    commit_identity_date(&commit.author, &options.date_mode)
+                )?;
+            }
             writeln!(stdout)?;
             let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
             for line in commit_message_lines(&display_message) {
@@ -641,6 +661,11 @@ fn show_commit(
             stdout.write_all(b"\n")?;
         }
         ShowCommitFormat::Custom { compiled, .. } => {
+            let signature_ctx = LogSignatureContext {
+                git_dir: context.git_dir,
+                db: context.db,
+                config: context.config,
+            };
             print_log_format(
                 &record,
                 compiled,
@@ -653,6 +678,7 @@ fn show_commit(
                     date_mode: &options.date_mode,
                     source_oid: None,
                     describe: None,
+                    signature: Some(&signature_ctx),
                     mailmap: &mailmap,
                     use_mailmap,
                     color: false,
@@ -742,6 +768,22 @@ fn show_commit_separate_merge(
             &entries,
         )?;
     }
+    Ok(())
+}
+
+fn write_show_signature(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    oid: &ObjectId,
+) -> Result<()> {
+    let object = context.db.read_object(oid)?;
+    let Some((payload, signature)) = commands::signing::commit_signature_payload(&object.body)
+    else {
+        return Ok(());
+    };
+    let verification =
+        commands::signing::verify_payload(context.git_dir, Some(context.config), &payload, &signature)?;
+    stdout.write_all(&verification.human_output)?;
     Ok(())
 }
 
@@ -1576,6 +1618,8 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             }
             "--indent-heuristic" => options.indent_heuristic = Some(true),
             "--no-indent-heuristic" => options.indent_heuristic = Some(false),
+            "--show-signature" => options.show_signature = Some(true),
+            "--no-show-signature" => options.show_signature = Some(false),
             "--no-color"
             | "--color"
             | "--no-prefix"
@@ -1584,8 +1628,7 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             | "--no-ext-diff"
             | "--ext-diff"
             | "--no-textconv"
-            | "--textconv"
-            | "--no-show-signature" => {}
+            | "--textconv" => {}
             "--root" => options.show_root = Some(true),
             "--no-root" => options.show_root = Some(false),
             value if value.starts_with("--color=") => {}
@@ -1647,6 +1690,7 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
     }
     match value {
         "" | "medium" | "default" => Ok(ShowCommitFormat::Medium),
+        "short" => Ok(ShowCommitFormat::Short),
         "oneline" => Ok(ShowCommitFormat::FullOneline),
         // `reference`: `<abbrev-hash> (<subject>, <short-author-date>)`.
         "reference" => Ok(ShowCommitFormat::Custom {
@@ -1655,7 +1699,7 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
         }),
         // Built-in named layouts sley does not yet render. Reject explicitly
         // rather than mis-formatting them as literal text.
-        "short" | "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(
+        "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(
             format!("show does not support --pretty={value}"),
         )),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {

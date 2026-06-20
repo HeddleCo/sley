@@ -1,7 +1,7 @@
 pub mod rebase;
 pub mod replay;
 
-use sley_core::{GitError, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag};
 use sley_odb::FileObjectDatabase;
 use sley_odb::ObjectReader;
@@ -45,6 +45,7 @@ pub struct CommitCreate {
     pub message: Vec<u8>,
     /// `encoding` header value (`i18n.commitEncoding`); `None`/UTF-8 omits it.
     pub encoding: Option<Vec<u8>>,
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub struct CommitIndexOptions {
     pub reflog_message: Vec<u8>,
     /// `encoding` header value (`i18n.commitEncoding`); `None`/UTF-8 omits it.
     pub encoding: Option<Vec<u8>>,
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,7 @@ pub fn create_commit(writer: &mut impl ObjectWriter, commit: CommitCreate) -> Re
             )));
         }
     }
+    let signature = commit.signature;
     let commit = Commit {
         tree: commit.tree,
         parents: commit.parents,
@@ -93,7 +96,43 @@ pub fn create_commit(writer: &mut impl ObjectWriter, commit: CommitCreate) -> Re
         encoding: commit.encoding,
         message: commit.message,
     };
-    writer.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
+    let mut body = commit.write();
+    if let Some(signature) = signature {
+        body = commit_body_with_signature(format, &body, &signature);
+    }
+    writer.write_object(EncodedObject::new(ObjectType::Commit, body))
+}
+
+fn commit_body_with_signature(format: ObjectFormat, body: &[u8], signature: &[u8]) -> Vec<u8> {
+    let Some(split) = body.windows(2).position(|window| window == b"\n\n") else {
+        return body.to_vec();
+    };
+    let mut out = Vec::with_capacity(body.len() + signature.len() + signature.len() / 70 + 16);
+    out.extend_from_slice(&body[..split]);
+    out.push(b'\n');
+    out.extend_from_slice(match format {
+        ObjectFormat::Sha1 => b"gpgsig ",
+        ObjectFormat::Sha256 => b"gpgsig-sha256 ",
+    });
+    append_folded_signature(&mut out, signature);
+    out.extend_from_slice(&body[split + 1..]);
+    out
+}
+
+fn append_folded_signature(out: &mut Vec<u8>, signature: &[u8]) {
+    let mut first = true;
+    let mut lines = signature.split(|byte| *byte == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.is_empty() && lines.peek().is_none() && signature.ends_with(b"\n") {
+            continue;
+        }
+        if !first {
+            out.push(b' ');
+        }
+        out.extend_from_slice(line);
+        out.push(b'\n');
+        first = false;
+    }
 }
 
 pub fn create_annotated_tag(writer: &mut impl ObjectWriter, tag: TagCreate) -> Result<ObjectId> {
@@ -206,6 +245,7 @@ fn commit_tree_with_amend_with_odb(
             committer: options.committer.clone(),
             message: options.message,
             encoding: options.encoding,
+            signature: options.signature,
         },
     )?;
     let expected = parent.map(RefTarget::Direct);
@@ -345,6 +385,7 @@ mod tests {
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 encoding: None,
+            signature: None,
             },
         )
         .expect("test operation should succeed");

@@ -185,26 +185,25 @@ fn verify_one_commit(
         return Ok(false);
     }
 
-    // Detect a signature the way git does: a `gpgsig`/`gpgsig-sha256` header in
-    // the commit object's header block. (`Commit::parse` discards unknown headers,
-    // so the raw body is inspected directly.)
-    if !commit_object_is_signed(&object.body) {
+    let Some((payload, signature)) = commands::signing::commit_signature_payload(&object.body)
+    else {
         // An unsigned commit cannot be verified: git prints nothing — not even
         // under `-v` — and exits non-zero. Reproduce that silence exactly.
         return Ok(false);
-    }
+    };
 
-    // A signed commit: git would echo the signature-stripped payload under `-v`
-    // before running gpg. We can reproduce the payload echo, but cannot perform
-    // signature verification, so report the unsupported operation afterwards.
     if options.verbose {
-        io::stdout().write_all(&commit_payload_without_signature(&object.body))?;
+        io::stdout().write_all(&payload)?;
         io::stdout().flush()?;
     }
-    let _ = options.raw;
-    Err(GitError::Command(
-        "signed commit verification is not implemented".into(),
-    ))
+    let verification =
+        commands::signing::verify_payload(repo.git_dir(), Some(repo.config()), &payload, &signature)?;
+    if options.raw {
+        io::stderr().write_all(&verification.status_output)?;
+    } else {
+        io::stderr().write_all(&verification.human_output)?;
+    }
+    Ok(verification.success)
 }
 
 /// The signature header keys git recognizes on a commit object.

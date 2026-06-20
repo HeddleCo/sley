@@ -723,6 +723,7 @@ fn shortlog_render_format(
         date_mode,
         source_oid: None,
         describe: None,
+                signature: None,
         color: false,
         output_encoding: "UTF-8",
         mailmap,
