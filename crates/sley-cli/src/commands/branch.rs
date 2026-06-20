@@ -7834,7 +7834,7 @@ fn validate_branch_creation_name(branch: &str) -> Result<String> {
 }
 
 fn validate_branch_source_name(branch: &str) -> Result<String> {
-    match branch_ref_name(branch) {
+    match sley_refs::branch_ref_name_for_source(branch) {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
             eprintln!("fatal: invalid branch name: '{branch}'");
@@ -7979,9 +7979,9 @@ fn force_delete_branches(
         let deleted = store.delete_branch(branch)?;
         remove_branch_config(git_dir, branch)?;
         if !quiet {
+            let deleted_display = branch_delete_display(branch, &name, &deleted.oid);
             println!(
-                "Deleted branch {branch} (was {}).",
-                short_oid(&deleted.oid.to_hex())
+                "Deleted branch {branch} (was {deleted_display})."
             );
         }
     }
@@ -8137,9 +8137,9 @@ fn delete_merged_branches(
         let deleted = store.delete_branch(branch)?;
         remove_branch_config(git_dir, branch)?;
         if !quiet {
+            let deleted_display = branch_delete_display(branch, &name, &deleted.oid);
             println!(
-                "Deleted branch {branch} (was {}).",
-                short_oid(&deleted.oid.to_hex())
+                "Deleted branch {branch} (was {deleted_display})."
             );
         }
     }
@@ -8148,6 +8148,16 @@ fn delete_merged_branches(
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn branch_delete_display(branch: &str, refname: &str, oid: &ObjectId) -> String {
+    if sley_refs::validate_ref_name(refname).is_err()
+        && let Some((display, _)) = branch.split_once("...")
+        && !display.is_empty()
+    {
+        return display.to_string();
+    }
+    short_oid(&oid.to_hex()).to_string()
 }
 
 fn branch_delete_reachable_base<'a>(
