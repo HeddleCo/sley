@@ -255,7 +255,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     .is_some();
                 if !is_branch
                     && sley_rev::resolve_revision(&git_dir, format, value).is_err()
-                    && cwd.join(value).exists()
+                    && (cwd.join(value).exists()
+                        || checkout_index_has_path(&git_dir, &worktree_root, &cwd, format, value)?)
                 {
                     if guess {
                         let _ = checkout_dwim_remote_branch(
@@ -761,6 +762,26 @@ fn run_post_checkout_hook(
         ],
     )?;
     Ok(())
+}
+
+fn checkout_index_has_path(
+    git_dir: &Path,
+    worktree_root: &Path,
+    cwd: &Path,
+    format: ObjectFormat,
+    value: &str,
+) -> Result<bool> {
+    let absolute = if Path::new(value).is_absolute() {
+        PathBuf::from(value)
+    } else {
+        cwd.join(value)
+    };
+    let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", absolute.display()))
+    })?;
+    let git_path = relative.to_string_lossy().replace('\\', "/").into_bytes();
+    Ok(sley_worktree::read_repository_index(git_dir, format)?
+        .is_some_and(|index| index.entries.iter().any(|entry| entry.path.as_bytes() == git_path)))
 }
 
 fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflictStyle> {

@@ -5209,7 +5209,8 @@ impl DiffPathspec {
         let mut filters = Vec::new();
         let magic = effective_pathspec_flags();
         for arg in path_args {
-            let element = parse_normalized_pathspec_element(&prefix, arg, magic)?;
+            let parse_arg = normalize_absolute_cli_pathspec(&root, &cwd, arg)?;
+            let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -7473,7 +7474,8 @@ impl LsFilesPathspec {
                 );
                 return Err(GitError::Exit(128));
             }
-            let element = parse_normalized_pathspec_element(&prefix, arg, magic)?;
+            let parse_arg = normalize_absolute_cli_pathspec(&root, &cwd, arg)?;
+            let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
             // Under literal magic, wildcard characters carry no special meaning.
             let is_glob =
                 !element.magic().literal && sley_worktree::pathspec_is_glob(element.pattern());
@@ -7590,6 +7592,25 @@ impl LsFilesPathspec {
         }
         Ok(())
     }
+}
+
+fn normalize_absolute_cli_pathspec(root: &Path, cwd: &Path, arg: &str) -> Result<String> {
+    let path = Path::new(arg);
+    if !path.is_absolute() {
+        return Ok(arg.to_string());
+    }
+    let absolute = fs::canonicalize(path)?;
+    let relative = absolute
+        .strip_prefix(root)
+        .map_err(|_| GitError::InvalidPath(format!("pathspec {arg} is outside worktree")))?;
+    let repo_path = relative.to_string_lossy().replace('\\', "/");
+    if repo_path.is_empty() {
+        return Ok(":/".to_string());
+    }
+    if cwd == root {
+        return Ok(repo_path);
+    }
+    Ok(format!(":(top){repo_path}"))
 }
 
 fn path_component_count(path: &[u8]) -> usize {
