@@ -1,5 +1,5 @@
-//! OpenPGP signing and verification helpers shared by commit, tag, log, and
-//! verify-* commands.
+//! Signing and verification helpers shared by commit, tag, log, and verify-*
+//! commands.
 
 use crate::*;
 use std::process::Stdio;
@@ -38,14 +38,23 @@ impl GpgVerification {
     }
 }
 
-pub(crate) fn validate_openpgp_format(config: Option<&GitConfig>) -> Result<()> {
-    if let Some(value) = config.and_then(|config| config.get("gpg", None, "format"))
-        && value != "openpgp"
-    {
-        eprintln!("fatal: unsupported value for gpg.format: {value}");
-        return Err(GitError::Exit(128));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SigningFormat {
+    OpenPgp,
+    Ssh,
+    X509,
+}
+
+pub(crate) fn signing_format(config: Option<&GitConfig>) -> Result<SigningFormat> {
+    match config.and_then(|config| config.get("gpg", None, "format")) {
+        None | Some("openpgp") => Ok(SigningFormat::OpenPgp),
+        Some("ssh") => Ok(SigningFormat::Ssh),
+        Some("x509") => Ok(SigningFormat::X509),
+        Some(value) => {
+            eprintln!("fatal: unsupported value for gpg.format: {value}");
+            Err(GitError::Exit(128))
+        }
     }
-    Ok(())
 }
 
 pub(crate) fn committer_email(identity: &[u8]) -> Option<String> {
@@ -77,13 +86,25 @@ pub(crate) fn sign_payload(
     payload: &[u8],
     key: Option<&str>,
 ) -> Result<Vec<u8>> {
-    validate_openpgp_format(config)?;
-    let program = gpg_program(config);
+    match signing_format(config)? {
+        SigningFormat::OpenPgp => sign_gpg_payload(gpg_program(config), payload, key, true),
+        SigningFormat::Ssh => sign_ssh_payload(config, payload, key),
+        SigningFormat::X509 => sign_gpg_payload(gpg_x509_program(config), payload, key, false),
+    }
+}
+
+fn sign_gpg_payload(
+    program: PathBuf,
+    payload: &[u8],
+    key: Option<&str>,
+    use_long_keyid: bool,
+) -> Result<Vec<u8>> {
     let mut command = ProcessCommand::new(program);
-    command
-        .arg("--status-fd=2")
-        .arg("--keyid-format=long")
-        .arg("-bsau");
+    command.arg("--status-fd=2");
+    if use_long_keyid {
+        command.arg("--keyid-format=long");
+    }
+    command.arg("-bsau");
     if let Some(key) = key.filter(|key| !key.is_empty()) {
         command.arg(key);
     }
@@ -113,13 +134,40 @@ pub(crate) fn verify_payload(
     payload: &[u8],
     signature: &[u8],
 ) -> Result<GpgVerification> {
-    validate_openpgp_format(config)?;
+    match verification_format(config, signature)? {
+        SigningFormat::OpenPgp => verify_gpg_payload(gpg_program(config), git_dir, config, payload, signature, true),
+        SigningFormat::Ssh => verify_ssh_payload(git_dir, config, payload, signature),
+        SigningFormat::X509 => verify_gpg_payload(gpg_x509_program(config), git_dir, config, payload, signature, false),
+    }
+}
+
+fn verification_format(config: Option<&GitConfig>, signature: &[u8]) -> Result<SigningFormat> {
+    if signature
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == b"-----BEGIN SSH SIGNATURE-----")
+    {
+        return Ok(SigningFormat::Ssh);
+    }
+    signing_format(config)
+}
+
+fn verify_gpg_payload(
+    program: PathBuf,
+    git_dir: &Path,
+    config: Option<&GitConfig>,
+    payload: &[u8],
+    signature: &[u8],
+    use_long_keyid: bool,
+) -> Result<GpgVerification> {
     let temp = GpgTempFiles::new(git_dir)?;
     fs::write(&temp.payload, payload)?;
     fs::write(&temp.signature, signature)?;
-    let output = ProcessCommand::new(gpg_program(config))
-        .arg("--status-fd=1")
-        .arg("--keyid-format=long")
+    let mut command = ProcessCommand::new(program);
+    command.arg("--status-fd=1");
+    if use_long_keyid {
+        command.arg("--keyid-format=long");
+    }
+    let output = command
         .arg("--verify")
         .arg(&temp.signature)
         .arg(&temp.payload)
@@ -203,7 +251,7 @@ const TAG_SIGNATURE_MARKERS: [&[u8]; 4] = [
     b"-----BEGIN SSH SIGNATURE-----",
 ];
 
-fn signature_has_marker(signature: &[u8]) -> bool {
+pub(crate) fn signature_has_marker(signature: &[u8]) -> bool {
     signature
         .split(|byte| *byte == b'\n')
         .any(|line| TAG_SIGNATURE_MARKERS.contains(&line))
@@ -214,6 +262,276 @@ fn gpg_program(config: Option<&GitConfig>) -> PathBuf {
         .and_then(|config| config.get("gpg", None, "program"))
         .map(sley_config::expand_user_path)
         .unwrap_or_else(|| PathBuf::from("gpg"))
+}
+
+fn gpg_x509_program(config: Option<&GitConfig>) -> PathBuf {
+    config
+        .and_then(|config| config.get("gpg", Some("x509"), "program"))
+        .map(sley_config::expand_user_path)
+        .unwrap_or_else(|| PathBuf::from("gpgsm"))
+}
+
+fn ssh_program(config: Option<&GitConfig>) -> PathBuf {
+    config
+        .and_then(|config| config.get("gpg", Some("ssh"), "program"))
+        .map(sley_config::expand_user_path)
+        .unwrap_or_else(|| PathBuf::from("ssh-keygen"))
+}
+
+fn ssh_allowed_signers_file(config: Option<&GitConfig>) -> Option<PathBuf> {
+    config
+        .and_then(|config| config.get("gpg", Some("ssh"), "allowedSignersFile"))
+        .filter(|value| !value.is_empty())
+        .map(sley_config::expand_user_path)
+}
+
+fn sign_ssh_payload(
+    config: Option<&GitConfig>,
+    payload: &[u8],
+    key: Option<&str>,
+) -> Result<Vec<u8>> {
+    let Some(key) = key.filter(|key| !key.is_empty()) else {
+        eprintln!("error: user.signingKey needs to be set for ssh signing");
+        return Err(GitError::Exit(128));
+    };
+    let temp = GpgTempFiles::new(Path::new(".git"))?;
+    let (key_path, use_agent) = ssh_signing_key_file(&temp, key)?;
+    let mut command = ProcessCommand::new(ssh_program(config));
+    command
+        .arg("-Y")
+        .arg("sign")
+        .arg("-n")
+        .arg("git")
+        .arg("-f")
+        .arg(key_path);
+    if use_agent {
+        command.arg("-U");
+    }
+    let output = command_with_stdin(command, payload)
+        .map_err(|err| GitError::Command(format!("could not run ssh-keygen: {err}")))?;
+    if !output.status.success() || !signature_has_marker(&output.stdout) {
+        io::stderr().write_all(&output.stderr)?;
+        eprintln!("error: ssh-keygen failed to sign the data");
+        return Err(GitError::Exit(128));
+    }
+    Ok(strip_cr(output.stdout))
+}
+
+fn ssh_signing_key_file<'a>(temp: &'a GpgTempFiles, key: &'a str) -> Result<(&'a Path, bool)> {
+    let Some(literal) = literal_ssh_key(key) else {
+        return Ok((Path::new(key), false));
+    };
+    fs::write(&temp.key, literal)?;
+    Ok((&temp.key, true))
+}
+
+fn literal_ssh_key(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("key::")
+        .or_else(|| value.starts_with("ssh-").then_some(value))
+        .or_else(|| value.starts_with("ecdsa-").then_some(value))
+        .or_else(|| value.starts_with("sk-").then_some(value))
+}
+
+fn verify_ssh_payload(
+    git_dir: &Path,
+    config: Option<&GitConfig>,
+    payload: &[u8],
+    signature: &[u8],
+) -> Result<GpgVerification> {
+    let Some(allowed_signers) = ssh_allowed_signers_file(config) else {
+        return Ok(ssh_error_verification(
+            b"error: gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification\n",
+        ));
+    };
+    if !allowed_signers.is_file() {
+        return Ok(ssh_error_verification(
+            format!(
+                "error: gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification\n"
+            )
+            .as_bytes(),
+        ));
+    }
+    let temp = GpgTempFiles::new(git_dir)?;
+    fs::write(&temp.signature, signature)?;
+    let verify_time = ssh_verify_time_arg(payload);
+    let program = ssh_program(config);
+    let find = ssh_find_principals(&program, &allowed_signers, &temp.signature, verify_time.as_deref())?;
+    let mut human_output = Vec::new();
+    let mut ret_success = false;
+    if find.status.success() && !find.stdout.is_empty() {
+        for principal in String::from_utf8_lossy(&find.stdout)
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+        {
+            let output = ssh_verify_principal(
+                &program,
+                &allowed_signers,
+                &temp.signature,
+                verify_time.as_deref(),
+                principal,
+                payload,
+            )?;
+            let good_output = output.stdout;
+            human_output = good_output.clone();
+            human_output.extend_from_slice(&find.stderr);
+            human_output.extend_from_slice(&output.stderr);
+            ret_success = output.status.success() && good_output.starts_with(b"Good");
+            if ret_success {
+                break;
+            }
+        }
+    } else {
+        let output = ssh_check_novalidate(&program, &temp.signature, verify_time.as_deref(), payload)?;
+        let good_output = output.stdout;
+        human_output = good_output.clone();
+        human_output.extend_from_slice(&find.stderr);
+        human_output.extend_from_slice(&output.stderr);
+    }
+    let mut verification = parse_ssh_output(&human_output);
+    verification.human_output = human_output;
+    verification.status_output = verification.human_output.clone();
+    verification.success = ret_success && min_trust_satisfied(config, &verification);
+    Ok(verification)
+}
+
+fn ssh_find_principals(
+    program: &Path,
+    allowed_signers: &Path,
+    signature: &Path,
+    verify_time: Option<&str>,
+) -> Result<std::process::Output> {
+    let mut command = ProcessCommand::new(program);
+    command
+        .arg("-Y")
+        .arg("find-principals")
+        .arg("-f")
+        .arg(allowed_signers)
+        .arg("-s")
+        .arg(signature);
+    if let Some(verify_time) = verify_time {
+        command.arg(verify_time);
+    }
+    command
+        .output()
+        .map_err(|err| GitError::Command(format!("could not run ssh-keygen: {err}")))
+}
+
+fn ssh_verify_principal(
+    program: &Path,
+    allowed_signers: &Path,
+    signature: &Path,
+    verify_time: Option<&str>,
+    principal: &str,
+    payload: &[u8],
+) -> Result<std::process::Output> {
+    let mut command = ProcessCommand::new(program);
+    command
+        .arg("-Y")
+        .arg("verify")
+        .arg("-n")
+        .arg("git")
+        .arg("-f")
+        .arg(allowed_signers)
+        .arg("-I")
+        .arg(principal)
+        .arg("-s")
+        .arg(signature);
+    if let Some(verify_time) = verify_time {
+        command.arg(verify_time);
+    }
+    command_with_stdin(command, payload)
+        .map_err(|err| GitError::Command(format!("could not run ssh-keygen: {err}")))
+}
+
+fn ssh_check_novalidate(
+    program: &Path,
+    signature: &Path,
+    verify_time: Option<&str>,
+    payload: &[u8],
+) -> Result<std::process::Output> {
+    let mut command = ProcessCommand::new(program);
+    command
+        .arg("-Y")
+        .arg("check-novalidate")
+        .arg("-n")
+        .arg("git")
+        .arg("-s")
+        .arg(signature);
+    if let Some(verify_time) = verify_time {
+        command.arg(verify_time);
+    }
+    command_with_stdin(command, payload)
+        .map_err(|err| GitError::Command(format!("could not run ssh-keygen: {err}")))
+}
+
+fn command_with_stdin(
+    mut command: ProcessCommand,
+    input: &[u8],
+) -> std::io::Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "could not open stdin"))?
+        .write_all(input)?;
+    child.wait_with_output()
+}
+
+fn parse_ssh_output(output: &[u8]) -> GpgVerification {
+    let mut out = GpgVerification {
+        trust: "never".to_string(),
+        status: GpgSignatureStatus::Bad,
+        ..GpgVerification::default()
+    };
+    let first = String::from_utf8_lossy(output)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let Some(rest) = first.strip_prefix("Good \"git\" signature ") else {
+        return out;
+    };
+    let key_part;
+    if let Some(rest) = rest.strip_prefix("for ") {
+        let Some((principal, with_key)) = rest.rsplit_once(" with ") else {
+            return out;
+        };
+        out.status = GpgSignatureStatus::Good;
+        out.trust = "fully".to_string();
+        out.signer = principal.to_string();
+        key_part = with_key;
+    } else if let Some(rest) = rest.strip_prefix("with ") {
+        out.status = GpgSignatureStatus::Good;
+        out.trust = "undefined".to_string();
+        key_part = rest;
+    } else {
+        return out;
+    }
+    if let Some((_, fingerprint)) = key_part.split_once("key ") {
+        out.key = fingerprint.to_string();
+        out.fingerprint = fingerprint.to_string();
+    } else {
+        out.status = GpgSignatureStatus::Bad;
+        out.trust = "never".to_string();
+        out.signer.clear();
+    }
+    out
+}
+
+fn ssh_error_verification(message: &[u8]) -> GpgVerification {
+    GpgVerification {
+        status: GpgSignatureStatus::Unknown,
+        trust: "undefined".to_string(),
+        human_output: message.to_vec(),
+        status_output: message.to_vec(),
+        ..GpgVerification::default()
+    }
 }
 
 fn parse_gpg_status(status: &[u8]) -> GpgVerification {
@@ -300,7 +618,7 @@ fn min_trust_satisfied(config: Option<&GitConfig>, verification: &GpgVerificatio
     let Some(min) = config.and_then(|config| config.get("gpg", None, "minTrustLevel")) else {
         return true;
     };
-    trust_rank(&verification.trust) >= trust_rank(min)
+    trust_rank(&verification.trust) >= trust_rank(&min.to_ascii_lowercase())
 }
 
 fn trust_rank(value: &str) -> u8 {
@@ -311,6 +629,67 @@ fn trust_rank(value: &str) -> u8 {
         "never" => 1,
         _ => 0,
     }
+}
+
+fn strip_cr(bytes: Vec<u8>) -> Vec<u8> {
+    bytes.into_iter().filter(|byte| *byte != b'\r').collect()
+}
+
+fn ssh_verify_time_arg(payload: &[u8]) -> Option<String> {
+    let timestamp = payload_identity_timestamp(payload)?;
+    let (year, month, day, hour, minute, second) = utc_ymdhms(timestamp)?;
+    Some(format!(
+        "-Overify-time={year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}"
+    ))
+}
+
+fn payload_identity_timestamp(payload: &[u8]) -> Option<i64> {
+    for line in payload.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            break;
+        }
+        let value = line
+            .strip_prefix(b"committer ")
+            .or_else(|| line.strip_prefix(b"tagger "));
+        if let Some(value) = value {
+            return identity_timestamp(value);
+        }
+    }
+    None
+}
+
+fn identity_timestamp(identity: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(identity).ok()?;
+    let (before_tz, _tz) = text.rsplit_once(' ')?;
+    let (_name_email, timestamp) = before_tz.rsplit_once(' ')?;
+    timestamp.parse::<i64>().ok()
+}
+
+fn utc_ymdhms(timestamp: i64) -> Option<(i64, u32, u32, u32, u32, u32)> {
+    if timestamp < 0 {
+        return None;
+    }
+    let days = timestamp / 86_400;
+    let seconds_of_day = timestamp % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = (seconds_of_day / 3_600) as u32;
+    let minute = ((seconds_of_day % 3_600) / 60) as u32;
+    let second = (seconds_of_day % 60) as u32;
+    Some((year, month, day, hour, minute, second))
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m as u32, d as u32)
 }
 
 fn extract_commit_signature(body: &[u8]) -> Option<Vec<u8>> {
@@ -350,6 +729,7 @@ fn header_value<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 struct GpgTempFiles {
     payload: PathBuf,
     signature: PathBuf,
+    key: PathBuf,
 }
 
 impl GpgTempFiles {
@@ -367,6 +747,7 @@ impl GpgTempFiles {
         Ok(Self {
             payload: dir.join(format!("{id}.payload")),
             signature: dir.join(format!("{id}.sig")),
+            key: dir.join(format!("{id}.key")),
         })
     }
 }
@@ -375,5 +756,6 @@ impl Drop for GpgTempFiles {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.payload);
         let _ = fs::remove_file(&self.signature);
+        let _ = fs::remove_file(&self.key);
     }
 }

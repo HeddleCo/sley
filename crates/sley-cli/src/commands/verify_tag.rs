@@ -222,8 +222,12 @@ fn verify_one_tag(repo: &RepositoryContext, tag: &str, options: &VerifyTagOption
                 io::stdout().write_all(payload)?;
                 io::stdout().flush()?;
             }
-            let verification =
-                commands::signing::verify_payload(repo.git_dir(), Some(repo.config()), payload, signature)?;
+            let verification = commands::signing::verify_payload(
+                repo.git_dir(),
+                Some(repo.config()),
+                payload,
+                signature,
+            )?;
             if options.raw {
                 io::stderr().write_all(&verification.status_output)?;
             } else {
@@ -242,7 +246,10 @@ fn verify_one_tag(repo: &RepositoryContext, tag: &str, options: &VerifyTagOption
 
 fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
     let marker = b"-----BEGIN PGP SIGNATURE-----";
-    let Some(start) = body.windows(marker.len()).position(|window| window == marker) else {
+    let Some(start) = body
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
         return Ok(true);
     };
     let unsigned = &body[..start];
@@ -276,17 +283,6 @@ fn verify_tag_name(body: &[u8]) -> String {
     String::new()
 }
 
-/// The armor markers git's signature parser recognizes at the start of a line as
-/// the beginning of a tag signature (see git's `gpg-interface.c`). A
-/// `-----BEGIN GPG SIGNATURE-----` line is deliberately *not* in this set, matching
-/// git, which reports such a tag as having no signature.
-const TAG_SIGNATURE_MARKERS: [&[u8]; 4] = [
-    b"-----BEGIN PGP SIGNATURE-----",
-    b"-----BEGIN PGP MESSAGE-----",
-    b"-----BEGIN SIGNED MESSAGE-----",
-    b"-----BEGIN SSH SIGNATURE-----",
-];
-
 /// Return the byte offset at which the tag's trailing signature begins (the first
 /// byte of the line carrying a recognized armor marker), or `None` when the tag
 /// carries no signature. Matching git, a marker is only honored at the start of a
@@ -299,7 +295,7 @@ fn tag_signature_offset(body: &[u8]) -> Option<usize> {
             .position(|byte| *byte == b'\n')
             .map_or(body.len(), |idx| line_start + idx);
         let line = &body[line_start..line_end];
-        if TAG_SIGNATURE_MARKERS.contains(&line) {
+        if commands::signing::signature_has_marker(line) {
             return Some(line_start);
         }
         // Advance past the newline (or to the end if this was the final line).

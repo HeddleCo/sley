@@ -689,7 +689,6 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         }
         let tagger = commit_identity_from_env("COMMITTER")?;
         if signed {
-            commands::signing::validate_openpgp_format(Some(&config))?;
             let key =
                 commands::signing::signing_key(Some(&config), signing_key.as_deref(), &tagger);
             message = sign_tag_message(
@@ -973,9 +972,7 @@ fn resolve_tag_merged_filter(git_dir: &Path, format: ObjectFormat, rev: &str) ->
 }
 
 fn tag_message_has_signature(message: &[u8]) -> bool {
-    message
-        .windows(b"-----BEGIN PGP SIGNATURE-----".len())
-        .any(|window| window == b"-----BEGIN PGP SIGNATURE-----")
+    commands::signing::signature_has_marker(message)
 }
 
 fn sign_tag_message(
