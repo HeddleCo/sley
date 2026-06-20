@@ -48,6 +48,8 @@ struct GrepOptions {
     full_name_set: bool,
     null_data: bool,
     cached: bool,
+    untracked: bool,
+    exclude_standard: bool,
     max_depth: Option<i64>,
     max_count: Option<i64>,
     before_context: usize,
@@ -56,6 +58,7 @@ struct GrepOptions {
     function_context: bool,
     heading: bool,
     break_between_files: bool,
+    color: bool,
     revs: Vec<String>,
     pathspecs: Vec<String>,
 }
@@ -87,6 +90,8 @@ impl GrepOptions {
             full_name_set: false,
             null_data: false,
             cached: false,
+            untracked: false,
+            exclude_standard: false,
             max_depth: None,
             max_count: None,
             before_context: 0,
@@ -95,6 +100,7 @@ impl GrepOptions {
             function_context: false,
             heading: false,
             break_between_files: false,
+            color: false,
             revs: Vec::new(),
             pathspecs: Vec::new(),
         }
@@ -321,6 +327,10 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             "-I" => opts.ignore_binary = true,
             "-z" | "--null" => opts.null_data = true,
             "--cached" => opts.cached = true,
+            "--untracked" => {
+                opts.untracked = true;
+                opts.exclude_standard = true;
+            }
             "-p" | "--show-function" => opts.show_function = true,
             "-W" | "--function-context" => opts.function_context = true,
             "--heading" => opts.heading = true,
@@ -393,13 +403,14 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                 opts.before_context = n;
                 opts.after_context = n;
             }
-            "--color"
-            | "--no-color"
-            | "--recurse-submodules"
-            | "--no-recurse-submodules"
-            | "--untracked"
-            | "--no-exclude-standard"
-            | "--exclude-standard" => {
+            "--exclude-standard" => opts.exclude_standard = true,
+            "--no-exclude-standard" => opts.exclude_standard = false,
+            "--color" => opts.color = true,
+            "--no-color" => opts.color = false,
+            value if value.starts_with("--color=") => {
+                opts.color = !matches!(value.strip_prefix("--color="), Some("never" | "false"));
+            }
+            "--recurse-submodules" | "--no-recurse-submodules" => {
                 // Accepted-but-no-op flags whose default behaviour we already match.
             }
             "--threads" => {
@@ -443,11 +454,29 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         opts.push_pattern(positionals.remove(0));
     }
 
-    if no_index {
-        return Err(GitError::Unsupported("grep --no-index".into()));
+    let repo = match RepositoryContext::discover_current() {
+        Ok(repo) => Some(repo),
+        Err(err) => {
+            if no_index || grep_fallback_to_no_index()? {
+                None
+            } else {
+                return Err(err);
+            }
+        }
+    };
+    if no_index || opts.untracked || repo.is_none() {
+        let pattern_type = cli_pattern_type.unwrap_or(PatternTypeOption::Bre);
+        opts.kind = match pattern_type {
+            PatternTypeOption::Ere => PatternKind::Extended,
+            PatternTypeOption::Fixed => PatternKind::Fixed,
+            PatternTypeOption::Pcre => PatternKind::Perl,
+            _ => PatternKind::Basic,
+        };
+        let color_config = repo.as_ref().map(|repo| repo.config());
+        return grep_no_index(&opts, color_config, &positionals, DASHDASH);
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = repo.expect("repository discovery succeeded above");
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -549,6 +578,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         expr: expr.as_ref(),
         opts: &opts,
         pathspec: &pathspec,
+        colors: GrepColors::from_config(repo.config(), opts.color),
     };
 
     let mut any_match = false;
@@ -601,6 +631,52 @@ struct GrepPlan<'a> {
     expr: Option<&'a Expr>,
     opts: &'a GrepOptions,
     pathspec: &'a GrepPathspec,
+    colors: GrepColors,
+}
+
+struct GrepColors {
+    enabled: bool,
+    filename: String,
+    separator: String,
+    matched: String,
+    reset: String,
+}
+
+impl GrepColors {
+    fn none() -> Self {
+        Self {
+            enabled: false,
+            filename: String::new(),
+            separator: String::new(),
+            matched: String::new(),
+            reset: String::new(),
+        }
+    }
+
+    fn from_config(config: &GitConfig, enabled: bool) -> Self {
+        if !enabled {
+            return Self::none();
+        }
+        let filename = config
+            .get("color", Some("grep"), "filename")
+            .map(|spec| git_color_spec_to_ansi(spec, enabled))
+            .unwrap_or_default();
+        let separator = config
+            .get("color", Some("grep"), "separator")
+            .map(|spec| git_color_spec_to_ansi(spec, enabled))
+            .unwrap_or_default();
+        let matched_spec = config
+            .get("color", Some("grep"), "matchSelected")
+            .or_else(|| config.get("color", Some("grep"), "match"))
+            .unwrap_or("bold red");
+        Self {
+            enabled,
+            filename,
+            separator,
+            matched: git_color_spec_to_ansi(matched_spec, enabled),
+            reset: git_color_spec_to_ansi("reset", enabled),
+        }
+    }
 }
 
 fn is_negative_number(value: &str) -> bool {
@@ -810,6 +886,224 @@ fn grep_unknown_option(flag: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
+fn grep_fallback_to_no_index() -> Result<bool> {
+    let mut fallback = false;
+    for param in injected_config_parameters()? {
+        if param
+            .canonical_key
+            .eq_ignore_ascii_case("grep.fallbacktonoindex")
+        {
+            fallback = parse_grep_bool(param.value.as_deref());
+        }
+    }
+    Ok(fallback)
+}
+
+fn grep_no_index(
+    opts: &GrepOptions,
+    color_config: Option<&GitConfig>,
+    positionals: &[String],
+    dashdash: &str,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let cwd_canon = fs::canonicalize(&cwd)?;
+    let raw_paths = no_index_paths(positionals, dashdash)?;
+    let matcher = GrepMatcher::compile(GrepCompileConfig {
+        patterns: &opts.patterns,
+        kind: opts.kind,
+        ignore_case: opts.ignore_case,
+        word: opts.word,
+        line_regexp: opts.line_regexp,
+        diagnostic_verbosity: RegexDiagnosticVerbosity::from_env(),
+    })?;
+    let expr = build_expr(&opts.tokens);
+    let empty_pathspec = GrepPathspec::new(None, &cwd, opts.full_name, &[])?;
+    let plan = GrepPlan {
+        matcher: &matcher,
+        expr: expr.as_ref(),
+        opts,
+        pathspec: &empty_pathspec,
+        colors: color_config
+            .map(|config| GrepColors::from_config(config, opts.color))
+            .unwrap_or_else(GrepColors::none),
+    };
+    let ignore = if opts.exclude_standard {
+        NoIndexIgnore::from_cwd(&cwd)?
+    } else {
+        NoIndexIgnore::default()
+    };
+    let mut files = Vec::new();
+    for raw in raw_paths {
+        collect_no_index_path(&cwd, &cwd_canon, &raw, &ignore, &mut files)?;
+    }
+    files.sort_by(|a, b| a.display.cmp(&b.display));
+
+    let mut any_match = false;
+    let mut printed_file = false;
+    let mut out = io::stdout();
+    for file in files {
+        let Ok(content) = fs::read(&file.absolute) else {
+            continue;
+        };
+        let matched = grep_buffer(&content, &file.display, None, &plan, &mut out, &mut printed_file)?;
+        any_match = any_match || matched;
+    }
+    if any_match {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
+}
+
+fn no_index_paths(positionals: &[String], dashdash: &str) -> Result<Vec<String>> {
+    let has_dashdash = positionals.iter().any(|p| p == dashdash);
+    if has_dashdash {
+        let Some(split) = positionals.iter().position(|p| p == dashdash) else {
+            return Ok(Vec::new());
+        };
+        if split > 0 {
+            eprintln!("fatal: option '--no-index' cannot be used with revs");
+            return Err(GitError::Exit(128));
+        }
+        let paths: Vec<String> = positionals[split + 1..].to_vec();
+        return Ok(if paths.is_empty() {
+            vec![".".to_string()]
+        } else {
+            paths
+        });
+    }
+    Ok(if positionals.is_empty() {
+        vec![".".to_string()]
+    } else {
+        positionals.to_vec()
+    })
+}
+
+#[derive(Default)]
+struct NoIndexIgnore {
+    patterns: Vec<String>,
+}
+
+impl NoIndexIgnore {
+    fn from_cwd(cwd: &Path) -> Result<Self> {
+        let mut patterns = Vec::new();
+        let gitignore = cwd.join(".gitignore");
+        if let Ok(text) = fs::read_to_string(gitignore) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                patterns.push(line.to_string());
+            }
+        }
+        Ok(Self { patterns })
+    }
+
+    fn ignores(&self, display: &[u8]) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let path = String::from_utf8_lossy(display);
+        let basename = path.rsplit('/').next().unwrap_or(&path);
+        self.patterns.iter().any(|pattern| {
+            if pattern.contains('/') {
+                wildcard_match(pattern.as_bytes(), path.as_bytes())
+            } else {
+                wildcard_match(pattern.as_bytes(), basename.as_bytes())
+            }
+        })
+    }
+}
+
+struct NoIndexFile {
+    absolute: PathBuf,
+    display: Vec<u8>,
+}
+
+fn collect_no_index_path(
+    cwd: &Path,
+    cwd_canon: &Path,
+    raw: &str,
+    ignore: &NoIndexIgnore,
+    out: &mut Vec<NoIndexFile>,
+) -> Result<()> {
+    let path = cwd.join(raw);
+    if !path.exists() {
+        eprintln!("fatal: {raw}: no such path in the working tree");
+        return Err(GitError::Exit(128));
+    }
+    let canon = fs::canonicalize(&path)?;
+    if !canon.starts_with(cwd_canon) {
+        eprintln!("fatal: {raw}: '{raw}' is outside the directory tree");
+        return Err(GitError::Exit(128));
+    }
+    if path.is_dir() {
+        collect_no_index_dir(cwd, &path, ignore, out)?;
+    } else if path.is_file() {
+        push_no_index_file(cwd, &path, ignore, out)?;
+    }
+    Ok(())
+}
+
+fn collect_no_index_dir(
+    cwd: &Path,
+    dir: &Path,
+    ignore: &NoIndexIgnore,
+    out: &mut Vec<NoIndexFile>,
+) -> Result<()> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.as_encoded_bytes() == b".git" && path.is_dir() {
+            continue;
+        }
+        if path.is_dir() {
+            collect_no_index_dir(cwd, &path, ignore, out)?;
+        } else if path.is_file() {
+            push_no_index_file(cwd, &path, ignore, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn push_no_index_file(
+    cwd: &Path,
+    path: &Path,
+    ignore: &NoIndexIgnore,
+    out: &mut Vec<NoIndexFile>,
+) -> Result<()> {
+    let display_path = path.strip_prefix(cwd).unwrap_or(path);
+    let display = path_to_bytes(display_path);
+    if display.is_empty() || ignore.ignores(&display) {
+        return Ok(());
+    }
+    out.push(NoIndexFile {
+        absolute: path.to_path_buf(),
+        display,
+    });
+    Ok(())
+}
+
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    fn inner(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((&b'*', rest)) => {
+                inner(rest, text) || (!text.is_empty() && inner(pattern, &text[1..]))
+            }
+            Some((&b'?', rest)) => !text.is_empty() && inner(rest, &text[1..]),
+            Some((&p, rest)) => text.first() == Some(&p) && inner(rest, &text[1..]),
+        }
+    }
+    inner(pattern, text)
+}
+
 // ---------------------------------------------------------------------------
 // Source iteration
 // ---------------------------------------------------------------------------
@@ -856,6 +1150,13 @@ fn grep_index_source(
         // intent-to-add entries entirely (they carry no real content to grep).
         // Otherwise grep the live worktree file.
         let use_cached = plan.opts.cached || (entry.flags & CE_VALID) != 0;
+        if !plan.opts.cached
+            && plan.opts.files_without_match
+            && (entry.flags & CE_VALID) != 0
+            && entry.oid == ObjectId::empty_blob(source.format)
+        {
+            continue;
+        }
         let content: Cow<'_, [u8]> = if use_cached {
             if entry.is_intent_to_add() {
                 continue;
@@ -1096,6 +1397,9 @@ fn grep_buffer(
         show_filename,
         field_sep,
         opts,
+        plan.matcher,
+        plan.expr,
+        &plan.colors,
         printed_file,
     )?;
     Ok(true)
@@ -1275,6 +1579,9 @@ fn emit_lines(
     show_filename: bool,
     field_sep: &[u8],
     opts: &GrepOptions,
+    matcher: &GrepMatcher,
+    expr: Option<&Expr>,
+    colors: &GrepColors,
     printed_file: &mut bool,
 ) -> Result<()> {
     // Column lookup per selected line.
@@ -1294,7 +1601,7 @@ fn emit_lines(
     }
 
     if heading {
-        write_path_line(out, rev, display_path, b'\n', false)?;
+        write_heading_path(out, rev, display_path, opts, colors)?;
         wrote_in_file = true;
     }
 
@@ -1311,10 +1618,12 @@ fn emit_lines(
                     if *printed_file {
                         // Between files git also prints `--`; handled by the gap too.
                     }
-                    out.write_all(b"--\n")?;
+                    write_colored_bytes(out, b"--", &colors.separator, &colors.reset)?;
+                    out.write_all(b"\n")?;
                 }
             } else if *printed_file && !opts.break_between_files && !heading {
-                out.write_all(b"--\n")?;
+                write_colored_bytes(out, b"--", &colors.separator, &colors.reset)?;
+                out.write_all(b"\n")?;
             }
         }
         let sep: &[u8] = if flag.selected {
@@ -1325,7 +1634,14 @@ fn emit_lines(
             b"-"
         };
         if !heading {
-            write_match_prefix_sep(out, rev, display_path, show_filename, sep)?;
+            write_match_prefix_sep_colored(
+                out,
+                rev,
+                display_path,
+                show_filename,
+                sep,
+                colors,
+            )?;
         }
         if opts.line_number {
             out.write_all((i + 1).to_string().as_bytes())?;
@@ -1336,7 +1652,11 @@ fn emit_lines(
             out.write_all(c.to_string().as_bytes())?;
             out.write_all(field_sep)?;
         }
-        out.write_all(lines[i])?;
+        if flag.selected {
+            write_highlighted_line(out, matcher, expr, lines[i], colors)?;
+        } else {
+            out.write_all(lines[i])?;
+        }
         out.write_all(b"\n")?;
         last_printed = Some(i);
         wrote_in_file = true;
@@ -1374,6 +1694,99 @@ fn write_match_prefix_sep(
         let raw = sep == b"\0";
         write_quoted_path(out, display_path, raw)?;
         out.write_all(sep)?;
+    }
+    Ok(())
+}
+
+fn write_match_prefix_sep_colored(
+    out: &mut impl Write,
+    rev: Option<&str>,
+    display_path: &[u8],
+    show_filename: bool,
+    sep: &[u8],
+    colors: &GrepColors,
+) -> Result<()> {
+    if let Some(rev) = rev {
+        out.write_all(rev.as_bytes())?;
+        write_colored_bytes(out, b":", &colors.separator, &colors.reset)?;
+    }
+    if show_filename || rev.is_some() {
+        let raw = sep == b"\0";
+        let quoted = if raw {
+            display_path.to_vec()
+        } else {
+            status_quote_path(display_path, false).into_bytes()
+        };
+        write_colored_bytes(out, &quoted, &colors.filename, &colors.reset)?;
+        write_colored_bytes(out, sep, &colors.separator, &colors.reset)?;
+    }
+    Ok(())
+}
+
+fn write_heading_path(
+    out: &mut impl Write,
+    rev: Option<&str>,
+    display_path: &[u8],
+    opts: &GrepOptions,
+    colors: &GrepColors,
+) -> Result<()> {
+    if let Some(rev) = rev {
+        out.write_all(rev.as_bytes())?;
+        write_colored_bytes(out, b":", &colors.separator, &colors.reset)?;
+    }
+    let raw = opts.null_data;
+    let quoted = if raw {
+        display_path.to_vec()
+    } else {
+        status_quote_path(display_path, false).into_bytes()
+    };
+    write_colored_bytes(out, &quoted, &colors.filename, &colors.reset)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_highlighted_line(
+    out: &mut impl Write,
+    matcher: &GrepMatcher,
+    expr: Option<&Expr>,
+    line: &[u8],
+    colors: &GrepColors,
+) -> Result<()> {
+    if !colors.enabled || colors.matched.is_empty() {
+        out.write_all(line)?;
+        return Ok(());
+    }
+    let spans = matcher.match_spans_expr(expr, line);
+    if spans.is_empty() {
+        out.write_all(line)?;
+        return Ok(());
+    }
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if start > cursor {
+            out.write_all(&line[cursor..start])?;
+        }
+        write_colored_bytes(out, &line[start..end], &colors.matched, &colors.reset)?;
+        cursor = end;
+    }
+    if cursor < line.len() {
+        out.write_all(&line[cursor..])?;
+    }
+    Ok(())
+}
+
+fn write_colored_bytes(
+    out: &mut impl Write,
+    bytes: &[u8],
+    color: &str,
+    reset: &str,
+) -> Result<()> {
+    if color.is_empty() {
+        out.write_all(bytes)?;
+    } else {
+        out.write_all(color.as_bytes())?;
+        out.write_all(bytes)?;
+        out.write_all(reset.as_bytes())?;
     }
     Ok(())
 }
@@ -1457,6 +1870,18 @@ impl<'a> Iterator for SplitLines<'a> {
 fn buffer_is_binary(content: &[u8]) -> bool {
     let window = content.len().min(8000);
     content[..window].contains(&0)
+}
+
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().replace('\\', "/").into_bytes()
+    }
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
