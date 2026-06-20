@@ -1966,7 +1966,7 @@ fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
 fn patch_validate_unified_context(value: &str, short: bool) -> Result<()> {
     commit_validate_unified_context(value, short)?;
     if git_count_value_is_negative(value) {
-        eprintln!("fatal: --unified cannot be negative");
+        eprintln!("fatal: '--unified' cannot be negative");
         return Err(GitError::Exit(128));
     }
     Ok(())
@@ -1997,7 +1997,7 @@ fn commit_validate_inter_hunk_context(value: &str) -> Result<()> {
 fn patch_validate_inter_hunk_context(value: &str) -> Result<()> {
     commit_validate_inter_hunk_context(value)?;
     if git_count_value_is_negative(value) {
-        eprintln!("fatal: --inter-hunk-context cannot be negative");
+        eprintln!("fatal: '--inter-hunk-context' cannot be negative");
         return Err(GitError::Exit(128));
     }
     Ok(())
