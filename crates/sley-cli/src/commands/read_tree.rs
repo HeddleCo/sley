@@ -464,7 +464,7 @@ fn read_tree_overlay(
     let mut merged: LeafMap = BTreeMap::new();
     for tree_oid in tree_oids {
         for (path, value) in tree_leaf_map(db, format, tree_oid)? {
-            verify_read_tree_path(&path, path_rules)?;
+            verify_read_tree_path(&path, value.0, path_rules)?;
             merged.insert(path, value);
         }
     }
@@ -493,7 +493,7 @@ fn read_tree_prefix(
         for (path, value) in tree_leaf_map(db, format, tree_oid)? {
             let mut full = real_prefix.to_vec();
             full.extend_from_slice(&path);
-            verify_read_tree_path(&full, path_rules)?;
+            verify_read_tree_path(&full, value.0, path_rules)?;
             merged.insert(full, value);
         }
     }
@@ -519,7 +519,7 @@ impl ReadTreePathRules {
 /// git's `verify_path()` check for tree entries read into the index. It rejects
 /// paths that would address `.git` (or its HFS/NTFS aliases), `.`/`..`, or an
 /// embedded NUL before any index/worktree mutation.
-fn verify_read_tree_path(path: &[u8], rules: ReadTreePathRules) -> Result<()> {
+fn verify_read_tree_path(path: &[u8], mode: u32, rules: ReadTreePathRules) -> Result<()> {
     if path.is_empty() || path.contains(&0) {
         return invalid_read_tree_path(path);
     }
@@ -537,6 +537,17 @@ fn verify_read_tree_path(path: &[u8], rules: ReadTreePathRules) -> Result<()> {
         if rules.protect_ntfs && is_ntfs_dotgit(component) {
             return invalid_read_tree_path(path);
         }
+        if mode == 0o120000 {
+            if rules.protect_hfs && is_hfs_dotgitmodules(component) {
+                return invalid_read_tree_path(path);
+            }
+            if rules.protect_ntfs && is_ntfs_dotgitmodules(component) {
+                return invalid_read_tree_path(path);
+            }
+            if component.eq_ignore_ascii_case(b".gitmodules") {
+                return invalid_read_tree_path(path);
+            }
+        }
     }
 
     Ok(())
@@ -549,6 +560,10 @@ fn invalid_read_tree_path(path: &[u8]) -> Result<()> {
 
 fn is_hfs_dotgit(name: &[u8]) -> bool {
     strip_hfs_ignorable(name).eq_ignore_ascii_case(b".git")
+}
+
+fn is_hfs_dotgitmodules(name: &[u8]) -> bool {
+    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".gitmodules")
 }
 
 fn is_ntfs_dotgit(name: &[u8]) -> bool {
@@ -564,6 +579,52 @@ fn is_ntfs_dotgit(name: &[u8]) -> bool {
         let trimmed = &stream_name[..end];
         if trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1") {
             return true;
+        }
+    }
+    false
+}
+
+fn is_ntfs_dotgitmodules(name: &[u8]) -> bool {
+    is_ntfs_dot_name(name, b".gitmodules", b"gitmodules", b"gi7eba")
+}
+
+fn is_ntfs_dot_name(name: &[u8], long: &[u8], short_base: &[u8], fallback: &[u8]) -> bool {
+    for segment in name.split(|&byte| byte == b'\\') {
+        let stream_name = segment
+            .iter()
+            .position(|&byte| byte == b':')
+            .map_or(segment, |colon| &segment[..colon]);
+        let mut end = stream_name.len();
+        while end > 0 && (stream_name[end - 1] == b'.' || stream_name[end - 1] == b' ') {
+            end -= 1;
+        }
+        let trimmed = &stream_name[..end];
+        if trimmed.eq_ignore_ascii_case(long) {
+            return true;
+        }
+        if short_base.len() >= 6
+            && trimmed.len() == 8
+            && trimmed[..6].eq_ignore_ascii_case(&short_base[..6])
+            && trimmed[6] == b'~'
+            && matches!(trimmed[7], b'1'..=b'4')
+        {
+            return true;
+        }
+        if trimmed.len() == 8 && trimmed[..fallback.len()].eq_ignore_ascii_case(fallback) {
+            let mut saw_tilde = false;
+            let mut ok = true;
+            for byte in trimmed.iter().take(8).skip(fallback.len()) {
+                if saw_tilde {
+                    ok &= byte.is_ascii_digit();
+                } else if *byte == b'~' {
+                    saw_tilde = true;
+                } else {
+                    ok = false;
+                }
+            }
+            if ok && saw_tilde {
+                return true;
+            }
         }
     }
     false
@@ -1122,8 +1183,8 @@ fn merge_trees(
         .iter()
         .map(|oid| {
             let tree = tree_leaf_map(db, format, oid)?;
-            for path in tree.keys() {
-                verify_read_tree_path(path, path_rules)?;
+            for (path, (mode, _)) in &tree {
+                verify_read_tree_path(path, *mode, path_rules)?;
             }
             Ok(tree)
         })
