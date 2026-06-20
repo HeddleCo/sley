@@ -226,6 +226,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 object_filter = object_filter.combine_with(parsed);
             }
             "--missing=print" => missing_action = RevListMissingAction::Print,
+            "--missing=print-info" => missing_action = RevListMissingAction::PrintInfo,
             "--missing=allow-any" => missing_action = RevListMissingAction::AllowAny,
             "--missing=allow-promisor" => missing_action = RevListMissingAction::AllowPromisor,
             "--boundary" => boundary = true,
@@ -361,6 +362,11 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     object_filter = object_filter.resolve(&git_dir, &db, format)?;
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let exclude_object_tips = if objects {
+        rev_list_extract_non_commit_excludes(&mut setup_args, &git_dir, &db, format)?
+    } else {
+        Vec::new()
+    };
     if bisect_inject_refs {
         // git's `setup_revisions` treats `--bisect` as "also add the current
         // `refs/bisect/<bad>` as a positive and every `refs/bisect/<good>-*`
@@ -375,6 +381,16 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             setup_args.push(format!("^{}", good.to_hex()));
         }
     }
+    let missing_tip_candidates = if objects
+        || matches!(
+            missing_action,
+            RevListMissingAction::Print | RevListMissingAction::PrintInfo
+        )
+    {
+        rev_list_missing_tip_candidates(&setup_args)
+    } else {
+        Vec::new()
+    };
     if !matches!(missing_action, RevListMissingAction::Error)
         && !setup_args.iter().any(|arg| arg == "--ignore-missing")
     {
@@ -452,7 +468,11 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             .split_once(':')
                             .map(|(_, path)| path.as_bytes().to_vec())
                             .unwrap_or_default();
-                        provided_objects.push(RevListObject { oid: tip.oid, name });
+                        provided_objects.push(RevListObject {
+                            oid: tip.oid,
+                            name,
+                            object_type: Some(ObjectType::Blob),
+                        });
                     }
                     ObjectType::Blob | ObjectType::Tree if !use_bitmap_index => {
                         // Without --objects, git silently ignores non-commit
@@ -812,20 +832,49 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         stdout.flush()?;
         return Ok(());
     }
+    let mut missing_commit_objects = Vec::new();
     let commits = match walk_mode {
         RevListWalkMode::Walk => {
-            rev_list_walk_commits_with_missing(
+            let walk = rev_list_walk_commits_with_missing_details(
                 &db,
                 format,
                 include_commits,
                 first_parent,
                 missing_action,
-            )?
+            )?;
+            missing_commit_objects = walk
+                .missing
+                .into_iter()
+                .map(|oid| RevListObject {
+                    oid,
+                    name: Vec::new(),
+                    object_type: Some(ObjectType::Commit),
+                })
+                .collect();
+            walk.records
         }
         RevListWalkMode::NoWalkSorted | RevListWalkMode::NoWalkUnsorted => {
             rev_list_no_walk_commits(&db, format, include_commits)?
         }
     };
+    let selected_commit_oids = commits.iter().map(|record| record.oid).collect::<HashSet<_>>();
+    let mut known_direct_object_oids = start_tag_objects
+        .iter()
+        .map(|tag| tag.object.oid)
+        .collect::<HashSet<_>>();
+    known_direct_object_oids.extend(provided_objects.iter().map(|object| object.oid));
+    let mut recovered_missing_tips = rev_list_missing_tip_objects(
+        &git_dir,
+        &db,
+        format,
+        &missing_tip_candidates,
+        &selected_commit_oids,
+        &known_direct_object_oids,
+        objects,
+        missing_action,
+    )?;
+    provided_objects.append(&mut recovered_missing_tips.provided);
+    let mut missing_tip_objects = recovered_missing_tips.missing;
     let mut selected = Vec::new();
     for record in &commits {
         if excluded.contains(&record.oid) {
@@ -962,6 +1011,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             format,
             &selected,
             &excluded,
+            &exclude_object_tips,
             &object_filter,
             filter_print_omitted,
             missing_action,
@@ -1034,7 +1084,14 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    if quiet && !(objects && (filter_print_omitted || missing_action == RevListMissingAction::Print)) {
+    if quiet
+        && !(objects
+            && (filter_print_omitted
+                || matches!(
+                    missing_action,
+                    RevListMissingAction::Print | RevListMissingAction::PrintInfo
+                )))
+    {
         return Ok(());
     }
     let mut child_oids = HashMap::<ObjectId, Vec<ObjectId>>::new();
@@ -1216,9 +1273,26 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             write_rev_list_omitted_object_line(&object, nul_terminated)?;
         }
     }
-    if missing_action == RevListMissingAction::Print {
+    if matches!(
+        missing_action,
+        RevListMissingAction::Print | RevListMissingAction::PrintInfo
+    ) {
+        let print_info = missing_action == RevListMissingAction::PrintInfo;
+        let mut printed_missing = HashSet::new();
+        for object in missing_tip_objects.drain(..) {
+            if printed_missing.insert(object.oid) {
+                write_rev_list_missing_object_line(&object, nul_terminated, print_info)?;
+            }
+        }
+        for object in missing_commit_objects.drain(..) {
+            if printed_missing.insert(object.oid) {
+                write_rev_list_missing_object_line(&object, nul_terminated, print_info)?;
+            }
+        }
         for object in missing_objects.drain(..) {
-            write_rev_list_missing_object_line(&object, nul_terminated)?;
+            if printed_missing.insert(object.oid) {
+                write_rev_list_missing_object_line(&object, nul_terminated, print_info)?;
+            }
         }
     }
     io::stdout().flush()?;
@@ -1621,6 +1695,7 @@ fn write_rev_list_boundary_record(
 struct RevListObject {
     oid: ObjectId,
     name: Vec<u8>,
+    object_type: Option<ObjectType>,
 }
 
 struct RevListStart {
@@ -1631,6 +1706,136 @@ struct RevListStart {
 struct RevListTagObject {
     commit: ObjectId,
     object: RevListObject,
+}
+
+struct RevListRecoveredMissingTips {
+    provided: Vec<RevListObject>,
+    missing: Vec<RevListObject>,
+}
+
+fn rev_list_missing_tip_candidates(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => break,
+            "--default" | "-n" | "--max-count" | "--skip" | "--max-age" | "--min-age"
+            | "--since" | "--after" | "--until" | "--before" | "--glob" | "--exclude"
+            | "--exclude-hidden" => {
+                let _ = iter.next();
+            }
+            value if value.starts_with('-') || value.starts_with('^') || value.contains("..") => {}
+            value => out.push(value.to_string()),
+        }
+    }
+    out
+}
+
+fn rev_list_extract_non_commit_excludes(
+    args: &mut Vec<String>,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<Vec<RevListObject>> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut excluded = Vec::new();
+    for arg in args.drain(..) {
+        let Some(rev) = arg.strip_prefix('^').filter(|rev| !rev.is_empty()) else {
+            kept.push(arg);
+            continue;
+        };
+        let oid = match sley_rev::resolve_revision_with_reader(git_dir, format, db, rev) {
+            Ok(oid) => oid,
+            Err(_) => {
+                kept.push(arg);
+                continue;
+            }
+        };
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => {
+                kept.push(arg);
+                continue;
+            }
+        };
+        if matches!(object.object_type, ObjectType::Commit | ObjectType::Tag) {
+            kept.push(arg);
+            continue;
+        }
+        let name = rev
+            .split_once(':')
+            .map(|(_, path)| path.as_bytes().to_vec())
+            .unwrap_or_default();
+        excluded.push(RevListObject {
+            oid,
+            name,
+            object_type: Some(object.object_type),
+        });
+    }
+    *args = kept;
+    Ok(excluded)
+}
+
+fn rev_list_missing_tip_objects(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    candidates: &[String],
+    selected_commit_oids: &HashSet<ObjectId>,
+    known_direct_object_oids: &HashSet<ObjectId>,
+    objects: bool,
+    missing_action: RevListMissingAction,
+) -> Result<RevListRecoveredMissingTips> {
+    let mut provided = Vec::new();
+    let mut missing = Vec::new();
+    let mut provided_seen = HashSet::new();
+    let mut missing_seen = HashSet::new();
+    for candidate in candidates {
+        let Ok(oid) = sley_rev::resolve_revision_with_reader(git_dir, format, db, candidate) else {
+            continue;
+        };
+        if selected_commit_oids.contains(&oid) || known_direct_object_oids.contains(&oid) {
+            continue;
+        }
+        match db.read_object(&oid) {
+            Ok(object) if objects && object.object_type == ObjectType::Tag => {
+                let tag = Tag::parse(format, &object.body)?;
+                if provided_seen.insert(oid) {
+                    provided.push(RevListObject {
+                        oid,
+                        name: tag.name,
+                        object_type: Some(ObjectType::Tag),
+                    });
+                }
+                if matches!(
+                    missing_action,
+                    RevListMissingAction::Print | RevListMissingAction::PrintInfo
+                ) && db.read_object(&tag.object).is_err()
+                    && missing_seen.insert(tag.object)
+                {
+                    missing.push(RevListObject {
+                        oid: tag.object,
+                        name: Vec::new(),
+                        object_type: Some(tag.object_type),
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(_) if matches!(
+                missing_action,
+                RevListMissingAction::Print | RevListMissingAction::PrintInfo
+            ) && missing_seen.insert(oid) =>
+            {
+                missing.push(RevListObject {
+                    oid,
+                    name: Vec::new(),
+                    object_type: None,
+                });
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(RevListRecoveredMissingTips { provided, missing })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1866,6 +2071,7 @@ fn rev_list_objects(
     format: ObjectFormat,
     records: &[&sley_rev::CommitRecord],
     excluded: &HashSet<ObjectId>,
+    exclude_objects: &[RevListObject],
     filter: &RevListObjectFilter,
     collect_omitted: bool,
     missing_action: RevListMissingAction,
@@ -1881,6 +2087,14 @@ fn rev_list_objects(
         }
         let commit = Commit::parse_ref(format, &object.body)?;
         rev_list_mark_tree_objects(db, format, &commit.tree, &mut seen)?;
+    }
+    for object in exclude_objects {
+        match object.object_type {
+            Some(ObjectType::Tree) => rev_list_mark_tree_objects(db, format, &object.oid, &mut seen)?,
+            _ => {
+                seen.insert(object.oid);
+            }
+        }
     }
     let mut state = RevListObjectState::default();
     let walk = RevListObjectWalk {
@@ -1928,7 +2142,7 @@ fn rev_list_mark_tree_objects(
     tree_oid: &ObjectId,
     seen: &mut HashSet<ObjectId>,
 ) -> Result<()> {
-    if seen.contains(tree_oid) {
+    if !seen.insert(*tree_oid) {
         return Ok(());
     }
     let object = db.read_object(tree_oid)?;
@@ -1958,13 +2172,23 @@ fn rev_list_collect_tree_objects(
     tree_depth: Option<usize>,
     depth: usize,
 ) -> Result<()> {
-    if !seen.insert(*tree_oid) {
+    if seen.contains(tree_oid) {
         return Ok(());
     }
     let object = match walk.db.read_object(tree_oid) {
         Ok(object) => object,
-        Err(err) => return rev_list_handle_missing_object(walk, tree_oid, state, err),
+        Err(err) => {
+            return rev_list_handle_missing_object(
+                walk,
+                tree_oid,
+                &path,
+                Some(ObjectType::Tree),
+                state,
+                err,
+            );
+        }
     };
+    seen.insert(*tree_oid);
     if object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(
             "expected tree {tree_oid}, found {}",
@@ -2019,7 +2243,14 @@ fn rev_list_collect_tree_objects(
                 let object = match walk.db.read_object(&entry.oid) {
                     Ok(object) => object,
                     Err(err) => {
-                        rev_list_handle_missing_object(walk, &entry.oid, state, err)?;
+                        rev_list_handle_missing_object(
+                            walk,
+                            &entry.oid,
+                            &entry_path,
+                            Some(entry_type),
+                            state,
+                            err,
+                        )?;
                         continue;
                     }
                 };
@@ -2036,6 +2267,8 @@ fn rev_list_collect_tree_objects(
                 rev_list_handle_missing_object(
                     walk,
                     &entry.oid,
+                    &entry_path,
+                    Some(entry_type),
                     state,
                     GitError::object_not_found(entry.oid),
                 )?;
@@ -2077,6 +2310,7 @@ fn rev_list_record_filter_decision(
             state.objects.push(RevListObject {
                 oid: *oid,
                 name: path.to_vec(),
+                object_type: Some(object_type),
             });
         }
         state.omitted_oids.remove(oid);
@@ -2085,6 +2319,7 @@ fn rev_list_record_filter_decision(
         state.omitted.push(RevListObject {
             oid: *oid,
             name: Vec::new(),
+            object_type: Some(object_type),
         });
     }
     Ok(())
@@ -2098,7 +2333,16 @@ fn rev_list_collect_omitted_tree_contents(
 ) -> Result<()> {
     let object = match walk.db.read_object(tree_oid) {
         Ok(object) => object,
-        Err(err) => return rev_list_handle_missing_object(walk, tree_oid, state, err),
+        Err(err) => {
+            return rev_list_handle_missing_object(
+                walk,
+                tree_oid,
+                path,
+                Some(ObjectType::Tree),
+                state,
+                err,
+            );
+        }
     };
     if object.object_type != ObjectType::Tree {
         return Ok(());
@@ -2126,17 +2370,20 @@ fn rev_list_collect_omitted_tree_contents(
 fn rev_list_handle_missing_object(
     walk: &RevListObjectWalk<'_>,
     oid: &ObjectId,
+    path: &[u8],
+    object_type: Option<ObjectType>,
     state: &mut RevListObjectState,
     err: GitError,
 ) -> Result<()> {
     match walk.missing_action {
         RevListMissingAction::Error => Err(err),
         RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor => Ok(()),
-        RevListMissingAction::Print => {
+        RevListMissingAction::Print | RevListMissingAction::PrintInfo => {
             if state.missing_oids.insert(*oid) {
                 state.missing.push(RevListObject {
                     oid: *oid,
-                    name: Vec::new(),
+                    name: path.to_vec(),
+                    object_type,
                 });
             }
             Ok(())
@@ -2192,11 +2439,62 @@ fn write_rev_list_omitted_object_line(
 fn write_rev_list_missing_object_line(
     object: &RevListObject,
     nul_terminated: bool,
+    print_info: bool,
 ) -> Result<()> {
     let mut stdout = io::stdout();
+    if nul_terminated {
+        if print_info {
+            write!(stdout, "{}", object.oid)?;
+            stdout.write_all(b"\0missing=yes\0")?;
+            if !object.name.is_empty() {
+                stdout.write_all(b"path=")?;
+                stdout.write_all(&object.name)?;
+                stdout.write_all(b"\0")?;
+            }
+            if let Some(object_type) = object.object_type {
+                write!(stdout, "type={}", object_type.as_str())?;
+                stdout.write_all(b"\0")?;
+            }
+        } else {
+            write!(stdout, "?{}", object.oid)?;
+            stdout.write_all(b"\0")?;
+        }
+        return Ok(());
+    }
     write!(stdout, "?{}", object.oid)?;
-    stdout.write_all(if nul_terminated { b"\0" } else { b"\n" })?;
+    if print_info {
+        if !object.name.is_empty() {
+            stdout.write_all(b" path=")?;
+            stdout.write_all(&rev_list_quote_missing_path(&object.name))?;
+        }
+        if let Some(object_type) = object.object_type {
+            write!(stdout, " type={}", object_type.as_str())?;
+        }
+    }
+    stdout.write_all(b"\n")?;
     Ok(())
+}
+
+fn rev_list_quote_missing_path(path: &[u8]) -> Vec<u8> {
+    let needs_quote = path.iter().any(|byte| {
+        byte.is_ascii_whitespace() || matches!(*byte, b'"' | b'\\') || !byte.is_ascii_graphic()
+    });
+    if !needs_quote {
+        return path.to_vec();
+    }
+    let mut out = Vec::with_capacity(path.len() + 2);
+    out.push(b'"');
+    for byte in path {
+        match *byte {
+            b'"' => out.extend_from_slice(br#"\""#),
+            b'\\' => out.extend_from_slice(br#"\\"#),
+            b'\n' => out.extend_from_slice(br#"\n"#),
+            b'\t' => out.extend_from_slice(br#"\t"#),
+            other => out.push(other),
+        }
+    }
+    out.push(b'"');
+    out
 }
 
 fn rev_list_disk_usage(
@@ -2256,6 +2554,7 @@ fn rev_list_start_from_oid(
         Some(RevListObject {
             oid,
             name: tag.name,
+            object_type: Some(ObjectType::Tag),
         })
     } else {
         None
