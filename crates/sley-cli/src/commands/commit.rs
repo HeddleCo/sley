@@ -1331,6 +1331,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
+    commands::rerere::record_resolved_after_commit(&git_dir, format)?;
     remove_commit_state_files(&git_dir);
     if let Some((summary_author, summary_committer, summary_message)) = summary {
         print_commit_summary(

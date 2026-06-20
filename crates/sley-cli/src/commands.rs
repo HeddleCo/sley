@@ -64,6 +64,7 @@ pub(crate) mod ref_command_stream;
 pub(crate) mod refs;
 pub(crate) mod remote_cmds;
 pub(crate) mod replay;
+pub(crate) mod rerere;
 pub(crate) mod reset;
 pub(crate) mod rev_list;
 pub(crate) mod rev_parse;

@@ -16,9 +16,10 @@ mod merge_util;
 mod pull;
 
 pub(crate) use merge::{
-    apply_merge_autostash, cmd_fmt_merge_msg, cmd_merge, conclude_in_progress_merge,
-    conclude_rebase_step_via_commit, directory_renames_config, effective_config_with_overrides,
-    index_unmerged_paths, parse_maybe_bool, print_branch_commit_summary,
+    apply_merge_autostash, cmd_fmt_merge_msg, cmd_merge, cmd_merge_recursive,
+    conclude_in_progress_merge, conclude_rebase_step_via_commit, directory_renames_config,
+    effective_config_with_overrides, index_unmerged_paths, parse_maybe_bool,
+    print_branch_commit_summary,
     print_commit_shortstat_between_trees, read_merge_message_from_file, read_worktree_index,
     rebase_in_progress, save_merge_autostash, set_reflog_action_override,
     verify_fast_forward_untracked_safe,

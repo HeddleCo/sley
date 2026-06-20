@@ -1125,6 +1125,8 @@ struct MergeOptions {
     into_name: Option<String>,
     /// Move populated submodule worktrees when gitlink entries change.
     recurse_submodules: bool,
+    /// `--rerere-autoupdate` / `--no-rerere-autoupdate`.
+    rerere_autoupdate: Option<bool>,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -1158,6 +1160,7 @@ impl Default for MergeOptions {
             autostash: None,
             into_name: None,
             recurse_submodules: false,
+            rerere_autoupdate: None,
         }
     }
 }
@@ -2283,6 +2286,8 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--continue" => parsed.continue_merge = true,
             "--autostash" => options.autostash = Some(true),
             "--no-autostash" => options.autostash = Some(false),
+            "--rerere-autoupdate" => options.rerere_autoupdate = Some(true),
+            "--no-rerere-autoupdate" => options.rerere_autoupdate = Some(false),
             "--recurse-submodules" => options.recurse_submodules = true,
             "--no-recurse-submodules" => options.recurse_submodules = false,
             value if value.starts_with("--recurse-submodules=") => {
@@ -2499,6 +2504,7 @@ fn split_cmdline(cmdline: &str) -> std::result::Result<Vec<String>, SplitCmdline
 /// invocation here and `merge`/`rebase` read it back via
 /// [`reflog_action_override`].
 static REFLOG_ACTION_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static SUPPRESS_RERERE_ONCE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Record the reflog action git would have put in `GIT_REFLOG_ACTION` (e.g. the
 /// `pull …` argv) for `merge`/`rebase` invoked in-process to pick up.
@@ -2569,7 +2575,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         // git's `--quit` (remove_merge_branch_state): drop the in-progress merge
         // bookkeeping, leaving the index and worktree exactly as they are.
         save_merge_autostash(&git_dir, format);
-        commands::plumbing::rerere_clear(&git_dir)?;
+        commands::rerere::rerere_clear(&git_dir)?;
         clear_in_progress_merge_state(&git_dir);
         return Ok(());
     }
@@ -3267,7 +3273,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         &options,
         None,
     )?;
-    write_rerere_merge_rr(&git_dir, &conflicts)?;
+    run_rerere_after_conflicted_merge(&git_dir, format, &options)?;
     if merge_autostash {
         write_merge_autostash_marker(&git_dir)?;
     }
@@ -3277,6 +3283,27 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     print_merge_conflict_messages(&results);
     eprintln!("Automatic merge failed; fix conflicts and then commit the result.");
     Err(GitError::Exit(1))
+}
+
+pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        return Err(GitError::Command(
+            "merge-recursive requires '<base> -- <head> <remote>'".into(),
+        ));
+    };
+    let Some(remote) = args.get(separator + 2) else {
+        return Err(GitError::Command(
+            "merge-recursive requires '<base> -- <head> <remote>'".into(),
+        ));
+    };
+    if let Ok(mut suppress) = SUPPRESS_RERERE_ONCE.lock() {
+        *suppress = true;
+    }
+    let result = cmd_merge(std::slice::from_ref(remote));
+    if let Ok(mut suppress) = SUPPRESS_RERERE_ONCE.lock() {
+        *suppress = false;
+    }
+    result
 }
 
 fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
@@ -3498,28 +3525,21 @@ fn merge_conflict_cleanup_scissors(options: &MergeOptions) -> bool {
         .unwrap_or(false)
 }
 
-fn write_rerere_merge_rr(git_dir: &Path, conflicts: &[Vec<u8>]) -> Result<()> {
-    if conflicts.is_empty() || !rerere_enabled_for_merge(git_dir) {
+fn run_rerere_after_conflicted_merge(
+    git_dir: &Path,
+    format: ObjectFormat,
+    options: &MergeOptions,
+) -> Result<()> {
+    if let Ok(mut suppress) = SUPPRESS_RERERE_ONCE.lock()
+        && *suppress
+    {
+        *suppress = false;
         return Ok(());
     }
-    fs::create_dir_all(git_dir.join("rr-cache"))?;
-    let mut data = Vec::new();
-    for path in conflicts {
-        data.extend_from_slice(b"0000000000000000000000000000000000000000\t");
-        data.extend_from_slice(String::from_utf8_lossy(path).as_bytes());
-        data.push(0);
+    if !commands::rerere::is_rerere_enabled(git_dir) {
+        return Ok(());
     }
-    fs::write(git_dir.join("MERGE_RR"), data)?;
-    Ok(())
-}
-
-fn rerere_enabled_for_merge(git_dir: &Path) -> bool {
-    if let Some(config) = effective_config_with_overrides()
-        && let Some(value) = config.get("rerere", None, "enabled")
-    {
-        return parse_maybe_bool(value.trim()).unwrap_or(false);
-    }
-    git_dir.join("rr-cache").is_dir()
+    commands::rerere::repo_rerere(git_dir, format, options.rerere_autoupdate).map(|_| ())
 }
 
 /// git's pre-merge `verify_uptodate` guard. Returns an error (exit 2, matching
@@ -3804,6 +3824,7 @@ pub(crate) fn conclude_in_progress_merge(
         merge_commit_reflog_message(&message),
         committer,
     )?;
+    commands::rerere::record_resolved_after_commit(git_dir, format)?;
     clear_in_progress_merge_state(git_dir);
     apply_merge_autostash(git_dir, format);
     if !quiet {

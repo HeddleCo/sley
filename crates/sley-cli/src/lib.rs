@@ -278,6 +278,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "whatchanged" => commands::log::cmd_whatchanged(&args[1..]),
         "merge" => commands::merge_rebase::cmd_merge(&args[1..]),
         "merge-base" => commands::merge_rebase::cmd_merge_base(&args[1..]),
+        "merge-recursive" => commands::merge_rebase::cmd_merge_recursive(&args[1..]),
         "fmt-merge-msg" => commands::merge_rebase::cmd_fmt_merge_msg(&args[1..]),
         "mergetool" => commands::mergetool::cmd_mergetool(&args[1..]),
         "pull" => {
@@ -316,7 +317,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "reflog" => commands::refs::cmd_reflog(&args[1..]),
         "remote" => commands::remote_cmds::cmd_remote(&args[1..]),
         "replace" => commands::plumbing::cmd_replace(&args[1..]),
-        "rerere" => commands::plumbing::cmd_rerere(&args[1..]),
+        "rerere" => commands::rerere::cmd_rerere(&args[1..]),
         "reset" => commands::reset::cmd_reset(&args[1..]),
         "restore" => commands::checkout::cmd_restore(&args[1..]),
         "rm" => commands::plumbing::cmd_rm(&args[1..]),
