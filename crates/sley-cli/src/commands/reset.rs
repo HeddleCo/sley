@@ -26,8 +26,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let mut intent_to_add = false;
     let mut patch = false;
     let mut no_auto_advance = false;
-    let mut unified_context = false;
-    let mut inter_hunk_context = false;
+    let mut unified_context: Option<i64> = None;
+    let mut inter_hunk_context: Option<i64> = None;
     // git's `reset --mixed` refreshes the index stat-cache by default; `--no-refresh`
     // leaves the freshly-restored entries stat-dirty so `git diff-files` shows them.
     let mut refresh = true;
@@ -61,39 +61,42 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                     return commit_unified_requires_value_error(true);
                 };
                 patch_validate_unified_context(value, true)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             value if value.starts_with("-U") && value.len() > 2 => {
-                patch_validate_unified_context(&value[2..], true)?;
-                unified_context = true;
+                let value = &value[2..];
+                patch_validate_unified_context(value, true)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified" => {
                 let Some(value) = iter.next() else {
                     return commit_unified_requires_value_error(false);
                 };
                 patch_validate_unified_context(value, false)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified=" => {
                 return commit_unified_expects_numerical_value_error(false);
             }
             value if value.starts_with("--unified=") => {
-                patch_validate_unified_context(&value["--unified=".len()..], false)?;
-                unified_context = true;
+                let value = &value["--unified=".len()..];
+                patch_validate_unified_context(value, false)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context" => {
                 let Some(value) = iter.next() else {
                     return commit_inter_hunk_context_requires_value_error();
                 };
                 patch_validate_inter_hunk_context(value)?;
-                inter_hunk_context = true;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context=" => {
                 return commit_inter_hunk_context_expects_numerical_value_error();
             }
             value if value.starts_with("--inter-hunk-context=") => {
-                patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
-                inter_hunk_context = true;
+                let value = &value["--inter-hunk-context=".len()..];
+                patch_validate_inter_hunk_context(value)?;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             // A whole-tree `--mixed` reset restores index entries with a zeroed
             // cached stat (see `restored_head_index_entry`). git refreshes them
@@ -162,11 +165,11 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if unified_context && !patch {
+    if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if inter_hunk_context && !patch {
+    if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
@@ -174,6 +177,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         let mut stdin = io::stdin().lock();
         let mut cfg = commands::add_patch::PatchConfig {
             auto_advance: !no_auto_advance,
+            context: unified_context.map(|value| value as usize),
+            interhunk: inter_hunk_context.map(|value| value as usize),
             ..commands::add_patch::PatchConfig::default()
         };
         cfg.reset_interactive = sley_config::read_repo_config(
