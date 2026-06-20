@@ -437,7 +437,7 @@ declare -A FLOOR=(
     # false dir-renames), rename/rename(1to2) split higher-stages, transitive dest
     # remapping for rename/delete. t6423 34->41 (raw 41/82, 2 known breakages).
     # Side gains banked: t6402 34->35, t6422 NEW@6.
-    [t6423-merge-rename-directories.sh]=52
+    [t6423-merge-rename-directories.sh]=55
     [t6422-merge-rename-corner-cases.sh]=6
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
@@ -656,7 +656,7 @@ declare -A FLOOR=(
     # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
     # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
     [t1091-sparse-checkout-builtin.sh]=50
-    [t1092-sparse-checkout-compatibility.sh]=34
+    [t1092-sparse-checkout-compatibility.sh]=39
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
@@ -698,7 +698,7 @@ declare -A FLOOR=(
     [t4072-diff-max-depth.sh]=50
     [t6132-pathspec-exclude.sh]=23
     [t6135-pathspec-with-attrs.sh]=27
-    [t6022-rev-list-missing.sh]=13
+    [t6022-rev-list-missing.sh]=40
     [t1013-read-tree-submodule.sh]=52
     [t2013-checkout-submodule.sh]=51
     [t7112-reset-submodule.sh]=54
@@ -829,6 +829,15 @@ declare -A FLOOR=(
     [t5572-pull-submodule.sh]=40
     [t4255-am-submodule.sh]=17
     [t1502-rev-parse-parseopt.sh]=37
+    # wave-22 (2026-06-20, integ/wave22 onto cb9e88a2): sparse-compat deep + rev-list-missing
+    # + merge-rename-dirs + rerere (greenfield). All hermetic vs the integ binary. sparse t1092
+    # 34->39 (aggressive bucket-by-bucket: checkout sparse-materialize/reset skip-worktree/
+    # read-tree paired-entries/status sparse-mode), rev-list-missing t6022 13->40 FULL (--missing
+    # modes + list-objects-filter), merge dir-rename t6423 52->55, rerere t4200 11->34 NEW (native
+    # rr-cache + 6 subcmds + replay/autoupdate hooks). rerere<->merge-rename merge.rs auto-merge
+    # SAFE (t7600=83 t3404=94 t3501=21 t6402=35 held). Cross-guards held EXACTLY (t1091=53 t1011=19
+    # t7508=119 t7102=37 t2013=51 t6112=48 t6006=58 t4202=124); cargo test green.
+    [t4200-rerere.sh]=34
 )
 
 fail=0
