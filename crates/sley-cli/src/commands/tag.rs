@@ -46,7 +46,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut points_at = Vec::new();
     let mut contains = Vec::new();
     let mut no_contains = Vec::new();
-    let mut merged = None;
+    let mut merged = Vec::new();
+    let mut no_merged = Vec::new();
     let mut messages = Vec::new();
     let mut file_message = None;
     let mut trailers = Vec::new();
@@ -209,13 +210,13 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
-                merged = Some((value, true));
+                merged.push(value);
             }
             "--no-merged" => {
                 let value = iter
                     .next()
                     .map_or_else(|| "HEAD".to_string(), |value| value.to_string());
-                merged = Some((value, false));
+                no_merged.push(value);
             }
             // `--with`/`--without` are hidden aliases for `--contains`/
             // `--no-contains` (parse-options.h OPT_WITH/OPT_WITHOUT). Like their
@@ -315,13 +316,13 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 let value = value
                     .strip_prefix("--merged=")
                     .ok_or_else(|| GitError::Command("tag --merged requires a value".into()))?;
-                merged = Some((value.to_string(), true));
+                merged.push(value.to_string());
             }
             value if value.starts_with("--no-merged=") => {
                 let value = value
                     .strip_prefix("--no-merged=")
                     .ok_or_else(|| GitError::Command("tag --no-merged requires a value".into()))?;
-                merged = Some((value.to_string(), false));
+                no_merged.push(value.to_string());
             }
             value if value.starts_with("--sort=") => {
                 let value = value
@@ -499,7 +500,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         && points_at.is_empty()
         && contains.is_empty()
         && no_contains.is_empty()
-        && merged.is_none()
+        && merged.is_empty()
+        && no_merged.is_empty()
         && messages.is_empty()
         && file_message.is_none()
         && trailers.is_empty()
@@ -523,9 +525,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             Some("--no-contains")
         } else if !points_at.is_empty() {
             Some("--points-at")
-        } else if matches!(merged, Some((_, true))) {
+        } else if !merged.is_empty() {
             Some("--merged")
-        } else if matches!(merged, Some((_, false))) {
+        } else if !no_merged.is_empty() {
             Some("--no-merged")
         } else {
             None
@@ -563,7 +565,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         || !points_at.is_empty()
         || !contains.is_empty()
         || !no_contains.is_empty()
-        || merged.is_some()
+        || !merged.is_empty()
+        || !no_merged.is_empty()
     {
         if annotated || force || delete || !messages.is_empty() || file_message.is_some() {
             return Err(GitError::Command(
@@ -594,11 +597,13 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             .map(|rev| resolve_tag_contains_filter(&git_dir, format, rev))
             .collect::<Result<Vec<_>>>()?;
         let merged = merged
-            .as_ref()
-            .map(|(rev, include)| {
-                resolve_tag_merged_filter(&git_dir, format, rev).map(|oid| (oid, *include))
-            })
-            .transpose()?;
+            .iter()
+            .map(|rev| resolve_tag_merged_filter(&git_dir, format, rev))
+            .collect::<Result<Vec<_>>>()?;
+        let no_merged = no_merged
+            .iter()
+            .map(|rev| resolve_tag_merged_filter(&git_dir, format, rev))
+            .collect::<Result<Vec<_>>>()?;
         let prereleases = if sorts.iter().any(|sort| {
             matches!(
                 sort,
@@ -630,7 +635,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 points_at: &points_at,
                 contains: &contains,
                 no_contains: &no_contains,
-                merged: merged.as_ref().map(|(oid, include)| (oid, *include)),
+                merged: &merged,
+                no_merged: &no_merged,
             },
         )?;
         return Ok(());
@@ -773,7 +779,8 @@ fn print_default_tag_list(
             points_at: &[],
             contains: &[],
             no_contains: &[],
-            merged: None,
+            merged: &[],
+            no_merged: &[],
         },
     )
 }
@@ -1554,7 +1561,8 @@ struct TagListOptions<'a> {
     points_at: &'a [ObjectId],
     contains: &'a [ObjectId],
     no_contains: &'a [ObjectId],
-    merged: Option<(&'a ObjectId, bool)>,
+    merged: &'a [ObjectId],
+    no_merged: &'a [ObjectId],
 }
 
 /// Resolve the version-sort prerelease/suffix list from config, mirroring
@@ -2063,12 +2071,15 @@ fn print_tag_list(
         || !options.points_at.is_empty()
         || !options.contains.is_empty()
         || !options.no_contains.is_empty()
-        || options.merged.is_some()
+        || !options.merged.is_empty()
+        || !options.no_merged.is_empty()
         || options
             .sorts
             .iter()
             .any(|sort| sort.needs_object_metadata()))
     .then(|| FileObjectDatabase::from_git_dir(git_dir, format));
+    let merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.merged)?;
+    let no_merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.no_merged)?;
     let mut entries = Vec::new();
     for reference in store.list_refs()? {
         if let Some(name) = reference.name.strip_prefix("refs/tags/")
@@ -2084,7 +2095,13 @@ fn print_tag_list(
                 options.contains,
                 options.no_contains,
             )?
-            && tag_merged(&db, format, &reference.target, options.merged)?
+            && tag_merged(
+                &db,
+                format,
+                &reference.target,
+                &merged_reachable,
+                &no_merged_reachable,
+            )?
         {
             entries.push(TagListEntry {
                 name: name.to_string(),
@@ -3193,26 +3210,50 @@ fn tag_merged(
     db: &Option<FileObjectDatabase>,
     format: ObjectFormat,
     target: &RefTarget,
-    merged: Option<(&ObjectId, bool)>,
+    merged_reachable: &[HashSet<ObjectId>],
+    no_merged_reachable: &[HashSet<ObjectId>],
 ) -> Result<bool> {
-    let Some((merged, include)) = merged else {
+    if merged_reachable.is_empty() && no_merged_reachable.is_empty() {
         return Ok(true);
     };
     let Some(db) = db else {
-        return Ok(!include);
+        return Ok(false);
     };
-    let merged = sley_rev::peel_to_commit(db, format, merged)?;
-    let reachable = sley_rev::walk_commits(db, format, [merged])?
-        .into_iter()
-        .map(|record| record.oid)
-        .collect::<HashSet<_>>();
     let RefTarget::Direct(oid) = target else {
-        return Ok(!include);
+        return Ok(false);
     };
-    let merged = sley_rev::peel_to_commit(db, format, oid)
-        .map(|oid| reachable.contains(&oid))
-        .unwrap_or(false);
-    Ok(merged == include)
+    let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
+        return Ok(false);
+    };
+    let merged_match =
+        merged_reachable.is_empty() || merged_reachable.iter().any(|set| set.contains(&tip));
+    let no_merged_match = no_merged_reachable.iter().any(|set| set.contains(&tip));
+    Ok(merged_match && !no_merged_match)
+}
+
+fn tag_merged_reachable_sets(
+    db: Option<&FileObjectDatabase>,
+    format: ObjectFormat,
+    filters: &[ObjectId],
+) -> Result<Vec<HashSet<ObjectId>>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(db) = db else {
+        return Ok(Vec::new());
+    };
+    filters
+        .iter()
+        .map(|oid| {
+            let commit = sley_rev::peel_to_commit(db, format, oid)?;
+            sley_rev::walk_commits(db, format, [commit]).map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| record.oid)
+                    .collect::<HashSet<_>>()
+            })
+        })
+        .collect()
 }
 
 fn tag_points_at(
