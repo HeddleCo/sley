@@ -101,6 +101,7 @@ jobs:
           SLEY_TESTS: >-
             t0001-init.sh
             t0008-ignores.sh
+            t0012-help.sh
             t0020-crlf.sh
             t0021-conversion.sh
             t0027-auto-crlf.sh
@@ -117,6 +118,7 @@ jobs:
             t1461-refs-list.sh
             t1462-refs-exists.sh
             t1500-rev-parse.sh
+            t1506-rev-parse-diagnosis.sh
             t1510-repo-setup.sh
             t1800-hook.sh
             t1900-repo-info.sh
@@ -186,6 +188,7 @@ jobs:
             t3510-cherry-pick-sequence.sh
             t3600-rm.sh
             t3903-stash.sh
+            t3900-i18n-commit.sh
             t3920-crlf-messages.sh
             t4013-diff-various.sh
             t4014-format-patch.sh

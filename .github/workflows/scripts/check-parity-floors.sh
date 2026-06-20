@@ -394,6 +394,7 @@ declare -A FLOOR=(
     # side gain t1463 43->45. Auto-merge w/ wave-10 (branch.rs/log.rs/pack.rs) held:
     # t6040=44 t4205=110 t7700=29 t3404=80.
     [t1500-rev-parse.sh]=81
+    [t1506-rev-parse-diagnosis.sh]=30
     [t2400-worktree-add.sh]=214
     # codex-wave-11 (worktree repair): re-link .git file + worktrees/<id>/gitdir
     # back-pointer after a move, broken-link detection + repair messages, repair
@@ -500,7 +501,7 @@ declare -A FLOOR=(
     [t5332-multi-pack-reuse.sh]=9
     [t4013-diff-various.sh]=205
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
-    [t4014-format-patch.sh]=202
+    [t4014-format-patch.sh]=208
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     [t4150-am.sh]=84
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
@@ -525,6 +526,7 @@ declare -A FLOOR=(
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=398
+    [t0012-help.sh]=153
     # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
     # codex-wave-11 (submodule verbs): add/init/status/sync/deinit/update/foreach/
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
@@ -547,6 +549,7 @@ declare -A FLOOR=(
     # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
     # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
     [t3903-stash.sh]=133
+    [t3900-i18n-commit.sh]=38
     [t4209-log-pickaxe.sh]=45
     # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
     # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
