@@ -5155,6 +5155,15 @@ pub enum MergeInfoMessage {
         added_in: String,
         dir_renamed_in: String,
     },
+    /// A rename/delete conflict whose conflicted destination was later moved
+    /// aside by directory/file conflict handling. The primary per-path conflict
+    /// remains `FileDirectory`; this preserves git's extra rename/delete line.
+    RenameDeleteConflict {
+        old_path: Vec<u8>,
+        new_path: Vec<u8>,
+        renamed_in: String,
+        deleted_in: String,
+    },
 }
 
 /// Read a tree object (by oid) into a flattened path -> (mode, oid) map,
@@ -5736,6 +5745,7 @@ pub fn merge_entry_maps(
         &eff_ours,
         &eff_theirs,
         options,
+        &mut info_messages,
     )?;
 
     let tree = write_merged_tree(db, &leaves)?;
@@ -5799,6 +5809,7 @@ fn resolve_directory_file_conflicts(
     eff_ours: &MergeEntryMap,
     eff_theirs: &MergeEntryMap,
     options: &MergeTreesOptions<'_>,
+    info_messages: &mut Vec<MergeInfoMessage>,
 ) -> Result<()> {
     // A path is a "directory" in the result iff some leaf key has it as a strict
     // `path/` prefix. Collect every such directory prefix once.
@@ -5849,6 +5860,19 @@ fn resolve_directory_file_conflicts(
         // Relocate the path's MergedPath: update its destination and stamp the D/F
         // conflict. If the path had no MergedPath (defensive), synthesize one.
         if let Some(slot) = paths.iter_mut().find(|p| p.path == original) {
+            if let Some(MergeConflictKind::RenameDelete {
+                old_path,
+                renamed_in,
+                deleted_in,
+            }) = &slot.conflict
+            {
+                info_messages.push(MergeInfoMessage::RenameDeleteConflict {
+                    old_path: old_path.clone(),
+                    new_path: original.clone(),
+                    renamed_in: renamed_in.clone(),
+                    deleted_in: deleted_in.clone(),
+                });
+            }
             slot.path = new_path.clone();
             slot.result = Some(entry);
             // Preserve any pre-existing higher-order stages; a clean file leaf has

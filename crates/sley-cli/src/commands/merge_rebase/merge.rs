@@ -3368,6 +3368,18 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
                     String::from_utf8_lossy(new_path),
                 ),
             },
+            sley_diff_merge::MergeInfoMessage::RenameDeleteConflict {
+                old_path,
+                new_path,
+                renamed_in,
+                deleted_in,
+            } => {
+                println!(
+                    "CONFLICT (rename/delete): {} renamed to {} in {renamed_in}, but deleted in {deleted_in}.",
+                    String::from_utf8_lossy(old_path),
+                    String::from_utf8_lossy(new_path),
+                );
+            }
         }
     }
 }
