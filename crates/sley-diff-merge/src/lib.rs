@@ -5700,32 +5700,31 @@ pub fn merge_entry_maps(
     if !dir_rename_conflict_paths.is_empty() {
         clean = false;
         for (dest, infos) in &dir_rename_conflict_paths {
-            let Some(info) = infos.ours.as_ref().or(infos.theirs.as_ref()) else {
-                continue;
-            };
-            let (added_in, dir_renamed_in) = if info.added_on_ours {
-                // The path was added/renamed by ours, into a dir theirs renamed.
-                (options.ours_label.to_string(), options.theirs_label.to_string())
-            } else {
-                (options.theirs_label.to_string(), options.ours_label.to_string())
-            };
-            if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
-                && slot.conflict.is_none()
-            {
-                slot.conflict = Some(MergeConflictKind::DirRenameLocation {
-                    old_path: info.old_path.clone(),
-                    renamed_from: info.renamed_from.clone(),
-                    added_in,
-                    dir_renamed_in,
-                });
-            } else {
-                info_messages.push(MergeInfoMessage::DirRenameLocationConflict {
-                    old_path: info.old_path.clone(),
-                    new_path: dest.clone(),
-                    renamed_from: info.renamed_from.clone(),
-                    added_in,
-                    dir_renamed_in,
-                });
+            for info in [&infos.ours, &infos.theirs].into_iter().flatten() {
+                let (added_in, dir_renamed_in) = if info.added_on_ours {
+                    // The path was added/renamed by ours, into a dir theirs renamed.
+                    (options.ours_label.to_string(), options.theirs_label.to_string())
+                } else {
+                    (options.theirs_label.to_string(), options.ours_label.to_string())
+                };
+                if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
+                    && slot.conflict.is_none()
+                {
+                    slot.conflict = Some(MergeConflictKind::DirRenameLocation {
+                        old_path: info.old_path.clone(),
+                        renamed_from: info.renamed_from.clone(),
+                        added_in,
+                        dir_renamed_in,
+                    });
+                } else {
+                    info_messages.push(MergeInfoMessage::DirRenameLocationConflict {
+                        old_path: info.old_path.clone(),
+                        new_path: dest.clone(),
+                        renamed_from: info.renamed_from.clone(),
+                        added_in,
+                        dir_renamed_in,
+                    });
+                }
             }
         }
     }
