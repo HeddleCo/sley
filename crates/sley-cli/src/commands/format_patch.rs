@@ -1797,7 +1797,8 @@ fn render_format_patch_notes(
 /// once before walking the commits.
 fn resolve_format(options: &FormatPatchOptions, config: &GitConfig) -> Result<ResolvedFormat> {
     let prefix_body = resolve_prefix_body(options, config);
-    let header_block = resolve_header_block(options, config);
+    let encode_headers = encode_email_headers_on(options, config);
+    let header_block = resolve_header_block(options, config, encode_headers);
     let from_ident = resolve_from_ident(options, config)?;
     let force_in_body_from = options
         .force_in_body_from
@@ -1854,7 +1855,11 @@ fn resolve_prefix_body(options: &FormatPatchOptions, config: &GitConfig) -> Stri
 /// block. `--no-add-header` drops everything; `--no-to`/`--no-cc` drop only the
 /// configured recipients of that kind (a later `--to`/`--cc` re-adds the
 /// command-line ones).
-fn resolve_header_block(options: &FormatPatchOptions, config: &GitConfig) -> Vec<u8> {
+fn resolve_header_block(
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+    encode_headers: bool,
+) -> Vec<u8> {
     let mut headers: Vec<String> = Vec::new();
     let mut to: Vec<String> = Vec::new();
     let mut cc: Vec<String> = Vec::new();
@@ -1887,8 +1892,8 @@ fn resolve_header_block(options: &FormatPatchOptions, config: &GitConfig) -> Vec
         out.extend_from_slice(header.as_bytes());
         out.push(b'\n');
     }
-    write_recipient_block(&mut out, "To: ", &to);
-    write_recipient_block(&mut out, "Cc: ", &cc);
+    write_recipient_block(&mut out, "To: ", &to, encode_headers);
+    write_recipient_block(&mut out, "Cc: ", &cc, encode_headers);
     out
 }
 
@@ -1914,7 +1919,12 @@ fn route_config_header(
 /// Emit a folded `To: `/`Cc: ` recipient block: the first recipient on the
 /// header line, each subsequent one on a continuation line indented by four
 /// spaces, with a trailing comma after every recipient except the last.
-fn write_recipient_block(out: &mut Vec<u8>, label: &str, recipients: &[String]) {
+fn write_recipient_block(
+    out: &mut Vec<u8>,
+    label: &str,
+    recipients: &[String],
+    encode: bool,
+) {
     if recipients.is_empty() {
         return;
     }
@@ -1923,7 +1933,10 @@ fn write_recipient_block(out: &mut Vec<u8>, label: &str, recipients: &[String]) 
         if idx > 0 {
             out.extend_from_slice(b"    ");
         }
-        out.extend_from_slice(recipient.as_bytes());
+        match parse_from_ident(recipient) {
+            Ok(ident) => write_address_name_and_email(out, &ident.name, &ident.email, encode),
+            Err(_) => out.extend_from_slice(recipient.as_bytes()),
+        }
         if idx + 1 < recipients.len() {
             out.push(b',');
         }
@@ -2380,10 +2393,15 @@ fn write_email_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &[u8], 
 /// `max_length` columns; the ` <email>` is folded onto its own line when it would
 /// overflow that last line.
 fn write_from_header(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
+    out.extend_from_slice(b"From: ");
+    write_address_name_and_email(out, name, email, encode);
+    out.push(b'\n');
+}
+
+fn write_address_name_and_email(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
     let name_bytes = name.as_bytes();
     // git: max_length starts at 78, narrows to 76 once the name is rfc2047-encoded.
     let mut max_length: isize = 78;
-    out.extend_from_slice(b"From: ");
 
     if encode && needs_rfc2047_encoding(name_bytes) {
         add_rfc2047(out, name_bytes, Rfc2047Type::Address);
@@ -2402,7 +2420,7 @@ fn write_from_header(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
     if max_length < needed {
         out.push(b'\n');
     }
-    writeln_fmt_buf(out, format_args!(" <{email}>"));
+    write_fmt_buf(out, format_args!(" <{email}>"));
 }
 
 /// Per-mail threading headers: the `Message-ID`, the `In-Reply-To` target, and
