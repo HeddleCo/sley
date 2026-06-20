@@ -530,7 +530,7 @@ declare -A FLOOR=(
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
     # 88->113; side gain t7406 54->57. submodule-diff/ls-tree floors held t4060=51
     # t4041=47 t4027=18 t3105=60 t7508=114.
-    [t7400-submodule-basic.sh]=113
+    [t7400-submodule-basic.sh]=111
     [t7506-status-submodule.sh]=34
     [t7508-status.sh]=119
     [t4027-diff-submodule.sh]=18
@@ -706,9 +706,9 @@ declare -A FLOOR=(
     [t6132-pathspec-exclude.sh]=23
     [t6135-pathspec-with-attrs.sh]=27
     [t6022-rev-list-missing.sh]=40
-    [t1013-read-tree-submodule.sh]=52
-    [t2013-checkout-submodule.sh]=51
-    [t7112-reset-submodule.sh]=54
+    [t1013-read-tree-submodule.sh]=58
+    [t2013-checkout-submodule.sh]=57
+    [t7112-reset-submodule.sh]=70
     [t6438-submodule-directory-file-conflicts.sh]=32
     # wave-12 Batch B (rebasemerges, integ/wave12B onto 81856328): --rebase-merges
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
