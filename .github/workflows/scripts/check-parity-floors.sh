@@ -372,13 +372,16 @@ declare -A FLOOR=(
     [t1006-cat-file.sh]=290
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=497
-    # NOTE 2026-06-20 (wave-23 integ): current main measures 271, not 275. The 275
-    # floor was validly banked at wave-4 (eb1f4dfd) but a later reftable-migration
-    # commit silently regressed 4 cells (hidden — upstream-parity is weekly-only).
-    # Lowered to the honest current value; the badrefname fix-slice restores it to 275.
-    [t1400-update-ref.sh]=271
+    # 271->275 RESTORED 2026-06-20 (wave-23 fixes): the wave-4 (eb1f4dfd) floor of 275
+    # was silently regressed to 271 by a later reftable-migration commit; the badrefname
+    # fix-slice restores the 4 cells. CI-reproducible (local plumbing, no transport).
+    [t1400-update-ref.sh]=275
     [t1401-symbolic-ref.sh]=25
+    # t1430 + t7450 NEW 2026-06-20 (wave-23): bad-ref-name validation + bad-git-dotfiles
+    # security hardening. Enrolled in SLEY_TESTS below.
+    [t1430-bad-ref-name.sh]=40
     [t1450-fsck.sh]=96
+    [t7450-bad-git-dotfiles.sh]=45
     # codex-wave-10 (refs optimize / pack-refs): native pack-refs (selected loose
     # packing w/ include/exclude + default tag behavior), prune of packed loose
     # refs, packed-refs parse diagnostics, --auto heuristic, lock retry, packed
