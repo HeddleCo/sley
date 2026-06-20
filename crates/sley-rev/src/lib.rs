@@ -260,6 +260,61 @@ pub fn resolve_revision_with_config<R: ObjectReader>(
     resolve_revision_inner(git_dir, format, reader, rev, Some(config))
 }
 
+/// Resolve a revision expression to the full refname that names it, when the
+/// expression is ref-backed. This is the symbolic side of
+/// `resolve_revision_with_config`: it is used by callers such as
+/// `rev-parse --symbolic-full-name`, checkout, and branch deletion to keep
+/// `@{upstream}` selectors as refs instead of flattening them to object IDs.
+pub fn resolve_revision_symbolic_full_name(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<Option<String>> {
+    resolve_revision_symbolic_full_name_inner(git_dir, format, rev, None)
+}
+
+pub fn resolve_revision_symbolic_full_name_with_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    config: &GitConfig,
+) -> Result<Option<String>> {
+    resolve_revision_symbolic_full_name_inner(git_dir, format, rev, Some(config))
+}
+
+fn resolve_revision_symbolic_full_name_inner(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    config: Option<&GitConfig>,
+) -> Result<Option<String>> {
+    if rev.len() == format.hex_len() && rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    if let Some(name) = resolve_at_selector_ref_name(git_dir, format, rev, config)? {
+        return Ok(Some(name));
+    }
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    if rev == "HEAD" {
+        return refs.current_branch_ref();
+    }
+    if rev.starts_with("refs/") {
+        return Ok(refs.read_ref(rev)?.map(|_| rev.to_string()));
+    }
+    for candidate in [
+        format!("refs/{rev}"),
+        format!("refs/tags/{rev}"),
+        format!("refs/heads/{rev}"),
+        format!("refs/remotes/{rev}"),
+        format!("refs/remotes/{rev}/HEAD"),
+    ] {
+        if refs.read_ref(&candidate)?.is_some() {
+            return Ok(Some(candidate));
+        }
+    }
+    Err(GitError::not_found(format!("revision {rev}")))
+}
+
 fn resolve_revision_inner<R: ObjectReader>(
     git_dir: &Path,
     format: ObjectFormat,
@@ -529,7 +584,7 @@ fn resolve_at_selector(
     }
 
     // Everything else must be `<base>@{<selector>}` with the braces at the end.
-    let Some(open) = rev.find("@{") else {
+    let Some(open) = rev.rfind("@{") else {
         return Ok(None);
     };
     let Some(inner) = rev.strip_suffix('}') else {
@@ -541,6 +596,7 @@ fn resolve_at_selector(
         return Ok(None);
     }
     let base = &rev[..open];
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
 
     // `@{-N}` is special: it names a previously checked-out branch and ignores
     // any `<base>` to its left (git only accepts a bare `@{-N}`).
@@ -556,22 +612,66 @@ fn resolve_at_selector(
         )?));
     }
 
-    if inner == "u" || inner == "upstream" {
-        return Ok(Some(resolve_upstream(
-            git_dir, format, base, false, rev, config,
-        )?));
+    if inner.eq_ignore_ascii_case("u") || inner.eq_ignore_ascii_case("upstream") {
+        let upstream = resolve_upstream_ref(git_dir, format, base, false, rev, config)?;
+        return match resolve_revision_ref(&refs, &upstream.refname)? {
+            Some(oid) => Ok(Some(oid)),
+            None => Err(upstream.missing_error(rev)),
+        };
     }
-    if inner == "push" {
-        return Ok(Some(resolve_upstream(
-            git_dir, format, base, true, rev, config,
-        )?));
+    if inner.eq_ignore_ascii_case("push") {
+        let upstream = resolve_upstream_ref(git_dir, format, base, true, rev, config)?;
+        return match resolve_revision_ref(&refs, &upstream.refname)? {
+            Some(oid) => Ok(Some(oid)),
+            None => Err(upstream.missing_error(rev)),
+        };
     }
     if inner.bytes().all(|byte| byte.is_ascii_digit()) {
         let count = parse_at_count(rev, inner)?;
-        return Ok(Some(resolve_reflog_nth(git_dir, format, base, count, rev)?));
+        return Ok(Some(resolve_reflog_nth(
+            git_dir, format, base, count, rev, config,
+        )?));
     }
 
-    Ok(Some(resolve_reflog_date(git_dir, format, base, inner, rev)?))
+    Ok(Some(resolve_reflog_date(
+        git_dir, format, base, inner, rev, config,
+    )?))
+}
+
+fn resolve_at_selector_ref_name(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    rev: &str,
+    config: Option<&GitConfig>,
+) -> Result<Option<String>> {
+    let Some(open) = rev.rfind("@{") else {
+        return Ok(None);
+    };
+    let Some(inner) = rev.strip_suffix('}') else {
+        return Ok(None);
+    };
+    let inner = &inner[open + 2..];
+    if inner.contains('}') {
+        return Ok(None);
+    }
+    let base = &rev[..open];
+    if inner.eq_ignore_ascii_case("u") || inner.eq_ignore_ascii_case("upstream") {
+        return Ok(Some(
+            resolve_upstream_ref(git_dir, format, base, false, rev, config)?.refname,
+        ));
+    }
+    if inner.eq_ignore_ascii_case("push") {
+        return Ok(Some(
+            resolve_upstream_ref(git_dir, format, base, true, rev, config)?.refname,
+        ));
+    }
+    if inner.bytes().all(|byte| byte.is_ascii_digit()) || !inner.starts_with('-') {
+        let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+        return Ok(Some(reflog_ref_name_for_base(
+            git_dir, format, &refs, base, config,
+        )?));
+    }
+    Ok(None)
 }
 
 /// Parse the numeric portion of an `@{N}` / `@{-N}` selector.
@@ -610,6 +710,21 @@ fn reflog_ref_name(refs: &FileRefStore, base: &str) -> String {
     format!("refs/heads/{base}")
 }
 
+fn reflog_ref_name_for_base(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    refs: &FileRefStore,
+    base: &str,
+    config: Option<&GitConfig>,
+) -> Result<String> {
+    if base.contains("@{")
+        && let Some(name) = resolve_at_selector_ref_name(git_dir, format, base, config)?
+    {
+        return Ok(name);
+    }
+    Ok(reflog_ref_name(refs, base))
+}
+
 /// git's `ref_rev_parse_rules` expansions for a short ref name, in order.
 fn reflog_dwim_candidates(base: &str) -> [String; 6] {
     [
@@ -642,9 +757,10 @@ fn resolve_reflog_nth(
     base: &str,
     n: usize,
     rev: &str,
+    config: Option<&GitConfig>,
 ) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
-    let ref_name = reflog_ref_name(&refs, base);
+    let ref_name = reflog_ref_name_for_base(git_dir, format, &refs, base, config)?;
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
         return Err(GitError::not_found(format!(
@@ -669,12 +785,13 @@ fn resolve_reflog_date(
     base: &str,
     date: &str,
     rev: &str,
+    config: Option<&GitConfig>,
 ) -> Result<ObjectId> {
     let cutoff = parse_reflog_selector_date(date).ok_or_else(|| {
         GitError::Unsupported(format!("revision selector @{{{date}}}"))
     })?;
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
-    let ref_name = reflog_ref_name(&refs, base);
+    let ref_name = reflog_ref_name_for_base(git_dir, format, &refs, base, config)?;
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
         return Err(GitError::not_found(format!(
@@ -695,6 +812,12 @@ fn reflog_entry_timestamp(entry: &ReflogEntry) -> Result<i64> {
 }
 
 fn parse_reflog_selector_date(value: &str) -> Option<i64> {
+    if value == "now" {
+        return std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    }
     if let Some(years) = value.strip_suffix(".year.ago") {
         let years = years.parse::<i64>().ok()?;
         let now = std::time::SystemTime::now()
@@ -878,29 +1001,41 @@ fn checkout_move_source(message: &[u8]) -> Option<&str> {
     Some(from)
 }
 
+struct UpstreamRef {
+    refname: String,
+    merge: String,
+}
+
+impl UpstreamRef {
+    fn missing_error(&self, _rev: &str) -> GitError {
+        GitError::not_found(format!(
+            "upstream branch '{}' not stored as a remote-tracking branch",
+            self.merge
+        ))
+    }
+}
+
 /// Resolve `<base>@{u}` / `@{upstream}` (when `push` is false) or `@{push}`
-/// (when `push` is true) to the configured tracking ref's current value.
+/// (when `push` is true) to the configured tracking ref name.
 ///
 /// The branch is `base` (or the current branch when `base` is empty). The
 /// tracking ref is built from `branch.<name>.remote` (or `pushRemote` for the
 /// push form) plus the short name from `branch.<name>.merge`, yielding
 /// `refs/remotes/<remote>/<short>`. `@{push}` falls back to the upstream remote
 /// when no push-specific remote is configured.
-fn resolve_upstream(
+fn resolve_upstream_ref(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
     base: &str,
     push: bool,
     rev: &str,
     config: Option<&GitConfig>,
-) -> Result<ObjectId> {
+) -> Result<UpstreamRef> {
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let branch = if base.is_empty() {
         refs.current_branch()?.ok_or_else(|| {
-            GitError::InvalidFormat(format!("HEAD is not a branch, cannot resolve {rev}"))
+            GitError::InvalidFormat("HEAD does not point to a branch".to_string())
         })?
-    } else if let Some(short) = base.strip_prefix("refs/heads/") {
-        short.to_string()
     } else if base.starts_with("refs/") {
         return Err(GitError::InvalidFormat(format!(
             "{base} is not a branch, cannot resolve {rev}"
@@ -908,6 +1043,12 @@ fn resolve_upstream(
     } else {
         base.to_string()
     };
+    if refs
+        .read_ref(&format!("refs/heads/{branch}"))?
+        .is_none()
+    {
+        return Err(GitError::not_found(format!("no such branch: '{branch}'")));
+    }
 
     // Prefer the caller-resolved effective config (includes + `-c` overrides);
     // fall back to an include-aware read of `<git_dir>/config` when none was
@@ -939,13 +1080,15 @@ fn resolve_upstream(
     }
     .ok_or_else(|| GitError::not_found(format!("no upstream remote for branch '{branch}'")))?;
 
-    let tracking = format!("refs/remotes/{remote}/{short}");
-    match resolve_revision_ref(&refs, &tracking)? {
-        Some(oid) => Ok(oid),
-        None => Err(GitError::not_found(format!(
-            "upstream tracking ref '{tracking}' for {rev} is missing"
-        ))),
-    }
+    let refname = if remote == "." {
+        merge.to_string()
+    } else {
+        format!("refs/remotes/{remote}/{short}")
+    };
+    Ok(UpstreamRef {
+        refname,
+        merge: merge.to_string(),
+    })
 }
 
 /// Read the repository config (`<git_dir>/config`), resolving `include`/`includeIf`

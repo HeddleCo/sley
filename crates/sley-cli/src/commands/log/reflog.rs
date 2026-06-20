@@ -20,19 +20,17 @@ pub(super) fn log_walk_reflogs(
     let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
     let mut stdout = io::stdout();
     let references = if revisions.is_empty() {
-        vec![reflog_reference_name(None)?]
+        vec![ReflogWalkTarget::new(None)?]
     } else {
         revisions
             .iter()
-            .map(|revision| reflog_reference_name(Some(revision)))
+            .map(|revision| ReflogWalkTarget::new(Some(revision)))
             .collect::<Result<Vec<_>>>()?
     };
     let mut skipped = 0usize;
     let mut emitted = 0usize;
-    for reference in references {
-        let display_reference = reflog_walk_display_reference(&reference);
-        let full_display_reference = reflog_walk_display_reference(&reference);
-        let mut entries = store.read_reflog(&reference)?;
+    for target in references {
+        let mut entries = store.read_reflog(&target.reference)?;
         entries.reverse();
         if opts.reverse {
             entries.reverse();
@@ -57,26 +55,30 @@ pub(super) fn log_walk_reflogs(
                         compiled,
                         db: &mut db,
                         format,
-                        display_reference: &display_reference,
-                        full_reference: &full_display_reference,
+                        display_reference: &target.display_reference,
+                        full_reference: &target.display_reference,
                         date_mode: opts.date_mode,
                         decorations: &decorations,
                         mailmap: &mailmap,
                     };
-                    emit_compiled_reflog_walk_format(
-                        &mut ctx,
-                        entry,
-                        index,
-                        &mut line,
-                    )?;
+                    emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)?;
                     stdout.write_all(&line)?;
                     if *final_newline && !line.ends_with(b"\n") {
                         stdout.write_all(b"\n")?;
                     }
                 }
                 LogOutput::Default(_) => {
-                    stdout.write_all(&entry.message)?;
-                    stdout.write_all(b"\n")?;
+                    let display_selector = target.display_selector(entry, index, opts.date_mode);
+                    emit_default_reflog_walk_format(
+                        &mut db,
+                        format,
+                        entry,
+                        &target.display_reference,
+                        &display_selector,
+                        opts.date_mode,
+                        &mailmap,
+                        &mut stdout,
+                    )?;
                 }
             }
             emitted += 1;
@@ -86,11 +88,102 @@ pub(super) fn log_walk_reflogs(
     Ok(())
 }
 
+struct ReflogWalkTarget {
+    reference: String,
+    display_reference: String,
+    date_selector: bool,
+}
+
+impl ReflogWalkTarget {
+    fn new(revision: Option<&String>) -> Result<Self> {
+        let original = revision.map(String::as_str);
+        let reference = reflog_reference_name(original)?;
+        Ok(Self {
+            display_reference: reflog_walk_display_reference(&reference),
+            reference,
+            date_selector: original.is_some_and(reflog_revision_uses_date_selector),
+        })
+    }
+
+    fn display_selector(&self, entry: &ReflogEntry, index: usize, date_mode: &DateMode) -> String {
+        if self.date_selector {
+            commit_identity_date(&entry.committer, date_mode)
+        } else {
+            index.to_string()
+        }
+    }
+}
+
+fn reflog_revision_uses_date_selector(revision: &str) -> bool {
+    let Some(open) = revision.rfind("@{") else {
+        return false;
+    };
+    let Some(inner) = revision.strip_suffix('}') else {
+        return false;
+    };
+    let inner = &inner[open + 2..];
+    !(inner.bytes().all(|byte| byte.is_ascii_digit())
+        || inner.eq_ignore_ascii_case("u")
+        || inner.eq_ignore_ascii_case("upstream")
+        || inner.eq_ignore_ascii_case("push")
+        || inner.starts_with('-'))
+}
+
 fn reflog_walk_display_reference(reference: &str) -> String {
     reference
         .strip_prefix("refs/heads/")
         .unwrap_or(reference)
         .to_string()
+}
+
+fn emit_default_reflog_walk_format(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+    display_reference: &str,
+    display_selector: &str,
+    date_mode: &DateMode,
+    mailmap: &commands::utility::Mailmap,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Some(record) = reflog_walk_commit_record(db, format, entry)? else {
+        return Ok(());
+    };
+    writeln!(out, "commit {}", record.oid).map_err(io::Error::from)?;
+    let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
+    writeln!(
+        out,
+        "Reflog: {}@{{{}}} ({} <{}>)",
+        display_reference, display_selector, reflog_name, reflog_email
+    )
+    .map_err(io::Error::from)?;
+    out.write_all(b"Reflog message: ")?;
+    out.write_all(&reflog_walk_subject(db, format, entry)?)?;
+    out.write_all(b"\n")?;
+    writeln!(
+        out,
+        "Author: {}",
+        commit_identity_mailmapped(&record.commit.author, Some(mailmap))
+    )
+    .map_err(io::Error::from)?;
+    writeln!(
+        out,
+        "Date:   {}",
+        commit_identity_date(&record.commit.author, date_mode)
+    )
+    .map_err(io::Error::from)?;
+    out.write_all(b"\n")?;
+    let display_message = commit_message_for_commit_encoding(&record.commit, "UTF-8");
+    for line in commit_message_lines(&display_message) {
+        if line.is_empty() {
+            out.write_all(b"\n")?;
+        } else {
+            out.write_all(b"    ")?;
+            out.write_all(line)?;
+            out.write_all(b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn compile_log_filter_matcher(
@@ -189,7 +282,10 @@ pub(super) fn log_author_matcher_matches(
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
     filter.is_none_or(|filter| {
-        filter.matches_any(&log_mailmapped_identity_header(&record.commit.author, mailmap))
+        filter.matches_any(&log_mailmapped_identity_header(
+            &record.commit.author,
+            mailmap,
+        ))
     })
 }
 
@@ -199,7 +295,10 @@ pub(super) fn log_committer_matcher_matches(
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
     filter.is_none_or(|filter| {
-        filter.matches_any(&log_mailmapped_identity_header(&record.commit.committer, mailmap))
+        filter.matches_any(&log_mailmapped_identity_header(
+            &record.commit.committer,
+            mailmap,
+        ))
     })
 }
 
@@ -268,7 +367,8 @@ fn emit_compiled_reflog_walk_format(
     let commit_record = reflog_walk_commit_record(ctx.db, ctx.format, entry)?;
     let commit_identity = commit_record.as_ref().map(|record| {
         let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
-        let (committer_name, committer_email) = commit_identity_name_email(&record.commit.committer);
+        let (committer_name, committer_email) =
+            commit_identity_name_email(&record.commit.committer);
         let author_timestamp = commit_identity_timestamp(&record.commit.author);
         let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
         (
@@ -289,7 +389,7 @@ fn emit_compiled_reflog_walk_format(
         date_mode: ctx.date_mode,
         source_oid: None,
         describe: None,
-                signature: None,
+        signature: None,
         color: false,
         output_encoding: "UTF-8",
         mailmap: ctx.mailmap,
@@ -313,7 +413,9 @@ fn emit_compiled_reflog_walk_format(
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
             _ => {
-                if let (Some(record), Some(identity)) = (commit_record.as_ref(), commit_identity.as_ref()) {
+                if let (Some(record), Some(identity)) =
+                    (commit_record.as_ref(), commit_identity.as_ref())
+                {
                     emit_log_one_token(
                         token,
                         record,

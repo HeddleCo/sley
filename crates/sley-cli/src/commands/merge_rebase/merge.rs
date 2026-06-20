@@ -888,15 +888,16 @@ fn merge_message_title(
     let mut remotes = Vec::new();
     let mut commits = Vec::new();
     for target in targets {
-        if let Some(branch) = merge_target_early_branch(refs, target)? {
+        let target_name = merge_message_target_name(git_dir, format, target);
+        if let Some(branch) = merge_target_early_branch(refs, &target_name)? {
             early_branches.push(branch);
             continue;
         }
-        match classify_merge_target_for_message(refs, db, git_dir, format, target)? {
-            MergeRefKind::Branch => branches.push(target.clone()),
-            MergeRefKind::Tag => tags.push(target.clone()),
-            MergeRefKind::RemoteBranch => remotes.push(target.clone()),
-            MergeRefKind::Commit => commits.push(target.clone()),
+        match classify_merge_target_for_message(refs, db, git_dir, format, &target_name)? {
+            MergeRefKind::Branch => branches.push(target_name),
+            MergeRefKind::Tag => tags.push(target_name),
+            MergeRefKind::RemoteBranch => remotes.push(target_name),
+            MergeRefKind::Commit => commits.push(target_name),
         }
     }
 
@@ -928,6 +929,21 @@ fn merge_message_title(
         title.push_str(&format!(" into {current_branch}"));
     }
     Ok(title)
+}
+
+fn merge_message_target_name(git_dir: &Path, format: ObjectFormat, target: &str) -> String {
+    if !target.contains("@{") {
+        return target.to_string();
+    }
+    match sley_rev::resolve_revision_symbolic_full_name(git_dir, format, target) {
+        Ok(Some(refname)) => refname
+            .strip_prefix("refs/remotes/")
+            .or_else(|| refname.strip_prefix("refs/heads/"))
+            .or_else(|| refname.strip_prefix("refs/tags/"))
+            .unwrap_or(&refname)
+            .to_string(),
+        _ => target.to_string(),
+    }
 }
 
 /// git's `merge_name` source descriptor for a single head, as it appears in the
