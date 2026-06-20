@@ -86,6 +86,26 @@ fn assert_same(cwd: &Path, args: &[&str]) {
     );
 }
 
+fn assert_sley_stdout(cwd: &Path, args: &[&str], expected: &str) {
+    let r = git_rs(cwd, args);
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout),
+        expected,
+        "stdout differs for {args:?}\nsley stderr: {}",
+        String::from_utf8_lossy(&r.stderr),
+    );
+    assert!(
+        r.status.success(),
+        "sley {args:?} failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(
+        r.stderr.is_empty(),
+        "stderr not empty for {args:?}: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
 /// Build a repo whose working tree diverges from the index across the common
 /// change classes: a content modification, a deletion, a binary change, and a
 /// nested-path modification. The returned path is the repository root.
@@ -192,6 +212,59 @@ fn diff_files_pathspec_matches_git() {
     let sub = repo.join("sub");
     assert_same(&sub, &["diff-files", "--name-only"]);
     fs::remove_dir_all(repo.parent().expect("repo has parent")).ok();
+}
+
+#[test]
+fn diff_files_max_depth_limits_worktree_paths() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("diff-files-max-depth");
+    let repo = root.join("repo");
+    git_ok(&root, &["init", "-q", repo.to_str().expect("utf8 path")]);
+    fs::write(repo.join("file"), "index\n").expect("write file");
+    fs::create_dir_all(repo.join("one/two/three")).expect("mkdir nested");
+    fs::write(repo.join("one/file"), "index\n").expect("write one/file");
+    fs::write(repo.join("one/two/file"), "index\n").expect("write one/two/file");
+    fs::write(repo.join("one/two/three/file"), "index\n").expect("write deep file");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    for path in [
+        "file",
+        "one/file",
+        "one/two/file",
+        "one/two/three/file",
+    ] {
+        fs::write(repo.join(path), "worktree\n").expect("modify tracked file");
+    }
+
+    assert_sley_stdout(
+        &repo,
+        &["diff-files", "--max-depth=0", "--name-only", "--"],
+        "file\n",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-files", "--max-depth=1", "--name-only", "--"],
+        "file\none/file\n",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-files", "--max-depth=0", "--name-only", "--", "one/two"],
+        "",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-files", "--max-depth=2", "--name-only", "--", "one/two"],
+        "one/two/file\none/two/three/file\n",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-files", "--max-depth=-1", "--name-only", "--"],
+        "file\none/file\none/two/file\none/two/three/file\n",
+    );
+
+    fs::remove_dir_all(&root).ok();
 }
 
 /// `--diff-filter` selection, including lowercase exclusion classes, over a repo

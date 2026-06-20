@@ -111,6 +111,7 @@ struct DiffFilesOptions {
     // `diff.indentHeuristic` config (default git-enabled).
     indent_heuristic: Option<bool>,
     ignore_submodules: bool,
+    max_depth: Option<i64>,
     path_args: Vec<String>,
 }
 
@@ -153,6 +154,7 @@ impl Default for DiffFilesOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             indent_heuristic: None,
             ignore_submodules: false,
+            max_depth: None,
             path_args: Vec::new(),
         }
     }
@@ -407,14 +409,10 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
                 let value = args
                     .get(idx)
                     .ok_or_else(|| GitError::Command("--max-depth requires a value".into()))?;
-                if value != "-1" {
-                    return Err(diff_files_usage_error());
-                }
+                o.max_depth = Some(parse_diff_max_depth(value)?);
             }
             value if let Some(value) = value.strip_prefix("--max-depth=") => {
-                if value != "-1" {
-                    return Err(diff_files_usage_error());
-                }
+                o.max_depth = Some(parse_diff_max_depth(value)?);
             }
             value
                 if value.starts_with("--stat=")
@@ -585,6 +583,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         &config,
     )?;
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = apply_diff_max_depth(entries, &pathspec, o.max_depth);
     let entries = if o.ignore_submodules {
         entries
             .into_iter()

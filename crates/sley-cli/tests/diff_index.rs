@@ -101,6 +101,26 @@ fn assert_same_all(cwd: &Path, args: &[&str]) {
     );
 }
 
+fn assert_sley_stdout(cwd: &Path, args: &[&str], expected: &str) {
+    let r = git_rs(cwd, args);
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout),
+        expected,
+        "stdout differs for {args:?}\nsley stderr: {}",
+        String::from_utf8_lossy(&r.stderr),
+    );
+    assert!(
+        r.status.success(),
+        "sley {args:?} failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(
+        r.stderr.is_empty(),
+        "stderr not empty for {args:?}: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
 /// Initialise a fresh repo at `<root>/repo` with the default object format.
 fn init_repo(root: &Path) -> PathBuf {
     let repo = root.join("repo");
@@ -444,6 +464,59 @@ fn diff_index_pathspec_matches_git() {
     let dir = repo.join("dir");
     assert_same(&dir, &["diff-index", "--cached", "HEAD", "--", "inner.txt"]);
     assert_same(&dir, &["diff-index", "--cached", "HEAD"]);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn diff_index_cached_max_depth_limits_index_paths() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("diff-index-max-depth");
+    let repo = init_repo(&root);
+    fs::write(repo.join("file"), "base\n").expect("test operation should succeed");
+    fs::create_dir_all(repo.join("one/two/three")).expect("test operation should succeed");
+    fs::write(repo.join("one/file"), "base\n").expect("test operation should succeed");
+    fs::write(repo.join("one/two/file"), "base\n").expect("test operation should succeed");
+    fs::write(repo.join("one/two/three/file"), "base\n").expect("test operation should succeed");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    for path in [
+        "file",
+        "one/file",
+        "one/two/file",
+        "one/two/three/file",
+    ] {
+        fs::write(repo.join(path), "index\n").expect("test operation should succeed");
+    }
+    git_ok(&repo, &["add", "."]);
+
+    assert_sley_stdout(
+        &repo,
+        &["diff-index", "--max-depth=0", "--name-only", "--cached", "HEAD", "--"],
+        "file\n",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-index", "--max-depth=1", "--name-only", "--cached", "HEAD", "--"],
+        "file\none/file\n",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-index", "--max-depth=0", "--name-only", "--cached", "HEAD", "--", "one"],
+        "",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-index", "--max-depth=2", "--name-only", "--cached", "HEAD", "--", "one"],
+        "one/file\none/two/file\n",
+    );
+    assert_sley_stdout(
+        &repo,
+        &["diff-index", "--max-depth=-1", "--name-only", "--cached", "HEAD", "--"],
+        "file\none/file\none/two/file\none/two/three/file\n",
+    );
 
     fs::remove_dir_all(&root).ok();
 }
