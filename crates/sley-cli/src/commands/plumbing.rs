@@ -2895,6 +2895,11 @@ enum WsAction {
 
 pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut check = false;
+    let mut apply = false;
+    let mut stat = false;
+    let mut numstat = false;
+    let mut summary = false;
+    let mut recount = false;
     let mut update_index = false;
     let mut files = Vec::new();
     // git's default when applying is `warn`; the value is overridden by the
@@ -2904,9 +2909,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--check" => check = true,
-            "--apply" | "--stat" | "--numstat" | "--summary" | "-q" | "--quiet" | "--recount"
-            | "--allow-empty" | "--unsafe-paths" | "-l" | "--ignore-whitespace"
-            | "--ignore-space-change" => {}
+            "--apply" => apply = true,
+            "--stat" => stat = true,
+            "--numstat" => numstat = true,
+            "--summary" => summary = true,
+            "--recount" => recount = true,
+            "-q" | "--quiet" | "--allow-empty" | "--unsafe-paths" | "-l"
+            | "--ignore-whitespace" | "--ignore-space-change" => {}
             "-R" | "--reverse" => {
                 return Err(GitError::Unsupported(
                     "apply --reverse is not supported yet".into(),
@@ -2950,16 +2959,29 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
-    let mut input = Vec::new();
-    if files.is_empty() {
-        io::stdin().read_to_end(&mut input)?;
-    } else {
-        for file in &files {
-            input.extend_from_slice(&fs::read(file)?);
+    let inputs = read_apply_inputs(&files)?;
+    let mut patches = Vec::new();
+    for (name, input) in &inputs {
+        validate_apply_input(input, name)?;
+        patches.extend(sley_diff_merge::parse_unified_patch_with_recount(input, recount).map_err(
+            |err| match err {
+                GitError::InvalidFormat(message) if message.starts_with("malformed hunk header") => {
+                    apply_corrupt_patch_error(input, name)
+                }
+                other => other,
+            },
+        )?);
+    }
+    if stat || numstat || summary {
+        write_apply_read_only_output(&patches, stat, numstat, summary)?;
+        if !apply {
+            return Ok(());
         }
     }
-    let mut patches = sley_diff_merge::parse_unified_patch(&input)?;
-    let patch_input_file = files.first().map(String::as_str).unwrap_or("<stdin>");
+    let patch_input_file = inputs
+        .first()
+        .map(|(name, _)| name.as_str())
+        .unwrap_or("<stdin>");
 
     // Phase 0: whitespace handling. Resolve the per-path rule, then warn/error
     // or fix the introduced (`+`) lines per `--whitespace=<action>`. In `fix`
@@ -3104,6 +3126,386 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn read_apply_inputs(files: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    if files.is_empty() {
+        let mut input = Vec::new();
+        io::stdin().read_to_end(&mut input)?;
+        return Ok(vec![("<stdin>".to_string(), input)]);
+    }
+    files
+        .iter()
+        .map(|file| Ok((file.clone(), fs::read(file)?)))
+        .collect()
+}
+
+fn write_apply_read_only_output(
+    patches: &[sley_diff_merge::FilePatch],
+    stat: bool,
+    numstat: bool,
+    summary: bool,
+) -> Result<()> {
+    let mut entries = Vec::with_capacity(patches.len());
+    let mut stats = Vec::with_capacity(patches.len());
+    for patch in patches {
+        entries.push(apply_patch_name_status_entry(patch));
+        stats.push(apply_patch_line_stats(patch));
+    }
+    let stat_entries = entries
+        .iter()
+        .zip(stats)
+        .map(|(entry, stats)| DiffStatEntryData { entry, stats })
+        .collect::<Vec<_>>();
+
+    let mut stdout = io::stdout();
+    if numstat {
+        for data in &stat_entries {
+            write_diff_numstat_materialized_entry(&mut stdout, data.entry, data.stats, false)?;
+        }
+    }
+    if stat {
+        write_apply_stat(&mut stdout, &stat_entries)?;
+    }
+    if summary {
+        for patch in patches {
+            write_apply_summary_entry(&mut stdout, patch)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_apply_stat(stdout: &mut dyn Write, entries: &[DiffStatEntryData<'_>]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut name_width = 0usize;
+    let mut max_change = 0usize;
+    for data in entries {
+        name_width = name_width.max(status_quote_path(&data.entry.path, false).chars().count());
+        if let DiffLineStats::Text { inserted, deleted } = data.stats {
+            max_change = max_change.max(inserted + deleted);
+        }
+    }
+    let number_width = 4usize.max(diff_stat_decimal_width(max_change) as usize);
+    let graph_width = 80usize
+        .saturating_sub(name_width + number_width + 6)
+        .min(max_change)
+        .max(1);
+    for data in entries {
+        let name = status_quote_path(&data.entry.path, false);
+        let padding = name_width.saturating_sub(name.chars().count());
+        match data.stats {
+            DiffLineStats::Binary { .. } => {
+                writeln!(stdout, " {name}{:padding$} |  Bin", "")?;
+            }
+            DiffLineStats::Text { inserted, deleted } => {
+                let total = inserted + deleted;
+                write!(stdout, " {name}{:padding$} | {total:>number_width$} ", "")?;
+                let scaled_total = apply_stat_scale(total, graph_width, max_change);
+                if scaled_total > 0 {
+                    if inserted == 0 {
+                        write!(stdout, "{}", "-".repeat(scaled_total))?;
+                    } else if deleted == 0 {
+                        write!(stdout, "{}", "+".repeat(scaled_total))?;
+                    } else {
+                        let add = apply_stat_scale(inserted, graph_width, max_change)
+                            .min(scaled_total);
+                        let del = scaled_total.saturating_sub(add);
+                        write!(stdout, "{}{}", "+".repeat(add), "-".repeat(del))?;
+                    }
+                }
+                writeln!(stdout)?;
+            }
+        }
+    }
+    let (inserted, deleted) = diff_stat_totals(entries);
+    write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
+}
+
+fn apply_stat_scale(value: usize, width: usize, max_change: usize) -> usize {
+    if value == 0 || max_change == 0 {
+        return 0;
+    }
+    (value * width + max_change / 2) / max_change
+}
+
+fn apply_patch_name_status_entry(patch: &sley_diff_merge::FilePatch) -> sley_diff_merge::NameStatusEntry {
+    let path = patch
+        .new_path
+        .as_ref()
+        .or(patch.old_path.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let status = if patch.is_new {
+        sley_diff_merge::NameStatus::Added
+    } else if patch.is_delete {
+        sley_diff_merge::NameStatus::Deleted
+    } else {
+        sley_diff_merge::NameStatus::Modified
+    };
+    sley_diff_merge::NameStatusEntry {
+        status,
+        path: BString::from(path),
+        old_path: None,
+        old_mode: apply_patch_old_mode(patch),
+        new_mode: apply_patch_new_mode(patch),
+        old_oid: None,
+        new_oid: None,
+    }
+}
+
+fn apply_patch_line_stats(patch: &sley_diff_merge::FilePatch) -> DiffLineStats {
+    let mut inserted = 0usize;
+    let mut deleted = 0usize;
+    for hunk in &patch.hunks {
+        for line in &hunk.lines {
+            match line {
+                sley_diff_merge::HunkLine::Insert(_) => inserted += 1,
+                sley_diff_merge::HunkLine::Delete(_) => deleted += 1,
+                sley_diff_merge::HunkLine::Context(_) => {}
+            }
+        }
+    }
+    DiffLineStats::Text { inserted, deleted }
+}
+
+fn write_apply_summary_entry(stdout: &mut dyn Write, patch: &sley_diff_merge::FilePatch) -> Result<()> {
+    if patch.is_rename {
+        if let (Some(old_path), Some(new_path)) = (&patch.old_path, &patch.new_path) {
+            let path = diff_stat_pprint_rename(old_path, new_path);
+            let score = patch.similarity.unwrap_or(100);
+            writeln!(stdout, " rename {path} ({score}%)")?;
+        }
+    } else if patch.is_copy {
+        if let (Some(old_path), Some(new_path)) = (&patch.old_path, &patch.new_path) {
+            let path = diff_stat_pprint_rename(old_path, new_path);
+            let score = patch.similarity.unwrap_or(100);
+            writeln!(stdout, " copy {path} ({score}%)")?;
+        }
+    } else if patch.is_new {
+        if let Some(path) = &patch.new_path {
+            let path = status_quote_path(path, false);
+            if let Some(mode) = patch.new_mode {
+                writeln!(stdout, " create mode {mode:06o} {path}")?;
+            } else {
+                writeln!(stdout, " create {path}")?;
+            }
+        }
+    } else if patch.is_delete {
+        if let Some(path) = &patch.old_path {
+            let path = status_quote_path(path, false);
+            if let Some(mode) = patch.old_mode {
+                writeln!(stdout, " delete mode {mode:06o} {path}")?;
+            } else {
+                writeln!(stdout, " delete {path}")?;
+            }
+        }
+    } else if let Some(score) = patch.dissimilarity {
+        if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref()) {
+            let path = status_quote_path(path, false);
+            writeln!(stdout, " rewrite {path} ({score}%)")?;
+        }
+    }
+    if let (Some(old_mode), Some(new_mode)) = (patch.old_mode, patch.new_mode)
+        && old_mode != new_mode
+        && !patch.is_new
+        && !patch.is_delete
+    {
+        if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref()) {
+            let path = status_quote_path(path, false);
+            writeln!(stdout, " mode change {old_mode:06o} => {new_mode:06o} {path}")?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_patch_old_mode(patch: &sley_diff_merge::FilePatch) -> Option<u32> {
+    if patch.is_new { None } else { patch.old_mode }
+}
+
+fn apply_patch_new_mode(patch: &sley_diff_merge::FilePatch) -> Option<u32> {
+    if patch.is_delete { None } else { patch.new_mode }
+}
+
+fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
+    let lines = apply_split_patch_lines(input);
+    let mut saw_header = false;
+    let mut expect_new_header = false;
+    let mut after_file_header = false;
+    let mut saw_hunk = false;
+    for (idx, line) in lines.iter().enumerate() {
+        let line_nr = idx + 1;
+        if line.starts_with(b"diff --git ") || line.starts_with(b"diff ") {
+            saw_header = true;
+            expect_new_header = false;
+            after_file_header = false;
+            saw_hunk = false;
+            continue;
+        }
+        if let Some(rest) = apply_strip_prefix(line, b"old mode ")
+            .or_else(|| apply_strip_prefix(line, b"new mode "))
+            .or_else(|| apply_strip_prefix(line, b"new file mode "))
+            .or_else(|| apply_strip_prefix(line, b"deleted file mode "))
+        {
+            if apply_parse_octal(rest).is_none() {
+                eprintln!(
+                    "error: invalid mode at {name}:{line_nr}: {}",
+                    String::from_utf8_lossy(apply_trim_ascii_end(rest))
+                );
+                eprintln!();
+                return Err(GitError::Exit(1));
+            }
+            saw_header = true;
+            continue;
+        }
+        if line.starts_with(b"--- ") {
+            saw_header = true;
+            expect_new_header = true;
+            after_file_header = false;
+            continue;
+        }
+        if line.starts_with(b"+++ ") {
+            expect_new_header = false;
+            after_file_header = true;
+            continue;
+        }
+        if line.starts_with(b"@@ ") {
+            if !saw_header {
+                eprintln!(
+                    "error: patch fragment without header at {name}:{line_nr}: {}",
+                    String::from_utf8_lossy(line)
+                );
+                return Err(GitError::Exit(1));
+            }
+            if expect_new_header {
+                eprintln!("error: git diff header lacks filename information at {name}:{line_nr}");
+                return Err(GitError::Exit(1));
+            }
+            if !apply_hunk_header_well_formed(line) {
+                eprintln!("error: corrupt patch at {name}:{line_nr}");
+                return Err(GitError::Exit(1));
+            }
+            after_file_header = false;
+            saw_hunk = true;
+            continue;
+        }
+        if after_file_header && !saw_hunk && !line.is_empty() {
+            eprintln!("error: patch with only garbage at {name}:{line_nr}");
+            return Err(GitError::Exit(1));
+        }
+    }
+    Ok(())
+}
+
+fn apply_corrupt_patch_error(input: &[u8], name: &str) -> GitError {
+    let line_nr = apply_split_patch_lines(input)
+        .iter()
+        .position(|line| line.starts_with(b"@@ ") && !apply_hunk_header_well_formed(line))
+        .map(|idx| idx + 1)
+        .unwrap_or(1);
+    eprintln!("error: corrupt patch at {name}:{line_nr}");
+    GitError::Exit(1)
+}
+
+fn apply_hunk_header_well_formed(line: &[u8]) -> bool {
+    let Some(rest) = apply_strip_prefix(line, b"@@ ") else {
+        return false;
+    };
+    let Some(close) = apply_find_subslice(rest, b" @@") else {
+        return false;
+    };
+    let ranges = &rest[..close];
+    let mut parts = ranges.split(|&b| b == b' ').filter(|part| !part.is_empty());
+    let Some(old) = parts.next().and_then(|part| apply_strip_prefix(part, b"-")) else {
+        return false;
+    };
+    let Some(new) = parts.next().and_then(|part| apply_strip_prefix(part, b"+")) else {
+        return false;
+    };
+    apply_parse_range(old).is_some() && apply_parse_range(new).is_some()
+}
+
+fn apply_parse_range(range: &[u8]) -> Option<(usize, usize)> {
+    match range.iter().position(|&b| b == b',') {
+        Some(comma) => {
+            let start = apply_parse_usize(&range[..comma])?;
+            let len = apply_parse_usize(&range[comma + 1..])?;
+            Some((start, len))
+        }
+        None => Some((apply_parse_usize(range)?, 1)),
+    }
+}
+
+fn apply_parse_usize(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0usize;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add((byte - b'0') as usize)?;
+    }
+    Some(value)
+}
+
+fn apply_parse_octal(bytes: &[u8]) -> Option<u32> {
+    let trimmed = apply_trim_ascii_end(bytes);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut value = 0u32;
+    for &byte in trimmed {
+        if !(b'0'..=b'7').contains(&byte) {
+            return None;
+        }
+        value = value.checked_mul(8)?.checked_add((byte - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+fn apply_split_patch_lines(input: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    while start < input.len() {
+        match input[start..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                let end = start + rel;
+                lines.push(&input[start..end]);
+                start = end + 1;
+            }
+            None => {
+                lines.push(&input[start..]);
+                start = input.len();
+            }
+        }
+    }
+    lines
+}
+
+fn apply_strip_prefix<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    line.starts_with(prefix).then(|| &line[prefix.len()..])
+}
+
+fn apply_find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn apply_trim_ascii_end(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &bytes[..end]
 }
 
 fn apply_write_mode(

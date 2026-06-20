@@ -4079,6 +4079,12 @@ pub struct FilePatch {
     pub is_delete: bool,
     /// The patch renames the file (`rename from`/`rename to`).
     pub is_rename: bool,
+    /// The patch copies the file (`copy from`/`copy to`).
+    pub is_copy: bool,
+    /// Similarity score from `similarity index N%`, used for rename/copy summaries.
+    pub similarity: Option<u8>,
+    /// Dissimilarity score from `dissimilarity index N%`, used for rewrite summaries.
+    pub dissimilarity: Option<u8>,
 }
 
 /// Outcome of applying a [`FilePatch`] to a base buffer.
@@ -4110,10 +4116,17 @@ const MIN_FUZZ_CONTEXT: usize = usize::MAX;
 /// invalid hunks (bad `@@` headers, body lines that overflow the declared hunk
 /// counts, or hunk bodies that appear with no preceding file header).
 pub fn parse_unified_patch(input: &[u8]) -> Result<Vec<FilePatch>> {
+    parse_unified_patch_with_recount(input, false)
+}
+
+/// Parse a unified/git diff, optionally ignoring hunk header line counts and
+/// recounting them from the hunk body. This mirrors `git apply --recount`.
+pub fn parse_unified_patch_with_recount(input: &[u8], recount: bool) -> Result<Vec<FilePatch>> {
     let lines = split_patch_lines(input);
     let mut parser = PatchParser {
         lines: &lines,
         index: 0,
+        recount,
     };
     parser.parse()
 }
@@ -4492,6 +4505,7 @@ fn split_patch_lines(input: &[u8]) -> Vec<&[u8]> {
 struct PatchParser<'a> {
     lines: &'a [&'a [u8]],
     index: usize,
+    recount: bool,
 }
 
 impl<'a> PatchParser<'a> {
@@ -4529,6 +4543,9 @@ impl<'a> PatchParser<'a> {
             is_new: false,
             is_delete: false,
             is_rename: false,
+            is_copy: false,
+            similarity: None,
+            dissimilarity: None,
         };
         // Default paths from `diff --git a/x b/x` if present (overridden by
         // `---`/`+++` lines when those carry real paths).
@@ -4569,6 +4586,16 @@ impl<'a> PatchParser<'a> {
             } else if let Some(rest) = strip_prefix(line, b"rename to ") {
                 patch.is_rename = true;
                 patch.new_path = Some(rest.to_vec());
+            } else if let Some(rest) = strip_prefix(line, b"copy from ") {
+                patch.is_copy = true;
+                patch.old_path = Some(rest.to_vec());
+            } else if let Some(rest) = strip_prefix(line, b"copy to ") {
+                patch.is_copy = true;
+                patch.new_path = Some(rest.to_vec());
+            } else if let Some(rest) = strip_prefix(line, b"similarity index ") {
+                patch.similarity = parse_percent(rest);
+            } else if let Some(rest) = strip_prefix(line, b"dissimilarity index ") {
+                patch.dissimilarity = parse_percent(rest);
             } else {
                 // `index ..`, `similarity index`, `copy from/to`, etc. — ignore.
                 self.index += 1;
@@ -4613,7 +4640,7 @@ impl<'a> PatchParser<'a> {
             }
             HeaderPath::Path(p) => {
                 // Only override if we did not already learn a real path.
-                if patch.old_path.is_none() || !patch.is_rename {
+                if patch.old_path.is_none() || !(patch.is_rename || patch.is_copy) {
                     patch.old_path = Some(p);
                 }
             }
@@ -4629,7 +4656,7 @@ impl<'a> PatchParser<'a> {
                 patch.new_path = None;
             }
             HeaderPath::Path(p) => {
-                if patch.new_path.is_none() || !patch.is_rename {
+                if patch.new_path.is_none() || !(patch.is_rename || patch.is_copy) {
                     patch.new_path = Some(p);
                 }
             }
@@ -4654,11 +4681,21 @@ impl<'a> PatchParser<'a> {
         let mut new_seen = 0usize;
 
         while self.index < self.lines.len() {
-            // Stop when both sides are satisfied.
-            if old_seen >= old_len && new_seen >= new_len {
+            // Stop when both sides are satisfied. In recount mode the header
+            // counts are intentionally ignored; the next hunk/file header ends
+            // the body.
+            if !self.recount && old_seen >= old_len && new_seen >= new_len {
                 break;
             }
             let line = self.lines[self.index];
+            if self.recount
+                && (line.starts_with(b"@@ ")
+                    || line.starts_with(b"diff --git ")
+                    || line.starts_with(b"diff a/")
+                    || line.starts_with(b"--- "))
+            {
+                break;
+            }
             if line.is_empty() {
                 // A wholly empty line in a unified diff is a context line whose
                 // content is the empty string (git emits a bare ` `, but some
@@ -4705,7 +4742,10 @@ impl<'a> PatchParser<'a> {
             self.index += 1;
         }
 
-        if old_seen != old_len || new_seen != new_len {
+        if self.recount {
+            hunk.old_len = old_seen;
+            hunk.new_len = new_seen;
+        } else if old_seen != old_len || new_seen != new_len {
             return Err(GitError::InvalidFormat(format!(
                 "hunk body line counts mismatch: header declared -{old_len},+{new_len} \
                  but body had -{old_seen},+{new_seen}"
@@ -4836,6 +4876,12 @@ fn parse_octal(bytes: &[u8]) -> Option<u32> {
         value = value.checked_mul(8)?.checked_add((b - b'0') as u32)?;
     }
     Some(value)
+}
+
+fn parse_percent(bytes: &[u8]) -> Option<u8> {
+    let trimmed = trim_ascii_end(bytes).strip_suffix(b"%").unwrap_or(trim_ascii_end(bytes));
+    let value = parse_usize(trimmed)?;
+    u8::try_from(value).ok().filter(|value| *value <= 100)
 }
 
 fn strip_prefix<'b>(line: &'b [u8], prefix: &[u8]) -> Option<&'b [u8]> {
