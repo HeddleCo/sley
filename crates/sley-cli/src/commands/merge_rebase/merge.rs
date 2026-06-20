@@ -487,7 +487,7 @@ fn merge_octopus(
                 continue;
             }
             let (mode, oid) = entry;
-            let content = merge_read_blob(&db, oid)?;
+            let content = merge_worktree_content(&db, *mode, oid)?;
             merge_write_worktree_file(worktree_root, path, &content, *mode)?;
         }
         for path in head_map.keys() {
@@ -3028,7 +3028,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                             if ours_map.get(path) == Some(entry) {
                                 continue;
                             }
-                            let content = merge_read_blob(&db, oid)?;
+                            let content = merge_worktree_content(&db, *mode, oid)?;
                             merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                         }
                         None => {
@@ -3211,7 +3211,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(&db, oid)?;
+                    let content = merge_worktree_content(&db, *mode, oid)?;
                     merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                 }
             }
@@ -3593,6 +3593,9 @@ fn verify_merge_uptodate(
         }
     }
 
+    let target_map = merge_results_entry_map(results);
+    verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, ours_map)?;
+
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
         if entry.index == b'?' && entry.worktree == b'?' && changed.contains(&entry.path) {
@@ -3643,6 +3646,7 @@ pub(crate) fn verify_fast_forward_untracked_safe(
 ) -> Result<()> {
     let head_map = stash_tree_entry_map(db, format, head_tree)?;
     let target_map = stash_tree_entry_map(db, format, target_tree)?;
+    verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, &head_map)?;
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     let untracked: BTreeSet<Vec<u8>> = status
         .iter()
@@ -3707,6 +3711,60 @@ fn path_with_trailing_slash(path: &[u8]) -> Vec<u8> {
     let mut prefix = path.to_vec();
     prefix.push(b'/');
     prefix
+}
+
+fn verify_no_populated_gitlink_directory_overwrite(
+    worktree_root: &Path,
+    target_map: &MergeTreeMap,
+    head_map: &MergeTreeMap,
+) -> Result<()> {
+    for (path, (mode, _)) in head_map {
+        if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        let prefix = path_with_trailing_slash(path);
+        let overwritten: Vec<&Vec<u8>> = target_map
+            .keys()
+            .filter(|candidate| candidate.starts_with(&prefix))
+            .filter(|candidate| merge_worktree_path_exists(worktree_root, candidate))
+            .collect();
+        if overwritten.is_empty() {
+            continue;
+        }
+        eprintln!("error: The following untracked working tree files would be overwritten by merge:");
+        for candidate in overwritten {
+            eprintln!("\t{}", String::from_utf8_lossy(candidate));
+        }
+        eprintln!("Please move or remove them before you merge.");
+        eprintln!("Aborting");
+        return Err(GitError::Exit(2));
+    }
+    Ok(())
+}
+
+fn merge_worktree_path_exists(worktree_root: &Path, path: &[u8]) -> bool {
+    let Ok(rel) = std::str::from_utf8(path) else {
+        return false;
+    };
+    fs::symlink_metadata(worktree_root.join(rel)).is_ok()
+}
+
+fn merge_results_entry_map(results: &MergePathResults) -> MergeTreeMap {
+    let mut entries = MergeTreeMap::new();
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some(entry)) => {
+                entries.insert(path.clone(), *entry);
+            }
+            MergePathResult::Resolved(None) => {}
+            MergePathResult::Conflict { ours, .. } => {
+                if let Some(entry) = ours {
+                    entries.insert(path.clone(), *entry);
+                }
+            }
+        }
+    }
+    entries
 }
 
 fn reset_index_and_worktree_to_commit_for_merge(
@@ -3803,7 +3861,7 @@ fn reset_merge_to_head(
     for path in &touched {
         match head_map.get(path) {
             Some((mode, oid)) => {
-                let content = merge_read_blob(&db, oid)?;
+                let content = merge_worktree_content(&db, *mode, oid)?;
                 merge_write_worktree_file(worktree_root, path, &content, *mode)?;
             }
             None => merge_remove_worktree_file(worktree_root, path)?,

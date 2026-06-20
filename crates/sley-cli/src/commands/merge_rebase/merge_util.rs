@@ -15,6 +15,18 @@ pub(crate) fn merge_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result
     Ok(object.body.clone())
 }
 
+pub(crate) fn merge_worktree_content(
+    db: &FileObjectDatabase,
+    mode: u32,
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    if sley_index::is_gitlink(mode) {
+        Ok(Vec::new())
+    } else {
+        merge_read_blob(db, oid)
+    }
+}
+
 pub(crate) fn merge_index_entry(path: &[u8], mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
     let flags = ((stage & 0x3) << 12) | (path.len().min(0x0fff) as u16);
     IndexEntry {
@@ -568,4 +580,3 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
     }
     Ok((results, conflicts, info_messages))
 }
-
