@@ -5085,6 +5085,30 @@ fn apply_diff_pathspec(
     filtered
 }
 
+fn apply_diff_max_depth(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    pathspec: &DiffPathspec,
+    max_depth: Option<i64>,
+) -> Vec<sley_diff_merge::NameStatusEntry> {
+    let Some(max_depth) = max_depth else {
+        return entries;
+    };
+    if max_depth < 0 {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| pathspec.within_max_depth(&entry.path, max_depth))
+        .collect()
+}
+
+fn parse_diff_max_depth(value: &str) -> Result<i64> {
+    value.parse::<i64>().map_err(|_| {
+        eprintln!("error: option `max-depth' expects a numerical value");
+        GitError::Exit(129)
+    })
+}
+
 fn reverse_diff_entries(
     entries: Vec<sley_diff_merge::NameStatusEntry>,
 ) -> Vec<sley_diff_merge::NameStatusEntry> {
@@ -5197,8 +5221,64 @@ impl DiffPathspec {
         pathspec_filters_match(&self.filters, path)
     }
 
+    fn within_max_depth(&self, path: &[u8], max_depth: i64) -> bool {
+        self.relative_depth(path)
+            .is_some_and(|depth| depth <= max_depth)
+    }
+
+    fn relative_depth(&self, path: &[u8]) -> Option<i64> {
+        if self.filters.is_empty() {
+            return Some(diff_path_slash_depth(path));
+        }
+        let mut saw_include = false;
+        let mut best: Option<i64> = None;
+        for filter in &self.filters {
+            if filter.is_exclude() {
+                continue;
+            }
+            saw_include = true;
+            if let Some(depth) = diff_relative_depth_from_spec(filter.element.pattern(), path) {
+                best = Some(best.map_or(depth, |current| current.min(depth)));
+            }
+        }
+        if saw_include {
+            best
+        } else {
+            Some(diff_path_slash_depth(path))
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.filters.is_empty()
+    }
+}
+
+fn diff_relative_depth_from_spec(spec: &[u8], path: &[u8]) -> Option<i64> {
+    let spec = spec.strip_suffix(b"/").unwrap_or(spec);
+    if spec.is_empty() || spec == b"." {
+        return Some(diff_path_slash_depth(path));
+    }
+    if path == spec {
+        return Some(0);
+    }
+    if path.len() > spec.len()
+        && path.starts_with(spec)
+        && path.get(spec.len()) == Some(&b'/')
+    {
+        return Some(diff_path_component_count(&path[spec.len() + 1..]));
+    }
+    None
+}
+
+fn diff_path_slash_depth(path: &[u8]) -> i64 {
+    path.iter().filter(|byte| **byte == b'/').count() as i64
+}
+
+fn diff_path_component_count(path: &[u8]) -> i64 {
+    if path.is_empty() {
+        0
+    } else {
+        diff_path_slash_depth(path) + 1
     }
 }
 

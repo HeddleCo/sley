@@ -67,6 +67,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut indent_heuristic: Option<bool> = None;
     let mut submodule_format = commands::diff_options::SubmoduleDiffFormat::Short;
     let mut ignore_submodules_cli: Option<SubmoduleIgnoreMode> = None;
+    let mut max_depth: Option<i64> = None;
     let mut setup_args: Vec<String> = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
@@ -188,14 +189,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             "--max-depth" => {
                 idx += 1;
                 let value = take_value(args, idx, "--max-depth")?;
-                if value != "-1" {
-                    return diff_index_usage_error();
-                }
+                max_depth = Some(parse_diff_max_depth(value)?);
             }
             value if let Some(value) = value.strip_prefix("--max-depth=") => {
-                if value != "-1" {
-                    return diff_index_usage_error();
-                }
+                max_depth = Some(parse_diff_max_depth(value)?);
             }
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
                 abbrev = AbbrevRequest::Width(parse_diff_index_abbrev(value)?);
@@ -376,6 +373,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     };
 
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = apply_diff_max_depth(entries, &pathspec, max_depth);
     let entries = if match_missing && !cached {
         entries
             .into_iter()
