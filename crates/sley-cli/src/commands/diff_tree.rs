@@ -75,6 +75,8 @@ impl DiffTreeOutput {
 enum DiffTreePretty {
     Medium,
     Oneline,
+    Subject,
+    Notes,
 }
 
 /// Parsed `diff-tree` invocation.
@@ -96,6 +98,9 @@ struct DiffTreeOptions {
     /// `--pretty[=medium|oneline]` / `-v`: print a commit-log header instead of
     /// the bare commit id.
     pretty: Option<DiffTreePretty>,
+    /// `--notes` / `--show-notes`: append the standard notes block to the
+    /// medium pretty header.
+    show_notes: bool,
     /// `-m`: for a merge commit, emit one diff per parent (each preceded by the
     /// commit header). Without it a merge produces no output at all.
     merges_separate: bool,
@@ -157,6 +162,7 @@ impl Default for DiffTreeOptions {
             merge_base: false,
             no_commit_id: false,
             pretty: None,
+            show_notes: false,
             merges_separate: false,
             combined: None,
             combined_all_paths: false,
@@ -428,6 +434,14 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 options.pretty = Some(DiffTreePretty::Medium);
             }
             "--pretty=oneline" => options.pretty = Some(DiffTreePretty::Oneline),
+            "--notes" | "--show-notes" => options.show_notes = true,
+            "--no-notes" => options.show_notes = false,
+            "--format=%s" | "--pretty=format:%s" | "--pretty=tformat:%s" => {
+                options.pretty = Some(DiffTreePretty::Subject);
+            }
+            "--format=%N" | "--pretty=format:%N" | "--pretty=tformat:%N" => {
+                options.pretty = Some(DiffTreePretty::Notes);
+            }
             value if value.starts_with("--pretty=") || value.starts_with("--format=") => {
                 return Err(GitError::Unsupported(
                     "diff-tree pretty/commit-log output is not supported".into(),
@@ -497,13 +511,6 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             "diff-tree pathspec filtering is not supported".into(),
         ));
     }
-    // Pathspec filtering is currently implemented only for the depth-limited
-    // tree-walk path exercised by `--max-depth`.
-    if !setup.pathspecs.is_empty() && options.max_depth.is_none() {
-        return Err(GitError::Unsupported(
-            "diff-tree pathspec filtering is not supported".into(),
-        ));
-    }
     if options.max_depth.is_some() && diff_tree_has_wildcard_pathspec(&setup.pathspecs) {
         eprintln!("fatal: max-depth cannot be used with wildcard pathspecs");
         return Err(GitError::Exit(128));
@@ -539,11 +546,19 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             .get_bool("diff", None, "indentheuristic")
             .unwrap_or(true)
     });
+    let diff_pathspec = if setup.pathspecs.is_empty() || options.max_depth.is_some() {
+        None
+    } else if let Ok(worktree_root) = repo.worktree_root() {
+        Some(DiffPathspec::new(repo.cwd(), worktree_root, &setup.pathspecs)?)
+    } else {
+        None
+    };
     let request_context = DiffRequestContext {
         format,
         db,
         options: &options,
         pathspecs: &setup.pathspecs,
+        diff_pathspec,
         raw_abbrev,
         patch_abbrev,
         indent_heuristic,
@@ -562,7 +577,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             if line.is_empty() {
                 continue;
             }
-            for request in parse_stdin_request(format, db, &options, line)? {
+            for request in parse_stdin_request(git_dir, format, db, &options, line)? {
                 if run_diff_request(&mut stdout, &request_context, &request)? {
                     has_differences = true;
                 }
@@ -580,7 +595,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         let requests = if options.merge_base {
             resolve_merge_base_arg_request(git_dir, db, &setup.options.positives)?
         } else {
-            resolve_arg_request(db, &options, &setup.options.positives)?
+            resolve_arg_request(git_dir, db, &options, &setup.options.positives)?
         };
         for request in requests {
             if run_diff_request(&mut stdout, &request_context, &request)? {
@@ -642,6 +657,7 @@ struct DiffHeader {
 ///     becomes the (suppressible) header.
 ///   * Two operands: diff the two tree-ish objects directly; no header.
 fn resolve_arg_request(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
     revs: &[sley_rev::RevisionTip],
@@ -650,7 +666,7 @@ fn resolve_arg_request(
     if revs.len() == 1 {
         let oid = revs[0].oid;
         // The argument form prints the resolved commit id as its header.
-        single_commit_request(format, db, options, &oid, oid.to_hex())
+        single_commit_request(git_dir, format, db, options, &oid, oid.to_hex())
     } else {
         // git only ever uses the first two operands as trees; anything further
         // would be a pathspec, which we reject earlier when it reaches us via
@@ -693,6 +709,7 @@ fn resolve_merge_base_arg_request(
 /// argument form, or the verbatim input token for `--stdin`). A root commit is
 /// skipped unless `--root` is set, exactly like git.
 fn single_commit_request(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
@@ -715,7 +732,7 @@ fn single_commit_request(
         }]);
     }
     let commit = Commit::parse(format, &object.body)?;
-    let header_text = diff_tree_header_text(options, oid, &commit, header_text);
+    let header_text = diff_tree_header_text(git_dir, format, options, oid, &commit, header_text)?;
     if commit.parents.len() > 1 {
         // A merge commit. Precedence matches git: `-c`/`--cc` (combined) wins
         // over `-m` (separate). Without any of them a merge produces no output.
@@ -788,16 +805,21 @@ fn single_commit_request(
 /// trailing newline so the printed block ends with the blank line that
 /// separates it from the diff.
 fn diff_tree_header_text(
+    git_dir: &Path,
+    format: ObjectFormat,
     options: &DiffTreeOptions,
     oid: &ObjectId,
     commit: &Commit,
     plain_text: String,
-) -> String {
+) -> Result<String> {
     match options.pretty {
-        None => plain_text,
-        Some(DiffTreePretty::Oneline) => {
-            format!("{oid} {}", commit_subject(&commit.message))
+        None => Ok(plain_text),
+        Some(DiffTreePretty::Oneline) => Ok(format!("{oid} {}", commit_subject(&commit.message))),
+        Some(DiffTreePretty::Subject) if options.output.silent => {
+            Ok(commit_subject(&commit.message))
         }
+        Some(DiffTreePretty::Subject) => Ok(format!("{}\n", commit_subject(&commit.message))),
+        Some(DiffTreePretty::Notes) => diff_tree_pretty_notes(git_dir, format, oid),
         Some(DiffTreePretty::Medium) => {
             let mut text = format!("commit {oid}\n");
             if commit.parents.len() > 1 {
@@ -821,9 +843,22 @@ fn diff_tree_header_text(
                     text.push_str(&format!("    {line}\n"));
                 }
             }
-            text
+            if options.show_notes {
+                let notes = crate::commands::log::render_standard_notes(git_dir, format, oid)?;
+                text.push_str(&String::from_utf8_lossy(&notes));
+            }
+            Ok(text)
         }
     }
+}
+
+fn diff_tree_pretty_notes(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> Result<String> {
+    let store = FileRefStore::new(git_dir, format);
+    let handle = sley_notes::NotesRef::expand(sley_notes::DEFAULT_NOTES_REF);
+    let mut notes = sley_notes::read_note_bytes(git_dir, format, &store, &handle, oid)?
+        .unwrap_or_default();
+    notes.push(b'\n');
+    Ok(String::from_utf8_lossy(&notes).into_owned())
 }
 
 /// Parse one `--stdin` line.
@@ -840,6 +875,7 @@ fn diff_tree_header_text(
 ///   * Two tokens: two tree-ish object ids, diffed directly. The header echoes
 ///     the verbatim input line and is not suppressed by `--no-commit-id`.
 fn parse_stdin_request(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
@@ -888,7 +924,7 @@ fn parse_stdin_request(
             eprintln!("error: Need exactly two trees, separated by a space");
             return Ok(vec![skip_silent()]);
         }
-        single_commit_request(format, db, options, &oid, first.to_string())
+        single_commit_request(git_dir, format, db, options, &oid, first.to_string())
     }
 }
 
@@ -932,6 +968,7 @@ struct DiffRequestContext<'a> {
     db: &'a FileObjectDatabase,
     options: &'a DiffTreeOptions,
     pathspecs: &'a [String],
+    diff_pathspec: Option<DiffPathspec>,
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
     /// Resolved `--indent-heuristic` / `diff.indentHeuristic`.
@@ -990,6 +1027,10 @@ fn run_diff_request(
         &right,
         recursive,
     )?;
+    let entries = match context.diff_pathspec.as_ref() {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    };
     let has_differences = !entries.is_empty();
 
     // `--check`: report whitespace errors in place of the normal diff body.
