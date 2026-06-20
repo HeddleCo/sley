@@ -502,6 +502,7 @@ declare -A FLOOR=(
     [t4013-diff-various.sh]=205
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
     [t4014-format-patch.sh]=208
+    [t4100-apply-stat.sh]=25
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     [t4150-am.sh]=84
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
@@ -665,8 +666,8 @@ declare -A FLOOR=(
     # t1092 22->29; side gains t1091 45->50 (measured 51/53, slack closed), t1011 7->9.
     # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
     # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
-    [t1091-sparse-checkout-builtin.sh]=50
-    [t1092-sparse-checkout-compatibility.sh]=39
+    [t1091-sparse-checkout-builtin.sh]=64
+    [t1092-sparse-checkout-compatibility.sh]=41
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,

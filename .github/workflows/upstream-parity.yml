@@ -192,6 +192,7 @@ jobs:
             t3920-crlf-messages.sh
             t4013-diff-various.sh
             t4014-format-patch.sh
+            t4100-apply-stat.sh
             t4015-diff-whitespace.sh
             t4018-diff-funcname.sh
             t4019-diff-wserror.sh
