@@ -288,6 +288,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 .collect();
             match source {
                 Some(rev) => {
+                    if path_merge || conflict_implies_merge {
+                        eprintln!("fatal: '--merge' cannot be used when checking out paths from a tree");
+                        return Err(GitError::Exit(128));
+                    }
                     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
                     let oid = resolve_revision(&git_dir, format, rev)?;
                     let tree = sley_rev::peel_to_tree(&db, format, &oid)?;
@@ -627,6 +631,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
             let store = FileRefStore::new(&git_dir, format);
+            if matches!(track, Some(crate::commands::branch::BranchTrackMode::Direct))
+                && !checkout_start_is_trackable_branch(&store, &checkout_config, start)?
+            {
+                eprintln!("fatal: cannot set up tracking information; starting point '{start}' is not a branch");
+                return Err(GitError::Exit(128));
+            }
             let was_reset = checkout_create_or_reset_branch(
                 &git_dir,
                 &git_dir,
@@ -821,6 +831,34 @@ fn checkout_tracking_direct_ref(store: &FileRefStore, name: &str) -> Option<Stri
             RefTarget::Symbolic(next) => current = next,
         }
     }
+}
+
+fn checkout_start_is_trackable_branch(
+    store: &FileRefStore,
+    config: &GitConfig,
+    start: &str,
+) -> Result<bool> {
+    if start == "HEAD" {
+        return Ok(store.current_branch()?.is_some());
+    }
+    if let Ok(local_ref) = branch_ref_name(start)
+        && store.read_ref(&local_ref)?.is_some()
+    {
+        return Ok(true);
+    }
+    if start.starts_with("refs/heads/") || start.starts_with("refs/remotes/") {
+        return Ok(store.read_ref(start)?.is_some());
+    }
+    for remote in checkout_config_remote_names(config) {
+        let Some(branch) = start.strip_prefix(&format!("{remote}/")) else {
+            continue;
+        };
+        let remote_ref = format!("refs/remotes/{remote}/{branch}");
+        if store.read_ref(&remote_ref)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 struct CheckoutDwimRemoteBranch {
