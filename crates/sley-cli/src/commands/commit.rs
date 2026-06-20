@@ -150,8 +150,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut interactive = false;
     let mut patch = false;
     let mut gpg_sign = false;
-    let mut unified_context = false;
-    let mut inter_hunk_context = false;
+    let mut unified_context: Option<i64> = None;
+    let mut inter_hunk_context: Option<i64> = None;
     let mut pathspec_from_file = None;
     let mut pathspec_from_file_active = false;
     let mut pathspec_file_nul = false;
@@ -530,39 +530,42 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                     return commit_unified_requires_value_error(true);
                 };
                 patch_validate_unified_context(value, true)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             value if value.starts_with("-U") && value.len() > 2 => {
-                patch_validate_unified_context(&value[2..], true)?;
-                unified_context = true;
+                let value = &value[2..];
+                patch_validate_unified_context(value, true)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified" => {
                 let Some(value) = iter.next() else {
                     return commit_unified_requires_value_error(false);
                 };
                 patch_validate_unified_context(value, false)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified=" => {
                 return commit_unified_expects_numerical_value_error(false);
             }
             value if value.starts_with("--unified=") => {
-                patch_validate_unified_context(&value["--unified=".len()..], false)?;
-                unified_context = true;
+                let value = &value["--unified=".len()..];
+                patch_validate_unified_context(value, false)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context" => {
                 let Some(value) = iter.next() else {
                     return commit_inter_hunk_context_requires_value_error();
                 };
                 patch_validate_inter_hunk_context(value)?;
-                inter_hunk_context = true;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context=" => {
                 return commit_inter_hunk_context_expects_numerical_value_error();
             }
             value if value.starts_with("--inter-hunk-context=") => {
-                patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
-                inter_hunk_context = true;
+                let value = &value["--inter-hunk-context=".len()..];
+                patch_validate_inter_hunk_context(value)?;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "-v" | "--verbose" => verbose = verbose.max(0).saturating_add(1),
             "--no-verbose" => verbose = 0,
@@ -806,11 +809,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             ));
         }
     }
-    if unified_context && !interactive && !patch {
+    if unified_context.is_some() && !interactive && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if inter_hunk_context && !interactive && !patch {
+    if inter_hunk_context.is_some() && !interactive && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
@@ -821,10 +824,25 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         return cmd_commit_long_status_preview(amend, commit_untracked);
     }
     let _ = gpg_sign;
-    if interactive || patch {
+    if interactive {
         return Err(GitError::Unsupported(
             "commit interactive patch selection is not implemented".into(),
         ));
+    }
+    if patch {
+        commands::add_interactive::cmd_add_patch(
+            &pathspec_args,
+            unified_context,
+            inter_hunk_context,
+            true,
+        )?;
+        if template_file.is_none()
+            && file_message.is_none()
+            && message_chunks.is_empty()
+            && reuse_message.is_none()
+        {
+            return Ok(());
+        }
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
