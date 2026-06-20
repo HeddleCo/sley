@@ -492,7 +492,7 @@ declare -A FLOOR=(
     # pathspec staging before pre-commit, post-commit on replay/start, rebase-vs-
     # cherry-pick error precedence. t3404 63->80. Neighbors held: t3400=19,
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
-    [t3404-rebase-interactive.sh]=94
+    [t3404-rebase-interactive.sh]=120
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=12
     [t3420-rebase-autostash.sh]=40
