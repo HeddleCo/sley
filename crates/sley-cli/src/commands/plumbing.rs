@@ -4861,7 +4861,12 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     if !quiet {
         let mut stdout = io::stdout().lock();
         for path in result.removed {
-            writeln!(stdout, "rm '{}'", String::from_utf8_lossy(&path))?;
+            if let Err(err) = writeln!(stdout, "rm '{}'", String::from_utf8_lossy(&path)) {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    std::process::exit(141);
+                }
+                return Err(err.into());
+            }
         }
     }
     Ok(())
