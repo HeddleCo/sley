@@ -3738,6 +3738,18 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         push_options,
         packfile,
     };
+    if !request.packfile.is_empty() {
+        let config = read_repo_config(&git_dir)?;
+        if config
+            .get_bool("transfer", None, "fsckObjects")
+            .unwrap_or(false)
+        {
+            let exit = super::pack::fsck_pack_objects(&request.packfile, format, &[])?;
+            if exit != 0 {
+                return Err(GitError::Exit(exit));
+            }
+        }
+    }
     let report = sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();

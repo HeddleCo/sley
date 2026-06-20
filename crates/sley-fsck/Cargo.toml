@@ -8,9 +8,11 @@ license.workspace = true
 
 [dependencies]
 sley-core = { path = "../sley-core" }
+sley-config = { path = "../sley-config" }
 sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
+sley-submodule = { path = "../sley-submodule" }
 
 [lints]
 workspace = true

@@ -1162,11 +1162,20 @@ fn submodule_add_name(
     name_override: Option<&str>,
 ) -> Result<String> {
     if let Some(name) = name_override {
+        if !sley_submodule::check_submodule_name(name) {
+            eprintln!("fatal: '{name}' is not a valid submodule name");
+            return Err(GitError::Exit(128));
+        }
         return Ok(name.to_string());
     }
     let gitmodules_path = worktree_root.join(".gitmodules");
     let gitmodules = GitConfig::read(&gitmodules_path).unwrap_or_default();
-    Ok(submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string()))
+    let name = submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string());
+    if !sley_submodule::check_submodule_name(&name) {
+        eprintln!("fatal: '{name}' is not a valid submodule name");
+        return Err(GitError::Exit(128));
+    }
+    Ok(name)
 }
 
 fn validate_submodule_add_name_available(

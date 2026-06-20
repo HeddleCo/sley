@@ -1,4 +1,5 @@
 use sley_core::{ObjectFormat, ObjectId};
+use sley_config::GitConfig;
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -166,6 +167,7 @@ where
         connectivity_only: options.connectivity_only,
         object_names: options.object_names.clone(),
         error_bits: 0,
+        gitmodules_found: HashSet::new(),
         gitattributes_found: HashSet::new(),
     };
     let roots = roots.into_iter().collect::<Vec<_>>();
@@ -176,8 +178,10 @@ where
     for oid in object_ids.iter().cloned() {
         checker.check_object(oid);
     }
-    // git's deferred `fsck_blobs` pass: every blob a tree named `.gitattributes`
-    // gets a content check (line-length / size) it would not get as a plain blob.
+    // git's deferred `fsck_blobs` pass: every non-symlink entry named
+    // `.gitmodules` or `.gitattributes` is type/content checked with the
+    // path-specific security rules.
+    checker.check_gitmodules_blobs();
     checker.check_gitattributes_blobs();
     let notices = if options.report_unreachable {
         unreachable_notices(reader, format, &roots, &object_ids)
@@ -203,6 +207,8 @@ struct FsckChecker<'a, R> {
     object_names: HashMap<ObjectId, String>,
     /// Accumulated git exit-code bits (`ERROR_REACHABLE`).
     error_bits: i32,
+    /// Blob oids that some tree entry named `.gitmodules`.
+    gitmodules_found: HashSet<ObjectId>,
     /// Blob oids that some tree entry named `.gitattributes`, mirroring git's
     /// `gitattributes_found` oidset. Content-checked in a deferred final pass
     /// (`fsck_blobs`) so the blob is validated as a gitattributes file even
@@ -400,15 +406,46 @@ where
         };
         for entry in entries {
             let entry_object_type = fsck_tree_entry_object_type(entry.mode);
-            // git's `fsck_tree` records `.gitattributes`-named blob entries into
-            // `gitattributes_found` for the deferred content pass. Symlinks
-            // (mode S_IFLNK) get a different `gitattributesSymlink` report and
-            // are not content-checked; we only enroll regular-file blobs.
-            if entry_object_type == ObjectType::Blob
-                && entry.mode != 0o120000
-                && content::is_dotgitattributes_name(entry.name)
-            {
-                self.gitattributes_found.insert(entry.oid.clone());
+            let is_symlink = entry.mode == 0o120000;
+            if content::is_dotgitmodules_name(entry.name) {
+                if is_symlink {
+                    self.report_content(
+                        ObjectType::Tree,
+                        oid,
+                        content::MsgId::GitmodulesSymlink,
+                        ".gitmodules is a symbolic link",
+                    );
+                } else {
+                    self.gitmodules_found.insert(entry.oid.clone());
+                }
+            }
+            if content::is_dotgitattributes_name(entry.name) {
+                if is_symlink {
+                    self.report_content(
+                        ObjectType::Tree,
+                        oid,
+                        content::MsgId::GitattributesSymlink,
+                        ".gitattributes is a symlink",
+                    );
+                } else {
+                    self.gitattributes_found.insert(entry.oid.clone());
+                }
+            }
+            if is_symlink && content::is_dotgitignore_name(entry.name) {
+                self.report_content(
+                    ObjectType::Tree,
+                    oid,
+                    content::MsgId::GitignoreSymlink,
+                    ".gitignore is a symlink",
+                );
+            }
+            if is_symlink && content::is_dotmailmap_name(entry.name) {
+                self.report_content(
+                    ObjectType::Tree,
+                    oid,
+                    content::MsgId::MailmapSymlink,
+                    ".mailmap is a symlink",
+                );
             }
             // A null-sha entry is reported by the content checker as a warning;
             // do not also walk it as a broken link (git skips null entries).
@@ -456,6 +493,122 @@ where
         );
     }
 
+    fn report_content(
+        &mut self,
+        object_type: ObjectType,
+        oid: ObjectId,
+        msg_id: content::MsgId,
+        detail: impl Into<String>,
+    ) {
+        let severity = self.severity.resolve(msg_id);
+        if severity == content::Severity::Ignore {
+            return;
+        }
+        let prefix = match severity {
+            content::Severity::Error => "error in",
+            content::Severity::Warn => "warning in",
+            content::Severity::Ignore => return,
+        };
+        let msg = format!(
+            "{prefix} {} {oid}: {}: {}",
+            object_type.as_str(),
+            msg_id.camel(),
+            detail.into()
+        );
+        let issue = match severity {
+            content::Severity::Error => FsckIssue::content_error(msg),
+            _ => FsckIssue::content_warning(msg),
+        };
+        self.issues.push(issue);
+    }
+
+    /// git's deferred `fsck_blobs` pass for `.gitmodules`.
+    fn check_gitmodules_blobs(&mut self) {
+        let mut oids: Vec<ObjectId> = self.gitmodules_found.iter().cloned().collect();
+        oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for oid in oids {
+            let Ok(object) = self.reader.read_object(&oid) else {
+                self.report_content(
+                    ObjectType::Blob,
+                    oid,
+                    content::MsgId::GitmodulesMissing,
+                    "unable to read .gitmodules blob",
+                );
+                continue;
+            };
+            if object.object_type != ObjectType::Blob {
+                self.report_content(
+                    object.object_type,
+                    oid,
+                    content::MsgId::GitmodulesBlob,
+                    "non-blob found at .gitmodules",
+                );
+                continue;
+            }
+            let Ok(config) = GitConfig::parse(&object.body) else {
+                self.report_content(
+                    ObjectType::Blob,
+                    oid,
+                    content::MsgId::GitmodulesParse,
+                    "could not parse gitmodules blob",
+                );
+                continue;
+            };
+            for section in &config.sections {
+                if section.name != "submodule" {
+                    continue;
+                }
+                let Some(name) = section.subsection.as_deref() else {
+                    continue;
+                };
+                if !sley_submodule::check_submodule_name(name) {
+                    self.report_content(
+                        ObjectType::Blob,
+                        oid,
+                        content::MsgId::GitmodulesName,
+                        format!("disallowed submodule name: {name}"),
+                    );
+                }
+                for entry in &section.entries {
+                    let key = entry.key.to_ascii_lowercase();
+                    let Some(value) = entry.value.as_deref() else {
+                        continue;
+                    };
+                    match key.as_str() {
+                        "url" if !sley_submodule::check_submodule_url(value) => {
+                            self.report_content(
+                                ObjectType::Blob,
+                                oid,
+                                content::MsgId::GitmodulesUrl,
+                                format!("disallowed submodule url: {value}"),
+                            );
+                        }
+                        "path" if sley_submodule::looks_like_command_line_option(value) => {
+                            self.report_content(
+                                ObjectType::Blob,
+                                oid,
+                                content::MsgId::GitmodulesPath,
+                                format!("disallowed submodule path: {value}"),
+                            );
+                        }
+                        "update"
+                            if sley_submodule::parse_update_type(value)
+                                == sley_submodule::UpdateType::Command =>
+                        {
+                            self.report_content(
+                                ObjectType::Blob,
+                                oid,
+                                content::MsgId::GitmodulesUpdate,
+                                format!("disallowed submodule update setting: {value}"),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// git's deferred `fsck_blobs` pass for `.gitattributes`: each enrolled blob
     /// is loaded and content-checked for the line-length / size limits it would
     /// not get as a plain blob. Findings render as `error in blob <oid>: ...` on
@@ -466,12 +619,21 @@ where
         oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for oid in oids {
             let Ok(object) = self.reader.read_object(&oid) else {
-                // A missing .gitattributes blob is reported by the connectivity
-                // walk as a broken link already; git's gitattributesMissing path
-                // is for the same condition. Skip the content check here.
+                self.report_content(
+                    ObjectType::Blob,
+                    oid,
+                    content::MsgId::GitattributesMissing,
+                    "unable to read .gitattributes blob",
+                );
                 continue;
             };
             if object.object_type != ObjectType::Blob {
+                self.report_content(
+                    object.object_type,
+                    oid,
+                    content::MsgId::GitattributesBlob,
+                    "non-blob found at .gitattributes",
+                );
                 continue;
             }
             let findings = content::check_gitattributes_blob(&object.body, &self.severity);

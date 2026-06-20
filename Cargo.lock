@@ -1205,10 +1205,12 @@ dependencies = [
 name = "sley-fsck"
 version = "0.1.0"
 dependencies = [
+ "sley-config",
  "sley-core",
  "sley-formats",
  "sley-object",
  "sley-odb",
+ "sley-submodule",
 ]
 
 [[package]]

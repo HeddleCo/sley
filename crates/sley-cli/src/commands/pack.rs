@@ -3,7 +3,10 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_object::EncodedObject;
+use sley_odb::ObjectReader;
 use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct IndexPackOptions {
@@ -70,6 +73,12 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
             let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
             eprintln!("Receiving objects: 100% ({count}/{count}), done.");
             eprintln!("Resolving deltas: 100% ({count}/{count}), done.");
+        }
+        if options.fsck {
+            let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
+            if exit != 0 {
+                return Err(GitError::Exit(exit));
+            }
         }
         let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let install = db.install_raw_pack(&pack)?;
@@ -324,7 +333,11 @@ fn pack_has_unresolved_link(pack_bytes: &[u8], format: ObjectFormat) -> Result<b
 /// when no error-severity finding fired, 1 otherwise. Warnings never fail the
 /// command, matching builtin/index-pack.c's fsck pass (which leaves the default
 /// severities intact rather than applying the connectivity `--strict` promote).
-fn fsck_pack_objects(pack_bytes: &[u8], format: ObjectFormat, overrides: &[String]) -> Result<i32> {
+pub(crate) fn fsck_pack_objects(
+    pack_bytes: &[u8],
+    format: ObjectFormat,
+    overrides: &[String],
+) -> Result<i32> {
     let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
         Ok(pack) => pack,
         // A pack that does not even parse is reported by the index step; the
@@ -339,6 +352,44 @@ fn fsck_pack_objects(pack_bytes: &[u8], format: ObjectFormat, overrides: &[Strin
         }
     }
 
+    let reader = PackObjectReader::new(format, &pack);
+    let object_ids = pack
+        .entries
+        .iter()
+        .map(|object| object.entry.oid)
+        .collect::<Vec<_>>();
+    let report = sley_fsck::fsck_objects_with_options(
+        &reader,
+        format,
+        [],
+        object_ids,
+        sley_fsck::FsckOptions {
+            severity: severity.clone(),
+            ..Default::default()
+        },
+    );
+    let mut had_error = false;
+    for issue in &report.issues {
+        match issue.stream {
+            sley_fsck::IssueStream::Stderr => {
+                if print_index_pack_fsck_issue(&issue.message) {
+                    had_error = true;
+                }
+            }
+            sley_fsck::IssueStream::Stdout => {
+                eprintln!("error: {}", issue.message);
+                if issue.severity == sley_fsck::IssueSeverity::Error {
+                    had_error = true;
+                }
+            }
+        }
+    }
+    if had_error || report.exit_code() != 0 {
+        return Ok(1);
+    }
+
+    // Keep the simple per-object loop as a backstop for content-only findings
+    // while the full fsck walker above carries the tree-context checks.
     let mut had_error = false;
     for object in &pack.entries {
         let findings = sley_fsck::content::check_object_content(
@@ -367,6 +418,60 @@ fn fsck_pack_objects(pack_bytes: &[u8], format: ObjectFormat, overrides: &[Strin
         }
     }
     Ok(if had_error { 1 } else { 0 })
+}
+
+struct PackObjectReader {
+    format: ObjectFormat,
+    objects: HashMap<ObjectId, Arc<EncodedObject>>,
+}
+
+impl PackObjectReader {
+    fn new(format: ObjectFormat, pack: &sley_pack::PackFile) -> Self {
+        let objects = pack
+            .entries
+            .iter()
+            .map(|entry| (entry.entry.oid, Arc::new(entry.object.clone())))
+            .collect();
+        Self { format, objects }
+    }
+}
+
+impl ObjectReader for PackObjectReader {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        if *oid == ObjectId::empty_tree(self.format) {
+            return Ok(Arc::new(EncodedObject::new(
+                sley_object::ObjectType::Tree,
+                Vec::new(),
+            )));
+        }
+        self.objects
+            .get(oid)
+            .cloned()
+            .ok_or_else(|| GitError::NotFound(sley_core::NotFoundKind::Message(oid.to_string())))
+    }
+}
+
+fn print_index_pack_fsck_issue(message: &str) -> bool {
+    if let Some(rest) = message.strip_prefix("error in ") {
+        print_index_pack_fsck_content("error", rest);
+        return true;
+    }
+    if let Some(rest) = message.strip_prefix("warning in ") {
+        print_index_pack_fsck_content("warning", rest);
+        return false;
+    }
+    eprintln!("{message}");
+    message.starts_with("error:")
+}
+
+fn print_index_pack_fsck_content(label: &str, rest: &str) {
+    if let Some((_, oid_and_detail)) = rest.split_once(' ')
+        && let Some((oid, detail)) = oid_and_detail.split_once(": ")
+    {
+        eprintln!("{label}: object {oid}: {detail}");
+        return;
+    }
+    eprintln!("{label}: object {rest}");
 }
 
 fn write_index_pack_output(path: &Path, index: &[u8]) -> Result<()> {
@@ -2840,10 +2945,12 @@ fn xdg_config_home() -> PathBuf {
 /// other upstream flags are accepted and inert for this in-process path.
 pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
     let mut dry_run = false;
+    let mut strict = false;
     for arg in args {
         match arg.as_str() {
             "-n" => dry_run = true,
-            "-q" | "-r" | "--strict" => {}
+            "--strict" => strict = true,
+            "-q" | "-r" => {}
             value
                 if value.starts_with("--pack_header=")
                     || value.starts_with("--max-input-size=") => {}
@@ -2862,6 +2969,12 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
     if dry_run {
         sley_pack::PackFile::parse(&pack_bytes, format)?;
         return Ok(());
+    }
+    if strict {
+        let exit = fsck_pack_objects(&pack_bytes, format, &[])?;
+        if exit != 0 {
+            return Err(GitError::Exit(exit));
+        }
     }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     sley_odb::unpack_packfile_objects(&pack_bytes, format, db.loose())?;

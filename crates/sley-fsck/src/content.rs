@@ -81,9 +81,24 @@ pub enum MsgId {
     TreeNotSorted,
     LargePathname,
     BadTree,
+    // gitmodules blob/tree checks
+    GitmodulesMissing,
+    GitmodulesBlob,
+    GitmodulesLarge,
+    GitmodulesName,
+    GitmodulesParse,
+    GitmodulesPath,
+    GitmodulesSymlink,
+    GitmodulesUpdate,
+    GitmodulesUrl,
     // gitattributes blob content (checked when a tree entry names .gitattributes)
+    GitattributesMissing,
+    GitattributesBlob,
     GitattributesLarge,
     GitattributesLineLength,
+    GitattributesSymlink,
+    GitignoreSymlink,
+    MailmapSymlink,
 }
 
 impl MsgId {
@@ -133,8 +148,22 @@ impl MsgId {
             MsgId::TreeNotSorted => "treeNotSorted",
             MsgId::LargePathname => "largePathname",
             MsgId::BadTree => "badTree",
+            MsgId::GitmodulesMissing => "gitmodulesMissing",
+            MsgId::GitmodulesBlob => "gitmodulesBlob",
+            MsgId::GitmodulesLarge => "gitmodulesLarge",
+            MsgId::GitmodulesName => "gitmodulesName",
+            MsgId::GitmodulesParse => "gitmodulesParse",
+            MsgId::GitmodulesPath => "gitmodulesPath",
+            MsgId::GitmodulesSymlink => "gitmodulesSymlink",
+            MsgId::GitmodulesUpdate => "gitmodulesUpdate",
+            MsgId::GitmodulesUrl => "gitmodulesUrl",
+            MsgId::GitattributesMissing => "gitattributesMissing",
+            MsgId::GitattributesBlob => "gitattributesBlob",
             MsgId::GitattributesLarge => "gitattributesLarge",
             MsgId::GitattributesLineLength => "gitattributesLineLength",
+            MsgId::GitattributesSymlink => "gitattributesSymlink",
+            MsgId::GitignoreSymlink => "gitignoreSymlink",
+            MsgId::MailmapSymlink => "mailmapSymlink",
         }
     }
 
@@ -170,6 +199,16 @@ impl MsgId {
             | MsgId::BadTimezone
             | MsgId::DuplicateEntries
             | MsgId::TreeNotSorted
+            | MsgId::GitmodulesMissing
+            | MsgId::GitmodulesBlob
+            | MsgId::GitmodulesLarge
+            | MsgId::GitmodulesName
+            | MsgId::GitmodulesPath
+            | MsgId::GitmodulesSymlink
+            | MsgId::GitmodulesUpdate
+            | MsgId::GitmodulesUrl
+            | MsgId::GitattributesMissing
+            | MsgId::GitattributesBlob
             | MsgId::GitattributesLarge
             | MsgId::GitattributesLineLength
             | MsgId::BadTree => DefaultSeverity::Error,
@@ -182,6 +221,10 @@ impl MsgId {
             | MsgId::HasDotdot
             | MsgId::HasDotgit
             | MsgId::ZeroPaddedFilemode
+            | MsgId::GitmodulesParse
+            | MsgId::GitattributesSymlink
+            | MsgId::GitignoreSymlink
+            | MsgId::MailmapSymlink
             | MsgId::LargePathname => DefaultSeverity::Warn,
             // INFO in git's table (rendered as warning, ignored when promoted off).
             MsgId::BadFilemode | MsgId::BadTagName | MsgId::MissingTaggerEntry => {
@@ -355,7 +398,100 @@ pub fn check_gitattributes_blob(body: &[u8], config: &SeverityConfig) -> Vec<Con
 /// mirroring git's `is_hfs_dotgitattributes`/`is_ntfs_dotgitattributes`). For
 /// the parity suite the plain ASCII form is what the tests exercise.
 pub fn is_dotgitattributes_name(name: &[u8]) -> bool {
-    name.eq_ignore_ascii_case(b".gitattributes")
+    is_hfs_dot_name(name, "gitattributes") || is_ntfs_dot_name(name, "gitattributes", "gi7d29")
+}
+
+pub fn is_dotgitmodules_name(name: &[u8]) -> bool {
+    is_hfs_dot_name(name, "gitmodules") || is_ntfs_dot_name(name, "gitmodules", "gi7eba")
+}
+
+pub fn is_dotgitignore_name(name: &[u8]) -> bool {
+    is_hfs_dot_name(name, "gitignore") || is_ntfs_dot_name(name, "gitignore", "gi250a")
+}
+
+pub fn is_dotmailmap_name(name: &[u8]) -> bool {
+    is_hfs_dot_name(name, "mailmap") || is_ntfs_dot_name(name, "mailmap", "maba30")
+}
+
+fn is_hfs_dot_name(name: &[u8], needle: &str) -> bool {
+    let Ok(text) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let folded: String = text
+        .chars()
+        .filter(|ch| !is_hfs_ignorable(*ch))
+        .collect();
+    folded.eq_ignore_ascii_case(&format!(".{needle}"))
+}
+
+fn is_ntfs_dot_name(name: &[u8], needle: &str, short_prefix: &str) -> bool {
+    for segment in name.split(|&byte| byte == b'\\') {
+        let stream_name = segment
+            .iter()
+            .position(|&byte| byte == b':')
+            .map_or(segment, |colon| &segment[..colon]);
+        if ntfs_long_name_matches(stream_name, needle)
+            || ntfs_short_name_matches(stream_name, needle, short_prefix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn ntfs_long_name_matches(name: &[u8], needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if name.len() < needle.len() + 1 || name[0] != b'.' {
+        return false;
+    }
+    if !name[1..1 + needle.len()].eq_ignore_ascii_case(needle) {
+        return false;
+    }
+    ntfs_suffix_is_ignorable(&name[1 + needle.len()..])
+}
+
+fn ntfs_short_name_matches(name: &[u8], needle: &str, short_prefix: &str) -> bool {
+    let prefix = needle.as_bytes();
+    if prefix.len() >= 6
+        && name.len() >= 8
+        && name[..6].eq_ignore_ascii_case(&prefix[..6])
+        && name[6] == b'~'
+        && matches!(name[7], b'1'..=b'4')
+    {
+        return ntfs_suffix_is_ignorable(&name[8..]);
+    }
+
+    let short = short_prefix.as_bytes();
+    if name.len() < 8 {
+        return false;
+    }
+    let mut saw_tilde = false;
+    for i in 0..8 {
+        let c = name[i];
+        if c == 0 || c & 0x80 != 0 {
+            return false;
+        }
+        if saw_tilde {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+        } else if c == b'~' {
+            if i + 1 >= 8 || !matches!(name[i + 1], b'1'..=b'9') {
+                return false;
+            }
+            saw_tilde = true;
+        } else if i >= 6 || ![c].eq_ignore_ascii_case(&[short[i]]) {
+            return false;
+        }
+    }
+    saw_tilde && ntfs_suffix_is_ignorable(&name[8..])
+}
+
+fn ntfs_suffix_is_ignorable(mut suffix: &[u8]) -> bool {
+    if let Some(colon) = suffix.iter().position(|&byte| byte == b':') {
+        suffix = &suffix[..colon];
+    }
+    suffix.iter().all(|&byte| byte == b'.' || byte == b' ')
 }
 
 /// Validate a loaded object body, returning every content finding whose
