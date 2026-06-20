@@ -444,7 +444,7 @@ declare -A FLOOR=(
     # false dir-renames), rename/rename(1to2) split higher-stages, transitive dest
     # remapping for rename/delete. t6423 34->41 (raw 41/82, 2 known breakages).
     # Side gains banked: t6402 34->35, t6422 NEW@6.
-    [t6423-merge-rename-directories.sh]=55
+    [t6423-merge-rename-directories.sh]=69
     [t6422-merge-rename-corner-cases.sh]=6
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
@@ -643,7 +643,7 @@ declare -A FLOOR=(
     [t5404-tracking-branches.sh]=6
     [t5543-atomic-push.sh]=11
     [t5548-push-porcelain.sh]=11
-    [t6430-merge-recursive.sh]=23
+    [t6430-merge-recursive.sh]=29
     [t5702-protocol-v2.sh]=21
     [t7103-reset-bare.sh]=12
     [t7110-reset-merge.sh]=21
