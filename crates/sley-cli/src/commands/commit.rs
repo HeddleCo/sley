@@ -903,15 +903,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     // `i18n.commitEncoding` is recorded as the commit's `encoding` header so that
     // `git log` can re-encode the message to the log output encoding (UTF-8 by
     // default). git omits the header for UTF-8.
-    let commit_encoding_header = read_repo_config(&git_dir)
-        .ok()
-        .and_then(|config| {
-            config
-                .get("i18n", None, "commitEncoding")
-                .map(str::to_string)
-        })
-        .filter(|enc| !encoding_is_utf8(enc))
-        .map(String::into_bytes);
+    let commit_encoding = commit_encoding_config(&git_dir);
+    let commit_encoding_header =
+        (!encoding_is_utf8(&commit_encoding)).then(|| commit_encoding.clone().into_bytes());
     let committer = commit_identity_from_env("COMMITTER")?;
     let amended_old_oid = if amend {
         commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?
@@ -927,7 +921,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         .transpose()?;
     let fixup_message = fixup_commit
         .as_ref()
-        .map(|fixup| read_fixup_commit_message(&git_dir, format, fixup))
+        .map(|fixup| read_fixup_commit_message(&git_dir, format, fixup, &commit_encoding))
         .transpose()?;
     let fixup_reword_tree = if fixup_commit.as_ref().is_some_and(|fixup| {
         fixup.is_reword() || (fixup.is_amend_style() && only_without_paths)
@@ -942,7 +936,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     };
     let squash_message = squash_commit
         .as_deref()
-        .map(|rev| read_squash_commit_message(&git_dir, format, rev))
+        .map(|rev| read_squash_commit_message(&git_dir, format, rev, &commit_encoding))
         .transpose()?;
     let author = if reset_author {
         build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
@@ -1287,6 +1281,14 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message body.");
         return Err(GitError::Exit(1));
+    }
+    if commit_message_has_nul(&message) {
+        let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
+        eprintln!("error: a NUL byte in commit log message not allowed.");
+        return Err(GitError::Exit(1));
+    }
+    if encoding_is_utf8(&commit_encoding) && commit_message_has_invalid_utf8(&message) {
+        eprintln!("Warning: commit message did not conform to UTF-8.");
     }
     if let Some(path) = template_file.as_deref()
         && !allow_empty_message
@@ -2303,27 +2305,46 @@ fn read_fixup_commit_message(
     git_dir: &Path,
     format: ObjectFormat,
     fixup: &CommitFixup,
+    output_encoding: &str,
 ) -> Result<Vec<u8>> {
     let commit = read_reused_commit(git_dir, format, fixup.rev())?;
-    let subject = commit_subject(&commit.message);
+    let message = commit_message_for_commit_encoding(&commit, output_encoding);
+    let subject = commit_subject_bytes(&message);
     match fixup {
-        CommitFixup::Plain(_) => Ok(format!("fixup! {subject}\n").into_bytes()),
+        CommitFixup::Plain(_) => {
+            let mut message = b"fixup! ".to_vec();
+            message.extend_from_slice(subject);
+            message.push(b'\n');
+            Ok(message)
+        }
         CommitFixup::Amend { .. } => {
-            let mut message = format!("amend! {subject}\n\n").into_bytes();
+            let mut amend = b"amend! ".to_vec();
+            amend.extend_from_slice(subject);
+            amend.extend_from_slice(b"\n\n");
             let body = if commit.message.starts_with(b"amend! ") {
                 commit_message_body(&commit.message)
             } else {
-                commit.message
+                commit_message_for_commit_encoding(&commit, output_encoding).into_owned()
             };
-            message.extend_from_slice(&body);
-            Ok(message)
+            amend.extend_from_slice(&body);
+            Ok(amend)
         }
     }
 }
 
-fn read_squash_commit_message(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<u8>> {
+fn read_squash_commit_message(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    output_encoding: &str,
+) -> Result<Vec<u8>> {
     let commit = read_reused_commit(git_dir, format, rev)?;
-    Ok(format!("squash! {}\n", commit_subject(&commit.message)).into_bytes())
+    let message = commit_message_for_commit_encoding(&commit, output_encoding);
+    let subject = commit_subject_bytes(&message);
+    let mut squash = b"squash! ".to_vec();
+    squash.extend_from_slice(subject);
+    squash.push(b'\n');
+    Ok(squash)
 }
 
 fn read_squash_merge_message_from_file(git_dir: &Path) -> Result<Vec<u8>> {

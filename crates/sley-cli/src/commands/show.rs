@@ -119,6 +119,8 @@ struct ShowOptions {
     copy_threshold: u8,
     /// Date rendering mode for the `Date:` line and `%ad`/`%cd`.
     date_mode: DateMode,
+    /// `--encoding=<encoding>` override for commit message output.
+    output_encoding: Option<String>,
     /// Ref decoration mode for the `commit` header and `%d`/`%D`. `git show`
     /// defaults to off; `--decorate`/`--decorate=<mode>` enables it.
     decorate: LogDecorationMode,
@@ -214,6 +216,7 @@ impl Default for ShowOptions {
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             date_mode: DateMode::Default,
+            output_encoding: None,
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
@@ -500,6 +503,10 @@ fn show_commit(
 ) -> Result<()> {
     let options = context.options;
     let decorations = context.decorations;
+    let output_encoding = options
+        .output_encoding
+        .clone()
+        .unwrap_or_else(|| log_output_encoding(context.config));
     // `git show` is a log variant: `log.mailmap` (default true) controls whether
     // the default `Author:` line and lower-case identity atoms are mapped; the
     // upper-case `%aN`/… atoms always map.
@@ -598,8 +605,11 @@ fn show_commit(
                 commit_identity_date(&commit.author, &options.date_mode)
             )?;
             writeln!(stdout)?;
-            for line in String::from_utf8_lossy(&commit.message).lines() {
-                writeln!(stdout, "    {line}")?;
+            let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
+            for line in commit_message_lines(&display_message) {
+                stdout.write_all(b"    ")?;
+                stdout.write_all(line)?;
+                stdout.write_all(b"\n")?;
             }
             if options.show_notes {
                 let notes = crate::commands::log::render_standard_notes(
@@ -613,7 +623,10 @@ fn show_commit(
         ShowCommitFormat::Oneline => {
             write!(stdout, "{}", format_log_oid(oid, options.abbrev_len))?;
             print_log_decorations(oid, decorations);
-            writeln!(stdout, " {}", commit_subject(&commit.message))?;
+            let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
+            stdout.write_all(b" ")?;
+            stdout.write_all(commit_subject_bytes(&display_message))?;
+            stdout.write_all(b"\n")?;
         }
         ShowCommitFormat::FullOneline => {
             write!(
@@ -622,7 +635,10 @@ fn show_commit(
                 format_log_commit_header_oid(oid, options.abbrev_commit, options.abbrev_len)
             )?;
             print_log_decorations(oid, decorations);
-            writeln!(stdout, " {}", commit_subject(&commit.message))?;
+            let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
+            stdout.write_all(b" ")?;
+            stdout.write_all(commit_subject_bytes(&display_message))?;
+            stdout.write_all(b"\n")?;
         }
         ShowCommitFormat::Custom { compiled, .. } => {
             print_log_format(
@@ -640,7 +656,7 @@ fn show_commit(
                     mailmap: &mailmap,
                     use_mailmap,
                     color: false,
-                    output_encoding: "UTF-8",
+                    output_encoding: &output_encoding,
                 },
             )?;
         }
@@ -1451,6 +1467,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 // tformat (trailing newline).
                 options.commit_format = parse_pretty_value(spec)?;
                 options.show_notes = false;
+            }
+            value if let Some(encoding) = value.strip_prefix("--encoding=") => {
+                options.output_encoding = Some(encoding.to_string());
             }
             "--notes" | "--show-notes" => options.show_notes = true,
             "--no-notes" => options.show_notes = false,

@@ -2347,6 +2347,11 @@ fn format_subject(message: &[u8]) -> String {
     out
 }
 
+fn format_commit_subject(commit: &Commit) -> String {
+    let message = commit_message_for_commit_encoding(commit, "UTF-8");
+    format_subject(&message)
+}
+
 /// `skip_fixupish`: strip one `fixup! `/`amend! `/`squash! ` prefix, returning
 /// the remainder.
 fn skip_fixupish(subject: &str) -> Option<&str> {
@@ -2388,7 +2393,7 @@ fn rearrange_squash(
         // The subject is read off the commit, not the (potentially custom)
         // instruction-format arg.
         let record = read_rev_list_commit_record(db, ctx.format, item.oid.expect("checked"))?;
-        let subject = format_subject(&record.commit.message);
+        let subject = format_commit_subject(&record.commit);
         subjects[i] = Some(subject.clone());
 
         let mut i2: i64 = -1;
@@ -3750,7 +3755,8 @@ fn pick_one_commit(
     )?;
 
     // Compose the message (fixup/squash machinery).
-    let mut message = record.commit.message.clone();
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
+    let mut message = commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
     if opts.signoff && !is_fixup {
         message =
             commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?);
@@ -4388,6 +4394,7 @@ fn update_squash_messages(
 ) -> Result<()> {
     let comment = comment_char(&ctx.git_dir);
     let comment_str = (comment as char).to_string();
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
     let count = current_fixup_count(ctx);
     let flagged = is_fixup_flag(item.command, item.flags);
     let mut buf: Vec<u8>;
@@ -4416,31 +4423,32 @@ fn update_squash_messages(
         let head = head_commit_oid(&refs)?
             .ok_or_else(|| GitError::Command("need a HEAD to fixup".into()))?;
         let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
-        let head_body = &head_record.commit.message;
+        let head_body =
+            commit_message_for_commit_encoding(&head_record.commit, &target_encoding).into_owned();
         // Plain fixup (no flag) seeds message-fixup with HEAD's body.
         if item.command == TodoCommand::Fixup && item.flags == 0 {
-            fs::write(ctx.state_path("message-fixup"), head_body)?;
+            fs::write(ctx.state_path("message-fixup"), &head_body)?;
         }
         buf = format!("{comment_str} This is a combination of 2 commits.\n").into_bytes();
         if flagged {
             buf.extend_from_slice(
                 format!("{comment_str} The 1st commit message will be skipped:\n\n").as_bytes(),
             );
-            buf.extend_from_slice(&commented_lines(head_body, comment));
+            buf.extend_from_slice(&commented_lines(&head_body, comment));
         } else {
             buf.extend_from_slice(
                 format!("{comment_str} This is the 1st commit message:\n\n").as_bytes(),
             );
-            buf.extend_from_slice(head_body);
+            buf.extend_from_slice(&head_body);
         }
     }
 
-    let body = &record.commit.message;
+    let body = commit_message_for_commit_encoding(&record.commit, &target_encoding);
     if item.command == TodoCommand::Squash || flagged {
         append_squash_message(
             ctx,
             &mut buf,
-            body,
+            &body,
             item.command,
             item.flags,
             comment,
@@ -4456,7 +4464,7 @@ fn update_squash_messages(
             )
             .as_bytes(),
         );
-        buf.extend_from_slice(&commented_lines(body, comment));
+        buf.extend_from_slice(&commented_lines(&body, comment));
     }
     fs::write(ctx.state_path("message-squash"), &buf)?;
 
@@ -4622,7 +4630,7 @@ fn machine_commit(
             author,
             committer: committer.clone(),
             message: message.clone(),
-            encoding: None,
+            encoding: commit_encoding_header_from_config(&ctx.git_dir),
         },
     )?;
 

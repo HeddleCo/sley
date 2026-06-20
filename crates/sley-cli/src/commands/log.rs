@@ -586,6 +586,10 @@ fn emit_plain_oneline_limited_commit(
     append_log_oid(out, &record.oid, abbrev_len);
     out.push(b' ');
     let (message, encoding) = commit_object_message_and_optional_encoding(&object.body);
+    if encoding_is_none(output_encoding) {
+        out.extend_from_slice(commit_subject_bytes(message));
+        return Ok(());
+    }
     if encoding.is_none() && output_encoding_is_utf8 {
         out.extend_from_slice(commit_subject_bytes(message));
         return Ok(());
@@ -616,6 +620,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // "format kind" flag: `--format=`/`tformat:` terminate each entry with a
     // newline; `--pretty=format:` separates entries instead.
     let mut pretty_spec: Option<(String, bool)> = None;
+    let mut output_encoding_override: Option<String> = None;
     let mut walk_reflogs = false;
     let mut min_parents = None;
     let mut max_parents = None;
@@ -1456,7 +1461,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--no-mailmap=") => {
                 return log_option_takes_no_value_error("no-mailmap");
             }
-            value if value.starts_with("--encoding=") => {}
+            value if value.starts_with("--encoding=") => {
+                output_encoding_override = Some(value["--encoding=".len()..].to_string());
+            }
             "--notes" | "--show-notes" => notes_display.add_default(),
             value if value.starts_with("--notes=") => {
                 notes_display.add_ref(&value["--notes=".len()..]);
@@ -1760,7 +1767,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if diff_opts.merges.is_none() {
         diff_opts.merges = config_diff_merges;
     }
-    let output_encoding = log_output_encoding(&config);
+    let output_encoding = output_encoding_override.unwrap_or_else(|| log_output_encoding(&config));
     if !abbrev_commit_explicit
         && config.get_bool("log", None, "abbrevcommit").unwrap_or(false)
     {
@@ -3004,11 +3011,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         }
                     }
                     msg.push(b'\n');
-                    for line in String::from_utf8_lossy(&record.commit.message).lines() {
+                    let display_message =
+                        commit_message_for_commit_encoding(&record.commit, &output_encoding);
+                    for line in commit_message_lines(&display_message) {
                         if line.is_empty() {
                             msg.push(b'\n');
                         } else {
-                            writeln!(msg, "    {line}").map_err(io::Error::from)?;
+                            msg.extend_from_slice(b"    ");
+                            msg.extend_from_slice(line);
+                            msg.push(b'\n');
                         }
                     }
                     if let Some(log_diff) = &log_diff {
@@ -3160,10 +3171,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     )?;
                 }
                 writeln!(out)?;
-                for line in String::from_utf8_lossy(&record.commit.message).lines() {
+                let display_message =
+                    commit_message_for_commit_encoding(&record.commit, &output_encoding);
+                for line in commit_message_lines(&display_message) {
                     write!(out, "    ")?;
                     out.write_all(&log_highlight_matches(
-                        line.as_bytes(),
+                        line,
                         grep_filters.as_ref(),
                         &grep_colors,
                     ))?;

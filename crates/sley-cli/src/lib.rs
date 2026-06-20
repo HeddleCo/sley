@@ -8877,6 +8877,14 @@ fn commit_body(message: &[u8]) -> &[u8] {
     body
 }
 
+fn commit_message_lines(message: &[u8]) -> Vec<&[u8]> {
+    let mut lines = message.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
 struct LogFormatContext<'a> {
     abbrev_len: Option<usize>,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
@@ -10135,6 +10143,22 @@ fn commit_encoding(commit: &Commit) -> String {
         .to_string()
 }
 
+fn commit_encoding_config(git_dir: &Path) -> String {
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("i18n", None, "commitEncoding")
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "UTF-8".to_string())
+}
+
+fn commit_encoding_header_from_config(git_dir: &Path) -> Option<Vec<u8>> {
+    let encoding = commit_encoding_config(git_dir);
+    (!encoding_is_utf8(&encoding)).then(|| encoding.into_bytes())
+}
+
 /// True when `name` denotes a UTF-8 encoding (git's `is_encoding_utf8`).
 fn encoding_is_utf8(name: &str) -> bool {
     let n = name.trim();
@@ -10151,58 +10175,81 @@ fn encoding_is_latin1(name: &str) -> bool {
         || n.eq_ignore_ascii_case("8859-1")
 }
 
+fn encoding_is_none(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("none")
+}
+
+fn encoding_for_name(name: &str) -> Option<&'static encoding_rs::Encoding> {
+    let n = name.trim();
+    if encoding_is_utf8(n) {
+        return Some(encoding_rs::UTF_8);
+    }
+    if encoding_is_latin1(n) {
+        return Some(encoding_rs::WINDOWS_1252);
+    }
+    let compact = n
+        .bytes()
+        .filter(|byte| !matches!(*byte, b'-' | b'_' | b' '))
+        .map(|byte| byte.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    match compact.as_slice() {
+        b"EUCJP" => Some(encoding_rs::EUC_JP),
+        b"ISO2022JP" => Some(encoding_rs::ISO_2022_JP),
+        _ => encoding_rs::Encoding::for_label(n.as_bytes()),
+    }
+}
+
 /// Re-encode a commit message from its stored `encoding` header to the desired
-/// log output encoding, mirroring git's `repo_logmsg_reencode`. We natively
-/// support the conversions the upstream corpus exercises (Latin-1 ⇄ UTF-8) and
-/// pass the bytes through unchanged when the encodings already match or when the
-/// pair is one we don't convert (git would shell out to iconv there).
+/// log output encoding, mirroring git's `repo_logmsg_reencode`.
 fn log_reencode_message<'a>(message: &'a [u8], from: &str, to: &str) -> std::borrow::Cow<'a, [u8]> {
     use std::borrow::Cow;
-    if from.trim().is_empty() || from.eq_ignore_ascii_case(to) {
+    if encoding_is_none(to) || from.trim().eq_ignore_ascii_case(to.trim()) {
         return Cow::Borrowed(message);
     }
-    if encoding_is_utf8(from) && encoding_is_utf8(to) {
+    let from_encoding = encoding_for_name(from).unwrap_or(encoding_rs::UTF_8);
+    let to_encoding = encoding_for_name(to).unwrap_or(encoding_rs::UTF_8);
+    if from_encoding == to_encoding {
         return Cow::Borrowed(message);
     }
-    if encoding_is_latin1(from) && encoding_is_utf8(to) {
-        // Each Latin-1 byte maps to the same Unicode scalar.
-        let mut out = Vec::with_capacity(message.len());
-        for &b in message {
-            if b < 0x80 {
-                out.push(b);
-            } else {
-                out.push(0xc0 | (b >> 6));
-                out.push(0x80 | (b & 0x3f));
-            }
+    let (decoded, _, _) = from_encoding.decode(message);
+    let (encoded, _, _) = to_encoding.encode(&decoded);
+    Cow::Owned(encoded.into_owned())
+}
+
+fn commit_message_for_output<'a>(
+    message: &'a [u8],
+    encoding: Option<&[u8]>,
+    output_encoding: &str,
+) -> std::borrow::Cow<'a, [u8]> {
+    let from = encoding
+        .map(String::from_utf8_lossy)
+        .unwrap_or(std::borrow::Cow::Borrowed("UTF-8"));
+    log_reencode_message(message, &from, output_encoding)
+}
+
+fn commit_message_for_commit_encoding<'a>(
+    commit: &'a Commit,
+    output_encoding: &str,
+) -> std::borrow::Cow<'a, [u8]> {
+    commit_message_for_output(&commit.message, commit.encoding.as_deref(), output_encoding)
+}
+
+fn commit_message_has_nul(message: &[u8]) -> bool {
+    message.contains(&b'\0')
+}
+
+fn commit_message_has_invalid_utf8(message: &[u8]) -> bool {
+    let mut idx = 0usize;
+    while idx < message.len() {
+        let Some((cp, len)) = log_pick_utf8(message, idx) else {
+            return true;
+        };
+        if (0xfdd0..=0xfdef).contains(&cp) || (cp & 0xfffe == 0xfffe && cp <= 0x10ffff) {
+            return true;
         }
-        return Cow::Owned(out);
+        idx += len;
     }
-    if encoding_is_utf8(from) && encoding_is_latin1(to) {
-        // Reverse: collapse 2-byte Latin-1 range back to single bytes.
-        let mut out = Vec::with_capacity(message.len());
-        let mut idx = 0;
-        while idx < message.len() {
-            let b = message[idx];
-            if b < 0x80 {
-                out.push(b);
-                idx += 1;
-            } else if b & 0xe0 == 0xc0 && idx + 1 < message.len() && message[idx + 1] & 0xc0 == 0x80
-            {
-                let cp = (((b & 0x1f) as u32) << 6) | (message[idx + 1] & 0x3f) as u32;
-                if cp <= 0xff {
-                    out.push(cp as u8);
-                } else {
-                    out.extend_from_slice(&message[idx..idx + 2]);
-                }
-                idx += 2;
-            } else {
-                out.push(b);
-                idx += 1;
-            }
-        }
-        return Cow::Owned(out);
-    }
-    Cow::Borrowed(message)
+    false
 }
 
 /// The effective `git log` output encoding: `i18n.logOutputEncoding`, else
