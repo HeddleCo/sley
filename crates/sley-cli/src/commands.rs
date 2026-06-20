@@ -39,6 +39,7 @@ pub(crate) mod grep;
 pub(crate) mod grep_args;
 pub(crate) mod hash_object;
 pub(crate) mod hash_object_fsck;
+pub(crate) mod help;
 pub(crate) mod hooks;
 pub(crate) mod index;
 pub(crate) mod interpret_trailers;
