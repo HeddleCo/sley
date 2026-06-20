@@ -196,13 +196,15 @@ pub struct LineRange {
 /// line it touches is blank (when `ignore_blank_lines`) or matches one of the
 /// `-I` regexes (`regex_match`). Ignorable groups are kept out of hunk emission
 /// per `xdl_get_hunk`'s leading/isolated-ignorable removal.
+pub type ChangeIgnoreRegex<'a> = &'a dyn Fn(&[u8]) -> bool;
+
 pub struct ChangeIgnore<'a> {
     /// `--ignore-blank-lines`: blank change groups are ignorable.
     pub ignore_blank_lines: bool,
     /// `-I<regex>`: a line is regex-ignorable when this returns `true`. The
     /// closure receives the raw line bytes (including the trailing `\n`). When
     /// `None`, no regex suppression applies.
-    pub regex_match: Option<&'a dyn Fn(&[u8]) -> bool>,
+    pub regex_match: Option<ChangeIgnoreRegex<'a>>,
 }
 
 /// Which line kinds get whitespace-error highlighting, plus the rule to check
@@ -297,9 +299,11 @@ pub fn render_hunks(
         match op {
             DiffOp::Equal(n) => {
                 for _ in 0..n {
+                    // When records match only under whitespace-ignore flags,
+                    // git emits the postimage bytes as context.
                     tagged.push(TaggedLine {
                         kind: LineKind::Context,
-                        content: old[old_idx].content,
+                        content: new[new_idx].content,
                         old_index: old_idx,
                         new_index: new_idx,
                     });
@@ -1239,13 +1243,12 @@ fn mark_ignorable_changes(
                     .all(|i| line_is_blank(new[i].content, ws_ignore));
             change.ignore = blank;
         }
-        if !change.ignore {
-            if let Some(regex_match) = ci.regex_match {
-                let matched = (change.i1..change.i1 + change.chg1)
-                    .all(|i| regex_match(old[i].content))
-                    && (change.i2..change.i2 + change.chg2).all(|i| regex_match(new[i].content));
-                change.ignore = matched;
-            }
+        if !change.ignore
+            && let Some(regex_match) = ci.regex_match
+        {
+            let matched = (change.i1..change.i1 + change.chg1).all(|i| regex_match(old[i].content))
+                && (change.i2..change.i2 + change.chg2).all(|i| regex_match(new[i].content));
+            change.ignore = matched;
         }
     }
 }
@@ -1439,15 +1442,7 @@ fn function_context_range(
         }
         (start, end)
     } else {
-        let mut start = anchor;
-        while start > 0 && !line_is_blank(lines[start - 1].content, WsIgnore::default()) {
-            start -= 1;
-        }
-        let mut end = anchor + 1;
-        while end < lines.len() && !line_is_blank(lines[end].content, WsIgnore::default()) {
-            end += 1;
-        }
-        (start, end)
+        (0, lines.len())
     };
 
     while start < end && line_is_blank(lines[start].content, WsIgnore::default()) {
@@ -1989,10 +1984,8 @@ fn combine_one_parent(
                 }
                 // Mark inserted result lines: flag bit n set => parent n lacked
                 // this line.
-                for r in hunk_new_start..new_idx {
-                    if r < cnt {
-                        sline[r].flag |= nmask;
-                    }
+                for line in sline.iter_mut().take(new_idx.min(cnt)).skip(hunk_new_start) {
+                    line.flag |= nmask;
                 }
             }
         }
@@ -2001,19 +1994,19 @@ fn combine_one_parent(
     // Coalesce the plost lines into lost (git's coalesce_lines), then assign
     // p_lno numbers per parent — git's second loop in combine_diff.
     let mut p_lno: u64 = 1;
-    for lno in 0..=cnt {
-        sline[lno].p_lno[n] = p_lno;
-        if !sline[lno].plost.is_empty() {
-            let plost = std::mem::take(&mut sline[lno].plost);
-            coalesce_lost(&mut sline[lno].lost, plost, n, options);
+    for (lno, line) in sline.iter_mut().enumerate().take(cnt + 1) {
+        line.p_lno[n] = p_lno;
+        if !line.plost.is_empty() {
+            let plost = std::mem::take(&mut line.plost);
+            coalesce_lost(&mut line.lost, plost, n, options);
         }
         // How many parent lines does this sline advance?
-        for ll in &sline[lno].lost {
+        for ll in &line.lost {
             if ll.parent_map & nmask != 0 {
                 p_lno += 1; // '-' means parent had it
             }
         }
-        if lno < cnt && (sline[lno].flag & nmask) == 0 {
+        if lno < cnt && (line.flag & nmask) == 0 {
             p_lno += 1; // no '+' means parent had it
         }
     }
@@ -2161,15 +2154,15 @@ fn ws_squash_eq(a: &[u8], b: &[u8], change_only: bool) -> bool {
 fn reuse_combine_diff(sline: &mut [CdLine], cnt: usize, i: usize, j: usize) {
     let imask = 1u64 << i;
     let jmask = 1u64 << j;
-    for lno in 0..=cnt {
-        sline[lno].p_lno[i] = sline[lno].p_lno[j];
-        for ll in &mut sline[lno].lost {
+    for line in sline.iter_mut().take(cnt + 1) {
+        line.p_lno[i] = line.p_lno[j];
+        for ll in &mut line.lost {
             if ll.parent_map & jmask != 0 {
                 ll.parent_map |= imask;
             }
         }
-        if sline[lno].flag & jmask != 0 {
-            sline[lno].flag |= imask;
+        if line.flag & jmask != 0 {
+            line.flag |= imask;
         }
     }
     // The overall trailer (sline[cnt+1]).
@@ -2184,7 +2177,7 @@ fn cd_interesting(sline: &CdLine, all_mask: u64) -> bool {
 
 /// git's `adjust_hunk_tail`.
 fn adjust_hunk_tail(sline: &[CdLine], all_mask: u64, hunk_begin: usize, mut i: usize) -> usize {
-    if hunk_begin + 1 <= i && (sline[i - 1].flag & all_mask) == 0 {
+    if hunk_begin < i && (sline[i - 1].flag & all_mask) == 0 {
         i -= 1;
     }
     i
@@ -2225,7 +2218,7 @@ fn give_context(sline: &mut [CdLine], cnt: usize, num_parent: usize, context: us
     }
 
     while i <= cnt {
-        let mut j = if context < i { i - context } else { 0 };
+        let mut j = i.saturating_sub(context);
         // Paint a few lines before the first interesting line.
         while j < i {
             if (sline[j].flag & mark) == 0 {
@@ -2283,11 +2276,11 @@ fn make_hunks(
     let all_mask = (1u64 << num_parent) - 1;
     let mark = 1u64 << num_parent;
 
-    for i in 0..=cnt {
-        if cd_interesting(&sline[i], all_mask) {
-            sline[i].flag |= mark;
+    for line in sline.iter_mut().take(cnt + 1) {
+        if cd_interesting(line, all_mask) {
+            line.flag |= mark;
         } else {
-            sline[i].flag &= !mark;
+            line.flag &= !mark;
         }
     }
     if !dense {
@@ -2313,7 +2306,7 @@ fn make_hunks(
                 let mut la = adjust_hunk_tail(sline, all_mask, hunk_begin, j);
                 la = if la + context < cnt + 1 { la + context } else { cnt + 1 };
                 let mut contin = false;
-                while la > 0 && j <= la - 1 {
+                while la > 0 && j < la {
                     la -= 1;
                     if (sline[la].flag & mark) != 0 {
                         contin = true;
@@ -2360,8 +2353,8 @@ fn make_hunks(
 
         if !has_interesting && same_diff != all_mask {
             // Not interesting after all: unmark the whole hunk.
-            for x in hunk_begin..hunk_end {
-                sline[x].flag &= !mark;
+            for line in sline.iter_mut().take(hunk_end).skip(hunk_begin) {
+                line.flag &= !mark;
             }
         }
         i = hunk_end;

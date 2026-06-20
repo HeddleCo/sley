@@ -974,6 +974,20 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    if let Ok(config) = read_repo_config(&git_dir) {
+        if let Some(value) = config.get("diff", None, "colormoved")
+            && let Err(err) = log_validate_color_moved(value)
+        {
+            eprintln!("fatal: bad config variable 'diff.colormoved' from command-line config");
+            return Err(err);
+        }
+        if let Some(value) = config.get("diff", None, "colormovedws")
+            && let Err(err) = log_validate_color_moved_ws(value)
+        {
+            eprintln!("fatal: bad config variable 'diff.colormovedws' from command-line config");
+            return Err(err);
+        }
+    }
     if !color_always
         && read_repo_config(&git_dir)
             .ok()

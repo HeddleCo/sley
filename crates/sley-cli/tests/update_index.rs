@@ -345,7 +345,8 @@ fn update_index_add_symlink_matches_upstream_git() {
 
     // Each scenario: a name, a worktree-setup closure run inside a repo, and the
     // update-index argv to run + diff against upstream git.
-    let scenarios: Vec<(&str, fn(&Path), Vec<&str>)> = vec![
+    type Scenario<'a> = (&'a str, fn(&Path), Vec<&'a str>);
+    let scenarios: Vec<Scenario<'_>> = vec![
         (
             "symlink-to-directory",
             |repo: &Path| {

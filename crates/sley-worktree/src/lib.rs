@@ -1,3 +1,10 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::if_same_then_else,
+    clippy::ptr_arg,
+    clippy::too_many_arguments
+)]
+
 use sley_config::GitConfig;
 use sley_core::{
     BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, RepoPath,

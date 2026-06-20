@@ -234,7 +234,7 @@ fn init_templatedir_config_and_tilde_expansion_match_upstream_git() {
 
     let upstream = root.join("upstream");
     let rust = root.join("rust");
-    let templatedir = format!("~/templates");
+    let templatedir = "~/templates".to_string();
     let config_arg = format!("init.templatedir={templatedir}");
     let upstream_path = upstream.to_str().expect("utf8 temp path");
     let rust_path = rust.to_str().expect("utf8 temp path");

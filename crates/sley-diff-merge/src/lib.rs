@@ -2017,7 +2017,7 @@ fn diff_name_status_index_worktree_changes_for_entry_chunk(
     let mut path = PathBuf::from(worktree_root);
     for entry in entries {
         worktree_path_for_repo_path_into(&mut path, worktree_root, entry.path.as_bytes());
-        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, &stat_cache)? {
+        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, stat_cache)? {
             changes.push(change);
         }
     }
@@ -2034,7 +2034,7 @@ fn diff_name_status_index_worktree_changes_for_borrowed_entry_chunk(
     let mut path = PathBuf::from(worktree_root);
     for entry in entries {
         worktree_path_for_repo_path_into(&mut path, worktree_root, entry.path);
-        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, &stat_cache)? {
+        if let Some(change) = index_worktree_change_for_entry(&path, format, entry, stat_cache)? {
             changes.push(change);
         }
     }
@@ -3696,7 +3696,7 @@ fn worktree_entries_for_unique_paths<'a>(
     let mut entries = BTreeMap::new();
     for git_path in candidates {
         if let Some(entry) =
-            worktree_entry_for_path(worktree_root, format, &git_path, index_gitlinks, stat_cache)?
+            worktree_entry_for_path(worktree_root, format, git_path, index_gitlinks, stat_cache)?
         {
             entries.insert(git_path.clone(), entry);
         }
@@ -3784,13 +3784,11 @@ fn index_worktree_change_for_entry(
                 mode: sley_index::GITLINK_MODE,
                 oid,
             })
-        } else if let Some(oid) = gitlink_head_oid(path, format) {
-            Some(TrackedEntry {
+        } else {
+            gitlink_head_oid(path, format).map(|oid| TrackedEntry {
                 mode: sley_index::GITLINK_MODE,
                 oid,
             })
-        } else {
-            None
         }
     } else if metadata.is_file() || file_type.is_symlink() {
         if index_entry.reusable_with(stat_cache, &metadata) {
@@ -5846,6 +5844,7 @@ fn unique_df_path(
 /// Resolve directory/file collisions in the merged leaf set. For every file leaf
 /// whose path is also a directory (some other leaf lives under `path/`), move the
 /// file to `path~<branch>` and record a [`MergeConflictKind::FileDirectory`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_directory_file_conflicts(
     db: &FileObjectDatabase,
     paths: &mut Vec<MergedPath>,
@@ -6698,6 +6697,7 @@ struct DirRenameOutcome {
 ///     renamed — that would create a spurious rename/rename(1to2)),
 ///   - collisions (N paths mapping to one destination -> conflict),
 ///   - splits (a source dir with no majority target -> conflict, leave in place).
+#[allow(clippy::too_many_arguments)]
 fn apply_directory_renames(
     base_map: &MergeEntryMap,
     eff_base: &MergeEntryMap,

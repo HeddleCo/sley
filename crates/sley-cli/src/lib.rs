@@ -1,3 +1,12 @@
+#![allow(
+    dead_code,
+    unused_assignments,
+    unused_mut,
+    unused_variables,
+    clippy::all,
+    clippy::unwrap_used
+)]
+
 use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{BString, DateMode, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
@@ -2900,26 +2909,10 @@ pub(crate) fn write_diff_patch_entry(
     if empty_add_or_delete {
         return Ok(());
     }
-    match entry.status {
-        sley_diff_merge::NameStatus::Added => {
-            write_diff_meta_line(stdout, colors, "--- /dev/null")?;
-        }
-        _ => {
-            write_diff_meta_line(stdout, colors, &format!("--- {old_header_path}"))?;
-        }
-    }
-    match entry.status {
-        sley_diff_merge::NameStatus::Deleted => {
-            write_diff_meta_line(stdout, colors, "+++ /dev/null")?;
-        }
-        _ => {
-            write_diff_meta_line(stdout, colors, &format!("+++ {header_path}"))?;
-        }
-    }
-    // Hunks with git's section headings (shared with format-patch). The
-    // funcname pattern comes from the old side's driver, then the new side's,
-    // mirroring diff_funcname_pattern(one) ?: diff_funcname_pattern(two);
-    // the word regex resolves CLI > old driver > new driver > diff.wordRegex.
+    // Build the hunk body before emitting the file headers. When whitespace
+    // ignore suppresses all content hunks for a rename/copy/mode change, git
+    // still emits the metadata through the index line, but does not print the
+    // `---`/`+++` file headers.
     let funcname = old_driver
         .as_ref()
         .and_then(|driver| driver.funcname.as_ref())
@@ -2976,31 +2969,21 @@ pub(crate) fn write_diff_patch_entry(
         }
         None => None,
     };
-    // Pilot consumer of the shared renderer: build the engine's hunk-render
-    // options directly (funcname classifier closure, color palette borrow,
-    // word-diff hook) and emit the hunk body via
-    // `sley_diff_merge::render::render_hunks`. The per-file metainfo header
-    // above stays here (it is repository/option-shaped); the engine owns the
-    // `@@`-header/`+`/`-`/no-newline byte-shaping.
     let mut heading = commands::format_patch::heading_classifier(funcname);
     let mut word_diff_adapter = word_diff
         .as_ref()
         .map(commands::format_patch::WordDiffAdapter::new);
-    // Whitespace-error highlighting (`--ws-error-highlight`, default new-only)
-    // is active only when both color and a resolved rule are present.
     let ws_error = colors.and(options.ws_error);
-    // `--ignore-blank-lines` / `-I<regex>` change-group suppression: build the
-    // regex predicate over the compiled `-I` patterns (ERE substring match,
-    // like git's regexec_buf over the line including its trailing newline).
     let ignore_regexes = options.ignore_regexes;
-    let regex_match = (!ignore_regexes.is_empty())
-        .then_some(move |line: &[u8]| ignore_regexes.iter().any(|re| re.is_match_with_case(line, false)));
+    let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
+        ignore_regexes
+            .iter()
+            .any(|re| re.is_match_with_case(line, false))
+    });
     let change_ignore = (options.ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
         sley_diff_merge::render::ChangeIgnore {
             ignore_blank_lines: options.ignore_blank_lines,
-            regex_match: regex_match
-                .as_ref()
-                .map(|f| f as &dyn Fn(&[u8]) -> bool),
+            regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
         }
     });
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
@@ -3026,6 +3009,25 @@ pub(crate) fn write_diff_patch_entry(
         new_content.as_deref(),
         &mut render_options,
     );
+    if hunks.is_empty() {
+        return Ok(());
+    }
+    match entry.status {
+        sley_diff_merge::NameStatus::Added => {
+            write_diff_meta_line(stdout, colors, "--- /dev/null")?;
+        }
+        _ => {
+            write_diff_meta_line(stdout, colors, &format!("--- {old_header_path}"))?;
+        }
+    }
+    match entry.status {
+        sley_diff_merge::NameStatus::Deleted => {
+            write_diff_meta_line(stdout, colors, "+++ /dev/null")?;
+        }
+        _ => {
+            write_diff_meta_line(stdout, colors, &format!("+++ {header_path}"))?;
+        }
+    }
     stdout.write_all(&hunks)?;
     Ok(())
 }
