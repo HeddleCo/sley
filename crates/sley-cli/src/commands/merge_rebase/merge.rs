@@ -3318,6 +3318,29 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
                     String::from_utf8_lossy(new_path),
                 ),
             },
+            sley_diff_merge::MergeInfoMessage::DirRenameLocationConflict {
+                old_path,
+                new_path,
+                renamed_from,
+                added_in,
+                dir_renamed_in,
+            } => match renamed_from {
+                Some(source) => println!(
+                    "CONFLICT (file location): {} renamed to {} in {}, inside a directory that was renamed in {}, suggesting it should perhaps be moved to {}.",
+                    String::from_utf8_lossy(source),
+                    String::from_utf8_lossy(old_path),
+                    added_in,
+                    dir_renamed_in,
+                    String::from_utf8_lossy(new_path),
+                ),
+                None => println!(
+                    "CONFLICT (file location): {} added in {} inside a directory that was renamed in {}, suggesting it should perhaps be moved to {}.",
+                    String::from_utf8_lossy(old_path),
+                    added_in,
+                    dir_renamed_in,
+                    String::from_utf8_lossy(new_path),
+                ),
+            },
         }
     }
 }

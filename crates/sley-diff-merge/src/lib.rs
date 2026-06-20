@@ -5144,6 +5144,17 @@ pub enum MergeInfoMessage {
         added_in: String,
         dir_renamed_in: String,
     },
+    /// A directory-rename location conflict that overlaps another conflict at
+    /// the same final path, such as a content conflict. The path's primary
+    /// conflict kind remains attached to the path; this carries git's extra
+    /// `CONFLICT (file location)` line.
+    DirRenameLocationConflict {
+        old_path: Vec<u8>,
+        new_path: Vec<u8>,
+        renamed_from: Option<Vec<u8>>,
+        added_in: String,
+        dir_renamed_in: String,
+    },
 }
 
 /// Read a tree object (by oid) into a flattened path -> (mode, oid) map,
@@ -5297,6 +5308,7 @@ pub fn merge_entry_maps(
         info_messages = outcome.info_messages;
         dir_rename_dirty = outcome.dirty;
         remap_rename_destinations(&mut renames, &rehomed_paths);
+        drop_collapsed_rename_rename_conflicts(&mut renames);
         dir_rename_two_to_one = collect_dir_rename_two_to_one(&renames, &rehomed_paths);
     }
     for info in rehomed_paths
@@ -5693,6 +5705,14 @@ pub fn merge_entry_maps(
             {
                 slot.conflict = Some(MergeConflictKind::DirRenameLocation {
                     old_path: info.old_path.clone(),
+                    renamed_from: info.renamed_from.clone(),
+                    added_in,
+                    dir_renamed_in,
+                });
+            } else {
+                info_messages.push(MergeInfoMessage::DirRenameLocationConflict {
+                    old_path: info.old_path.clone(),
+                    new_path: dest.clone(),
                     renamed_from: info.renamed_from.clone(),
                     added_in,
                     dir_renamed_in,
@@ -6851,7 +6871,28 @@ fn apply_rehome_moves(
                     (true, RenameSide::Theirs) | (false, RenameSide::Ours) => true,
                     (true, RenameSide::Ours) | (false, RenameSide::Theirs) => false,
                 });
-        if (original_base.contains_key(&mv.to)
+        let base_entry_at_dest = original_base.get(&mv.to).copied();
+        let base_entry_at_source = original_base.get(&mv.from).copied();
+        let other_side_entry_at_dest = if side_is_ours {
+            theirs.get(&mv.to).copied()
+        } else {
+            ours.get(&mv.to).copied()
+        };
+        let other_side_entry_at_source = if side_is_ours {
+            theirs.get(&mv.from).copied()
+        } else {
+            ours.get(&mv.from).copied()
+        };
+        let base_entry_for_shifted_source = base_entry_at_source.or(base_entry_at_dest);
+        let rename_back_to_modified_source = mv
+            .renamed_from
+            .as_ref()
+            .is_some_and(|source| source == &mv.to)
+            && base_entry_at_dest.is_some()
+            && (other_side_entry_at_dest.is_some_and(|entry| Some(entry) != base_entry_at_dest)
+                || other_side_entry_at_source
+                    .is_some_and(|entry| Some(entry) != base_entry_for_shifted_source));
+        if ((base_entry_at_dest.is_some() && !rename_back_to_modified_source)
             || (occupied_on_this_side && !occupied_by_cross_rename))
             && mv.to != mv.from
         {
@@ -6998,6 +7039,12 @@ fn remap_rename_destinations(renames: &mut MergeRenames, rehomed: &BTreeMap<Vec<
             }
         }
     }
+}
+
+fn drop_collapsed_rename_rename_conflicts(renames: &mut MergeRenames) {
+    renames
+        .rename_rename_one_to_two
+        .retain(|_, rename| rename.ours_dest != rename.theirs_dest);
 }
 
 fn apply_dir_rename_two_to_one_conflicts(
