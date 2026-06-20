@@ -83,8 +83,15 @@ pub enum RevListOrdering {
 pub enum RevListMissingAction {
     Error,
     Print,
+    PrintInfo,
     AllowAny,
     AllowPromisor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevListWalkWithMissing {
+    pub records: Vec<CommitRecord>,
+    pub missing: Vec<ObjectId>,
 }
 
 /// `--topo-order` (git's `REV_SORT_IN_GRAPH_ORDER`).
@@ -329,12 +336,31 @@ pub fn rev_list_walk_commits_with_missing(
     first_parent: bool,
     missing_action: RevListMissingAction,
 ) -> Result<Vec<CommitRecord>> {
+    Ok(rev_list_walk_commits_with_missing_details(
+        db,
+        format,
+        starts,
+        first_parent,
+        missing_action,
+    )?
+    .records)
+}
+
+pub fn rev_list_walk_commits_with_missing_details(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: impl IntoIterator<Item = ObjectId>,
+    first_parent: bool,
+    missing_action: RevListMissingAction,
+) -> Result<RevListWalkWithMissing> {
     if !first_parent {
-        return rev_list_walk_commits_all_parents(db, format, starts, missing_action);
+        return rev_list_walk_commits_all_parents_with_missing(db, format, starts, missing_action);
     }
     let mut seen = HashSet::new();
+    let mut missing_seen = HashSet::new();
     let mut pending = starts.into_iter().collect::<VecDeque<_>>();
     let mut out = Vec::new();
+    let mut missing = Vec::new();
     while let Some(oid) = pending.pop_front() {
         if !seen.insert(oid) {
             continue;
@@ -343,6 +369,13 @@ pub fn rev_list_walk_commits_with_missing(
             Ok(object) => object,
             Err(err) if missing_action != RevListMissingAction::Error => {
                 let _ = err;
+                if matches!(
+                    missing_action,
+                    RevListMissingAction::Print | RevListMissingAction::PrintInfo
+                ) && missing_seen.insert(oid)
+                {
+                    missing.push(oid);
+                }
                 continue;
             }
             Err(err) => return Err(err),
@@ -364,18 +397,23 @@ pub fn rev_list_walk_commits_with_missing(
             commit,
         });
     }
-    Ok(out)
+    Ok(RevListWalkWithMissing {
+        records: out,
+        missing,
+    })
 }
 
-pub fn rev_list_walk_commits_all_parents(
+fn rev_list_walk_commits_all_parents_with_missing(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     starts: impl IntoIterator<Item = ObjectId>,
     missing_action: RevListMissingAction,
-) -> Result<Vec<CommitRecord>> {
+) -> Result<RevListWalkWithMissing> {
     let mut seen = HashSet::new();
+    let mut missing_seen = HashSet::new();
     let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
     let mut out = Vec::new();
+    let mut missing = Vec::new();
     while let Some(oid) = pending.pop_front() {
         if !seen.insert(oid) {
             continue;
@@ -384,6 +422,13 @@ pub fn rev_list_walk_commits_all_parents(
             Ok(object) => object,
             Err(err) if missing_action != RevListMissingAction::Error => {
                 let _ = err;
+                if matches!(
+                    missing_action,
+                    RevListMissingAction::Print | RevListMissingAction::PrintInfo
+                ) && missing_seen.insert(oid)
+                {
+                    missing.push(oid);
+                }
                 continue;
             }
             Err(err) => return Err(err),
@@ -403,7 +448,19 @@ pub fn rev_list_walk_commits_all_parents(
             commit,
         });
     }
-    Ok(out)
+    Ok(RevListWalkWithMissing {
+        records: out,
+        missing,
+    })
+}
+
+pub fn rev_list_walk_commits_all_parents(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: impl IntoIterator<Item = ObjectId>,
+    missing_action: RevListMissingAction,
+) -> Result<Vec<CommitRecord>> {
+    Ok(rev_list_walk_commits_all_parents_with_missing(db, format, starts, missing_action)?.records)
 }
 
 pub fn rev_list_no_walk_commits(
