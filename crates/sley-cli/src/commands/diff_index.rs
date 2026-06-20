@@ -358,7 +358,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             )?
         }
     };
-    let submodule_config = submodule_diff_config(git_dir, worktree_root, ignore_submodules_cli);
+    let mut submodule_config = submodule_diff_config(git_dir, worktree_root, ignore_submodules_cli);
+    if ignore_submodules_cli.is_none() && submodule_config.base == SubmoduleIgnoreMode::Untracked {
+        submodule_config.base = SubmoduleIgnoreMode::Dirty;
+    }
     let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
     let submodule_dirt = match (!cached, worktree_root) {
         (true, Some(root)) => collect_dirty_submodules(

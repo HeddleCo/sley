@@ -5339,6 +5339,9 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
+    if paths.len() > 2 {
+        validate_mv_sources_do_not_overlap(&cwd, &worktree_root, &paths[..paths.len() - 1])?;
+    }
 
     let mut results = Vec::new();
     for source in &paths[..paths.len() - 1] {
@@ -5400,6 +5403,93 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_mv_sources_do_not_overlap(
+    cwd: &Path,
+    worktree_root: &Path,
+    sources: &[PathBuf],
+) -> Result<()> {
+    let mut normalized = Vec::new();
+    for source in sources {
+        let absolute = if source.is_absolute() {
+            source.clone()
+        } else {
+            cwd.join(source)
+        };
+        let absolute = normalize_mv_absolute_path_lexically(&absolute);
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", source.display()))
+        })?;
+        let path = mv_git_path_bytes(relative)?;
+        normalized.push(path);
+    }
+    for (left_index, left) in normalized.iter().enumerate() {
+        for right in normalized.iter().skip(left_index + 1) {
+            if mv_path_is_parent(left, right) {
+                print_mv_parent_child_error(right, left);
+                return Err(GitError::Exit(128));
+            }
+            if mv_path_is_parent(right, left) {
+                print_mv_parent_child_error(left, right);
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mv_path_is_parent(parent: &[u8], child: &[u8]) -> bool {
+    child.len() > parent.len()
+        && child.starts_with(parent)
+        && child.get(parent.len()) == Some(&b'/')
+}
+
+fn print_mv_parent_child_error(child: &[u8], parent: &[u8]) {
+    eprintln!(
+        "fatal: cannot move both '{}' and its parent directory '{}'",
+        String::from_utf8_lossy(child),
+        String::from_utf8_lossy(parent)
+    );
+}
+
+fn mv_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(GitError::InvalidPath(format!(
+            "invalid index path {}",
+            path.display()
+        )));
+    }
+    Ok(path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+        .into_bytes())
+}
+
+fn normalize_mv_absolute_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 struct CleanTarget {

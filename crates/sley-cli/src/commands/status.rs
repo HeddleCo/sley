@@ -32,6 +32,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut column_untracked = false;
     let mut ahead_behind = true;
     let mut explicit_ahead_behind = false;
+    let mut detect_renames = true;
     // `git status -v` verbosity: 0 (none), 1 (append the staged HEAD-vs-index
     // diff), 2+ (also append the index-vs-worktree diff). `-vv` and repeated
     // `-v` accumulate; `--no-verbose` resets to 0 (wt-status verbose level).
@@ -163,7 +164,8 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             }
             "-v" | "--verbose" => verbose = verbose.saturating_add(1),
             "--no-verbose" => verbose = 0,
-            "--no-renames" | "--renames" | "--find-renames" => {}
+            "--no-renames" => detect_renames = false,
+            "--renames" | "--find-renames" => detect_renames = true,
             "--column"
             | "--column="
             | "--column=auto"
@@ -207,9 +209,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             }
             "--show-stash" => show_stash = true,
             "--no-show-stash" => show_stash = false,
-            "-M" => {}
-            value if value.starts_with("-M") && value.len() > 2 => {}
-            value if value.starts_with("--find-renames=") => {}
+            "-M" => detect_renames = true,
+            value if value.starts_with("-M") && value.len() > 2 => detect_renames = true,
+            value if value.starts_with("--find-renames=") => detect_renames = true,
             value if value.starts_with("--short=") => {
                 return status_option_takes_no_value_error("short");
             }
@@ -378,6 +380,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 z,
                 porcelain_v1,
                 relative_paths,
+                detect_renames,
             },
         )?;
         if !pathspec.has_filters() && !show_ignored && explicit_untracked {
@@ -574,6 +577,7 @@ struct StatusShortStreamDisplay {
     z: bool,
     porcelain_v1: bool,
     relative_paths: bool,
+    detect_renames: bool,
 }
 
 fn print_status_short_stream(
@@ -622,6 +626,45 @@ fn print_status_short_stream(
             status_branch_header(git_dir, format, display.ahead_behind)?
         );
     }
+    if display.detect_renames {
+        let mut entries =
+            crate::collect_short_status_with_options(worktree_root, git_dir, format, options)?;
+        if pathspec.has_filters() {
+            entries.retain(|entry| pathspec.matches(&entry.path));
+        }
+        apply_submodule_ignore(&mut entries, ignore_resolver);
+        for entry in status_entries_with_exact_renames(entries) {
+            let mut entry = entry;
+            if !display.porcelain_v1 && display.relative_paths {
+                entry.entry.path = pathspec.display(&entry.entry.path);
+                if let Some(path) = entry.rename_from.as_mut() {
+                    *path = pathspec.display(path);
+                }
+            }
+            let worktree_code = if display.porcelain_v1 {
+                entry.entry.worktree
+            } else {
+                status_short_submodule_code(&entry.entry)
+            };
+            if let Some(rename_from) = entry.rename_from {
+                println!(
+                    "{}{} {} -> {}",
+                    entry.entry.index as char,
+                    worktree_code as char,
+                    status_quote_path(&rename_from, true),
+                    status_quote_path(&entry.entry.path, true)
+                );
+            } else {
+                println!(
+                    "{}{} {}",
+                    entry.entry.index as char,
+                    worktree_code as char,
+                    status_quote_path(&entry.entry.path, true)
+                );
+            }
+        }
+        return Ok(());
+    }
     sley_worktree::stream_short_status_with_options(
         worktree_root,
         git_dir,
@@ -652,6 +695,61 @@ fn print_status_short_stream(
             Ok(sley_worktree::StreamControl::Continue)
         },
     )
+}
+
+struct StatusOutputEntry {
+    entry: sley_worktree::ShortStatusEntry,
+    rename_from: Option<Vec<u8>>,
+}
+
+fn status_entries_with_exact_renames(
+    entries: Vec<sley_worktree::ShortStatusEntry>,
+) -> Vec<StatusOutputEntry> {
+    let mut used = vec![false; entries.len()];
+    let mut output = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if used[index] {
+            continue;
+        }
+        if entry.index == b'A'
+            && entry.worktree == b' '
+            && let Some(deleted_index) = entries
+                .iter()
+                .enumerate()
+                .find(|(candidate_index, candidate)| {
+                    !used[*candidate_index] && status_entries_are_exact_rename(candidate, entry)
+                })
+                .map(|(candidate_index, _)| candidate_index)
+        {
+            let mut renamed = entry.clone();
+            renamed.index = b'R';
+            used[index] = true;
+            used[deleted_index] = true;
+            output.push(StatusOutputEntry {
+                entry: renamed,
+                rename_from: Some(entries[deleted_index].path.clone()),
+            });
+            continue;
+        }
+        used[index] = true;
+        output.push(StatusOutputEntry {
+            entry: entry.clone(),
+            rename_from: None,
+        });
+    }
+    output
+}
+
+fn status_entries_are_exact_rename(
+    deleted: &sley_worktree::ShortStatusEntry,
+    added: &sley_worktree::ShortStatusEntry,
+) -> bool {
+    deleted.index == b'D'
+        && deleted.worktree == b' '
+        && added.index == b'A'
+        && added.worktree == b' '
+        && deleted.head_mode == added.index_mode
+        && deleted.head_oid == added.index_oid
 }
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
