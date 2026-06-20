@@ -406,6 +406,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                     &target_commit,
                 )?;
             }
+            apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
         }
         update_reset_head_ref(
             &git_dir,
@@ -701,6 +702,60 @@ fn reset_soft_blocked_by_merge(git_dir: &Path, format: ObjectFormat) -> Result<b
         .entries
         .iter()
         .any(|entry| entry.stage() != sley_index::Stage::Normal))
+}
+
+fn apply_reset_sparse_checkout(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let sparse_enabled = worktree_config
+        .get_bool("core", None, "sparseCheckout")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return Ok(());
+    }
+    let sparse_file = git_dir.join("info").join("sparse-checkout");
+    if !sparse_file.exists() {
+        return Ok(());
+    }
+    let cone = worktree_config
+        .get_bool("core", None, "sparseCheckoutCone")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
+        .unwrap_or(false);
+    let sparse_index = cone
+        && worktree_config
+            .get_bool("index", None, "sparse")
+            .or_else(|| repo_config.get_bool("index", None, "sparse"))
+            .unwrap_or(false);
+    let bytes = fs::read(sparse_file)?;
+    let mut patterns: Vec<Vec<u8>> = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    if patterns.last().map(Vec::is_empty) == Some(true) {
+        patterns.pop();
+    }
+    let mode = if cone && commands::sparse_checkout::cone_patterns_are_valid(&patterns, true) {
+        sley_worktree::SparseCheckoutMode::Cone
+    } else {
+        sley_worktree::SparseCheckoutMode::Full
+    };
+    let sparse = sley_worktree::SparseCheckout {
+        patterns,
+        sparse_index,
+    };
+    sley_worktree::apply_sparse_checkout_with_mode(
+        worktree_root,
+        git_dir,
+        format,
+        &sparse,
+        mode,
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -115,7 +115,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
             }
         }
@@ -139,7 +139,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
             }
         }
@@ -161,7 +161,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
             }
         }
@@ -182,7 +182,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format)?;
+                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
             }
         }
@@ -191,11 +191,16 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn apply_read_tree_sparse_checkout(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+fn apply_read_tree_sparse_checkout(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<()> {
     let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
     let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
-    let sparse_enabled = worktree_config
+    let sparse_enabled = config
         .get_bool("core", None, "sparseCheckout")
+        .or_else(|| worktree_config.get_bool("core", None, "sparseCheckout"))
         .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
         .unwrap_or(false);
     if !sparse_enabled {
@@ -205,13 +210,15 @@ fn apply_read_tree_sparse_checkout(git_dir: &Path, format: ObjectFormat) -> Resu
     if !sparse_file.exists() {
         return Ok(());
     }
-    let cone = worktree_config
+    let cone = config
         .get_bool("core", None, "sparseCheckoutCone")
+        .or_else(|| worktree_config.get_bool("core", None, "sparseCheckoutCone"))
         .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
         .unwrap_or(false);
     let sparse_index = cone
-        && worktree_config
+        && config
             .get_bool("index", None, "sparse")
+            .or_else(|| worktree_config.get_bool("index", None, "sparse"))
             .or_else(|| repo_config.get_bool("index", None, "sparse"))
             .unwrap_or(false);
     let bytes = fs::read(sparse_file)?;
@@ -222,14 +229,15 @@ fn apply_read_tree_sparse_checkout(git_dir: &Path, format: ObjectFormat) -> Resu
     if patterns.last().map(Vec::is_empty) == Some(true) {
         patterns.pop();
     }
-    let sparse = sley_worktree::SparseCheckout {
-        patterns,
-        sparse_index,
-    };
-    let mode = if cone {
+    let mode = if cone && crate::commands::sparse_checkout::cone_patterns_are_valid(&patterns, true)
+    {
         sley_worktree::SparseCheckoutMode::Cone
     } else {
         sley_worktree::SparseCheckoutMode::Full
+    };
+    let sparse = sley_worktree::SparseCheckout {
+        patterns,
+        sparse_index,
     };
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     sley_worktree::apply_sparse_checkout_with_mode(&worktree_root, git_dir, format, &sparse, mode)?;
@@ -259,6 +267,10 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             "-m" => set_mode(ReadTreeMode::Merge, &mut mode)?,
             "--reset" => set_mode(ReadTreeMode::Reset, &mut mode)?,
             "-u" => update_worktree = true,
+            "-mu" | "-um" => {
+                set_mode(ReadTreeMode::Merge, &mut mode)?;
+                update_worktree = true;
+            }
             "-i" => {} // "don't check the working tree" — we already skip those checks.
             "--empty" => empty = true,
             "--no-empty" => empty = false,
