@@ -125,6 +125,9 @@ struct ShowOptions {
     /// pretty format or `--no-notes` suppresses them, `--notes`/`--show-notes`
     /// forces them on.
     show_notes: bool,
+    /// Explicit `--root` / `--no-root` override. When unset, `log.showRoot`
+    /// controls whether a root commit shows the empty-tree diff.
+    show_root: Option<bool>,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`).
     ws_ignore: sley_diff_merge::WsIgnore,
@@ -211,6 +214,7 @@ impl Default for ShowOptions {
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
+            show_root: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
@@ -625,13 +629,20 @@ fn show_commit(
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
     // a root) is computed for merges too, because git's default renders the stat
     // family for them even though the patch/raw/name listings are suppressed.
-    let entries = commit_diff_entries(
-        context.db,
-        context.format,
-        options,
-        context.diff_pathspec,
-        commit,
-    )?;
+    let show_root = options
+        .show_root
+        .unwrap_or_else(|| context.config.get_bool("log", None, "showroot").unwrap_or(true));
+    let entries = if commit.parents.is_empty() && !show_root {
+        Vec::new()
+    } else {
+        commit_diff_entries(
+            context.db,
+            context.format,
+            options,
+            context.diff_pathspec,
+            commit,
+        )?
+    };
 
     write_commit_trailer(
         stdout,
@@ -1397,8 +1408,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             | "--ext-diff"
             | "--no-textconv"
             | "--textconv"
-            | "--no-show-signature"
-            | "--root" => {}
+            | "--no-show-signature" => {}
+            "--root" => options.show_root = Some(true),
+            "--no-root" => options.show_root = Some(false),
             value if value.starts_with("--color=") => {}
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
