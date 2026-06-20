@@ -462,6 +462,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
+                checkout_print_detached_head_advice(&config, target);
                 eprintln!(
                     "HEAD is now at {} {}",
                     format_log_abbrev_oid(&target_oid),
@@ -543,6 +544,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
+                    checkout_print_detached_head_advice(&config, branch);
                     eprintln!(
                         "HEAD is now at {} {}",
                         format_log_abbrev_oid(&target_oid),
@@ -770,6 +772,32 @@ fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflic
             Err(GitError::Exit(129))
         }
     }
+}
+
+fn checkout_print_detached_head_advice(config: &GitConfig, target: &str) {
+    if !config
+        .get_bool("advice", None, "detachedHead")
+        .unwrap_or(true)
+    {
+        return;
+    }
+    eprintln!("Note: switching to '{target}'.");
+    eprintln!();
+    eprintln!("You are in 'detached HEAD' state. You can look around, make experimental");
+    eprintln!("changes and commit them, and you can discard any commits you make in this");
+    eprintln!("state without impacting any branches by switching back to a branch.");
+    eprintln!();
+    eprintln!("If you want to create a new branch to retain commits you create, you may");
+    eprintln!("do so (now or later) by using -c with the switch command. Example:");
+    eprintln!();
+    eprintln!("  git switch -c <new-branch-name>");
+    eprintln!();
+    eprintln!("Or undo this operation with:");
+    eprintln!();
+    eprintln!("  git switch -");
+    eprintln!();
+    eprintln!("Turn off this advice by setting config variable advice.detachedHead to false");
+    eprintln!();
 }
 
 fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<String> {
