@@ -659,7 +659,7 @@ fn parse_set_like(args: &[String], help: &str, allow_cone: bool) -> Result<SetLi
             continue;
         }
         match arg.as_str() {
-            "--" => no_more_flags = true,
+            "--" | "--end-of-options" => no_more_flags = true,
             "--cone" if allow_cone => cone = ConeFlag::Cone,
             "--no-cone" if allow_cone => cone = ConeFlag::NoCone,
             "--skip-checks" => skip_checks = true,
@@ -996,7 +996,7 @@ fn slash_wrapped(dir: &[u8]) -> Vec<u8> {
 // `list` output
 // --------------------------------------------------------------------------
 
-fn cone_patterns_are_valid(patterns: &[Vec<u8>], warn: bool) -> bool {
+pub(crate) fn cone_patterns_are_valid(patterns: &[Vec<u8>], warn: bool) -> bool {
     let mut recursive: Vec<Vec<u8>> = Vec::new();
     let mut parent: Vec<Vec<u8>> = Vec::new();
     for raw in patterns {
