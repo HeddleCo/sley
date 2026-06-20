@@ -17,7 +17,8 @@ use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader, repository_objects_dir};
 use sley_refs::{
-    FileRefStore, PackedRef, RefTarget, ReflogEntry, resolve_ref_peeled, validate_symref_name,
+    FileRefStore, PackedRef, RefTarget, ReflogEntry, validate_ref_name_for_read,
+    validate_symref_target,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -435,32 +436,63 @@ fn resolve_describe_name(
 }
 
 fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectId>> {
-    let initial = if rev == "HEAD" {
-        "HEAD".to_string()
+    let mut candidates = Vec::new();
+    if rev == "HEAD" {
+        candidates.push("HEAD".to_string());
     } else if rev.starts_with("refs/") {
-        rev.to_string()
-    } else if refs.read_ref(&format!("refs/{rev}"))?.is_some() {
-        // git's ref_rev_parse_rules try "refs/%s" before tags/heads. This
-        // matters for pseudo-names such as "stash" (refs/stash), not just names
-        // containing a slash.
-        format!("refs/{rev}")
-    } else if refs.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
-        format!("refs/tags/{rev}")
-    } else if refs.read_ref(&format!("refs/heads/{rev}"))?.is_some() {
-        format!("refs/heads/{rev}")
-    } else if refs.read_ref(&format!("refs/remotes/{rev}"))?.is_some() {
-        format!("refs/remotes/{rev}")
-    } else if refs
-        .read_ref(&format!("refs/remotes/{rev}/HEAD"))?
-        .is_some()
-    {
-        format!("refs/remotes/{rev}/HEAD")
-    } else if validate_symref_name(rev).is_ok() {
-        rev.to_string()
+        candidates.push(rev.to_string());
     } else {
-        return Ok(None);
-    };
-    resolve_ref_peeled(refs, &initial)
+        let refs_name = format!("refs/{rev}");
+        if refs.read_ref(&refs_name)?.is_some() {
+            // git's ref_rev_parse_rules try "refs/%s" before tags/heads. This
+            // matters for pseudo-names such as "stash" (refs/stash), not just names
+            // containing a slash.
+            candidates.push(refs_name);
+        }
+        let tag_name = format!("refs/tags/{rev}");
+        if refs.read_ref(&tag_name)?.is_some() {
+            candidates.push(tag_name);
+        }
+        let head_name = format!("refs/heads/{rev}");
+        if refs.read_ref(&head_name)?.is_some() {
+            candidates.push(head_name);
+        }
+        let remote_name = format!("refs/remotes/{rev}");
+        if refs.read_ref(&remote_name)?.is_some() {
+            candidates.push(remote_name);
+        }
+        let remote_head_name = format!("refs/remotes/{rev}/HEAD");
+        if refs.read_ref(&remote_head_name)?.is_some() {
+            candidates.push(remote_head_name);
+        }
+        if validate_ref_name_for_read(rev).is_ok() {
+            candidates.push(rev.to_string());
+        }
+    }
+    for candidate in candidates {
+        if let Some(oid) = resolve_revision_ref_candidate(refs, &candidate)? {
+            return Ok(Some(oid));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_revision_ref_candidate(refs: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
+    let mut current = name.to_string();
+    for _ in 0..16 {
+        match refs.read_ref(&current)? {
+            Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
+            Some(RefTarget::Symbolic(target)) => {
+                if validate_symref_target(&target).is_err() {
+                    eprintln!("warning: ignoring dangling symref {name}");
+                    return Ok(None);
+                }
+                current = target;
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

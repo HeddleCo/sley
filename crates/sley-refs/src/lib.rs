@@ -165,7 +165,7 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
             .ok_or_else(|| packed_refs_unexpected_line(line))?;
         if oid.len() != format.hex_len()
             || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || validate_ref_name(name).is_err()
+            || validate_ref_name_for_read(name).is_err()
         {
             return Err(packed_refs_unexpected_line(line));
         }
@@ -218,7 +218,7 @@ fn packed_refs_have_prefix(format: ObjectFormat, bytes: &[u8], prefix: &str) -> 
             .ok_or_else(|| packed_refs_unexpected_line(line))?;
         if oid.len() != format.hex_len()
             || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || validate_ref_name(name).is_err()
+            || validate_ref_name_for_read(name).is_err()
         {
             return Err(packed_refs_unexpected_line(line));
         }
@@ -888,6 +888,14 @@ impl FileRefStore {
             refs.retain(|reference| !loose_refs.contains_key(&reference.name));
             refs.extend(loose_refs.into_values());
         }
+        refs.retain(|reference| {
+            if validate_ref_name(&reference.name).is_ok() {
+                true
+            } else {
+                warn_broken_ref_name(&reference.name);
+                false
+            }
+        });
         refs.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(refs)
     }
@@ -1141,7 +1149,7 @@ impl FileRefStore {
     }
 
     pub fn delete_branch(&self, branch: &str) -> Result<BranchDelete> {
-        let name = branch_ref_name(branch)?;
+        let name = branch_ref_name_for_read(branch)?;
         if matches!(self.read_ref("HEAD")?, Some(RefTarget::Symbolic(head)) if head == name) {
             return Err(GitError::Transaction(format!(
                 "cannot delete branch {branch} checked out at HEAD"
@@ -1204,7 +1212,7 @@ impl FileRefStore {
         copy: bool,
         committer: Vec<u8>,
     ) -> Result<()> {
-        let old_name = branch_ref_name(old_branch)?;
+        let old_name = branch_ref_name_for_source(old_branch)?;
         let new_name = branch_ref_name(new_branch)?;
         if old_name == new_name {
             return Ok(());
@@ -1341,7 +1349,7 @@ impl FileRefStore {
     }
 
     pub fn delete_ref(&self, name: &str) -> Result<RefDelete> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
         let oid = self.delete_direct_ref(name, "ref", name)?;
         self.remove_reflog_file(name);
         Ok(RefDelete {
@@ -1354,7 +1362,7 @@ impl FileRefStore {
         &self,
         delete: DeleteRef,
     ) -> std::result::Result<RefDelete, RefDeleteError> {
-        validate_ref_name(&delete.name).map_err(|_| RefDeleteError::InvalidName)?;
+        validate_ref_name_for_read(&delete.name).map_err(|_| RefDeleteError::InvalidName)?;
         if self.uses_reftable().map_err(ref_delete_error_from_git)? {
             return self.delete_reftable_ref_checked(delete);
         }
@@ -3330,7 +3338,10 @@ fn coalesce_ref_changes(changes: Vec<QueuedRefChange>) -> Result<Vec<CoalescedRe
             QueuedRefChange::Update(update) => &update.name,
             QueuedRefChange::Delete(delete) => &delete.name,
         };
-        validate_ref_name_for_update(name)?;
+        match &change {
+            QueuedRefChange::Update(update) => validate_ref_name_for_update(&update.name)?,
+            QueuedRefChange::Delete(delete) => validate_ref_name_for_read(&delete.name)?,
+        }
         if !seen.insert(name.clone()) {
             return Err(GitError::Transaction(format!(
                 "ref {name} appears more than once in transaction"
@@ -4326,6 +4337,27 @@ pub fn branch_ref_name(branch: &str) -> Result<String> {
     BranchRefNameBuf::from_branch_name(branch).map(BranchRefNameBuf::into_string)
 }
 
+pub fn branch_ref_name_for_read(branch: &str) -> Result<String> {
+    let name = format!("{}{}", BranchRefName::PREFIX, branch);
+    if validate_ref_name(&name).is_err() {
+        if name.contains("..") {
+            validate_ref_path_safe_for_read(&name)?;
+        } else {
+            return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+        }
+    }
+    Ok(name)
+}
+
+pub fn branch_ref_name_for_source(branch: &str) -> Result<String> {
+    if branch.starts_with("--") {
+        return Err(GitError::InvalidPath(format!("invalid branch name {branch}")));
+    }
+    let name = format!("{}{}", BranchRefName::PREFIX, branch);
+    check_refname_format(&name, false)?;
+    Ok(name)
+}
+
 pub fn tag_ref_name(tag: &str) -> Result<String> {
     TagRefNameBuf::from_tag_name(tag).map(TagRefNameBuf::into_string)
 }
@@ -4484,24 +4516,24 @@ pub fn resolve_ref_peeled(store: &FileRefStore, name: &str) -> Result<Option<Obj
     Ok(None)
 }
 
-fn validate_ref_name_for_read(name: &str) -> Result<()> {
+pub fn validate_ref_name_for_read(name: &str) -> Result<()> {
     if validate_ref_name(name).is_ok() {
         return Ok(());
     }
     if is_root_ref_syntax(name) {
         return Ok(());
     }
-    validate_symref_name(name)
+    validate_ref_path_safe_for_read(name)
 }
 
-fn validate_ref_name_for_update(name: &str) -> Result<()> {
+pub fn validate_ref_name_for_update(name: &str) -> Result<()> {
     if validate_ref_name(name).is_ok() {
         return Ok(());
     }
     if is_root_ref_syntax(name) {
         return Ok(());
     }
-    validate_symref_name(name)
+    Err(GitError::InvalidPath(format!("invalid ref name {name}")))
 }
 
 /// git's is_root_ref_syntax (refs.c): a ref name made only of uppercase ASCII,
@@ -4519,12 +4551,17 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
     if name == "HEAD" {
         return Ok(());
     }
+    if !name.starts_with("refs/") || check_refname_format(name, false).is_err() {
+        return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+    }
+    Ok(())
+}
+
+fn validate_ref_path_safe_for_read(name: &str) -> Result<()> {
     let path = Path::new(name);
     if !name.starts_with("refs/")
-        || name.contains("..")
+        || name.starts_with('/')
         || name.contains('\\')
-        || name.ends_with('/')
-        || name.ends_with(".lock")
         || path.is_absolute()
         || path.components().any(|component| {
             matches!(
@@ -4536,6 +4573,10 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
         return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
     }
     Ok(())
+}
+
+fn warn_broken_ref_name(name: &str) {
+    eprintln!("warning: ignoring ref with broken name {name}");
 }
 
 fn ref_directory_conflict_error(new_ref: &str, existing_ref: &str) -> GitError {
