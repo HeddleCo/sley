@@ -3881,6 +3881,51 @@ fn pick_one_commit(
     } else {
         (Some(ctx.git_dir.join("MERGE_MSG")), false, false)
     };
+    if item.command == TodoCommand::Reword && !is_fixup {
+        let result = machine_commit(
+            ctx,
+            db,
+            opts,
+            MachineCommit {
+                amend,
+                edit,
+                cleanup_message: true,
+                allow_empty,
+                create_root,
+                message_file: commit_message_file.clone(),
+                reflog_sub: command_reflog_name(item.command),
+                original: Some(&record),
+            },
+        )?;
+        if let CommitOutcome::Failed(code) = result {
+            return stop_with_patch(ctx, db, opts, &record, item, code, false);
+        }
+        let result = machine_commit(
+            ctx,
+            db,
+            opts,
+            MachineCommit {
+                amend: true,
+                edit: true,
+                cleanup_message: true,
+                allow_empty: true,
+                create_root: false,
+                message_file: None,
+                reflog_sub: command_reflog_name(item.command),
+                original: Some(&record),
+            },
+        )?;
+        match result {
+            CommitOutcome::Committed => {
+                record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+                reread_todo_if_changed(ctx, db, todo)?;
+                return Ok(PickOutcome::Continue);
+            }
+            CommitOutcome::Failed(code) => {
+                return stop_with_patch(ctx, db, opts, &record, item, code, false);
+            }
+        }
+    }
     let result = machine_commit(
         ctx,
         db,
