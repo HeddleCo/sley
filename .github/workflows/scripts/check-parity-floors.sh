@@ -709,7 +709,7 @@ declare -A FLOOR=(
     [t1013-read-tree-submodule.sh]=58
     [t2013-checkout-submodule.sh]=57
     [t7112-reset-submodule.sh]=70
-    [t6438-submodule-directory-file-conflicts.sh]=32
+    [t6438-submodule-directory-file-conflicts.sh]=48
     # wave-12 Batch B (rebasemerges, integ/wave12B onto 81856328): --rebase-merges
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
     # t3404 held 80, t3418 11->12; cross-guard t5520-pull held 75 (pull-rebase now
