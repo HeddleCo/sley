@@ -107,6 +107,8 @@ struct ShowOptions {
     patch_abbrev: Option<usize>,
     /// Rename detection toggle (on by default, `--no-renames` disables).
     detect_renames: bool,
+    /// Whether rename/copy detection was chosen explicitly by the command line.
+    renames_explicit: bool,
     /// Copy detection (`-C`/`--find-copies`).
     detect_copies: bool,
     /// `-C` with `--find-copies-harder`.
@@ -206,6 +208,7 @@ impl Default for ShowOptions {
             patch_full_index: false,
             patch_abbrev: None,
             detect_renames: true,
+            renames_explicit: false,
             detect_copies: false,
             find_copies_harder: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -539,6 +542,25 @@ fn show_commit(
                 ..
             }
     );
+    let merge_mode = resolve_show_merge_mode(options);
+
+    if is_merge
+        && merge_mode == ShowMergeMode::Separate
+        && matches!(options.commit_format, ShowCommitFormat::Medium)
+    {
+        return show_commit_separate_merge(
+            stdout,
+            context,
+            oid,
+            commit,
+            shown_one,
+            suppress_separator,
+            use_mailmap.then_some(&mailmap),
+            text_self_terminated,
+            blank_before_diff,
+            separator_mode,
+        );
+    }
 
     // Leading inter-entry separator (separator-mode only). A tag parent already
     // supplied the gap, so honour `suppress_separator`.
@@ -638,6 +660,7 @@ fn show_commit(
         commit_diff_entries(
             context.db,
             context.format,
+            context.config,
             options,
             context.diff_pathspec,
             commit,
@@ -652,11 +675,119 @@ fn show_commit(
             blank_before_diff,
             separator_mode,
             is_merge,
-            merge_mode: resolve_show_merge_mode(options),
+            merge_mode,
         },
         commit,
         &entries,
     )
+}
+
+fn show_commit_separate_merge(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    oid: &ObjectId,
+    commit: &Commit,
+    shown_one: &mut bool,
+    suppress_separator: bool,
+    mailmap: Option<&commands::utility::Mailmap>,
+    text_self_terminated: bool,
+    blank_before_diff: bool,
+    separator_mode: bool,
+) -> Result<()> {
+    let options = context.options;
+    for (idx, parent) in commit.parents.iter().enumerate() {
+        if separator_mode && (*shown_one || idx > 0) && !(suppress_separator && idx == 0) {
+            writeln!(stdout)?;
+        }
+        write_show_commit_header(stdout, context, oid, commit, Some(parent), mailmap)?;
+        *shown_one = true;
+
+        let mut parent_commit = commit.clone();
+        parent_commit.parents = vec![*parent];
+        let entries = commit_diff_entries(
+            context.db,
+            context.format,
+            context.config,
+            options,
+            context.diff_pathspec,
+            &parent_commit,
+        )?;
+        write_commit_trailer(
+            stdout,
+            context,
+            CommitTrailerLayout {
+                text_self_terminated,
+                blank_before_diff,
+                separator_mode,
+                is_merge: false,
+                merge_mode: ShowMergeMode::FirstParent,
+            },
+            commit,
+            &entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_show_commit_header(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    oid: &ObjectId,
+    commit: &Commit,
+    from_parent: Option<&ObjectId>,
+    mailmap: Option<&commands::utility::Mailmap>,
+) -> Result<()> {
+    let options = context.options;
+    match &options.commit_format {
+        ShowCommitFormat::Medium => {
+            write!(
+                stdout,
+                "commit {}",
+                format_log_commit_header_oid(oid, options.abbrev_commit, options.abbrev_len)
+            )?;
+            if let Some(parent) = from_parent {
+                write!(
+                    stdout,
+                    " (from {})",
+                    format_log_commit_header_oid(parent, options.abbrev_commit, options.abbrev_len)
+                )?;
+            }
+            print_log_decorations(oid, context.decorations);
+            writeln!(stdout)?;
+            let abbrev = merge_line_abbrev(options);
+            let parents = commit
+                .parents
+                .iter()
+                .map(|parent| format_log_oid(parent, abbrev))
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(stdout, "Merge: {parents}")?;
+            writeln!(
+                stdout,
+                "Author: {}",
+                commit_identity_mailmapped(&commit.author, mailmap)
+            )?;
+            writeln!(
+                stdout,
+                "Date:   {}",
+                commit_identity_date(&commit.author, &options.date_mode)
+            )?;
+            writeln!(stdout)?;
+            for line in String::from_utf8_lossy(&commit.message).lines() {
+                writeln!(stdout, "    {line}")?;
+            }
+            if options.show_notes {
+                let notes = crate::commands::log::render_standard_notes(
+                    context.git_dir,
+                    context.format,
+                    oid,
+                )?;
+                stdout.write_all(&notes)?;
+            }
+        }
+        _ => unreachable!("separate merge header is only used for medium format"),
+    }
+    Ok(())
 }
 
 /// Emit the gap and diff body after a commit's text, implementing the precise
@@ -906,13 +1037,15 @@ fn merge_line_abbrev(options: &ShowOptions) -> Option<usize> {
 fn commit_diff_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    config: &GitConfig,
     options: &ShowOptions,
     pathspec: Option<&DiffPathspec>,
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let (detect_renames, detect_copies) = show_effective_rename_detection(options, config);
     let base = sley_diff_merge::DiffNameStatusOptions {
-        detect_renames: options.detect_renames,
-        detect_copies: options.detect_copies,
+        detect_renames,
+        detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
     };
@@ -945,6 +1078,20 @@ fn commit_diff_entries(
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
     })
+}
+
+fn show_effective_rename_detection(options: &ShowOptions, config: &GitConfig) -> (bool, bool) {
+    if options.renames_explicit {
+        return (options.detect_renames, options.detect_copies);
+    }
+    match config.get("diff", None, "renames").map(str::trim) {
+        Some("false" | "no" | "off" | "0") => (false, false),
+        Some("copies" | "copy") => (true, true),
+        Some("true" | "yes" | "on" | "1" | "renames") | None => {
+            (options.detect_renames, options.detect_copies)
+        }
+        Some(_) => (options.detect_renames, options.detect_copies),
+    }
 }
 
 /// Emit the diff body (stat/raw/summary/numstat/shortstat/patch or the
@@ -1332,28 +1479,39 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 options.date_mode = show_date_mode(value)?;
             }
             // --- rename / copy detection ----------------------------------------
-            "--no-renames" => options.detect_renames = false,
-            "-M" | "--find-renames" => options.detect_renames = true,
+            "--no-renames" => {
+                options.detect_renames = false;
+                options.renames_explicit = true;
+            }
+            "-M" | "--find-renames" => {
+                options.detect_renames = true;
+                options.renames_explicit = true;
+            }
             value if let Some(rest) = value.strip_prefix("--find-renames=") => {
                 options.detect_renames = true;
+                options.renames_explicit = true;
                 options.rename_threshold = show_parse_similarity(rest)?;
             }
             value if value.starts_with("-M") => {
                 options.detect_renames = true;
+                options.renames_explicit = true;
                 options.rename_threshold = show_parse_similarity(&value[2..])?;
             }
             "-C" | "--find-copies" => {
                 options.detect_renames = true;
                 options.detect_copies = true;
+                options.renames_explicit = true;
             }
             value if let Some(rest) = value.strip_prefix("--find-copies=") => {
                 options.detect_renames = true;
                 options.detect_copies = true;
+                options.renames_explicit = true;
                 options.copy_threshold = show_parse_similarity(rest)?;
             }
             value if value.starts_with("-C") => {
                 options.detect_renames = true;
                 options.detect_copies = true;
+                options.renames_explicit = true;
                 options.copy_threshold = show_parse_similarity(&value[2..])?;
             }
             "--find-copies-harder" => {
