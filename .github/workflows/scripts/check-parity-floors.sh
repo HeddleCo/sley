@@ -647,7 +647,7 @@ declare -A FLOOR=(
     [t5702-protocol-v2.sh]=21
     [t7103-reset-bare.sh]=12
     [t7110-reset-merge.sh]=21
-    [t7201-co.sh]=19
+    [t7201-co.sh]=37
     # wave-8 engine-completion (2026-06-17): rebase-i sequencer (autosquash + fixup
     # -C/-c message machinery), update-ref --stdin ref-transaction hook + git-faithful
     # error surface, sparse-checkout builtin + the sparse-index collapse/expand format.
