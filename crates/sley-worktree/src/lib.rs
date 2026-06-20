@@ -4233,13 +4233,18 @@ fn collect_status_entries_with_head(
                 (index_code, worktree_code)
             };
         if index_code != b' ' || worktree_code != b' ' {
+            let worktree_mode = if skip_worktree && !worktree_present && worktree_entry.is_none() {
+                index_entry.map(|entry| entry.mode)
+            } else {
+                status_worktree_mode(index_entry, worktree_entry, worktree_present)
+            };
             entries.push(ShortStatusEntry {
                 index: index_code,
                 worktree: worktree_code,
                 path,
                 head_mode: head_entry.map(|entry| entry.mode),
                 index_mode: index_entry.map(|entry| entry.mode),
-                worktree_mode: status_worktree_mode(index_entry, worktree_entry, worktree_present),
+                worktree_mode,
                 head_oid: head_entry.map(|entry| entry.oid),
                 index_oid: index_entry.map(|entry| entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
@@ -11443,6 +11448,16 @@ fn checkout_commit_to_index_and_worktree_filtered(
     target: &ObjectId,
     smudge_config: Option<&GitConfig>,
 ) -> Result<usize> {
+    if let Some((sparse, mode)) = active_sparse_checkout(git_dir)? {
+        return checkout_commit_to_index_and_worktree_sparse(
+            worktree_root,
+            git_dir,
+            format,
+            target,
+            Some((&sparse, mode)),
+            smudge_config,
+        );
+    }
     let mut dirty = false;
     stream_short_status(worktree_root, git_dir, format, |entry| {
         if !status_row_is_untracked_or_ignored(entry) {
@@ -11538,6 +11553,33 @@ fn build_tree_attribute_matcher(
     Ok(matcher)
 }
 
+fn materialize_tree_entry_with_optional_smudge(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+    smudge_config: Option<&GitConfig>,
+    attributes: Option<&AttributeMatcher>,
+) -> Result<IndexEntry> {
+    if smudge_config.is_none() || sley_index::is_gitlink(entry.mode) {
+        return materialize_tree_entry(db, worktree_root, path, entry);
+    }
+    let config = smudge_config.expect("checked above");
+    let matcher = attributes.expect("attributes are built when smudge_config is set");
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
+    let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
+    let body = apply_smudge_filter_with_attributes_cow(config, &checks, path, &object.body)?;
+    let file_path = worktree_path(worktree_root, path)?;
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
+    fs::write(&file_path, &body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
+    let metadata = fs::metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
+}
+
 /// Sparse- and skip-worktree-aware variant of
 /// [`checkout_commit_to_index_and_worktree`].
 ///
@@ -11554,6 +11596,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
     format: ObjectFormat,
     target: &ObjectId,
     sparse: Option<(&SparseCheckout, SparseCheckoutMode)>,
+    smudge_config: Option<&GitConfig>,
 ) -> Result<usize> {
     let previously_skipped = skip_worktree_paths(git_dir, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -11602,6 +11645,9 @@ fn checkout_commit_to_index_and_worktree_sparse(
     }
 
     let matcher = sparse.map(|(spec, mode)| SparseMatcher::new(spec, mode));
+    let attributes = smudge_config
+        .map(|_| build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree))
+        .transpose()?;
 
     for path in read_index_entries(git_dir, format)?.keys() {
         if target_entries.contains_key(path) {
@@ -11616,15 +11662,19 @@ fn checkout_commit_to_index_and_worktree_sparse(
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        let in_cone = matcher.as_ref().is_none_or(|matcher| {
-            // A path already marked skip-worktree stays out unless it now
-            // matches the sparse cone, mirroring upstream "honor skip-worktree".
-            matcher.includes_file(path)
-        });
+        let in_cone = matcher.as_ref().map_or_else(
+            || !previously_skipped.contains(path),
+            |matcher| matcher.includes_file(path),
+        );
         let index_entry = if in_cone {
-            // `materialize_tree_entry` leaves flags_extended at 0, so the
-            // skip-worktree bit is already clear for in-cone paths.
-            materialize_tree_entry(&db, worktree_root, path, entry)?
+            materialize_tree_entry_with_optional_smudge(
+                &db,
+                worktree_root,
+                path,
+                entry,
+                smudge_config,
+                attributes.as_ref(),
+            )?
         } else {
             // Out of cone: ensure no stale worktree file remains and synthesize
             // an index entry straight from the tree (no worktree metadata),
@@ -11792,6 +11842,7 @@ pub fn restore_index_paths_from_head(
         index,
         &head_entries,
         paths,
+        false,
     )
 }
 
@@ -11825,6 +11876,41 @@ pub fn restore_index_paths_from_tree(
         index,
         &source_entries,
         paths,
+        false,
+    )
+}
+
+pub fn restore_index_paths_from_tree_allow_unmatched(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let source_entries = tree_entries(&db, format, tree_oid)?;
+    restore_index_paths_from_entries(
+        worktree_root,
+        git_dir,
+        format,
+        &db,
+        index,
+        &source_entries,
+        paths,
+        true,
     )
 }
 
@@ -11836,6 +11922,7 @@ fn restore_index_paths_from_entries(
     mut index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     paths: &[PathBuf],
+    allow_unmatched: bool,
 ) -> Result<RestoreResult> {
     let sparse = active_sparse_checkout(git_dir)?;
     if index.is_sparse() {
@@ -11848,6 +11935,11 @@ fn restore_index_paths_from_entries(
         .into_iter()
         .map(|entry| (entry.path.as_bytes().to_vec(), entry))
         .collect::<BTreeMap<_, _>>();
+    let prior_skip_worktree = index_entries
+        .iter()
+        .filter(|(_, entry)| entry.is_skip_worktree())
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
     let mut restored = BTreeSet::new();
     for path in paths {
         let absolute = if path.is_absolute() {
@@ -11877,6 +11969,9 @@ fn restore_index_paths_from_entries(
             }
         }
         if matched_paths.is_empty() {
+            if allow_unmatched {
+                continue;
+            }
             eprintln!(
                 "error: pathspec '{}' did not match any file(s) known to git",
                 path.display()
@@ -11895,9 +11990,14 @@ fn restore_index_paths_from_entries(
                     existing.oid == entry.oid && existing.mode == entry.mode
                 });
                 if !unchanged {
+                    let mut restored =
+                        restored_head_index_entry(worktree_root, db, &path, entry)?;
+                    if prior_skip_worktree.contains(&path) {
+                        restored.set_skip_worktree(true);
+                    }
                     index_entries.insert(
                         path.clone(),
-                        restored_head_index_entry(worktree_root, db, &path, entry)?,
+                        restored,
                     );
                 }
             } else {
@@ -13035,6 +13135,7 @@ pub fn checkout_detached_sparse(
         format,
         target,
         Some((sparse, SparseCheckoutMode::Auto)),
+        None,
     )?;
     let refs = FileRefStore::new(git_dir, format);
     let zero = ObjectId::null(format);

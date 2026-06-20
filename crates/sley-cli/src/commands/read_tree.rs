@@ -1380,9 +1380,14 @@ fn write_paired_entries(
     format: ObjectFormat,
     pairs: Vec<(Vec<u8>, StagedEntry)>,
 ) -> Result<()> {
+    let skip_worktree_paths = read_skip_worktree_paths(git_dir, format)?;
     let mut index_entries = Vec::with_capacity(pairs.len());
     for (path, entry) in pairs {
-        index_entries.push(make_index_entry(path, entry)?);
+        let mut index_entry = make_index_entry(path, entry)?;
+        if skip_worktree_paths.contains(index_entry.path.as_bytes()) {
+            index_entry.set_skip_worktree(true);
+        }
+        index_entries.push(index_entry);
     }
     index_entries.sort_by(|left, right| {
         left.path
@@ -1390,6 +1395,22 @@ fn write_paired_entries(
             .then_with(|| (left.flags & 0x3000).cmp(&(right.flags & 0x3000)))
     });
     persist_index(git_dir, format, index_entries)
+}
+
+fn read_skip_worktree_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    Ok(sley_worktree::read_repository_index(git_dir, format)?
+        .map(|index| {
+            index
+                .entries
+                .into_iter()
+                .filter(|entry| entry.is_skip_worktree())
+                .map(|entry| entry.path.into_bytes())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Convert a `(path, StagedEntry)` into a writable [`IndexEntry`], encoding the
@@ -1425,12 +1446,13 @@ fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
 /// stage bits in `flags`; the index v2/v3 writer accepts those (the higher bits
 /// of `flags`), so a fixed version 2 layout matches git's `ls-files --stage`.
 fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>) -> Result<()> {
-    let index = Index {
+    let mut index = Index {
         version: 2,
         entries,
         extensions: Vec::new(),
         checksum: None,
     };
+    index.upgrade_version_for_flags();
     sley_worktree::write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
 }

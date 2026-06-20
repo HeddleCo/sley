@@ -2711,16 +2711,14 @@ pub(crate) fn reset_merge_in(
         }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(format)?)?;
     for (path, (mode, oid)) in &updates {
         let content = crate::commands::merge_rebase::merge_read_blob(&db, oid)?;
         crate::commands::merge_rebase::merge_write_worktree_file(

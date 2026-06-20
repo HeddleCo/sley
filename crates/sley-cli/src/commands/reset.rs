@@ -535,7 +535,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         })
         .collect::<Vec<_>>();
     if let Some(tree_oid) = source_tree.as_ref() {
-        sley_worktree::restore_index_paths_from_tree(
+        sley_worktree::restore_index_paths_from_tree_allow_unmatched(
             worktree_root.clone(),
             git_dir.clone(),
             format,

@@ -428,7 +428,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 "reference-transaction",
                 commands::hooks::HookRun::default(),
             )?;
-            checkout_show_local_changes(&target_oid, quiet, force)?;
+            checkout_show_local_changes(&git_dir, &target_oid, quiet, force)?;
             return Ok(());
         }
         CheckoutBranchMode::Existing => {
@@ -501,7 +501,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     "reference-transaction",
                     commands::hooks::HookRun::default(),
                 )?;
-                checkout_show_local_changes(&target_oid, quiet, force)?;
+                checkout_show_local_changes(&git_dir, &target_oid, quiet, force)?;
                 return Ok(());
             }
             if !is_branch {
@@ -680,7 +680,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     checkout_show_branch_tracking(&git_dir, format, branch, quiet)?;
     // git's `show_local_changes`: report carried-forward worktree modifications
     // relative to the newly checked-out commit (`M\t<path>`, etc.).
-    checkout_show_local_changes(&checkout_new_head, quiet, force)?;
+    checkout_show_local_changes(&git_dir, &checkout_new_head, quiet, force)?;
     Ok(())
 }
 
@@ -1226,7 +1226,12 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
 /// new_branch_info->commit`: a force checkout (`-f`, which discards local
 /// changes) and a quiet checkout (`-q`) print nothing, and there is nothing to
 /// diff against when the target has no commit (an unborn branch).
-fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) -> Result<()> {
+fn checkout_show_local_changes(
+    git_dir: &Path,
+    new_commit: &ObjectId,
+    quiet: bool,
+    force: bool,
+) -> Result<()> {
     if quiet || force {
         return Ok(());
     }
@@ -1237,6 +1242,9 @@ fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) 
     if new_commit.is_null() {
         return Ok(());
     }
+    if checkout_sparse_checkout_enabled(git_dir) {
+        return Ok(());
+    }
     // Reuse the shared `diff-index` renderer (byte-identical with git's
     // name-status output). It diffs the tree-ish against the working tree by
     // default — exactly git's `run_diff_index(&rev, 0)`.
@@ -1244,6 +1252,17 @@ fn checkout_show_local_changes(new_commit: &ObjectId, quiet: bool, force: bool) 
         "--name-status".to_string(),
         new_commit.to_hex(),
     ])
+}
+
+fn checkout_sparse_checkout_enabled(git_dir: &Path) -> bool {
+    GitConfig::read(git_dir.join("config.worktree"))
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
+        == Some(true)
+        || GitConfig::read(git_dir.join("config"))
+            .ok()
+            .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
+            == Some(true)
 }
 
 fn prefetch_local_promisor_checkout_blobs(
