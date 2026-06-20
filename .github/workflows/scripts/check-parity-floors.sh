@@ -702,7 +702,7 @@ declare -A FLOOR=(
     # 0->23, t2013 3->23, t7112 0->25, t6438 0->32). All measured at the integ
     # tip against the same binary; floor-guards (t4013=191 t7810=235) held.
     [t4020-diff-external.sh]=72
-    [t4072-diff-max-depth.sh]=50
+    [t4072-diff-max-depth.sh]=76
     [t6132-pathspec-exclude.sh]=23
     [t6135-pathspec-with-attrs.sh]=27
     [t6022-rev-list-missing.sh]=40
