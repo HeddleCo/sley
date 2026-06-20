@@ -98,12 +98,17 @@ struct ShowOptions {
     summary: bool,
     /// `--raw` diff output.
     raw: bool,
+    /// `--patch-with-stat` / `--patch-with-raw`: render the patch after the
+    /// requested prefix output instead of replacing it.
+    patch_with_extra: bool,
     /// Full 40/64-hex `index` lines in patches (`--full-index`).
     patch_full_index: bool,
     /// Explicit patch abbreviation width (`--abbrev=<n>` affects this too).
     patch_abbrev: Option<usize>,
     /// Rename detection toggle (on by default, `--no-renames` disables).
     detect_renames: bool,
+    /// Whether rename/copy detection was chosen explicitly by the command line.
+    renames_explicit: bool,
     /// Copy detection (`-C`/`--find-copies`).
     detect_copies: bool,
     /// `-C` with `--find-copies-harder`.
@@ -122,6 +127,9 @@ struct ShowOptions {
     /// pretty format or `--no-notes` suppresses them, `--notes`/`--show-notes`
     /// forces them on.
     show_notes: bool,
+    /// Explicit `--root` / `--no-root` override. When unset, `log.showRoot`
+    /// controls whether a root commit shows the empty-tree diff.
+    show_root: Option<bool>,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`).
     ws_ignore: sley_diff_merge::WsIgnore,
@@ -196,9 +204,11 @@ impl Default for ShowOptions {
             shortstat: false,
             summary: false,
             raw: false,
+            patch_with_extra: false,
             patch_full_index: false,
             patch_abbrev: None,
             detect_renames: true,
+            renames_explicit: false,
             detect_copies: false,
             find_copies_harder: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -207,6 +217,7 @@ impl Default for ShowOptions {
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
+            show_root: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
@@ -234,6 +245,10 @@ impl ShowOptions {
             || self.raw
     }
 
+    fn shows_patch_body(&self) -> bool {
+        self.patch_with_extra || !self.has_diff_extras()
+    }
+
     /// `-s` / `--no-patch`: clear every diff-output selection. A later flag such
     /// as `--stat` can re-enable a specific sub-mode, matching real git's
     /// order-dependent behaviour.
@@ -245,6 +260,7 @@ impl ShowOptions {
         self.shortstat = false;
         self.summary = false;
         self.raw = false;
+        self.patch_with_extra = false;
     }
 
     /// Re-enable patch output after a diff sub-mode flag clears the `-s` state.
@@ -335,7 +351,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 
     let mut shown_one = false;
     let mut stdout = io::stdout();
-    let userdiff = if options.diff_mode == ShowDiffMode::Patch && !options.has_diff_extras() {
+    let userdiff = if options.diff_mode == ShowDiffMode::Patch && options.shows_patch_body() {
         let attributes = repo
             .worktree_root()
             .ok()
@@ -526,6 +542,25 @@ fn show_commit(
                 ..
             }
     );
+    let merge_mode = resolve_show_merge_mode(options);
+
+    if is_merge
+        && merge_mode == ShowMergeMode::Separate
+        && matches!(options.commit_format, ShowCommitFormat::Medium)
+    {
+        return show_commit_separate_merge(
+            stdout,
+            context,
+            oid,
+            commit,
+            shown_one,
+            suppress_separator,
+            use_mailmap.then_some(&mailmap),
+            text_self_terminated,
+            blank_before_diff,
+            separator_mode,
+        );
+    }
 
     // Leading inter-entry separator (separator-mode only). A tag parent already
     // supplied the gap, so honour `suppress_separator`.
@@ -616,13 +651,21 @@ fn show_commit(
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
     // a root) is computed for merges too, because git's default renders the stat
     // family for them even though the patch/raw/name listings are suppressed.
-    let entries = commit_diff_entries(
-        context.db,
-        context.format,
-        options,
-        context.diff_pathspec,
-        commit,
-    )?;
+    let show_root = options
+        .show_root
+        .unwrap_or_else(|| context.config.get_bool("log", None, "showroot").unwrap_or(true));
+    let entries = if commit.parents.is_empty() && !show_root {
+        Vec::new()
+    } else {
+        commit_diff_entries(
+            context.db,
+            context.format,
+            context.config,
+            options,
+            context.diff_pathspec,
+            commit,
+        )?
+    };
 
     write_commit_trailer(
         stdout,
@@ -632,11 +675,119 @@ fn show_commit(
             blank_before_diff,
             separator_mode,
             is_merge,
-            merge_mode: resolve_show_merge_mode(options),
+            merge_mode,
         },
         commit,
         &entries,
     )
+}
+
+fn show_commit_separate_merge(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    oid: &ObjectId,
+    commit: &Commit,
+    shown_one: &mut bool,
+    suppress_separator: bool,
+    mailmap: Option<&commands::utility::Mailmap>,
+    text_self_terminated: bool,
+    blank_before_diff: bool,
+    separator_mode: bool,
+) -> Result<()> {
+    let options = context.options;
+    for (idx, parent) in commit.parents.iter().enumerate() {
+        if separator_mode && (*shown_one || idx > 0) && !(suppress_separator && idx == 0) {
+            writeln!(stdout)?;
+        }
+        write_show_commit_header(stdout, context, oid, commit, Some(parent), mailmap)?;
+        *shown_one = true;
+
+        let mut parent_commit = commit.clone();
+        parent_commit.parents = vec![*parent];
+        let entries = commit_diff_entries(
+            context.db,
+            context.format,
+            context.config,
+            options,
+            context.diff_pathspec,
+            &parent_commit,
+        )?;
+        write_commit_trailer(
+            stdout,
+            context,
+            CommitTrailerLayout {
+                text_self_terminated,
+                blank_before_diff,
+                separator_mode,
+                is_merge: false,
+                merge_mode: ShowMergeMode::FirstParent,
+            },
+            commit,
+            &entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_show_commit_header(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    oid: &ObjectId,
+    commit: &Commit,
+    from_parent: Option<&ObjectId>,
+    mailmap: Option<&commands::utility::Mailmap>,
+) -> Result<()> {
+    let options = context.options;
+    match &options.commit_format {
+        ShowCommitFormat::Medium => {
+            write!(
+                stdout,
+                "commit {}",
+                format_log_commit_header_oid(oid, options.abbrev_commit, options.abbrev_len)
+            )?;
+            if let Some(parent) = from_parent {
+                write!(
+                    stdout,
+                    " (from {})",
+                    format_log_commit_header_oid(parent, options.abbrev_commit, options.abbrev_len)
+                )?;
+            }
+            print_log_decorations(oid, context.decorations);
+            writeln!(stdout)?;
+            let abbrev = merge_line_abbrev(options);
+            let parents = commit
+                .parents
+                .iter()
+                .map(|parent| format_log_oid(parent, abbrev))
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(stdout, "Merge: {parents}")?;
+            writeln!(
+                stdout,
+                "Author: {}",
+                commit_identity_mailmapped(&commit.author, mailmap)
+            )?;
+            writeln!(
+                stdout,
+                "Date:   {}",
+                commit_identity_date(&commit.author, &options.date_mode)
+            )?;
+            writeln!(stdout)?;
+            for line in String::from_utf8_lossy(&commit.message).lines() {
+                writeln!(stdout, "    {line}")?;
+            }
+            if options.show_notes {
+                let notes = crate::commands::log::render_standard_notes(
+                    context.git_dir,
+                    context.format,
+                    oid,
+                )?;
+                stdout.write_all(&notes)?;
+            }
+        }
+        _ => unreachable!("separate merge header is only used for medium format"),
+    }
+    Ok(())
 }
 
 /// Emit the gap and diff body after a commit's text, implementing the precise
@@ -691,7 +842,13 @@ fn write_commit_trailer(
         // even for `--oneline` which abuts the diff for ordinary commits. The
         // exception is `--pretty=format:` (text not self-terminated): there the
         // text line's own newline above is the only separator, matching git.
-        if layout.blank_before_diff || (combined_merge && layout.text_self_terminated) {
+        if options.patch_with_extra
+            && (options.stat || options.compact_summary)
+            && layout.blank_before_diff
+            && !combined_merge
+        {
+            writeln!(stdout, "---")?;
+        } else if layout.blank_before_diff || (combined_merge && layout.text_self_terminated) {
             writeln!(stdout)?;
         }
         return if combined_merge {
@@ -854,7 +1011,7 @@ fn write_show_combined(
     if stat_active {
         write_merge_stat(stdout, db, context.config, options, entries)?;
     }
-    if options.has_diff_extras() {
+    if options.has_diff_extras() && !options.patch_with_extra {
         return Ok(());
     }
 
@@ -880,13 +1037,15 @@ fn merge_line_abbrev(options: &ShowOptions) -> Option<usize> {
 fn commit_diff_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    config: &GitConfig,
     options: &ShowOptions,
     pathspec: Option<&DiffPathspec>,
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let (detect_renames, detect_copies) = show_effective_rename_detection(options, config);
     let base = sley_diff_merge::DiffNameStatusOptions {
-        detect_renames: options.detect_renames,
-        detect_copies: options.detect_copies,
+        detect_renames,
+        detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
     };
@@ -919,6 +1078,20 @@ fn commit_diff_entries(
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
     })
+}
+
+fn show_effective_rename_detection(options: &ShowOptions, config: &GitConfig) -> (bool, bool) {
+    if options.renames_explicit {
+        return (options.detect_renames, options.detect_copies);
+    }
+    match config.get("diff", None, "renames").map(str::trim) {
+        Some("false" | "no" | "off" | "0") => (false, false),
+        Some("copies" | "copy") => (true, true),
+        Some("true" | "yes" | "on" | "1" | "renames") | None => {
+            (options.detect_renames, options.detect_copies)
+        }
+        Some(_) => (options.detect_renames, options.detect_copies),
+    }
 }
 
 /// Emit the diff body (stat/raw/summary/numstat/shortstat/patch or the
@@ -989,7 +1162,7 @@ fn write_commit_diff_patch(
     let color = diff_color_enabled(config);
 
     let show_stat = options.stat || options.compact_summary;
-    let show_patch = !options.has_diff_extras();
+    let show_patch = options.shows_patch_body();
     let mut wrote_prefix = false;
 
     if entries.is_empty() {
@@ -1244,6 +1417,16 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 options.raw = true;
                 options.restore_patch();
             }
+            "--patch-with-stat" => {
+                options.stat = true;
+                options.patch_with_extra = true;
+                options.restore_patch();
+            }
+            "--patch-with-raw" => {
+                options.raw = true;
+                options.patch_with_extra = true;
+                options.restore_patch();
+            }
             // --- pretty / format -------------------------------------------------
             "--oneline" => {
                 options.commit_format = ShowCommitFormat::Oneline;
@@ -1296,28 +1479,39 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 options.date_mode = show_date_mode(value)?;
             }
             // --- rename / copy detection ----------------------------------------
-            "--no-renames" => options.detect_renames = false,
-            "-M" | "--find-renames" => options.detect_renames = true,
+            "--no-renames" => {
+                options.detect_renames = false;
+                options.renames_explicit = true;
+            }
+            "-M" | "--find-renames" => {
+                options.detect_renames = true;
+                options.renames_explicit = true;
+            }
             value if let Some(rest) = value.strip_prefix("--find-renames=") => {
                 options.detect_renames = true;
+                options.renames_explicit = true;
                 options.rename_threshold = show_parse_similarity(rest)?;
             }
             value if value.starts_with("-M") => {
                 options.detect_renames = true;
+                options.renames_explicit = true;
                 options.rename_threshold = show_parse_similarity(&value[2..])?;
             }
             "-C" | "--find-copies" => {
                 options.detect_renames = true;
                 options.detect_copies = true;
+                options.renames_explicit = true;
             }
             value if let Some(rest) = value.strip_prefix("--find-copies=") => {
                 options.detect_renames = true;
                 options.detect_copies = true;
+                options.renames_explicit = true;
                 options.copy_threshold = show_parse_similarity(rest)?;
             }
             value if value.starts_with("-C") => {
                 options.detect_renames = true;
                 options.detect_copies = true;
+                options.renames_explicit = true;
                 options.copy_threshold = show_parse_similarity(&value[2..])?;
             }
             "--find-copies-harder" => {
@@ -1372,8 +1566,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             | "--ext-diff"
             | "--no-textconv"
             | "--textconv"
-            | "--no-show-signature"
-            | "--root" => {}
+            | "--no-show-signature" => {}
+            "--root" => options.show_root = Some(true),
+            "--no-root" => options.show_root = Some(false),
             value if value.starts_with("--color=") => {}
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
