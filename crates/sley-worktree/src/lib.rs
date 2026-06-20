@@ -14231,7 +14231,7 @@ pub fn move_index_and_worktree_path(
     } else {
         worktree_root.join(destination)
     };
-    let destination_absolute = if destination_absolute.is_dir() {
+    let mut destination_absolute = if destination_absolute.is_dir() {
         let Some(file_name) = source_absolute.file_name() else {
             return Err(GitError::InvalidPath(format!(
                 "invalid source path {}",
@@ -14242,6 +14242,14 @@ pub fn move_index_and_worktree_path(
     } else {
         destination_absolute
     };
+    if path_has_trailing_separator(&destination_absolute)
+        && !destination_absolute.exists()
+        && source_absolute.is_dir()
+        && let (Some(parent), Some(file_name)) =
+            (destination_absolute.parent(), destination_absolute.file_name())
+    {
+        destination_absolute = parent.join(file_name);
+    }
     let source_relative = source_absolute.strip_prefix(worktree_root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", source.display()))
     })?;

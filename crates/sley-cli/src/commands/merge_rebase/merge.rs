@@ -3593,6 +3593,15 @@ fn verify_merge_uptodate(
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
+        if entry.index == b'?' && entry.worktree == b'?' && changed.contains(&entry.path) {
+            eprintln!(
+                "error: The following untracked working tree files would be overwritten by merge:\n\t{}",
+                String::from_utf8_lossy(&entry.path)
+            );
+            eprintln!("Please move or remove them before you merge.");
+            eprintln!("Aborting");
+            return Err(GitError::Exit(1));
+        }
         // A staged change anywhere (index column non-blank, not untracked/ignored)
         // makes the index an unclean merge base.
         if entry.index != b' ' && entry.index != b'?' && entry.index != b'!' {
