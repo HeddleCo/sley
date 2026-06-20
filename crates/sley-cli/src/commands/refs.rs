@@ -1603,7 +1603,17 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         } else {
             None
         };
-        let name = update_ref_effective_name(&store, &positional[0], deref)?;
+        let name = match update_ref_effective_name(&store, &positional[0], deref) {
+            Ok(name) => name,
+            Err(GitError::InvalidPath(_)) => {
+                eprintln!(
+                    "error: refusing to update ref with bad name '{}'",
+                    positional[0]
+                );
+                return Err(GitError::Exit(1));
+            }
+            Err(err) => return Err(err),
+        };
         return update_ref_delete(&store, format, &name, expected_oid.as_ref());
     }
     if positional.len() != 2 && positional.len() != 3 {
@@ -1612,7 +1622,22 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         ));
     }
     let requested_name = positional[0].clone();
-    let name = update_ref_effective_name(&store, &requested_name, deref)?;
+    let name = match update_ref_effective_name(&store, &requested_name, deref) {
+        Ok(name) => name,
+        Err(GitError::InvalidPath(_)) => {
+            eprintln!(
+                "fatal: update_ref failed for ref '{requested_name}': refusing to update ref with bad name '{requested_name}'"
+            );
+            return Err(GitError::Exit(128));
+        }
+        Err(err) => return Err(err),
+    };
+    if sley_refs::validate_ref_name_for_update(&name).is_err() {
+        eprintln!(
+            "fatal: update_ref failed for ref '{requested_name}': refusing to update ref with bad name '{name}'"
+        );
+        return Err(GitError::Exit(128));
+    }
     let new_oid = parse_update_ref_new_oid(&git_dir, format, &store, &positional[1])?;
     let expected_oid = if let Some(old) = positional.get(2) {
         Some(parse_update_ref_expected(&git_dir, format, &store, old)?)
@@ -2031,7 +2056,7 @@ fn dispatch_ref_stdin_command(
                     &v,
                 )?),
             };
-            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
@@ -2105,7 +2130,7 @@ fn dispatch_ref_stdin_command(
             if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(&raw_name);
             }
-            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             let zero = zero_oid(context.format)?;
             if context.batch_updates {
@@ -2182,7 +2207,7 @@ fn dispatch_ref_stdin_command(
                     Some(oid)
                 }
             };
-            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             if context.batch_updates {
                 return update_ref_delete_stdin_batch(
@@ -2238,7 +2263,7 @@ fn dispatch_ref_stdin_command(
                 )?,
                 None => zero_oid(context.format)?,
             };
-            let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
@@ -2816,6 +2841,11 @@ fn update_ref_stdin_restart_transaction() -> Result<()> {
 
 fn update_ref_stdin_closed_transaction() -> Result<()> {
     eprintln!("fatal: transaction is closed");
+    Err(GitError::Exit(128))
+}
+
+fn update_ref_stdin_invalid_ref_format(name: &str) -> Result<EffectiveRefName> {
+    eprintln!("fatal: invalid ref format: {name}");
     Err(GitError::Exit(128))
 }
 
@@ -3510,6 +3540,22 @@ fn update_ref_effective_name(store: &FileRefStore, name: &str, deref: bool) -> R
     Ok(update_ref_effective_ref(store, name, deref)?.effective)
 }
 
+fn update_ref_stdin_effective_ref(
+    store: &FileRefStore,
+    name: &str,
+    deref: bool,
+) -> Result<EffectiveRefName> {
+    let effective = match update_ref_effective_ref(store, name, deref) {
+        Ok(effective) => effective,
+        Err(GitError::InvalidPath(_)) => return update_ref_stdin_invalid_ref_format(name),
+        Err(err) => return Err(err),
+    };
+    if sley_refs::validate_ref_name_for_update(&effective.effective).is_err() {
+        return update_ref_stdin_invalid_ref_format(name);
+    }
+    Ok(effective)
+}
+
 /// The result of dereferencing a (possibly symbolic) ref for an update: the
 /// `requested` name the user typed and the `effective` name the write lands on.
 /// git reports the *requested* name in the `cannot lock ref '<requested>'`
@@ -3895,7 +3941,6 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let refs = store.list_refs()?;
     let mut include_head = false;
     let mut heads = false;
     let mut tags = false;
@@ -3971,6 +4016,7 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
         }
     }
     if let Some(pattern) = exclude_existing {
+        let refs = store.list_refs()?;
         return cmd_show_ref_exclude_existing(
             &refs,
             (!pattern.is_empty()).then_some(pattern.as_str()),
@@ -3980,7 +4026,7 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
         if filters.len() != 1 {
             return show_ref_exists_requires_reference(filters.len());
         }
-        if show_ref_exists(&store, &refs, filters[0])? {
+        if show_ref_exists(&store, filters[0])? {
             return Ok(());
         }
         eprintln!("error: reference does not exist");
@@ -4029,6 +4075,7 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut matched = false;
+    let refs = store.list_refs()?;
     if include_head && let Ok(oid) = resolve_revision(&git_dir, format, "HEAD") {
         matched = true;
         if !quiet {
@@ -4095,11 +4142,8 @@ fn parse_show_ref_short_options(
     Ok(true)
 }
 
-fn show_ref_exists(store: &FileRefStore, refs: &[sley_refs::Ref], name: &str) -> Result<bool> {
-    if name == "HEAD" {
-        return Ok(store.read_ref("HEAD")?.is_some());
-    }
-    Ok(refs.iter().any(|reference| reference.name == name))
+fn show_ref_exists(store: &FileRefStore, name: &str) -> Result<bool> {
+    store.raw_ref_exists(name)
 }
 
 fn show_ref_exists_requires_reference(count: usize) -> Result<()> {

@@ -1490,6 +1490,10 @@ fn checkout_create_or_reset_branch(
     committer: Vec<u8>,
 ) -> Result<bool> {
     let store = FileRefStore::new(git_dir, format);
+    if branch == "HEAD" || branch == "@" {
+        eprintln!("fatal: '{branch}' is not a valid branch name");
+        return Err(GitError::Exit(128));
+    }
     let name = branch_ref_name(branch)?;
     let existing = store.read_ref(&name)?;
     if existing.is_some() && !force {
@@ -5556,6 +5560,9 @@ fn resolve_for_each_ref_target(
             RefTarget::Direct(oid) => return Ok(Some((oid, symref))),
             RefTarget::Symbolic(name) => {
                 symref.get_or_insert_with(|| name.clone());
+                if sley_refs::validate_ref_name(&name).is_err() {
+                    return Ok(None);
+                }
                 let Some(next) = store.read_ref(&name)? else {
                     return Ok(None);
                 };
