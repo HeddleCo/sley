@@ -110,8 +110,16 @@ struct DiffFilesOptions {
     // `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
     // `diff.indentHeuristic` config (default git-enabled).
     indent_heuristic: Option<bool>,
-    ignore_submodules: bool,
+    ignore_submodules: IgnoreSubmodules,
     path_args: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IgnoreSubmodules {
+    Default,
+    None,
+    Dirty,
+    All,
 }
 
 impl Default for DiffFilesOptions {
@@ -152,7 +160,7 @@ impl Default for DiffFilesOptions {
             interhunk: None,
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             indent_heuristic: None,
-            ignore_submodules: false,
+            ignore_submodules: IgnoreSubmodules::Default,
             path_args: Vec::new(),
         }
     }
@@ -307,10 +315,15 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
             // Plumbing diff-files never colorizes; `--ignore-submodules` filters
             // gitlink pairs before rendering below.
             "--color" | "--no-color" => {}
-            "--ignore-submodules" => o.ignore_submodules = true,
+            "--ignore-submodules" => o.ignore_submodules = IgnoreSubmodules::All,
             value if value.starts_with("--color=") => {}
             value if let Some(mode) = value.strip_prefix("--ignore-submodules=") => {
-                o.ignore_submodules = mode != "none";
+                o.ignore_submodules = match mode {
+                    "none" => IgnoreSubmodules::None,
+                    "dirty" => IgnoreSubmodules::Dirty,
+                    "all" => IgnoreSubmodules::All,
+                    _ => IgnoreSubmodules::Dirty,
+                };
             }
             "--full-index" => o.patch_full_index = true,
             "--no-prefix" => {
@@ -585,7 +598,12 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         &config,
     )?;
     let entries = apply_diff_pathspec(entries, &pathspec);
-    let entries = if o.ignore_submodules {
+    let entries = if o.ignore_submodules == IgnoreSubmodules::None {
+        add_dirty_submodule_entries(entries, worktree_root, git_dir, format)?
+    } else {
+        entries
+    };
+    let entries = if o.ignore_submodules == IgnoreSubmodules::All {
         entries
             .into_iter()
             .filter(|entry| {
@@ -792,6 +810,42 @@ fn render_diff_files_entries(
         }
     }
     Ok(())
+}
+
+fn add_dirty_submodule_entries(
+    mut entries: Vec<sley_diff_merge::NameStatusEntry>,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let index = Index::parse(&fs::read(sley_worktree::repository_index_path(git_dir))?, format)?;
+    for entry in index.entries {
+        if sley_index::Stage::from_flags(entry.flags) != sley_index::Stage::Normal {
+            continue;
+        }
+        if !sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        if entries.iter().any(|diff| diff.path.as_bytes() == entry.path.as_bytes()) {
+            continue;
+        }
+        let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
+        let sub_root = worktree_root.join(Path::new(&path));
+        if sley_worktree::submodule_dirt(&sub_root) == 0 {
+            continue;
+        }
+        entries.push(sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Modified,
+            path: entry.path,
+            old_path: None,
+            old_mode: Some(sley_index::GITLINK_MODE),
+            new_mode: Some(sley_index::GITLINK_MODE),
+            old_oid: Some(entry.oid),
+            new_oid: Some(entry.oid),
+        });
+    }
+    entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    Ok(entries)
 }
 
 /// Whether `entry` is a real content/mode change for the purpose of stat-family
