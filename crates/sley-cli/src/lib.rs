@@ -228,15 +228,29 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         setup::git_trace_line("git.c:502", &msg);
     }
     let Some(command) = args.first().map(String::as_str) else {
-        print_usage();
-        return Err(GitError::Command("missing command".into()));
+        commands::help::print_common_help();
+        return Err(GitError::Exit(1));
     };
     // GIT_TRACE_PACKET identity: git's `packet_trace_identity` is the running
     // program's basename (the subcommand here). The transports' pkt-line traces
     // are prefixed `packet: %12s` with this value (e.g. `ls-remote`, `clone`,
     // `fetch`, `upload-pack`).
     sley_protocol::set_packet_trace_identity(command);
+    if command != "help"
+        && args.len() == 2
+        && args.get(1).is_some_and(|arg| arg == "-h")
+        && commands::help::is_builtin_command(command)
+        && !commands::help::has_command_specific_help(command)
+    {
+        commands::help::print_command_usage(command);
+        return Err(GitError::Exit(129));
+    }
     match command {
+        "help" => commands::help::cmd_help(&args[1..]),
+        "--list-cmds=builtins" => {
+            commands::help::print_builtin_commands();
+            Ok(())
+        }
         "init" => commands::plumbing::cmd_init(&args[1..], global_config),
         "add" => commands::plumbing::cmd_add(&args[1..]),
         "archive" => commands::plumbing::cmd_archive(&args[1..]),
@@ -366,7 +380,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "mktag" => commands::mktag::cmd_mktag(&args[1..]),
         "patch-id" => commands::patch_id::cmd_patch_id(&args[1..]),
         "interpret-trailers" => commands::interpret_trailers::cmd_interpret_trailers(&args[1..]),
-        _ => Err(GitError::Command(format!("unsupported command {command}"))),
+        _ => commands::help::unknown_command(command, 1),
     }
 }
 
@@ -10587,12 +10601,6 @@ fn match_refname_pattern_class(class: &[u8], name: Option<u8>) -> Option<(bool, 
 
 fn short_oid(hex: &str) -> &str {
     &hex[..hex.len().min(7)]
-}
-
-fn print_usage() {
-    eprintln!(
-        "usage: sley <init|add|branch|bundle|checkout|check-attr|check-ignore|clean|clone|config|count-objects|commit-graph|diff|fetch|for-each-ref|hash-object|cat-file|commit|commit-tree|ls-remote|ls-files|ls-tree|log|merge-base|mktree|multi-pack-index|mv|pack-refs|reflog|remote|reset|restore|rm|write-tree|worktree|update-index|update-ref|rev-parse|rev-list|show-ref|stash|submodule|symbolic-ref|status|switch|tag|testkit|version> ..."
-    );
 }
 
 fn resolve_cli_path(cwd: &Path, value: &str) -> PathBuf {
