@@ -2822,6 +2822,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         let other_tree = commit_tree_oid(&db, format, &other_oid)?;
         if let Err(err) = verify_fast_forward_untracked_safe(
             &worktree_root,
+            &git_dir,
             &db,
             format,
             &head_tree,
@@ -2875,6 +2876,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         let other_tree = commit_tree_oid(&db, format, &other_oid)?;
         if let Err(err) = verify_fast_forward_untracked_safe(
             &worktree_root,
+            &git_dir,
             &db,
             format,
             &head_tree,
@@ -3633,6 +3635,7 @@ fn verify_merge_uptodate(
 
 pub(crate) fn verify_fast_forward_untracked_safe(
     worktree_root: &Path,
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     head_tree: &ObjectId,
@@ -3640,8 +3643,21 @@ pub(crate) fn verify_fast_forward_untracked_safe(
 ) -> Result<()> {
     let head_map = stash_tree_entry_map(db, format, head_tree)?;
     let target_map = stash_tree_entry_map(db, format, target_tree)?;
+    let status = crate::collect_short_status(worktree_root, git_dir, format)?;
+    let untracked: BTreeSet<Vec<u8>> = status
+        .iter()
+        .filter(|entry| entry.index == b'?' && entry.worktree == b'?')
+        .map(|entry| entry.path.clone())
+        .collect();
     for path in target_map.keys() {
         if head_map.contains_key(path) {
+            continue;
+        }
+        if target_map
+            .get(path)
+            .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode))
+            && gitlink_target_dir_is_safe(worktree_root, path, &head_map, &untracked)?
+        {
             continue;
         }
         let rel = std::str::from_utf8(path)
@@ -3657,6 +3673,40 @@ pub(crate) fn verify_fast_forward_untracked_safe(
         }
     }
     Ok(())
+}
+
+fn gitlink_target_dir_is_safe(
+    worktree_root: &Path,
+    path: &[u8],
+    head_map: &MergeTreeMap,
+    untracked: &BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    let full = worktree_root.join(rel);
+    let Ok(metadata) = fs::symlink_metadata(&full) else {
+        return Ok(true);
+    };
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    if fs::read_dir(&full)?.next().is_none() {
+        return Ok(true);
+    }
+    let prefix = path_with_trailing_slash(path);
+    let tracked_dir = head_map.keys().any(|candidate| candidate.starts_with(&prefix));
+    if !tracked_dir {
+        return Ok(false);
+    }
+    Ok(!untracked
+        .iter()
+        .any(|candidate| candidate == path || candidate.starts_with(&prefix)))
+}
+
+fn path_with_trailing_slash(path: &[u8]) -> Vec<u8> {
+    let mut prefix = path.to_vec();
+    prefix.push(b'/');
+    prefix
 }
 
 fn reset_index_and_worktree_to_commit_for_merge(
