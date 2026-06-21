@@ -1700,6 +1700,30 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
+    if !update
+        && !all
+        && let Some(actions) = try_add_regular_exact_untracked(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &paths,
+            AddRegularOptions {
+                chmod,
+                force,
+                ignore_errors,
+                ignore_removal,
+                ignore_missing,
+                dry_run,
+                sparse,
+            },
+        )?
+    {
+        if verbose {
+            print_add_actions(&worktree_root, &actions)?;
+        }
+        return Ok(());
+    }
     let parsed_index = if paths.is_empty() {
         None
     } else {
@@ -2080,6 +2104,95 @@ fn try_add_regular_exact_tracked_raw(
             .map(Some),
         sley_worktree::AddExactTrackedPathResult::Unsupported => Ok(None),
     }
+}
+
+fn try_add_regular_exact_untracked(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: AddRegularOptions,
+) -> Result<Option<Vec<AddAction>>> {
+    if paths.len() != 1
+        || options.dry_run
+        || options.ignore_missing
+        || add_pathspec_needs_status_walk(&paths[0])
+        || add_pathspec_has_trailing_separator(&paths[0])
+    {
+        return Ok(None);
+    }
+    reject_add_paths_outside_sparse_checkout(cwd, worktree_root, git_dir, paths, options)?;
+
+    let path = &paths[0];
+    let absolute = if path.is_absolute() {
+        path.clone()
+    } else {
+        cwd.join(path)
+    };
+    let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+        return Ok(None);
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let git_path = match add_git_path_bytes(relative) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    match sley_worktree::index_path_gitlink_ancestor_from_disk(git_dir, format, &git_path) {
+        Ok(Some(link)) => {
+            eprintln!(
+                "fatal: Pathspec '{}' is in submodule '{}'",
+                path.to_string_lossy(),
+                String::from_utf8_lossy(&link)
+            );
+            return Err(GitError::Exit(128));
+        }
+        Ok(None) => {}
+        Err(GitError::Unsupported(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let file_type = metadata.file_type();
+    if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(None);
+    }
+
+    if !options.force
+        && let Some(ignore_match) = sley_worktree::standard_ignore_match_for_path(
+            worktree_root,
+            &git_path,
+            /* is_dir */ false,
+        )?
+        && ignore_match.ignored
+    {
+        print_add_ignored_paths(git_dir, &[git_path]);
+        return Err(GitError::Exit(1));
+    }
+
+    let config = read_repo_config(git_dir)?;
+    sley_worktree::update_index_paths_filtered(
+        worktree_root,
+        git_dir,
+        format,
+        &[absolute.clone()],
+        sley_worktree::UpdateIndexOptions {
+            add: true,
+            remove: true,
+            force_remove: false,
+            chmod: options.chmod,
+            info_only: false,
+            ignore_skip_worktree_entries: false,
+            allow_skip_worktree_entries: options.sparse,
+        },
+        &config,
+    )?;
+
+    Ok(Some(vec![AddAction::Add(absolute)]))
 }
 
 fn add_pathspec_has_trailing_separator(path: &Path) -> bool {

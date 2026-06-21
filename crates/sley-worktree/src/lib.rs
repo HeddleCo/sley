@@ -1260,6 +1260,23 @@ pub fn add_exact_tracked_path_from_disk(
     ))
 }
 
+pub fn index_path_gitlink_ancestor_from_disk(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    git_path: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if !git_path.contains(&b'/') {
+        return Ok(None);
+    }
+    let index_path = repository_index_path(git_dir);
+    let index_bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    raw_index_path_gitlink_ancestor(&index_bytes, format, git_path)
+}
+
 pub fn add_exact_tracked_path_with_index(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -1303,6 +1320,82 @@ pub fn add_exact_tracked_path_with_index(
         write_repository_index_ref(git_dir, format, &index)?;
     }
     Ok(action)
+}
+
+fn raw_index_path_gitlink_ancestor(
+    bytes: &[u8],
+    format: ObjectFormat,
+    git_path: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let hash_len = format.raw_len();
+    if bytes.len() < 12 + hash_len {
+        return Err(GitError::InvalidFormat("index header too short".into()));
+    }
+    let checksum_offset = bytes.len() - hash_len;
+    let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    let expected_checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+    if actual_checksum != expected_checksum {
+        return Err(GitError::InvalidFormat(format!(
+            "index checksum mismatch: expected {expected_checksum}, got {actual_checksum}"
+        )));
+    }
+    if &bytes[..4] != b"DIRC" {
+        return Err(GitError::InvalidFormat("missing DIRC signature".into()));
+    }
+    let version = u32_from_be(&bytes[4..8]);
+    if !(2..=3).contains(&version) {
+        return Err(GitError::Unsupported(format!("index version {version}")));
+    }
+    let count = u32_from_be(&bytes[8..12]) as usize;
+    let mut offset = 12;
+    for _ in 0..count {
+        let entry_header_len = 40 + hash_len + 2;
+        if checksum_offset.saturating_sub(offset) < entry_header_len {
+            return Err(GitError::InvalidFormat("truncated index entry".into()));
+        }
+        let start = offset;
+        let oid_start = offset + 40;
+        let oid_end = oid_start + hash_len;
+        let mode = u32_from_be(&bytes[start + 24..start + 28]);
+        let flags = u16_from_be(&bytes[oid_end..oid_end + 2]);
+        offset = oid_end + 2;
+        if flags & INDEX_FLAG_EXTENDED != 0 {
+            if checksum_offset.saturating_sub(offset) < 2 {
+                return Err(GitError::InvalidFormat(
+                    "truncated index extended flags".into(),
+                ));
+            }
+            offset += 2;
+        }
+        let path_start = offset;
+        while bytes.get(offset).copied() != Some(0) {
+            offset += 1;
+            if offset >= checksum_offset {
+                return Err(GitError::InvalidFormat("unterminated index path".into()));
+            }
+        }
+        let path = &bytes[path_start..offset];
+        offset += 1;
+        while (offset - start) % 8 != 0 {
+            offset += 1;
+            if offset > checksum_offset {
+                return Err(GitError::InvalidFormat("truncated index padding".into()));
+            }
+        }
+        if path > git_path {
+            break;
+        }
+        let stage = (flags >> 12) & 0x3;
+        if stage == 0
+            && mode == 0o160000
+            && git_path.len() > path.len()
+            && git_path.starts_with(path)
+            && git_path[path.len()] == b'/'
+        {
+            return Ok(Some(path.to_vec()));
+        }
+    }
+    Ok(None)
 }
 
 struct RawExactIndexEntry {
@@ -4057,9 +4150,6 @@ struct StatusProfileCounters {
     overlap_enabled: bool,
 }
 
-const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 1024;
-const STATUS_WORKER_STACK_SIZE: usize = 32 * 1024;
-
 fn spawn_status_worker<'scope, 'env, F, T>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     name: &str,
@@ -4071,7 +4161,6 @@ where
 {
     std::thread::Builder::new()
         .name(name.to_string())
-        .stack_size(STATUS_WORKER_STACK_SIZE)
         .spawn_scoped(scope, f)
         .map_err(|err| GitError::Command(format!("failed to spawn status worker `{name}`: {err}")))
 }
@@ -4106,34 +4195,6 @@ impl StatusProfileCounters {
         std::env::var_os("SLEY_STATUS_PROFILE")
             .and_then(|value| value.into_string().ok())
             .is_some_and(|value| value == "mem" || value == "memory")
-    }
-
-    fn merge_untracked(&mut self, other: StatusProfileCounters) {
-        self.read_dir_calls += other.read_dir_calls;
-        self.dir_entries_seen += other.dir_entries_seen;
-        self.file_type_calls += other.file_type_calls;
-        self.ignore_checks += other.ignore_checks;
-        self.ignore_pattern_tests += other.ignore_pattern_tests;
-        self.ignore_glob_fallback_tests += other.ignore_glob_fallback_tests;
-        self.tracked_exact_hits += other.tracked_exact_hits;
-        self.tracked_dir_prefix_hits += other.tracked_dir_prefix_hits;
-        self.tracked_skip_worktree_prefix_hits += other.tracked_skip_worktree_prefix_hits;
-        self.read_dir_entry_vec_cap_bytes += other.read_dir_entry_vec_cap_bytes;
-        self.read_dir_entry_vec_max_len = self
-            .read_dir_entry_vec_max_len
-            .max(other.read_dir_entry_vec_max_len);
-        self.read_dir_entry_vec_max_cap = self
-            .read_dir_entry_vec_max_cap
-            .max(other.read_dir_entry_vec_max_cap);
-        self.read_dir_name_vec_cap_bytes += other.read_dir_name_vec_cap_bytes;
-        self.read_dir_name_vec_max_len = self
-            .read_dir_name_vec_max_len
-            .max(other.read_dir_name_vec_max_len);
-        self.read_dir_name_vec_max_cap = self
-            .read_dir_name_vec_max_cap
-            .max(other.read_dir_name_vec_max_cap);
-        self.untracked_rows += other.untracked_rows;
-        self.untracked_elapsed_us += other.untracked_elapsed_us;
     }
 
     fn emit(&self) {
@@ -5125,138 +5186,33 @@ fn short_status_borrowed_head_matches_index_if_possible(
         return Ok(Some(entries));
     }
 
-    if stage0_entry_count < STATUS_BORROWED_OVERLAP_MIN_STAGE0 {
-        let tracked_start = Instant::now();
-        let mut entries = short_status_borrowed_tracked_only_head_matches_index_parallel(
-            worktree_root,
-            git_dir,
-            format,
-            &borrowed,
-            &stat_cache,
-            sparse_checkout_active,
-            untracked_mode,
-        )?;
-        if let Some(profile) = profile.as_mut() {
-            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
-        }
-        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-        let untracked_start = Instant::now();
-        let untracked_paths = status_untracked_paths_from_borrowed_index(
-            worktree_root,
-            git_dir,
-            &borrowed,
-            &mut ignores,
-            untracked_mode,
-            profile.as_mut(),
-        )?;
-        if let Some(profile) = profile.as_mut() {
-            profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
-            profile.untracked_rows = untracked_paths.len() as u64;
-        }
-        let render_start = Instant::now();
-        append_untracked_status_entries(&mut entries, untracked_paths);
-        if let Some(profile) = profile.as_mut() {
-            profile.render_elapsed_us = render_start.elapsed().as_micros();
-            profile.emit();
-        }
-        return Ok(Some(entries));
-    }
-
+    let tracked_start = Instant::now();
+    let mut entries = short_status_borrowed_tracked_only_head_matches_index_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        &borrowed,
+        &stat_cache,
+        sparse_checkout_active,
+        untracked_mode,
+    )?;
     if let Some(profile) = profile.as_mut() {
-        profile.overlap_enabled = true;
+        profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
     }
-    if profile_enabled {
-        let (mut entries, untracked_paths, untracked_profile) =
-            std::thread::scope(|scope| -> Result<_> {
-                let tracked = spawn_status_worker(scope, "status-tracked", || {
-                    let start = Instant::now();
-                    short_status_borrowed_tracked_only_head_matches_index_parallel(
-                        worktree_root,
-                        git_dir,
-                        format,
-                        &borrowed,
-                        &stat_cache,
-                        sparse_checkout_active,
-                        untracked_mode,
-                    )
-                    .map(|entries| (entries, start.elapsed().as_micros()))
-                })?;
-                let untracked = spawn_status_worker(
-                    scope,
-                    "status-untracked",
-                    || -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
-                        let mut local_profile = StatusProfileCounters::default();
-                        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                        let start = Instant::now();
-                        let paths = status_untracked_paths_from_borrowed_index(
-                            worktree_root,
-                            git_dir,
-                            &borrowed,
-                            &mut ignores,
-                            untracked_mode,
-                            Some(&mut local_profile),
-                        )?;
-                        local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-                        local_profile.untracked_rows = paths.len() as u64;
-                        Ok((paths, local_profile))
-                    },
-                )?;
-                let (entries, tracked_elapsed_us) = tracked
-                    .join()
-                    .map_err(|_| GitError::Command("status worker panicked".into()))??;
-                let (untracked_paths, untracked_profile) = untracked
-                    .join()
-                    .map_err(|_| GitError::Command("status worker panicked".into()))??;
-                if let Some(profile) = profile.as_mut() {
-                    profile.tracked_elapsed_us = tracked_elapsed_us;
-                }
-                Ok((entries, untracked_paths, Some(untracked_profile)))
-            })?;
-        if let Some(profile) = profile.as_mut() {
-            if let Some(untracked_profile) = untracked_profile {
-                profile.merge_untracked(untracked_profile);
-            }
-        }
-        let render_start = Instant::now();
-        append_untracked_status_entries(&mut entries, untracked_paths);
-        if let Some(profile) = profile.as_mut() {
-            profile.render_elapsed_us = render_start.elapsed().as_micros();
-            profile.emit();
-        }
-        return Ok(Some(entries));
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    let untracked_start = Instant::now();
+    let untracked_paths = status_untracked_paths_from_borrowed_index(
+        worktree_root,
+        git_dir,
+        &borrowed,
+        &mut ignores,
+        untracked_mode,
+        profile.as_mut(),
+    )?;
+    if let Some(profile) = profile.as_mut() {
+        profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
+        profile.untracked_rows = untracked_paths.len() as u64;
     }
-    let (mut entries, untracked_paths) = std::thread::scope(|scope| -> Result<_> {
-        let tracked = spawn_status_worker(scope, "status-tracked", || {
-            short_status_borrowed_tracked_only_head_matches_index_parallel(
-                worktree_root,
-                git_dir,
-                format,
-                &borrowed,
-                &stat_cache,
-                sparse_checkout_active,
-                untracked_mode,
-            )
-        })?;
-        let untracked =
-            spawn_status_worker(scope, "status-untracked", || -> Result<Vec<Vec<u8>>> {
-                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                status_untracked_paths_from_borrowed_index(
-                    worktree_root,
-                    git_dir,
-                    &borrowed,
-                    &mut ignores,
-                    untracked_mode,
-                    None,
-                )
-            })?;
-        let entries = tracked
-            .join()
-            .map_err(|_| GitError::Command("status worker panicked".into()))??;
-        let untracked_paths = untracked
-            .join()
-            .map_err(|_| GitError::Command("status worker panicked".into()))??;
-        Ok((entries, untracked_paths))
-    })?;
     let render_start = Instant::now();
     append_untracked_status_entries(&mut entries, untracked_paths);
     if let Some(profile) = profile.as_mut() {
@@ -5435,153 +5391,41 @@ where
         return Ok(Some(()));
     }
 
-    if stage0_entry_count < STATUS_BORROWED_OVERLAP_MIN_STAGE0 {
-        let tracked_start = Instant::now();
-        let tracked_control =
-            stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
-                worktree_root,
-                git_dir,
-                format,
-                &borrowed,
-                &stat_cache,
-                sparse_checkout_active,
-                untracked_mode,
-                emit,
-            )?;
-        if let Some(profile) = profile.as_mut() {
-            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
-        }
-        if tracked_control.is_stop() {
-            if let Some(profile) = profile.as_ref() {
-                profile.emit();
-            }
-            return Ok(Some(()));
-        }
-        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-        let untracked_start = Instant::now();
-        stream_status_untracked_paths_from_borrowed_index(
-            worktree_root,
-            git_dir,
-            &borrowed,
-            &mut ignores,
-            untracked_mode,
-            profile.as_mut(),
-            emit_untracked_status_entry(emit),
-        )?;
-        if let Some(profile) = profile.as_mut() {
-            profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
-            profile.emit();
-        }
-        return Ok(Some(()));
-    }
-
+    let tracked_start = Instant::now();
+    let tracked_control = stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        &borrowed,
+        &stat_cache,
+        sparse_checkout_active,
+        untracked_mode,
+        emit,
+    )?;
     if let Some(profile) = profile.as_mut() {
-        profile.overlap_enabled = true;
+        profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
     }
-    let (tracked_control, untracked_paths, untracked_profile) =
-        std::thread::scope(|scope| -> Result<_> {
-            let untracked = spawn_status_worker(
-                scope,
-                "status-untracked",
-                || -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
-                    let mut local_profile = StatusProfileCounters::default();
-                    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                    ignores.emit_memory_profile("after_untracked_ignore");
-                    let start = Instant::now();
-                    let paths = status_untracked_paths_from_borrowed_index(
-                        worktree_root,
-                        git_dir,
-                        &borrowed,
-                        &mut ignores,
-                        untracked_mode,
-                        profile_enabled.then_some(&mut local_profile),
-                    )?;
-                    status_profile_mem(
-                        "after_untracked_collect",
-                        &[
-                            ("untracked_paths_len", paths.len()),
-                            ("untracked_paths_cap", paths.capacity()),
-                            (
-                                "untracked_paths_cap_bytes",
-                                paths.capacity() * std::mem::size_of::<Vec<u8>>(),
-                            ),
-                            (
-                                "untracked_path_payload_bytes",
-                                paths.iter().map(Vec::capacity).sum(),
-                            ),
-                        ],
-                    );
-                    local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-                    local_profile.untracked_rows = paths.len() as u64;
-                    Ok((paths, local_profile))
-                },
-            )?;
-            let tracked_start = Instant::now();
-            let tracked_control =
-                stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
-                    worktree_root,
-                    git_dir,
-                    format,
-                    &borrowed,
-                    &stat_cache,
-                    sparse_checkout_active,
-                    untracked_mode,
-                    emit,
-                )?;
-            let tracked_elapsed_us = tracked_start.elapsed().as_micros();
-            let (untracked_paths, untracked_profile) = untracked
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
-            if let Some(profile) = profile.as_mut() {
-                profile.tracked_elapsed_us = tracked_elapsed_us;
-            }
-            Ok((
-                tracked_control,
-                untracked_paths,
-                profile_enabled.then_some(untracked_profile),
-            ))
-        })?;
-    status_profile_mem(
-        "after_join",
-        &[
-            ("untracked_paths_len", untracked_paths.len()),
-            ("untracked_paths_cap", untracked_paths.capacity()),
-            (
-                "untracked_paths_cap_bytes",
-                untracked_paths.capacity() * std::mem::size_of::<Vec<u8>>(),
-            ),
-            (
-                "untracked_path_payload_bytes",
-                untracked_paths.iter().map(Vec::capacity).sum(),
-            ),
-        ],
-    );
     if tracked_control.is_stop() {
-        if let Some(profile) = profile.as_mut()
-            && let Some(untracked_profile) = untracked_profile
-        {
-            profile.merge_untracked(untracked_profile);
+        if let Some(profile) = profile.as_mut() {
             profile.emit();
         }
         return Ok(Some(()));
     }
-    if let Some(profile) = profile.as_mut()
-        && let Some(untracked_profile) = untracked_profile
-    {
-        profile.merge_untracked(untracked_profile);
-    }
-    let render_start = Instant::now();
-    for path in untracked_paths {
-        let row = untracked_status_row(&path);
-        if emit(row)?.is_stop() {
-            break;
-        }
-    }
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    let untracked_start = Instant::now();
+    stream_status_untracked_paths_from_borrowed_index(
+        worktree_root,
+        git_dir,
+        &borrowed,
+        &mut ignores,
+        untracked_mode,
+        profile.as_mut(),
+        emit_untracked_status_entry(emit),
+    )?;
     if let Some(profile) = profile.as_mut() {
-        profile.render_elapsed_us = render_start.elapsed().as_micros();
+        profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
         profile.emit();
     }
-    status_profile_mem("after_render", &[]);
     Ok(Some(()))
 }
 
@@ -5661,95 +5505,32 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
         return Ok(Some(count));
     }
 
-    if stage0_entry_count < STATUS_BORROWED_OVERLAP_MIN_STAGE0 {
-        let tracked_start = Instant::now();
-        let tracked_count = short_status_borrowed_tracked_only_head_matches_index_count_parallel(
-            worktree_root,
-            git_dir,
-            format,
-            &borrowed,
-            &stat_cache,
-            sparse_checkout_active,
-            untracked_mode,
-        )?;
-        if let Some(profile) = profile.as_mut() {
-            profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
-        }
-        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-        let untracked_start = Instant::now();
-        let untracked_count = status_untracked_count_from_borrowed_index(
-            worktree_root,
-            git_dir,
-            &borrowed,
-            &mut ignores,
-            untracked_mode,
-            profile.as_mut(),
-        )?;
-        if let Some(profile) = profile.as_mut() {
-            profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
-            profile.untracked_rows = untracked_count as u64;
-            profile.emit();
-        }
-        return Ok(Some(tracked_count + untracked_count));
-    }
-
+    let tracked_start = Instant::now();
+    let tracked_count = short_status_borrowed_tracked_only_head_matches_index_count_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        &borrowed,
+        &stat_cache,
+        sparse_checkout_active,
+        untracked_mode,
+    )?;
     if let Some(profile) = profile.as_mut() {
-        profile.overlap_enabled = true;
+        profile.tracked_elapsed_us = tracked_start.elapsed().as_micros();
     }
-    let (tracked_count, untracked_count, untracked_profile) =
-        std::thread::scope(|scope| -> Result<_> {
-            let tracked = spawn_status_worker(scope, "status-tracked", || {
-                let start = Instant::now();
-                short_status_borrowed_tracked_only_head_matches_index_count_parallel(
-                    worktree_root,
-                    git_dir,
-                    format,
-                    &borrowed,
-                    &stat_cache,
-                    sparse_checkout_active,
-                    untracked_mode,
-                )
-                .map(|count| (count, start.elapsed().as_micros()))
-            })?;
-            let untracked = spawn_status_worker(
-                scope,
-                "status-untracked",
-                || -> Result<(usize, StatusProfileCounters)> {
-                    let mut local_profile = StatusProfileCounters::default();
-                    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                    let start = Instant::now();
-                    let count = status_untracked_count_from_borrowed_index(
-                        worktree_root,
-                        git_dir,
-                        &borrowed,
-                        &mut ignores,
-                        untracked_mode,
-                        profile_enabled.then_some(&mut local_profile),
-                    )?;
-                    local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-                    local_profile.untracked_rows = count as u64;
-                    Ok((count, local_profile))
-                },
-            )?;
-            let (tracked_count, tracked_elapsed_us) = tracked
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
-            let (untracked_count, untracked_profile) = untracked
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
-            if let Some(profile) = profile.as_mut() {
-                profile.tracked_elapsed_us = tracked_elapsed_us;
-            }
-            Ok((
-                tracked_count,
-                untracked_count,
-                profile_enabled.then_some(untracked_profile),
-            ))
-        })?;
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    let untracked_start = Instant::now();
+    let untracked_count = status_untracked_count_from_borrowed_index(
+        worktree_root,
+        git_dir,
+        &borrowed,
+        &mut ignores,
+        untracked_mode,
+        profile.as_mut(),
+    )?;
     if let Some(profile) = profile.as_mut() {
-        if let Some(untracked_profile) = untracked_profile {
-            profile.merge_untracked(untracked_profile);
-        }
+        profile.untracked_elapsed_us = untracked_start.elapsed().as_micros();
+        profile.untracked_rows = untracked_count as u64;
         profile.emit();
     }
     Ok(Some(tracked_count + untracked_count))
@@ -6899,6 +6680,17 @@ pub fn standard_ignore_match(
     is_dir: bool,
 ) -> Result<Option<IgnoreMatch>> {
     let ignores = IgnoreMatcher::from_worktree_root(worktree_root.as_ref())?;
+    Ok(ignores.match_for(path, is_dir).map(IgnorePattern::to_match))
+}
+
+pub fn standard_ignore_match_for_path(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    is_dir: bool,
+) -> Result<Option<IgnoreMatch>> {
+    let root = worktree_root.as_ref();
+    let mut ignores = IgnoreMatcher::from_worktree_base(root)?;
+    read_per_directory_ignore_patterns_for_path(root, path, &mut ignores)?;
     Ok(ignores.match_for(path, is_dir).map(IgnorePattern::to_match))
 }
 
@@ -8689,63 +8481,6 @@ impl IgnorePatternBuckets {
         }
         truncate_indices(&mut self.other, len);
     }
-
-    fn profile_map_count(&self) -> usize {
-        self.literal_basename.len()
-            + self.directory_literal_basename.len()
-            + self.literal_path_basename.len()
-            + self.directory_literal_path_basename.len()
-            + self.path_suffix_basename.len()
-            + self.directory_path_suffix_basename.len()
-            + self.glob_path_literal_basename.len()
-            + self.glob_directory_literal_basename.len()
-            + self.suffix_basename.len()
-            + self.prefix_basename.len()
-    }
-
-    fn profile_index_count(&self) -> usize {
-        fn map_indices<K>(map: &HashMap<K, Vec<usize>>) -> usize {
-            map.values().map(Vec::len).sum()
-        }
-        map_indices(&self.literal_basename)
-            + map_indices(&self.directory_literal_basename)
-            + map_indices(&self.literal_path_basename)
-            + map_indices(&self.directory_literal_path_basename)
-            + map_indices(&self.path_suffix_basename)
-            + map_indices(&self.directory_path_suffix_basename)
-            + map_indices(&self.glob_path_literal_basename)
-            + map_indices(&self.glob_directory_literal_basename)
-            + self.glob_path_suffix_basename.len()
-            + self.glob_path_prefix_basename.len()
-            + self.glob_directory_suffix_basename.len()
-            + self.glob_directory_prefix_basename.len()
-            + map_indices(&self.suffix_basename)
-            + map_indices(&self.prefix_basename)
-            + self.other.len()
-    }
-
-    fn profile_index_vec_bytes(&self) -> usize {
-        fn map_bytes<K>(map: &HashMap<K, Vec<usize>>) -> usize {
-            map.values()
-                .map(|indices| indices.capacity() * std::mem::size_of::<usize>())
-                .sum()
-        }
-        map_bytes(&self.literal_basename)
-            + map_bytes(&self.directory_literal_basename)
-            + map_bytes(&self.literal_path_basename)
-            + map_bytes(&self.directory_literal_path_basename)
-            + map_bytes(&self.path_suffix_basename)
-            + map_bytes(&self.directory_path_suffix_basename)
-            + map_bytes(&self.glob_path_literal_basename)
-            + map_bytes(&self.glob_directory_literal_basename)
-            + self.glob_path_suffix_basename.capacity() * std::mem::size_of::<usize>()
-            + self.glob_path_prefix_basename.capacity() * std::mem::size_of::<usize>()
-            + self.glob_directory_suffix_basename.capacity() * std::mem::size_of::<usize>()
-            + self.glob_directory_prefix_basename.capacity() * std::mem::size_of::<usize>()
-            + map_bytes(&self.suffix_basename)
-            + map_bytes(&self.prefix_basename)
-            + self.other.capacity() * std::mem::size_of::<usize>()
-    }
 }
 
 #[derive(Debug)]
@@ -8871,40 +8606,6 @@ fn classify_ignore_pattern(pattern: &[u8]) -> MatchKind {
 }
 
 impl IgnoreMatcher {
-    fn emit_memory_profile(&self, label: &str) {
-        let pattern_payload_bytes = self
-            .patterns
-            .iter()
-            .map(|pattern| {
-                pattern.base.capacity()
-                    + pattern.pattern.capacity()
-                    + pattern.original.capacity()
-                    + pattern.source.capacity()
-            })
-            .sum();
-        status_profile_mem(
-            label,
-            &[
-                ("ignore_patterns_len", self.patterns.len()),
-                ("ignore_patterns_cap", self.patterns.capacity()),
-                (
-                    "ignore_pattern_struct_bytes",
-                    self.patterns.capacity() * std::mem::size_of::<IgnorePattern>(),
-                ),
-                ("ignore_pattern_payload_bytes", pattern_payload_bytes),
-                ("ignore_bucket_map_count", self.buckets.profile_map_count()),
-                (
-                    "ignore_bucket_index_count",
-                    self.buckets.profile_index_count(),
-                ),
-                (
-                    "ignore_bucket_index_vec_bytes",
-                    self.buckets.profile_index_vec_bytes(),
-                ),
-            ],
-        );
-    }
-
     fn from_sources(
         root: &Path,
         exclude_standard: bool,
@@ -10279,6 +9980,33 @@ fn read_dir_ignore_patterns_for_base(
     }
     source.extend_from_slice(b".gitignore");
     read_per_directory_ignore_patterns_into_matcher(dir.join(".gitignore"), matcher, base, &source)
+}
+
+fn read_per_directory_ignore_patterns_for_path(
+    root: &Path,
+    path: &[u8],
+    matcher: &mut IgnoreMatcher,
+) -> Result<()> {
+    let mut dir = root.to_path_buf();
+    let mut base = Vec::new();
+    read_dir_ignore_patterns_for_base(&dir, &base, matcher)?;
+
+    let mut components = path
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        dir.push(repo_path_to_os_path(component)?);
+        if !base.is_empty() {
+            base.push(b'/');
+        }
+        base.extend_from_slice(component);
+        read_dir_ignore_patterns_for_base(&dir, &base, matcher)?;
+    }
+    Ok(())
 }
 
 /// Fold `dir`'s `.gitattributes` (if any) into `matcher`, scoped to `dir`'s path
