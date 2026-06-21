@@ -1819,6 +1819,9 @@ fn update_index_paths_impl(
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
         let git_path = git_path_bytes(relative)?;
+        if index_sparse_dir_contains_path(&index, &git_path) {
+            expand_sparse_index(&mut index, &odb, format)?;
+        }
         let existing_range = index_entries_path_range(&index.entries, &git_path);
         if path_mode.force_remove {
             record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
@@ -1826,16 +1829,6 @@ fn update_index_paths_impl(
             untracked_cache_invalidation_paths.push(git_path.clone());
             // git's update_one() reports `remove` for a --force-remove path.
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
-            continue;
-        }
-        if !options.allow_skip_worktree_entries
-            && index.entries[existing_range.clone()]
-                .iter()
-                .any(index_entry_skip_worktree)
-        {
-            if path_mode.remove && !options.ignore_skip_worktree_entries {
-                index.entries.drain(existing_range);
-            }
             continue;
         }
         // lstat (not stat): a symlink must be inspected as the link itself, never
@@ -1863,6 +1856,21 @@ fn update_index_paths_impl(
             }
             Err(err) => return Err(err.into()),
         };
+        if !options.allow_skip_worktree_entries
+            && index.entries[existing_range.clone()]
+                .iter()
+                .any(index_entry_skip_worktree)
+        {
+            if path_mode.remove {
+                if !options.ignore_skip_worktree_entries {
+                    index.entries.drain(existing_range);
+                }
+                continue;
+            }
+            if symlink_metadata.is_none() {
+                continue;
+            }
+        }
         let Some(metadata) = symlink_metadata else {
             if path_mode.remove {
                 record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
@@ -14726,6 +14734,14 @@ pub fn expand_sparse_index(
     normalize_index_version_for_extended_flags(index);
     sley_core::trace2::region("index", "ensure_full_index");
     Ok(true)
+}
+
+fn index_sparse_dir_contains_path(index: &Index, git_path: &[u8]) -> bool {
+    index.entries.iter().any(|entry| {
+        entry.is_sparse_dir()
+            && git_path.starts_with(entry.path.as_bytes())
+            && git_path.len() > entry.path.len()
+    })
 }
 
 /// Builds a minimal index entry for an expanded sparse blob: zeroed stat fields
