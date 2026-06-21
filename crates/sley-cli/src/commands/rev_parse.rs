@@ -171,6 +171,12 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--is-bare-repository" => println!("{}", is_bare_repository(&git_dir)?),
             "--is-shallow-repository" => println!("{}", is_shallow_repository(&git_dir)),
             "--short" => short = repository_abbrev(&git_dir, format)?,
+            value if value.starts_with("--disambiguate=") && !verify => {
+                let prefix = &value["--disambiguate=".len()..];
+                for oid in sley_rev::object_ids_with_prefix(&git_dir, format, prefix)? {
+                    println!("{}", oid.to_hex());
+                }
+            }
             "--default" => {
                 idx += 1;
                 default_rev = Some(
@@ -279,7 +285,8 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                         eprintln!("fatal: {}", rev_parse_error_message(&err));
                         return Err(GitError::Exit(128));
                     }
-                    Err(_) if verify => {
+                    Err(err) if verify => {
+                        rev_parse_maybe_print_ambiguity(&git_dir, format, &normalized_rev, &err)?;
                         return rev_parse_needed_single_revision(false);
                     }
                     Err(err) => {
@@ -369,8 +376,8 @@ fn rev_parse_render_range(
     }
     let left = if left.is_empty() { "HEAD" } else { left };
     let right = if right.is_empty() { "HEAD" } else { right };
-    let left_oid = resolve_revision(git_dir, format, left)?;
-    let right_oid = resolve_revision(git_dir, format, right)?;
+    let left_oid = rev_parse_resolve_commitish(git_dir, format, left)?;
+    let right_oid = rev_parse_resolve_commitish(git_dir, format, right)?;
     let mut out = Vec::new();
     if symmetric {
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -394,6 +401,26 @@ fn rev_parse_render_range(
         out.push(format!("^{}", left_oid.to_hex()));
     }
     Ok(Some(out))
+}
+
+fn rev_parse_resolve_commitish(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<ObjectId> {
+    if rev.len() >= 4
+        && rev.len() < format.hex_len()
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return sley_rev::resolve_short_object_id(
+            git_dir,
+            format,
+            rev,
+            sley_rev::ObjectDisambiguation::Commitish,
+        )?
+        .into_result(rev);
+    }
+    resolve_revision(git_dir, format, rev)
 }
 
 fn rev_parse_split_range(rev: &str) -> Option<(&str, &str, bool)> {
@@ -516,8 +543,76 @@ fn rev_parse_diagnose_arg_failure(
         eprintln!("fatal: {}", rev_parse_error_message(&err));
         return Err(GitError::Exit(128));
     }
+    rev_parse_maybe_print_ambiguity(git_dir, format, normalized_rev, &err)?;
     println!("{rev}");
     Err(sley_rev::ambiguous_argument_error(rev))
+}
+
+fn rev_parse_maybe_print_ambiguity(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    err: &GitError,
+) -> Result<()> {
+    let Some((prefix, disambiguation)) = rev_parse_ambiguity_context(format, rev, err) else {
+        return Ok(());
+    };
+    eprintln!("error: short object ID {prefix} is ambiguous");
+    let hints = sley_rev::ambiguous_short_object_id_hint(git_dir, format, &prefix, disambiguation)?;
+    if !hints.is_empty() {
+        eprintln!("hint: The candidates are:");
+        for hint in hints {
+            eprintln!("hint:   {hint}");
+        }
+    }
+    Ok(())
+}
+
+fn rev_parse_ambiguity_context(
+    format: ObjectFormat,
+    rev: &str,
+    err: &GitError,
+) -> Option<(String, sley_rev::ObjectDisambiguation)> {
+    if !sley_rev::is_short_object_id_ambiguous_error(err) {
+        return None;
+    }
+    let GitError::InvalidObjectId(message) = err else {
+        return None;
+    };
+    let prefix = message
+        .strip_prefix("short object ID ")?
+        .strip_suffix(" is ambiguous")?;
+    let disambiguation = rev_parse_disambiguation_for_rev(rev, prefix);
+    Some((prefix.to_string(), disambiguation))
+}
+
+fn rev_parse_disambiguation_for_rev(rev: &str, prefix: &str) -> sley_rev::ObjectDisambiguation {
+    if let Some((base, _)) = sley_rev::split_rev_path_spec(rev)
+        && base == prefix
+    {
+        return sley_rev::ObjectDisambiguation::Treeish;
+    }
+    if rev == prefix {
+        return sley_rev::ObjectDisambiguation::Any;
+    }
+    if rev == format!("{prefix}^0")
+        || rev == format!("{prefix}^")
+        || rev.starts_with(&format!("{prefix}~"))
+        || rev.starts_with(&format!("{prefix}^{{/"))
+        || rev.starts_with(&format!("{prefix}^{{commit}}"))
+    {
+        return sley_rev::ObjectDisambiguation::Commitish;
+    }
+    if rev.starts_with(&format!("{prefix}^{{tree}}")) {
+        return sley_rev::ObjectDisambiguation::Treeish;
+    }
+    if rev.starts_with(&format!("{prefix}^{{blob}}")) {
+        return sley_rev::ObjectDisambiguation::Blob;
+    }
+    if rev.starts_with(&format!("{prefix}^{{tag}}")) {
+        return sley_rev::ObjectDisambiguation::Tag;
+    }
+    sley_rev::ObjectDisambiguation::Any
 }
 
 fn rev_parse_tree_path_error(
