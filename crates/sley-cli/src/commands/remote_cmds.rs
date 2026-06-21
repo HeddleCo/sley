@@ -1035,6 +1035,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     )?;
     let git_dir = outcome.git_dir;
     if local_source {
+        copy_local_loose_objects(&source_alternates_git_dir, &git_dir, format)?;
         copy_local_commit_graph_metadata(&source_alternates_git_dir, &git_dir)?;
     }
     if outcome.empty {
@@ -2228,6 +2229,62 @@ fn copy_local_revision_objects(
         std::iter::once(*revision_oid),
     )
     .map(|_| ())
+}
+
+fn copy_local_loose_objects(
+    remote_git_dir: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let source_objects = repository_objects_dir(remote_git_dir);
+    let destination_objects = repository_objects_dir(git_dir);
+    let destination_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let hex_len = format.hex_len();
+    let Ok(entries) = fs::read_dir(&source_objects) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let fanout = entry.file_name();
+        let Some(fanout) = fanout.to_str() else {
+            continue;
+        };
+        if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let destination_fanout = destination_objects.join(fanout);
+        for object_entry in fs::read_dir(entry.path())? {
+            let object_entry = object_entry?;
+            if !object_entry.file_type()?.is_file() {
+                continue;
+            }
+            let suffix = object_entry.file_name();
+            let Some(suffix) = suffix.to_str() else {
+                continue;
+            };
+            if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let oid = ObjectId::from_hex(format, &format!("{fanout}{suffix}"))?;
+            if destination_db.contains(&oid)? {
+                continue;
+            }
+            fs::create_dir_all(&destination_fanout)?;
+            let destination = destination_fanout.join(suffix);
+            if !destination.exists() {
+                let source = object_entry.path();
+                let metadata = fs::metadata(&source)?;
+                fs::copy(&source, &destination)?;
+                let accessed = filetime::FileTime::from_last_access_time(&metadata);
+                let modified = filetime::FileTime::from_last_modification_time(&metadata);
+                filetime::set_file_times(&destination, accessed, modified)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_local_commit_graph_metadata(remote_git_dir: &Path, git_dir: &Path) -> Result<()> {

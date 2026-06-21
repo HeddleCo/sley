@@ -1573,6 +1573,12 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
         if let Some(spec) = prune_expire.as_deref() {
             let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
             gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
+        } else {
+            let expire = parse_prune_expire(
+                config.get("gc", None, "pruneExpire").unwrap_or("2.weeks.ago"),
+                "gc.pruneExpire",
+            )?;
+            gc_pack_recent_unreachable_loose(&common_git_dir, format, &roots, expire)?;
         }
     }
 
@@ -1581,6 +1587,7 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     if auto && store.uses_reftable()? && store.reftable_table_count()? > 2 {
         store.compact_reftable_stack()?;
     }
+    gc_clean_pack_garbage(&repository_objects_dir(&common_git_dir).join("pack"))?;
 
     let _ = quiet;
     Ok(())
@@ -3445,25 +3452,95 @@ fn count_pack_objects(
     if !pack_dir.exists() {
         return Ok(pack_indexes);
     }
+    let display_root = pack_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .unwrap_or(pack_dir);
+    let mut stems: BTreeMap<String, CountPackStem> = BTreeMap::new();
     for entry in fs::read_dir(pack_dir)? {
         let entry = entry?;
         let path = entry.path();
         let metadata = entry.metadata()?;
-        if path.extension().and_then(|ext| ext.to_str()) == Some("pack") {
-            stats.packs += 1;
-            stats.size_pack_bytes += metadata.len();
+        if !metadata.is_file() {
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
-            let summary = count_pack_index_summary(&path, &metadata, format)?;
-            if let Some(summary) = summary {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("")
+            .to_string();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("pack") => {
+                stats.packs += 1;
                 stats.size_pack_bytes += metadata.len();
-                stats.in_pack += u64::from(summary.object_count);
-                pack_indexes.push(summary);
+                stems.entry(stem).or_default().pack = Some(path);
             }
+            Some("idx") => {
+                let summary = count_pack_index_summary(&path, &metadata, format)?;
+                if let Some(summary) = summary {
+                    stats.size_pack_bytes += metadata.len();
+                    stats.in_pack += u64::from(summary.object_count);
+                    pack_indexes.push(summary);
+                }
+                stems.entry(stem).or_default().idx = Some(path);
+            }
+            Some("keep") => {
+                stems.entry(stem).or_default().keep = Some(path);
+            }
+            Some("rev" | "bitmap" | "mtimes" | "promisor") => {}
+            _ => count_pack_garbage(&path, &metadata, display_root, stats),
+        }
+    }
+    for stem in stems.values() {
+        match (&stem.pack, &stem.idx, &stem.keep) {
+            (Some(pack), None, Some(keep)) => {
+                count_pack_correspondence_warning("no corresponding .idx", keep, display_root);
+                count_pack_correspondence_warning("no corresponding .idx", pack, display_root);
+            }
+            (Some(pack), None, None) => {
+                count_pack_correspondence_warning("no corresponding .idx", pack, display_root);
+            }
+            (None, Some(idx), Some(keep)) => {
+                count_pack_correspondence_warning("no corresponding .pack", idx, display_root);
+                count_pack_correspondence_warning("no corresponding .pack", keep, display_root);
+            }
+            (None, Some(idx), None) => {
+                count_pack_correspondence_warning("no corresponding .pack", idx, display_root);
+            }
+            (None, None, Some(keep)) => {
+                count_pack_correspondence_warning(
+                    "no corresponding .idx or .pack",
+                    keep,
+                    display_root,
+                );
+            }
+            _ => {}
         }
     }
     Ok(pack_indexes)
+}
+
+#[derive(Debug, Default)]
+struct CountPackStem {
+    pack: Option<PathBuf>,
+    idx: Option<PathBuf>,
+    keep: Option<PathBuf>,
+}
+
+fn count_pack_garbage(
+    path: &Path,
+    _metadata: &fs::Metadata,
+    display_root: &Path,
+    _stats: &mut CountObjectsStats,
+) {
+    let display_path = path.strip_prefix(display_root).unwrap_or(path);
+    eprintln!("warning: garbage found: {}", display_path.display());
+}
+
+fn count_pack_correspondence_warning(message: &str, path: &Path, display_root: &Path) {
+    let display_path = path.strip_prefix(display_root).unwrap_or(path);
+    eprintln!("warning: {message}: {}", display_path.display());
 }
 
 #[derive(Debug, Clone)]
@@ -3605,6 +3682,10 @@ fn count_pack_index_summary(
         256 * 4
     };
     if len < prefix_len {
+        eprintln!(
+            "error: index file {} is too small",
+            count_pack_display_path(path).display()
+        );
         return Ok(None);
     }
     let mut file = fs::File::open(path)?;
@@ -3633,6 +3714,16 @@ fn count_pack_index_has_v2_magic(path: &Path) -> Result<bool> {
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(err) => Err(err.into()),
     }
+}
+
+fn count_pack_display_path(path: &Path) -> &Path {
+    let display_root = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new(""));
+    path.strip_prefix(display_root).unwrap_or(path)
 }
 
 fn load_count_pack_index_lookups(
@@ -4153,6 +4244,96 @@ fn gc_prune_expired_loose(
     prune_packed_loose_objects(common_git_dir, format, false)?;
     prune_empty_loose_object_dirs(&common_git_dir.join("objects"))?;
     Ok(())
+}
+
+fn gc_pack_recent_unreachable_loose(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    expire: i64,
+) -> Result<()> {
+    if expire <= i64::MIN {
+        return Ok(());
+    }
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut objects = Vec::new();
+    for oid in prune_unreachable_loose(common_git_dir, format, roots.to_vec(), false)? {
+        if prune_object_is_expired(&db, &oid, expire)? {
+            continue;
+        }
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => continue,
+        };
+        objects.push((oid, object));
+    }
+    if objects.is_empty() {
+        return Ok(());
+    }
+
+    let inputs: Vec<_> = objects
+        .iter()
+        .map(|(oid, object)| PackInput {
+            oid,
+            object: object.as_ref(),
+        })
+        .collect();
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let _install = db.install_written_pack(&written)?;
+    for (oid, _) in objects {
+        let path = db.loose().object_path(&oid)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+    }
+    prune_empty_loose_object_dirs(&common_git_dir.join("objects"))?;
+    Ok(())
+}
+
+fn gc_clean_pack_garbage(pack_dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return Ok(());
+    };
+    let mut stems: BTreeMap<String, CountPackStem> = BTreeMap::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let stem = stem.to_string();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("pack") => stems.entry(stem).or_default().pack = Some(path),
+            Some("idx") => stems.entry(stem).or_default().idx = Some(path),
+            Some("keep") => stems.entry(stem).or_default().keep = Some(path),
+            _ => {}
+        }
+    }
+    for stem in stems.values() {
+        if stem.pack.is_some() {
+            continue;
+        }
+        if let Some(idx) = &stem.idx {
+            remove_pack_garbage_file(idx)?;
+            if let Some(keep) = &stem.keep {
+                remove_pack_garbage_file(keep)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_pack_garbage_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(GitError::Io(err.to_string())),
+    }
 }
 
 fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: i64) -> Result<bool> {
