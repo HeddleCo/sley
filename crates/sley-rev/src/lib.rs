@@ -756,12 +756,10 @@ fn resolve_describe_name(
             if hex.len() >= 4
                 && hex.len() < format.hex_len()
                 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                if let ShortObjectIdResolution::Unique(oid) =
+                && let ShortObjectIdResolution::Unique(oid) =
                     resolve_short_object_id(git_dir, format, hex, ObjectDisambiguation::Commit)?
-                {
-                    return Ok(Some(oid));
-                }
+            {
+                return Ok(Some(oid));
             }
         }
         break;
