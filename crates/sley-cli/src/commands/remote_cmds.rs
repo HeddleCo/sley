@@ -3418,7 +3418,14 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
     if req.recurse_submodules == FetchRecurseSubmodules::Off {
         return Ok(());
     }
-    let submodules = crate::commands::submodule::read_submodule_configs(req.worktree_root)?;
+    let mut submodules = crate::commands::submodule::read_submodule_configs(req.worktree_root)?;
+    if req.worktree_root.is_dir() {
+        submodules.extend(crate::commands::submodule::index_gitlink_submodule_configs(
+            req.git_dir,
+            req.format,
+            &submodules,
+        )?);
+    }
     if submodules.is_empty() && req.changed_gitlinks.is_empty() {
         return Ok(());
     }
@@ -3437,34 +3444,36 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             &submodule,
             req.recurse_submodules,
         );
+        let submodule_root = req.worktree_root.join(&submodule.path);
+        let Some(sub_git_dir) =
+            resolve_submodule_git_dir(req.git_dir, &submodule_root, &submodule.path)
+        else {
+            continue;
+        };
+        let sub_format = repository_object_format(&sub_git_dir)?;
+        let changed_for_path = req
+            .changed_gitlinks
+            .iter()
+            .filter(|changed| changed.path == submodule.path)
+            .collect::<Vec<_>>();
         let should_fetch = match mode {
             FetchRecurseSubmodules::On => true,
-            FetchRecurseSubmodules::OnDemand => req
-                .changed_gitlinks
+            FetchRecurseSubmodules::OnDemand => changed_for_path
                 .iter()
-                .any(|changed| changed.path == submodule.path),
-            FetchRecurseSubmodules::Default => {
-                match req.default_recurse_submodules {
-                    FetchRecurseSubmodules::On => true,
-                    FetchRecurseSubmodules::OnDemand => {
-                        req.changed_gitlinks
-                            .iter()
-                            .any(|changed| changed.path == submodule.path)
-                    }
-                    FetchRecurseSubmodules::Default | FetchRecurseSubmodules::Off => false,
-                }
-            }
+                .any(|changed| !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid)),
+            FetchRecurseSubmodules::Default => match req.default_recurse_submodules {
+                FetchRecurseSubmodules::On => true,
+                FetchRecurseSubmodules::OnDemand => changed_for_path
+                    .iter()
+                    .any(|changed| !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid)),
+                FetchRecurseSubmodules::Default | FetchRecurseSubmodules::Off => false,
+            },
             FetchRecurseSubmodules::Off => false,
         };
         if !should_fetch {
             continue;
         }
         seen_submodules.insert(submodule.path.clone());
-        let submodule_root = req.worktree_root.join(&submodule.path);
-        let Some(sub_git_dir) = resolve_submodule_git_dir(req.git_dir, &submodule_root, &submodule.path) else {
-            continue;
-        };
-        let sub_format = repository_object_format(&sub_git_dir)?;
         let sub_source = default_fetch_remote(&sub_git_dir, sub_format)?;
         if !req.options.quiet {
             eprintln!(
@@ -3475,7 +3484,12 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
         let mut sub_options = req.options.clone();
         sub_options.merge_srcs =
             current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
-        let _guard = CurrentDirGuard::enter(&submodule_root)?;
+        let fetch_cwd = if submodule_root.is_dir() {
+            submodule_root.as_path()
+        } else {
+            sub_git_dir.as_path()
+        };
+        let _guard = CurrentDirGuard::enter(fetch_cwd)?;
         let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
         let outcome = fetch_one_source_with_outcome(
             &sub_git_dir,
@@ -7126,9 +7140,15 @@ fn print_fetch_status(
         return Ok(());
     }
     let source = sley_remote::fetch_head_source_description(config, source);
+    let src_width = rows
+        .iter()
+        .map(|(_, src, _)| src.len())
+        .max()
+        .unwrap_or(0)
+        .max(10);
     eprintln!("From {source}");
     for (summary, src, dst) in rows {
-        eprintln!("   {summary:<16}  {src:<10} -> {dst}");
+        eprintln!("   {summary:<16}  {src:<src_width$} -> {dst}");
     }
     Ok(())
 }

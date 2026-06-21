@@ -3081,6 +3081,39 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
     Ok(submodules)
 }
 
+pub(crate) fn index_gitlink_submodule_configs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    configured: &[SubmoduleConfigEntry],
+) -> Result<Vec<SubmoduleConfigEntry>> {
+    let Some(index) = read_repository_index(git_dir, format)? else {
+        return Ok(Vec::new());
+    };
+    let configured_paths = configured
+        .iter()
+        .map(|submodule| submodule.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut submodules = Vec::new();
+    for entry in index.entries {
+        if !sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        let Ok(path) = String::from_utf8(entry.path.to_vec()) else {
+            continue;
+        };
+        if configured_paths.contains(path.as_str()) {
+            continue;
+        }
+        submodules.push(SubmoduleConfigEntry {
+            name: path.clone(),
+            path,
+            url: None,
+            update: None,
+        });
+    }
+    Ok(submodules)
+}
+
 /// Re-stringify a typed update strategy back to the raw `.gitmodules` value the
 /// init path copies into `.git/config`. `Unspecified` (never set, or an
 /// invalid value the typed parser rejected) maps to `None`, matching the old
