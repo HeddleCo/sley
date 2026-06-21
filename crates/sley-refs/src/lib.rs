@@ -107,7 +107,11 @@ pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u
     let target = if let Some(symbolic) = value.strip_prefix("ref: ") {
         RefTarget::Symbolic(symbolic.to_string())
     } else {
-        RefTarget::Direct(ObjectId::from_hex(format, value)?)
+        RefTarget::Direct(ObjectId::from_hex(format, value).map_err(|_| {
+            GitError::InvalidFormat(format!(
+                "reference {name} has neither a valid OID nor a target"
+            ))
+        })?)
     };
     Ok(Ref { name, target })
 }

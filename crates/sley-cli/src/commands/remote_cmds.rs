@@ -66,6 +66,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut separate_git_dir = None::<String>;
     let mut depth = None::<u32>;
     let mut local = None::<bool>;
+    let mut no_hardlinks = false;
+    let mut upload_pack = None::<String>;
     let mut deepen_since = None::<i64>;
     let mut deepen_not = Vec::<String>::new();
     let mut server_options = Vec::<String>::new();
@@ -298,7 +300,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             "-6" | "--ipv6" => ssh_ip_version = Some(sley_transport::SshIpVersion::V6),
             "-l" | "--local" => local = Some(true),
             "--no-local" => local = Some(false),
-            "--hardlinks" | "--no-hardlinks" => {}
+            "--hardlinks" => no_hardlinks = false,
+            "--no-hardlinks" => no_hardlinks = true,
             "--no-ref-format" => ref_storage = RefStorageFormat::Files,
             "--ref-format" => {
                 let value = iter.next().ok_or_else(|| {
@@ -336,6 +339,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                         "clone --upload-pack requires a value".into(),
                     ));
                 }
+                upload_pack = Some(value.to_string());
             }
             value if value.starts_with("--upload-pack=") => {
                 let value = value.strip_prefix("--upload-pack=").ok_or_else(|| {
@@ -346,9 +350,19 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                         "clone --upload-pack requires a value".into(),
                     ));
                 }
+                upload_pack = Some(value.to_string());
             }
-            value if value.starts_with("-u") && !value.starts_with("--") && value.len() > 2 => {}
-            "--no-upload-pack" => {}
+            value if value.starts_with("-u") && !value.starts_with("--") && value.len() > 2 => {
+                upload_pack = Some(
+                    value
+                        .strip_prefix("-u")
+                        .ok_or_else(|| {
+                            GitError::Command("clone --upload-pack requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            "--no-upload-pack" => upload_pack = None,
             "--server-option" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --server-option requires a value".into())
@@ -547,13 +561,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // inside the destination — cannot re-anchor a relative source like ".".
     // It does not resolve symlinks in that spelling, so `/var/...` must stay
     // `/var/...` instead of becoming `/private/var/...` on macOS.
-    let repository = if Path::new(&repository).is_dir() {
-        resolve_cli_path(&cwd, &repository)
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        repository
-    };
+    let repository = absolutize_local_clone_source(&cwd, &repository);
     let transport_config = transport_policy_config_for_cwd()?;
     if !server_options_from_cli {
         server_options = configured_server_options(&transport_config, &origin)?;
@@ -707,6 +715,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let remote_git_dir = ls_remote_git_dir(&repository)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
+    if upload_pack.as_deref() == Some("false") {
+        return Err(GitError::Exit(128));
+    }
     // `--branch=<name>` may name a tag rather than a branch; git then checks the
     // tag's commit out with a detached HEAD (`our_head_points_at` is a tag ⇒
     // detach in builtin/clone.c). Detect that here so the clone routes through
@@ -724,7 +735,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         // the clone checks the commit out detached.
         (Some(_), _) if branch_tag_oid.is_some() => String::new(),
         (Some(_), None) => String::new(),
-        _ => remote_head_branch(&remote_common_git_dir, format)?,
+        _ => clone_remote_head_branch(&remote_common_git_dir, format)?.unwrap_or_default(),
     };
     let alternates = clone_alternates(&remote_git_dir, shared, &reference_alternates)?;
     let source_alternates_git_dir = remote_common_git_dir.clone();
@@ -733,7 +744,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         .map(|rev| resolve_revision(&remote_common_git_dir, format, rev))
         .transpose()?;
     let branch_explicit = branch.is_some();
-    let checkout_branch = branch.unwrap_or_else(|| remote_head_branch.clone());
+    let checkout_branch = branch.unwrap_or_else(|| {
+        if remote_head_branch.is_empty() {
+            clone_default_branch_name()
+        } else {
+            remote_head_branch.clone()
+        }
+    });
     // git only treats a clone as "local" (hardlink/copy mechanism, shallow
     // options warned-and-ignored) when the source resolves as a plain path and
     // `--no-local` was not given: `is_local = option_local != 0 && path &&
@@ -828,6 +845,22 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         && parse_remote_url(&repository)
             .map(|url| url.transport == RemoteTransport::Local)
             .unwrap_or(false);
+    if local == Some(true) && !local_source {
+        eprintln!("warning: --local is ignored");
+    }
+    let local_object_install = if local_source {
+        if shared {
+            LocalObjectInstall::Shared
+        } else if no_hardlinks {
+            LocalObjectInstall::Copy
+        } else {
+            LocalObjectInstall::Hardlink {
+                required: local == Some(true),
+            }
+        }
+    } else {
+        LocalObjectInstall::Transport
+    };
     if parse_remote_url(&repository)
         .map(|url| url.transport == RemoteTransport::File)
         .unwrap_or(false)
@@ -864,6 +897,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 bundle_uri: bundle_uri.as_ref(),
                 alternates: &alternates,
                 copy_source_alternates: local_source,
+                local_object_install,
                 dissociate,
                 config_overrides: &config_overrides,
                 submodule_active: &submodule_active,
@@ -1035,8 +1069,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     )?;
     let git_dir = outcome.git_dir;
     if local_source {
-        copy_local_loose_objects(&source_alternates_git_dir, &git_dir, format)?;
-        copy_local_commit_graph_metadata(&source_alternates_git_dir, &git_dir)?;
+        install_local_clone_objects(&source_alternates_git_dir, &git_dir, local_object_install)?;
     }
     if outcome.empty {
         warn_cloned_empty_repository();
@@ -1145,6 +1178,26 @@ fn clone_default_branch_name() -> String {
         return name;
     }
     "master".to_string()
+}
+
+fn absolutize_local_clone_source(cwd: &Path, repository: &str) -> String {
+    let Ok(parsed) = parse_remote_url(repository) else {
+        return repository.to_string();
+    };
+    if parsed.transport != RemoteTransport::Local {
+        return repository.to_string();
+    }
+    let path = PathBuf::from(&parsed.path);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    if local_repository_git_dir_path(&absolute).is_ok() {
+        absolute.to_string_lossy().into_owned()
+    } else {
+        repository.to_string()
+    }
 }
 
 /// Clone a repository over smart HTTP(S). Covers the common non-bare case;
@@ -1859,9 +1912,18 @@ struct CloneLocalOptions<'a> {
     bundle_uri: Option<&'a CloneBundleUri>,
     alternates: &'a [PathBuf],
     copy_source_alternates: bool,
+    local_object_install: LocalObjectInstall,
     dissociate: bool,
     config_overrides: &'a [GlobalConfigOverride],
     submodule_active: &'a [String],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalObjectInstall {
+    Hardlink { required: bool },
+    Copy,
+    Shared,
+    Transport,
 }
 
 fn clone_bare_or_mirror_local_repository(
@@ -1986,6 +2048,14 @@ fn clone_bare_or_mirror_local_repository(
     );
     env::set_current_dir(previous_cwd)?;
     fetch_result?;
+    if options.copy_source_alternates {
+        let source_git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?;
+        install_local_clone_objects(
+            &source_git_dir,
+            &git_dir,
+            options.local_object_install,
+        )?;
+    }
     // For a detached-HEAD source, point the destination HEAD directly at the
     // source's detached commit (it was just copied by the mirror/branch fetch),
     // matching git's `update_head` detached arm.
@@ -2231,82 +2301,132 @@ fn copy_local_revision_objects(
     .map(|_| ())
 }
 
-fn copy_local_loose_objects(
+fn install_local_clone_objects(
     remote_git_dir: &Path,
     git_dir: &Path,
-    format: ObjectFormat,
+    mode: LocalObjectInstall,
 ) -> Result<()> {
+    match mode {
+        LocalObjectInstall::Transport => return Ok(()),
+        LocalObjectInstall::Shared => {
+            clear_local_clone_object_files(&repository_objects_dir(git_dir))?;
+            return Ok(());
+        }
+        LocalObjectInstall::Hardlink { .. } | LocalObjectInstall::Copy => {}
+    }
+
     let source_objects = repository_objects_dir(remote_git_dir);
     let destination_objects = repository_objects_dir(git_dir);
-    let destination_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let hex_len = format.hex_len();
-    let Ok(entries) = fs::read_dir(&source_objects) else {
+    if fs::symlink_metadata(&source_objects)?.file_type().is_symlink() {
+        eprintln!(
+            "fatal: '{}' is a symlink, refusing to clone with --local",
+            source_objects.display()
+        );
+        return Err(GitError::Exit(128));
+    }
+    clear_local_clone_object_files(&destination_objects)?;
+    fs::create_dir_all(&destination_objects)?;
+
+    let mut hardlink = matches!(mode, LocalObjectInstall::Hardlink { .. });
+    copy_or_link_local_object_directory(
+        &source_objects,
+        &destination_objects,
+        Path::new(""),
+        mode,
+        &mut hardlink,
+    )
+}
+
+fn clear_local_clone_object_files(objects_dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(objects_dir) else {
         return Ok(());
     };
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let fanout = entry.file_name();
-        let Some(fanout) = fanout.to_str() else {
-            continue;
-        };
-        if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        let destination_fanout = destination_objects.join(fanout);
-        for object_entry in fs::read_dir(entry.path())? {
-            let object_entry = object_entry?;
-            if !object_entry.file_type()?.is_file() {
-                continue;
-            }
-            let suffix = object_entry.file_name();
-            let Some(suffix) = suffix.to_str() else {
-                continue;
-            };
-            if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                continue;
-            }
-            let oid = ObjectId::from_hex(format, &format!("{fanout}{suffix}"))?;
-            if destination_db.contains(&oid)? {
-                continue;
-            }
-            fs::create_dir_all(&destination_fanout)?;
-            let destination = destination_fanout.join(suffix);
-            if !destination.exists() {
-                let source = object_entry.path();
-                let metadata = fs::metadata(&source)?;
-                fs::copy(&source, &destination)?;
-                let accessed = filetime::FileTime::from_last_access_time(&metadata);
-                let modified = filetime::FileTime::from_last_modification_time(&metadata);
-                filetime::set_file_times(&destination, accessed, modified)?;
-            }
+        let path = entry.path();
+        if entry.file_name() == "info" {
+            clear_local_clone_info_dir(&path)?;
+        } else if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
         }
     }
     Ok(())
 }
 
-fn copy_local_commit_graph_metadata(remote_git_dir: &Path, git_dir: &Path) -> Result<()> {
-    let source_info = repository_objects_dir(remote_git_dir).join("info");
-    let destination_info = repository_objects_dir(git_dir).join("info");
-    let source_single = source_info.join("commit-graph");
-    if source_single.exists() {
-        fs::create_dir_all(&destination_info)?;
-        fs::copy(&source_single, destination_info.join("commit-graph"))?;
-    }
-    let source_split = source_info.join("commit-graphs");
-    if !source_split.is_dir() {
+fn clear_local_clone_info_dir(info_dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(info_dir) else {
         return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name() == "alternates" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
     }
-    let destination_split = destination_info.join("commit-graphs");
-    fs::create_dir_all(&destination_split)?;
-    for entry in fs::read_dir(source_split)? {
+    Ok(())
+}
+
+fn copy_or_link_local_object_directory(
+    source_dir: &Path,
+    destination_dir: &Path,
+    relative: &Path,
+    mode: LocalObjectInstall,
+    hardlink: &mut bool,
+) -> Result<()> {
+    for entry in fs::read_dir(source_dir)? {
         let entry = entry?;
         let source = entry.path();
-        if source.is_file() {
-            fs::copy(&source, destination_split.join(entry.file_name()))?;
+        let entry_relative = relative.join(entry.file_name());
+        let destination = destination_dir.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() {
+            eprintln!(
+                "fatal: symlink '{}' exists, refusing to clone with --local",
+                entry_relative.display()
+            );
+            return Err(GitError::Exit(128));
         }
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination)?;
+            copy_or_link_local_object_directory(
+                &source,
+                &destination,
+                &entry_relative,
+                mode,
+                hardlink,
+            )?;
+            continue;
+        }
+        if entry_relative == Path::new("info/alternates") {
+            continue;
+        }
+        if destination.exists() {
+            fs::remove_file(&destination)?;
+        }
+        if *hardlink {
+            match fs::hard_link(&source, &destination) {
+                Ok(()) => continue,
+                Err(err) if matches!(mode, LocalObjectInstall::Hardlink { required: true }) => {
+                    return Err(GitError::Io(format!(
+                        "failed to create link '{}': {err}",
+                        destination.display()
+                    )));
+                }
+                Err(_) => *hardlink = false,
+            }
+        }
+        fs::copy(&source, &destination)?;
+        let accessed = filetime::FileTime::from_last_access_time(&metadata);
+        let modified = filetime::FileTime::from_last_modification_time(&metadata);
+        filetime::set_file_times(&destination, accessed, modified)?;
     }
     Ok(())
 }
@@ -2795,6 +2915,21 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
         Some(RefTarget::Direct(_)) | None => {
             Err(GitError::reference_not_found("remote HEAD branch"))
         }
+    }
+}
+
+fn clone_remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Option<String>> {
+    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let Some(RefTarget::Symbolic(target)) = remote_store.read_ref("HEAD")? else {
+        return Ok(None);
+    };
+    let Some(branch) = target.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    if remote_store.read_ref(&target)?.is_some() {
+        Ok(Some(branch.to_string()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -7349,6 +7484,20 @@ fn maybe_set_remote_head_on_fetch(
     let Some(head_name) = head_symref.strip_prefix("refs/heads/") else {
         return Ok(());
     };
+    if !outcome
+        .ref_updates
+        .iter()
+        .any(|update| update.src == head_symref)
+    {
+        return Ok(());
+    }
+    if let Ok(remote_git_dir) = local_remote_git_dir(config, source, git_dir) {
+        let remote_format = repository_object_format(&remote_git_dir)?;
+        let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
+        if remote_store.read_ref(head_symref)?.is_none() {
+            return Ok(());
+        }
+    }
     let store = FileRefStore::new(git_dir, format);
     let head_ref = format!("refs/remotes/{source}/HEAD");
     let target = format!("refs/remotes/{source}/{head_name}");
@@ -8250,8 +8399,7 @@ fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
 pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let cwd = env::current_dir()?;
     if let Ok(path) = ls_remote_repository_path(repository, &cwd)
-        && path.exists()
-        && let Ok(git_dir) = discover_remote_git_dir(path)
+        && let Ok(git_dir) = local_repository_git_dir_path(&path)
     {
         return Ok(git_dir);
     }
@@ -8260,12 +8408,44 @@ pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let rewritten = rewrite_url_with_config(&config, repository, false);
     if rewritten != repository
         && let Ok(path) = ls_remote_repository_path(&rewritten, &cwd)
-        && path.exists()
-        && let Ok(git_dir) = discover_remote_git_dir(path)
+        && let Ok(git_dir) = local_repository_git_dir_path(&path)
     {
         return Ok(git_dir);
     }
     local_remote_git_dir(&config, repository, &local_git_dir)
+}
+
+fn local_repository_git_dir_path(path: &Path) -> Result<PathBuf> {
+    let dot_git_path = path_with_dot_git_suffix(path);
+    let candidates = [
+        path.join(".git"),
+        path.to_path_buf(),
+        dot_git_path.join(".git"),
+        dot_git_path,
+    ];
+    for candidate in candidates {
+        if remote_git_dir_candidate(&candidate) {
+            return Ok(candidate);
+        }
+        if candidate.is_file()
+            && let Some(git_dir) = read_gitdir_file(&candidate)?
+            && remote_git_dir_candidate(&git_dir)
+        {
+            return fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()));
+        }
+    }
+    Err(GitError::repository_not_found("not a git repository"))
+}
+
+fn path_with_dot_git_suffix(path: &Path) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(".git");
+    PathBuf::from(suffixed)
+}
+
+fn remote_git_dir_candidate(path: &Path) -> bool {
+    path.join("HEAD").is_file()
+        && (path.join("objects").is_dir() || path.join("commondir").is_file())
 }
 
 fn ls_remote_repository_path(repository: &str, cwd: &Path) -> Result<PathBuf> {
@@ -9707,10 +9887,16 @@ fn discover_local_remote_head_branch(
     let remote_format = repository_object_format(&remote_git_dir)?;
     let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
     match remote_store.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(target)) => target
-            .strip_prefix("refs/heads/")
-            .map(str::to_string)
-            .ok_or_else(|| GitError::reference_not_found("remote HEAD branch")),
+        Some(RefTarget::Symbolic(target)) => {
+            let branch = target
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| GitError::reference_not_found("remote HEAD branch"))?;
+            if remote_store.read_ref(&target)?.is_some() {
+                Ok(branch.to_string())
+            } else {
+                Err(GitError::reference_not_found("remote HEAD branch"))
+            }
+        }
         Some(RefTarget::Direct(_)) | None => {
             Err(GitError::reference_not_found("remote HEAD branch"))
         }

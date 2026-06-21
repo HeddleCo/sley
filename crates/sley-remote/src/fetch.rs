@@ -515,7 +515,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // The remote's advertised HEAD symref target (e.g. `refs/heads/main`),
             // used by the CLI to create `refs/remotes/<remote>/HEAD` on a default
             // fetch — parity with the network transports' `head_symref`.
-            if let Some(RefTarget::Symbolic(target)) =
+            if advertisements
+                .iter()
+                .any(|advertisement| advertisement.name == "HEAD")
+                && let Some(RefTarget::Symbolic(target)) =
                 FileRefStore::new(remote_git_dir, request.format).read_ref("HEAD")?
             {
                 outcome.head_symref = Some(target);
