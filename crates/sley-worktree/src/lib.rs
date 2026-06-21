@@ -21,9 +21,9 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 use std::{env, fs};
@@ -1138,7 +1138,9 @@ pub fn add_exact_tracked_path_from_disk(
     }
 
     let entry = raw.entry.clone();
-    if entry.stage() != Stage::Normal || index_entry_skip_worktree(&entry) || sley_index::is_gitlink(entry.mode)
+    if entry.stage() != Stage::Normal
+        || index_entry_skip_worktree(&entry)
+        || sley_index::is_gitlink(entry.mode)
     {
         return Ok(AddExactTrackedPathResult::Unsupported);
     }
@@ -1789,8 +1791,8 @@ fn update_index_paths_impl(
         let existing_range = index_entries_path_range(&index.entries, &git_path);
         if !options.allow_skip_worktree_entries
             && index.entries[existing_range.clone()]
-            .iter()
-            .any(index_entry_skip_worktree)
+                .iter()
+                .any(index_entry_skip_worktree)
         {
             if path_mode.remove && !options.ignore_skip_worktree_entries {
                 index.entries.drain(existing_range);
@@ -2620,10 +2622,7 @@ pub fn refresh_untracked_cache_after_status(
     }
     let old_cache = index.untracked_cache(format).ok().flatten();
     let ident = untracked_cache_ident(worktree_root);
-    if old_cache
-        .as_ref()
-        .is_some_and(|cache| cache.ident != ident)
-    {
+    if old_cache.as_ref().is_some_and(|cache| cache.ident != ident) {
         eprintln!("warning: untracked cache is disabled on this system or location");
         emit_untracked_cache_bypass_trace();
         return Ok(());
@@ -2717,12 +2716,18 @@ fn repository_index_is_split(git_dir: &Path, format: ObjectFormat) -> Result<boo
 }
 
 pub fn write_repository_index(git_dir: &Path, format: ObjectFormat, index: Index) -> Result<()> {
-    let split = index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
+    let split =
+        index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
     write_repository_index_ref_with_split(git_dir, format, &index, split)
 }
 
-pub fn write_repository_index_ref(git_dir: &Path, format: ObjectFormat, index: &Index) -> Result<()> {
-    let split = index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
+pub fn write_repository_index_ref(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+) -> Result<()> {
+    let split =
+        index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
     write_repository_index_ref_with_split(git_dir, format, index, split)
 }
 
@@ -2872,12 +2877,17 @@ fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 fn index_checksum_from_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
     let hash_len = format.raw_len();
     if bytes.len() < hash_len {
-        return Err(GitError::InvalidFormat("index too short for checksum".into()));
+        return Err(GitError::InvalidFormat(
+            "index too short for checksum".into(),
+        ));
     }
     ObjectId::from_raw(format, &bytes[bytes.len() - hash_len..])
 }
 
-pub fn enable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<UpdateIndexResult> {
+pub fn enable_split_index(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
     let mut index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
     normalize_index_version_for_extended_flags(&mut index);
@@ -2888,7 +2898,10 @@ pub fn enable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Re
     })
 }
 
-pub fn disable_split_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<UpdateIndexResult> {
+pub fn disable_split_index(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
     if !repository_index_path(git_dir).exists() {
         return Ok(UpdateIndexResult {
@@ -2950,7 +2963,9 @@ fn racily_clean_entry_indexes_before_write(
         let Ok(metadata) = fs::symlink_metadata(&absolute) else {
             continue;
         };
-        if entry.mode != worktree_entry_mode(&metadata) || !worktree_entry_is_uptodate(entry, &metadata) {
+        if entry.mode != worktree_entry_mode(&metadata)
+            || !worktree_entry_is_uptodate(entry, &metadata)
+        {
             continue;
         }
         let body = if metadata.file_type().is_symlink() {
@@ -6594,10 +6609,9 @@ struct IndexStatusLookup<'a> {
 
 impl StatusTrackedLookup for IndexStatusLookup<'_> {
     fn tracked_kind(&self, git_path: &[u8]) -> Option<StatusTrackedKind> {
-        self.stat_cache
-            .entries
-            .get(git_path)
-            .map(|entry| StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree()))
+        self.stat_cache.entries.get(git_path).map(|entry| {
+            StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree())
+        })
     }
 
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind> {
@@ -6878,8 +6892,7 @@ where
                                 if git_path.last() != Some(&b'/') {
                                     git_path.push(b'/');
                                 }
-                                let control =
-                                    emit_status_untracked_path(context, &git_path, emit)?;
+                                let control = emit_status_untracked_path(context, &git_path, emit)?;
                                 git_path.truncate(directory_len);
                                 if control.is_stop() {
                                     return Ok(StreamControl::Stop);
@@ -6906,8 +6919,7 @@ where
                                 if git_path.last() != Some(&b'/') {
                                     git_path.push(b'/');
                                 }
-                                let control =
-                                    emit_status_untracked_path(context, &git_path, emit)?;
+                                let control = emit_status_untracked_path(context, &git_path, emit)?;
                                 git_path.truncate(directory_len);
                                 if control.is_stop() {
                                     return Ok(StreamControl::Stop);
@@ -7208,7 +7220,11 @@ fn build_untracked_cache(
 
 fn emit_untracked_cache_trace(old: Option<&UntrackedCache>, new: &UntrackedCache) {
     sley_core::trace2::perf_read_directory_data("path", "");
-    let dir_count = new.root.as_ref().map(count_untracked_cache_dirs).unwrap_or(0);
+    let dir_count = new
+        .root
+        .as_ref()
+        .map(count_untracked_cache_dirs)
+        .unwrap_or(0);
     let Some(old) = old else {
         sley_core::trace2::perf_read_directory_data("node-creation", dir_count.saturating_sub(1));
         sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
@@ -7233,7 +7249,8 @@ fn emit_untracked_cache_trace(old: Option<&UntrackedCache>, new: &UntrackedCache
         sley_core::trace2::perf_read_directory_data("opendir", dir_count);
         return;
     }
-    if old.info_exclude.oid != new.info_exclude.oid || old.excludes_file.oid != new.excludes_file.oid
+    if old.info_exclude.oid != new.info_exclude.oid
+        || old.excludes_file.oid != new.excludes_file.oid
     {
         sley_core::trace2::perf_read_directory_data("node-creation", 0);
         sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
@@ -7277,7 +7294,11 @@ fn emit_untracked_cache_trace(old: Option<&UntrackedCache>, new: &UntrackedCache
 }
 
 fn count_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
-    1 + dir.dirs.iter().map(count_untracked_cache_dirs).sum::<usize>()
+    1 + dir
+        .dirs
+        .iter()
+        .map(count_untracked_cache_dirs)
+        .sum::<usize>()
 }
 
 fn count_invalid_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
@@ -7942,11 +7963,7 @@ fn final_component_match_kind(pattern: &[u8]) -> MatchKind {
     classify_ignore_pattern(path_basename(pattern))
 }
 
-fn visit_directory_match_components(
-    path: &[u8],
-    is_dir: bool,
-    mut visit: impl FnMut(&[u8]),
-) {
+fn visit_directory_match_components(path: &[u8], is_dir: bool, mut visit: impl FnMut(&[u8])) {
     let mut start = 0usize;
     for (index, byte) in path.iter().enumerate() {
         if *byte == b'/' {
@@ -8162,11 +8179,7 @@ impl IgnoreMatcher {
                     &mut profile,
                 );
             }
-            if let Some(indices) = self
-                .buckets
-                .directory_literal_path_basename
-                .get(component)
-            {
+            if let Some(indices) = self.buckets.directory_literal_path_basename.get(component) {
                 self.match_bucket_candidates(
                     indices,
                     path,
@@ -9475,7 +9488,10 @@ fn read_attribute_patterns_from_bytes(
 ) {
     for (index, raw) in contents.split(|byte| *byte == b'\n').enumerate() {
         if raw.len() >= 2048 {
-            eprintln!("warning: ignoring overly long attributes line {}", index + 1);
+            eprintln!(
+                "warning: ignoring overly long attributes line {}",
+                index + 1
+            );
             continue;
         }
         push_attribute_pattern(matcher, raw, base, source, index + 1);
@@ -9949,6 +9965,8 @@ struct ContentFilterPlan {
     text: TextDecision,
     /// The conversion to apply when `text` resolves to "this is text".
     eol: EolConversion,
+    /// Whether `$Id$` keyword collapse/expansion applies to this path.
+    ident: bool,
     /// `filter.<name>` driver, if assigned via attributes and configured.
     driver: Option<FilterDriver>,
 }
@@ -9956,6 +9974,7 @@ struct ContentFilterPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FilterDriver {
     name: Vec<u8>,
+    process: Option<String>,
     clean: Option<String>,
     smudge: Option<String>,
     required: bool,
@@ -9990,6 +10009,7 @@ impl ContentFilterPlan {
     fn resolve(config: &GitConfig, checks: &[AttributeCheck]) -> Self {
         let text_attr = checks.iter().find(|check| check.attribute == b"text");
         let crlf_attr = checks.iter().find(|check| check.attribute == b"crlf");
+        let ident_attr = checks.iter().find(|check| check.attribute == b"ident");
         let eol_attr = checks.iter().find(|check| check.attribute == b"eol");
         let filter_attr = checks.iter().find(|check| check.attribute == b"filter");
 
@@ -10071,8 +10091,17 @@ impl ContentFilterPlan {
         };
 
         let driver = resolve_filter_driver(config, filter_attr);
+        let ident = matches!(
+            ident_attr.and_then(|check| check.state.as_ref()),
+            Some(AttributeState::Set)
+        );
 
-        ContentFilterPlan { text, eol, driver }
+        ContentFilterPlan {
+            text,
+            eol,
+            ident,
+            driver,
+        }
     }
 
     /// Whether EOL conversion should run for the given content.
@@ -10225,27 +10254,50 @@ fn resolve_filter_driver(
         _ => return None,
     };
     let subsection = String::from_utf8_lossy(&name).into_owned();
-    let clean = config
-        .get("filter", Some(&subsection), "clean")
-        .filter(|cmd| !cmd.is_empty())
-        .map(str::to_owned);
-    let smudge = config
-        .get("filter", Some(&subsection), "smudge")
-        .filter(|cmd| !cmd.is_empty())
-        .map(str::to_owned);
-    let required = config
-        .get_bool("filter", Some(&subsection), "required")
-        .unwrap_or(false);
+    let process = filter_config_value(config, &subsection, "process").filter(|cmd| !cmd.is_empty());
+    let clean = filter_config_value(config, &subsection, "clean").filter(|cmd| !cmd.is_empty());
+    let smudge = filter_config_value(config, &subsection, "smudge").filter(|cmd| !cmd.is_empty());
+    let required = filter_config_bool(config, &subsection, "required").unwrap_or(false);
     // A filter with neither command and not required is a no-op.
-    if clean.is_none() && smudge.is_none() && !required {
+    if process.is_none() && clean.is_none() && smudge.is_none() && !required {
         return None;
     }
     Some(FilterDriver {
         name,
+        process,
         clean,
         smudge,
         required,
     })
+}
+
+fn filter_config_value(config: &GitConfig, subsection: &str, key: &str) -> Option<String> {
+    config
+        .get("filter", Some(subsection), key)
+        .map(str::to_owned)
+        .or_else(|| global_filter_config_value(subsection, key))
+}
+
+fn filter_config_bool(config: &GitConfig, subsection: &str, key: &str) -> Option<bool> {
+    config
+        .get_bool("filter", Some(subsection), key)
+        .or_else(|| {
+            global_filter_config_value(subsection, key)
+                .as_deref()
+                .and_then(sley_config::parse_config_bool)
+        })
+}
+
+fn global_filter_config_value(subsection: &str, key: &str) -> Option<String> {
+    for (path, _) in sley_config::default_config_layer_paths().into_iter().rev() {
+        let Ok(config) = GitConfig::read(path) else {
+            continue;
+        };
+        if let Some(value) = config.get("filter", Some(subsection), key) {
+            return Some(value.to_owned());
+        }
+    }
+    None
 }
 
 /// Heuristic mirroring git's `buffer_is_binary`: content is treated as binary
@@ -10291,6 +10343,113 @@ fn convert_lf_to_crlf(content: &[u8]) -> Vec<u8> {
         prev = byte;
     }
     out
+}
+
+/// Collapse git `$Id: ... $` keywords to `$Id$` on the clean path.
+fn ident_to_git_cow(content: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+    let input = content.as_ref();
+    if !has_git_ident(input) {
+        return content;
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut pos = 0;
+    while let Some(relative) = input[pos..].iter().position(|byte| *byte == b'$') {
+        let dollar = pos + relative;
+        out.extend_from_slice(&input[pos..=dollar]);
+        pos = dollar + 1;
+        if input.len().saturating_sub(pos) > 3 && input[pos..].starts_with(b"Id:") {
+            let search = &input[pos + 3..];
+            let Some(end_relative) = search.iter().position(|byte| *byte == b'$') else {
+                break;
+            };
+            let end = pos + 3 + end_relative;
+            if input[pos + 3..end].contains(&b'\n') {
+                continue;
+            }
+            out.extend_from_slice(b"Id$");
+            pos = end + 1;
+        }
+    }
+    out.extend_from_slice(&input[pos..]);
+    Cow::Owned(out)
+}
+
+/// Expand `$Id$` and git-style `$Id: <hex> $` keywords using the blob id of the
+/// unexpanded content, matching convert.c's ident_to_worktree.
+fn ident_to_worktree_cow(format: ObjectFormat, content: Cow<'_, [u8]>) -> Result<Cow<'_, [u8]>> {
+    let input = content.as_ref();
+    if !has_git_ident(input) {
+        return Ok(content);
+    }
+    let oid = EncodedObject::new(ObjectType::Blob, input.to_vec()).object_id(format)?;
+    let replacement = format!("Id: {} $", oid.to_hex());
+    let mut out = Vec::with_capacity(input.len() + replacement.len());
+    let mut pos = 0;
+    while let Some(relative) = input[pos..].iter().position(|byte| *byte == b'$') {
+        let dollar = pos + relative;
+        out.extend_from_slice(&input[pos..=dollar]);
+        pos = dollar + 1;
+        if input.len().saturating_sub(pos) < 3 || !input[pos..].starts_with(b"Id") {
+            continue;
+        }
+        match input.get(pos + 2) {
+            Some(b'$') => {
+                pos += 3;
+            }
+            Some(b':') => {
+                let search = &input[pos + 3..];
+                let Some(end_relative) = search.iter().position(|byte| *byte == b'$') else {
+                    break;
+                };
+                let end = pos + 3 + end_relative;
+                if input[pos + 3..end].contains(&b'\n') || is_foreign_ident(&input[pos + 3..end]) {
+                    continue;
+                }
+                pos = end + 1;
+            }
+            _ => continue,
+        }
+        out.extend_from_slice(replacement.as_bytes());
+    }
+    out.extend_from_slice(&input[pos..]);
+    Ok(Cow::Owned(out))
+}
+
+fn has_git_ident(content: &[u8]) -> bool {
+    let mut pos = 0;
+    while let Some(relative) = content[pos..].iter().position(|byte| *byte == b'$') {
+        let start = pos + relative + 1;
+        if content.len().saturating_sub(start) < 3 {
+            break;
+        }
+        if !content[start..].starts_with(b"Id") {
+            pos = start;
+            continue;
+        }
+        match content.get(start + 2) {
+            Some(b'$') => return true,
+            Some(b':') => {
+                let search = &content[start + 3..];
+                let Some(end_relative) = search.iter().position(|byte| *byte == b'$') else {
+                    break;
+                };
+                let end = start + 3 + end_relative;
+                if !content[start + 3..end].contains(&b'\n') {
+                    return true;
+                }
+                pos = end + 1;
+            }
+            _ => pos = start,
+        }
+    }
+    false
+}
+
+fn is_foreign_ident(expansion: &[u8]) -> bool {
+    if expansion.len() <= 1 {
+        return false;
+    }
+    expansion[1..expansion.len().saturating_sub(1)].contains(&b' ')
 }
 
 /// Run a configured `clean`/`smudge` command as a subprocess, feeding `content`
@@ -10343,6 +10502,346 @@ fn run_filter_command(command: &str, path: &[u8], content: &[u8]) -> Result<Vec<
         )));
     }
     Ok(output.stdout)
+}
+
+const PROCESS_CAP_CLEAN: u8 = 1;
+const PROCESS_CAP_SMUDGE: u8 = 1 << 1;
+const PROCESS_CAP_DELAY: u8 = 1 << 2;
+const PKT_DATA_MAX: usize = 65_516;
+
+static PROCESS_FILTERS: OnceLock<Mutex<HashMap<String, ProcessFilter>>> = OnceLock::new();
+type ProcessFilterMetadata = Vec<(String, String)>;
+static PROCESS_FILTER_METADATA: OnceLock<Mutex<Option<ProcessFilterMetadata>>> = OnceLock::new();
+
+struct ProcessFilterMetadataGuard {
+    previous: Option<ProcessFilterMetadata>,
+}
+
+impl Drop for ProcessFilterMetadataGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = PROCESS_FILTER_METADATA
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *guard = self.previous.take();
+        }
+    }
+}
+
+fn set_process_filter_metadata(
+    metadata: Option<ProcessFilterMetadata>,
+) -> ProcessFilterMetadataGuard {
+    let mutex = PROCESS_FILTER_METADATA.get_or_init(|| Mutex::new(None));
+    let previous = mutex
+        .lock()
+        .map(|mut guard| std::mem::replace(&mut *guard, metadata))
+        .unwrap_or(None);
+    ProcessFilterMetadataGuard { previous }
+}
+
+fn current_process_filter_metadata() -> Option<ProcessFilterMetadata> {
+    PROCESS_FILTER_METADATA
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+struct ProcessFilter {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    capabilities: u8,
+}
+
+enum ProcessFilterOutcome {
+    Filtered(Vec<u8>),
+    Unsupported,
+    Status(String),
+}
+
+struct ProcessFilterFailure {
+    message: String,
+    protocol: bool,
+}
+
+impl ProcessFilterFailure {
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            protocol: true,
+        }
+    }
+}
+
+fn run_process_filter(
+    command: &str,
+    direction: &str,
+    path: &[u8],
+    content: &[u8],
+    blob: Option<ObjectId>,
+) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
+    let filters = PROCESS_FILTERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut filters = filters
+        .lock()
+        .map_err(|_| ProcessFilterFailure::protocol("process filter cache poisoned"))?;
+    if !filters.contains_key(command) {
+        let filter = ProcessFilter::start(command)?;
+        filters.insert(command.to_string(), filter);
+    }
+    let result = filters
+        .get_mut(command)
+        .expect("process filter was inserted")
+        .apply(direction, path, content, blob);
+    if result.as_ref().is_err_and(|err| err.protocol) {
+        filters.remove(command);
+    }
+    result
+}
+
+impl ProcessFilter {
+    fn start(command: &str) -> std::result::Result<Self, ProcessFilterFailure> {
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("/bin/sh", "-c")
+        };
+        let mut child = Command::new(shell)
+            .arg(flag)
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|err| {
+                ProcessFilterFailure::protocol(format!(
+                    "cannot fork to run subprocess '{command}': {err}"
+                ))
+            })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProcessFilterFailure::protocol("process filter stdin unavailable"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProcessFilterFailure::protocol("process filter stdout unavailable"))?;
+
+        write_pkt_text(&mut stdin, "git-filter-client\n")?;
+        write_pkt_text(&mut stdin, "version=2\n")?;
+        write_flush(&mut stdin)?;
+
+        let line = read_pkt_text(&mut stdout)?.ok_or_else(|| {
+            ProcessFilterFailure::protocol(
+                "Unexpected line '<flush packet>', expected git-filter-server",
+            )
+        })?;
+        if line != "git-filter-server" {
+            return Err(ProcessFilterFailure::protocol(format!(
+                "Unexpected line '{line}', expected git-filter-server"
+            )));
+        }
+        let line = read_pkt_text(&mut stdout)?.ok_or_else(|| {
+            ProcessFilterFailure::protocol("Unexpected line '<flush packet>', expected version")
+        })?;
+        if line != "version=2" {
+            return Err(ProcessFilterFailure::protocol(format!(
+                "Unexpected line '{line}', expected version"
+            )));
+        }
+        if let Some(line) = read_pkt_text(&mut stdout)? {
+            return Err(ProcessFilterFailure::protocol(format!(
+                "Unexpected line '{line}', expected flush"
+            )));
+        }
+
+        write_pkt_text(&mut stdin, "capability=clean\n")?;
+        write_pkt_text(&mut stdin, "capability=smudge\n")?;
+        write_pkt_text(&mut stdin, "capability=delay\n")?;
+        write_flush(&mut stdin)?;
+
+        let mut capabilities = 0;
+        while let Some(line) = read_pkt_text(&mut stdout)? {
+            match line.as_str() {
+                "capability=clean" => capabilities |= PROCESS_CAP_CLEAN,
+                "capability=smudge" => capabilities |= PROCESS_CAP_SMUDGE,
+                "capability=delay" => capabilities |= PROCESS_CAP_DELAY,
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            capabilities,
+        })
+    }
+
+    fn apply(
+        &mut self,
+        direction: &str,
+        path: &[u8],
+        content: &[u8],
+        blob: Option<ObjectId>,
+    ) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
+        let wanted = match direction {
+            "clean" => PROCESS_CAP_CLEAN,
+            "smudge" => PROCESS_CAP_SMUDGE,
+            _ => 0,
+        };
+        if self.capabilities & wanted == 0 {
+            return Ok(ProcessFilterOutcome::Unsupported);
+        }
+
+        write_pkt_text(&mut self.stdin, &format!("command={direction}\n"))?;
+        write_pkt_text(
+            &mut self.stdin,
+            &format!("pathname={}\n", String::from_utf8_lossy(path)),
+        )?;
+        if direction == "smudge"
+            && let Some(blob) = blob
+        {
+            if let Some(metadata) = current_process_filter_metadata() {
+                for (key, value) in metadata {
+                    write_pkt_text(&mut self.stdin, &format!("{key}={value}\n"))?;
+                }
+            }
+            write_pkt_text(&mut self.stdin, &format!("blob={}\n", blob.to_hex()))?;
+        }
+        write_flush(&mut self.stdin)?;
+        write_pkt_content(&mut self.stdin, content)?;
+        write_flush(&mut self.stdin)?;
+
+        let mut status = read_process_status(&mut self.stdout)?.unwrap_or_default();
+        match status.as_str() {
+            "success" => {}
+            "error" | "abort" | "delayed" => return Ok(ProcessFilterOutcome::Status(status)),
+            other => {
+                return Err(ProcessFilterFailure::protocol(format!(
+                    "external filter returned unsupported status '{other}'"
+                )));
+            }
+        }
+
+        let output = read_pkt_content(&mut self.stdout)?;
+        if let Some(next) = read_process_status(&mut self.stdout)? {
+            status = next;
+        }
+        match status.as_str() {
+            "" | "success" => Ok(ProcessFilterOutcome::Filtered(output)),
+            "error" | "abort" | "delayed" => Ok(ProcessFilterOutcome::Status(status)),
+            other => Err(ProcessFilterFailure::protocol(format!(
+                "external filter returned unsupported status '{other}'"
+            ))),
+        }
+    }
+}
+
+impl Drop for ProcessFilter {
+    fn drop(&mut self) {
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn write_pkt_text(
+    writer: &mut ChildStdin,
+    text: &str,
+) -> std::result::Result<(), ProcessFilterFailure> {
+    write_pkt_data(writer, text.as_bytes())
+}
+
+fn write_pkt_content(
+    writer: &mut ChildStdin,
+    content: &[u8],
+) -> std::result::Result<(), ProcessFilterFailure> {
+    for chunk in content.chunks(PKT_DATA_MAX) {
+        write_pkt_data(writer, chunk)?;
+    }
+    Ok(())
+}
+
+fn write_pkt_data(
+    writer: &mut ChildStdin,
+    data: &[u8],
+) -> std::result::Result<(), ProcessFilterFailure> {
+    let len = data.len() + 4;
+    write!(writer, "{len:04x}")
+        .and_then(|_| writer.write_all(data))
+        .map_err(|err| {
+            ProcessFilterFailure::protocol(format!("process filter write failed: {err}"))
+        })
+}
+
+fn write_flush(writer: &mut ChildStdin) -> std::result::Result<(), ProcessFilterFailure> {
+    writer
+        .write_all(b"0000")
+        .and_then(|_| writer.flush())
+        .map_err(|err| {
+            ProcessFilterFailure::protocol(format!("process filter write failed: {err}"))
+        })
+}
+
+fn read_pkt_text(
+    reader: &mut ChildStdout,
+) -> std::result::Result<Option<String>, ProcessFilterFailure> {
+    let Some(mut data) = read_pkt_data(reader)? else {
+        return Ok(None);
+    };
+    if data.last() == Some(&b'\n') {
+        data.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&data).into_owned()))
+}
+
+fn read_pkt_content(
+    reader: &mut ChildStdout,
+) -> std::result::Result<Vec<u8>, ProcessFilterFailure> {
+    let mut out = Vec::new();
+    while let Some(data) = read_pkt_data(reader)? {
+        out.extend_from_slice(&data);
+    }
+    Ok(out)
+}
+
+fn read_pkt_data(
+    reader: &mut ChildStdout,
+) -> std::result::Result<Option<Vec<u8>>, ProcessFilterFailure> {
+    let mut header = [0u8; 4];
+    reader.read_exact(&mut header).map_err(|err| {
+        ProcessFilterFailure::protocol(format!("process filter read failed: {err}"))
+    })?;
+    let header = std::str::from_utf8(&header)
+        .map_err(|err| ProcessFilterFailure::protocol(format!("invalid pkt-line header: {err}")))?;
+    let len = usize::from_str_radix(header, 16)
+        .map_err(|err| ProcessFilterFailure::protocol(format!("invalid pkt-line length: {err}")))?;
+    if len == 0 {
+        return Ok(None);
+    }
+    if len < 4 {
+        return Err(ProcessFilterFailure::protocol(format!(
+            "invalid pkt-line length {len}"
+        )));
+    }
+    let mut data = vec![0; len - 4];
+    reader.read_exact(&mut data).map_err(|err| {
+        ProcessFilterFailure::protocol(format!("process filter read failed: {err}"))
+    })?;
+    Ok(Some(data))
+}
+
+fn read_process_status(
+    reader: &mut ChildStdout,
+) -> std::result::Result<Option<String>, ProcessFilterFailure> {
+    let mut status = None;
+    while let Some(line) = read_pkt_text(reader)? {
+        if let Some(value) = line.strip_prefix("status=") {
+            status = Some(value.to_string());
+        }
+    }
+    Ok(status)
 }
 
 /// Minimal POSIX single-quote escaping for substituting `%f` into a shell
@@ -10612,7 +11111,7 @@ pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
     let plan = ContentFilterPlan::resolve(config, attributes);
     let mut data = Cow::Borrowed(content);
     if let Some(driver) = &plan.driver {
-        data = run_driver(driver, driver.clean.as_deref(), path, data)?;
+        data = run_driver(driver, driver.clean.as_deref(), "clean", None, path, data)?;
     }
     // The safecrlf check scans the (post-driver) buffer once for line-ending
     // stats. Gate it tightly so the extra scan never runs on the dominant
@@ -10624,6 +11123,9 @@ pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
     }
     if plan.convert_eol(&data) {
         data = convert_crlf_to_lf_cow(data);
+    }
+    if plan.ident {
+        data = ident_to_git_cow(data);
     }
     Ok(data)
 }
@@ -10647,7 +11149,10 @@ pub fn apply_smudge_filter(
     // attributes from the `.gitattributes` recorded in the index.
     let checks =
         smudge_attribute_checks_from_index(worktree_root.as_ref(), git_dir.as_ref(), format, path)?;
-    apply_smudge_filter_with_attributes(config, &checks, path, content)
+    Ok(
+        apply_smudge_filter_with_attributes_cow_format(config, &checks, path, content, format)?
+            .into_owned(),
+    )
 }
 
 /// Like [`apply_smudge_filter`] but takes already-resolved attribute checks.
@@ -10671,8 +11176,27 @@ pub fn apply_smudge_filter_with_attributes_cow<'a>(
     path: &[u8],
     content: &'a [u8],
 ) -> Result<Cow<'a, [u8]>> {
+    apply_smudge_filter_with_attributes_cow_format(
+        config,
+        attributes,
+        path,
+        content,
+        ObjectFormat::Sha1,
+    )
+}
+
+fn apply_smudge_filter_with_attributes_cow_format<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+    format: ObjectFormat,
+) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     let mut data = Cow::Borrowed(content);
+    if plan.ident {
+        data = ident_to_worktree_cow(format, data)?;
+    }
     if plan.eol == EolConversion::Crlf
         && plan.convert_eol(&data)
         && plan.will_convert_lf_to_crlf(&data)
@@ -10680,7 +11204,14 @@ pub fn apply_smudge_filter_with_attributes_cow<'a>(
         data = Cow::Owned(convert_lf_to_crlf(&data));
     }
     if let Some(driver) = &plan.driver {
-        data = run_driver(driver, driver.smudge.as_deref(), path, data)?;
+        data = run_driver(
+            driver,
+            driver.smudge.as_deref(),
+            "smudge",
+            Some(format),
+            path,
+            data,
+        )?;
     }
     Ok(data)
 }
@@ -10689,17 +11220,57 @@ pub fn apply_smudge_filter_with_attributes_cow<'a>(
 fn run_driver<'a>(
     driver: &FilterDriver,
     command: Option<&str>,
+    direction: &str,
+    format: Option<ObjectFormat>,
     path: &[u8],
     content: Cow<'a, [u8]>,
 ) -> Result<Cow<'a, [u8]>> {
+    if let Some(process) = &driver.process {
+        let blob = if direction == "smudge" {
+            match format {
+                Some(format) => {
+                    Some(EncodedObject::new(ObjectType::Blob, content.to_vec()).object_id(format)?)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        match run_process_filter(process, direction, path, &content, blob) {
+            Ok(ProcessFilterOutcome::Filtered(output)) => return Ok(Cow::Owned(output)),
+            Ok(ProcessFilterOutcome::Unsupported) => {}
+            Ok(ProcessFilterOutcome::Status(status)) => {
+                if driver.required {
+                    return Err(GitError::Command(format!(
+                        "external filter '{}' returned status {status}",
+                        process
+                    )));
+                }
+                return Ok(content);
+            }
+            Err(err) => {
+                if err.protocol {
+                    eprintln!("error: external filter '{}' failed", process);
+                }
+                if driver.required {
+                    return Err(GitError::Command(err.message));
+                }
+                return Ok(content);
+            }
+        }
+    }
     let Some(command) = command else {
         // No command in this direction. Required filters must error; optional
         // ones pass content through unchanged.
         if driver.required {
-            return Err(GitError::Command(format!(
-                "required filter `{}` has no configured command for this direction",
-                String::from_utf8_lossy(&driver.name)
-            )));
+            let path = String::from_utf8_lossy(path);
+            let name = String::from_utf8_lossy(&driver.name);
+            if direction == "clean" {
+                eprintln!("fatal: {path}: clean filter '{name}' failed");
+            } else {
+                eprintln!("fatal: {path}: smudge filter {name} failed");
+            }
+            return Err(GitError::Exit(128));
         }
         return Ok(content);
     };
@@ -10873,6 +11444,7 @@ fn filter_attribute_names() -> Vec<Vec<u8>> {
     vec![
         b"text".to_vec(),
         b"crlf".to_vec(),
+        b"ident".to_vec(),
         b"eol".to_vec(),
         b"filter".to_vec(),
     ]
@@ -11411,6 +11983,10 @@ pub fn checkout_branch_filtered(
             format,
             &target,
             Some(config),
+            Some(vec![
+                ("ref".to_string(), branch_ref.clone()),
+                ("treeish".to_string(), target.to_hex()),
+            ]),
         )?
     };
     checkout_switch_head_symbolic(
@@ -11447,6 +12023,7 @@ pub fn checkout_detached_filtered(
         format,
         target,
         Some(config),
+        Some(vec![("treeish".to_string(), target.to_hex())]),
     )?;
     let refs = FileRefStore::new(git_dir, format);
     let zero = ObjectId::null(format);
@@ -11476,7 +12053,14 @@ fn checkout_commit_to_index_and_worktree(
     format: ObjectFormat,
     target: &ObjectId,
 ) -> Result<usize> {
-    checkout_commit_to_index_and_worktree_filtered(worktree_root, git_dir, format, target, None)
+    checkout_commit_to_index_and_worktree_filtered(
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        None,
+        None,
+    )
 }
 
 /// Like [`checkout_commit_to_index_and_worktree`] but optionally runs the
@@ -11489,6 +12073,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
     format: ObjectFormat,
     target: &ObjectId,
     smudge_config: Option<&GitConfig>,
+    process_metadata: Option<Vec<(String, String)>>,
 ) -> Result<usize> {
     if let Some((sparse, mode)) = active_sparse_checkout(git_dir)? {
         return checkout_commit_to_index_and_worktree_sparse(
@@ -11498,16 +12083,22 @@ fn checkout_commit_to_index_and_worktree_filtered(
             target,
             Some((&sparse, mode)),
             smudge_config,
+            process_metadata,
         );
     }
+    let _process_filter_metadata = set_process_filter_metadata(process_metadata);
     let mut dirty = false;
-    stream_short_status(worktree_root, git_dir, format, |entry| {
-        if !status_row_is_untracked_or_ignored(entry) {
-            dirty = true;
-            return Ok(StreamControl::Stop);
-        }
-        Ok(StreamControl::Continue)
-    })?;
+    if smudge_config.is_some() {
+        dirty = !modified_index_entries(worktree_root, git_dir, format)?.is_empty();
+    } else {
+        stream_short_status(worktree_root, git_dir, format, |entry| {
+            if !status_row_is_untracked_or_ignored(entry) {
+                dirty = true;
+                return Ok(StreamControl::Stop);
+            }
+            Ok(StreamControl::Continue)
+        })?;
+    }
     if dirty {
         return Err(GitError::Transaction(
             "checkout requires a clean working tree".into(),
@@ -11540,7 +12131,13 @@ fn checkout_commit_to_index_and_worktree_filtered(
         let body: Cow<'_, [u8]> = match (smudge_config, &attributes) {
             (Some(config), Some(matcher)) => {
                 let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
-                apply_smudge_filter_with_attributes_cow(config, &checks, path, &object.body)?
+                apply_smudge_filter_with_attributes_cow_format(
+                    config,
+                    &checks,
+                    path,
+                    &object.body,
+                    format,
+                )?
             }
             _ => Cow::Borrowed(&object.body),
         };
@@ -11597,6 +12194,7 @@ fn build_tree_attribute_matcher(
 
 fn materialize_tree_entry_with_optional_smudge(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     worktree_root: &Path,
     path: &[u8],
     entry: &TrackedEntry,
@@ -11610,7 +12208,13 @@ fn materialize_tree_entry_with_optional_smudge(
     let matcher = attributes.expect("attributes are built when smudge_config is set");
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
-    let body = apply_smudge_filter_with_attributes_cow(config, &checks, path, &object.body)?;
+    let body = apply_smudge_filter_with_attributes_cow_format(
+        config,
+        &checks,
+        path,
+        &object.body,
+        format,
+    )?;
     let file_path = worktree_path(worktree_root, path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
     remove_existing_worktree_path(&file_path)?;
@@ -11639,7 +12243,9 @@ fn checkout_commit_to_index_and_worktree_sparse(
     target: &ObjectId,
     sparse: Option<(&SparseCheckout, SparseCheckoutMode)>,
     smudge_config: Option<&GitConfig>,
+    process_metadata: Option<Vec<(String, String)>>,
 ) -> Result<usize> {
+    let _process_filter_metadata = set_process_filter_metadata(process_metadata);
     let previously_skipped = skip_worktree_paths(git_dir, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target)?;
@@ -11666,10 +12272,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
         // gitlink is reused as-is (upstream entry.c write_entry: mkdir with
         // EEXIST is success), so it does not block the checkout either.
         if entry.index == b'?' && entry.worktree == b'?' {
-            let path = entry
-                .path
-                .strip_suffix(b"/")
-                .unwrap_or(entry.path);
+            let path = entry.path.strip_suffix(b"/").unwrap_or(entry.path);
             if target_entries
                 .get(path)
                 .is_some_and(|target| sley_index::is_gitlink(target.mode))
@@ -11711,6 +12314,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
         let index_entry = if in_cone {
             materialize_tree_entry_with_optional_smudge(
                 &db,
+                format,
                 worktree_root,
                 path,
                 entry,
@@ -11799,6 +12403,7 @@ fn restore_worktree_paths_inner(
         return Err(GitError::Exit(1));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut restored = BTreeSet::new();
     for path in paths {
@@ -11834,6 +12439,7 @@ fn restore_worktree_paths_inner(
                 &db,
                 &index.entries[position],
                 smudge_config,
+                Some(&stat_cache),
             )?;
             restored.insert(index.entries[position].path.clone());
             matched = true;
@@ -11869,13 +12475,17 @@ pub fn checkout_index_paths(
         return Err(GitError::Exit(1));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let selected = checkout_selected_index_paths(worktree_root, &index, paths)?;
 
     if options.stage.is_none() && !options.merge && !options.force {
         for path in &selected {
             if checkout_path_is_unmerged(&index, path) {
-                eprintln!("error: path '{}' is unmerged", String::from_utf8_lossy(path));
+                eprintln!(
+                    "error: path '{}' is unmerged",
+                    String::from_utf8_lossy(path)
+                );
                 return Err(GitError::Exit(1));
             }
         }
@@ -11926,6 +12536,7 @@ pub fn checkout_index_paths(
                     &db,
                     &index.entries[position],
                     options.smudge_config,
+                    Some(&stat_cache),
                 )?;
                 restored.insert(path);
                 continue;
@@ -11954,6 +12565,7 @@ pub fn checkout_index_paths(
                 &db,
                 &index.entries[position],
                 options.smudge_config,
+                Some(&stat_cache),
             )? {
                 refreshed.insert(position, updated);
             }
@@ -12033,8 +12645,17 @@ fn checkout_write_index_entry_to_worktree(
     db: &FileObjectDatabase,
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
+    stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<IndexEntry>> {
-    restore_index_entry(worktree_root, git_dir, format, db, entry, smudge_config)
+    restore_index_entry(
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        entry,
+        smudge_config,
+        stat_cache,
+    )
 }
 
 fn checkout_merge_unmerged_path(
@@ -12063,11 +12684,17 @@ fn checkout_merge_unmerged_path(
         return Ok(());
     };
     let base_body = match base {
-        Some(entry) => read_expected_object(db, &entry.oid, ObjectType::Blob)?.body.clone(),
+        Some(entry) => read_expected_object(db, &entry.oid, ObjectType::Blob)?
+            .body
+            .clone(),
         None => Vec::new(),
     };
-    let ours_body = read_expected_object(db, &ours.oid, ObjectType::Blob)?.body.clone();
-    let theirs_body = read_expected_object(db, &theirs.oid, ObjectType::Blob)?.body.clone();
+    let ours_body = read_expected_object(db, &ours.oid, ObjectType::Blob)?
+        .body
+        .clone();
+    let theirs_body = read_expected_object(db, &theirs.oid, ObjectType::Blob)?
+        .body
+        .clone();
     let result = sley_diff_merge::merge_blobs(
         &base_body,
         &ours_body,
@@ -12267,15 +12894,11 @@ fn restore_index_paths_from_entries(
                     existing.oid == entry.oid && existing.mode == entry.mode
                 });
                 if !unchanged {
-                    let mut restored =
-                        restored_head_index_entry(worktree_root, db, &path, entry)?;
+                    let mut restored = restored_head_index_entry(worktree_root, db, &path, entry)?;
                     if prior_skip_worktree.contains(&path) {
                         restored.set_skip_worktree(true);
                     }
-                    index_entries.insert(
-                        path.clone(),
-                        restored,
-                    );
+                    index_entries.insert(path.clone(), restored);
                 }
             } else {
                 index_entries.remove(&path);
@@ -12481,6 +13104,7 @@ pub fn reset_index_and_worktree_to_commit(
     for (path, entry) in &target_entries {
         index_entries.push(materialize_tree_entry_filtered(
             &db,
+            format,
             worktree_root,
             path,
             entry,
@@ -12576,6 +13200,7 @@ fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> Result<()> 
 
 fn materialize_tree_entry_filtered(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     worktree_root: &Path,
     path: &[u8],
     entry: &TrackedEntry,
@@ -12587,7 +13212,13 @@ fn materialize_tree_entry_filtered(
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = attributes.attributes_for_path(path, &filter_attribute_names(), false);
-    let body = apply_smudge_filter_with_attributes_cow(config, &checks, path, &object.body)?;
+    let body = apply_smudge_filter_with_attributes_cow_format(
+        config,
+        &checks,
+        path,
+        &object.body,
+        format,
+    )?;
     let file_path = worktree_path(worktree_root, path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
     remove_existing_worktree_path(&file_path)?;
@@ -12913,13 +13544,15 @@ pub fn index_from_tree(
 /// the compiled matcher would keep its worktree file. Cone and full (gitignore)
 /// grammars are both handled, exactly as the apply engine interprets them, so
 /// `check-rules` and `set`/`reapply` agree by construction.
-pub fn path_in_sparse_checkout(path: &[u8], sparse: &SparseCheckout, mode: SparseCheckoutMode) -> bool {
+pub fn path_in_sparse_checkout(
+    path: &[u8],
+    sparse: &SparseCheckout,
+    mode: SparseCheckoutMode,
+) -> bool {
     SparseMatcher::new(sparse, mode).includes_file(path)
 }
 
-fn active_sparse_checkout(
-    git_dir: &Path,
-) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
+fn active_sparse_checkout(git_dir: &Path) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
     let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
     let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
     let sparse_enabled = worktree_config
@@ -13185,7 +13818,10 @@ fn collapse_to_sparse_index(
         let path = entry.path.as_bytes();
         let in_cone = matcher.includes_file(path);
         let mut start = 0usize;
-        while let Some(rel) = path.get(start..).and_then(|s| s.iter().position(|b| *b == b'/')) {
+        while let Some(rel) = path
+            .get(start..)
+            .and_then(|s| s.iter().position(|b| *b == b'/'))
+        {
             let end = start + rel;
             let dir = path[..end].to_vec();
             let flag = dir_has_in_cone.entry(dir).or_insert(false);
@@ -13412,6 +14048,7 @@ pub fn checkout_detached_sparse(
         format,
         target,
         Some((sparse, SparseCheckoutMode::Auto)),
+        None,
         None,
     )?;
     let refs = FileRefStore::new(git_dir, format);
@@ -13796,45 +14433,46 @@ pub fn remove_index_and_worktree_paths(
                 )
             } else {
                 match fs::symlink_metadata(&worktree_file) {
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) || err.raw_os_error() == Some(20) =>
-                {
-                    // ENOENT/ENOTDIR: already gone — not warning-worthy.
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-                Ok(meta) if meta.is_dir() => continue,
-                Ok(meta) => {
-                    // git refreshes the index before `check_local_mod`, so a path
-                    // whose stat changed but whose content is unchanged is up to
-                    // date. We mirror that: a clean cached stat short-circuits to
-                    // "unchanged"; otherwise re-hash the (clean-filtered) worktree
-                    // content and compare to the index entry's *cached oid* (git's
-                    // refresh `hash_object`), NOT the stored blob. Comparing to the
-                    // oid — not the blob bytes — means a removed object does not
-                    // abort the check (the worktree may still hash to the cached
-                    // oid), so `git rm --cached` of a path whose blob was deleted
-                    // still succeeds.
-                    match rm_stat_cache.index_entry_worktree_stat_verdict(index_entry, &meta) {
-                        sley_index::StatVerdict::Clean => false,
-                        sley_index::StatVerdict::Dirty
-                        | sley_index::StatVerdict::RacyNeedsContentCheck => {
-                            let worktree_bytes = apply_clean_filter(
-                                worktree_root,
-                                git_dir,
-                                &config,
-                                path,
-                                &fs::read(&worktree_file)?,
-                            )?;
-                            let worktree_oid = EncodedObject::new(ObjectType::Blob, worktree_bytes)
-                                .object_id(format)?;
-                            worktree_oid != index_entry.oid
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) || err.raw_os_error() == Some(20) =>
+                    {
+                        // ENOENT/ENOTDIR: already gone — not warning-worthy.
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                    Ok(meta) if meta.is_dir() => continue,
+                    Ok(meta) => {
+                        // git refreshes the index before `check_local_mod`, so a path
+                        // whose stat changed but whose content is unchanged is up to
+                        // date. We mirror that: a clean cached stat short-circuits to
+                        // "unchanged"; otherwise re-hash the (clean-filtered) worktree
+                        // content and compare to the index entry's *cached oid* (git's
+                        // refresh `hash_object`), NOT the stored blob. Comparing to the
+                        // oid — not the blob bytes — means a removed object does not
+                        // abort the check (the worktree may still hash to the cached
+                        // oid), so `git rm --cached` of a path whose blob was deleted
+                        // still succeeds.
+                        match rm_stat_cache.index_entry_worktree_stat_verdict(index_entry, &meta) {
+                            sley_index::StatVerdict::Clean => false,
+                            sley_index::StatVerdict::Dirty
+                            | sley_index::StatVerdict::RacyNeedsContentCheck => {
+                                let worktree_bytes = apply_clean_filter(
+                                    worktree_root,
+                                    git_dir,
+                                    &config,
+                                    path,
+                                    &fs::read(&worktree_file)?,
+                                )?;
+                                let worktree_oid =
+                                    EncodedObject::new(ObjectType::Blob, worktree_bytes)
+                                        .object_id(format)?;
+                                worktree_oid != index_entry.oid
+                            }
                         }
                     }
-                }
                 }
             };
             // Is the index different from the HEAD commit? (Before the first
@@ -13899,7 +14537,10 @@ pub fn remove_index_and_worktree_paths(
         .filter(|path| gitlink_paths.contains(*path))
         .cloned()
         .collect::<Vec<_>>();
-    if !options.cached && !selected_gitlinks.is_empty() && !selected.contains(b".gitmodules".as_slice()) {
+    if !options.cached
+        && !selected_gitlinks.is_empty()
+        && !selected.contains(b".gitmodules".as_slice())
+    {
         remove_submodule_sections_from_gitmodules(
             worktree_root,
             git_dir,
@@ -13919,7 +14560,8 @@ pub fn remove_index_and_worktree_paths(
         for path in &selected {
             let is_gitlink = gitlink_paths.contains(path);
             let is_stage0_gitlink = stage0_gitlink_paths.contains(path);
-            match remove_tracked_worktree_path(worktree_root, path, is_gitlink, is_stage0_gitlink)? {
+            match remove_tracked_worktree_path(worktree_root, path, is_gitlink, is_stage0_gitlink)?
+            {
                 true => removed_any = true,
                 false if !removed_any => {
                     eprintln!(
@@ -13954,10 +14596,7 @@ pub fn remove_index_and_worktree_paths(
         checksum: None,
     };
     invalidate_untracked_cache_for_git_paths(&mut index, format, &selected_paths)?;
-    fs::write(
-        index_path,
-        index.write(format)?,
-    )?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(RemoveResult {
         removed: selected.into_iter().collect(),
     })
@@ -14130,7 +14769,13 @@ fn remove_submodule_sections_from_gitmodules(
         }
     }
     fs::write(&gitmodules_path, &edited)?;
-    stage_gitmodules_after_rm(worktree_root, git_dir, format, index_entries, config_parameters_env)
+    stage_gitmodules_after_rm(
+        worktree_root,
+        git_dir,
+        format,
+        index_entries,
+        config_parameters_env,
+    )
 }
 
 fn gitmodules_worktree_differs_from_index(
@@ -14148,7 +14793,13 @@ fn gitmodules_worktree_differs_from_index(
         return Ok(false);
     };
     let config = sley_config::read_repo_config(git_dir, *config_parameters_env).unwrap_or_default();
-    let clean = apply_clean_filter(worktree_root, git_dir, &config, b".gitmodules", worktree_bytes)?;
+    let clean = apply_clean_filter(
+        worktree_root,
+        git_dir,
+        &config,
+        b".gitmodules",
+        worktree_bytes,
+    )?;
     let oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
     Ok(oid != entry.oid)
 }
@@ -14169,7 +14820,8 @@ fn stage_gitmodules_after_rm(
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     odb.write_object(object)?;
     let metadata = fs::symlink_metadata(&path)?;
-    let mut entry = index_entry_from_metadata(BString::from(b".gitmodules".as_slice()), oid, &metadata);
+    let mut entry =
+        index_entry_from_metadata(BString::from(b".gitmodules".as_slice()), oid, &metadata);
     entry.mode = 0o100644;
     if let Some(slot) = index_entries
         .iter_mut()
@@ -14378,11 +15030,7 @@ fn gitfile_path_value(path: &Path) -> String {
         }
     }
     let path = parts.join("/");
-    if absolute {
-        format!("/{path}")
-    } else {
-        path
-    }
+    if absolute { format!("/{path}") } else { path }
 }
 
 fn contains_nested_git_dir(root: &Path) -> bool {
@@ -14476,8 +15124,10 @@ pub fn move_index_and_worktree_path(
     if path_has_trailing_separator(&destination_absolute)
         && !destination_absolute.exists()
         && source_absolute.is_dir()
-        && let (Some(parent), Some(file_name)) =
-            (destination_absolute.parent(), destination_absolute.file_name())
+        && let (Some(parent), Some(file_name)) = (
+            destination_absolute.parent(),
+            destination_absolute.file_name(),
+        )
     {
         destination_absolute = parent.join(file_name);
     }
@@ -14683,8 +15333,13 @@ pub fn move_index_and_worktree_path(
     } else {
         Vec::new()
     };
-    let gitmodules_move =
-        prepare_gitmodules_for_moved_gitlinks(worktree_root, git_dir, format, &index.entries, &gitlink_moves)?;
+    let gitmodules_move = prepare_gitmodules_for_moved_gitlinks(
+        worktree_root,
+        git_dir,
+        format,
+        &index.entries,
+        &gitlink_moves,
+    )?;
     let gitlink_gitdir_moves = prepare_moved_gitlink_gitdirs(worktree_root, &gitlink_moves)?;
     if !directory_entries.is_empty() {
         let details: Vec<_> = directory_entries
@@ -14730,7 +15385,13 @@ pub fn move_index_and_worktree_path(
             index.entries.push(destination_entry);
         }
         if let Some(edited) = gitmodules_move {
-            apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
+            apply_prepared_gitmodules_move(
+                worktree_root,
+                git_dir,
+                format,
+                &mut index.entries,
+                edited,
+            )?;
         }
         index
             .entries
@@ -14806,6 +15467,7 @@ fn restore_index_entry(
     db: &FileObjectDatabase,
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
+    stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<IndexEntry>> {
     // A gitlink (mode 160000) names a commit in the submodule's repository, not
     // a blob here — reading it as a blob fails ("not found: blob object"). git's
@@ -14817,6 +15479,17 @@ fn restore_index_entry(
         materialize_gitlink_dir(worktree_root, &dir_path)?;
         return Ok(None);
     }
+    let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
+    if let Some(stat_cache) = stat_cache {
+        if let Ok(metadata) = fs::symlink_metadata(&file_path) {
+            if stat_cache
+                .reuse_index_entry_for_checkout(entry, &metadata)
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+    }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let body: Cow<'_, [u8]> = match smudge_config {
         Some(config) => {
@@ -14826,16 +15499,16 @@ fn restore_index_entry(
                 format,
                 entry.path.as_bytes(),
             )?;
-            apply_smudge_filter_with_attributes_cow(
+            apply_smudge_filter_with_attributes_cow_format(
                 config,
                 &checks,
                 entry.path.as_bytes(),
                 &object.body,
+                format,
             )?
         }
         None => Cow::Borrowed(&object.body),
     };
-    let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
     remove_existing_worktree_path(&file_path)?;
     fs::write(&file_path, &body)?;
@@ -15180,6 +15853,35 @@ impl IndexStatCache {
             return None;
         }
         if !worktree_entry_is_uptodate(entry, worktree_metadata) {
+            return None;
+        }
+        if self.is_racily_clean(entry) {
+            return None;
+        }
+        Some(TrackedEntry {
+            mode: entry.mode,
+            oid: entry.oid,
+        })
+    }
+
+    fn reuse_index_entry_for_checkout(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+    ) -> Option<TrackedEntry> {
+        if let Some(tracked) = self.reuse_index_entry(entry, worktree_metadata) {
+            return Some(tracked);
+        }
+        if u64::from(entry.size) != 0 || worktree_metadata.len() == 0 {
+            return None;
+        }
+        if entry.mode != worktree_entry_mode(worktree_metadata) {
+            return None;
+        }
+        let (mtime_seconds, mtime_nanoseconds) = file_mtime_parts(worktree_metadata)?;
+        if u64::from(entry.mtime_seconds) != mtime_seconds
+            || u64::from(entry.mtime_nanoseconds) != mtime_nanoseconds
+        {
             return None;
         }
         if self.is_racily_clean(entry) {
@@ -15882,7 +16584,8 @@ fn clean_filtered_oid_for_status(
     metadata: &fs::Metadata,
 ) -> Result<ObjectId> {
     let clean_oid = EncodedObject::new(ObjectType::Blob, clean_body).object_id(format)?;
-    if clean_oid == index_oid && index_size != index_size_from_metadata(metadata) {
+    let metadata_size = index_size_from_metadata(metadata);
+    if clean_oid == index_oid && index_size != 0 && index_size != metadata_size {
         return EncodedObject::new(ObjectType::Blob, raw_body.to_vec()).object_id(format);
     }
     Ok(clean_oid)
@@ -16198,7 +16901,9 @@ fn collect_worktree_entries(
                         index_entry.size,
                         &metadata,
                     )?,
-                    None => EncodedObject::new(ObjectType::Blob, clean).object_id(context.format)?,
+                    None => {
+                        EncodedObject::new(ObjectType::Blob, clean).object_id(context.format)?
+                    }
                 };
                 let tracked = TrackedEntry {
                     mode: entry_mode,
@@ -16648,6 +17353,7 @@ mod tests {
         let auto = ContentFilterPlan {
             text: TextDecision::Auto,
             eol: EolConversion::Crlf,
+            ident: false,
             driver: None,
         };
         assert!(auto.will_convert_lf_to_crlf(b"a\nb\n"));
@@ -16660,6 +17366,7 @@ mod tests {
         let text = ContentFilterPlan {
             text: TextDecision::Text,
             eol: EolConversion::Crlf,
+            ident: false,
             driver: None,
         };
         assert!(text.will_convert_lf_to_crlf(b"a\r\nb\nc\n"));
@@ -17425,12 +18132,7 @@ mod tests {
             let checks = match attrline {
                 Some(line) => {
                     let mut matcher = AttributeMatcher::default();
-                    read_attribute_patterns_from_bytes(
-                        line,
-                        &mut matcher,
-                        &[],
-                        b".gitattributes",
-                    );
+                    read_attribute_patterns_from_bytes(line, &mut matcher, &[], b".gitattributes");
                     matcher.attributes_for_path(b"f.txt", &filter_attribute_names(), false)
                 }
                 None => Vec::new(),
@@ -18001,7 +18703,7 @@ mod tests {
         }];
         let err = apply_clean_filter_with_attributes(&config, &checks, b"f", b"data")
             .expect_err("required filter without a clean command must error");
-        assert!(matches!(err, GitError::Command(_)), "got {err:?}");
+        assert!(matches!(err, GitError::Exit(128)), "got {err:?}");
     }
 
     #[test]
