@@ -7599,7 +7599,7 @@ impl LsFilesPathspec {
         if let Some(rest) = path.strip_prefix(self.prefix.as_slice()) {
             let rest = rest.strip_prefix(b"/")?;
             if rest.is_empty() {
-                return None;
+                return path.ends_with(b"/").then(|| b"./".to_vec());
             }
             Some(rest.to_vec())
         } else {

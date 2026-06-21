@@ -1962,11 +1962,7 @@ fn add_intent_to_add(
         // Resolve the pathspec to a worktree-relative git path. Reject anything
         // outside the worktree (git errors; we silently skip, matching the
         // tests which only ever pass in-tree paths).
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
+        let absolute = normalize_add_absolute_path(cwd, path);
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             continue;
         };
@@ -2049,11 +2045,7 @@ fn try_add_regular_exact_tracked_raw(
     if add_pathspec_needs_status_walk(path) || add_pathspec_has_trailing_separator(path) {
         return Ok(None);
     }
-    let absolute = if path.is_absolute() {
-        path.clone()
-    } else {
-        cwd.join(path)
-    };
+    let absolute = normalize_add_absolute_path(cwd, path);
     let Ok(relative) = absolute.strip_prefix(worktree_root) else {
         return Ok(None);
     };
@@ -2183,11 +2175,7 @@ fn add_pathspec_git_path_for_submodule_fast(
     worktree_root: &Path,
     path: &Path,
 ) -> Result<AddSubmodulePathspec> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
+    let absolute = normalize_add_absolute_path(cwd, path);
     let Ok(relative) = absolute.strip_prefix(worktree_root) else {
         return Ok(AddSubmodulePathspec::Outside);
     };
@@ -2240,11 +2228,7 @@ fn die_on_pathspec_inside_submodule_by_scan(
         return Ok(());
     }
     for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
+        let absolute = normalize_add_absolute_path(cwd, path);
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             continue;
         };
@@ -2429,11 +2413,7 @@ fn resolve_add_regular_actions(
     let pathspecs = paths
         .into_iter()
         .map(|path| {
-            let absolute = if path.is_absolute() {
-                path.clone()
-            } else {
-                cwd.join(&path)
-            };
+            let absolute = normalize_add_absolute_path(cwd, &path);
             let matched = absolute.exists();
             (path, absolute, matched)
         })
@@ -2499,7 +2479,7 @@ fn resolve_add_regular_actions(
         // pathspecs straight off the filesystem. The same walk feeds `--chmod`,
         // which must touch every matching file whether or not it changed.
         for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
-            for path in resolve_add_paths(cwd, worktree_root, vec![pathspec.clone()])? {
+            for path in resolve_add_paths(cwd, worktree_root, git_dir, vec![pathspec.clone()])? {
                 if fs::symlink_metadata(&path).is_err() {
                     continue;
                 }
@@ -2766,11 +2746,7 @@ fn resolve_add_regular_tracked_exact_actions(
         if add_pathspec_needs_status_walk(path) {
             return Ok(None);
         }
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
+        let absolute = normalize_add_absolute_path(cwd, path);
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             return Ok(None);
         };
@@ -2854,11 +2830,7 @@ fn reject_add_paths_outside_sparse_checkout(
         if add_pathspec_needs_status_walk(path) {
             continue;
         }
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
+        let absolute = normalize_add_absolute_path(cwd, path);
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             continue;
         };
@@ -2956,6 +2928,31 @@ fn add_pathspec_needs_status_walk(path: &Path) -> bool {
         .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
 }
 
+fn normalize_add_absolute_path(cwd: &Path, path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
+        return canonical;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 fn add_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
     if path.components().any(|component| {
         matches!(
@@ -2997,17 +2994,14 @@ fn add_index_entries_path_range(entries: &[IndexEntry], path: &[u8]) -> std::ops
 fn resolve_add_paths(
     cwd: &Path,
     worktree_root: &Path,
+    git_dir: &Path,
     paths: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = BTreeSet::new();
     for path in paths {
-        let absolute = if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        };
+        let absolute = normalize_add_absolute_path(cwd, &path);
         if absolute.is_dir() {
-            collect_add_files(worktree_root, &absolute, &mut resolved)?;
+            collect_add_files(worktree_root, git_dir, &absolute, &mut resolved)?;
         } else {
             resolved.insert(absolute);
         }
@@ -3017,6 +3011,7 @@ fn resolve_add_paths(
 
 fn collect_add_files(
     worktree_root: &Path,
+    git_dir: &Path,
     directory: &Path,
     out: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
@@ -3028,7 +3023,9 @@ fn collect_add_files(
         (Ok(left), Ok(right)) => left == right,
         _ => directory == worktree_root,
     };
-    if !is_root && sley_diff_merge::gitlink_git_dir(directory).is_some() {
+    let active_repository = sley_diff_merge::gitlink_git_dir(directory)
+        .is_some_and(|embedded| paths_refer_to_same_dir(&embedded, git_dir));
+    if !is_root && !active_repository && sley_diff_merge::gitlink_git_dir(directory).is_some() {
         out.insert(directory.to_path_buf());
         return Ok(());
     }
@@ -3039,7 +3036,7 @@ fn collect_add_files(
             continue;
         }
         if path.is_dir() {
-            collect_add_files(worktree_root, &path, out)?;
+            collect_add_files(worktree_root, git_dir, &path, out)?;
         } else {
             out.insert(path);
         }

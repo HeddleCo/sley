@@ -7475,7 +7475,7 @@ fn collect_untracked_directory_paths(
             continue;
         }
         if metadata.is_dir() {
-            if is_nested_repository_boundary(&path) {
+            if is_nested_repository_boundary(&path, git_dir) {
                 insert_untracked_directory(paths, &git_path);
                 continue;
             }
@@ -7485,6 +7485,8 @@ fn collect_untracked_directory_paths(
                 collect_untracked_directory_paths(
                     root, git_dir, &path, index, ignores, options, paths,
                 )?;
+            } else if active_repository_worktree_dir(&path, git_dir) {
+                insert_untracked_directory(paths, &git_path);
             } else if needs_descent {
                 // A pathspec reaches into this wholly-untracked directory. Git's
                 // `--directory` still rolls it up to `dir/` when a pathspec selects
@@ -7888,7 +7890,9 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     match context.untracked_mode {
                         StatusUntrackedMode::All => {
-                            if tracked_directory.is_none() && is_nested_repository_boundary(&path) {
+                            if tracked_directory.is_none()
+                                && is_nested_repository_boundary(&path, context.git_dir)
+                            {
                                 push_untracked_directory(paths, &git_path);
                             } else {
                                 collect_status_untracked_paths(context, &path, &git_path, paths)?;
@@ -7897,7 +7901,7 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                         StatusUntrackedMode::Normal => {
                             if tracked_directory.is_some() {
                                 collect_status_untracked_paths(context, &path, &git_path, paths)?;
-                            } else if is_nested_repository_boundary(&path) {
+                            } else if is_nested_repository_boundary(&path, context.git_dir) {
                                 push_untracked_directory(paths, &git_path);
                             } else if status_untracked_directory_has_file(
                                 context, &path, &git_path,
@@ -8013,7 +8017,9 @@ where
                     }
                     match context.untracked_mode {
                         StatusUntrackedMode::All => {
-                            if tracked_directory.is_none() && is_nested_repository_boundary(&path) {
+                            if tracked_directory.is_none()
+                                && is_nested_repository_boundary(&path, context.git_dir)
+                            {
                                 let directory_len = git_path.len();
                                 if git_path.last() != Some(&b'/') {
                                     git_path.push(b'/');
@@ -8038,7 +8044,7 @@ where
                                 {
                                     return Ok(StreamControl::Stop);
                                 }
-                            } else if is_nested_repository_boundary(&path)
+                            } else if is_nested_repository_boundary(&path, context.git_dir)
                                 || status_untracked_directory_has_file(context, &path, &git_path)?
                             {
                                 let directory_len = git_path.len();
@@ -8152,7 +8158,9 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     match context.untracked_mode {
                         StatusUntrackedMode::All => {
-                            if tracked_directory.is_none() && is_nested_repository_boundary(&path) {
+                            if tracked_directory.is_none()
+                                && is_nested_repository_boundary(&path, context.git_dir)
+                            {
                                 *count += 1;
                             } else {
                                 count_status_untracked_paths(context, &path, &git_path, count)?;
@@ -8161,7 +8169,7 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                         StatusUntrackedMode::Normal => {
                             if tracked_directory.is_some() {
                                 count_status_untracked_paths(context, &path, &git_path, count)?;
-                            } else if is_nested_repository_boundary(&path)
+                            } else if is_nested_repository_boundary(&path, context.git_dir)
                                 || status_untracked_directory_has_file(context, &path, &git_path)?
                             {
                                 *count += 1;
@@ -8258,7 +8266,7 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
                     if is_same_path(&path, context.git_dir) {
                         return Ok(None);
                     }
-                    if is_nested_repository_boundary(&path) {
+                    if is_nested_repository_boundary(&path, context.git_dir) {
                         return Ok(Some(true));
                     }
                     if status_untracked_directory_has_file(context, &path, &git_path)? {
@@ -8771,7 +8779,7 @@ fn directory_has_file(
             return Ok(true);
         }
         if metadata.is_dir() {
-            if is_nested_repository_boundary(&path) {
+            if is_nested_repository_boundary(&path, git_dir) {
                 continue;
             }
             if directory_has_file(&path, root, git_dir, ignores)? {
@@ -8883,7 +8891,7 @@ fn collect_ignored_untracked_paths(
         if metadata.is_dir() {
             let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
             if ignored && !index_has_path_under(context.index, &git_path) {
-                if context.directory || is_nested_repository_boundary(&path) {
+                if context.directory || is_nested_repository_boundary(&path, context.git_dir) {
                     let mut directory_path = git_path;
                     directory_path.push(b'/');
                     paths.insert(directory_path);
@@ -8891,7 +8899,7 @@ fn collect_ignored_untracked_paths(
                     collect_ignored_untracked_paths(context, &path, true, paths)?;
                 }
             } else {
-                if is_nested_repository_boundary(&path) {
+                if is_nested_repository_boundary(&path, context.git_dir) {
                     continue;
                 }
                 collect_ignored_untracked_paths(context, &path, ignored, paths)?;
@@ -18296,7 +18304,7 @@ fn collect_worktree_entries(
                 }
                 continue;
             }
-            if is_nested_repository_boundary(&path) {
+            if is_nested_repository_boundary(&path, context.git_dir) {
                 if let Some(tracked_paths) = context.tracked_paths
                     && !tracked_paths_may_contain(tracked_paths, &git_path)
                 {
@@ -18462,11 +18470,19 @@ fn is_dot_git_entry(path: &Path) -> bool {
 /// boundary (listing the directory as `dir/`); an *invalid* `.git` file (no
 /// resolvable `gitdir:` target) is not a boundary — Git descends into the
 /// directory and lists its other untracked contents normally.
-fn is_nested_repository_boundary(path: &Path) -> bool {
-    if path.join(".git").is_dir() {
+fn is_nested_repository_boundary(path: &Path, git_dir: &Path) -> bool {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        if is_same_path(&dot_git, git_dir) {
+            return false;
+        }
         return true;
     }
-    sley_diff_merge::gitlink_git_dir(path).is_some()
+    sley_diff_merge::gitlink_git_dir(path).is_some_and(|embedded| !is_same_path(&embedded, git_dir))
+}
+
+fn active_repository_worktree_dir(path: &Path, git_dir: &Path) -> bool {
+    sley_diff_merge::gitlink_git_dir(path).is_some_and(|embedded| is_same_path(&embedded, git_dir))
 }
 
 /// Whether `path` is an embedded repository's `.git` directory or a path inside it.

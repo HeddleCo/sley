@@ -562,6 +562,31 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             value if let Some(value) = value.strip_prefix("--format=") => {
                 format_spec = Some(value.to_string());
             }
+            value
+                if value.starts_with('-')
+                    && value.len() > 2
+                    && value[1..].bytes().all(|option| {
+                        matches!(
+                            option,
+                            b's' | b'c' | b'o' | b'd' | b'm' | b'u' | b'i' | b't' | b'z'
+                        )
+                    }) =>
+            {
+                for option in value[1..].bytes() {
+                    match option {
+                        b's' => stage = true,
+                        b'c' => cached = true,
+                        b'o' => others = true,
+                        b'd' => deleted = true,
+                        b'm' => modified = true,
+                        b'u' => unmerged = true,
+                        b'i' => ignored = true,
+                        b't' => tag = true,
+                        b'z' => nul = true,
+                        _ => unreachable!("ls-files short-option group was filtered"),
+                    }
+                }
+            }
             value if !value.starts_with('-') => path_args.push(arg.clone()),
             value => {
                 return Err(GitError::Command(format!(
