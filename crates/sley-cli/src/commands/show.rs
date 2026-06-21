@@ -169,7 +169,6 @@ struct ShowContext<'a> {
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     config: &'a GitConfig,
-    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
     options: &'a ShowOptions,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
@@ -314,13 +313,28 @@ impl super::grep_args::GrepArgOptions for ShowOptions {
 }
 
 pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
+    let profile_enabled = show_profile_enabled();
+    let profile_start = std::time::Instant::now();
+    let mut profile_last = profile_start;
     let mut options = parse_show_args(args)?;
+    show_profile_mark(
+        profile_enabled,
+        "parse_args",
+        profile_start,
+        &mut profile_last,
+    );
 
     let repo = RepositoryContext::discover_current()?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
+    show_profile_mark(
+        profile_enabled,
+        "discover",
+        profile_start,
+        &mut profile_last,
+    );
     if options.show_signature.is_none() {
         options.show_signature = Some(
             config
@@ -342,6 +356,12 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         }
         _ => options.decorate,
     };
+    show_profile_mark(
+        profile_enabled,
+        "signature_decor_mode",
+        profile_start,
+        &mut profile_last,
+    );
     let decorations: HashMap<ObjectId, Vec<String>> = if decoration_mode == LogDecorationMode::Off {
         HashMap::new()
     } else {
@@ -353,6 +373,12 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
             &crate::DecorationFilter::default(),
         )?
     };
+    show_profile_mark(
+        profile_enabled,
+        "decorations",
+        profile_start,
+        &mut profile_last,
+    );
 
     let mut setup_args = vec!["--default".to_string(), "HEAD".to_string()];
     setup_args.extend(options.setup_args.iter().cloned());
@@ -367,6 +393,12 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
             config: Some(config),
         },
     )?;
+    show_profile_mark(
+        profile_enabled,
+        "setup_revisions",
+        profile_start,
+        &mut profile_last,
+    );
     if let Some(leftover) = setup.leftovers.first() {
         return Err(GitError::Command(format!(
             "unsupported show option {leftover}"
@@ -385,25 +417,17 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 
     let mut shown_one = false;
     let mut stdout = io::stdout();
-    let userdiff = if options.diff_mode == ShowDiffMode::Patch && options.shows_patch_body() {
-        let attributes = repo
-            .worktree_root()
-            .ok()
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
-            .transpose()?;
-        Some(commands::userdiff::UserdiffResolver::with_attributes(
-            attributes,
-            Some(config.clone()),
-        ))
-    } else {
-        None
-    };
+    show_profile_mark(
+        profile_enabled,
+        "userdiff",
+        profile_start,
+        &mut profile_last,
+    );
     let context = ShowContext {
         git_dir,
         db,
         format,
         config,
-        userdiff: userdiff.as_ref(),
         options: &options,
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
@@ -418,6 +442,12 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         grep_kind,
         options.grep_ignore_case,
     )?;
+    show_profile_mark(
+        profile_enabled,
+        "grep_compile",
+        profile_start,
+        &mut profile_last,
+    );
     for tip in &setup.options.positives {
         if !show_tip_matches_grep(
             db,
@@ -438,8 +468,37 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
             false,
         )?;
     }
+    show_profile_mark(
+        profile_enabled,
+        "show_objects",
+        profile_start,
+        &mut profile_last,
+    );
     stdout.flush()?;
+    show_profile_mark(profile_enabled, "flush", profile_start, &mut profile_last);
     Ok(())
+}
+
+fn show_profile_enabled() -> bool {
+    std::env::var_os("SLEY_SHOW_PROFILE").is_some_and(|value| value != "0")
+}
+
+fn show_profile_mark(
+    enabled: bool,
+    label: &str,
+    start: std::time::Instant,
+    last: &mut std::time::Instant,
+) {
+    if !enabled {
+        return;
+    }
+    let now = std::time::Instant::now();
+    eprintln!(
+        "{{\"schema\":\"sley.show.profile.v1\",\"stage\":\"{label}\",\"delta_us\":{},\"total_us\":{}}}",
+        now.duration_since(*last).as_micros(),
+        now.duration_since(start).as_micros()
+    );
+    *last = now;
 }
 
 fn show_tip_matches_grep(
@@ -535,6 +594,9 @@ fn show_commit(
     shown_one: &mut bool,
     suppress_separator: bool,
 ) -> Result<()> {
+    let profile_enabled = show_profile_enabled();
+    let profile_start = std::time::Instant::now();
+    let mut profile_last = profile_start;
     let options = context.options;
     let decorations = context.decorations;
     let output_encoding = options
@@ -710,6 +772,12 @@ fn show_commit(
         }
     }
     *shown_one = true;
+    show_profile_mark(
+        profile_enabled,
+        "commit_header",
+        profile_start,
+        &mut profile_last,
+    );
 
     // Every format — including `--oneline` — still shows the patch (this is
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
@@ -721,7 +789,8 @@ fn show_commit(
             .get_bool("log", None, "showroot")
             .unwrap_or(true)
     });
-    let entries = if commit.parents.is_empty() && !show_root {
+    let needs_first_parent_entries = show_commit_needs_first_parent_entries(options, merge_mode);
+    let entries = if !needs_first_parent_entries || (commit.parents.is_empty() && !show_root) {
         Vec::new()
     } else {
         commit_diff_entries(
@@ -733,8 +802,14 @@ fn show_commit(
             commit,
         )?
     };
+    show_profile_mark(
+        profile_enabled,
+        "commit_diff_entries",
+        profile_start,
+        &mut profile_last,
+    );
 
-    write_commit_trailer(
+    let result = write_commit_trailer(
         stdout,
         context,
         CommitTrailerLayout {
@@ -746,7 +821,25 @@ fn show_commit(
         },
         commit,
         &entries,
-    )
+    );
+    show_profile_mark(
+        profile_enabled,
+        "commit_trailer",
+        profile_start,
+        &mut profile_last,
+    );
+    result
+}
+
+fn show_commit_needs_first_parent_entries(
+    options: &ShowOptions,
+    merge_mode: ShowMergeMode,
+) -> bool {
+    // Combined merge patch/name output is derived from all parents in
+    // `write_show_combined`. The first-parent entry list only feeds the stat
+    // family, so avoid flattening and diffing two full trees for plain
+    // `git show --oneline <merge>`.
+    !matches!(merge_mode, ShowMergeMode::Combined { .. }) || merge_renders_stat(options)
 }
 
 fn show_commit_separate_merge(
@@ -907,7 +1000,7 @@ fn write_commit_trailer(
         // A combined merge renders a body for every active diff mode (the
         // combined patch, the first-parent stat family, or the combined
         // name/name-status listing).
-        diff_active && !entries.is_empty()
+        diff_active && (!merge_renders_stat(options) || !entries.is_empty())
     } else if layout.is_merge && !first_parent_merge {
         diff_active && merge_renders_stat(options) && !entries.is_empty()
     } else {
@@ -948,7 +1041,6 @@ fn write_commit_trailer(
                 context.db,
                 context.format,
                 context.config,
-                context.userdiff,
                 options,
                 entries,
             )
@@ -1191,7 +1283,6 @@ fn write_commit_diff(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
-    userdiff: Option<&commands::userdiff::UserdiffResolver>,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
@@ -1215,9 +1306,9 @@ fn write_commit_diff(
             }
             Ok(())
         }
-        ShowDiffMode::Patch => write_commit_diff_patch(
-            stdout, git_dir, db, format, config, userdiff, options, entries,
-        ),
+        ShowDiffMode::Patch => {
+            write_commit_diff_patch(stdout, git_dir, db, format, config, options, entries)
+        }
     }
 }
 
@@ -1230,7 +1321,6 @@ fn write_commit_diff_patch(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
-    userdiff: Option<&commands::userdiff::UserdiffResolver>,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
@@ -1299,6 +1389,14 @@ fn write_commit_diff_patch(
         if wrote_prefix {
             writeln!(stdout)?;
         }
+        let userdiff_attributes = worktree_root_for_git_dir(git_dir)
+            .ok()
+            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .transpose()?;
+        let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+            userdiff_attributes,
+            Some(config.clone()),
+        );
         let colors = options
             .color_always
             .then(|| commands::diff_words::DiffColors::enabled(Some(config)));
@@ -1316,7 +1414,7 @@ fn write_commit_diff_patch(
                 src_prefix: "a/",
                 dst_prefix: "b/",
                 context: 3,
-                userdiff,
+                userdiff: Some(&userdiff),
                 colors: colors.as_ref(),
                 word_diff: word_request.as_ref(),
                 no_index_contents: None,

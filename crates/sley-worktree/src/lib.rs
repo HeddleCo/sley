@@ -18,7 +18,7 @@ use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry
 use sley_odb::{FileObjectDatabase, ObjectPresenceChecker, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -2694,12 +2694,26 @@ pub fn refresh_untracked_cache_after_status(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
+    let untracked_cache_setting = config.get("core", None, "untrackedCache");
+    match untracked_cache_setting {
+        Some("keep") | None => {
+            if !repository_index_has_extension(git_dir, format, b"UNTR")? {
+                return Ok(());
+            }
+        }
+        Some("false" | "no" | "off" | "0") | Some("true" | "yes" | "on" | "1") => {}
+        Some(_) => {
+            if !repository_index_has_extension(git_dir, format, b"UNTR")? {
+                return Ok(());
+            }
+        }
+    }
     let mut index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
         empty_index()
     };
-    match config.get("core", None, "untrackedCache") {
+    match untracked_cache_setting {
         Some("false") | Some("no") | Some("off") | Some("0") => {
             index.set_untracked_cache(format, None)?;
             write_repository_index_ref(git_dir, format, &index)?;
@@ -2729,6 +2743,19 @@ pub fn refresh_untracked_cache_after_status(
     index.set_untracked_cache(format, Some(&cache))?;
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
+}
+
+fn repository_index_has_extension(
+    git_dir: &Path,
+    format: ObjectFormat,
+    signature: &[u8; 4],
+) -> Result<bool> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(false);
+    }
+    let bytes = read_borrowed_index_bytes(&index_path)?;
+    sley_index::Index::bytes_have_extension(bytes.as_ref(), format, signature)
 }
 
 pub fn emit_untracked_cache_bypass_trace() {
@@ -4025,6 +4052,44 @@ struct StatusProfileCounters {
 }
 
 const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 1024;
+const STATUS_WORKER_STACK_SIZE: usize = 32 * 1024;
+
+fn spawn_status_worker<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: F,
+) -> Result<std::thread::ScopedJoinHandle<'scope, Result<T>>>
+where
+    F: FnOnce() -> Result<T> + Send + 'scope,
+    T: Send + 'scope,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(STATUS_WORKER_STACK_SIZE)
+        .spawn_scoped(scope, f)
+        .map_err(|err| GitError::Command(format!("failed to spawn status worker `{name}`: {err}")))
+}
+
+enum BorrowedIndexBytes {
+    Owned(Vec<u8>),
+    Mapped(sley_mmap::MappedFile),
+}
+
+impl AsRef<[u8]> for BorrowedIndexBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes.as_bytes(),
+        }
+    }
+}
+
+fn read_borrowed_index_bytes(index_path: &Path) -> Result<BorrowedIndexBytes> {
+    match sley_mmap::MappedFile::open_index(index_path) {
+        Ok(mapped) => Ok(BorrowedIndexBytes::Mapped(mapped)),
+        Err(_) => Ok(BorrowedIndexBytes::Owned(fs::read(index_path)?)),
+    }
+}
 
 impl StatusProfileCounters {
     fn enabled() -> bool {
@@ -4822,8 +4887,8 @@ fn short_status_borrowed_head_matches_index_if_possible(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let index_bytes = fs::read(&index_path)?;
-    let borrowed = match BorrowedIndex::parse(&index_bytes, format) {
+    let index_bytes = read_borrowed_index_bytes(&index_path)?;
+    let borrowed = match BorrowedIndex::parse(index_bytes.as_ref(), format) {
         Ok(index) => index,
         Err(GitError::Unsupported(_)) => return Ok(None),
         Err(err) => return Err(err),
@@ -4929,7 +4994,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
     if profile_enabled {
         let (mut entries, untracked_paths, untracked_profile) =
             std::thread::scope(|scope| -> Result<_> {
-                let tracked = scope.spawn(|| {
+                let tracked = spawn_status_worker(scope, "status-tracked", || {
                     let start = Instant::now();
                     short_status_borrowed_tracked_only_head_matches_index_parallel(
                         worktree_root,
@@ -4941,23 +5006,27 @@ fn short_status_borrowed_head_matches_index_if_possible(
                         untracked_mode,
                     )
                     .map(|entries| (entries, start.elapsed().as_micros()))
-                });
-                let untracked = scope.spawn(|| -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
-                    let mut local_profile = StatusProfileCounters::default();
-                    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                    let start = Instant::now();
-                    let paths = status_untracked_paths_from_borrowed_index(
-                        worktree_root,
-                        git_dir,
-                        &borrowed,
-                        &mut ignores,
-                        untracked_mode,
-                        Some(&mut local_profile),
-                    )?;
-                    local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-                    local_profile.untracked_rows = paths.len() as u64;
-                    Ok((paths, local_profile))
-                });
+                })?;
+                let untracked = spawn_status_worker(
+                    scope,
+                    "status-untracked",
+                    || -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
+                        let mut local_profile = StatusProfileCounters::default();
+                        let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+                        let start = Instant::now();
+                        let paths = status_untracked_paths_from_borrowed_index(
+                            worktree_root,
+                            git_dir,
+                            &borrowed,
+                            &mut ignores,
+                            untracked_mode,
+                            Some(&mut local_profile),
+                        )?;
+                        local_profile.untracked_elapsed_us = start.elapsed().as_micros();
+                        local_profile.untracked_rows = paths.len() as u64;
+                        Ok((paths, local_profile))
+                    },
+                )?;
                 let (entries, tracked_elapsed_us) = tracked
                     .join()
                     .map_err(|_| GitError::Command("status worker panicked".into()))??;
@@ -4983,7 +5052,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
         return Ok(Some(entries));
     }
     let (mut entries, untracked_paths) = std::thread::scope(|scope| -> Result<_> {
-        let tracked = scope.spawn(|| {
+        let tracked = spawn_status_worker(scope, "status-tracked", || {
             short_status_borrowed_tracked_only_head_matches_index_parallel(
                 worktree_root,
                 git_dir,
@@ -4993,18 +5062,19 @@ fn short_status_borrowed_head_matches_index_if_possible(
                 sparse_checkout_active,
                 untracked_mode,
             )
-        });
-        let untracked = scope.spawn(|| -> Result<Vec<Vec<u8>>> {
-            let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-            status_untracked_paths_from_borrowed_index(
-                worktree_root,
-                git_dir,
-                &borrowed,
-                &mut ignores,
-                untracked_mode,
-                None,
-            )
-        });
+        })?;
+        let untracked =
+            spawn_status_worker(scope, "status-untracked", || -> Result<Vec<Vec<u8>>> {
+                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+                status_untracked_paths_from_borrowed_index(
+                    worktree_root,
+                    git_dir,
+                    &borrowed,
+                    &mut ignores,
+                    untracked_mode,
+                    None,
+                )
+            })?;
         let entries = tracked
             .join()
             .map_err(|_| GitError::Command("status worker panicked".into()))??;
@@ -5045,8 +5115,8 @@ where
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let index_bytes = fs::read(&index_path)?;
-    let borrowed = match BorrowedIndex::parse(&index_bytes, format) {
+    let index_bytes = read_borrowed_index_bytes(&index_path)?;
+    let borrowed = match BorrowedIndex::parse(index_bytes.as_ref(), format) {
         Ok(index) => index,
         Err(GitError::Unsupported(_)) => return Ok(None),
         Err(err) => return Err(err),
@@ -5161,22 +5231,26 @@ where
     }
     let (tracked_control, untracked_paths, untracked_profile) =
         std::thread::scope(|scope| -> Result<_> {
-            let untracked = scope.spawn(|| -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
-                let mut local_profile = StatusProfileCounters::default();
-                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                let start = Instant::now();
-                let paths = status_untracked_paths_from_borrowed_index(
-                    worktree_root,
-                    git_dir,
-                    &borrowed,
-                    &mut ignores,
-                    untracked_mode,
-                    profile_enabled.then_some(&mut local_profile),
-                )?;
-                local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-                local_profile.untracked_rows = paths.len() as u64;
-                Ok((paths, local_profile))
-            });
+            let untracked = spawn_status_worker(
+                scope,
+                "status-untracked",
+                || -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
+                    let mut local_profile = StatusProfileCounters::default();
+                    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+                    let start = Instant::now();
+                    let paths = status_untracked_paths_from_borrowed_index(
+                        worktree_root,
+                        git_dir,
+                        &borrowed,
+                        &mut ignores,
+                        untracked_mode,
+                        profile_enabled.then_some(&mut local_profile),
+                    )?;
+                    local_profile.untracked_elapsed_us = start.elapsed().as_micros();
+                    local_profile.untracked_rows = paths.len() as u64;
+                    Ok((paths, local_profile))
+                },
+            )?;
             let tracked_start = Instant::now();
             let tracked_control =
                 stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
@@ -5249,8 +5323,8 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let index_bytes = fs::read(&index_path)?;
-    let borrowed = match BorrowedIndex::parse(&index_bytes, format) {
+    let index_bytes = read_borrowed_index_bytes(&index_path)?;
+    let borrowed = match BorrowedIndex::parse(index_bytes.as_ref(), format) {
         Ok(index) => index,
         Err(GitError::Unsupported(_)) => return Ok(None),
         Err(err) => return Err(err),
@@ -5343,7 +5417,7 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
     }
     let (tracked_count, untracked_count, untracked_profile) =
         std::thread::scope(|scope| -> Result<_> {
-            let tracked = scope.spawn(|| {
+            let tracked = spawn_status_worker(scope, "status-tracked", || {
                 let start = Instant::now();
                 short_status_borrowed_tracked_only_head_matches_index_count_parallel(
                     worktree_root,
@@ -5355,23 +5429,27 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
                     untracked_mode,
                 )
                 .map(|count| (count, start.elapsed().as_micros()))
-            });
-            let untracked = scope.spawn(|| -> Result<(usize, StatusProfileCounters)> {
-                let mut local_profile = StatusProfileCounters::default();
-                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                let start = Instant::now();
-                let count = status_untracked_count_from_borrowed_index(
-                    worktree_root,
-                    git_dir,
-                    &borrowed,
-                    &mut ignores,
-                    untracked_mode,
-                    profile_enabled.then_some(&mut local_profile),
-                )?;
-                local_profile.untracked_elapsed_us = start.elapsed().as_micros();
-                local_profile.untracked_rows = count as u64;
-                Ok((count, local_profile))
-            });
+            })?;
+            let untracked = spawn_status_worker(
+                scope,
+                "status-untracked",
+                || -> Result<(usize, StatusProfileCounters)> {
+                    let mut local_profile = StatusProfileCounters::default();
+                    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+                    let start = Instant::now();
+                    let count = status_untracked_count_from_borrowed_index(
+                        worktree_root,
+                        git_dir,
+                        &borrowed,
+                        &mut ignores,
+                        untracked_mode,
+                        profile_enabled.then_some(&mut local_profile),
+                    )?;
+                    local_profile.untracked_elapsed_us = start.elapsed().as_micros();
+                    local_profile.untracked_rows = count as u64;
+                    Ok((count, local_profile))
+                },
+            )?;
             let (tracked_count, tracked_elapsed_us) = tracked
                 .join()
                 .map_err(|_| GitError::Command("status worker panicked".into()))??;
@@ -5922,7 +6000,7 @@ fn tracked_only_non_clean_prechecks_parallel(
     let max_workers = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
-        .min(16);
+        .min(4);
     let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
     if worker_count == 1 {
         let mut prechecks = Vec::new();
@@ -5951,29 +6029,33 @@ fn tracked_only_non_clean_prechecks_parallel(
     let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
         let mut handles = Vec::new();
         for chunk in normal_indices.chunks(chunk_size) {
-            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
-                let mut prechecks = Vec::new();
-                let mut absolute = PathBuf::new();
-                for &idx in chunk {
-                    let entry = &index.entries[idx];
-                    match tracked_only_stat_precheck(
-                        worktree_root,
-                        entry,
-                        stat_cache,
-                        sparse_checkout_active,
-                        &mut absolute,
-                    )? {
-                        TrackedOnlyPrecheckOutcome::Clean => {}
-                        TrackedOnlyPrecheckOutcome::Deleted => {
-                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
-                        }
-                        TrackedOnlyPrecheckOutcome::Slow => {
-                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+            handles.push(spawn_status_worker(
+                scope,
+                "status-precheck",
+                move || -> Result<Vec<TrackedOnlyPrecheck>> {
+                    let mut prechecks = Vec::new();
+                    let mut absolute = PathBuf::new();
+                    for &idx in chunk {
+                        let entry = &index.entries[idx];
+                        match tracked_only_stat_precheck(
+                            worktree_root,
+                            entry,
+                            stat_cache,
+                            sparse_checkout_active,
+                            &mut absolute,
+                        )? {
+                            TrackedOnlyPrecheckOutcome::Clean => {}
+                            TrackedOnlyPrecheckOutcome::Deleted => {
+                                prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                            }
+                            TrackedOnlyPrecheckOutcome::Slow => {
+                                prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                            }
                         }
                     }
-                }
-                Ok(prechecks)
-            }));
+                    Ok(prechecks)
+                },
+            )?);
         }
         let mut prechecks = Vec::new();
         for handle in handles {
@@ -6008,7 +6090,7 @@ fn tracked_only_borrowed_non_clean_prechecks_parallel(
     let max_workers = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
-        .min(16);
+        .min(4);
     let worker_count = max_workers.min(normal_indices.len().div_ceil(512)).max(1);
     if worker_count == 1 {
         let mut prechecks = Vec::new();
@@ -6037,29 +6119,33 @@ fn tracked_only_borrowed_non_clean_prechecks_parallel(
     let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
         let mut handles = Vec::new();
         for chunk in normal_indices.chunks(chunk_size) {
-            handles.push(scope.spawn(move || -> Result<Vec<TrackedOnlyPrecheck>> {
-                let mut prechecks = Vec::new();
-                let mut absolute = PathBuf::new();
-                for &idx in chunk {
-                    let entry = &index.entries[idx];
-                    match tracked_only_borrowed_stat_precheck(
-                        worktree_root,
-                        entry,
-                        stat_cache,
-                        sparse_checkout_active,
-                        &mut absolute,
-                    )? {
-                        TrackedOnlyPrecheckOutcome::Clean => {}
-                        TrackedOnlyPrecheckOutcome::Deleted => {
-                            prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
-                        }
-                        TrackedOnlyPrecheckOutcome::Slow => {
-                            prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+            handles.push(spawn_status_worker(
+                scope,
+                "status-precheck",
+                move || -> Result<Vec<TrackedOnlyPrecheck>> {
+                    let mut prechecks = Vec::new();
+                    let mut absolute = PathBuf::new();
+                    for &idx in chunk {
+                        let entry = &index.entries[idx];
+                        match tracked_only_borrowed_stat_precheck(
+                            worktree_root,
+                            entry,
+                            stat_cache,
+                            sparse_checkout_active,
+                            &mut absolute,
+                        )? {
+                            TrackedOnlyPrecheckOutcome::Clean => {}
+                            TrackedOnlyPrecheckOutcome::Deleted => {
+                                prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                            }
+                            TrackedOnlyPrecheckOutcome::Slow => {
+                                prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                            }
                         }
                     }
-                }
-                Ok(prechecks)
-            }));
+                    Ok(prechecks)
+                },
+            )?);
         }
         let mut prechecks = Vec::new();
         for handle in handles {
@@ -6977,29 +7063,36 @@ impl StatusTrackedLookup for IndexStatusLookup<'_> {
 
 struct BorrowedIndexLookup<'a> {
     entries: &'a [IndexEntryRef<'a>],
-    tracked: HashMap<&'a [u8], StatusTrackedKind>,
+    exact_cursor: Cell<usize>,
 }
 
 impl<'a> BorrowedIndexLookup<'a> {
     fn new(entries: &'a [IndexEntryRef<'a>]) -> Self {
-        let mut tracked = HashMap::with_capacity(entries.len());
-        for entry in entries {
-            if entry.stage() != Stage::Normal {
-                continue;
-            }
-            let path = entry.path;
-            tracked.insert(
-                path,
-                StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree()),
-            );
+        Self {
+            entries,
+            exact_cursor: Cell::new(0),
         }
-        Self { entries, tracked }
     }
 }
 
 impl StatusTrackedLookup for BorrowedIndexLookup<'_> {
     fn tracked_kind(&self, git_path: &[u8]) -> Option<StatusTrackedKind> {
-        self.tracked.get(git_path).copied()
+        let mut start = self.exact_cursor.get().min(self.entries.len());
+        if start == self.entries.len() || self.entries[start].path > git_path {
+            start = self.entries.partition_point(|entry| entry.path < git_path);
+        } else {
+            while start < self.entries.len() && self.entries[start].path < git_path {
+                start += 1;
+            }
+        }
+        self.exact_cursor.set(start);
+        self.entries[start..]
+            .iter()
+            .take_while(|entry| entry.path == git_path)
+            .find(|entry| entry.stage() == Stage::Normal)
+            .map(|entry| {
+                StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree())
+            })
     }
 
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind> {

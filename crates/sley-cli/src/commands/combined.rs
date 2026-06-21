@@ -42,6 +42,9 @@ pub(crate) fn combined_paths(
     parent_trees: &[ObjectId],
 ) -> Result<Vec<CombinedPath>> {
     let num_parent = parent_trees.len();
+    let Some(first_parent_tree) = parent_trees.first() else {
+        return Ok(Vec::new());
+    };
     let rename_options = sley_diff_merge::RenameDetectionOptions {
         base: sley_diff_merge::DiffNameStatusOptions {
             detect_renames: false,
@@ -53,42 +56,132 @@ pub(crate) fn combined_paths(
         rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
     };
-    let mut per_parent: Vec<BTreeMap<Vec<u8>, sley_diff_merge::NameStatusEntry>> =
-        Vec::with_capacity(num_parent);
-    for parent_tree in parent_trees {
-        let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
-            db,
-            format,
-            parent_tree,
-            result_tree,
-            rename_options,
-        )?;
-        per_parent.push(entries.into_iter().map(|e| (e.path.to_vec(), e)).collect());
-    }
 
+    let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+        db,
+        format,
+        first_parent_tree,
+        result_tree,
+        rename_options,
+    )?;
+    first_parent_entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
     let mut paths = Vec::new();
-    if let Some(first) = per_parent.first() {
-        'paths: for (path, first_entry) in first {
-            let mut parents = Vec::with_capacity(num_parent);
-            for map in &per_parent {
-                let Some(entry) = map.get(path) else {
-                    continue 'paths;
-                };
-                parents.push(CombinedParentEntry {
-                    mode: entry.old_mode.unwrap_or(0),
-                    oid: entry.old_oid,
-                    status: entry.status.code(),
-                });
-            }
-            paths.push(CombinedPath {
-                path: path.clone(),
-                result_mode: first_entry.new_mode.unwrap_or(0),
-                result_oid: first_entry.new_oid,
-                parents,
+    'paths: for first_entry in first_parent_entries {
+        let path = first_entry.path.as_bytes();
+        let result_entry = TreePathEntry::from_new_side(&first_entry);
+        let first_parent_entry = TreePathEntry::from_old_side(&first_entry);
+        let Some(first_status) = combined_parent_status(first_parent_entry, result_entry) else {
+            continue;
+        };
+        let mut parents = Vec::with_capacity(num_parent);
+        parents.push(CombinedParentEntry {
+            mode: first_parent_entry.map(|entry| entry.mode).unwrap_or(0),
+            oid: first_parent_entry.map(|entry| entry.oid),
+            status: first_status,
+        });
+        for parent_tree in &parent_trees[1..] {
+            let parent_entry = tree_path_entry(db, format, parent_tree, path)?;
+            let Some(status) = combined_parent_status(parent_entry, result_entry) else {
+                continue 'paths;
+            };
+            parents.push(CombinedParentEntry {
+                mode: parent_entry.map(|entry| entry.mode).unwrap_or(0),
+                oid: parent_entry.map(|entry| entry.oid),
+                status,
             });
         }
+        paths.push(CombinedPath {
+            path: path.to_vec(),
+            result_mode: result_entry.map(|entry| entry.mode).unwrap_or(0),
+            result_oid: result_entry.map(|entry| entry.oid),
+            parents,
+        });
     }
     Ok(paths)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TreePathEntry {
+    mode: u32,
+    oid: ObjectId,
+}
+
+impl TreePathEntry {
+    fn from_old_side(entry: &sley_diff_merge::NameStatusEntry) -> Option<Self> {
+        Some(Self {
+            mode: entry.old_mode?,
+            oid: entry.old_oid?,
+        })
+    }
+
+    fn from_new_side(entry: &sley_diff_merge::NameStatusEntry) -> Option<Self> {
+        Some(Self {
+            mode: entry.new_mode?,
+            oid: entry.new_oid?,
+        })
+    }
+}
+
+fn combined_parent_status(
+    parent: Option<TreePathEntry>,
+    result: Option<TreePathEntry>,
+) -> Option<char> {
+    match (parent, result) {
+        (None, Some(_)) => Some('A'),
+        (Some(_), None) => Some('D'),
+        (Some(parent), Some(result)) if parent != result => Some('M'),
+        _ => None,
+    }
+}
+
+fn tree_path_entry(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    path: &[u8],
+) -> Result<Option<TreePathEntry>> {
+    let mut current = *tree_oid;
+    let mut components = path
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+        .peekable();
+    if components.peek().is_none() {
+        return Ok(Some(TreePathEntry {
+            mode: 0o040000,
+            oid: current,
+        }));
+    }
+    while let Some(component) = components.next() {
+        let object = db.read_object(&current)?;
+        if object.object_type != ObjectType::Tree {
+            return Err(GitError::InvalidObject(format!(
+                "expected tree {current}, found {}",
+                object.object_type.as_str()
+            )));
+        }
+        let mut found = None;
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry?;
+            if entry.name == component {
+                found = Some(TreePathEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                });
+                break;
+            }
+        }
+        let Some(entry) = found else {
+            return Ok(None);
+        };
+        if components.peek().is_none() {
+            return Ok(Some(entry));
+        }
+        if entry.mode != 0o040000 {
+            return Ok(None);
+        }
+        current = entry.oid;
+    }
+    Ok(None)
 }
 
 /// Options shared by the combined raw / patch writers.

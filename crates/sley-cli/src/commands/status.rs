@@ -357,20 +357,15 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         untracked_mode,
     };
     let pathspec = StatusPathspec::new(&cwd, &worktree_root, &path_args)?;
-    // Resolve the per-submodule ignore setting (command line > `.git/config` >
-    // `.gitmodules` > `diff.ignoreSubmodules`) and apply it to the worktree-side
-    // submodule change detail, exactly as git's handle_ignore_submodules_arg ahead
-    // of the diff. Computed before the relativePaths display rewrite so gitlink
-    // lookups use worktree-root-relative paths.
-    let ignore_resolver = SubmoduleIgnoreResolver::load(&git_dir, &config, ignore_submodules_arg)?;
     if !porcelain_v2 && (z || short) {
         print_status_short_stream(
             &worktree_root,
             &git_dir,
             format,
+            &config,
             status_options,
             &pathspec,
-            &ignore_resolver,
+            ignore_submodules_arg,
             StatusShortStreamDisplay {
                 branch,
                 ahead_behind,
@@ -393,6 +388,12 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
+    // Resolve the per-submodule ignore setting (command line > `.git/config` >
+    // `.gitmodules` > `diff.ignoreSubmodules`) and apply it to the worktree-side
+    // submodule change detail, exactly as git's handle_ignore_submodules_arg ahead
+    // of the diff. Computed before the relativePaths display rewrite so gitlink
+    // lookups use worktree-root-relative paths.
+    let ignore_resolver = SubmoduleIgnoreResolver::load(&git_dir, &config, ignore_submodules_arg)?;
     let collection_options = status_collection_options_for_pathspec(status_options, &pathspec);
     let mut entries = crate::collect_short_status_with_options(
         &worktree_root,
@@ -429,11 +430,13 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         }
     }
     if porcelain_v2 {
-        print_status_porcelain_v2(&git_dir, format, entries, branch, ahead_behind, z)?;
+        print_status_porcelain_v2(&git_dir, format, &config, entries, branch, ahead_behind, z)?;
     } else if z {
         let mut stdout = io::stdout().lock();
         if branch {
-            stdout.write_all(status_branch_header(&git_dir, format, ahead_behind)?.as_bytes())?;
+            stdout.write_all(
+                status_branch_header(&git_dir, format, &config, ahead_behind)?.as_bytes(),
+            )?;
             stdout.write_all(&[0])?;
         }
         for entry in entries {
@@ -443,7 +446,10 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         }
     } else if short {
         if branch {
-            println!("{}", status_branch_header(&git_dir, format, ahead_behind)?);
+            println!(
+                "{}",
+                status_branch_header(&git_dir, format, &config, ahead_behind)?
+            );
         }
         for entry in entries {
             // `--short` (but not --porcelain) refines a submodule's worktree
@@ -583,19 +589,21 @@ fn print_status_short_stream(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     options: sley_worktree::ShortStatusOptions,
     pathspec: &StatusPathspec,
-    ignore_resolver: &SubmoduleIgnoreResolver,
+    ignore_submodules_arg: Option<IgnoreSubmodules>,
     display: StatusShortStreamDisplay,
 ) -> Result<()> {
     if display.z {
         let mut stdout = io::stdout().lock();
         if display.branch {
             stdout.write_all(
-                status_branch_header(git_dir, format, display.ahead_behind)?.as_bytes(),
+                status_branch_header(git_dir, format, config, display.ahead_behind)?.as_bytes(),
             )?;
             stdout.write_all(&[0])?;
         }
+        let mut ignore_resolver = None;
         sley_worktree::stream_short_status_with_options(
             worktree_root,
             git_dir,
@@ -606,7 +614,17 @@ fn print_status_short_stream(
                     return Ok(sley_worktree::StreamControl::Continue);
                 }
                 let mut entry = entry.to_owned_entry();
-                if !apply_submodule_ignore_entry(&mut entry, ignore_resolver) {
+                if status_entry_needs_submodule_ignore(&entry)
+                    && !apply_submodule_ignore_entry(
+                        &mut entry,
+                        lazy_submodule_ignore_resolver(
+                            &mut ignore_resolver,
+                            git_dir,
+                            config,
+                            ignore_submodules_arg,
+                        )?,
+                    )
+                {
                     return Ok(sley_worktree::StreamControl::Continue);
                 }
                 write!(stdout, "{}{} ", entry.index as char, entry.worktree as char)?;
@@ -622,9 +640,10 @@ fn print_status_short_stream(
     if display.branch {
         println!(
             "{}",
-            status_branch_header(git_dir, format, display.ahead_behind)?
+            status_branch_header(git_dir, format, config, display.ahead_behind)?
         );
     }
+    let mut ignore_resolver = None;
     if display.detect_renames {
         let collection_options = status_collection_options_for_pathspec(options, pathspec);
         let mut entries = crate::collect_short_status_with_options(
@@ -636,7 +655,15 @@ fn print_status_short_stream(
         if pathspec.has_filters() {
             entries.retain(|entry| pathspec.matches(&entry.path));
         }
-        apply_submodule_ignore(&mut entries, ignore_resolver);
+        apply_submodule_ignore(
+            &mut entries,
+            lazy_submodule_ignore_resolver(
+                &mut ignore_resolver,
+                git_dir,
+                config,
+                ignore_submodules_arg,
+            )?,
+        );
         entries = status_collapse_pathspec_untracked_entries(entries, options, pathspec);
         for entry in status_entries_with_exact_renames(entries) {
             let mut entry = entry;
@@ -680,7 +707,17 @@ fn print_status_short_stream(
                 return Ok(sley_worktree::StreamControl::Continue);
             }
             let mut entry = entry.to_owned_entry();
-            if !apply_submodule_ignore_entry(&mut entry, ignore_resolver) {
+            if status_entry_needs_submodule_ignore(&entry)
+                && !apply_submodule_ignore_entry(
+                    &mut entry,
+                    lazy_submodule_ignore_resolver(
+                        &mut ignore_resolver,
+                        git_dir,
+                        config,
+                        ignore_submodules_arg,
+                    )?,
+                )
+            {
                 return Ok(sley_worktree::StreamControl::Continue);
             }
             if !display.porcelain_v1 && display.relative_paths {
@@ -814,6 +851,31 @@ fn status_entries_are_exact_rename(
         && added.worktree == b' '
         && deleted.head_mode == added.index_mode
         && deleted.head_oid == added.index_oid
+}
+
+fn status_entry_needs_submodule_ignore(entry: &sley_worktree::ShortStatusEntry) -> bool {
+    entry.submodule.is_some()
+        || entry.head_mode.is_some_and(sley_index::is_gitlink)
+        || entry.index_mode.is_some_and(sley_index::is_gitlink)
+        || entry.worktree_mode.is_some_and(sley_index::is_gitlink)
+}
+
+fn lazy_submodule_ignore_resolver<'a>(
+    resolver: &'a mut Option<SubmoduleIgnoreResolver>,
+    git_dir: &Path,
+    config: &GitConfig,
+    ignore_submodules_arg: Option<IgnoreSubmodules>,
+) -> Result<&'a SubmoduleIgnoreResolver> {
+    if resolver.is_none() {
+        *resolver = Some(SubmoduleIgnoreResolver::load(
+            git_dir,
+            config,
+            ignore_submodules_arg,
+        )?);
+    }
+    Ok(resolver
+        .as_ref()
+        .expect("submodule ignore resolver initialized"))
 }
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
@@ -954,6 +1016,7 @@ impl StatusPathspec {
 fn print_status_porcelain_v2(
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     entries: Vec<sley_worktree::ShortStatusEntry>,
     branch: bool,
     ahead_behind: bool,
@@ -962,7 +1025,7 @@ fn print_status_porcelain_v2(
     let mut stdout = io::stdout().lock();
     let separator = if z { b'\0' } else { b'\n' };
     if branch {
-        for header in status_porcelain_v2_branch_headers(git_dir, format, ahead_behind)? {
+        for header in status_porcelain_v2_branch_headers(git_dir, format, config, ahead_behind)? {
             stdout.write_all(header.as_bytes())?;
             stdout.write_all(&[separator])?;
         }
@@ -2851,9 +2914,15 @@ pub(crate) fn status_long_tracking_lines(
             );
             sink.blank();
         }
-    } else if let Some(tracking) =
-        status_branch_tracking(git_dir, format, store, branch_ref, oid, ahead_behind)?
-    {
+    } else if let Some(tracking) = status_branch_tracking(
+        git_dir,
+        format,
+        store,
+        &config,
+        branch_ref,
+        oid,
+        ahead_behind,
+    )? {
         status_long_tracking_state_lines(
             &tracking,
             suppress_divergence_advice,
@@ -3032,6 +3101,7 @@ fn status_porcelain_v2_code(code: u8) -> char {
 fn status_porcelain_v2_branch_headers(
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     ahead_behind: bool,
 ) -> Result<Vec<String>> {
     let store = FileRefStore::new(git_dir, format);
@@ -3054,8 +3124,15 @@ fn status_porcelain_v2_branch_headers(
                 format!("# branch.head {head}"),
             ];
             if let Some(oid) = target_oid.as_ref()
-                && let Some(tracking) =
-                    status_branch_tracking(git_dir, format, &store, &target, oid, ahead_behind)?
+                && let Some(tracking) = status_branch_tracking(
+                    git_dir,
+                    format,
+                    &store,
+                    config,
+                    &target,
+                    oid,
+                    ahead_behind,
+                )?
             {
                 headers.push(format!("# branch.upstream {}", tracking.upstream));
                 match tracking.state {
@@ -3084,6 +3161,7 @@ fn status_porcelain_v2_branch_headers(
 fn status_branch_header(
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     ahead_behind: bool,
 ) -> Result<String> {
     let store = FileRefStore::new(git_dir, format);
@@ -3096,6 +3174,7 @@ fn status_branch_header(
                         git_dir,
                         format,
                         &store,
+                        config,
                         &target,
                         &oid,
                         ahead_behind,
@@ -3143,20 +3222,44 @@ fn status_branch_tracking(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
     branch_ref: &str,
     oid: &ObjectId,
     ahead_behind: bool,
 ) -> Result<Option<StatusBranchTracking>> {
-    let config = read_repo_config(git_dir)?;
-    let Some(upstream) = for_each_ref_upstream(&config, branch_ref) else {
+    let Some(upstream) = for_each_ref_upstream(config, branch_ref) else {
         return Ok(None);
     };
-    let db = FileObjectDatabase::new(repository_objects_dir(git_dir), format);
+    let gone_track = ForEachRefTrack {
+        ahead: 0,
+        behind: 0,
+        gone: true,
+    };
     let track = if ahead_behind {
         match store.read_ref(&upstream.refname)? {
             None => StatusBranchTrackingState::Gone,
-            Some(_) => {
-                for_each_ref_upstream_track(store, git_dir, &db, format, oid, &upstream.refname)?
+            Some(upstream_target) => {
+                let upstream_ref = sley_refs::Ref {
+                    name: upstream.refname.clone(),
+                    target: upstream_target,
+                };
+                let Some((upstream_oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)?
+                else {
+                    return Ok(Some(StatusBranchTracking {
+                        upstream: for_each_ref_short_name(&upstream.refname).to_string(),
+                        state: StatusBranchTrackingState::Counts(gone_track),
+                    }));
+                };
+                if oid == &upstream_oid {
+                    Some(ForEachRefTrack {
+                        ahead: 0,
+                        behind: 0,
+                        gone: false,
+                    })
+                } else {
+                    let db = FileObjectDatabase::new(repository_objects_dir(git_dir), format);
+                    for_each_ref_ahead_behind(git_dir, &db, format, oid, &upstream_oid)?
+                }
             }
             .map(StatusBranchTrackingState::Counts)
             .unwrap_or(StatusBranchTrackingState::Different),
