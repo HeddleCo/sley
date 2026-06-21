@@ -1788,6 +1788,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
                 writeln!(stdout)?;
             }
+            let combined_unmerged = if plain_index_worktree_diff {
+                diff_unmerged_worktree_combined_paths(&git_dir, worktree_root.as_deref(), format)?
+            } else {
+                BTreeMap::new()
+            };
+            let mut wrote_combined_unmerged = BTreeSet::new();
             let colors = color_always
                 .then(|| commands::diff_words::DiffColors::enabled(repo_config.as_ref()));
             let word_request = word_diff_mode.map(|mode| WordDiffRequest {
@@ -1815,6 +1821,19 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 })
                 .transpose()?;
             for entry in &entries {
+                if let Some(combined) = combined_unmerged.get(entry.path.as_bytes()) {
+                    if wrote_combined_unmerged.insert(entry.path.as_bytes().to_vec()) {
+                        write_diff_unmerged_worktree_combined(
+                            &mut stdout,
+                            &db,
+                            combined,
+                            patch_abbrev,
+                            &src_prefix,
+                            &dst_prefix,
+                        )?;
+                    }
+                    continue;
+                }
                 let ws_error = match (ws_resolver.as_ref(), ws_error_kinds) {
                     (Some(resolver), Some(kinds)) => {
                         let rule = if kinds.plain {
@@ -2025,6 +2044,116 @@ fn write_diff_combined_three_tree(
         stdout.write_all(&out)?;
     }
     Ok(!out.is_empty())
+}
+
+struct UnmergedWorktreeCombinedPath {
+    path: Vec<u8>,
+    ours: ObjectId,
+    theirs: ObjectId,
+    worktree: Vec<u8>,
+}
+
+fn diff_unmerged_worktree_combined_paths(
+    git_dir: &Path,
+    worktree_root: Option<&Path>,
+    format: ObjectFormat,
+) -> Result<BTreeMap<Vec<u8>, UnmergedWorktreeCombinedPath>> {
+    let Some(worktree_root) = worktree_root else {
+        return Ok(BTreeMap::new());
+    };
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let index = Index::parse(&fs::read(index_path)?, format)?;
+    let mut stages: BTreeMap<Vec<u8>, (Option<ObjectId>, Option<ObjectId>)> = BTreeMap::new();
+    for entry in index.entries {
+        let slot = stages
+            .entry(entry.path.as_bytes().to_vec())
+            .or_insert((None, None));
+        match entry.stage() {
+            sley_index::Stage::Ours => slot.0 = Some(entry.oid),
+            sley_index::Stage::Theirs => slot.1 = Some(entry.oid),
+            _ => {}
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (path, (ours, theirs)) in stages {
+        let (Some(ours), Some(theirs)) = (ours, theirs) else {
+            continue;
+        };
+        let worktree_path = worktree_root.join(repo_path_to_path(&path));
+        let Ok(worktree) = fs::read(worktree_path) else {
+            continue;
+        };
+        out.insert(
+            path.clone(),
+            UnmergedWorktreeCombinedPath {
+                path,
+                ours,
+                theirs,
+                worktree,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn write_diff_unmerged_worktree_combined(
+    stdout: &mut impl Write,
+    db: &FileObjectDatabase,
+    path: &UnmergedWorktreeCombinedPath,
+    abbrev: usize,
+    src_prefix: &str,
+    dst_prefix: &str,
+) -> Result<()> {
+    let ours = read_blob(db, &path.ours)?;
+    let theirs = read_blob(db, &path.theirs)?;
+    let ours_lines = diff_split_lines(&ours);
+    let theirs_lines = diff_split_lines(&theirs);
+    let worktree_lines = diff_split_lines(&path.worktree);
+    let ours_abbrev = diff_abbrev_oid(&path.ours, abbrev);
+    let theirs_abbrev = diff_abbrev_oid(&path.theirs, abbrev);
+    let quoted = status_quote_path(&path.path, false);
+    writeln!(stdout, "diff --cc {quoted}")?;
+    writeln!(stdout, "index {ours_abbrev},{theirs_abbrev}..0000000")?;
+    writeln!(stdout, "--- {src_prefix}{quoted}")?;
+    writeln!(stdout, "+++ {dst_prefix}{quoted}")?;
+    writeln!(
+        stdout,
+        "@@@ -1,{} -1,{} +1,{} @@@",
+        ours_lines.len().max(1),
+        theirs_lines.len().max(1),
+        worktree_lines.len().max(1)
+    )?;
+    for line in worktree_lines {
+        let in_ours = ours_lines.contains(&line);
+        let in_theirs = theirs_lines.contains(&line);
+        let prefix = match (in_ours, in_theirs) {
+            (true, true) => b"  ".as_slice(),
+            (true, false) => b" +".as_slice(),
+            (false, true) => b"+ ".as_slice(),
+            (false, false) => b"++".as_slice(),
+        };
+        stdout.write_all(prefix)?;
+        stdout.write_all(line)?;
+        if !line.ends_with(b"\n") {
+            stdout.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn diff_split_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
+        Vec::new()
+    } else {
+        bytes.split_inclusive(|byte| *byte == b'\n').collect()
+    }
+}
+
+fn diff_abbrev_oid(oid: &ObjectId, width: usize) -> String {
+    oid.to_hex().chars().take(width).collect()
 }
 
 fn write_line_prefixed(stdout: &mut dyn Write, bytes: &[u8], prefix: &[u8]) -> Result<()> {

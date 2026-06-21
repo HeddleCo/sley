@@ -3081,6 +3081,20 @@ fn set_resolve_undo_extension(index: &mut Index, records: &[ResolveUndoRecord]) 
     Ok(())
 }
 
+pub fn clear_resolve_undo(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<()> {
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    match fs::read(&index_path) {
+        Ok(bytes) => {
+            let mut index = Index::parse(&bytes, format)?;
+            set_resolve_undo_extension(&mut index, &[])?;
+            write_repository_index_ref(git_dir, format, &index)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn append_index_extension(out: &mut Vec<u8>, signature: &[u8; 4], body: &[u8]) -> Result<()> {
     let len = u32::try_from(body.len())
         .map_err(|_| GitError::InvalidFormat("index extension body too large".into()))?;
@@ -3123,11 +3137,37 @@ fn preserved_index_extensions(git_dir: &Path, format: ObjectFormat) -> Result<Ve
     match fs::read(&index_path) {
         Ok(bytes) => {
             let index = Index::parse(&bytes, format)?;
-            Ok(index_extensions_without_cache_tree(&index.extensions))
+            Ok(index_extensions_without_cache_tree_or_resolve_undo(
+                &index.extensions,
+            ))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err.into()),
     }
+}
+
+fn index_extensions_without_cache_tree_or_resolve_undo(extensions: &[u8]) -> Vec<u8> {
+    let mut filtered = Vec::new();
+    let mut offset = 0usize;
+    while offset + 8 <= extensions.len() {
+        let signature = &extensions[offset..offset + 4];
+        let len = u32::from_be_bytes([
+            extensions[offset + 4],
+            extensions[offset + 5],
+            extensions[offset + 6],
+            extensions[offset + 7],
+        ]) as usize;
+        let end = offset + 8 + len;
+        if end > extensions.len() {
+            filtered.extend_from_slice(&extensions[offset..]);
+            break;
+        }
+        if signature != b"TREE" && signature != b"REUC" {
+            filtered.extend_from_slice(&extensions[offset..end]);
+        }
+        offset = end;
+    }
+    filtered
 }
 
 fn repository_index_is_split(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
@@ -13981,6 +14021,23 @@ pub fn checkout_index_paths(
     })
 }
 
+pub fn unresolve_index_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<()> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    checkout_unmerge_resolve_undo_paths(worktree_root, &mut index, format, paths)?;
+    write_repository_index_ref(git_dir, format, &index)
+}
+
 fn checkout_selected_index_paths(
     worktree_root: &Path,
     index: &Index,
@@ -14060,9 +14117,7 @@ fn checkout_unmerge_resolve_undo_paths(
         }
     }
     if unmerged_any {
-        index
-            .entries
-            .sort_by(|left, right| left.path.cmp(&right.path));
+        index.entries.sort_by(compare_index_key);
         normalize_index_version_for_extended_flags(index);
         set_resolve_undo_extension(index, &remaining)?;
     }
