@@ -97,7 +97,7 @@ struct SubmoduleStatusOptions<'a> {
 
 #[derive(Debug)]
 pub(crate) struct SubmoduleConfigEntry {
-    name: String,
+    pub(crate) name: String,
     pub(crate) path: String,
     url: Option<String>,
     update: Option<String>,
@@ -3112,6 +3112,64 @@ pub(crate) fn index_gitlink_submodule_configs(
         });
     }
     Ok(submodules)
+}
+
+pub(crate) fn ensure_populated_gitlinks_readable(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let Some(index) = read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    for entry in index.entries {
+        if !sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        let Ok(path) = String::from_utf8(entry.path.to_vec()) else {
+            continue;
+        };
+        let sub_root = worktree_root.join(path);
+        if sley_diff_merge::gitlink_git_dir(&sub_root).is_some() {
+            ensure_gitlink_head_readable(&sub_root, format)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_gitlink_head_readable(sub_root: &Path, format: ObjectFormat) -> Result<()> {
+    let Some(git_dir) = sley_diff_merge::gitlink_git_dir(sub_root) else {
+        return Ok(());
+    };
+    let store = FileRefStore::new(&git_dir, format);
+    let mut target = store
+        .read_ref("HEAD")?
+        .ok_or_else(|| broken_submodule_repository(&git_dir))?;
+    for _ in 0..10 {
+        match target {
+            RefTarget::Direct(oid) => {
+                let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+                let object = db
+                    .read_object(&oid)
+                    .map_err(|_| broken_submodule_repository(&git_dir))?;
+                if object.object_type == ObjectType::Commit {
+                    return Ok(());
+                }
+                return Err(broken_submodule_repository(&git_dir));
+            }
+            RefTarget::Symbolic(name) => {
+                target = store
+                    .read_ref(&name)?
+                    .ok_or_else(|| broken_submodule_repository(&git_dir))?;
+            }
+        }
+    }
+    Err(broken_submodule_repository(&git_dir))
+}
+
+fn broken_submodule_repository(git_dir: &Path) -> GitError {
+    eprintln!("fatal: not a git repository: {}", git_dir.display());
+    GitError::Exit(128)
 }
 
 /// Re-stringify a typed update strategy back to the raw `.gitmodules` value the

@@ -351,6 +351,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     // the core.bare+core.worktree conflict) when one isn't available.
     let worktree_root = require_work_tree(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    commands::submodule::ensure_populated_gitlinks_readable(&worktree_root, &git_dir, format)?;
     let status_options = sley_worktree::ShortStatusOptions {
         include_ignored: show_ignored,
         ignored_mode,
