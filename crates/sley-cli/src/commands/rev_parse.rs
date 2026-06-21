@@ -777,7 +777,7 @@ fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) ->
     Ok(index
         .entries
         .iter()
-        .any(|entry| entry.path == path.as_bytes()))
+        .any(|entry| !entry.is_sparse_dir() && entry.path == path.as_bytes()))
 }
 
 fn rev_parse_repository_index_path(git_dir: &Path) -> PathBuf {
