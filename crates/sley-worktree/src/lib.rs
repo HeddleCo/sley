@@ -12700,7 +12700,9 @@ pub fn deleted_index_entries(
     let index = Index::parse(&fs::read(index_path)?, format)?;
     let mut deleted = Vec::new();
     for entry in index.entries {
-        if !worktree_path(worktree_root, entry.path.as_bytes())?.exists() {
+        if !worktree_path(worktree_root, entry.path.as_bytes())?.exists()
+            && !index_entry_skip_worktree(&entry)
+        {
             deleted.push(entry);
         }
     }
@@ -12718,24 +12720,31 @@ pub fn modified_index_entries(
     if !index_path.exists() {
         return Ok(Vec::new());
     }
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        expand_sparse_index(&mut index, &db, format)?;
+    }
     // Reuse the same racy-git stat shortcut here: build the cache from the index
     // we just parsed (no second parse) so the worktree walk can skip re-hashing
     // unchanged files. A cached oid is only trusted on a non-racy stat match, so
     // genuinely modified files still fall through to a hash and are reported.
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
-    let worktree = worktree_entries_with_stat_cache(
-        worktree_root,
-        git_dir,
-        format,
-        Some(&stat_cache),
-        None,
-        None,
-    )?;
     let mut modified = Vec::new();
     for entry in index.entries {
-        let Some(worktree_entry) = worktree.get(entry.path.as_bytes()) else {
-            modified.push(entry);
+        let worktree_entry = worktree_entry_for_git_path(
+            worktree_root,
+            git_dir,
+            format,
+            entry.path.as_bytes(),
+            &entry.oid,
+            entry.mode,
+            Some(&stat_cache),
+        )?;
+        let Some(worktree_entry) = worktree_entry else {
+            if !index_entry_skip_worktree(&entry) {
+                modified.push(entry);
+            }
             continue;
         };
         if worktree_entry.mode != entry.mode || worktree_entry.oid != entry.oid {

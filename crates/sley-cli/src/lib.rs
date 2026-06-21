@@ -152,6 +152,7 @@ pub(crate) use repository::RepositoryContext;
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let global = apply_global_options(&args)?;
+    sley_core::trace2::touch();
     // `-c` / `--config-env` overrides are folded into the process
     // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
     // `injected_config_parameters()` reader is the source of truth for every
