@@ -26,9 +26,10 @@ use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
-    ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest,
-    RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
+    ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus,
+    ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
+    UploadPackRawPackfileResponse,
     UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     encode_receive_pack_features, encode_upload_pack_features,
     read_protocol_v2_command_request, read_upload_pack_negotiation_request, read_upload_pack_request,
@@ -217,9 +218,10 @@ pub fn receive_pack_into_local_repository(
         |packfile| remote_db.install_raw_pack(packfile).map(|_| ()),
         |oid| remote_db.contains(oid),
         |commands| {
+            let commands = canonical_receive_pack_update_commands(&remote_store, commands)?;
             let mut tx = remote_store.transaction();
             let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-            for command in commands {
+            for command in &commands {
                 let precondition = if command.old_id.is_null() {
                     RefPrecondition::MustNotExist
                 } else {
@@ -352,9 +354,10 @@ pub fn receive_pack_reachable_pack_into_local_repository(
         },
         |oid| remote_db.contains(oid),
         |commands| {
+            let commands = canonical_receive_pack_update_commands(&remote_store, commands)?;
             let mut tx = remote_store.transaction();
             let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-            for command in commands {
+            for command in &commands {
                 let precondition = if command.old_id.is_null() {
                     RefPrecondition::MustNotExist
                 } else {
@@ -385,6 +388,33 @@ pub fn receive_pack_reachable_pack_into_local_repository(
                 .map_err(|err| GitError::Transaction(err.to_string()))
         },
     )
+}
+
+fn canonical_receive_pack_update_commands(
+    store: &FileRefStore,
+    commands: &[ReceivePackCommand],
+) -> Result<Vec<ReceivePackCommand>> {
+    let mut by_actual = HashMap::<String, ObjectId>::new();
+    let mut canonical = Vec::with_capacity(commands.len());
+    for command in commands {
+        let name = match store.read_ref(&command.name)? {
+            Some(RefTarget::Symbolic(target)) => target,
+            Some(RefTarget::Direct(_)) | None => command.name.clone(),
+        };
+        if let Some(existing) = by_actual.get(&name) {
+            if existing != &command.new_id {
+                return Err(GitError::Command("refusing inconsistent update".into()));
+            }
+        } else {
+            by_actual.insert(name.clone(), command.new_id);
+        }
+        canonical.push(ReceivePackCommand {
+            old_id: command.old_id,
+            new_id: command.new_id,
+            name,
+        });
+    }
+    Ok(canonical)
 }
 
 /// The ref advertisements a local repository would send to a fetching client:
