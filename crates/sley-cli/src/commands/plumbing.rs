@@ -2934,6 +2934,12 @@ fn normalize_add_absolute_path(cwd: &Path, path: &Path) -> PathBuf {
     } else {
         cwd.join(path)
     };
+    if let Some(name) = absolute.file_name()
+        && let Some(parent) = absolute.parent()
+        && let Ok(canonical_parent) = fs::canonicalize(parent)
+    {
+        return canonical_parent.join(name);
+    }
     if let Ok(canonical) = fs::canonicalize(&absolute) {
         return canonical;
     }

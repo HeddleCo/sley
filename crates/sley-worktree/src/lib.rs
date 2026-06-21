@@ -2060,11 +2060,23 @@ fn update_index_paths_impl(
             }
             let Some(head_oid) = sley_diff_merge::gitlink_head_oid(&absolute, format) else {
                 if has_dot_git {
-                    eprintln!("error: '{display}' does not have a commit checked out");
+                    if clean_config.is_some() {
+                        let display_dir = if display.ends_with('/') {
+                            display.clone()
+                        } else {
+                            format!("{display}/")
+                        };
+                        eprintln!("error: '{display_dir}' does not have a commit checked out");
+                        eprintln!("error: unable to index file '{display_dir}'");
+                        eprintln!("fatal: adding files failed");
+                    } else {
+                        eprintln!("error: '{display}' does not have a commit checked out");
+                        eprintln!("fatal: Unable to process path {display}");
+                    }
                 } else {
                     eprintln!("error: {display}: is a directory - add files inside instead");
+                    eprintln!("fatal: Unable to process path {display}");
                 }
-                eprintln!("fatal: Unable to process path {display}");
                 return Err(GitError::Exit(128));
             };
             if path_chmod.is_some() {
