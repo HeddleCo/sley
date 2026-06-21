@@ -118,6 +118,7 @@ jobs:
             t1461-refs-list.sh
             t1462-refs-exists.sh
             t1500-rev-parse.sh
+            t1501-work-tree.sh
             t1506-rev-parse-diagnosis.sh
             t1510-repo-setup.sh
             t1800-hook.sh
@@ -262,6 +263,7 @@ jobs:
             t4209-log-pickaxe.sh
             t4211-line-log.sh
             t5300-pack-object.sh
+            t5317-pack-objects-filter-objects.sh
             t5302-pack-index.sh
             t5303-pack-corruption-resilience.sh
             t5304-prune.sh

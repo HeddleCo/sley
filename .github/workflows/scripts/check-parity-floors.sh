@@ -393,7 +393,10 @@ declare -A FLOOR=(
     # reachability, worktree-local reflogs, branch/tag reflog cleanup. t1410 20->41 FULL;
     # side gain t1463 43->45. Auto-merge w/ wave-10 (branch.rs/log.rs/pack.rs) held:
     # t6040=44 t4205=110 t7700=29 t3404=80.
+    # wave-29 (2026-06-21, fresh-sweep): sparse-compat DEEPER 41->61 (+20: ls-files/cached-index/update-index
+    # clusters; hard state-change clusters remain); work-tree resolution 25->39/39 (NEW); pack --filter 14->33/33 (NEW).
     [t1500-rev-parse.sh]=81
+    [t1501-work-tree.sh]=39
     [t1506-rev-parse-diagnosis.sh]=30
     [t2400-worktree-add.sh]=214
     # codex-wave-11 (worktree repair): re-link .git file + worktrees/<id>/gitdir
@@ -597,6 +600,7 @@ declare -A FLOOR=(
     # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
     [t4211-line-log.sh]=70
     [t5300-pack-object.sh]=55
+    [t5317-pack-objects-filter-objects.sh]=33
     [t5302-pack-index.sh]=31
     [t5303-pack-corruption-resilience.sh]=31
     [t5304-prune.sh]=32
@@ -709,7 +713,7 @@ declare -A FLOOR=(
     # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
     # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
     [t1091-sparse-checkout-builtin.sh]=64
-    [t1092-sparse-checkout-compatibility.sh]=41
+    [t1092-sparse-checkout-compatibility.sh]=61
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
