@@ -154,6 +154,9 @@ jobs:
             t2012-checkout-last.sh
             t5605-clone-local.sh
             t1508-at-combinations.sh
+            t5604-clone-reference.sh
+            t1417-reflog-updateref.sh
+            t2401-worktree-prune.sh
             t2204-add-ignored.sh
             t6020-bundle-misc.sh
             t4068-diff-symmetric-merge-base.sh

@@ -954,6 +954,19 @@ declare -A FLOOR=(
     [t2012-checkout-last.sh]=22
     [t5605-clone-local.sh]=23
     [t1508-at-combinations.sh]=35
+    # wave-34 (2026-06-21, sweep-picked off main 8fd7bb3d): clone-reference, reflog-updateref,
+    # worktree-prune. t5604-clone-reference 24->31 (banked 30, 1-cell clone-family margin; --reference
+    # alternates borrow, --dissociate repack/unlink, multi-ref dedup, incomplete-alternates fetch;
+    # 3 residual symlink object-dir cells deferred). t1417-reflog-updateref 9->21 FULL (reflog
+    # expire rejects @{N} selectors, --updateref/--rewrite). t2401-worktree-prune 4->13 FULL (gone/
+    # corrupt/unreadable gitdir, locked-skip, --expire, dry-run/verbose reasons, dup admin cleanup).
+    # No file collisions (sley-remote / sley-cli refs.rs / sley-cli worktree.rs). All 3 re-verified
+    # on the MERGED binary. clonereref's fetch work also unblocked t5510-fetch to run 109/214 cells
+    # (was truncating at 7; floor stays 7). Guards held/gained: t5601=108 t5605=23 t2400=215 t2402=27
+    # t1400=275 t1404=38 t1450=96 t2012=22 t2018=25 t5512=40 t5516=110 t5526=56 t7508=119. cargo test green.
+    [t5604-clone-reference.sh]=30
+    [t1417-reflog-updateref.sh]=21
+    [t2401-worktree-prune.sh]=13
 )
 
 fail=0
