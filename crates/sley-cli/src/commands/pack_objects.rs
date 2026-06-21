@@ -59,6 +59,7 @@ struct PackObjectsOptions {
     thin: bool,
     write_bitmap_index: bool,
     name_hash_version: Option<i32>,
+    max_pack_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +132,11 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             // sley packs everything into one cruft pack; the split-by-size
             // knobs are accepted (the single-pack result still passes the
             // mtimes/contents assertions the suite checks for most cases).
-            value
-                if !saw_dashdash
-                    && (value.starts_with("--max-pack-size=")
-                        || value.starts_with("--max-cruft-size=")) => {}
+            value if !saw_dashdash && value.starts_with("--max-pack-size=") => {
+                let value = &value["--max-pack-size=".len()..];
+                options.max_pack_size = Some(parse_pack_size_limit_arg(value)?);
+            }
+            value if !saw_dashdash && value.starts_with("--max-cruft-size=") => {}
             // Delta-search tuning. sley's writer picks deltas itself, so only
             // the window/depth==0 "disable deltas" case changes behaviour; the
             // rest are accepted as no-ops (their numeric value never alters the
@@ -214,6 +216,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
+    let max_pack_size =
+        pack_objects_pack_size_limit(&git_dir, options.max_pack_size, options.stdout_mode)?;
 
     if options.cruft {
         return write_cruft_pack(&git_dir, &common_git_dir, &database, format, &options, progress);
@@ -278,6 +282,26 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let written_total = oids.len() as u64 + pack_reused;
     if options.path_walk && progress {
         eprintln!("Compressing objects by path: 100% ({written_total}/{written_total}), done.");
+    }
+
+    if !options.stdout_mode
+        && reused_packs.is_empty()
+        && let Some(limit) = max_pack_size
+    {
+        let base_name = options.base_name.expect("checked above");
+        let delta_count = write_split_pack_files(
+            &base_name,
+            format,
+            &oids,
+            &objects,
+            &pack_write_options,
+            options.index_version,
+            limit,
+        )?;
+        let stats_line =
+            pack_objects_stats_line(written_total, delta_count, pack_reused, packs_reused);
+        emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
+        return Ok(());
     }
 
     let result = if !reused_packs.is_empty() {
@@ -370,6 +394,123 @@ fn pack_objects_write_options(git_dir: &Path) -> Result<PackWriteOptions> {
         options = options.with_window(0).with_depth(0).with_reorder(false);
     }
     Ok(options)
+}
+
+fn parse_pack_size_limit_arg(value: &str) -> Result<u64> {
+    let Some(parsed) = sley_config::parse_config_int(value) else {
+        eprintln!("fatal: failed to parse --max-pack-size value '{value}'");
+        return Err(GitError::Exit(128));
+    };
+    if parsed < 0 {
+        eprintln!("fatal: failed to parse --max-pack-size value '{value}'");
+        return Err(GitError::Exit(128));
+    }
+    Ok(parsed as u64)
+}
+
+fn pack_objects_pack_size_limit(
+    git_dir: &Path,
+    arg_limit: Option<u64>,
+    stdout_mode: bool,
+) -> Result<Option<u64>> {
+    let config = read_repo_config(git_dir)?;
+    let mut limit = arg_limit;
+    if !stdout_mode
+        && limit.is_none()
+        && let Some(value) = config.get("pack", None, "packSizeLimit")
+        && let Some(parsed) = sley_config::parse_config_int(value)
+        && parsed > 0
+    {
+        limit = Some(parsed as u64);
+    }
+    if stdout_mode && arg_limit.is_some() {
+        eprintln!("fatal: --max-pack-size cannot be used to build a pack for transfer");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(size) = limit
+        && size < 1024 * 1024
+    {
+        eprintln!("warning: minimum pack size limit is 1 MiB");
+        return Ok(Some(1024 * 1024));
+    }
+    Ok(limit)
+}
+
+fn write_split_pack_files(
+    base_name: &str,
+    format: ObjectFormat,
+    oids: &[ObjectId],
+    objects: &[Arc<EncodedObject>],
+    options: &PackWriteOptions,
+    index_version: Option<u32>,
+    limit: u64,
+) -> Result<u32> {
+    let mut total_delta_count = 0u32;
+    for range in split_pack_ranges(objects, limit) {
+        let inputs: Vec<PackInput<'_>> = oids[range.clone()]
+            .iter()
+            .zip(&objects[range])
+            .map(|(oid, object)| PackInput {
+                oid,
+                object: object.as_ref(),
+            })
+            .collect();
+        let written = PackFile::write_packed_with_known_ids_and_options(&inputs, format, options)?;
+        total_delta_count += written.delta_count;
+        write_pack_file_parts(
+            base_name,
+            format,
+            written.pack,
+            written.index,
+            written.entries,
+            written.checksum,
+            index_version,
+        )?;
+    }
+    Ok(total_delta_count)
+}
+
+fn split_pack_ranges(objects: &[Arc<EncodedObject>], limit: u64) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current_size = 0u64;
+    for (idx, object) in objects.iter().enumerate() {
+        let estimate = object.body.len() as u64 + 32;
+        if idx > start && current_size.saturating_add(estimate) > limit {
+            ranges.push(start..idx);
+            start = idx;
+            current_size = 0;
+        }
+        current_size = current_size.saturating_add(estimate);
+    }
+    if start < objects.len() {
+        ranges.push(start..objects.len());
+    }
+    ranges
+}
+
+fn write_pack_file_parts(
+    base_name: &str,
+    format: ObjectFormat,
+    pack: Vec<u8>,
+    index: Vec<u8>,
+    entries: Vec<sley_pack::PackIndexEntry>,
+    checksum: ObjectId,
+    index_version: Option<u32>,
+) -> Result<()> {
+    let positions = pack_order_index_positions(&entries);
+    let reverse_index = PackReverseIndex::write(format, &positions, &checksum)?;
+    let index_bytes = if index_version == Some(1) {
+        PackIndex::write_v1(format, &entries, &checksum)?
+    } else {
+        index
+    };
+    let checksum_hex = checksum.to_hex();
+    fs::write(format!("{base_name}-{checksum_hex}.pack"), &pack)?;
+    fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
+    fs::write(format!("{base_name}-{checksum_hex}.idx"), &index_bytes)?;
+    println!("{checksum_hex}");
+    Ok(())
 }
 
 fn sort_no_delta_traversal_pack(
