@@ -52,7 +52,10 @@ pub enum FetchSource {
     /// (the credential seam is unused — the `ssh` program owns authentication).
     Ssh(RemoteUrl),
     /// A native anonymous `git://` remote at the given already-resolved URL.
-    Git(RemoteUrl),
+    Git {
+        remote: RemoteUrl,
+        protocol_v2: bool,
+    },
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -435,9 +438,19 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             )?;
             advertisements
         }
-        FetchSource::Git(remote) => {
-            let (advertisements, features) =
-                crate::git::git_upload_pack_advertisements(remote, request.format)?;
+        FetchSource::Git {
+            remote,
+            protocol_v2,
+        } => {
+            let protocol_v2 =
+                *protocol_v2 || request.config.get("protocol", None, "version") == Some("2");
+            let discovered = crate::git::git_upload_pack_advertisements_with_protocol(
+                remote,
+                request.format,
+                protocol_v2,
+            )?;
+            let advertisements = discovered.refs;
+            let features = discovered.features;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
             let mut updates = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
@@ -464,6 +477,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
+                    protocol_v2: discovered.protocol_v2,
                 },
             )?;
             if !options.dry_run {
@@ -723,7 +737,7 @@ fn scheme_for_fetch_source(source: &FetchSource) -> &'static str {
     match source {
         FetchSource::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
         FetchSource::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
-        FetchSource::Git(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        FetchSource::Git { remote, .. } => crate::protocol::transport_scheme_for_remote(remote),
         FetchSource::Local { .. } => "file",
     }
 }

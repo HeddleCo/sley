@@ -112,7 +112,14 @@ pub fn ls_remote(
             "HTTP transport is not enabled in this build".into(),
         )),
         LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
-        LsRemoteSource::Git(remote) => crate::git::ls_remote_git(remote, filter, matches),
+        LsRemoteSource::Git(remote) => crate::git::ls_remote_git(
+            remote,
+            filter,
+            matches,
+            config
+                .and_then(|config| config.get("protocol", None, "version"))
+                == Some("2"),
+        ),
         LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
     }
 }

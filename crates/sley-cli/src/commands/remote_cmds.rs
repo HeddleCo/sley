@@ -1349,7 +1349,12 @@ fn clone_network_repository(
             )?
         }
         CloneNetworkTransport::Git => {
-            sley_remote::git_upload_pack_advertisements(&remote, ObjectFormat::Sha1)?
+            let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
+                &remote,
+                ObjectFormat::Sha1,
+                configured_protocol_version(None) == Some(ProtocolVersion::V2),
+            )?;
+            (discovered.refs, discovered.features)
         }
     };
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
@@ -1396,7 +1401,10 @@ fn clone_network_repository(
     let submodule_active = options.submodule_active;
     let remote_source = match transport {
         CloneNetworkTransport::Ssh => sley_remote::CloneSource::Ssh(remote),
-        CloneNetworkTransport::Git => sley_remote::CloneSource::Git(remote),
+        CloneNetworkTransport::Git => sley_remote::CloneSource::Git {
+            remote,
+            protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
+        },
     };
     let clone_options = sley_remote::CloneOptions {
         origin,
@@ -1526,7 +1534,10 @@ fn clone_bare_network_repository(
     let config = repo_config_with_transport_policy(&git_dir)?;
     let source = match transport {
         CloneNetworkTransport::Ssh => sley_remote::FetchSource::Ssh(remote),
-        CloneNetworkTransport::Git => sley_remote::FetchSource::Git(remote),
+        CloneNetworkTransport::Git => sley_remote::FetchSource::Git {
+            remote,
+            protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
+        },
     };
     let mut refspecs = if options.single_branch {
         vec![format!("+refs/heads/{checkout_branch}:refs/heads/{checkout_branch}")]
@@ -4851,6 +4862,21 @@ fn trace_protocol_v2_ls_refs_request(server_options: &[String]) {
     sley_protocol::trace_packet_write_payload(b"0000");
 }
 
+fn configured_server_options(config: &GitConfig, remote: &str) -> Result<Vec<String>> {
+    let mut options = Vec::new();
+    for value in config.get_all("remote", Some(remote), "serverOption") {
+        match value {
+            Some("") => options.clear(),
+            Some(value) => options.push(value.to_string()),
+            None => {
+                eprintln!("error: missing value for 'remote.{remote}.serveroption'");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+    Ok(options)
+}
+
 fn protocol_version_for_trace2(config: &GitConfig) -> &'static str {
     match config.get("protocol", None, "version") {
         Some("1") => "1",
@@ -6823,9 +6849,12 @@ fn fetch_git_repository_with_outcome(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<sley_remote::FetchOutcome> {
-    let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let fetch_source = sley_remote::FetchSource::Git(remote);
+    let config = read_repo_config(git_dir)?;
+    let fetch_source = sley_remote::FetchSource::Git {
+        remote,
+        protocol_v2: configured_protocol_version(Some(&config)) == Some(ProtocolVersion::V2),
+    };
     run_fetch(
         git_dir,
         format,
@@ -7139,7 +7168,7 @@ fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
-    let options = parse_ls_remote_options(args)?;
+    let mut options = parse_ls_remote_options(args)?;
     let repository = options.repository.as_deref().unwrap_or("origin");
     validate_configured_remote_refspecs(repository)?;
     if options.get_url {
@@ -7152,6 +7181,13 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         .map(repository_object_format)
         .transpose()?;
     let transport_config = transport_policy_config_for_cwd()?;
+    if options.server_options.is_empty() {
+        options.server_options = configured_server_options(&transport_config, repository)?;
+    } else if configured_protocol_version(Some(&transport_config)) != Some(ProtocolVersion::V2) {
+        eprintln!("fatal: server options require protocol version 2 or later");
+        eprintln!("fatal: see protocol.version in 'git help config' for more details");
+        return Err(GitError::Exit(128));
+    }
     let resolved_repository = ls_remote_resolved_url(repository)?;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
 

@@ -53,7 +53,8 @@ pub use ssh::{
 
 mod git;
 pub use git::{
-    GitFetchPackRequest, git_upload_pack_advertisements, install_fetch_pack_via_git_upload_pack,
+    GitFetchPackRequest, git_upload_pack_advertisements,
+    git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,
 };
 
 mod local;
