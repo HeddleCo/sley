@@ -273,7 +273,12 @@ where
                 return;
             }
         };
-        self.check_loaded_object_content(oid, &object, false);
+        if self.check_loaded_object_content(oid, &object, false) {
+            return;
+        }
+        if object.object_type == ObjectType::Tree {
+            self.check_unreachable_tree_paths(&object.body);
+        }
     }
 
     /// Check a ref-reachable root. The driver validates the ref tip itself
@@ -354,8 +359,11 @@ where
                 f.msg_id.camel(),
                 f.detail,
             );
+            let masked_tag_ident = object.object_type == ObjectType::Tag
+                && is_tag_ident_msg(f.msg_id)
+                && !f.fatal;
             let issue = if f.severity == content::Severity::Error
-                && (fail_nonfatal_errors || f.fatal)
+                && (fail_nonfatal_errors || !masked_tag_ident)
             {
                 FsckIssue::content_error(msg)
             } else {
@@ -504,6 +512,23 @@ where
                     oid: entry.oid,
                 },
             );
+        }
+    }
+
+    fn check_unreachable_tree_paths(&mut self, body: &[u8]) {
+        let Ok(entries) =
+            TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>()
+        else {
+            return;
+        };
+        for entry in entries {
+            let is_symlink = entry.mode == 0o120000;
+            if !is_symlink && content::is_dotgitmodules_name(entry.name) {
+                self.gitmodules_found.insert(entry.oid);
+            }
+            if !is_symlink && content::is_dotgitattributes_name(entry.name) {
+                self.gitattributes_found.insert(entry.oid);
+            }
         }
     }
 
@@ -726,6 +751,22 @@ where
             None => oid.to_string(),
         }
     }
+}
+
+fn is_tag_ident_msg(msg_id: content::MsgId) -> bool {
+    matches!(
+        msg_id,
+        content::MsgId::MissingNameBeforeEmail
+            | content::MsgId::MissingEmail
+            | content::MsgId::BadName
+            | content::MsgId::MissingSpaceBeforeEmail
+            | content::MsgId::BadEmail
+            | content::MsgId::MissingSpaceBeforeDate
+            | content::MsgId::BadDate
+            | content::MsgId::ZeroPaddedDate
+            | content::MsgId::BadDateOverflow
+            | content::MsgId::BadTimezone
+    )
 }
 
 fn reachable_objects<R>(reader: &R, format: ObjectFormat, roots: &[ObjectId]) -> HashSet<ObjectId>
