@@ -835,16 +835,37 @@ fn status_entries_with_exact_renames(
             continue;
         }
         if entry.index == b' ' && entry.worktree == b'D' {
-            residual_deletes.push(entry.clone());
-            residual_used.push(false);
-            used[index] = true;
-            continue;
+            let mut has_later_add = false;
+            for added in entries.iter().skip(index + 1) {
+                if status_entries_are_exact_worktree_rename(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    added,
+                )? {
+                    has_later_add = true;
+                    break;
+                }
+            }
+            if has_later_add {
+                residual_deletes.push(entry.clone());
+                residual_used.push(false);
+                used[index] = true;
+                continue;
+            }
         }
         if entry.index == b'D' && entry.worktree == b' ' {
-            staged_deletes.push(entry.clone());
-            staged_used.push(false);
-            used[index] = true;
-            continue;
+            let has_later_add = entries
+                .iter()
+                .skip(index + 1)
+                .any(|added| status_entries_are_exact_rename(entry, added));
+            if has_later_add {
+                staged_deletes.push(entry.clone());
+                staged_used.push(false);
+                used[index] = true;
+                continue;
+            }
         }
         if entry.index == b'A' {
             let mut staged_match = entries
