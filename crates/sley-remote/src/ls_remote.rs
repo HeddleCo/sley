@@ -118,7 +118,9 @@ pub fn ls_remote(
             matches,
             config.and_then(|config| config.get("protocol", None, "version")) == Some("2"),
         ),
-        LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
+        LsRemoteSource::Local { git_dir } => {
+            ls_remote_local(git_dir, format, filter, matches, config)
+        }
     }
 }
 
@@ -190,9 +192,14 @@ fn ls_remote_local(
     format: ObjectFormat,
     filter: &LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
+    config: Option<&GitConfig>,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     let store = FileRefStore::new(git_dir, format);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let config = ls_remote_local_config(git_dir, config);
+    let hidden_refs = upload_pack_hidden_ref_values(&config);
+    let include_non_head_symrefs =
+        !matches!(config.get("protocol", None, "version"), Some("0" | "1"));
     let mut records = Vec::new();
 
     if !filter.refs_only
@@ -216,6 +223,9 @@ fn ls_remote_local(
     }
 
     for reference in store.list_refs()? {
+        if ref_is_hidden_by_patterns(&reference.name, &hidden_refs) {
+            continue;
+        }
         if !ref_class_selected(&reference.name, filter) {
             continue;
         }
@@ -228,7 +238,11 @@ fn ls_remote_local(
         records.push(LsRemoteRecord {
             oid,
             name: reference.name.clone(),
-            symref,
+            symref: if include_non_head_symrefs {
+                symref
+            } else {
+                None
+            },
         });
         if !filter.refs_only
             && let Some(record) = peeled_tag_record(&db, format, &oid, &reference.name, matches)?
@@ -238,6 +252,61 @@ fn ls_remote_local(
     }
 
     Ok((records, format))
+}
+
+fn ls_remote_local_config(git_dir: &Path, config: Option<&GitConfig>) -> GitConfig {
+    let mut local = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    if let Some(config) = config {
+        local.sections.extend(config.sections.clone());
+    }
+    local
+}
+
+fn upload_pack_hidden_ref_values(config: &GitConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for section in &config.sections {
+        let applies = section.subsection.is_none()
+            && (section.name.eq_ignore_ascii_case("transfer")
+                || section.name.eq_ignore_ascii_case("uploadpack"));
+        if !applies {
+            continue;
+        }
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("hiderefs")
+                && let Some(value) = entry.value.as_deref()
+            {
+                out.push(trim_hidden_ref_pattern(value));
+            }
+        }
+    }
+    out
+}
+
+fn trim_hidden_ref_pattern(value: &str) -> String {
+    value.trim_end_matches('/').to_string()
+}
+
+fn ref_is_hidden_by_patterns(refname: &str, patterns: &[String]) -> bool {
+    for pattern in patterns.iter().rev() {
+        let mut pattern = pattern.as_str();
+        let negated = pattern.strip_prefix('!').is_some();
+        if negated {
+            pattern = &pattern[1..];
+        }
+        if let Some(rest) = pattern.strip_prefix('^') {
+            pattern = rest;
+        }
+        if hidden_ref_pattern_matches(refname, pattern) {
+            return !negated;
+        }
+    }
+    false
+}
+
+fn hidden_ref_pattern_matches(refname: &str, pattern: &str) -> bool {
+    refname
+        .strip_prefix(pattern)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The peeled `^{}` record for `name` when `oid` is an annotated tag and the

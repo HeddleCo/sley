@@ -7886,7 +7886,10 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = ls_remote_git_dir(&repository)?;
+    let git_dir = match ls_remote_git_dir(&repository) {
+        Ok(git_dir) => git_dir,
+        Err(_) => return ls_remote_repository_not_found(&repository),
+    };
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let (mut records, format) = sley_remote::ls_remote(
@@ -7911,6 +7914,15 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         print_ls_remote_ref(&record, options.symref);
     }
     Ok(())
+}
+
+fn ls_remote_repository_not_found(repository: &str) -> Result<()> {
+    eprintln!("fatal: '{repository}' does not appear to be a git repository");
+    eprintln!("fatal: Could not read from remote repository.");
+    eprintln!();
+    eprintln!("Please make sure you have the correct access rights");
+    eprintln!("and the repository exists.");
+    Err(GitError::Exit(128))
 }
 
 fn ls_remote_upload_pack_command_records(
