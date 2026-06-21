@@ -1407,6 +1407,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     {
         let mut interactive = false;
         let mut patch = false;
+        let mut dry_run = false;
         let mut spec: Vec<String> = Vec::new();
         // Explicit `-U<n>` / `--inter-hunk-context=<n>` from add's own argv. `None`
         // means "fall back to diff.context / diff.interHunkContext config".
@@ -1424,6 +1425,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
             match arg.as_str() {
                 "--" => after_dd = true,
+                "-n" | "--dry-run" => dry_run = true,
+                "--no-dry-run" => dry_run = false,
                 "-i" | "--interactive" => interactive = true,
                 "-p" | "--patch" => patch = true,
                 "--auto-advance" => auto_advance = Some(true),
@@ -1481,6 +1484,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 );
                 return Err(GitError::Exit(128));
             }
+        }
+        if (patch || interactive) && dry_run {
+            eprintln!(
+                "fatal: options '--dry-run' and '--interactive/--patch' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
         }
         if patch {
             return super::add_interactive::cmd_add_patch(

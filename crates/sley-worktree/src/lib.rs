@@ -1766,6 +1766,9 @@ fn update_index_paths_impl(
     let trust_filemode = clean_config
         .map(trust_executable_bit)
         .unwrap_or_else(|| trust_executable_bit_from_git_dir(git_dir, None));
+    let trust_symlinks = clean_config
+        .map(trust_symlinks)
+        .unwrap_or_else(|| trust_symlinks_from_git_dir(git_dir, None));
     if options.allow_skip_worktree_entries {
         expand_sparse_index(&mut index, &odb, format)?;
     }
@@ -1968,6 +1971,13 @@ fn update_index_paths_impl(
         );
         if is_symlink {
             entry.mode = 0o120000;
+        }
+        if let Some(mode) = preferred_unmerged_mode_for_untrusted_worktree(
+            &index.entries[existing_range.clone()],
+            trust_filemode,
+            trust_symlinks,
+        ) {
+            entry.mode = mode;
         }
         // git's update_one() reports `add` for every staged path (whether the
         // entry is new or an update), then chmod_path() reports the chmod after.
@@ -15852,6 +15862,41 @@ fn trust_executable_bit(config: &GitConfig) -> bool {
     config
         .get_bool("core", None, "filemode")
         .unwrap_or(true)
+}
+
+fn trust_symlinks_from_git_dir(git_dir: &Path, config_parameters_env: Option<&str>) -> bool {
+    sley_config::read_repo_config(git_dir, config_parameters_env)
+        .ok()
+        .as_ref()
+        .map(trust_symlinks)
+        .unwrap_or(true)
+}
+
+fn trust_symlinks(config: &GitConfig) -> bool {
+    config
+        .get_bool("core", None, "symlinks")
+        .unwrap_or(true)
+}
+
+fn preferred_unmerged_mode_for_untrusted_worktree(
+    entries: &[IndexEntry],
+    trust_filemode: bool,
+    trust_symlinks: bool,
+) -> Option<u32> {
+    if trust_filemode && trust_symlinks {
+        return None;
+    }
+    let preferred = entries
+        .iter()
+        .find(|entry| entry.stage() == Stage::Ours)
+        .or_else(|| entries.iter().find(|entry| entry.stage() == Stage::Base))?;
+    if (!trust_symlinks && preferred.mode == 0o120000)
+        || (!trust_filemode && matches!(preferred.mode, 0o100644 | 0o100755))
+    {
+        Some(preferred.mode)
+    } else {
+        None
+    }
 }
 
 fn file_mode_with_trust(metadata: &fs::Metadata, trust_filemode: bool) -> u32 {
