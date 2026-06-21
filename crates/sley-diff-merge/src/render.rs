@@ -30,6 +30,7 @@
 use crate::{
     DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws, split_lines,
 };
+use std::collections::HashMap;
 
 /// git's default hunk context (`-U3`).
 pub const DEFAULT_CONTEXT: usize = 3;
@@ -101,6 +102,53 @@ pub struct RenderColors<'a> {
     /// `color.diff.whitespace` — the highlight for whitespace errors
     /// (`--ws-error-highlight`).
     pub whitespace: &'a str,
+    /// `color.diff.oldMoved` — removed lines detected as moved.
+    pub old_moved: &'a str,
+    /// `color.diff.oldMovedAlternative` — alternate removed moved block.
+    pub old_moved_alt: &'a str,
+    /// `color.diff.oldMovedDimmed` — uninteresting removed moved line.
+    pub old_moved_dim: &'a str,
+    /// `color.diff.oldMovedAlternativeDimmed` — alternate dimmed removed line.
+    pub old_moved_alt_dim: &'a str,
+    /// `color.diff.newMoved` — added lines detected as moved.
+    pub new_moved: &'a str,
+    /// `color.diff.newMovedAlternative` — alternate added moved block.
+    pub new_moved_alt: &'a str,
+    /// `color.diff.newMovedDimmed` — uninteresting added moved line.
+    pub new_moved_dim: &'a str,
+    /// `color.diff.newMovedAlternativeDimmed` — alternate dimmed added line.
+    pub new_moved_alt_dim: &'a str,
+}
+
+/// `--color-moved=<mode>` hunk-body mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMovedMode {
+    /// Mark every matching `+`/`-` line.
+    Plain,
+    /// Mark moved blocks, without alternating colors.
+    Blocks,
+    /// Mark moved blocks, alternating adjacent blocks.
+    Zebra,
+    /// Like zebra, but dim interior lines.
+    DimmedZebra,
+}
+
+/// `--color-moved-ws=<mode>` comparison mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColorMovedWs {
+    /// Whitespace-ignore flags used when interning moved lines.
+    pub ignore: WsIgnore,
+    /// Allow a constant indentation delta across a moved block.
+    pub allow_indentation_change: bool,
+}
+
+/// Moved-code coloring configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorMoved {
+    /// Which moved-code coloring style to use.
+    pub mode: ColorMovedMode,
+    /// Whitespace handling for moved-code matching.
+    pub ws: ColorMovedWs,
 }
 
 /// Resolve the section heading for one candidate line.
@@ -179,6 +227,9 @@ pub struct HunkRenderOptions<'a, 'h> {
     /// Ranges must be sorted and disjoint. `None` disables the filter (every
     /// non-line-log caller).
     pub line_ranges: Option<&'a [LineRange]>,
+    /// `--color-moved`: classify moved `+`/`-` lines and paint them with the
+    /// moved-color slots. `None` disables moved-code coloring.
+    pub color_moved: Option<ColorMoved>,
 }
 
 /// A half-open `[start, end)` line range (0-based) for `log -L` hunk
@@ -236,6 +287,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             indent_heuristic: true,
             change_ignore: None,
             line_ranges: None,
+            color_moved: None,
         }
     }
 }
@@ -367,6 +419,11 @@ pub fn render_hunks(
         );
     }
 
+    let moved_styles = options
+        .color_moved
+        .filter(|_| options.colors.is_some() && options.word_diff.is_none())
+        .map(|color_moved| mark_color_as_moved(&tagged, color_moved));
+
     for (first_change, last_change) in groups {
         let (hunk_start, hunk_end) = if function_context {
             (first_change, (last_change + 1).min(tagged.len()))
@@ -376,7 +433,15 @@ pub fn render_hunks(
                 (last_change + context + 1).min(tagged.len()),
             )
         };
-        render_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
+        render_one_hunk(
+            out,
+            &tagged,
+            moved_styles.as_deref(),
+            &old,
+            hunk_start,
+            hunk_end,
+            options,
+        );
     }
 }
 
@@ -1496,12 +1561,436 @@ fn expand_tag_end(
     end
 }
 
+const COLOR_MOVED_MIN_ALNUM_COUNT: usize = 20;
+const INDENT_BLANKLINE: i32 = i32::MIN;
+
+#[derive(Clone, Copy, Default)]
+struct MovedStyle {
+    moved: bool,
+    alt: bool,
+    uninteresting: bool,
+}
+
+#[derive(Clone)]
+struct MovedEntry {
+    tag_idx: usize,
+    next_line: Option<usize>,
+    next_match: Option<usize>,
+    id: usize,
+    indent_width: i32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MovedEntryList {
+    add: Option<usize>,
+    del: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct MovedBlock {
+    match_entry: usize,
+    wsd: i32,
+}
+
+fn mark_color_as_moved(tagged: &[TaggedLine<'_>], color_moved: ColorMoved) -> Vec<MovedStyle> {
+    let (entries, entry_for_tag, entry_list) = add_lines_to_move_detection(tagged, color_moved.ws);
+    let mut styles = vec![MovedStyle::default(); tagged.len()];
+    let mut pmb: Vec<MovedBlock> = Vec::new();
+    let mut n = 0usize;
+    let mut flipped_block = false;
+    let mut block_length = 0usize;
+    let mut moved_symbol: Option<LineKind> = None;
+
+    while n < tagged.len() {
+        let line = tagged[n];
+        let line_entry = entry_for_tag[n];
+        let mut line_match = line_entry.and_then(|entry_idx| {
+            let id = entries[entry_idx].id;
+            match line.kind {
+                LineKind::Insert => entry_list.get(id).and_then(|list| list.del),
+                LineKind::Delete => entry_list.get(id).and_then(|list| list.add),
+                LineKind::Context => None,
+            }
+        });
+
+        if line.kind == LineKind::Context {
+            flipped_block = false;
+        }
+
+        if !pmb.is_empty() && (line_match.is_none() || Some(line.kind) != moved_symbol) {
+            if !adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length)
+                && block_length > 1
+            {
+                line_match = None;
+                n -= block_length;
+            }
+            pmb.clear();
+            block_length = 0;
+            flipped_block = false;
+        }
+
+        let Some(line_match) = line_match else {
+            moved_symbol = None;
+            n += 1;
+            continue;
+        };
+
+        if color_moved.mode == ColorMovedMode::Plain {
+            styles[n].moved = true;
+            n += 1;
+            continue;
+        }
+
+        pmb_advance_or_null(
+            &mut pmb,
+            &entries,
+            tagged,
+            line_entry.expect("plus/minus line has move-detection entry"),
+            color_moved.ws,
+        );
+
+        if pmb.is_empty() {
+            let contiguous = adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length);
+            if !contiguous && block_length > 1 {
+                n -= block_length;
+            } else {
+                fill_potential_moved_blocks(
+                    line_match,
+                    &entries,
+                    tagged,
+                    n,
+                    color_moved.ws,
+                    &mut pmb,
+                );
+            }
+
+            if contiguous && !pmb.is_empty() && moved_symbol == Some(line.kind) {
+                flipped_block = !flipped_block;
+            } else {
+                flipped_block = false;
+            }
+
+            moved_symbol = (!pmb.is_empty()).then_some(line.kind);
+            block_length = 0;
+        }
+
+        if !pmb.is_empty() {
+            block_length += 1;
+            styles[n].moved = true;
+            if flipped_block && color_moved.mode != ColorMovedMode::Blocks {
+                styles[n].alt = true;
+            }
+        }
+        n += 1;
+    }
+
+    adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length);
+    if color_moved.mode == ColorMovedMode::DimmedZebra {
+        dim_moved_lines(&mut styles, tagged);
+    }
+    styles
+}
+
+fn add_lines_to_move_detection(
+    tagged: &[TaggedLine<'_>],
+    ws: ColorMovedWs,
+) -> (Vec<MovedEntry>, Vec<Option<usize>>, Vec<MovedEntryList>) {
+    let mut entries: Vec<MovedEntry> = Vec::new();
+    let mut entry_for_tag = vec![None; tagged.len()];
+    let mut entry_list = Vec::<MovedEntryList>::new();
+    let mut interned = HashMap::<Vec<u8>, usize>::new();
+    let mut prev_line: Option<usize> = None;
+
+    for (tag_idx, line) in tagged.iter().enumerate() {
+        if line.kind != LineKind::Insert && line.kind != LineKind::Delete {
+            prev_line = None;
+            continue;
+        }
+        let indent = if ws.allow_indentation_change {
+            moved_indent_data(line.content)
+        } else {
+            (0, 0)
+        };
+        let key = moved_line_key(line.content, indent.0, ws.ignore);
+        let id = match interned.get(&key) {
+            Some(id) => *id,
+            None => {
+                let id = interned.len();
+                interned.insert(key, id);
+                entry_list.push(MovedEntryList::default());
+                id
+            }
+        };
+
+        let entry_idx = entries.len();
+        if let Some(prev) = prev_line
+            && tagged[entries[prev].tag_idx].kind == line.kind
+        {
+            entries[prev].next_line = Some(entry_idx);
+        }
+        let next_match = match line.kind {
+            LineKind::Insert => entry_list[id].add,
+            LineKind::Delete => entry_list[id].del,
+            LineKind::Context => None,
+        };
+        entries.push(MovedEntry {
+            tag_idx,
+            next_line: None,
+            next_match,
+            id,
+            indent_width: indent.1,
+        });
+        match line.kind {
+            LineKind::Insert => entry_list[id].add = Some(entry_idx),
+            LineKind::Delete => entry_list[id].del = Some(entry_idx),
+            LineKind::Context => {}
+        }
+        entry_for_tag[tag_idx] = Some(entry_idx);
+        prev_line = Some(entry_idx);
+    }
+
+    (entries, entry_for_tag, entry_list)
+}
+
+fn moved_line_key(line: &[u8], indent_off: usize, ignore: WsIgnore) -> Vec<u8> {
+    let bytes = line.get(indent_off..).unwrap_or_default();
+    if ignore.is_empty() {
+        bytes.to_vec()
+    } else {
+        canonicalize_moved_line(bytes, ignore)
+    }
+}
+
+fn canonicalize_moved_line(line: &[u8], ignore: WsIgnore) -> Vec<u8> {
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    if ignore.all_space {
+        return line.iter().copied().filter(|b| !is_ws(*b)).collect();
+    }
+    if ignore.space_change {
+        let mut out = Vec::with_capacity(line.len());
+        let mut i = 0usize;
+        while i < line.len() {
+            if is_ws(line[i]) {
+                out.push(b' ');
+                while i < line.len() && is_ws(line[i]) {
+                    i += 1;
+                }
+            } else {
+                out.push(line[i]);
+                i += 1;
+            }
+        }
+        while out.last() == Some(&b' ') {
+            out.pop();
+        }
+        return out;
+    }
+    if ignore.space_at_eol {
+        let mut end = line.len();
+        if end > 0 && line[end - 1] == b'\n' {
+            end -= 1;
+        }
+        while end > 0 && matches!(line[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        let mut out = line[..end].to_vec();
+        if line.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        return out;
+    }
+    if ignore.cr_at_eol {
+        let mut out = line.to_vec();
+        if out.ends_with(b"\r\n") {
+            let len = out.len();
+            out.remove(len - 2);
+        }
+        return out;
+    }
+    line.to_vec()
+}
+
+fn moved_indent_data(line: &[u8]) -> (usize, i32) {
+    let mut off = 0usize;
+    let mut width = 0i32;
+    while off < line.len() && matches!(line[off], b'\x0c' | b'\x0b' | b'\r') {
+        off += 1;
+    }
+    while off < line.len() {
+        match line[off] {
+            b' ' => {
+                width += 1;
+                off += 1;
+            }
+            b'\t' => {
+                width += 8 - (width % 8);
+                off += 1;
+                while off < line.len() && line[off] == b'\t' {
+                    width += 8;
+                    off += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    if line[off..].iter().all(|b| b.is_ascii_whitespace()) {
+        (line.len(), INDENT_BLANKLINE)
+    } else {
+        (off, width)
+    }
+}
+
+fn pmb_advance_or_null(
+    pmb: &mut Vec<MovedBlock>,
+    entries: &[MovedEntry],
+    tagged: &[TaggedLine<'_>],
+    line_entry: usize,
+    ws: ColorMovedWs,
+) {
+    let mut kept = Vec::with_capacity(pmb.len());
+    for mut block in pmb.iter().copied() {
+        let Some(cur) = entries[block.match_entry].next_line else {
+            continue;
+        };
+        let matched = if ws.allow_indentation_change {
+            !cmp_in_block_with_wsd(entries, cur, tagged, line_entry, &mut block)
+        } else {
+            entries[cur].id == entries[line_entry].id
+        };
+        if matched {
+            block.match_entry = cur;
+            kept.push(block);
+        }
+    }
+    *pmb = kept;
+}
+
+fn fill_potential_moved_blocks(
+    mut line_match: usize,
+    entries: &[MovedEntry],
+    tagged: &[TaggedLine<'_>],
+    tag_idx: usize,
+    ws: ColorMovedWs,
+    pmb: &mut Vec<MovedBlock>,
+) {
+    loop {
+        let entry = &entries[line_match];
+        let wsd = if ws.allow_indentation_change {
+            compute_ws_delta(tagged[tag_idx].content, entry.indent_width)
+        } else {
+            0
+        };
+        pmb.push(MovedBlock {
+            match_entry: line_match,
+            wsd,
+        });
+        match entry.next_match {
+            Some(next) => line_match = next,
+            None => break,
+        }
+    }
+}
+
+fn compute_ws_delta(line: &[u8], match_indent_width: i32) -> i32 {
+    let (_, width) = moved_indent_data(line);
+    if width == INDENT_BLANKLINE && match_indent_width == INDENT_BLANKLINE {
+        INDENT_BLANKLINE
+    } else {
+        width - match_indent_width
+    }
+}
+
+fn cmp_in_block_with_wsd(
+    entries: &[MovedEntry],
+    cur: usize,
+    tagged: &[TaggedLine<'_>],
+    line_entry: usize,
+    block: &mut MovedBlock,
+) -> bool {
+    let cur_entry = &entries[cur];
+    if cur_entry.id != entries[line_entry].id {
+        return true;
+    }
+    if cur_entry.indent_width == INDENT_BLANKLINE {
+        return false;
+    }
+    let (_, line_width) = moved_indent_data(tagged[entries[line_entry].tag_idx].content);
+    let delta = line_width - cur_entry.indent_width;
+    if block.wsd == INDENT_BLANKLINE {
+        block.wsd = delta;
+    }
+    delta != block.wsd
+}
+
+fn adjust_last_block(
+    styles: &mut [MovedStyle],
+    tagged: &[TaggedLine<'_>],
+    mode: ColorMovedMode,
+    n: usize,
+    block_length: usize,
+) -> bool {
+    if mode == ColorMovedMode::Plain {
+        return block_length != 0;
+    }
+    let mut alnum_count = 0usize;
+    for i in 1..=block_length {
+        for byte in tagged[n - i].content {
+            if byte.is_ascii_alphanumeric() {
+                alnum_count += 1;
+                if alnum_count >= COLOR_MOVED_MIN_ALNUM_COUNT {
+                    return true;
+                }
+            }
+        }
+    }
+    for i in 1..=block_length {
+        styles[n - i] = MovedStyle::default();
+    }
+    false
+}
+
+fn dim_moved_lines(styles: &mut [MovedStyle], tagged: &[TaggedLine<'_>]) {
+    for n in 0..tagged.len() {
+        if tagged[n].kind != LineKind::Insert && tagged[n].kind != LineKind::Delete {
+            continue;
+        }
+        if !styles[n].moved {
+            continue;
+        }
+        let prev = (n > 0
+            && (tagged[n - 1].kind == LineKind::Insert || tagged[n - 1].kind == LineKind::Delete))
+            .then_some(n - 1);
+        let next = (n + 1 < tagged.len()
+            && (tagged[n + 1].kind == LineKind::Insert || tagged[n + 1].kind == LineKind::Delete))
+            .then_some(n + 1);
+
+        if prev.is_some_and(|i| moved_zebra_mask(styles[i]) == moved_zebra_mask(styles[n]))
+            && next.is_some_and(|i| moved_zebra_mask(styles[i]) == moved_zebra_mask(styles[n]))
+        {
+            styles[n].uninteresting = true;
+            continue;
+        }
+        if prev.is_some_and(|i| styles[i].moved && styles[i].alt != styles[n].alt) {
+            continue;
+        }
+        if next.is_some_and(|i| styles[i].moved && styles[i].alt != styles[n].alt) {
+            continue;
+        }
+        styles[n].uninteresting = true;
+    }
+}
+
+fn moved_zebra_mask(style: MovedStyle) -> (bool, bool) {
+    (style.moved, style.alt)
+}
+
 /// Emit a single hunk covering `tagged[start..end]`: the `@@ -os,oc +ns,nc @@
 /// <heading>` header followed by the context/`-`/`+` lines, including the
 /// `\ No newline at end of file` markers.
 fn render_one_hunk(
     out: &mut Vec<u8>,
     tagged: &[TaggedLine<'_>],
+    moved_styles: Option<&[MovedStyle]>,
     old_lines: &[DiffLine<'_>],
     start: usize,
     end: usize,
@@ -1596,7 +2085,7 @@ fn render_one_hunk(
         return;
     }
 
-    for line in slice {
+    for (offset, line) in slice.iter().enumerate() {
         let prefix = match line.kind {
             LineKind::Context => b' ',
             LineKind::Delete => b'-',
@@ -1614,7 +2103,11 @@ fn render_one_hunk(
                     };
                     enabled.then_some(ws.rule)
                 });
-                write_patch_line_colored(out, prefix, line.content, colors, ws_rule);
+                let moved = moved_styles
+                    .and_then(|styles| styles.get(start + offset))
+                    .copied()
+                    .filter(|style| style.moved);
+                write_patch_line_colored(out, prefix, line.content, colors, ws_rule, moved);
             }
             None => write_patch_line(out, prefix, line.content),
         }
@@ -1681,14 +2174,23 @@ fn write_patch_line_colored(
     line: &[u8],
     colors: RenderColors<'_>,
     ws_rule: Option<crate::ws::WsRule>,
+    moved: Option<MovedStyle>,
 ) {
     let (body, terminated) = match line.split_last() {
         Some((b'\n', body)) => (body, true),
         _ => (line, false),
     };
-    let color = match prefix {
-        b'-' => colors.old,
-        b'+' => colors.new,
+    let color = match (prefix, moved) {
+        (b'-', Some(style)) if style.uninteresting && style.alt => colors.old_moved_alt_dim,
+        (b'-', Some(style)) if style.uninteresting => colors.old_moved_dim,
+        (b'-', Some(style)) if style.alt => colors.old_moved_alt,
+        (b'-', Some(_)) => colors.old_moved,
+        (b'+', Some(style)) if style.uninteresting && style.alt => colors.new_moved_alt_dim,
+        (b'+', Some(style)) if style.uninteresting => colors.new_moved_dim,
+        (b'+', Some(style)) if style.alt => colors.new_moved_alt,
+        (b'+', Some(_)) => colors.new_moved,
+        (b'-', _) => colors.old,
+        (b'+', _) => colors.new,
         _ => colors.context,
     };
 

@@ -429,6 +429,7 @@ fn render_line_log_patch(
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 ws_error: None,
+                color_moved: None,
                 interhunk: 0,
                 ws_ignore: diff_opts.ws_ignore,
                 diff_algorithm: diff_opts.diff_algorithm,

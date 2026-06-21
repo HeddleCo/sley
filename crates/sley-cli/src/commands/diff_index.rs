@@ -608,6 +608,7 @@ fn render(
                 submodule_format: ctx.submodule_format,
                 submodule_dirt: Some(ctx.submodule_dirt),
                 ws_error: None,
+                color_moved: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,

@@ -1156,6 +1156,7 @@ fn run_diff_request(
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 ws_error: None,
+                color_moved: None,
                 interhunk: 0,
                 ws_ignore: context.options.ws_ignore,
                 diff_algorithm: context.options.diff_algorithm,

@@ -3794,6 +3794,14 @@ pub(crate) fn render_colors(
         context: &colors.context,
         reset: &colors.reset,
         whitespace: &colors.whitespace,
+        old_moved: &colors.old_moved,
+        old_moved_alt: &colors.old_moved_alt,
+        old_moved_dim: &colors.old_moved_dim,
+        old_moved_alt_dim: &colors.old_moved_alt_dim,
+        new_moved: &colors.new_moved,
+        new_moved_alt: &colors.new_moved_alt,
+        new_moved_dim: &colors.new_moved_dim,
+        new_moved_alt_dim: &colors.new_moved_alt_dim,
     }
 }
 
@@ -3879,6 +3887,7 @@ pub(crate) fn write_patch_hunks_with(
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         ws_error: None,
+        color_moved: None,
         ..Default::default()
     };
     sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);

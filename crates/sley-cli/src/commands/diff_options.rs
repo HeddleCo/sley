@@ -78,6 +78,8 @@ pub(crate) struct DiffOptions {
     pub(crate) patch_abbrev: Option<usize>,
     pub(crate) patch_full_index: bool,
     pub(crate) color_always: bool,
+    pub(crate) color_moved: Option<Option<sley_diff_merge::render::ColorMovedMode>>,
+    pub(crate) color_moved_ws: Option<sley_diff_merge::render::ColorMovedWs>,
     pub(crate) diff_algorithm_control: bool,
     pub(crate) diff_algorithm: sley_diff_merge::DiffAlgorithm,
     pub(crate) diff_driver_control: bool,
@@ -156,6 +158,8 @@ impl Default for DiffOptions {
             patch_abbrev: None,
             patch_full_index: false,
             color_always: false,
+            color_moved: None,
+            color_moved_ws: None,
             diff_algorithm_control: false,
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             diff_driver_control: false,
@@ -1141,13 +1145,26 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         },
         (_, Some("no-color")) => options.color_always = false,
         (_, Some("color-moved")) => {
+            options.color_moved = Some(match optional_arg(option) {
+                None => Some(sley_diff_merge::render::ColorMovedMode::Zebra),
+                Some(value) => {
+                    let mode = parse_color_moved_mode(value)?;
+                    mode
+                }
+            });
             if let Some(value) = optional_arg(option) {
                 log_validate_color_moved(value)?;
             }
         }
-        (_, Some("no-color-moved")) => {}
-        (_, Some("color-moved-ws")) => log_validate_color_moved_ws(str_value(option))?,
-        (_, Some("no-color-moved-ws")) => {}
+        (_, Some("no-color-moved")) => options.color_moved = Some(None),
+        (_, Some("color-moved-ws")) => {
+            let value = str_value(option);
+            log_validate_color_moved_ws(value)?;
+            options.color_moved_ws = Some(parse_color_moved_ws(value)?);
+        }
+        (_, Some("no-color-moved-ws")) => {
+            options.color_moved_ws = Some(sley_diff_merge::render::ColorMovedWs::default());
+        }
         (_, Some("ignore-submodules")) => {
             let mode = optional_arg(option).unwrap_or("all");
             let Some(mode) = parse_submodule_ignore_mode(mode) else {
@@ -1234,6 +1251,53 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         _ => {}
     }
     Ok(())
+}
+
+pub(crate) fn parse_color_moved_mode(
+    value: &str,
+) -> Result<Option<sley_diff_merge::render::ColorMovedMode>> {
+    match value {
+        "no" | "false" | "0" | "off" => Ok(None),
+        "" | "default" | "true" | "1" | "on" | "yes" | "zebra" => {
+            Ok(Some(sley_diff_merge::render::ColorMovedMode::Zebra))
+        }
+        "plain" => Ok(Some(sley_diff_merge::render::ColorMovedMode::Plain)),
+        "blocks" => Ok(Some(sley_diff_merge::render::ColorMovedMode::Blocks)),
+        "dimmed-zebra" | "dimmed_zebra" => {
+            Ok(Some(sley_diff_merge::render::ColorMovedMode::DimmedZebra))
+        }
+        _ => {
+            log_validate_color_moved(value)?;
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn parse_color_moved_ws(value: &str) -> Result<sley_diff_merge::render::ColorMovedWs> {
+    let mut ws = sley_diff_merge::render::ColorMovedWs::default();
+    if value.is_empty() {
+        return log_color_moved_ws_invalid_mode(value, value).map(|_| ws);
+    }
+    for mode in value.split(',') {
+        match mode {
+            "no" => ws = sley_diff_merge::render::ColorMovedWs::default(),
+            "ignore-space-change" => ws.ignore.space_change = true,
+            "ignore-space-at-eol" => ws.ignore.space_at_eol = true,
+            "ignore-all-space" => ws.ignore.all_space = true,
+            "allow-indentation-change" => ws.allow_indentation_change = true,
+            _ => return log_color_moved_ws_invalid_mode(value, mode).map(|_| ws),
+        }
+    }
+    if ws.allow_indentation_change
+        && (ws.ignore.all_space || ws.ignore.space_change || ws.ignore.space_at_eol)
+    {
+        eprintln!(
+            "error: color-moved-ws: allow-indentation-change cannot be combined with other whitespace modes"
+        );
+        eprintln!("error: invalid mode '{value}' in --color-moved-ws");
+        return Err(GitError::Exit(129));
+    }
+    Ok(ws)
 }
 
 fn bool_value(option: &ParsedOption<'_>) -> bool {

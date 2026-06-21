@@ -2409,6 +2409,9 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// Whitespace-error highlighting (`--ws-error-highlight` /
     /// `diff.wsErrorHighlight`) when color is enabled. `None` disables it.
     pub(crate) ws_error: Option<sley_diff_merge::render::WsErrorHighlight>,
+    /// Moved-code coloring (`--color-moved`) when color is enabled and
+    /// word-diff is disabled. `None` disables it.
+    pub(crate) color_moved: Option<sley_diff_merge::render::ColorMoved>,
     /// Extra inter-hunk merge distance (`--inter-hunk-context`).
     pub(crate) interhunk: usize,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
@@ -2686,6 +2689,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 ws_error: None,
+                color_moved: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
@@ -2999,6 +3003,7 @@ pub(crate) fn write_diff_patch_entry(
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         ws_error,
+        color_moved: colors.and(options.color_moved).filter(|_| word_diff.is_none()),
         ws_ignore: options.ws_ignore,
         algorithm: options.diff_algorithm,
         indent_heuristic: options.indent_heuristic,
@@ -4528,6 +4533,7 @@ fn write_submodule_inline_diff(
                     submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                     submodule_dirt: Some(&submodule_dirt),
                     ws_error: None,
+                    color_moved: None,
                     interhunk: options.interhunk,
                     ws_ignore: sley_diff_merge::WsIgnore::default(),
                     diff_algorithm: options.diff_algorithm,
@@ -4570,6 +4576,7 @@ fn write_submodule_inline_diff(
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                 submodule_dirt: Some(&nested_dirt),
                 ws_error: None,
+                color_moved: None,
                 interhunk: options.interhunk,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: options.diff_algorithm,

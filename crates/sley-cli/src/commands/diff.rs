@@ -891,6 +891,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         patch_abbrev,
         patch_full_index,
         mut color_always,
+        color_moved,
+        color_moved_ws,
         diff_algorithm_control,
         diff_algorithm,
         diff_driver_control,
@@ -1018,6 +1020,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             DiffNoIndexParams {
                 context: patch_context,
                 color: color_always,
+                color_moved_cli: color_moved,
+                color_moved_ws_cli: color_moved_ws,
                 output_format,
                 raw_abbrev,
                 z,
@@ -1054,6 +1058,30 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             return Err(err);
         }
     }
+    let color_moved_mode = match color_moved {
+        Some(mode) => mode,
+        None => match read_repo_config(&git_dir)
+            .ok()
+            .and_then(|config| config.get("diff", None, "colormoved").map(str::to_owned))
+        {
+            Some(value) => commands::diff_options::parse_color_moved_mode(&value)?,
+            None => None,
+        },
+    };
+    let color_moved_ws = match color_moved_ws {
+        Some(ws) => ws,
+        None => match read_repo_config(&git_dir)
+            .ok()
+            .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
+        {
+            Some(value) => commands::diff_options::parse_color_moved_ws(&value)?,
+            None => sley_diff_merge::render::ColorMovedWs::default(),
+        },
+    };
+    let color_moved = color_moved_mode.map(|mode| sley_diff_merge::render::ColorMoved {
+        mode,
+        ws: color_moved_ws,
+    });
     if !color_always
         && read_repo_config(&git_dir)
             .ok()
@@ -1825,6 +1853,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     submodule_format,
                     submodule_dirt: Some(&dirty_submodules),
                     ws_error,
+                    color_moved,
                     interhunk: interhunk.unwrap_or(0),
                     ws_ignore,
                     diff_algorithm,
@@ -2387,6 +2416,8 @@ fn diff_line_stats_from_ignored_hunks(
 struct DiffNoIndexParams<'a> {
     context: usize,
     color: bool,
+    color_moved_cli: Option<Option<sley_diff_merge::render::ColorMovedMode>>,
+    color_moved_ws_cli: Option<sley_diff_merge::render::ColorMovedWs>,
     output_format: commands::diff_options::DiffOutputFormat,
     raw_abbrev: Option<Option<usize>>,
     z: bool,
@@ -2442,6 +2473,30 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     let word_request = params.word_diff_mode.map(|mode| WordDiffRequest {
         mode,
         cli_regex: params.word_diff_regex,
+    });
+    let color_moved_mode = match params.color_moved_cli {
+        Some(mode) => mode,
+        None => match config
+            .as_ref()
+            .and_then(|config| config.get("diff", None, "colormoved").map(str::to_owned))
+        {
+            Some(value) => commands::diff_options::parse_color_moved_mode(&value)?,
+            None => None,
+        },
+    };
+    let color_moved_ws = match params.color_moved_ws_cli {
+        Some(ws) => ws,
+        None => match config
+            .as_ref()
+            .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
+        {
+            Some(value) => commands::diff_options::parse_color_moved_ws(&value)?,
+            None => sley_diff_merge::render::ColorMovedWs::default(),
+        },
+    };
+    let color_moved = color_moved_mode.map(|mode| sley_diff_merge::render::ColorMoved {
+        mode,
+        ws: color_moved_ws,
     });
     // A throwaway object database handle: content reads are overridden, so it
     // is never consulted.
@@ -2556,6 +2611,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                         context: false,
                     }
                 }),
+                color_moved,
                 interhunk: params.interhunk,
                 ws_ignore: params.ws_ignore,
                 diff_algorithm: params.diff_algorithm,

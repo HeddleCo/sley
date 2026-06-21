@@ -1304,6 +1304,7 @@ fn write_commit_diff_patch(
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 ws_error: None,
+                color_moved: None,
                 interhunk: 0,
                 ws_ignore: options.ws_ignore,
                 diff_algorithm: options.diff_algorithm,

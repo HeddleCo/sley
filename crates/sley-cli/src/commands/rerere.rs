@@ -871,6 +871,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 ws_error: None,
+                color_moved: None,
                 interhunk: 0,
                 ws_ignore: sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,

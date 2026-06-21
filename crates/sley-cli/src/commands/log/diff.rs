@@ -384,6 +384,7 @@ impl LogDiffContext<'_> {
                         submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                         submodule_dirt: None,
                         ws_error: None,
+                        color_moved: None,
                         interhunk: 0,
                         ws_ignore: self.opts.ws_ignore,
                         diff_algorithm: self.opts.diff_algorithm,

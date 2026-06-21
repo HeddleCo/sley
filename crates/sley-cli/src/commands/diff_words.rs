@@ -20,6 +20,14 @@ pub(crate) struct DiffColors {
     /// `color.diff.whitespace` — the highlight for whitespace errors
     /// (`--ws-error-highlight`). Default `[7m` (reverse), matching git.
     pub(crate) whitespace: String,
+    pub(crate) old_moved: String,
+    pub(crate) old_moved_alt: String,
+    pub(crate) old_moved_dim: String,
+    pub(crate) old_moved_alt_dim: String,
+    pub(crate) new_moved: String,
+    pub(crate) new_moved_alt: String,
+    pub(crate) new_moved_dim: String,
+    pub(crate) new_moved_alt_dim: String,
 }
 
 impl DiffColors {
@@ -49,6 +57,14 @@ impl DiffColors {
             // git's GIT_COLOR_REVERSE for whitespace by default; the test
             // decoder names this red-background span `<BRED>`.
             whitespace: lookup("whitespace", "\x1b[41m"),
+            old_moved: lookup("oldMoved", "\x1b[1;35m"),
+            old_moved_alt: lookup("oldMovedAlternative", "\x1b[1;34m"),
+            old_moved_dim: lookup("oldMovedDimmed", "\x1b[2m"),
+            old_moved_alt_dim: lookup("oldMovedAlternativeDimmed", "\x1b[2;3m"),
+            new_moved: lookup("newMoved", "\x1b[1;36m"),
+            new_moved_alt: lookup("newMovedAlternative", "\x1b[1;33m"),
+            new_moved_dim: lookup("newMovedDimmed", "\x1b[2m"),
+            new_moved_alt_dim: lookup("newMovedAlternativeDimmed", "\x1b[2;3m"),
         }
     }
 }
@@ -58,6 +74,7 @@ impl DiffColors {
 /// unknown words yield `None` (caller keeps the default).
 pub(crate) fn parse_color_value(value: &str) -> Option<String> {
     let mut fg: Option<u8> = None;
+    let mut fg_seen = false;
     let mut bg: Option<u8> = None;
     let mut attrs: Vec<u8> = Vec::new();
     for word in value.split_ascii_whitespace() {
@@ -81,12 +98,13 @@ pub(crate) fn parse_color_value(value: &str) -> Option<String> {
             "ul" => attrs.push(4),
             "blink" => attrs.push(5),
             "reverse" => attrs.push(7),
-            "normal" => {}
+            "normal" => fg_seen = true,
             "reset" => return Some("\x1b[m".to_string()),
             _ => {
                 if let Some(code) = code(word) {
-                    if fg.is_none() {
+                    if !fg_seen {
                         fg = Some(code);
+                        fg_seen = true;
                     } else {
                         bg = Some(code);
                     }
