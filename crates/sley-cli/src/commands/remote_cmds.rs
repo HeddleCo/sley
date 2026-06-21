@@ -3353,7 +3353,7 @@ fn parse_fetch_jobs(value: &str) -> Result<Option<usize>> {
 pub(crate) fn resolve_fetch_recurse_submodules(
     config: &GitConfig,
     cli: FetchRecurseSubmodules,
-    default_mode: FetchRecurseSubmodules,
+    _default_mode: FetchRecurseSubmodules,
 ) -> FetchRecurseSubmodules {
     if cli != FetchRecurseSubmodules::Default {
         return cli;
@@ -3370,7 +3370,7 @@ pub(crate) fn resolve_fetch_recurse_submodules(
             return mode;
         }
     }
-    default_mode
+    FetchRecurseSubmodules::Default
 }
 
 pub(crate) struct FetchSubmoduleRequest<'a> {
@@ -3381,10 +3381,17 @@ pub(crate) struct FetchSubmoduleRequest<'a> {
     pub(crate) recurse_submodules: FetchRecurseSubmodules,
     pub(crate) default_recurse_submodules: FetchRecurseSubmodules,
     pub(crate) source: &'a str,
-    pub(crate) changed_gitlinks: std::collections::BTreeSet<String>,
+    pub(crate) changed_gitlinks: Vec<ChangedGitlink>,
     pub(crate) options: &'a FetchOptions,
     pub(crate) submodule_prefix: &'a str,
     pub(crate) jobs: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangedGitlink {
+    path: String,
+    oid: ObjectId,
+    super_oid: ObjectId,
 }
 
 struct CurrentDirGuard {
@@ -3411,16 +3418,24 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
     if req.recurse_submodules == FetchRecurseSubmodules::Off {
         return Ok(());
     }
-    let submodules = crate::commands::submodule::read_submodule_configs(req.worktree_root)?;
-    if submodules.is_empty() {
+    let mut submodules = crate::commands::submodule::read_submodule_configs(req.worktree_root)?;
+    if req.worktree_root.is_dir() {
+        submodules.extend(crate::commands::submodule::index_gitlink_submodule_configs(
+            req.git_dir,
+            req.format,
+            &submodules,
+        )?);
+    }
+    if submodules.is_empty() && req.changed_gitlinks.is_empty() {
         return Ok(());
     }
     let jobs = req
         .jobs
         .or_else(|| configured_submodule_fetch_jobs(req.config));
     trace_fetch_submodule_jobs(jobs.unwrap_or(1));
+    let mut seen_submodules = std::collections::BTreeSet::new();
     for submodule in submodules {
-        if !fetch_submodule_is_active(req.config, &submodule) {
+        if !fetch_submodule_path_is_active(req.config, &submodule.path) {
             continue;
         }
         let mode = fetch_recurse_mode_for_submodule(
@@ -3429,22 +3444,38 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             &submodule,
             req.recurse_submodules,
         );
+        let submodule_root = req.worktree_root.join(&submodule.path);
+        let Some(sub_git_dir) =
+            resolve_submodule_git_dir(req.git_dir, &submodule_root, &submodule.path)
+        else {
+            continue;
+        };
+        ensure_submodule_object_store(&sub_git_dir)?;
+        let sub_format = repository_object_format(&sub_git_dir)?;
+        let changed_for_path = req
+            .changed_gitlinks
+            .iter()
+            .filter(|changed| changed.path == submodule.path)
+            .collect::<Vec<_>>();
         let should_fetch = match mode {
             FetchRecurseSubmodules::On => true,
-            FetchRecurseSubmodules::OnDemand => req.changed_gitlinks.contains(&submodule.path),
-            FetchRecurseSubmodules::Default => {
-                req.default_recurse_submodules == FetchRecurseSubmodules::On
-            }
+            FetchRecurseSubmodules::OnDemand => changed_for_path
+                .iter()
+                .any(|changed| !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid)),
+            FetchRecurseSubmodules::Default => match req.default_recurse_submodules {
+                FetchRecurseSubmodules::On => true,
+                FetchRecurseSubmodules::OnDemand => changed_for_path
+                    .iter()
+                    .any(|changed| !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid)),
+                FetchRecurseSubmodules::Default | FetchRecurseSubmodules::Off => false,
+            },
             FetchRecurseSubmodules::Off => false,
         };
         if !should_fetch {
             continue;
         }
-        let submodule_root = req.worktree_root.join(&submodule.path);
-        let Some(sub_git_dir) = sley_diff_merge::gitlink_git_dir(&submodule_root) else {
-            continue;
-        };
-        let sub_format = repository_object_format(&sub_git_dir)?;
+        seen_submodules.insert(submodule.path.clone());
+        trace_submodule_get_default_remote(&submodule.path);
         let sub_source = default_fetch_remote(&sub_git_dir, sub_format)?;
         if !req.options.quiet {
             eprintln!(
@@ -3452,10 +3483,17 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
                 req.submodule_prefix, submodule.path
             );
         }
+        let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
+        trace_submodule_fetch(&nested_prefix, &sub_source, &[]);
         let mut sub_options = req.options.clone();
         sub_options.merge_srcs =
             current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
-        let _guard = CurrentDirGuard::enter(&submodule_root)?;
+        let fetch_cwd = if submodule_root.is_dir() {
+            submodule_root.as_path()
+        } else {
+            sub_git_dir.as_path()
+        };
+        let _guard = CurrentDirGuard::enter(fetch_cwd)?;
         let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
         let outcome = fetch_one_source_with_outcome(
             &sub_git_dir,
@@ -3465,17 +3503,47 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             sub_options.clone(),
             &[],
         )?;
+        let missing_oids = changed_for_path
+            .iter()
+            .filter(|changed| !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid))
+            .map(|changed| changed.oid.to_string())
+            .collect::<Vec<_>>();
+        if !missing_oids.is_empty() {
+            trace_submodule_fetch(&nested_prefix, &sub_source, &missing_oids);
+            let _ = fetch_raw_oid_refspecs(
+                &sub_git_dir,
+                sub_format,
+                &sub_source,
+                &missing_oids,
+                &sub_options,
+            )?;
+        }
         let nested_changed_gitlinks =
             changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
-        let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
         let nested_config = read_repo_config(&sub_git_dir)?;
+        let nested_default_recurse_submodules = match mode {
+            FetchRecurseSubmodules::Default => req.default_recurse_submodules,
+            FetchRecurseSubmodules::OnDemand => FetchRecurseSubmodules::OnDemand,
+            FetchRecurseSubmodules::On => FetchRecurseSubmodules::On,
+            FetchRecurseSubmodules::Off => FetchRecurseSubmodules::Off,
+        };
+        let nested_recurse_submodules = if req.recurse_submodules == FetchRecurseSubmodules::Default
+        {
+            resolve_fetch_recurse_submodules(
+                &nested_config,
+                FetchRecurseSubmodules::Default,
+                nested_default_recurse_submodules,
+            )
+        } else {
+            req.recurse_submodules
+        };
         fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
             git_dir: &sub_git_dir,
             format: sub_format,
             worktree_root: &submodule_root,
             config: &nested_config,
-            recurse_submodules: mode,
-            default_recurse_submodules: req.default_recurse_submodules,
+            recurse_submodules: nested_recurse_submodules,
+            default_recurse_submodules: nested_default_recurse_submodules,
             source: &sub_source,
             changed_gitlinks: nested_changed_gitlinks,
             options: &sub_options,
@@ -3483,8 +3551,159 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             jobs,
         })?;
     }
+    for changed in req
+        .changed_gitlinks
+        .iter()
+        .filter(|changed| !seen_submodules.contains(&changed.path))
+    {
+        fetch_changed_submodule_after_superproject(&req, changed, jobs)?;
+    }
     let _ = (req.git_dir, req.format, req.source);
     Ok(())
+}
+
+fn fetch_changed_submodule_after_superproject(
+    req: &FetchSubmoduleRequest<'_>,
+    changed: &ChangedGitlink,
+    jobs: Option<usize>,
+) -> Result<()> {
+    if !fetch_submodule_path_is_active(req.config, &changed.path) {
+        return Ok(());
+    }
+    let mode = match req.recurse_submodules {
+        FetchRecurseSubmodules::On | FetchRecurseSubmodules::OnDemand => req.recurse_submodules,
+        FetchRecurseSubmodules::Off => return Ok(()),
+        FetchRecurseSubmodules::Default => req.default_recurse_submodules,
+    };
+    if !matches!(
+        mode,
+        FetchRecurseSubmodules::On | FetchRecurseSubmodules::OnDemand
+    ) {
+        return Ok(());
+    }
+    let Some((sub_git_dir, submodule_root, display_path)) =
+        resolve_changed_submodule_fetch_target(req, changed)?
+    else {
+        return Ok(());
+    };
+    ensure_submodule_object_store(&sub_git_dir)?;
+    let sub_format = repository_object_format(&sub_git_dir)?;
+    if submodule_has_commit(&sub_git_dir, sub_format, &changed.oid) {
+        return Ok(());
+    }
+    trace_submodule_get_default_remote(&display_path);
+    let sub_source = default_fetch_remote(&sub_git_dir, sub_format)?;
+    if !req.options.quiet {
+        eprintln!(
+            "Fetching submodule {}{} at commit {}",
+            req.submodule_prefix,
+            display_path,
+            short_object_id(&changed.super_oid)
+        );
+    }
+    let mut sub_options = req.options.clone();
+    sub_options.merge_srcs = current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
+    let fetch_cwd = if submodule_root.is_dir() {
+        submodule_root.as_path()
+    } else {
+        sub_git_dir.as_path()
+    };
+    let _guard = CurrentDirGuard::enter(fetch_cwd)?;
+    let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
+    let outcome = fetch_one_source_with_outcome(
+        &sub_git_dir,
+        sub_format,
+        &sub_source,
+        &[],
+        sub_options.clone(),
+        &[],
+    )?;
+    if !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid) {
+        let refspec = changed.oid.to_string();
+        let nested_prefix = format!("{}{}/", req.submodule_prefix, display_path);
+        trace_submodule_fetch(&nested_prefix, &sub_source, std::slice::from_ref(&refspec));
+        let _ = fetch_raw_oid_refspecs(
+            &sub_git_dir,
+            sub_format,
+            &sub_source,
+            &[refspec],
+            &sub_options,
+        )?;
+    }
+    let mut nested_changed_gitlinks =
+        changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
+    if nested_changed_gitlinks.is_empty() {
+        nested_changed_gitlinks =
+            changed_gitlinks_for_commit(&sub_git_dir, sub_format, &changed.oid)?;
+    }
+    let nested_prefix = format!("{}{}/", req.submodule_prefix, display_path);
+    let nested_config = read_repo_config(&sub_git_dir)?;
+    let nested_recurse_submodules = if req.recurse_submodules == FetchRecurseSubmodules::Default {
+        resolve_fetch_recurse_submodules(&nested_config, FetchRecurseSubmodules::Default, mode)
+    } else {
+        req.recurse_submodules
+    };
+    fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+        git_dir: &sub_git_dir,
+        format: sub_format,
+        worktree_root: &submodule_root,
+        config: &nested_config,
+        recurse_submodules: nested_recurse_submodules,
+        default_recurse_submodules: mode,
+        source: &sub_source,
+        changed_gitlinks: nested_changed_gitlinks,
+        options: &sub_options,
+        submodule_prefix: &nested_prefix,
+        jobs,
+    })
+}
+
+fn resolve_submodule_git_dir(git_dir: &Path, submodule_root: &Path, path: &str) -> Option<PathBuf> {
+    sley_diff_merge::gitlink_git_dir(submodule_root).or_else(|| {
+        let modules_git_dir = git_dir.join("modules").join(path);
+        modules_git_dir.is_dir().then_some(modules_git_dir)
+    })
+}
+
+fn resolve_changed_submodule_fetch_target(
+    req: &FetchSubmoduleRequest<'_>,
+    changed: &ChangedGitlink,
+) -> Result<Option<(PathBuf, PathBuf, String)>> {
+    let submodule_root = req.worktree_root.join(&changed.path);
+    if let Some(sub_git_dir) =
+        resolve_submodule_git_dir(req.git_dir, &submodule_root, &changed.path)
+    {
+        return Ok(Some((sub_git_dir, submodule_root, changed.path.clone())));
+    }
+    let Some(name) =
+        submodule_name_for_path_at_commit(req.git_dir, req.format, &changed.super_oid, &changed.path)?
+    else {
+        return Ok(None);
+    };
+    let submodules = crate::commands::submodule::read_submodule_configs(req.worktree_root)?;
+    for submodule in submodules {
+        if submodule.name != name {
+            continue;
+        }
+        let submodule_root = req.worktree_root.join(&submodule.path);
+        if let Some(sub_git_dir) =
+            resolve_submodule_git_dir(req.git_dir, &submodule_root, &submodule.path)
+        {
+            return Ok(Some((sub_git_dir, submodule_root, submodule.path)));
+        }
+    }
+    Ok(None)
+}
+
+fn ensure_submodule_object_store(git_dir: &Path) -> Result<()> {
+    if git_dir.join("objects").is_dir() {
+        return Ok(());
+    }
+    eprintln!(
+        "fatal: not a git repository: {}",
+        git_dir.display()
+    );
+    Err(GitError::Exit(128))
 }
 
 fn configured_submodule_fetch_jobs(config: &GitConfig) -> Option<usize> {
@@ -3494,24 +3713,43 @@ fn configured_submodule_fetch_jobs(config: &GitConfig) -> Option<usize> {
 }
 
 fn trace_fetch_submodule_jobs(jobs: usize) {
+    let line = format!("trace: run_processes_parallel: preparing to run up to {jobs} tasks\n");
+    trace_fetch_line(&line);
+}
+
+fn trace_submodule_get_default_remote(path: &str) {
+    trace_fetch_line(&format!(
+        "trace: built-in: git submodule--helper get-default-remote {path}\n"
+    ));
+}
+
+fn trace_submodule_fetch(prefix: &str, remote: &str, refspecs: &[String]) {
+    let mut line = format!(
+        "trace: built-in: git fetch --recurse-submodules-default on-demand --submodule-prefix={prefix} {remote}"
+    );
+    for refspec in refspecs {
+        line.push(' ');
+        line.push_str(refspec);
+    }
+    line.push('\n');
+    trace_fetch_line(&line);
+}
+
+fn trace_fetch_line(line: &str) {
     let Some(path) = env::var_os("GIT_TRACE") else {
         return;
     };
     if path == "1" || path == "true" {
-        eprintln!("trace: run_processes_parallel: preparing to run up to {jobs} tasks");
+        eprint!("{line}");
         return;
     }
-    let line = format!("trace: run_processes_parallel: preparing to run up to {jobs} tasks\n");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
 }
 
-fn fetch_submodule_is_active(
-    config: &GitConfig,
-    submodule: &crate::commands::submodule::SubmoduleConfigEntry,
-) -> bool {
-    if let Some(active) = config.get_bool("submodule", Some(&submodule.path), "active") {
+fn fetch_submodule_path_is_active(config: &GitConfig, path: &str) -> bool {
+    if let Some(active) = config.get_bool("submodule", Some(path), "active") {
         return active;
     }
     true
@@ -3564,31 +3802,132 @@ pub(crate) fn changed_gitlinks_for_fetch(
     format: ObjectFormat,
     before: &std::collections::BTreeMap<String, ObjectId>,
     outcome: &sley_remote::FetchOutcome,
-) -> Result<std::collections::BTreeSet<String>> {
+) -> Result<Vec<ChangedGitlink>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut changed = std::collections::BTreeSet::new();
+    let mut changed = Vec::new();
     for update in &outcome.ref_updates {
-        let Some(dst) = update.dst.as_deref() else {
-            continue;
-        };
-        let old = before.get(dst).copied();
+        let old = update.dst.as_deref().and_then(|dst| before.get(dst)).copied();
         if old == Some(update.oid) {
             continue;
         }
-        let new_gitlinks = commit_gitlinks(&db, format, &update.oid)?;
-        let old_gitlinks = match old {
-            Some(old) => commit_gitlinks(&db, format, &old)?,
-            None => std::collections::BTreeMap::new(),
-        };
-        for (path, oid) in new_gitlinks {
-            if old_gitlinks.get(&path) != Some(&oid)
-                && let Ok(path) = String::from_utf8(path)
-            {
-                changed.insert(path);
+        for gitlink in changed_gitlinks_for_commit_range(&db, format, old, &update.oid)? {
+            if !changed.iter().any(|existing| existing == &gitlink) {
+                changed.push(gitlink);
             }
         }
     }
     Ok(changed)
+}
+
+fn changed_gitlinks_for_commit(
+    git_dir: &Path,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<Vec<ChangedGitlink>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    Ok(commit_gitlinks(&db, format, commit_oid)?
+        .into_iter()
+        .filter_map(|(path, oid)| {
+            String::from_utf8(path).ok().map(|path| ChangedGitlink {
+                path,
+                oid,
+                super_oid: *commit_oid,
+            })
+        })
+        .collect())
+}
+
+fn submodule_name_for_path_at_commit(
+    git_dir: &Path,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    path: &str,
+) -> Result<Option<String>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let object = db.read_object(commit_oid)?;
+    let commit = match object.object_type {
+        ObjectType::Commit => Commit::parse_ref(format, &object.body)?,
+        ObjectType::Tag => {
+            let tag = Tag::parse_ref(format, &object.body)?;
+            return submodule_name_for_path_at_commit(git_dir, format, &tag.object, path);
+        }
+        _ => return Ok(None),
+    };
+    let Some((_, (_, gitmodules_oid))) = sley_diff_merge::flatten_tree(&db, format, &commit.tree)?
+        .into_iter()
+        .find(|(entry_path, _)| entry_path.as_slice() == b".gitmodules")
+    else {
+        return Ok(None);
+    };
+    let gitmodules = db.read_object(&gitmodules_oid)?;
+    if gitmodules.object_type != ObjectType::Blob {
+        return Ok(None);
+    }
+    let config = GitConfig::parse(&gitmodules.body)?;
+    let set = sley_submodule::SubmoduleConfigSet::parse(&config);
+    Ok(set
+        .iter()
+        .find(|submodule| submodule.path.as_deref() == Some(path))
+        .map(|submodule| submodule.name.clone()))
+}
+
+fn changed_gitlinks_for_commit_range(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old: Option<ObjectId>,
+    new: &ObjectId,
+) -> Result<Vec<ChangedGitlink>> {
+    let old_ancestors = match old {
+        Some(old) => ancestor_depths(db, format, &old)?,
+        None => std::collections::HashMap::new(),
+    };
+    let mut changed = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending = vec![*new];
+    while let Some(oid) = pending.pop() {
+        if !seen.insert(oid) || old_ancestors.contains_key(&oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        let commit = match object.object_type {
+            ObjectType::Commit => Commit::parse_ref(format, &object.body)?,
+            ObjectType::Tag => {
+                pending.push(Tag::parse_ref(format, &object.body)?.object);
+                continue;
+            }
+            _ => continue,
+        };
+        let gitlinks = commit_tree_gitlinks(db, format, &commit.tree)?;
+        let parent_gitlinks = commit
+            .parents
+            .first()
+            .and_then(|parent| commit_gitlinks(db, format, parent).ok())
+            .unwrap_or_default();
+        for (path, gitlink_oid) in gitlinks {
+            if parent_gitlinks.get(&path) != Some(&gitlink_oid)
+                && let Ok(path) = String::from_utf8(path)
+            {
+                changed.push(ChangedGitlink {
+                    path,
+                    oid: gitlink_oid,
+                    super_oid: oid,
+                });
+            }
+        }
+        pending.extend(commit.parents);
+    }
+    Ok(changed)
+}
+
+fn submodule_has_commit(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> bool {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    db.read_object(oid)
+        .map(|object| object.object_type == ObjectType::Commit)
+        .unwrap_or(false)
+}
+
+fn short_object_id(oid: &ObjectId) -> String {
+    oid.to_string().chars().take(7).collect()
 }
 
 fn commit_gitlinks(
@@ -3605,11 +3944,19 @@ fn commit_gitlinks(
         }
         _ => return Ok(std::collections::BTreeMap::new()),
     };
-    let tree = db.read_object(&commit.tree)?;
+    commit_tree_gitlinks(db, format, &commit.tree)
+}
+
+fn commit_tree_gitlinks(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectId>> {
+    let tree = db.read_object(tree_oid)?;
     if tree.object_type != ObjectType::Tree {
         return Ok(std::collections::BTreeMap::new());
     }
-    Ok(sley_diff_merge::flatten_tree(db, format, &commit.tree)?
+    Ok(sley_diff_merge::flatten_tree(db, format, tree_oid)?
         .into_iter()
         .filter(|(_, (mode, _))| sley_index::is_gitlink(*mode))
         .map(|(path, (_, oid))| (path, oid))
@@ -6954,9 +7301,15 @@ fn print_fetch_status(
         return Ok(());
     }
     let source = sley_remote::fetch_head_source_description(config, source);
+    let src_width = rows
+        .iter()
+        .map(|(_, src, _)| src.len())
+        .max()
+        .unwrap_or(0)
+        .max(10);
     eprintln!("From {source}");
     for (summary, src, dst) in rows {
-        eprintln!("   {summary:<16}  {src:<10} -> {dst}");
+        eprintln!("   {summary:<16}  {src:<src_width$} -> {dst}");
     }
     Ok(())
 }

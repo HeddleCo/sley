@@ -1311,6 +1311,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         Some(worktree_root_for_git_dir(&git_dir)?)
     };
+    if !cached
+        && diff_trees.len() != 2
+        && let Some(worktree_root) = &worktree_root
+    {
+        commands::submodule::ensure_populated_gitlinks_readable(worktree_root, &git_dir, format)?;
+    }
     let pathspec = if path_args.is_empty() {
         DiffPathspec::default()
     } else {
