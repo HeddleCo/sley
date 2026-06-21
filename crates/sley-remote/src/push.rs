@@ -1649,7 +1649,11 @@ fn normalize_push_refspec_for_sources(
         .map_or((false, refspec), |refspec| (true, refspec));
     let normalized = if let Some((src, dst)) = refspec.split_once(':') {
         let (src, src_kind) = normalize_push_source_refname(src, local_refs);
-        let dst = normalize_push_destination_refname(dst, src_kind, remote_refs)?;
+        let dst = if src.is_empty() {
+            normalize_push_delete_destination_refname(dst, remote_refs)?
+        } else {
+            normalize_push_destination_refname(dst, src_kind, remote_refs)?
+        };
         if !src.is_empty() && !dst.contains('*') && push_destination_is_onelevel_under_refs(&dst) {
             return Err(GitError::Command(format!(
                 "destination refspec {dst} is not a valid ref"
@@ -1789,6 +1793,22 @@ fn normalize_push_source_refname(
         (name.to_string(), PushSourceKind::Unqualifiable)
     } else {
         (branch, PushSourceKind::Branch)
+    }
+}
+
+fn normalize_push_delete_destination_refname(
+    name: &str,
+    remote_refs: &[RefAdvertisement],
+) -> Result<String> {
+    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
+        return Ok(name.to_string());
+    }
+    match count_refspec_match_dst(name, remote_refs) {
+        DstMatch::Unique(matched) => Ok(matched.to_string()),
+        DstMatch::Ambiguous => Err(GitError::Command(format!(
+            "dst refspec {name} matches more than one"
+        ))),
+        DstMatch::None => Err(GitError::reference_not_found(format!("remote ref {name}"))),
     }
 }
 
