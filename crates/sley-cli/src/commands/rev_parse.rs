@@ -19,6 +19,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let cwd = env::current_dir()?;
+    let setup = setup::setup_git_directory();
     let git_dir = match discover_git_dir(&cwd) {
         Ok(git_dir) => git_dir,
         Err(GitError::NotFound(_)) => {
@@ -34,6 +35,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     // in a malformed repository must still die (t0001 #60/#62/#64).
     let format = verify_repository_format(&git_dir)?;
     if args.is_empty() {
+        validate_bare_rev_parse_setup(&setup)?;
         return Err(GitError::Command("rev-parse requires <rev>...".into()));
     }
     let mut short: Option<usize> = None;
@@ -120,10 +122,10 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                 println!("{}", resolve_git_dir_arg(&cwd, path)?);
             }
             "--show-toplevel" => {
-                if !is_inside_work_tree(&cwd, &git_dir)? {
+                if !is_inside_work_tree(&cwd, &git_dir, setup.as_ref())? {
                     return rev_parse_requires_work_tree();
                 }
-                let root = worktree_root_for_git_dir(&git_dir)?;
+                let root = rev_parse_worktree_root(&git_dir, setup.as_ref())?;
                 match path_format {
                     RevParsePathFormat::Default | RevParsePathFormat::Absolute => {
                         println!("{}", root.display());
@@ -134,15 +136,18 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                 }
             }
             "--show-prefix" => {
-                if is_inside_work_tree(&cwd, &git_dir)? {
-                    println!("{}", worktree_prefix(&cwd, &git_dir)?);
+                if is_inside_work_tree(&cwd, &git_dir, setup.as_ref())? {
+                    println!("{}", worktree_prefix(&cwd, &git_dir, setup.as_ref())?);
                 } else {
                     println!();
                 }
             }
             "--show-cdup" => {
-                if is_inside_work_tree(&cwd, &git_dir)? {
-                    println!("{}", worktree_cdup(&cwd, &git_dir)?);
+                if is_inside_work_tree(&cwd, &git_dir, setup.as_ref())? {
+                    println!("{}", worktree_cdup(&cwd, &git_dir, setup.as_ref())?);
+                } else if let Some(root) = setup.as_ref().and_then(|setup| setup.worktree.as_ref())
+                {
+                    println!("{}", root.display());
                 }
             }
             "--show-superproject-working-tree" => {
@@ -164,10 +169,12 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--path-format=relative" => path_format = RevParsePathFormat::Relative,
             "--path-format" => return rev_parse_path_format_requires_argument(),
             "--is-inside-work-tree" => {
-                println!("{}", is_inside_work_tree(&cwd, &git_dir)?);
+                println!("{}", is_inside_work_tree(&cwd, &git_dir, setup.as_ref())?);
             }
-            "--is-inside-git-dir" => println!("{}", is_inside_git_dir(&cwd, &git_dir)?),
-            "--is-bare-repository" => println!("{}", is_bare_repository(&git_dir)?),
+            "--is-inside-git-dir" => {
+                println!("{}", is_inside_git_dir(&cwd, &git_dir, setup.as_ref())?)
+            }
+            "--is-bare-repository" => println!("{}", is_bare_repository(&git_dir, setup.as_ref())?),
             "--is-shallow-repository" => println!("{}", is_shallow_repository(&git_dir)),
             "--short" => short = repository_abbrev(&git_dir, format)?,
             value if value.starts_with("--disambiguate=") && !verify => {
@@ -499,7 +506,7 @@ fn rev_parse_normalize_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> 
     if !(path.starts_with("./") || path.starts_with("../")) {
         return Ok(path.to_string());
     }
-    if !is_inside_work_tree(cwd, git_dir)? {
+    if !is_inside_work_tree(cwd, git_dir, None)? {
         eprintln!("fatal: relative path syntax can't be used outside working tree");
         return Err(GitError::Exit(128));
     }
@@ -752,10 +759,10 @@ fn rev_parse_prefixed_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<Opt
     if path.starts_with("./") || path.starts_with("../") || Path::new(path).is_absolute() {
         return Ok(None);
     }
-    if !is_inside_work_tree(cwd, git_dir)? {
+    if !is_inside_work_tree(cwd, git_dir, None)? {
         return Ok(None);
     }
-    let prefix = worktree_prefix(cwd, git_dir)?;
+    let prefix = worktree_prefix(cwd, git_dir, None)?;
     if prefix.is_empty() {
         return Ok(None);
     }
@@ -1582,10 +1589,62 @@ fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bo
     Ok(())
 }
 
-fn worktree_cdup(cwd: &Path, git_dir: &Path) -> Result<String> {
-    let prefix = worktree_prefix(cwd, git_dir)?;
+fn validate_bare_rev_parse_setup(setup: &Option<setup::SetupResult>) -> Result<()> {
+    let Some(setup) = setup else {
+        return Ok(());
+    };
+    let Some(worktree) = setup.worktree.as_ref() else {
+        return Ok(());
+    };
+    if explicit_work_tree()
+        .as_ref()
+        .is_some_and(|worktree| worktree.is_absolute())
+        && fs::canonicalize(worktree).is_err()
+    {
+        eprintln!("fatal: cannot chdir to '{}'", worktree.display());
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn rev_parse_worktree_root(
+    git_dir: &Path,
+    setup: Option<&setup::SetupResult>,
+) -> Result<PathBuf> {
+    if let Some(worktree) = setup.and_then(|setup| setup.worktree.as_ref()) {
+        return Ok(worktree.clone());
+    }
+    worktree_root_for_git_dir(git_dir)
+}
+
+fn worktree_cdup(
+    cwd: &Path,
+    git_dir: &Path,
+    setup: Option<&setup::SetupResult>,
+) -> Result<String> {
+    let prefix = worktree_prefix(cwd, git_dir, setup)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok("../".repeat(depth))
+}
+
+fn worktree_prefix(
+    cwd: &Path,
+    git_dir: &Path,
+    setup: Option<&setup::SetupResult>,
+) -> Result<String> {
+    let root = fs::canonicalize(rev_parse_worktree_root(git_dir, setup)?)?;
+    let cwd = fs::canonicalize(cwd)?;
+    let prefix = cwd.strip_prefix(&root).map_err(|_| {
+        GitError::InvalidPath(format!(
+            "{} is outside worktree {}",
+            cwd.display(),
+            root.display()
+        ))
+    })?;
+    if prefix.as_os_str().is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("{}/", prefix.to_string_lossy().replace('\\', "/")))
 }
 
 fn display_git_dir(cwd: &Path, git_dir: &Path, path_format: RevParsePathFormat) -> Result<String> {
@@ -1631,15 +1690,15 @@ fn display_git_common_dir(
 }
 
 fn display_git_common_dir_default(cwd: &Path, git_dir: &Path) -> Result<String> {
-    if let Some(git_dir) = explicit_git_dir() {
-        return Ok(git_dir.to_string_lossy().into_owned());
-    }
     // A linked worktree's git dir (`…/worktrees/<id>`) carries a `commondir`
     // file pointing at the shared repository. git's `--git-common-dir`
     // (DEFAULT_RELATIVE_IF_SHARED) prints that common dir, not the per-worktree
     // git dir, so resolve it before any `.git`-suffix heuristics.
     if git_dir.join("commondir").is_file() {
         return Ok(common_git_dir_for_git_dir(git_dir)?.display().to_string());
+    }
+    if let Some(git_dir) = explicit_git_dir() {
+        return Ok(git_dir.to_string_lossy().into_owned());
     }
     if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
         return display_git_dir_default(cwd, git_dir);
@@ -1656,7 +1715,7 @@ fn display_git_common_dir_default(cwd: &Path, git_dir: &Path) -> Result<String> 
     if cwd == fs::canonicalize(worktree_root)? {
         return Ok(".git".into());
     }
-    let prefix = worktree_prefix(&cwd, &git_dir)?;
+    let prefix = worktree_prefix(&cwd, &git_dir, None)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok(format!("{}.git", "../".repeat(depth)))
 }
@@ -1798,34 +1857,51 @@ fn relative_path_from(cwd: &Path, target: &Path) -> Result<String> {
     relative_path_from_absolute_components(&cwd, &target)
 }
 
-fn is_inside_git_dir(cwd: &Path, git_dir: &Path) -> Result<bool> {
+fn is_inside_git_dir(
+    cwd: &Path,
+    git_dir: &Path,
+    _setup: Option<&setup::SetupResult>,
+) -> Result<bool> {
     let cwd = fs::canonicalize(cwd)?;
     let git_dir = fs::canonicalize(git_dir)?;
     Ok(cwd.starts_with(git_dir))
 }
 
-fn is_inside_work_tree(cwd: &Path, git_dir: &Path) -> Result<bool> {
-    if let Some(work_tree) = explicit_work_tree() {
-        let root = fs::canonicalize(resolve_cli_path(
-            &env::current_dir()?,
-            work_tree.to_string_lossy().as_ref(),
-        ))?;
-        let cwd = fs::canonicalize(cwd)?;
-        return Ok(cwd.starts_with(root));
+fn cwd_starts_with(cwd: &Path, root: &Path) -> Result<bool> {
+    let cwd = fs::canonicalize(cwd)?;
+    let Ok(root) = fs::canonicalize(root) else {
+        return Ok(false);
+    };
+    Ok(cwd.starts_with(root))
+}
+
+fn is_inside_work_tree(
+    cwd: &Path,
+    git_dir: &Path,
+    setup: Option<&setup::SetupResult>,
+) -> Result<bool> {
+    if let Some(setup) = setup {
+        let Some(worktree) = setup.worktree.as_ref() else {
+            return Ok(false);
+        };
+        return cwd_starts_with(cwd, worktree);
     }
     // A bare repository has no work tree, so we are never inside one. This
     // covers `core.bare = true` set on a `.git`-named directory, which the
     // directory-layout probe below would otherwise treat as having a worktree.
-    if is_bare_repository(git_dir)? {
+    if is_bare_repository(git_dir, None)? {
         return Ok(false);
     }
     if worktree_root_for_git_dir(git_dir).is_err() {
         return Ok(false);
     }
-    Ok(!is_inside_git_dir(cwd, git_dir)?)
+    Ok(!is_inside_git_dir(cwd, git_dir, None)?)
 }
 
-fn is_bare_repository(git_dir: &Path) -> Result<bool> {
+fn is_bare_repository(git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<bool> {
+    if setup.is_some_and(|setup| setup.worktree.is_some()) {
+        return Ok(false);
+    }
     if explicit_work_tree().is_some() {
         return Ok(false);
     }

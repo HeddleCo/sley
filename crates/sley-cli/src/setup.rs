@@ -290,16 +290,22 @@ fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult>
     };
 
     let (is_bare, core_worktree) = read_worktree_config(&effective_gitdir_dir);
+    let has_common_dir = effective_gitdir_dir.join("commondir").is_file();
+    let effective_core_worktree = if has_common_dir {
+        None
+    } else {
+        core_worktree.as_deref()
+    };
 
     // --work-tree / GIT_WORK_TREE / core.worktree: defer to explicit handling,
     // but with the *discovered* git dir. git makes the gitdir a realpath when
     // dir != cwd; we pass the resolved git dir text so trace matches.
-    if explicit_work_tree().is_some() || core_worktree.is_some() {
+    if explicit_work_tree().is_some() || effective_core_worktree.is_some() {
         return setup_explicit_from_discovered(
             &effective_gitdir_text,
             &effective_gitdir_dir,
             is_bare,
-            core_worktree.as_deref(),
+            effective_core_worktree,
             cwd,
             dir,
         );
