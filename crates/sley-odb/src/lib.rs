@@ -15,6 +15,7 @@ use sley_object::{
 use sley_pack::{
     MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
     PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
+    PackWriteOptions,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -4388,6 +4389,78 @@ impl FileObjectDatabase {
 
     pub fn install_pack(&self, pack: &PackWrite) -> Result<PackInstallResult> {
         self.install_pack_with_options(pack, RawPackInstallOptions::default())
+    }
+
+    pub fn write_blob_as_pack(
+        &self,
+        oid: ObjectId,
+        object: &EncodedObject,
+        compression_level: u32,
+    ) -> Result<ObjectId> {
+        if object.object_type != ObjectType::Blob {
+            return Err(GitError::InvalidObject(
+                "write_blob_as_pack requires a blob object".into(),
+            ));
+        }
+        if oid.format() != self.format {
+            return Err(GitError::InvalidObjectId(format!(
+                "object {oid} uses {}, store uses {}",
+                oid.format().name(),
+                self.format.name()
+            )));
+        }
+        if self.contains(&oid)? {
+            return Ok(oid);
+        }
+        let input = [PackInput {
+            oid: &oid,
+            object,
+        }];
+        let options = PackWriteOptions::new()
+            .with_window(0)
+            .with_depth(0)
+            .with_reorder(false)
+            .with_compression_level(compression_level);
+        let pack = PackFile::write_packed_with_known_ids_and_options(&input, self.format, &options)?;
+        self.install_pack(&pack)?;
+        Ok(oid)
+    }
+
+    pub fn write_blobs_as_pack(
+        &self,
+        objects: &[(ObjectId, EncodedObject)],
+        compression_level: u32,
+    ) -> Result<()> {
+        let mut seen = HashSet::with_capacity(objects.len());
+        let mut inputs = Vec::new();
+        for (oid, object) in objects {
+            if object.object_type != ObjectType::Blob {
+                return Err(GitError::InvalidObject(
+                    "write_blobs_as_pack requires blob objects".into(),
+                ));
+            }
+            if oid.format() != self.format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "object {oid} uses {}, store uses {}",
+                    oid.format().name(),
+                    self.format.name()
+                )));
+            }
+            if seen.insert(*oid) && !self.contains(oid)? {
+                inputs.push(PackInput { oid, object });
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let options = PackWriteOptions::new()
+            .with_window(0)
+            .with_depth(0)
+            .with_reorder(false)
+            .with_compression_level(compression_level);
+        let pack = PackFile::write_packed_with_known_ids_and_options(&inputs, self.format, &options)?;
+        self.install_pack(&pack)?;
+        Ok(())
     }
 
     pub fn install_pack_with_options(

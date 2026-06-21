@@ -265,6 +265,7 @@ impl HashObjectInvocation {
         }
         let cwd = env::current_dir()?;
         let repo_git_dir = discover_git_dir(&cwd).ok();
+        let _big_file_threshold = core_big_file_threshold(repo_git_dir.as_deref())?;
         let mut store = None;
         if self.write {
             let git_dir = repo_git_dir
