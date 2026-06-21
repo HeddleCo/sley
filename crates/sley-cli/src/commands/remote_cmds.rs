@@ -5790,6 +5790,16 @@ fn update_push_remote_tracking_refs(
         let name = format!("refs/remotes/{remote}/{branch}");
         if command.new_id.is_null() {
             let _ = refs.delete_ref(&name);
+        } else if refs.read_ref(&name)? == Some(RefTarget::Direct(command.new_id)) {
+            let packed_name = name.clone();
+            refs.pack_refs_selected_with_timeout(
+                true,
+                false,
+                0,
+                |candidate| candidate == packed_name,
+                |_, _| Ok(PackRefDecision::Pack { peeled: None }),
+            )?;
+            continue;
         } else {
             tx.update(RefUpdate {
                 name,
