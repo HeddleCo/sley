@@ -329,16 +329,20 @@ impl SeverityConfig {
             .rev()
             .find(|(id, _)| *id == canonical)
             .map(|(_, sev)| *sev);
-        let base = match configured {
-            Some(sev) => sev,
-            None => match msg_id.default_severity() {
-                DefaultSeverity::Error => Severity::Error,
-                DefaultSeverity::Warn | DefaultSeverity::Info => Severity::Warn,
-                DefaultSeverity::Ignore => Severity::Ignore,
-            },
+        let default = msg_id.default_severity();
+        let (base, strict_promotes) = match configured {
+            Some(sev) => (sev, sev == Severity::Warn),
+            None => {
+                let severity = match default {
+                    DefaultSeverity::Error => Severity::Error,
+                    DefaultSeverity::Warn | DefaultSeverity::Info => Severity::Warn,
+                    DefaultSeverity::Ignore => Severity::Ignore,
+                };
+                (severity, default == DefaultSeverity::Warn)
+            }
         };
         // `--strict` promotes a WARN to ERROR (git: `options->strict`).
-        if self.strict && base == Severity::Warn {
+        if self.strict && strict_promotes {
             Severity::Error
         } else {
             base
@@ -504,12 +508,49 @@ pub fn check_object_content(
         ObjectType::Tree => check_tree(body, config.large_pathname_len),
         ObjectType::Blob => Vec::new(),
     };
-    // Resolve severities and drop ignored findings, preserving order.
-    raw.retain_mut(|finding| {
+    // Resolve severities, apply tag-specific report-overwrite masking, then drop
+    // ignored findings while preserving printed order.
+    for finding in &mut raw {
         finding.severity = config.resolve(finding.msg_id);
-        finding.severity != Severity::Ignore
-    });
+    }
+    mask_tag_ident_error_if_extra_header_overwrites_return(object_type, &mut raw);
+    raw.retain(|finding| finding.severity != Severity::Ignore);
     raw
+}
+
+fn mask_tag_ident_error_if_extra_header_overwrites_return(
+    object_type: ObjectType,
+    findings: &mut [ContentFinding],
+) {
+    if object_type != ObjectType::Tag {
+        return;
+    }
+    let Some(extra_idx) = findings
+        .iter()
+        .position(|finding| finding.msg_id == MsgId::ExtraHeaderEntry)
+    else {
+        return;
+    };
+    if findings[extra_idx].severity == Severity::Error {
+        return;
+    }
+    for finding in &mut findings[..extra_idx] {
+        if matches!(
+            finding.msg_id,
+            MsgId::MissingNameBeforeEmail
+                | MsgId::MissingEmail
+                | MsgId::BadName
+                | MsgId::MissingSpaceBeforeEmail
+                | MsgId::BadEmail
+                | MsgId::MissingSpaceBeforeDate
+                | MsgId::BadDate
+                | MsgId::ZeroPaddedDate
+                | MsgId::BadDateOverflow
+                | MsgId::BadTimezone
+        ) {
+            finding.fatal = false;
+        }
+    }
 }
 
 fn finding(msg_id: MsgId, detail: impl Into<String>, fatal: bool) -> ContentFinding {
@@ -931,7 +972,7 @@ fn check_tag(body: &[u8]) -> Vec<ContentFinding> {
             Ok(next) => pos = next,
             Err(f) => {
                 out.push(f);
-                return out;
+                pos = line_end(body, after) + 1;
             }
         },
         None => {
@@ -1581,6 +1622,40 @@ This is an invalid tag.\n"
         assert_eq!(ids(&f), vec!["badTagName", "missingTaggerEntry"]);
         assert_eq!(f[0].detail, "invalid 'tag' name: wrong name format");
         assert_eq!(f[1].detail, "invalid format - expected 'tagger' line");
+    }
+
+    #[test]
+    fn strict_does_not_promote_default_info_tag_findings() {
+        let body = b"object 0000000000000000000000000000000000000000\n\
+type commit\n\
+tag wrong name format\n\n\
+This is an invalid tag.\n"
+            .to_vec();
+        let f = check_object_content(ObjectType::Tag, &body, &SeverityConfig::new(true));
+        let severities = f
+            .iter()
+            .map(|finding| (finding.msg_id.camel(), finding.severity))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            severities,
+            vec![
+                ("badTagName", Severity::Warn),
+                ("missingTaggerEntry", Severity::Warn),
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_ident_error_followed_by_ignored_extra_header_is_not_fatal() {
+        let body = b"object 0000000000000000000000000000000000000000\n\
+type commit\n\
+tag valid\n\
+tagger T A Gger <\n\
+ > 0 +0000\n\n"
+            .to_vec();
+        let f = check_object_content(ObjectType::Tag, &body, &cfg());
+        assert_eq!(ids(&f), vec!["badEmail"]);
+        assert!(!f[0].fatal, "{f:?}");
     }
 
     #[test]

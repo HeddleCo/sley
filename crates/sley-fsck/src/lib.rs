@@ -273,7 +273,7 @@ where
                 return;
             }
         };
-        self.check_loaded_object_content(oid, &object);
+        self.check_loaded_object_content(oid, &object, false);
     }
 
     /// Check a ref-reachable root. The driver validates the ref tip itself
@@ -288,7 +288,7 @@ where
         if !self.checked.insert(oid) {
             return;
         }
-        if self.check_loaded_object_content(oid, object) {
+        if self.check_loaded_object_content(oid, object, true) {
             return;
         }
 
@@ -300,7 +300,12 @@ where
         }
     }
 
-    fn check_loaded_object_content(&mut self, oid: ObjectId, object: &EncodedObject) -> bool {
+    fn check_loaded_object_content(
+        &mut self,
+        oid: ObjectId,
+        object: &EncodedObject,
+        fail_nonfatal_errors: bool,
+    ) -> bool {
         match object.object_id(self.format) {
             Ok(actual) if actual == oid => {}
             Ok(actual) => {
@@ -349,9 +354,12 @@ where
                 f.msg_id.camel(),
                 f.detail,
             );
-            let issue = match f.severity {
-                content::Severity::Error => FsckIssue::content_error(msg),
-                _ => FsckIssue::content_warning(msg),
+            let issue = if f.severity == content::Severity::Error
+                && (fail_nonfatal_errors || f.fatal)
+            {
+                FsckIssue::content_error(msg)
+            } else {
+                FsckIssue::content_warning(msg)
             };
             self.issues.push(issue);
         }
@@ -1040,6 +1048,51 @@ tagger T A Gger <tagger@example.com> 1234567890 +0000\n\n"
                 .iter()
                 .any(|issue| issue.message == format!("missing tag {missing_tag}")),
             "{reachable:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_nonfatal_tag_content_error_does_not_fail_fsck() {
+        let format = ObjectFormat::Sha1;
+        let mut db = ObjectDatabase::new(format);
+        let target = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"x".to_vec()))
+            .expect("test operation should succeed");
+        let tag = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tag,
+                format!(
+                    "object {target}\n\
+type blob\n\
+tag valid\n\
+tagger T A Gger <\n\
+ > 0 +0000\n\n"
+                )
+                .into_bytes(),
+            ))
+            .expect("test operation should succeed");
+
+        let report = fsck_objects_with_options(
+            &db,
+            format,
+            [],
+            [tag],
+            FsckOptions {
+                report_dangling: true,
+                report_unreachable: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(report.exit_code(), 0);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("badEmail:")
+                    && issue.severity == IssueSeverity::Warning),
+            "{report:?}"
         );
     }
 
