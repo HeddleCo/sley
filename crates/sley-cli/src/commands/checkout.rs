@@ -198,17 +198,24 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             .get_bool("checkout", None, "guess")
             .unwrap_or(true)
     });
-    // `git checkout -` is shorthand for `git checkout @{-1}`: switch back to the
-    // branch we most recently left (by name, so HEAD re-attaches). Expand it to
-    // that branch name before branch/revision resolution; if the prior checkout
-    // was detached (no branch name) leave it so the normal `@{-1}` revision path
-    // handles the detached case.
+    // `git checkout -` is shorthand for `git checkout @{-1}`. Bare `@{-N}` is
+    // interpreted as the Nth prior checkout target before branch/revision
+    // resolution, so branch targets re-attach HEAD while detached targets still
+    // flow through the normal revision path.
     if matches!(branch_mode, CheckoutBranchMode::Existing)
         && dashdash_index.is_none()
         && positional.len() == 1
-        && positional[0] == "-"
     {
-        if let Some(name) = sley_rev::nth_prior_checkout_branch_name(&git_dir, format, 1)? {
+        let store = FileRefStore::new(&git_dir, format);
+        if positional[0] == "-" {
+            if let Some(name) = checkout_expand_previous_branch_arg(&git_dir, format, &store, 1)? {
+                positional[0] = name;
+            } else {
+                positional[0] = "@{-1}".to_string();
+            }
+        } else if let Some(n) = checkout_previous_selector_n(&positional[0])
+            && let Some(name) = checkout_expand_previous_branch_arg(&git_dir, format, &store, n)?
+        {
             positional[0] = name;
         }
     }
@@ -258,7 +265,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 // `checkout <rev> <paths>...` — but if the first arg is not a
                 // revision, every positional is a pathspec (git's
                 // disambiguation for `checkout <path> <path>...`).
-                if sley_rev::resolve_revision(&git_dir, format, &positional[0]).is_ok() {
+                if checkout_resolve_start_oid(&git_dir, format, &positional[0]).is_ok() {
                     (Some(positional[0].as_str()), &positional[1..])
                 } else {
                     (None, positional.as_slice())
@@ -274,7 +281,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
                     .is_some();
                 if !is_branch
-                    && sley_rev::resolve_revision(&git_dir, format, value).is_err()
+                    && checkout_resolve_start_oid(&git_dir, format, value).is_err()
                     && (cwd.join(value).exists()
                         || checkout_index_has_path(&git_dir, &worktree_root, &cwd, format, value)?)
                 {
@@ -316,7 +323,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         return Err(GitError::Exit(128));
                     }
                     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                    let oid = resolve_revision(&git_dir, format, rev)?;
+                    let oid = checkout_resolve_start_oid(&git_dir, format, rev)?;
                     let tree = sley_rev::peel_to_tree(&db, format, &oid)?;
                     sley_worktree::restore_index_and_worktree_paths_from_tree(
                         worktree_root,
@@ -365,7 +372,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         let target = &positional[0];
         let store = FileRefStore::new(&git_dir, format);
         let head_commit = resolve_ref_peeled(&store, "HEAD")?;
-        if let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, target)
+        if let Ok(target_oid) = checkout_resolve_start_oid(&git_dir, format, target)
             && head_commit == Some(target_oid)
         {
             let switches_to_other_branch = branch_ref_name(target)
@@ -441,7 +448,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 ));
             }
             let target = positional.first().map(String::as_str).unwrap_or("HEAD");
-            let target_oid = resolve_revision(&git_dir, format, target)?;
+            let target_oid = checkout_resolve_start_oid(&git_dir, format, target)?;
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
             let target_oid = sley_rev::peel_to_commit(&db, format, &target_oid)?;
             let store = FileRefStore::new(&git_dir, format);
@@ -553,7 +560,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     branch: local_branch.to_string(),
                 }
             } else if !is_branch
-                && let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, branch)
+                && let Ok(target_oid) = checkout_resolve_start_oid(&git_dir, format, branch)
             {
                 let config = read_repo_config(&git_dir)?;
                 prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target_oid)?;
@@ -1102,6 +1109,42 @@ fn checkout_format_abbrev_oid(
         abbreviated.push_str("...");
     }
     Ok(abbreviated)
+}
+
+fn checkout_previous_selector_n(value: &str) -> Option<usize> {
+    let inner = value
+        .strip_prefix("@{-")
+        .and_then(|value| value.strip_suffix('}'))?;
+    inner.parse::<usize>().ok().filter(|n| *n > 0)
+}
+
+fn checkout_expand_previous_branch_arg(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    n: usize,
+) -> Result<Option<String>> {
+    let Some(name) = sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)? else {
+        return Ok(None);
+    };
+    let branch = name.strip_prefix("refs/heads/").unwrap_or(&name);
+    let Ok(refname) = branch_ref_name(branch) else {
+        return Ok(None);
+    };
+    if store.read_ref(&refname)?.is_some() {
+        Ok(Some(branch.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn checkout_resolve_start_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+    start: &str,
+) -> Result<ObjectId> {
+    resolve_checkout_start_oid(git_dir, format, start)?
+        .ok_or_else(|| GitError::not_found(format!("revision {start}")))
 }
 
 fn checkout_expand_creation_branch_name(
