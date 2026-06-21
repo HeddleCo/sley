@@ -1521,11 +1521,14 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
         let result = sley_odb::repack_cruft(&common_git_dir, format, &roots, cruft_expiration)?;
         sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
     } else {
-        // gc.cruftPacks=false: -A -d, dropping unreachable older than prune_expire
-        // (we drop all unreachable, matching the common "no recent unreachable"
-        // case the suite exercises).
+        // gc.cruftPacks=false: repack reachable objects, then prune loose
+        // unreachable objects older than gc.pruneExpire/--prune.
         if let Some(result) = sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)? {
             sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+        }
+        if let Some(spec) = prune_expire.as_deref() {
+            let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+            gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
         }
     }
 
@@ -4069,6 +4072,43 @@ fn prune_recent_hook_roots(common_git_dir: &Path, format: ObjectFormat) -> Resul
         }
     }
     Ok(roots)
+}
+
+fn gc_prune_expired_loose(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    expire: i64,
+) -> Result<()> {
+    if expire <= i64::MIN {
+        return Ok(());
+    }
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut prune_roots = roots.to_vec();
+    prune_roots.extend(prune_recent_object_roots(
+        &db,
+        common_git_dir,
+        format,
+        expire,
+    )?);
+    prune_roots.extend(prune_recent_hook_roots(common_git_dir, format)?);
+    prune_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    prune_roots.dedup();
+
+    for oid in prune_unreachable_loose(common_git_dir, format, prune_roots, false)? {
+        if !prune_object_is_expired(&db, &oid, expire)? {
+            continue;
+        }
+        let path = db.loose().object_path(&oid)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+    }
+    prune_packed_loose_objects(common_git_dir, format, false)?;
+    prune_empty_loose_object_dirs(&common_git_dir.join("objects"))?;
+    Ok(())
 }
 
 fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: i64) -> Result<bool> {
