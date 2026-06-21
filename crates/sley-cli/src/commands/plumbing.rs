@@ -3232,6 +3232,11 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
             .map_err(|err| GitError::InvalidPath(err.to_string()))?;
         let absolute = worktree_root.join(relative);
         if target.is_dir {
+            if clean_target_is_original_cwd(&absolute) {
+                clean_original_cwd_contents(&absolute, &excludes)?;
+                write!(stdout, "Refusing to remove current working directory\n")?;
+                continue;
+            }
             match fs::remove_dir_all(&absolute) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -3241,6 +3246,38 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
             }
         } else {
             fs::remove_file(absolute)?;
+        }
+    }
+    Ok(())
+}
+
+fn clean_target_is_original_cwd(path: &Path) -> bool {
+    let Some(cwd) = sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
+        return false;
+    };
+    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path == cwd
+}
+
+fn clean_original_cwd_contents(path: &Path, excludes: &[String]) -> Result<()> {
+    let read = match fs::read_dir(path) {
+        Ok(read) => read,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in read {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if excludes.iter().any(|exclude| exclude == &name) {
+            continue;
+        }
+        let child = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(child)?;
+        } else {
+            fs::remove_file(child)?;
         }
     }
     Ok(())

@@ -1744,6 +1744,7 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
     for path in &created.untracked_paths {
         remove_stashed_untracked_path(&created.worktree_root, path)?;
     }
+    prune_empty_untracked_dirs_preserving_cwd(&created.worktree_root)?;
     Ok(())
 }
 
@@ -2275,7 +2276,10 @@ fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()
     }
     let mut parent = path.parent();
     while let Some(directory) = parent {
-        if directory == worktree_root || directory.join(".git").exists() {
+        if directory == worktree_root
+            || directory.join(".git").exists()
+            || stash_path_is_original_cwd(directory)
+        {
             break;
         }
         match fs::remove_dir(directory) {
@@ -2292,6 +2296,48 @@ fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn stash_path_is_original_cwd(path: &Path) -> bool {
+    let Some(cwd) = sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
+        return false;
+    };
+    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path == cwd
+}
+
+fn prune_empty_untracked_dirs_preserving_cwd(worktree_root: &Path) -> Result<()> {
+    fn visit(root: &Path, dir: &Path) -> Result<()> {
+        let read = match fs::read_dir(dir) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        for entry in read {
+            let entry = entry?;
+            let path = entry.path();
+            if path == root || path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                visit(root, &path)?;
+                if !stash_path_is_original_cwd(&path) {
+                    match fs::remove_dir(&path) {
+                        Ok(()) => {}
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                            ) => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    visit(worktree_root, worktree_root)
 }
 
 fn stash_repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {

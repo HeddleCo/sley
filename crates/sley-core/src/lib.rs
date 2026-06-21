@@ -4,8 +4,21 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.54.0";
+
+static ORIGINAL_CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub fn set_original_cwd(path: Option<PathBuf>) {
+    if let Ok(mut original) = ORIGINAL_CWD.lock() {
+        *original = path;
+    }
+}
+
+pub fn original_cwd() -> Option<PathBuf> {
+    ORIGINAL_CWD.lock().ok()?.clone()
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum DateMode {

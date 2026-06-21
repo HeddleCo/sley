@@ -151,6 +151,7 @@ pub(crate) use repo_path::RepoPathBuf;
 pub(crate) use repository::RepositoryContext;
 
 pub fn run(args: Vec<String>) -> Result<()> {
+    sley_core::set_original_cwd(env::current_dir().ok());
     let global = apply_global_options(&args)?;
     sley_core::trace2::touch();
     // `-c` / `--config-env` overrides are folded into the process

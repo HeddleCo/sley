@@ -114,6 +114,9 @@ fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
     match fs::symlink_metadata(full) {
         Ok(metadata) => {
             if metadata.is_dir() {
+                if merge_path_is_original_cwd(full) {
+                    return merge_refuse_remove_current_working_directory(full);
+                }
                 match fs::remove_dir_all(full) {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -210,6 +213,9 @@ pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> R
     // dangling one, leaving it behind on removal.
     match fs::symlink_metadata(&full) {
         Ok(metadata) if metadata.is_dir() => {
+            if merge_path_is_original_cwd(&full) {
+                return Ok(());
+            }
             // A directory occupies a tracked path being removed: this is a
             // gitlink (submodule checkout). git's entry.c `unlink_entry` ⇒
             // `remove_or_warn(mode, ..)` dispatches on `S_ISGITLINK(mode)` to
@@ -237,7 +243,81 @@ pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> R
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
+    merge_prune_empty_dirs(worktree_root, full.parent());
     Ok(())
+}
+
+pub(crate) fn merge_refuse_if_current_working_directory_becomes_file(
+    worktree_root: &Path,
+    target_entries: &MergeTreeMap,
+) -> Result<()> {
+    let Some(cwd) = merge_original_cwd_relative_to(worktree_root) else {
+        return Ok(());
+    };
+    if target_entries.iter().any(|(path, (mode, _))| {
+        path == &cwd && !sley_index::is_gitlink(*mode) && (mode & 0o170000) != 0o040000
+    }) {
+        let full = worktree_root.join(path_from_git_bytes_lossy(&cwd));
+        if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_dir()) {
+            return merge_refuse_remove_current_working_directory(&full);
+        }
+    }
+    Ok(())
+}
+
+fn merge_original_cwd_absolute() -> Option<PathBuf> {
+    let cwd = sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
+    Some(fs::canonicalize(&cwd).unwrap_or(cwd))
+}
+
+fn merge_original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
+    let root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+    let cwd = merge_original_cwd_absolute()?;
+    if cwd == root {
+        return None;
+    }
+    let rel = cwd.strip_prefix(&root).ok()?;
+    Some(path_to_git_bytes_lossy(rel))
+}
+
+fn merge_path_is_original_cwd(path: &Path) -> bool {
+    let Some(cwd) = merge_original_cwd_absolute() else {
+        return false;
+    };
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path == cwd
+}
+
+fn merge_refuse_remove_current_working_directory(path: &Path) -> Result<()> {
+    eprintln!(
+        "error: Refusing to remove the current working directory:\n{}",
+        path.display()
+    );
+    Err(GitError::Exit(128))
+}
+
+fn merge_prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
+    while let Some(path) = dir {
+        if path == root || merge_path_is_original_cwd(path) {
+            break;
+        }
+        if fs::remove_dir(path).is_err() {
+            break;
+        }
+        dir = path.parent();
+    }
+}
+
+fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+        .into_bytes()
+}
+
+fn path_from_git_bytes_lossy(path: &[u8]) -> PathBuf {
+    String::from_utf8_lossy(path).split('/').collect()
 }
 
 /// Per-path outcome of a 3-way tree merge.

@@ -8,7 +8,8 @@
 //! `--skip` / `--quit`.
 
 use crate::commands::merge_rebase::{
-    MergePathResult, MergeTreeMap, commit_tree_oid, head_commit_oid, three_way_merge_trees_styled,
+    MergePathResult, MergeTreeMap, commit_tree_oid, head_commit_oid,
+    merge_refuse_if_current_working_directory_becomes_file, three_way_merge_trees_styled,
 };
 use crate::*;
 use sley_sequencer::replay::{self, ReplayAction, ReplayOpts, TodoItem};
@@ -1516,6 +1517,15 @@ fn do_pick_commit(
     .map_err(print_fatal_error)?;
 
     // Pre-flight worktree clobber checks (unpack_trees' verify steps).
+    let target_map = merge_results_to_tree_map(&results);
+    if let Err(err) =
+        merge_refuse_if_current_working_directory_becomes_file(&ctx.worktree_root, &target_map)
+    {
+        return match err {
+            GitError::Exit(code) => Err(ReplayHalt::Code(code)),
+            other => Err(print_fatal_error(other)),
+        };
+    }
     verify_worktree_safe(ctx, &ours_map, &results)?;
 
     let cleanup_mode = opts
