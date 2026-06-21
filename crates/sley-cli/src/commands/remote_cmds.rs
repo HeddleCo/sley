@@ -6102,6 +6102,7 @@ fn push_remote_and_refspecs(
     match positional {
         [] => {
             let config = read_repo_config(git_dir).unwrap_or_default();
+            reject_empty_branch_config(&config)?;
             let branch = store.current_branch()?;
             let remote = default_push_remote(&config, branch.as_deref())?;
             let refspecs = default_push_refspecs(&config, branch.as_deref(), &remote)?;
@@ -6114,6 +6115,7 @@ fn push_remote_and_refspecs(
         }
         [remote] => {
             let config = read_repo_config(git_dir).unwrap_or_default();
+            reject_empty_branch_config(&config)?;
             let branch = store.current_branch()?;
             let refspecs = default_push_refspecs(&config, branch.as_deref(), remote)?;
             Ok(PushRemoteAndRefspecs {
@@ -6125,6 +6127,7 @@ fn push_remote_and_refspecs(
         }
         [remote, refspecs @ ..] => {
             let config = read_repo_config(git_dir).unwrap_or_default();
+            reject_empty_branch_config(&config)?;
             let branch = store.current_branch()?;
             Ok(PushRemoteAndRefspecs {
                 remote: remote.clone(),
@@ -6140,6 +6143,22 @@ fn push_remote_and_refspecs(
             })
         }
     }
+}
+
+fn reject_empty_branch_config(config: &GitConfig) -> Result<()> {
+    for section in &config.sections {
+        if section.name.eq_ignore_ascii_case("branch") && section.subsection.as_deref() == Some("")
+        {
+            let key = section
+                .entries
+                .first()
+                .map(|entry| entry.key.as_str())
+                .unwrap_or("");
+            eprintln!("fatal: bad config variable 'branch..{key}' in file '.git/config'");
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
 }
 
 fn explicit_push_refspecs_with_refmap(
