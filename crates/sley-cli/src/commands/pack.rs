@@ -1605,6 +1605,10 @@ fn gc_run_locked(
             sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
         }
         gc_remove_cruft_packs(&common_git_dir)?;
+        if let Some(spec) = prune_expire.as_deref() {
+            let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+            gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
+        }
     } else if cruft_packs {
         // Default: reachable pack + cruft pack, cruft expiry = prune_expire.
         let cruft_expiration = match prune_expire.as_deref() {

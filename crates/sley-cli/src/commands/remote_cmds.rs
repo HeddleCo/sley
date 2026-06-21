@@ -2606,7 +2606,9 @@ fn install_local_clone_objects(
     match mode {
         LocalObjectInstall::Transport => return Ok(()),
         LocalObjectInstall::Shared => {
-            clear_local_clone_object_files(&repository_objects_dir(git_dir))?;
+            let objects_dir = repository_objects_dir(git_dir);
+            clear_local_clone_object_files(&objects_dir)?;
+            fs::create_dir_all(objects_dir.join("pack"))?;
             return Ok(());
         }
         LocalObjectInstall::Hardlink { .. } | LocalObjectInstall::Copy => {}
