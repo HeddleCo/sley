@@ -612,6 +612,24 @@ fn reflog_expire_matches_upstream_git() {
         vec!["reflog", "expire", "--expire"],
         vec!["reflog", "expire", "--expire=bad", "refs/heads/main"],
         vec!["reflog", "expire", "refs/heads/missing"],
+        vec!["reflog", "expire", "HEAD@{0}"],
+        vec!["reflog", "expire", "main@{0}"],
+        vec!["reflog", "expire", "--updateref", "HEAD@{0}"],
+        vec!["reflog", "expire", "--updateref", "main@{0}"],
+        vec![
+            "reflog",
+            "expire",
+            "--updateref",
+            "--rewrite",
+            "HEAD@{0}",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--updateref",
+            "--rewrite",
+            "main@{0}",
+        ],
     ] {
         let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
         let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
