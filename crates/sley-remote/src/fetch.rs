@@ -683,10 +683,21 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     .chain(primary_heads.iter().copied())
                     .filter(|oid| seen.insert(*oid))
                     .collect()
+            } else if deepen_plan.is_none() {
+                let mut starts = Vec::new();
+                for update in &updates {
+                    if !local_db.contains(&update.oid)? {
+                        starts.push(update.oid);
+                    }
+                }
+                starts
             } else {
                 updates.iter().map(|update| update.oid).collect()
             };
             let shallow_info = if starts.is_empty() && deepen_plan.is_none() {
+                if !updates.is_empty() {
+                    sley_protocol::trace_packet_write_payload(b"0000");
+                }
                 Vec::new()
             } else {
                 crate::local::install_fetch_pack_via_local_upload_pack(
@@ -699,7 +710,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options.record_promisor_refs,
                     options.filter.clone(),
                     options.refetch,
-                    None,
+                    local_fetch_unpack_limit(request.git_dir, promisor_remote),
                 )?
             };
             if !options.dry_run {
@@ -743,6 +754,18 @@ fn scheme_for_fetch_source(source: &FetchSource) -> &'static str {
         FetchSource::Git { remote, .. } => crate::protocol::transport_scheme_for_remote(remote),
         FetchSource::Local { .. } => "file",
     }
+}
+
+fn local_fetch_unpack_limit(git_dir: &Path, promisor_remote: bool) -> Option<usize> {
+    if promisor_remote {
+        return None;
+    }
+    git_dir
+        .join("objects")
+        .join("info")
+        .join("alternates")
+        .exists()
+        .then_some(100)
 }
 
 /// Does the (graft-aware) history of `tip` on the remote touch one of the

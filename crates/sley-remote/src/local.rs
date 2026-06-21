@@ -494,14 +494,21 @@ pub fn local_fetch_advertisements(
     Ok(advertisements)
 }
 
-/// The object ids the local repository can offer as `have`s during negotiation:
-/// the deduplicated tips of its own advertisements.
+/// The object ids the local repository can offer as `have`s during negotiation.
+/// Ref tips are offered first, then every object visible through the local
+/// object database, including alternates recorded in `objects/info/alternates`.
 pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut seen = HashSet::new();
     let mut haves = Vec::new();
     for advertisement in local_fetch_advertisements(git_dir, format)? {
         if seen.insert(advertisement.oid) {
             haves.push(advertisement.oid);
+        }
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    for oid in db.object_ids()? {
+        if seen.insert(oid) {
+            haves.push(oid);
         }
     }
     Ok(haves)
@@ -909,6 +916,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         None => true,
     };
     if all_wants_present && deepen_noop && !refetch {
+        sley_protocol::trace_packet_write_payload(b"0000");
         return Ok(Vec::new());
     }
 

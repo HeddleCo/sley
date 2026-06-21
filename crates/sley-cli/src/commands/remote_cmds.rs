@@ -979,6 +979,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         let git_dir = layout.git_dir;
         configure_local_clone(&git_dir, None)?;
         copy_local_revision_objects(&remote_common_git_dir, &git_dir, format, revision_oid)?;
+        if dissociate {
+            dissociate_clone_alternates(&git_dir, format)?;
+        }
         if let Some(bundle_uri) = bundle_uri.as_ref() {
             apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
         }
@@ -1094,6 +1097,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let git_dir = outcome.git_dir;
     if local_source {
         install_local_clone_objects(&source_alternates_git_dir, &git_dir, local_object_install)?;
+    }
+    if dissociate {
+        dissociate_clone_alternates(&git_dir, format)?;
     }
     if let Some(bundle_uri) = bundle_uri.as_ref() {
         apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
@@ -2197,6 +2203,9 @@ fn clone_bare_or_mirror_local_repository(
             options.format,
             revision_oid,
         )?;
+        if options.dissociate {
+            dissociate_clone_alternates(&git_dir, options.format)?;
+        }
         if let Some(bundle_uri) = options.bundle_uri {
             apply_clone_bundle_uri(&git_dir, options.format, bundle_uri)?;
         }
@@ -2267,6 +2276,9 @@ fn clone_bare_or_mirror_local_repository(
             &git_dir,
             options.local_object_install,
         )?;
+    }
+    if options.dissociate {
+        dissociate_clone_alternates(&git_dir, options.format)?;
     }
     if let Some(bundle_uri) = options.bundle_uri {
         apply_clone_bundle_uri(&git_dir, options.format, bundle_uri)?;
@@ -2404,13 +2416,15 @@ fn clone_alternates(
 ) -> Result<Vec<PathBuf>> {
     let mut alternates = Vec::new();
     if shared {
-        alternates.push(remote_git_dir.join("objects"));
+        push_unique_alternate(&mut alternates, remote_git_dir.join("objects"));
     }
     for reference in references {
         match ls_remote_git_dir(&reference.path)
             .and_then(|git_dir| common_git_dir_for_git_dir(&git_dir))
         {
-            Ok(reference_git_dir) => alternates.push(reference_git_dir.join("objects")),
+            Ok(reference_git_dir) => {
+                push_unique_alternate(&mut alternates, reference_git_dir.join("objects"));
+            }
             Err(_) if reference.if_able => eprintln!(
                 "info: Could not add alternate for '{}': reference repository '{}' is not a local repository.",
                 reference.path, reference.path
@@ -2421,8 +2435,18 @@ fn clone_alternates(
     Ok(alternates)
 }
 
-fn apply_clone_alternates(git_dir: &Path, alternates: &[PathBuf], dissociate: bool) -> Result<()> {
-    if alternates.is_empty() || dissociate {
+fn push_unique_alternate(alternates: &mut Vec<PathBuf>, alternate: PathBuf) {
+    if !alternates.iter().any(|existing| existing == &alternate) {
+        alternates.push(alternate);
+    }
+}
+
+fn apply_clone_alternates(
+    git_dir: &Path,
+    alternates: &[PathBuf],
+    _dissociate: bool,
+) -> Result<()> {
+    if alternates.is_empty() {
         return Ok(());
     }
     let alternates_path = git_dir.join("objects/info/alternates");
@@ -2433,6 +2457,55 @@ fn apply_clone_alternates(git_dir: &Path, alternates: &[PathBuf], dissociate: bo
     }
     fs::write(alternates_path, contents)?;
     Ok(())
+}
+
+fn dissociate_clone_alternates(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let alternates_path = git_dir.join("objects/info/alternates");
+    if !alternates_path.exists() {
+        return Ok(());
+    }
+    let roots = dissociate_repack_roots(git_dir, format)?;
+    if let Some(result) = sley_odb::repack_reachable_objects(git_dir, format, &roots)? {
+        sley_odb::install_repack_result(git_dir, format, &result, true)?;
+    }
+    match fs::remove_file(&alternates_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn dissociate_repack_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for reference in store.list_refs()? {
+        if let Some(oid) = resolve_clone_ref_oid(&store, reference.target)? && seen.insert(oid) {
+            roots.push(oid);
+        }
+    }
+    if let Some(head) = store.read_ref("HEAD")?
+        && let Some(oid) = resolve_clone_ref_oid(&store, head)?
+        && seen.insert(oid)
+    {
+        roots.push(oid);
+    }
+    Ok(roots)
+}
+
+fn resolve_clone_ref_oid(store: &FileRefStore, mut target: RefTarget) -> Result<Option<ObjectId>> {
+    for _ in 0..5 {
+        match target {
+            RefTarget::Direct(oid) => return Ok(Some(oid)),
+            RefTarget::Symbolic(name) => {
+                let Some(next) = store.read_ref(&name)? else {
+                    return Ok(None);
+                };
+                target = next;
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn apply_clone_source_alternates(git_dir: &Path, source_git_dir: &Path) -> Result<()> {
