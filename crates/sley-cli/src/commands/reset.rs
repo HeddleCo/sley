@@ -234,7 +234,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let target_oid = resolve_revision(&git_dir, format, target)?;
+        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         return commands::replay::reset_merge_in(
             &git_dir,
@@ -282,7 +282,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             })?;
         let old_head = head_oid;
         let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
-        let target_oid = resolve_revision(&git_dir, format, target)?;
+        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
@@ -386,7 +386,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             sley_sequencer::replay::remove_branch_state(&git_dir);
             return Ok(());
         }
-        let target_oid = resolve_revision(&git_dir, format, target)?;
+        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if mode == ResetMode::Hard {
@@ -428,7 +428,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
 
     if !saw_separator
         && positionals.len() == 1
-        && let Ok(target_oid) = resolve_revision(&git_dir, format, &positionals[0])
+        && let Ok(target_oid) = resolve_revision_commitish(&git_dir, format, &positionals[0])
     {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let old_head = match resolve_revision(&git_dir, format, "HEAD") {
@@ -484,7 +484,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             [] => {}
             [target] => {
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                let target_oid = resolve_revision(&git_dir, format, target)?;
+                let target_oid = resolve_revision_treeish(&git_dir, format, target)?;
                 source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
             }
             _ => {
@@ -499,7 +499,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     } else {
         let mut values = positionals;
         if values.len() > 1
-            && let Ok(target_oid) = resolve_revision(&git_dir, format, &values[0])
+            && let Ok(target_oid) = resolve_revision_treeish(&git_dir, format, &values[0])
         {
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
             source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);

@@ -3293,6 +3293,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut summary = false;
     let mut recount = false;
     let mut update_index = false;
+    let mut build_fake_ancestor: Option<String> = None;
     let mut files = Vec::new();
     // git's default when applying is `warn`; the value is overridden by the
     // last `--whitespace=` seen.
@@ -3314,6 +3315,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 ));
             }
             "--index" => update_index = true,
+            "--build-fake-ancestor" => {
+                let Some(path) = iter.next() else {
+                    return Err(GitError::Command(
+                        "apply --build-fake-ancestor requires a value".into(),
+                    ));
+                };
+                build_fake_ancestor = Some(path.to_string());
+            }
             "-3" | "--3way" | "--cached" => {
                 return Err(GitError::Unsupported(format!(
                     "apply {arg} is not supported yet"
@@ -3333,6 +3342,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             value if let Some(rest) = value.strip_prefix("--whitespace=") => {
                 ws_action = parse_ws_action(rest)?;
+            }
+            value if let Some(path) = value.strip_prefix("--build-fake-ancestor=") => {
+                build_fake_ancestor = Some(path.to_string());
             }
             value
                 if value.starts_with("-p")
@@ -3363,6 +3375,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 other => other,
             },
         )?);
+    }
+    if let Some(path) = build_fake_ancestor {
+        write_apply_fake_ancestor_index(&git_dir, format, &patches, &inputs, &path)?;
+        return Ok(());
     }
     if stat || numstat || summary {
         write_apply_read_only_output(&patches, stat, numstat, summary)?;
@@ -3518,6 +3534,99 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn write_apply_fake_ancestor_index(
+    git_dir: &Path,
+    format: ObjectFormat,
+    patches: &[sley_diff_merge::FilePatch],
+    inputs: &[(String, Vec<u8>)],
+    path: &str,
+) -> Result<()> {
+    let index_records = apply_patch_index_records(inputs);
+    let mut entries = Vec::new();
+    for (patch, index_record) in patches.iter().zip(index_records) {
+        if patch.is_new {
+            continue;
+        }
+        let Some(path) = patch.old_path.as_ref().or(patch.new_path.as_ref()) else {
+            continue;
+        };
+        let oid = sley_rev::resolve_short_object_id(
+            git_dir,
+            format,
+            &index_record.old_oid,
+            sley_rev::ObjectDisambiguation::Blob,
+        )?
+        .into_result(&index_record.old_oid)?;
+        let mode = index_record
+            .mode
+            .or(patch.old_mode)
+            .or(patch.new_mode)
+            .unwrap_or(0o100644);
+        let flags = (path.len().min(0x0fff)) as u16;
+        entries.push(IndexEntry {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid,
+            flags,
+            flags_extended: 0,
+            path: BString::from(path.clone()),
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    fs::write(path, index.write(format)?)?;
+    Ok(())
+}
+
+struct ApplyPatchIndexRecord {
+    old_oid: String,
+    mode: Option<u32>,
+}
+
+fn apply_patch_index_records(inputs: &[(String, Vec<u8>)]) -> Vec<ApplyPatchIndexRecord> {
+    let mut records = Vec::new();
+    for (_, input) in inputs {
+        for line in input.split(|byte| *byte == b'\n') {
+            let Some(rest) = line.strip_prefix(b"index ") else {
+                continue;
+            };
+            let Some((old, after_old)) = split_once_bytes(rest, b"..") else {
+                continue;
+            };
+            let old_oid = String::from_utf8_lossy(old).into_owned();
+            let mode = after_old
+                .split(|byte| *byte == b' ')
+                .nth(1)
+                .and_then(parse_apply_octal);
+            records.push(ApplyPatchIndexRecord { old_oid, mode });
+        }
+    }
+    records
+}
+
+fn parse_apply_octal(bytes: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    u32::from_str_radix(text, 8).ok()
+}
+
+fn split_once_bytes<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    let pos = bytes.windows(needle.len()).position(|window| window == needle)?;
+    Some((&bytes[..pos], &bytes[pos + needle.len()..]))
 }
 
 fn read_apply_inputs(files: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
@@ -9042,8 +9151,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let tree = match ObjectId::from_hex(format, &tree) {
         Ok(oid) => oid,
         Err(_) => {
-            let tree_rev =
-                sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, &tree)?;
+            let tree_rev = resolve_revision_treeish(&git_dir, format, &tree)?;
             sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
         }
     };
@@ -9052,8 +9160,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
         .map(|parent| match ObjectId::from_hex(format, parent) {
             Ok(oid) => Ok(oid),
             Err(_) => {
-                let resolved =
-                    sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, parent)?;
+                let resolved = resolve_revision_commitish(&git_dir, format, parent)?;
                 sley_rev::peel_to_commit(&db_resolve, format, &resolved)
             }
         })

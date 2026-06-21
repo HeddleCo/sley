@@ -583,14 +583,8 @@ pub fn ambiguous_short_object_id_hint(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut candidates = db.object_ids_with_prefix(prefix)?;
     candidates.sort_by(|left, right| {
-        let left_type = db
-            .read_object(left)
-            .ok()
-            .map(|object| object.object_type);
-        let right_type = db
-            .read_object(right)
-            .ok()
-            .map(|object| object.object_type);
+        let left_type = ambiguous_candidate_type_for_sort(&db, left);
+        let right_type = ambiguous_candidate_type_for_sort(&db, right);
         ambiguous_type_sort_key(left_type)
             .cmp(&ambiguous_type_sort_key(right_type))
             .then_with(|| left.to_hex().cmp(&right.to_hex()))
@@ -612,13 +606,27 @@ pub fn ambiguous_short_object_id_hint(
     Ok(out)
 }
 
+fn ambiguous_candidate_type_for_sort(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+) -> Option<ObjectType> {
+    match db.read_object_header(oid) {
+        Ok(Some((object_type, _))) => Some(object_type),
+        Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
+            eprintln!("error: {message}");
+            None
+        }
+        Ok(None) | Err(_) => None,
+    }
+}
+
 fn ambiguous_type_sort_key(object_type: Option<ObjectType>) -> u8 {
     match object_type {
-        Some(ObjectType::Tag) => 0,
-        Some(ObjectType::Commit) => 1,
-        Some(ObjectType::Tree) => 2,
-        Some(ObjectType::Blob) => 3,
-        None => 4,
+        None => 0,
+        Some(ObjectType::Tag) => 1,
+        Some(ObjectType::Commit) => 2,
+        Some(ObjectType::Tree) => 3,
+        Some(ObjectType::Blob) => 4,
     }
 }
 
@@ -628,10 +636,32 @@ fn ambiguous_short_object_id_line(
     oid: &ObjectId,
 ) -> Result<String> {
     let abbrev = unique_object_abbrev(db, oid)?;
-    let Ok(object) = db.read_object(oid) else {
-        return Ok(format!("{abbrev} [bad object]"));
+    let object_type = match db.read_object_header(oid) {
+        Ok(Some((object_type, _))) => object_type,
+        Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
+            return Err(GitError::InvalidObject(message));
+        }
+        Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
+            eprintln!("error: {message}");
+            return Ok(format!("{abbrev} [bad object]"));
+        }
+        Ok(None) | Err(_) => return Ok(format!("{abbrev} [bad object]")),
     };
-    Ok(match object.object_type {
+    if matches!(object_type, ObjectType::Tree | ObjectType::Blob) {
+        return Ok(format!("{abbrev} {}", object_type.as_str()));
+    }
+    let object = match db.read_object(oid) {
+        Ok(object) => object,
+        Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
+            return Err(GitError::InvalidObject(message));
+        }
+        Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
+            eprintln!("error: {message}");
+            return Ok(format!("{abbrev} [bad object]"));
+        }
+        Err(_) => return Ok(format!("{abbrev} [bad object]")),
+    };
+    Ok(match object_type {
         ObjectType::Commit => {
             let commit = Commit::parse_ref(format, &object.body)?;
             let subject = first_message_line(commit.message);
@@ -727,8 +757,9 @@ fn resolve_describe_name(
                 && hex.len() < format.hex_len()
                 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
-                let db = FileObjectDatabase::from_git_dir(git_dir, format);
-                if let ObjectPrefixResolution::Unique(oid) = db.resolve_prefix(hex)? {
+                if let ShortObjectIdResolution::Unique(oid) =
+                    resolve_short_object_id(git_dir, format, hex, ObjectDisambiguation::Commit)?
+                {
                     return Ok(Some(oid));
                 }
             }

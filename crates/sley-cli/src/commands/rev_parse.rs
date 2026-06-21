@@ -274,7 +274,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     return Err(GitError::Exit(128));
                 }
                 let normalized_rev = rev_parse_normalize_revision_arg(&cwd, &git_dir, rev)?;
-                let oid = match resolve_revision(&git_dir, format, &normalized_rev) {
+                let oid = match rev_parse_resolve_revision_arg(&git_dir, format, &normalized_rev) {
                     Ok(oid) => oid,
                     Err(_) if revs_only => {
                         idx += 1;
@@ -360,6 +360,35 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
 
 fn before_dashdash(dashdash: Option<usize>, idx: usize) -> bool {
     dashdash.is_some_and(|dashdash| idx < dashdash)
+}
+
+fn rev_parse_resolve_revision_arg(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<ObjectId> {
+    if rev.len() >= 4
+        && rev.len() < format.hex_len()
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && let Some(disambiguation) = rev_parse_core_disambiguate(git_dir)
+    {
+        return sley_rev::resolve_short_object_id(git_dir, format, rev, disambiguation)?
+            .into_result(rev);
+    }
+    resolve_revision(git_dir, format, rev)
+}
+
+fn rev_parse_core_disambiguate(git_dir: &Path) -> Option<sley_rev::ObjectDisambiguation> {
+    let config = read_repo_config(git_dir).ok()?;
+    match config.get("core", None, "disambiguate")? {
+        "commit" => Some(sley_rev::ObjectDisambiguation::Commit),
+        "committish" => Some(sley_rev::ObjectDisambiguation::Commitish),
+        "tree" => Some(sley_rev::ObjectDisambiguation::Tree),
+        "treeish" => Some(sley_rev::ObjectDisambiguation::Treeish),
+        "blob" => Some(sley_rev::ObjectDisambiguation::Blob),
+        "tag" => Some(sley_rev::ObjectDisambiguation::Tag),
+        _ => None,
+    }
 }
 
 fn rev_parse_render_range(
@@ -558,7 +587,15 @@ fn rev_parse_maybe_print_ambiguity(
         return Ok(());
     };
     eprintln!("error: short object ID {prefix} is ambiguous");
-    let hints = sley_rev::ambiguous_short_object_id_hint(git_dir, format, &prefix, disambiguation)?;
+    let hints =
+        match sley_rev::ambiguous_short_object_id_hint(git_dir, format, &prefix, disambiguation) {
+            Ok(hints) => hints,
+            Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
+                eprintln!("fatal: invalid object type");
+                return Err(GitError::Exit(128));
+            }
+            Err(err) => return Err(err),
+        };
     if !hints.is_empty() {
         eprintln!("hint: The candidates are:");
         for hint in hints {
@@ -625,6 +662,7 @@ fn rev_parse_tree_path_error(
     seen_path_arg: bool,
     err: GitError,
 ) -> Result<()> {
+    rev_parse_maybe_print_ambiguity(git_dir, format, &format!("{base}:{path}"), &err)?;
     if rev_parse_error_message(&err).starts_with("revision ") {
         eprintln!("fatal: invalid object name '{base}'.");
         return Err(GitError::Exit(128));

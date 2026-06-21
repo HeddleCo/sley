@@ -1240,6 +1240,9 @@ fn print_cat_file_batch_record(
         Some(oid) => oid,
         None => match record.view.resolve_object_name(record.object_name) {
             Ok(oid) => oid,
+            Err(err) if sley_rev::is_short_object_id_ambiguous_error(&err) => {
+                return report_object_ambiguous(stdout, &record, &err);
+            }
             Err(_) => return report_object_missing(stdout, &record, &query),
         },
     };
@@ -1399,6 +1402,39 @@ fn report_object_missing(
     }
     stdout.write_all(&[record.terminator])?;
     Ok(())
+}
+
+fn report_object_ambiguous(
+    stdout: &mut dyn Write,
+    record: &CatFileBatchRecord<'_>,
+    err: &GitError,
+) -> Result<()> {
+    let prefix = short_object_id_prefix_from_error(err).unwrap_or(record.object_name);
+    eprintln!("error: short object ID {prefix} is ambiguous");
+    let hints = sley_rev::ambiguous_short_object_id_hint(
+        record.view.common_git_dir(),
+        record.view.format(),
+        prefix,
+        sley_rev::ObjectDisambiguation::Any,
+    )?;
+    if !hints.is_empty() {
+        eprintln!("hint: The candidates are:");
+        for hint in hints {
+            eprintln!("hint:   {hint}");
+        }
+    }
+    write!(stdout, "{} ambiguous", record.object_name)?;
+    stdout.write_all(&[record.terminator])?;
+    Ok(())
+}
+
+fn short_object_id_prefix_from_error(err: &GitError) -> Option<&str> {
+    let GitError::InvalidObjectId(message) = err else {
+        return None;
+    };
+    message
+        .strip_prefix("short object ID ")?
+        .strip_suffix(" is ambiguous")
 }
 
 /// Emit one of the `--follow-symlinks` notification records (`symlink`/`dangling`/`loop`/
