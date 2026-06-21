@@ -1795,6 +1795,7 @@ fn update_index_paths_impl(
     // round-trip warning (default: warn). It only applies when content filters
     // run at all (i.e. when we have a config).
     let conv_flags = clean_config.map_or(ConvFlags::Off, ConvFlags::from_config);
+    let non_atomic_chmod_errors = clean_config.is_some() && options.add && options.remove;
     let requested_filter_attrs = filter_attribute_names();
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
@@ -2008,6 +2009,9 @@ fn update_index_paths_impl(
                     if executable { '+' } else { '-' },
                     String::from_utf8_lossy(&git_path)
                 );
+                if !non_atomic_chmod_errors {
+                    return Err(GitError::Exit(128));
+                }
                 chmod_error = true;
             } else {
                 entry.mode = if executable { 0o100755 } else { 0o100644 };
