@@ -160,6 +160,9 @@ jobs:
             t5510-fetch.sh
             t2205-add-worktree-config.sh
             t1050-large.sh
+            t5514-fetch-multiple.sh
+            t2030-unresolve-info.sh
+            t2407-worktree-heads.sh
             t2204-add-ignored.sh
             t6020-bundle-misc.sh
             t4068-diff-symmetric-merge-base.sh

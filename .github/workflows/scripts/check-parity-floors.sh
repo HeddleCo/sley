@@ -398,7 +398,7 @@ declare -A FLOOR=(
     [t1500-rev-parse.sh]=81
     [t1501-work-tree.sh]=39
     [t1506-rev-parse-diagnosis.sh]=30
-    [t2400-worktree-add.sh]=215
+    [t2400-worktree-add.sh]=218  # wave-36: 215->219 measured (wtheads ref-in-use protection), banked 218
     # codex-wave-11 (worktree repair): re-link .git file + worktrees/<id>/gitdir
     # back-pointer after a move, broken-link detection + repair messages, repair
     # both-moved + specific-path. t2406 7->24 FULL; side gain t2403 25->27.
@@ -982,6 +982,18 @@ declare -A FLOOR=(
     [t5510-fetch.sh]=167
     [t2205-add-worktree-config.sh]=13
     [t1050-large.sh]=29
+    # wave-36 (2026-06-21, off main 5dfe861a; t_fetch/worktree): fetch-multiple, unresolve-info,
+    # worktree-heads. t5514-fetch-multiple 17->25 FULL (--all/--multiple/groups, Fetching-<remote>
+    # framing, continue-on-error, --jobs; banked 24 w/ 1-cell multi-fetch margin). t2030-unresolve-info
+    # 3->13/14 (checkout -m resolve-undo / conflict recreation from index stages; 1 hard cell left).
+    # t2407-worktree-heads 2->12 FULL (cross-worktree ref-in-use protection: branch/checkout/rebase/
+    # fetch refuse a ref checked out in another worktree). unresolve + wtheads both edited
+    # sley-worktree/lib.rs — auto-merged clean AND both t2030=13 + t2407=12 re-verified on the MERGED
+    # binary. fetchmulti disjoint. Guards held/gained: t2400=219(banked 218) t2401=13 t2402=27 t5510=170
+    # t5516=110 t5526=56 t5601=108 t2018=25 t2020=26 t2070=15 t4200=34 t3404=121 t7508=119. cargo test green.
+    [t5514-fetch-multiple.sh]=24
+    [t2030-unresolve-info.sh]=13
+    [t2407-worktree-heads.sh]=12
 )
 
 fail=0
