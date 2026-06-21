@@ -1781,6 +1781,9 @@ fn update_index_paths_impl(
     if options.allow_skip_worktree_entries {
         expand_sparse_index(&mut index, &odb, format)?;
     }
+    let sparse_checkout_active = sparse_checkout_config_enabled(git_dir)
+        || index.is_sparse()
+        || index.entries.iter().any(IndexEntry::is_sparse_dir);
     // For small batches, read only each path's `.gitattributes` chain; a
     // whole-worktree matcher can dominate `add -u` when only a few files are
     // dirty in a huge checkout. Large batches still amortize the full matcher.
@@ -1867,7 +1870,10 @@ fn update_index_paths_impl(
                 }
                 continue;
             }
-            if symlink_metadata.is_none() {
+            if symlink_metadata.is_none()
+                || options.ignore_skip_worktree_entries
+                || !sparse_checkout_active
+            {
                 continue;
             }
         }
