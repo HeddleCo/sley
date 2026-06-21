@@ -709,7 +709,8 @@ fn status_collection_options_for_pathspec(
     mut options: sley_worktree::ShortStatusOptions,
     pathspec: &StatusPathspec,
 ) -> sley_worktree::ShortStatusOptions {
-    if pathspec.has_filters()
+    if options.include_ignored
+        && pathspec.has_filters()
         && matches!(
             options.untracked_mode,
             sley_worktree::StatusUntrackedMode::Normal
@@ -725,7 +726,8 @@ fn status_collapse_pathspec_untracked_entries(
     options: sley_worktree::ShortStatusOptions,
     pathspec: &StatusPathspec,
 ) -> Vec<sley_worktree::ShortStatusEntry> {
-    if !pathspec.has_filters()
+    if !options.include_ignored
+        || !pathspec.has_filters()
         || !matches!(
             options.untracked_mode,
             sley_worktree::StatusUntrackedMode::Normal

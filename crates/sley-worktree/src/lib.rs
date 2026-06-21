@@ -4165,8 +4165,7 @@ fn collect_short_status_with_options(
     entries.retain(|entry| !unmerged_paths.contains(&entry.path));
     entries.append(&mut unmerged_entries);
     if options.include_ignored {
-        let ignored_directory_rows = !matches!(options.untracked_mode, StatusUntrackedMode::All)
-            && !matches!(options.ignored_mode, StatusIgnoredMode::Matching);
+        let ignored_directory_rows = !matches!(options.untracked_mode, StatusUntrackedMode::All);
         let ignored_paths = ignored_untracked_paths(
             worktree_root,
             git_dir,
