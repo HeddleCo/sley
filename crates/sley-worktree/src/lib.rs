@@ -3891,6 +3891,10 @@ fn write_tree_from_index_with_options_and_odb(
         Err(err) => return Err(err.into()),
     };
     let mut checker = odb.presence_checker();
+    if Index::bytes_have_extension(&index_bytes, format, b"link")? {
+        let index = sley_index::read_repository_index(git_dir, format)?;
+        return write_tree_from_owned_index(&index, format, &options, odb, &mut checker);
+    }
     match BorrowedIndex::parse(&index_bytes, format) {
         Ok(index) => write_tree_from_borrowed_index(&index, format, &options, odb, &mut checker),
         Err(GitError::Unsupported(_)) => {
@@ -17612,7 +17616,7 @@ fn read_index_with_stat_cache_entries(
         }
         Err(err) => return Err(err.into()),
     };
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let index = sley_index::read_repository_index(git_dir, format)?;
     let index_mtime = file_mtime_parts(&index_metadata);
     let stage0_entry_count = index
         .entries
@@ -19166,6 +19170,38 @@ mod tests {
             .read_object(&tree_oid)
             .expect("test operation should succeed");
         assert_eq!(tree.object_type, ObjectType::Tree);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn write_tree_from_index_expands_empty_primary_split_index() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
+        add_paths_to_index(&root, &git_dir, ObjectFormat::Sha1, &[PathBuf::from("f.txt")])
+            .expect("test operation should succeed");
+        let expected = write_tree_from_index(&git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        enable_split_index(&git_dir, ObjectFormat::Sha1).expect("test operation should succeed");
+        let primary = read_index(&git_dir);
+        assert!(
+            primary.entries.is_empty(),
+            "fixture should put all entries in the shared index"
+        );
+        assert!(
+            primary
+                .split_index_link(ObjectFormat::Sha1)
+                .expect("test operation should succeed")
+                .is_some(),
+            "fixture should write a split-index link extension"
+        );
+
+        let actual = write_tree_from_index(&git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        assert_eq!(actual, expected);
+
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
