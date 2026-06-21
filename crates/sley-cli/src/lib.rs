@@ -1590,6 +1590,9 @@ fn resolve_checkout_start_oid(
     format: ObjectFormat,
     start: &str,
 ) -> Result<Option<ObjectId>> {
+    if let Some(oid) = resolve_checkout_merge_base_start_oid(git_dir, format, start)? {
+        return Ok(Some(oid));
+    }
     match resolve_revision(git_dir, format, start) {
         Ok(oid) => Ok(Some(oid)),
         Err(_) if start == "HEAD" || start == "@" => {
@@ -1600,6 +1603,37 @@ fn resolve_checkout_start_oid(
             }
         }
         Err(err) => Err(err),
+    }
+}
+
+fn resolve_checkout_merge_base_start_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+    start: &str,
+) -> Result<Option<ObjectId>> {
+    let Some((left, right)) = start.split_once("...") else {
+        return Ok(None);
+    };
+    if right.contains("...") {
+        return Ok(None);
+    }
+    let left = if left.is_empty() { "HEAD" } else { left };
+    let right = if right.is_empty() { "HEAD" } else { right };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let left = sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, left)?)?;
+    let right =
+        sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, right)?)?;
+    let bases = sley_rev::merge_bases(git_dir, format, &db, &left, &right)?;
+    match bases.as_slice() {
+        [base] => Ok(Some(*base)),
+        [] => {
+            eprintln!("fatal: no merge base found");
+            Err(GitError::Exit(128))
+        }
+        _ => {
+            eprintln!("fatal: multiple merge bases found");
+            Err(GitError::Exit(128))
+        }
     }
 }
 
