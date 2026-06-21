@@ -432,6 +432,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
     }
 
+    let mut branch_update_rollback = None::<(String, Option<RefTarget>)>;
     let checkout_message = match branch_mode {
         CheckoutBranchMode::Detach => {
             if positional.len() > 1 {
@@ -634,6 +635,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         dashdash_index.is_none() && cwd.join(&branch_name).exists(),
                     )?
                 {
+                    let branch_ref = branch_ref_name(&branch_name)?;
+                    branch_update_rollback =
+                        Some((branch_ref.clone(), store.read_ref(&branch_ref)?));
                     let was_reset = checkout_create_or_reset_branch(
                         &git_dir,
                         &git_dir,
@@ -676,6 +680,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             force,
             orphan,
         } => {
+            let store = FileRefStore::new(&git_dir, format);
+            let branch = checkout_expand_creation_branch_name(&git_dir, format, &store, branch)?;
             if orphan {
                 if !positional.is_empty() {
                     return Err(GitError::Command(
@@ -690,12 +696,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             if positional.len() > 1 {
-                return Err(GitError::Command(
-                    "checkout -b/-B accepts at most one start point".into(),
-                ));
+                eprintln!(
+                    "fatal: Cannot update paths and switch to branch '{branch}' at the same time."
+                );
+                return Err(GitError::Exit(128));
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
-            let store = FileRefStore::new(&git_dir, format);
             if matches!(
                 track,
                 Some(crate::commands::branch::BranchTrackMode::Direct)
@@ -706,6 +712,14 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 );
                 return Err(GitError::Exit(128));
             }
+            if resolve_checkout_start_oid(&git_dir, format, start).is_err() {
+                eprintln!(
+                    "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
+                );
+                return Err(GitError::Exit(128));
+            }
+            let branch_ref = branch_ref_name(&branch)?;
+            branch_update_rollback = Some((branch_ref.clone(), store.read_ref(&branch_ref)?));
             let was_reset = checkout_create_or_reset_branch(
                 &git_dir,
                 &git_dir,
@@ -745,12 +759,15 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
 
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
-    let branch_target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?;
+    let branch_ref = branch_ref_name(branch)?;
+    let branch_target = if store.read_ref(&branch_ref)?.is_some() {
+        sley_refs::resolve_ref_peeled(&store, &branch_ref)?
+    } else {
+        None
+    };
     if let Some(target) = branch_target {
-        let local_promisor =
-            prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target)?;
-        if local_promisor
-            && resolve_ref_peeled(&store, "HEAD")? == Some(target)
+        prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target)?;
+        if resolve_ref_peeled(&store, "HEAD")? == Some(target)
             && checkout_index_empty(&git_dir, format)?
         {
             sley_worktree::reset_index_and_worktree_to_commit(
@@ -761,18 +778,32 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             )?;
         }
     }
-    if recurse_submodules {
+    if branch_target.is_none() {
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        if !quiet {
+            checkout_message.print();
+        }
+        return Ok(());
+    }
+    if recurse_submodules || (branch_update_rollback.is_some() && !force) {
         let from = checkout_reflog_from_name(&store);
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
-        checkout_twoway_dirty(
+        if let Err(err) = checkout_twoway_dirty(
             &git_dir,
             &worktree_root,
             format,
             Some(&target),
             recurse_submodules,
             force,
-        )?;
-        switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
+        ) {
+            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            return Err(err);
+        }
+        if let Err(err) = switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)
+        {
+            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            return Err(err);
+        }
     } else {
         match sley_worktree::checkout_branch_filtered(
             &worktree_root,
@@ -788,17 +819,28 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 let from = checkout_reflog_from_name(&store);
                 let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
                     .ok_or_else(|| GitError::reference_not_found("branch"))?;
-                checkout_twoway_dirty(
+                if let Err(err) = checkout_twoway_dirty(
                     &git_dir,
                     &worktree_root,
                     format,
                     Some(&target),
                     recurse_submodules,
                     force,
-                )?;
-                switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
+                ) {
+                    checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                    return Err(err);
+                }
+                if let Err(err) =
+                    switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)
+                {
+                    checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                    return Err(err);
+                }
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                return Err(err);
+            }
         }
     }
     sley_sequencer::replay::remove_branch_state(&git_dir);
@@ -1044,6 +1086,35 @@ fn checkout_format_abbrev_oid(
         abbreviated.push_str("...");
     }
     Ok(abbreviated)
+}
+
+fn checkout_expand_creation_branch_name(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    branch: String,
+) -> Result<String> {
+    if let Some(inner) = branch
+        .strip_prefix("@{-")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        let n = inner
+            .parse::<usize>()
+            .map_err(|_| GitError::InvalidFormat(format!("invalid branch name: '{branch}'")))?;
+        return Ok(
+            sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?
+                .unwrap_or(branch),
+        );
+    }
+    if branch.contains("@{")
+        && let Ok(Some(refname)) =
+            sley_rev::resolve_revision_symbolic_full_name(git_dir, format, &branch)
+        && let Some(local) = refname.strip_prefix("refs/heads/")
+        && store.read_ref(&refname)?.is_some()
+    {
+        return Ok(local.to_string());
+    }
+    Ok(branch)
 }
 
 fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<String> {
@@ -1927,6 +1998,32 @@ fn switch_head_symbolic_with_reflog(
         }),
     });
     tx.commit()
+}
+
+fn checkout_rollback_branch_update(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rollback: &Option<(String, Option<RefTarget>)>,
+) {
+    let Some((name, previous)) = rollback else {
+        return;
+    };
+    let store = FileRefStore::new(git_dir, format);
+    match previous {
+        Some(target) => {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: name.clone(),
+                expected: None,
+                new: target.clone(),
+                reflog: None,
+            });
+            let _ = tx.commit();
+        }
+        None => {
+            let _ = store.delete_ref(name);
+        }
+    }
 }
 
 fn checkout_reflog_from_name(store: &FileRefStore) -> String {
