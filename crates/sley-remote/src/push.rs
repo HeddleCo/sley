@@ -1006,7 +1006,11 @@ pub fn push_local_with_report(
             && !plan.command.old_id.is_null()
             && !plan.command.new_id.is_null()
             && (stale_lease_overridden
-                || !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?);
+                || if plan.command.name.starts_with("refs/heads/") {
+                    !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?
+                } else {
+                    plan.force
+                });
         refs.push(PushReportRef {
             src: plan.source.clone(),
             dst: plan.command.name.clone(),
