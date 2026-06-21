@@ -232,10 +232,7 @@ fn parse_patch_id_args(args: &[String]) -> Result<PatchIdInvocation> {
             stable: true,
             verbatim: true,
         },
-        None => PatchIdOptions {
-            stable: patch_id_config_stable()?,
-            verbatim: false,
-        },
+        None => patch_id_config_defaults()?,
     };
     Ok(PatchIdInvocation::Run(options))
 }
@@ -296,32 +293,47 @@ fn patch_id_unknown_switch_error(switch: char) -> Result<PatchIdInvocation> {
     Err(GitError::Exit(129))
 }
 
-/// Resolve the default stable/unstable choice from `patchid.stable`.
+/// Resolve default behavior from `patchid.stable` and `patchid.verbatim`.
 ///
-/// Command-line `-c`/`GIT_CONFIG_*` overrides are consulted first (via
-/// `global_config_value`), then repository-local config when inside a repository.
-/// An unset value defaults to unstable, matching git. A value that is set but not
-/// a valid boolean is fatal with git's exact "bad boolean config value" message.
-fn patch_id_config_stable() -> Result<bool> {
-    if let Some(value) = global_config_value("patchid.stable")? {
-        return interpret_patch_id_stable(&value);
-    }
+/// An unset value defaults to unstable/non-verbatim, matching git. `verbatim`
+/// implies `stable`. A value that is set but not a valid boolean is fatal with
+/// git's exact "bad boolean config value" message.
+fn patch_id_config_defaults() -> Result<PatchIdOptions> {
+    let mut stable = false;
+    let mut verbatim = false;
     if let Ok(git_dir) = discover_git_dir(env::current_dir()?)
         && let Ok(config) = read_repo_config(&git_dir)
-        && let Some(value) = config.get("patchid", None, "stable")
     {
-        return interpret_patch_id_stable(value);
+        if let Some(value) = config.get_entry("patchid", None, "stable") {
+            stable = interpret_patch_id_bool("patchid.stable", value)?;
+        }
+        if let Some(value) = config.get_entry("patchid", None, "verbatim") {
+            verbatim = interpret_patch_id_bool("patchid.verbatim", value)?;
+        }
+    } else {
+        if let Some(value) = global_config_value("patchid.stable")? {
+            stable = interpret_patch_id_bool("patchid.stable", Some(&value))?;
+        }
+        if let Some(value) = global_config_value("patchid.verbatim")? {
+            verbatim = interpret_patch_id_bool("patchid.verbatim", Some(&value))?;
+        }
     }
-    Ok(false)
+    if verbatim {
+        stable = true;
+    }
+    Ok(PatchIdOptions { stable, verbatim })
 }
 
-/// Parse a `patchid.stable` value, emitting git's fatal diagnostic for a
-/// non-boolean string.
-fn interpret_patch_id_stable(value: &str) -> Result<bool> {
+/// Parse a patch-id boolean config value, emitting git's fatal diagnostic for a
+/// non-boolean string. A bare key (`patchid.stable` with no `=`) is true.
+fn interpret_patch_id_bool(key: &str, value: Option<&str>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(true);
+    };
     match sley_config::parse_config_bool(value) {
         Some(flag) => Ok(flag),
         None => {
-            eprintln!("fatal: bad boolean config value '{value}' for 'patchid.stable'");
+            eprintln!("fatal: bad boolean config value '{value}' for '{key}'");
             Err(GitError::Exit(128))
         }
     }
