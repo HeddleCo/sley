@@ -34,9 +34,11 @@ struct WorktreeListOptions {
 #[derive(Debug)]
 struct WorktreeListEntry {
     path: String,
-    head: ObjectId,
+    head: Option<ObjectId>,
     branch: Option<String>,
     detached: bool,
+    bare: bool,
+    error: bool,
     prunable_reason: Option<String>,
     locked_reason: Option<String>,
 }
@@ -270,7 +272,7 @@ pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
     if options.porcelain {
         print_worktree_list_porcelain(&entries, options.z)?;
     } else {
-        print_worktree_list_default(&entries, options.verbose);
+        print_worktree_list_default(&entries, &common_git_dir, options.verbose);
     }
     Ok(())
 }
@@ -309,6 +311,10 @@ fn parse_worktree_list_options(args: &[String]) -> Result<WorktreeListOptions> {
     }
     if z && !porcelain {
         eprintln!("fatal: the option '-z' requires '--porcelain'");
+        return Err(GitError::Exit(128));
+    }
+    if verbose && porcelain {
+        eprintln!("fatal: options '--verbose' and '--porcelain' cannot be used together");
         return Err(GitError::Exit(128));
     }
     Ok(WorktreeListOptions {
@@ -914,12 +920,14 @@ fn collect_worktree_list_entries(
     expire: bool,
 ) -> Result<Vec<WorktreeListEntry>> {
     let mut entries = Vec::new();
-    let main_path = worktree_root_for_git_dir(common_git_dir)?;
+    let main_bare = sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_none();
+    let main_path = main_worktree_list_path(common_git_dir);
     entries.push(read_worktree_list_entry(
         common_git_dir,
         common_git_dir,
         format,
         main_path,
+        main_bare,
         None,
         None,
     )?);
@@ -931,11 +939,22 @@ fn collect_worktree_list_entries(
             common_git_dir,
             format,
             admin.path,
+            false,
             prunable_reason,
             admin.locked_reason,
         )?);
     }
     Ok(entries)
+}
+
+fn main_worktree_list_path(common_git_dir: &Path) -> PathBuf {
+    let common = fs::canonicalize(common_git_dir).unwrap_or_else(|_| common_git_dir.to_path_buf());
+    if common.file_name().and_then(|name| name.to_str()) == Some(".git")
+        && let Some(parent) = common.parent()
+    {
+        return parent.to_path_buf();
+    }
+    common
 }
 
 fn collect_linked_worktree_admins(common_git_dir: &Path) -> Result<Vec<LinkedWorktreeAdmin>> {
@@ -2476,22 +2495,43 @@ fn read_worktree_list_entry(
     common_git_dir: &Path,
     format: ObjectFormat,
     path: PathBuf,
+    bare: bool,
     prunable_reason: Option<String>,
     locked_reason: Option<String>,
 ) -> Result<WorktreeListEntry> {
-    let head = fs::read_to_string(git_dir.join("HEAD"))?;
-    let head = head.trim();
-    let (head, branch, detached) = if let Some(branch) = head.strip_prefix("ref: ") {
-        let oid = read_common_ref_oid(common_git_dir, format, branch)?.unwrap_or(zero_oid(format)?);
-        (oid, Some(branch.to_string()), false)
+    let (head, branch, detached, error) = if bare {
+        (None, None, false, false)
     } else {
-        (ObjectId::from_hex(format, head)?, None, true)
+        match fs::read_to_string(git_dir.join("HEAD")) {
+            Ok(head) => {
+                let head = head.trim();
+                if let Some(branch) = head.strip_prefix("ref: ") {
+                    match read_common_ref_oid(common_git_dir, format, branch) {
+                        Ok(oid) => (
+                            Some(oid.unwrap_or(zero_oid(format)?)),
+                            Some(branch.to_string()),
+                            false,
+                            false,
+                        ),
+                        Err(_) => (Some(zero_oid(format)?), None, false, true),
+                    }
+                } else {
+                    match ObjectId::from_hex(format, head) {
+                        Ok(oid) => (Some(oid), None, true, false),
+                        Err(_) => (Some(zero_oid(format)?), None, false, true),
+                    }
+                }
+            }
+            Err(_) => (Some(zero_oid(format)?), None, false, true),
+        }
     };
     Ok(WorktreeListEntry {
         path: path.display().to_string(),
         head,
         branch,
         detached,
+        bare,
+        error,
         prunable_reason,
         locked_reason,
     })
@@ -2516,20 +2556,35 @@ fn read_common_ref_oid(
     )))
 }
 
-fn print_worktree_list_default(entries: &[WorktreeListEntry], verbose: bool) {
-    let width = entries
+fn print_worktree_list_default(entries: &[WorktreeListEntry], common_git_dir: &Path, verbose: bool) {
+    let quote_path = worktree_list_quote_path(common_git_dir);
+    let display_paths: Vec<String> = entries
         .iter()
-        .map(|entry| entry.path.chars().count())
+        .map(|entry| worktree_list_display_path(&entry.path, quote_path))
+        .collect();
+    let path_width = display_paths
+        .iter()
+        .map(|path| path.chars().count())
         .max()
         .unwrap_or(0);
-    for entry in entries {
-        let label = if let Some(branch) = &entry.branch {
+    let abbrev_width = entries
+        .iter()
+        .filter_map(|entry| entry.head.as_ref().map(format_log_abbrev_oid))
+        .map(|abbrev| abbrev.len())
+        .max()
+        .unwrap_or(7);
+    for (entry, display_path) in entries.iter().zip(display_paths.iter()) {
+        let label = if entry.bare {
+            "(bare)".to_string()
+        } else if let Some(branch) = &entry.branch {
             branch
                 .strip_prefix("refs/heads/")
                 .map(|name| format!("[{name}]"))
                 .unwrap_or_else(|| format!("[{branch}]"))
         } else if entry.detached {
             "(detached HEAD)".to_string()
+        } else if entry.error {
+            "(error)".to_string()
         } else {
             String::new()
         };
@@ -2538,31 +2593,26 @@ fn print_worktree_list_default(entries: &[WorktreeListEntry], verbose: bool) {
             .as_ref()
             .is_some_and(|reason| !verbose || reason.is_empty());
         let prunable = entry.prunable_reason.is_some() && !verbose && !locked;
-        if locked {
-            println!(
-                "{:<width$} {} {} locked",
-                entry.path,
-                format_log_abbrev_oid(&entry.head),
-                label,
-                width = width
-            );
-        } else if prunable {
-            println!(
-                "{:<width$} {} {} prunable",
-                entry.path,
-                format_log_abbrev_oid(&entry.head),
-                label,
-                width = width
-            );
+        let mut line = format!(
+            "{display_path}{}",
+            " ".repeat(1 + path_width.saturating_sub(display_path.chars().count()))
+        );
+        if entry.bare {
+            line.push_str(&label);
         } else {
-            println!(
-                "{:<width$} {} {}",
-                entry.path,
-                format_log_abbrev_oid(&entry.head),
-                label,
-                width = width
-            );
+            let abbrev = entry
+                .head
+                .as_ref()
+                .map(format_log_abbrev_oid)
+                .unwrap_or_default();
+            line.push_str(&format!("{abbrev:<abbrev_width$} {label}"));
         }
+        if locked {
+            line.push_str(" locked");
+        } else if prunable {
+            line.push_str(" prunable");
+        }
+        println!("{line}");
         if verbose
             && let Some(reason) = &entry.locked_reason
             && !reason.is_empty()
@@ -2575,6 +2625,21 @@ fn print_worktree_list_default(entries: &[WorktreeListEntry], verbose: bool) {
     }
 }
 
+fn worktree_list_quote_path(common_git_dir: &Path) -> bool {
+    GitConfig::read(common_git_dir.join("config"))
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "quotepath"))
+        .unwrap_or(true)
+}
+
+fn worktree_list_display_path(path: &str, quote_path: bool) -> String {
+    if quote_path {
+        status_quote_path(path.as_bytes(), false)
+    } else {
+        path.to_string()
+    }
+}
+
 fn print_worktree_list_porcelain(entries: &[WorktreeListEntry], z: bool) -> Result<()> {
     let mut stdout = io::stdout();
     let separator = if z { b"\0" as &[u8] } else { b"\n" as &[u8] };
@@ -2582,15 +2647,34 @@ fn print_worktree_list_porcelain(entries: &[WorktreeListEntry], z: bool) -> Resu
         stdout.write_all(b"worktree ")?;
         stdout.write_all(entry.path.as_bytes())?;
         stdout.write_all(separator)?;
-        stdout.write_all(b"HEAD ")?;
-        stdout.write_all(entry.head.to_hex().as_bytes())?;
-        stdout.write_all(separator)?;
-        if let Some(branch) = &entry.branch {
-            stdout.write_all(b"branch ")?;
-            stdout.write_all(branch.as_bytes())?;
+        if entry.bare {
+            stdout.write_all(b"bare")?;
             stdout.write_all(separator)?;
-        } else if entry.detached {
-            stdout.write_all(b"detached")?;
+        } else {
+            stdout.write_all(b"HEAD ")?;
+            if let Some(head) = &entry.head {
+                stdout.write_all(head.to_hex().as_bytes())?;
+            }
+            stdout.write_all(separator)?;
+            if let Some(branch) = &entry.branch {
+                stdout.write_all(b"branch ")?;
+                stdout.write_all(branch.as_bytes())?;
+                stdout.write_all(separator)?;
+            } else if entry.detached {
+                stdout.write_all(b"detached")?;
+                stdout.write_all(separator)?;
+            }
+        }
+        if let Some(reason) = &entry.locked_reason {
+            stdout.write_all(b"locked")?;
+            if !reason.is_empty() {
+                stdout.write_all(b" ")?;
+                if z {
+                    stdout.write_all(reason.as_bytes())?;
+                } else {
+                    stdout.write_all(worktree_list_quote_reason(reason).as_bytes())?;
+                }
+            }
             stdout.write_all(separator)?;
         }
         if let Some(reason) = &entry.prunable_reason {
@@ -2598,15 +2682,31 @@ fn print_worktree_list_porcelain(entries: &[WorktreeListEntry], z: bool) -> Resu
             stdout.write_all(reason.as_bytes())?;
             stdout.write_all(separator)?;
         }
-        if let Some(reason) = &entry.locked_reason {
-            stdout.write_all(b"locked")?;
-            if !reason.is_empty() {
-                stdout.write_all(b" ")?;
-                stdout.write_all(reason.as_bytes())?;
-            }
-            stdout.write_all(separator)?;
-        }
         stdout.write_all(separator)?;
     }
     Ok(())
+}
+
+fn worktree_list_quote_reason(reason: &str) -> String {
+    let bytes = reason.as_bytes();
+    if !bytes
+        .iter()
+        .any(|byte| matches!(byte, b'"' | b'\\' | b'\n' | b'\r' | b'\t') || !(0x20..0x7f).contains(byte))
+    {
+        return reason.to_string();
+    }
+    let mut out = String::from("\"");
+    for &byte in bytes {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    out.push('"');
+    out
 }
