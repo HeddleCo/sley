@@ -817,6 +817,9 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // `--reset` (OverwriteUntracked) authorizes clobbering anything in the
         // way (git's `o->reset == UNPACK_RESET_OVERWRITE_UNTRACKED` early return).
         if matches!(reset, sley_unpack_trees::ResetType::OverwriteUntracked) {
+            if original_cwd_relative_to(&self.worktree_root).as_deref() == Some(path) {
+                return refuse_remove_current_working_directory(path);
+            }
             return Ok(());
         }
         let Some(file_path) = safe_worktree_path(&self.worktree_root, path) else {
@@ -940,6 +943,9 @@ impl ReadTreeWorktree<'_> {
     /// file is written; on an unclean one this rejects with git's
     /// `ERROR_NOT_UPTODATE_DIR` exit so no untracked work is silently destroyed.
     fn verify_clean_subdirectory(&self, dir_git_path: &[u8], dir_fs_path: &Path) -> Result<()> {
+        if original_cwd_relative_to(&self.worktree_root).as_deref() == Some(dir_git_path) {
+            return refuse_remove_current_working_directory(dir_git_path);
+        }
         let mut stack = vec![(dir_fs_path.to_path_buf(), dir_git_path.to_vec())];
         while let Some((fs_dir, git_dir)) = stack.pop() {
             let read = match fs::read_dir(&fs_dir) {
@@ -1111,6 +1117,7 @@ pub(crate) fn checkout_two_way_engine(
     // failed checkout leaves the working tree exactly as it was — matching git's
     // "Aborting" guarantee.
     let mut result = unpack_trees(&index, &trees, MergeFn::TwoWay, &opts, &wt)?;
+    refuse_if_unpack_result_removes_current_directory(worktree_root, &result)?;
     check_updates(&mut result, &opts, &mut wt)?;
 
     // Serialize the merged index. check_updates folded the post-write `lstat`
@@ -1238,6 +1245,7 @@ fn merge_trees(
     let mut result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
 
     if update_worktree {
+        refuse_if_unpack_result_removes_current_directory(&wt.worktree_root, &result)?;
         // check_updates folds the post-write `lstat` back into `result.entries`
         // (git's refresh_cache), so the serialized index records real stat-info
         // for every freshly-written path.
@@ -1590,6 +1598,7 @@ fn reset_worktree_to_entries(
     entries: &mut [(Vec<u8>, StagedEntry)],
     recurse_submodules: bool,
 ) -> Result<()> {
+    refuse_if_current_working_directory_becomes_file(worktree_root, entries)?;
     let target: BTreeSet<&Vec<u8>> = entries.iter().map(|(path, _)| path).collect();
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         for entry in &index.entries {
@@ -2033,6 +2042,9 @@ fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo>
 fn remove_path_in_the_way(file_path: &Path) -> Result<()> {
     match fs::symlink_metadata(file_path) {
         Ok(md) if md.is_dir() => {
+            if path_is_original_cwd(file_path) {
+                return refuse_remove_current_working_directory_absolute(file_path);
+            }
             fs::remove_dir_all(file_path)?;
         }
         Ok(_) => {
@@ -2075,6 +2087,9 @@ fn create_leading_directories(worktree_root: &Path, file_path: &Path) -> Result<
         match fs::symlink_metadata(&cur) {
             Ok(md) if md.is_dir() => {}
             Ok(_) => {
+                if path_is_original_cwd(&cur) {
+                    return refuse_remove_current_working_directory_absolute(&cur);
+                }
                 fs::remove_file(&cur)?;
                 fs::create_dir(&cur)?;
             }
@@ -2135,7 +2150,7 @@ fn remove_worktree_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
 /// the walk.
 fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
     while let Some(path) = dir {
-        if path == root {
+        if path == root || path_is_original_cwd(path) {
             break;
         }
         if fs::remove_dir(path).is_err() {
@@ -2143,6 +2158,104 @@ fn prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
         }
         dir = path.parent();
     }
+}
+
+fn original_cwd_absolute() -> Option<PathBuf> {
+    let cwd = sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
+    Some(fs::canonicalize(&cwd).unwrap_or(cwd))
+}
+
+fn original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
+    let root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+    let cwd = original_cwd_absolute()?;
+    if cwd == root {
+        return None;
+    }
+    let rel = cwd.strip_prefix(&root).ok()?;
+    Some(path_to_git_bytes_lossy(rel))
+}
+
+fn path_is_original_cwd(path: &Path) -> bool {
+    let Some(cwd) = original_cwd_absolute() else {
+        return false;
+    };
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path == cwd
+}
+
+fn refuse_if_current_working_directory_becomes_file(
+    worktree_root: &Path,
+    entries: &[(Vec<u8>, StagedEntry)],
+) -> Result<()> {
+    let Some(cwd) = original_cwd_relative_to(worktree_root) else {
+        return Ok(());
+    };
+    if entries.iter().any(|(path, entry)| {
+        path == &cwd && !sley_index::is_gitlink(entry.mode) && (entry.mode & 0o170000) != 0o040000
+    }) {
+        if let Some(path) = safe_worktree_path(worktree_root, &cwd)
+            && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return refuse_remove_current_working_directory(&cwd);
+        }
+    }
+    Ok(())
+}
+
+fn refuse_if_unpack_result_removes_current_directory(
+    worktree_root: &Path,
+    result: &sley_unpack_trees::UnpackTreesResult,
+) -> Result<()> {
+    let Some(cwd) = original_cwd_relative_to(worktree_root) else {
+        return Ok(());
+    };
+    let cwd_slash = {
+        let mut value = cwd.clone();
+        value.push(b'/');
+        value
+    };
+    let writes_file_at_cwd = result.entries.iter().any(|entry| {
+        entry.path == cwd
+            && entry.entry.stage == 0
+            && !sley_index::is_gitlink(entry.entry.mode)
+            && (entry.entry.mode & 0o170000) != 0o040000
+    });
+    if writes_file_at_cwd
+        && result
+            .removed_paths
+            .iter()
+            .any(|removed| removed.starts_with(&cwd_slash))
+    {
+        return refuse_remove_current_working_directory(&cwd);
+    }
+    Ok(())
+}
+
+fn refuse_remove_current_working_directory(path: &[u8]) -> Result<()> {
+    eprintln!(
+        "error: Refusing to remove the current working directory:\n{}",
+        String::from_utf8_lossy(path)
+    );
+    Err(GitError::Exit(128))
+}
+
+fn refuse_remove_current_working_directory_absolute(path: &Path) -> Result<()> {
+    eprintln!(
+        "error: Refusing to remove the current working directory:\n{}",
+        path.display()
+    );
+    Err(GitError::Exit(128))
+}
+
+fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+        .into_bytes()
 }
 
 #[cfg(test)]

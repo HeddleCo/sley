@@ -3160,6 +3160,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // t7611 "merge ... fails" cases.
     verify_merge_uptodate(&worktree_root, &git_dir, format, &results, &ours_map)?;
 
+    let target_map = merge_results_entry_map(&results);
+    merge_refuse_if_current_working_directory_becomes_file(&worktree_root, &target_map)?;
+
     let message = build_merge_message(
         &refs,
         &git_dir,

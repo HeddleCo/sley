@@ -2128,6 +2128,7 @@ fn update_index_paths_impl(
         } else {
             worktree_root.join(path)
         };
+        let absolute = normalize_absolute_path_lexically(&absolute);
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
@@ -13723,6 +13724,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
 
     let attributes = smudge_config
         .map(|_| build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree))
@@ -14027,6 +14029,7 @@ fn restore_worktree_paths_inner(
         } else {
             worktree_root.join(path)
         };
+        let absolute = normalize_absolute_path_lexically(&absolute);
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
@@ -14236,6 +14239,7 @@ fn checkout_selected_index_paths(
         } else {
             worktree_root.join(path)
         };
+        let absolute = normalize_absolute_path_lexically(&absolute);
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
@@ -14811,6 +14815,7 @@ pub fn reset_index_and_worktree_to_commit(
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
 
@@ -15065,6 +15070,9 @@ fn remove_existing_worktree_path(file_path: &Path) -> Result<()> {
         Err(err) => return Err(err.into()),
     };
     if metadata.is_dir() {
+        if path_is_original_cwd(file_path) {
+            return refuse_remove_current_working_directory(file_path);
+        }
         // A directory in the way of a file (D/F transition) or a populated
         // gitlink: remove the subtree so the file can be created.
         match fs::remove_dir_all(file_path) {
@@ -15960,8 +15968,11 @@ pub fn remove_index_and_worktree_paths(
     options: RemoveOptions,
     config_parameters_env: Option<&str>,
 ) -> Result<RemoveResult> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
+    let cwd = env::current_dir()?;
+    let worktree_root = absolute_path_lexically(worktree_root.as_ref(), &cwd);
+    let git_dir = absolute_path_lexically(git_dir.as_ref(), &cwd);
+    let worktree_root = worktree_root.as_path();
+    let git_dir = git_dir.as_path();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
@@ -16039,6 +16050,7 @@ pub fn remove_index_and_worktree_paths(
         } else {
             worktree_root.join(path)
         };
+        let absolute = normalize_absolute_path_lexically(&absolute);
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
@@ -16294,7 +16306,13 @@ pub fn remove_index_and_worktree_paths(
         for path in &selected {
             let is_gitlink = gitlink_paths.contains(path);
             let is_stage0_gitlink = stage0_gitlink_paths.contains(path);
-            match remove_tracked_worktree_path(worktree_root, path, is_gitlink, is_stage0_gitlink)?
+            match remove_tracked_worktree_path(
+                worktree_root,
+                path,
+                is_gitlink,
+                is_stage0_gitlink,
+                options.force,
+            )?
             {
                 true => removed_any = true,
                 false if !removed_any => {
@@ -16377,6 +16395,7 @@ fn remove_tracked_worktree_path(
     path: &[u8],
     is_gitlink: bool,
     is_stage0_gitlink: bool,
+    force: bool,
 ) -> Result<bool> {
     let file = worktree_path(root, path)?;
     match fs::symlink_metadata(&file) {
@@ -16395,6 +16414,13 @@ fn remove_tracked_worktree_path(
                 if file.join(".git").is_dir() && !is_stage0_gitlink {
                     return Ok(false);
                 }
+                if !force && original_cwd_is_inside(&file) {
+                    let nested_git = file.join(".git");
+                    if nested_git.is_dir() {
+                        let _ = fs::remove_dir_all(nested_git);
+                    }
+                    return Ok(false);
+                }
                 if contains_nested_git_dir(&file) {
                     eprintln!(
                         "Migrating git directory of '{}' from",
@@ -16408,6 +16434,9 @@ fn remove_tracked_worktree_path(
                 // removed. git `die`s ("could not remove '<path>'") if the
                 // recursive removal fails; propagate the IO error to match.
                 fs::remove_dir_all(&file)?;
+                if fs::symlink_metadata(&file).is_ok() {
+                    fs::remove_dir(&file)?;
+                }
                 prune_empty_parents(root, file.parent())?;
                 return Ok(true);
             }
@@ -18935,7 +18964,7 @@ fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
 
 fn prune_empty_parents(root: &Path, mut dir: Option<&Path>) -> Result<()> {
     while let Some(path) = dir {
-        if path == root {
+        if path == root || path_is_original_cwd(path) {
             break;
         }
         match fs::remove_dir(path) {
@@ -18946,6 +18975,53 @@ fn prune_empty_parents(root: &Path, mut dir: Option<&Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn original_cwd_absolute() -> Option<PathBuf> {
+    let cwd = sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
+    Some(fs::canonicalize(&cwd).unwrap_or(cwd))
+}
+
+fn path_is_original_cwd(path: &Path) -> bool {
+    let Some(cwd) = original_cwd_absolute() else {
+        return false;
+    };
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path == cwd
+}
+
+fn original_cwd_is_inside(path: &Path) -> bool {
+    let Some(cwd) = original_cwd_absolute() else {
+        return false;
+    };
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    cwd == path || cwd.starts_with(&path)
+}
+
+fn refuse_if_current_working_directory_becomes_file(
+    worktree_root: &Path,
+    target_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<()> {
+    for (path, entry) in target_entries {
+        if sley_index::is_gitlink(entry.mode) || (entry.mode & 0o170000) == 0o040000 {
+            continue;
+        }
+        let path = worktree_path(worktree_root, path)?;
+        if path_is_original_cwd(&path)
+            && fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return refuse_remove_current_working_directory(&path);
+        }
+    }
+    Ok(())
+}
+
+fn refuse_remove_current_working_directory(path: &Path) -> Result<()> {
+    eprintln!(
+        "error: Refusing to remove the current working directory:\n{}",
+        path.display()
+    );
+    Err(GitError::Exit(128))
 }
 
 fn git_tree_entry_cmp(
@@ -19044,6 +19120,14 @@ fn normalize_absolute_path_lexically(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn absolute_path_lexically(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        normalize_absolute_path_lexically(path)
+    } else {
+        normalize_absolute_path_lexically(&cwd.join(path))
+    }
 }
 
 fn repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
