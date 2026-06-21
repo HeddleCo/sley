@@ -6348,16 +6348,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
 
     // pre-push hook (driven from the would-be commands), unless --no-verify.
     if !req.options.no_verify {
-        let commands: Vec<ReceivePackCommand> = plan
-            .refs
-            .iter()
-            .map(|reference| ReceivePackCommand {
-                old_id: reference.old_id,
-                new_id: reference.new_id,
-                name: reference.dst.clone(),
-            })
-            .collect();
-        run_pre_push_hook(req.git_dir, req.remote, req.refspecs, &commands)?;
+        run_pre_push_hook_for_report(req.git_dir, req.remote, &plan.refs)?;
     }
 
     let ok_commands: Vec<ReceivePackCommand> = plan
@@ -7264,6 +7255,50 @@ fn run_pre_push_hook(
     Ok(())
 }
 
+fn run_pre_push_hook_for_report(
+    git_dir: &Path,
+    remote: &str,
+    refs: &[sley_remote::PushReportRef],
+) -> Result<()> {
+    let url = push_resolved_url(remote).unwrap_or_else(|_| remote.to_string());
+    let stdin = pre_push_stdin_from_report(refs);
+    commands::hooks::run_hook(
+        "pre-push",
+        commands::hooks::HookRun {
+            args: vec![remote.to_string(), url],
+            stdin: Some(stdin.into_bytes()),
+            stdout_to_stderr: false,
+            git_dir: Some(git_dir.to_path_buf()),
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn pre_push_stdin_from_report(refs: &[sley_remote::PushReportRef]) -> String {
+    refs.iter()
+        .filter(|reference| {
+            !matches!(
+                reference.status,
+                sley_remote::PushRefStatus::RejectNonFastForward
+                    | sley_remote::PushRefStatus::RejectRemoteUpdated
+                    | sley_remote::PushRefStatus::RejectStale
+                    | sley_remote::PushRefStatus::UpToDate
+            )
+        })
+        .map(|reference| {
+            let local_ref = reference
+                .src
+                .clone()
+                .unwrap_or_else(|| "(delete)".to_string());
+            format!(
+                "{} {} {} {}\n",
+                local_ref, reference.new_id, reference.dst, reference.old_id
+            )
+        })
+        .collect()
+}
+
 fn pre_push_stdin(
     git_dir: &Path,
     refspecs: &[String],
@@ -7432,19 +7467,19 @@ fn explicit_push_refspecs_with_refmap(
         .flatten()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let upstream_ref = if configured_push.is_empty()
-        && matches!(push_default_mode(config), PushDefaultMode::Upstream)
-        && branch.is_some()
-        && default_fetch_remote_for_branch(config, branch.unwrap()) == remote
-    {
-        Some(push_upstream_ref(config, branch.unwrap(), remote, false)?)
-    } else {
-        None
-    };
-
     refspecs
         .iter()
         .map(|refspec| {
+            let upstream_ref = if configured_push.is_empty()
+                && matches!(push_default_mode(config), PushDefaultMode::Upstream)
+                && branch.is_some()
+                && explicit_refspec_uses_upstream_refmap(store, branch.unwrap(), refspec)
+                && default_fetch_remote_for_branch(config, branch.unwrap()) == remote
+            {
+                Some(push_upstream_ref(config, branch.unwrap(), remote, false)?)
+            } else {
+                None
+            };
             explicit_push_refspec_with_refmap(
                 store,
                 refspec,
@@ -7453,6 +7488,18 @@ fn explicit_push_refspecs_with_refmap(
             )
         })
         .collect()
+}
+
+fn explicit_refspec_uses_upstream_refmap(
+    store: &FileRefStore,
+    current_branch: &str,
+    refspec: &str,
+) -> bool {
+    let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+    if refspec.contains(':') || refspec == "tag" || matches!(refspec, "HEAD" | "@") {
+        return false;
+    }
+    push_refmap_source_name(store, refspec) == format!("refs/heads/{current_branch}")
 }
 
 fn explicit_push_refspec_with_refmap(
