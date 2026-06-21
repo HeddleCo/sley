@@ -53,6 +53,12 @@ struct PackObjectsOptions {
     /// undeltified. sley's writer chooses deltas internally, so this forces the
     /// no-delta path that emits `Total N (delta 0)`.
     no_delta: bool,
+    delta_base_offset: bool,
+    stdin_packs: bool,
+    path_walk: bool,
+    thin: bool,
+    write_bitmap_index: bool,
+    name_hash_version: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,11 +86,24 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             "--unpacked" if !saw_dashdash => options.unpacked = true,
             "--use-bitmap-index" if !saw_dashdash => options.use_bitmap_index = Some(true),
             "--no-use-bitmap-index" if !saw_dashdash => options.use_bitmap_index = Some(false),
-            // sley's writer always emits self-contained packs and chooses
-            // ofs-delta internally; the delta-encoding and path-walk toggles
-            // have no separate machinery to switch.
-            "--delta-base-offset" | "--no-delta-base-offset" | "--path-walk" | "--no-path-walk"
-                if !saw_dashdash => {}
+            "--delta-base-offset" if !saw_dashdash => options.delta_base_offset = true,
+            "--no-delta-base-offset" if !saw_dashdash => options.delta_base_offset = false,
+            "--path-walk" if !saw_dashdash => options.path_walk = true,
+            "--no-path-walk" if !saw_dashdash => options.path_walk = false,
+            "--thin" if !saw_dashdash => options.thin = true,
+            "--no-thin" if !saw_dashdash => options.thin = false,
+            "--write-bitmap-index" | "--write-bitmap-index-quiet" if !saw_dashdash => {
+                options.write_bitmap_index = true;
+            }
+            "--no-write-bitmap-index" if !saw_dashdash => options.write_bitmap_index = false,
+            "--stdin" if !saw_dashdash => {
+                eprintln!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
+                return Err(GitError::Exit(129));
+            }
+            "--stdin-packs" if !saw_dashdash => options.stdin_packs = true,
+            value if !saw_dashdash && value.starts_with("--stdin-packs=") => {
+                options.stdin_packs = true;
+            }
             "-q" | "--quiet" if !saw_dashdash => options.progress = Some(false),
             "--no-quiet" if !saw_dashdash => {}
             "--cruft" if !saw_dashdash => {
@@ -136,8 +155,14 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                 if !saw_dashdash
                     && (value.starts_with("--threads=")
                         || value.starts_with("--window-memory=")
-                        || value.starts_with("--compression=")
-                        || value.starts_with("--name-hash-version=")) => {}
+                        || value.starts_with("--compression=")) => {}
+            value if !saw_dashdash && value.starts_with("--name-hash-version=") => {
+                let value = &value["--name-hash-version=".len()..];
+                options.name_hash_version = Some(value.parse::<i32>().map_err(|_| {
+                    eprintln!("fatal: invalid --name-hash-version option: {value}");
+                    GitError::Exit(128)
+                })?);
+            }
             "--threads" | "--window" | "--depth" | "--compression" | "--window-memory"
                 if !saw_dashdash => {}
             // Accepted toggles with no separate sley machinery: sley always
@@ -176,6 +201,11 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     if options.base_name.is_some() && options.stdout_mode {
         return pack_objects_usage();
     }
+    if options.thin && !options.stdout_mode {
+        eprintln!("fatal: --thin cannot be used to build an indexable pack");
+        return Err(GitError::Exit(128));
+    }
+    validate_pack_objects_options(&options)?;
 
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -187,6 +217,9 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
 
     if options.cruft {
         return write_cruft_pack(&git_dir, &common_git_dir, &database, format, &options, progress);
+    }
+    if options.stdin_packs {
+        return read_stdin_packs(format);
     }
 
     let traversal = options.revs || options.all;
@@ -208,6 +241,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         (oids, objects, Vec::new())
     };
     let mut pack_write_options = pack_objects_write_options(&git_dir)?;
+    pack_write_options = pack_write_options.with_prefer_ofs_delta(options.delta_base_offset);
     if options.no_delta {
         pack_write_options = pack_write_options
             .with_window(0)
@@ -242,9 +276,9 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let pack_reused: u64 = reused_packs.iter().map(|reuse| reuse.count as u64).sum();
     let packs_reused = reused_packs.len() as u64;
     let written_total = oids.len() as u64 + pack_reused;
-    let stats_line = format!(
-        "Total {written_total} (delta 0), reused {pack_reused} (delta 0), pack-reused {pack_reused} (from {packs_reused})"
-    );
+    if options.path_walk && progress {
+        eprintln!("Compressing objects by path: 100% ({written_total}/{written_total}), done.");
+    }
 
     let result = if !reused_packs.is_empty() {
         // Verbatim whole-pack reuse: splice the bitmapped pack's entries and
@@ -259,6 +293,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             stdout.write_all(&pack)?;
             stdout.flush()?;
+            let stats_line = pack_objects_stats_line(written_total, 0, pack_reused, packs_reused);
             emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
             return Ok(());
         }
@@ -270,6 +305,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             index: build.index,
             entries: build.entries,
             checksum: build.pack_checksum,
+            delta_count: 0,
         }
     } else {
         let written = PackFile::write_packed_with_known_ids_and_options(
@@ -281,6 +317,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             stdout.write_all(&written.pack)?;
             stdout.flush()?;
+            let stats_line =
+                pack_objects_stats_line(written_total, written.delta_count, pack_reused, packs_reused);
             emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
             return Ok(());
         }
@@ -289,6 +327,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             index: written.index,
             entries: written.entries,
             checksum: written.checksum,
+            delta_count: written.delta_count,
         }
     };
 
@@ -311,6 +350,12 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     fs::write(format!("{base_name}-{checksum}.rev"), &reverse_index)?;
     fs::write(format!("{base_name}-{checksum}.idx"), &index_bytes)?;
     println!("{checksum}");
+    let stats_line = pack_objects_stats_line(
+        written_total,
+        result.delta_count,
+        pack_reused,
+        packs_reused,
+    );
     emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
     Ok(())
 }
@@ -393,10 +438,59 @@ struct WrittenPackParts {
     index: Vec<u8>,
     entries: Vec<sley_pack::PackIndexEntry>,
     checksum: ObjectId,
+    delta_count: u32,
+}
+
+fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
+    if let Some(version) = options.name_hash_version {
+        if version == 0 || version > 2 {
+            eprintln!("fatal: invalid --name-hash-version option: {version}");
+            return Err(GitError::Exit(128));
+        }
+        if options.write_bitmap_index && version != 1 && !options.stdout_mode {
+            eprintln!("warning: currently, --write-bitmap-index requires --name-hash-version=1");
+        }
+    }
+    Ok(())
+}
+
+fn read_stdin_packs(format: ObjectFormat) -> Result<()> {
+    let hex_len = format.raw_len() * 2;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut line = Vec::new();
+    let mut packs = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let Some(oid) = parse_pack_objects_oid(&line, hex_len, format) else {
+            return pack_objects_garbage("expected object ID", &line);
+        };
+        packs.push(oid);
+    }
+    packs.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    if let Some(oid) = packs.first() {
+        eprintln!("fatal: could not find pack '{oid}'");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
 }
 
 /// The final progress totals line and the trace2 data events upstream emits
 /// after writing the pack (builtin/pack-objects.c `cmd_pack_objects` tail).
+fn pack_objects_stats_line(
+    written_total: u64,
+    delta_count: u32,
+    pack_reused: u64,
+    packs_reused: u64,
+) -> String {
+    format!(
+        "Total {written_total} (delta {delta_count}), reused {pack_reused} (delta 0), pack-reused {pack_reused} (from {packs_reused})"
+    )
+}
+
 fn emit_pack_objects_totals(progress: bool, stats_line: &str, pack_reused: u64, packs_reused: u64) {
     if progress {
         eprintln!("{stats_line}");

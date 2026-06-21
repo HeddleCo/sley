@@ -183,6 +183,7 @@ pub struct PackWrite {
     pub index: Vec<u8>,
     pub checksum: ObjectId,
     pub entries: Vec<PackIndexEntry>,
+    pub delta_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +449,7 @@ impl PackFile {
             index,
             checksum: pack_checksum,
             entries,
+            delta_count: 0,
         })
     }
 
@@ -930,6 +932,7 @@ impl PackFile {
         pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
 
         let mut index_entries = Vec::with_capacity(objects.len());
+        let mut delta_count = 0u32;
         // Pack offset at which each original object index was written, or
         // `None` until it has been emitted.
         let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
@@ -948,6 +951,7 @@ impl PackFile {
                     );
                 }
                 PlannedBase::InPack { base_idx, delta } => {
+                    delta_count += 1;
                     let base_offset = written_offsets[*base_idx].ok_or_else(|| {
                         GitError::InvalidFormat(
                             "in-pack delta base emitted after dependent object".into(),
@@ -965,6 +969,7 @@ impl PackFile {
                     }
                 }
                 PlannedBase::External { base_oid, delta } => {
+                    delta_count += 1;
                     write_pack_entry_header_kind(&mut entry_bytes, 7, delta.len() as u64);
                     entry_bytes.extend_from_slice(base_oid.as_bytes());
                 }
@@ -988,6 +993,7 @@ impl PackFile {
             index,
             checksum,
             entries: index_entries,
+            delta_count,
         })
     }
 }
