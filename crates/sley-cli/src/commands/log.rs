@@ -1005,6 +1005,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--pickaxe-regex" => pickaxe_regex = true,
             "--pickaxe-all" => pickaxe_all = true,
             "-a" | "--text" => diff_opts.text = true,
+            "-O" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("O"))?;
+                diff_opts.order_file = Some(value.to_string());
+            }
+            value if value.starts_with("-O") => {
+                diff_opts.order_file = Some(value[2..].to_string());
+            }
             "--diff-filter" => {
                 let value = iter
                     .next()
@@ -1077,6 +1086,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--function-context"
             | "--default-prefix"
             | "--break-rewrites"
+            | "--binary"
+            | "--no-binary"
             | "--irreversible-delete"
             | "--textconv"
             | "--no-textconv"

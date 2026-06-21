@@ -2782,6 +2782,80 @@ pub(crate) fn render_tree_to_tree_patch(
     Ok(out)
 }
 
+pub(crate) fn apply_diff_order_file(
+    mut entries: Vec<sley_diff_merge::NameStatusEntry>,
+    order_file: Option<&str>,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let Some(order_file) = order_file else {
+        return Ok(entries);
+    };
+    if order_file == "/dev/null" {
+        return Ok(entries);
+    }
+    let path = Path::new(order_file);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let contents = fs::read(&path)?;
+    let patterns: Vec<Vec<u8>> = contents
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_vec())
+        .collect();
+    if patterns.is_empty() {
+        return Ok(entries);
+    }
+    entries.sort_by_key(|entry| diff_order_rank(entry, &patterns).unwrap_or(usize::MAX));
+    Ok(entries)
+}
+
+fn diff_order_rank(
+    entry: &sley_diff_merge::NameStatusEntry,
+    patterns: &[Vec<u8>],
+) -> Option<usize> {
+    patterns.iter().position(|pattern| {
+        diff_order_pattern_matches(pattern, entry.path.as_bytes())
+            || entry
+                .old_path
+                .as_ref()
+                .is_some_and(|old| diff_order_pattern_matches(pattern, old.as_bytes()))
+    })
+}
+
+fn diff_order_pattern_matches(pattern: &[u8], path: &[u8]) -> bool {
+    pattern == path || diff_order_glob_matches(pattern, path)
+}
+
+fn diff_order_glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p = 0usize;
+    let mut t = 0usize;
+    let mut star: Option<usize> = None;
+    let mut match_after_star = 0usize;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            match_after_star = t;
+        } else if let Some(star_index) = star {
+            p = star_index + 1;
+            match_after_star += 1;
+            t = match_after_star;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 /// Compile the `-I<regex>` (`--ignore-matching-lines`) patterns into ERE
 /// matchers. A malformed pattern fails like git's `diff_opt_ignore_regex`:
 /// `error: invalid regex given to -I: '<pat>'` and exit code 129.

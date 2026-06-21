@@ -208,6 +208,8 @@ struct FormatPatchOptions {
     rename_threshold: u8,
     /// Copy similarity threshold.
     copy_threshold: u8,
+    /// `-O<file>`: reorder per-patch diff entries according to an orderfile.
+    order_file: Option<String>,
     /// `--cover-letter` / `--no-cover-letter`: emit a `0000-cover-letter.patch`
     /// summary "email" ahead of the per-commit patches. `None` defers to
     /// `format.coverletter` (resolved in [`resolve_cover_letter`]).
@@ -346,6 +348,7 @@ impl Default for FormatPatchOptions {
             find_copies_harder: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            order_file: None,
             cover_letter: None,
             commit_list_format: None,
             cover_from_description: None,
@@ -3013,7 +3016,8 @@ fn first_parent_diff_entries(
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
     };
-    Ok(apply_format_patch_relative(entries, options))
+    let entries = apply_format_patch_relative(entries, options);
+    apply_diff_order_file(entries, options.order_file.as_deref())
 }
 
 /// Select the commits to format, newest-to-oldest from the walk then reversed to
@@ -4210,6 +4214,15 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.detect_copies = true;
                 options.copy_threshold = parse_similarity(&value[2..])?;
             }
+            "-O" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("-O requires a value".into()))?;
+                options.order_file = Some(value.clone());
+            }
+            value if let Some(path) = value.strip_prefix("-O") => {
+                options.order_file = Some(path.to_string());
+            }
             "--find-copies-harder" => {
                 options.detect_copies = true;
                 options.find_copies_harder = true;
@@ -4378,6 +4391,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // sley emits for the common path.
             "--no-color"
             | "--color"
+            | "--attach"
             | "--minimal"
             | "--patience"
             | "--histogram"
@@ -4388,6 +4402,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--text"
             | "-a"
             | "--ita-invisible-in-index" => {}
+            value if value.starts_with("--attach=") => {}
             "--no-prefix" => options.prefix_mode = Some(false),
             "--default-prefix" => options.prefix_mode = Some(true),
             "--relative" => options.relative_mode = RelativeMode::On(None),

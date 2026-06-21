@@ -81,6 +81,8 @@ pub(super) struct LogDiffOptions {
     pub(super) ignore_regexes: Vec<crate::grep_source::Regex>,
     /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
     pub(super) text: bool,
+    /// `-O<file>`: reorder diff entries according to an orderfile.
+    pub(super) order_file: Option<String>,
     /// Resolved `--indent-heuristic` / `diff.indentHeuristic` (default
     /// git-enabled).
     pub(super) indent_heuristic: bool,
@@ -107,6 +109,7 @@ impl Default for LogDiffOptions {
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             text: false,
+            order_file: None,
             indent_heuristic: true,
         }
     }
@@ -296,6 +299,7 @@ impl LogDiffContext<'_> {
         } else {
             entries
         };
+        let entries = apply_diff_order_file(entries, self.opts.order_file.as_deref())?;
         if entries.is_empty() {
             return Ok(());
         }
