@@ -4165,10 +4165,22 @@ fn collect_short_status_with_options(
     entries.retain(|entry| !unmerged_paths.contains(&entry.path));
     entries.append(&mut unmerged_entries);
     if options.include_ignored {
-        let ignored_paths =
-            ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)?;
+        let ignored_directory_rows = !matches!(options.untracked_mode, StatusUntrackedMode::All)
+            && !matches!(options.ignored_mode, StatusIgnoredMode::Matching);
+        let ignored_paths = ignored_untracked_paths(
+            worktree_root,
+            git_dir,
+            &index,
+            &ignores,
+            ignored_directory_rows,
+        )?;
         let ignored_paths: Vec<Vec<u8>> = match options.ignored_mode {
             StatusIgnoredMode::Matching => ignored_paths,
+            StatusIgnoredMode::Traditional
+                if matches!(options.untracked_mode, StatusUntrackedMode::All) =>
+            {
+                ignored_paths
+            }
             StatusIgnoredMode::Traditional => {
                 let mut rolled = BTreeSet::new();
                 for path in ignored_paths {
@@ -4203,9 +4215,22 @@ fn collect_short_status_with_options(
     }
     let untracked_paths: Vec<Vec<u8>> = match options.untracked_mode {
         StatusUntrackedMode::All => worktree
-            .keys()
-            .filter(|path| !index.contains_key(*path) && !ignores.is_ignored(path, false))
-            .cloned()
+            .iter()
+            .filter_map(|(path, entry)| {
+                let is_directory = entry.mode == 0o040000 && entry.oid.is_null();
+                if index.contains_key(path)
+                    || path_or_parent_is_ignored(&ignores, path, is_directory)
+                {
+                    return None;
+                }
+                if is_directory {
+                    let mut directory = path.clone();
+                    directory.push(b'/');
+                    Some(directory)
+                } else {
+                    Some(path.clone())
+                }
+            })
             .collect(),
         StatusUntrackedMode::Normal => {
             normal_untracked_paths_from_worktree(&worktree, &index, &ignores)
@@ -6614,7 +6639,7 @@ fn normal_untracked_paths_from_worktree(
 ) -> Vec<Vec<u8>> {
     let mut paths = BTreeSet::new();
     for (path, entry) in worktree {
-        if index.contains_key(path) || ignores.is_ignored(path, false) {
+        if index.contains_key(path) || path_or_parent_is_ignored(ignores, path, false) {
             continue;
         }
         if entry.mode == 0o040000 && entry.oid.is_null() {
@@ -6624,6 +6649,18 @@ fn normal_untracked_paths_from_worktree(
         paths.insert(untracked_normal_rollup_path(path, index, ignores));
     }
     paths.into_iter().collect()
+}
+
+fn path_or_parent_is_ignored(ignores: &IgnoreMatcher, path: &[u8], is_dir: bool) -> bool {
+    if ignores.is_ignored(path, is_dir) {
+        return true;
+    }
+    for (index, byte) in path.iter().enumerate() {
+        if *byte == b'/' && index > 0 && ignores.is_ignored(&path[..index], true) {
+            return true;
+        }
+    }
+    false
 }
 
 fn status_untracked_paths_from_index(
@@ -7907,7 +7944,7 @@ fn collect_ignored_untracked_paths(
         if metadata.is_dir() {
             let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
             if ignored && !index_has_path_under(context.index, &git_path) {
-                if context.directory {
+                if context.directory || is_nested_repository_boundary(&path) {
                     let mut directory_path = git_path;
                     directory_path.push(b'/');
                     paths.insert(directory_path);
@@ -8897,6 +8934,11 @@ fn parse_ignore_pattern(
     source: &[u8],
     line_number: usize,
 ) -> Option<IgnorePattern> {
+    let raw = if line_number == 1 {
+        raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw)
+    } else {
+        raw
+    };
     let mut line = raw.strip_suffix(b"\r").unwrap_or(raw).to_vec();
     normalize_ignore_trailing_spaces(&mut line);
     let original = line.clone();

@@ -396,16 +396,18 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
+    let collection_options = status_collection_options_for_pathspec(status_options, &pathspec);
     let mut entries = crate::collect_short_status_with_options(
         &worktree_root,
         &git_dir,
         format,
-        status_options,
+        collection_options,
     )?;
     if pathspec.has_filters() {
         entries.retain(|entry| pathspec.matches(&entry.path));
     }
     apply_submodule_ignore(&mut entries, &ignore_resolver);
+    entries = status_collapse_pathspec_untracked_entries(entries, status_options, &pathspec);
     // The long-format `Submodule changes to be committed:` /
     // `Submodules changed but not updated:` sections (status.submodulesummary).
     // Only the long output renders them; compute before the display rewrite so
@@ -627,12 +629,18 @@ fn print_status_short_stream(
         );
     }
     if display.detect_renames {
-        let mut entries =
-            crate::collect_short_status_with_options(worktree_root, git_dir, format, options)?;
+        let collection_options = status_collection_options_for_pathspec(options, pathspec);
+        let mut entries = crate::collect_short_status_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            collection_options,
+        )?;
         if pathspec.has_filters() {
             entries.retain(|entry| pathspec.matches(&entry.path));
         }
         apply_submodule_ignore(&mut entries, ignore_resolver);
+        entries = status_collapse_pathspec_untracked_entries(entries, options, pathspec);
         for entry in status_entries_with_exact_renames(entries) {
             let mut entry = entry;
             if !display.porcelain_v1 && display.relative_paths {
@@ -695,6 +703,63 @@ fn print_status_short_stream(
             Ok(sley_worktree::StreamControl::Continue)
         },
     )
+}
+
+fn status_collection_options_for_pathspec(
+    mut options: sley_worktree::ShortStatusOptions,
+    pathspec: &StatusPathspec,
+) -> sley_worktree::ShortStatusOptions {
+    if pathspec.has_filters()
+        && matches!(
+            options.untracked_mode,
+            sley_worktree::StatusUntrackedMode::Normal
+        )
+    {
+        options.untracked_mode = sley_worktree::StatusUntrackedMode::All;
+    }
+    options
+}
+
+fn status_collapse_pathspec_untracked_entries(
+    entries: Vec<sley_worktree::ShortStatusEntry>,
+    options: sley_worktree::ShortStatusOptions,
+    pathspec: &StatusPathspec,
+) -> Vec<sley_worktree::ShortStatusEntry> {
+    if !pathspec.has_filters()
+        || !matches!(
+            options.untracked_mode,
+            sley_worktree::StatusUntrackedMode::Normal
+        )
+    {
+        return entries;
+    }
+    let mut collapsed = BTreeMap::new();
+    for mut entry in entries {
+        if entry.index == b'?'
+            && entry.worktree == b'?'
+            && let Some(directory) = pathspec.recursive_directory_for(&entry.path)
+        {
+            entry.path = directory;
+        }
+        collapsed
+            .entry((entry.index, entry.worktree, entry.path.clone()))
+            .or_insert(entry);
+    }
+    let mut entries = collapsed.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        status_output_sort_category(left)
+            .cmp(&status_output_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries
+}
+
+fn status_output_sort_category(entry: &sley_worktree::ShortStatusEntry) -> u8 {
+    match (entry.index, entry.worktree) {
+        (b'?', b'?') => 1,
+        (b'!', b'!') => 2,
+        _ => 0,
+    }
 }
 
 struct StatusOutputEntry {
@@ -862,6 +927,28 @@ impl StatusPathspec {
 
     fn matches(&self, path: &[u8]) -> bool {
         pathspec_filters_match(&self.filters, path)
+    }
+
+    fn recursive_directory_for(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.filters
+            .iter()
+            .filter(|filter| !filter.is_exclude() && filter.recursive && !filter.is_glob)
+            .filter_map(|filter| {
+                let directory = filter.element.pattern();
+                if directory.is_empty() || path == directory {
+                    return None;
+                }
+                path.strip_prefix(directory)
+                    .and_then(|rest| rest.starts_with(b"/").then_some(directory))
+            })
+            .max_by_key(|directory| directory.len())
+            .map(|directory| {
+                let mut directory = directory.to_vec();
+                if directory.last() != Some(&b'/') {
+                    directory.push(b'/');
+                }
+                directory
+            })
     }
 }
 
