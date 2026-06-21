@@ -94,6 +94,10 @@ pub struct FetchOptions {
     /// Whether the prune-tags option (`--prune-tags`/`--no-prune-tags`) was set
     /// explicitly, so configured prune tag options must not override it.
     pub prune_tags_option_explicit: bool,
+    /// Explicit `--refmap` mappings for command-line refspec tracking updates.
+    /// `None` means use `remote.<name>.fetch`; `Some([])` disables the
+    /// opportunistic tracking update.
+    pub refmap: Option<Vec<String>>,
     /// Shallow fetch depth (`--depth N`): truncate history to `N` commits per tip.
     /// `None` is a full fetch. Honored by the HTTP and SSH transports and by the
     /// in-process local (`file://`/path) server, which computes the deepen
@@ -286,6 +290,22 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
+    if options.refmap.is_some() && request.refspecs.is_empty() {
+        return Err(GitError::Command(
+            "--refmap option is only meaningful with command-line refspec(s)".into(),
+        ));
+    }
+    let tracking_refspec_strings = if request.refspecs.is_empty() {
+        Vec::new()
+    } else {
+        options.refmap.clone().unwrap_or_else(|| {
+            configured_refspecs_for_tracking(request.config, request.remote_name)
+        })
+    };
+    let tracking_refspecs = tracking_refspec_strings
+        .iter()
+        .map(|refspec| parse_refspec(refspec))
+        .collect::<Result<Vec<_>>>()?;
     let parsed_prune_refspecs = prune_refspecs
         .iter()
         .map(|refspec| parse_refspec(refspec))
@@ -334,6 +354,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
                 has_merge_config,
+                tracking_refspecs: &tracking_refspecs,
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             // Shallow fetch: replay the current boundary as `shallow` lines and ask
@@ -412,6 +433,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
                 has_merge_config,
+                tracking_refspecs: &tracking_refspecs,
             })?;
             if remote.transport == RemoteTransport::Ext && options.auto_follow_tags {
                 append_missing_ext_advertised_tags(
@@ -482,6 +504,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
                 has_merge_config,
+                tracking_refspecs: &tracking_refspecs,
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             let existing_shallow =
@@ -633,6 +656,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
                 has_merge_config,
+                tracking_refspecs: &tracking_refspecs,
             })?;
             // A shallow server's new boundary points are only written on a
             // clone, an explicit deepen, or `--update-shallow`; otherwise the
@@ -863,6 +887,8 @@ struct FetchPlanInput<'a> {
     /// remote with `branch.<x>.merge` configured. The merge refs drive which
     /// FETCH_HEAD entries are for-merge (`add_merge_config`).
     has_merge_config: bool,
+    /// Opportunistic tracking mappings used only for command-line refspecs.
+    tracking_refspecs: &'a [RefSpec],
 }
 
 fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpdate>> {
@@ -877,6 +903,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         format,
         configured_remote_fetch,
         has_merge_config,
+        tracking_refspecs,
     } = input;
     let visible_advertisements = advertisements_without_peeled_refs(advertisements);
     let planning_advertisements = if visible_advertisements.len() == advertisements.len() {
@@ -946,7 +973,52 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         // stably to reproduce that layout.
         updates.sort_by_key(|update| update.not_for_merge);
     }
+    append_opportunistic_tracking_updates(&mut updates, tracking_refspecs)?;
     Ok(updates)
+}
+
+fn configured_refspecs_for_tracking(config: &GitConfig, remote: &str) -> Vec<String> {
+    if remote_exists(config, remote) {
+        remote_config_values(config, remote, "fetch")
+    } else {
+        Vec::new()
+    }
+}
+
+fn append_opportunistic_tracking_updates(
+    updates: &mut Vec<FetchRefUpdate>,
+    tracking_refspecs: &[RefSpec],
+) -> Result<()> {
+    if tracking_refspecs.is_empty() {
+        return Ok(());
+    }
+    let mut seen_dsts = updates
+        .iter()
+        .filter_map(|update| update.dst.clone())
+        .collect::<HashSet<_>>();
+    let mut additions = Vec::new();
+    for update in updates.iter() {
+        if fetch_refspec_excludes(tracking_refspecs, &update.src)? {
+            continue;
+        }
+        for refspec in tracking_refspecs.iter().filter(|refspec| !refspec.negative) {
+            let Some(dst) = refspec_map_source(refspec, &update.src)? else {
+                continue;
+            };
+            if !seen_dsts.insert(dst.clone()) {
+                continue;
+            }
+            additions.push(FetchRefUpdate {
+                src: update.src.clone(),
+                dst: Some(dst),
+                oid: update.oid,
+                not_for_merge: true,
+                force: refspec.force,
+            });
+        }
+    }
+    updates.extend(additions);
+    Ok(())
 }
 
 fn advertisements_without_peeled_refs(
@@ -1833,6 +1905,7 @@ mod tests {
             tag_option_explicit: true,
             prune_option_explicit: true,
             prune_tags_option_explicit: true,
+            refmap: None,
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,

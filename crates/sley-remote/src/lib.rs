@@ -269,6 +269,7 @@ mod tests {
             tag_option_explicit: true,
             prune_option_explicit: true,
             prune_tags_option_explicit: true,
+            refmap: None,
             depth,
             merge_srcs: Vec::new(),
             filter: None,

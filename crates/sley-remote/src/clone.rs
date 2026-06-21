@@ -517,6 +517,7 @@ fn clone_fetch_options(
         tag_option_explicit: false,
         prune_option_explicit: false,
         prune_tags_option_explicit: false,
+        refmap: None,
         depth,
         merge_srcs: Vec::new(),
         filter,

@@ -953,6 +953,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         tag_option_explicit: tags.is_some(),
         prune_option_explicit: false,
         prune_tags_option_explicit: false,
+        refmap: None,
         depth,
         merge_srcs: merge_srcs.clone(),
         filter: None,

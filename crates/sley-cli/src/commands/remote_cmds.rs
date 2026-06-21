@@ -1256,6 +1256,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             tag_option_explicit: false,
             prune_option_explicit: false,
             prune_tags_option_explicit: false,
+            refmap: None,
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
@@ -1858,6 +1859,7 @@ fn clone_bare_network_repository(
             tag_option_explicit: options.tag_opt.is_some(),
             prune_option_explicit: false,
             prune_tags_option_explicit: false,
+            refmap: None,
             depth: options.depth,
             merge_srcs: Vec::new(),
             filter: None,
@@ -2259,6 +2261,7 @@ fn clone_bare_or_mirror_local_repository(
             tag_option_explicit: options.tag_opt.is_some(),
             prune_option_explicit: false,
             prune_tags_option_explicit: false,
+            refmap: None,
             depth: None,
             merge_srcs: Vec::new(),
             filter: options.fetch_filter,
@@ -3359,6 +3362,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         tag_option_explicit: false,
         prune_option_explicit: false,
         prune_tags_option_explicit: false,
+        refmap: None,
         depth: None,
         merge_srcs: Vec::new(),
         filter: None,
@@ -3424,6 +3428,16 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-prune-tags" => {
                 options.prune_tags = false;
                 options.prune_tags_option_explicit = true;
+            }
+            "--refmap" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("fetch --refmap requires a value".into()))?;
+                push_fetch_refmap(&mut options, value);
+            }
+            value if value.starts_with("--refmap=") => {
+                let value = value.strip_prefix("--refmap=").unwrap_or_default();
+                push_fetch_refmap(&mut options, value);
             }
             "--tags" => {
                 options.auto_follow_tags = true;
@@ -3769,6 +3783,13 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
     pack_filter_from_spec(spec)
+}
+
+fn push_fetch_refmap(options: &mut FetchOptions, value: &str) {
+    let refmap = options.refmap.get_or_insert_with(Vec::new);
+    if !value.is_empty() {
+        refmap.push(value.to_string());
+    }
 }
 
 fn parse_fetch_jobs(value: &str) -> Result<Option<usize>> {
