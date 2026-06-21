@@ -994,6 +994,19 @@ declare -A FLOOR=(
     [t5514-fetch-multiple.sh]=24
     [t2030-unresolve-info.sh]=13
     [t2407-worktree-heads.sh]=12
+    # wave-37 (2026-06-21, post-sweep 84.7% off main 7f5514ba; t_push/diff/worktree-setup):
+    # pre-push-hook, patch-id, cwd-empty. t5571-pre-push-hook 1->11 FULL (hook argv/stdin ref-feed +
+    # abort-on-failure; SELF-HEALED a pre-existing aspirational floor=11 that was reddening the weekly
+    # gate, same pattern as t1404). t4204-patch-id 5->25/26 (stable hunk-canonicalized hash, multi-patch
+    # split, --stable/--verbatim; +log/format-patch -O orderfile for fixtures). t2501-cwd-empty 3->24
+    # FULL (repo discovery when cwd is rmdir'd: checkout/reset/merge/cherry-pick/rebase/revert/clean/
+    # stash/rm/submodule via GIT_DIR fallback). patchid + cwdempty both edited sley-cli/lib.rs —
+    # auto-merged clean, both t4204=25 + t2501=24 verified on MERGED binary. cwdempty's git-rm-rf cwd
+    # handling regressed t3600-rm 81->80 (trailing-slash pathspec); fix-round bad2376e restored ->81.
+    # prepushhook disjoint. Guards held/gained: t3600=81 t3700=51 t4013=216 t4015=129 t5510=170 t5516=110
+    # t5526=56 t5601=108 t3404=121 t1500=81 t1501=39 t7508=119 t2070=15. cargo test green.
+    [t4204-patch-id.sh]=25
+    [t2501-cwd-empty.sh]=24
 )
 
 fail=0

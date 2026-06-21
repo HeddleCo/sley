@@ -163,6 +163,8 @@ jobs:
             t5514-fetch-multiple.sh
             t2030-unresolve-info.sh
             t2407-worktree-heads.sh
+            t4204-patch-id.sh
+            t2501-cwd-empty.sh
             t2204-add-ignored.sh
             t6020-bundle-misc.sh
             t4068-diff-symmetric-merge-base.sh
