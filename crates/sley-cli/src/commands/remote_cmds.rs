@@ -521,15 +521,16 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     trace_index_pack_fsck_objects_if_configured();
     trace_pack_objects_filter(partial_clone_filter.as_deref());
     let repository = positional[0].clone();
+    let cwd = env::current_dir()?;
+    let bundle_source_path = clone_bundle_path(&cwd, &repository);
     let destination = positional
         .get(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_clone_directory(&repository, bare));
+        .unwrap_or_else(|| default_clone_directory(&repository, bare, bundle_source_path.is_some()));
     // git reports the destination as it was given on the command line (or as
     // derived from the source) — `dir` in upstream `builtin/clone.c` — not its
     // absolutized form.
     let destination_display = destination.clone();
-    let cwd = env::current_dir()?;
     let destination = if destination.is_absolute() {
         destination
     } else {
@@ -595,6 +596,29 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             destination_display.display()
         );
         return Err(GitError::Exit(128));
+    }
+
+    if let Some(bundle_path) = bundle_source_path.as_deref() {
+        clone_bundle_repository(CloneBundleOptions {
+            repository: &repository,
+            bundle_path,
+            destination: &checkout_destination,
+            destination_display: &destination_display,
+            git_dir_override: clone_git_dir_override.as_deref(),
+            core_worktree: clone_core_worktree.as_deref(),
+            origin: &origin,
+            quiet,
+            bare,
+            checkout,
+            sparse,
+            template: template.as_deref(),
+            template_config,
+            separate_git_dir: separate_git_dir.as_deref(),
+            config_overrides: &config_overrides,
+            submodule_active: &submodule_active,
+            ref_storage,
+        })?;
+        return Ok(());
     }
 
     if sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
@@ -1098,6 +1122,188 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         depth,
         quiet,
     )
+}
+
+struct CloneBundleOptions<'a> {
+    repository: &'a str,
+    bundle_path: &'a Path,
+    destination: &'a Path,
+    destination_display: &'a Path,
+    git_dir_override: Option<&'a Path>,
+    core_worktree: Option<&'a str>,
+    origin: &'a str,
+    quiet: bool,
+    bare: bool,
+    checkout: bool,
+    sparse: bool,
+    template: Option<&'a Path>,
+    template_config: bool,
+    separate_git_dir: Option<&'a Path>,
+    config_overrides: &'a [GlobalConfigOverride],
+    submodule_active: &'a [String],
+    ref_storage: RefStorageFormat,
+}
+
+fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
+    let parsed = parse_remote_url(repository).ok()?;
+    if parsed.transport != RemoteTransport::Local {
+        return None;
+    }
+    let raw = PathBuf::from(parsed.path);
+    let base = if raw.is_absolute() { raw } else { cwd.join(raw) };
+    let suffixed = path_with_bundle_suffix(&base);
+    for candidate in [suffixed, base] {
+        if candidate.is_file()
+            && let Ok(bytes) = fs::read(&candidate)
+            && Bundle::parse(&bytes, ObjectFormat::Sha1).is_ok()
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn path_with_bundle_suffix(path: &Path) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(".bundle");
+    PathBuf::from(suffixed)
+}
+
+fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
+    if options.bare {
+        return Err(GitError::Unsupported(
+            "cloning bare repositories from bundles is not supported yet".into(),
+        ));
+    }
+    let bundle_bytes = fs::read(options.bundle_path)?;
+    let format = ObjectFormat::Sha1;
+    let bundle = Bundle::parse(&bundle_bytes, format)?;
+    let bundle_url = options.bundle_path.to_string_lossy().into_owned();
+    if !options.quiet {
+        eprintln!(
+            "Cloning into '{}'...",
+            options.destination_display.display()
+        );
+    }
+    let head_branch = bundle_clone_head_branch(&bundle).or_else(|| {
+        let default = clone_default_branch_name();
+        bundle
+            .references
+            .iter()
+            .any(|reference| reference.name == format!("refs/heads/{default}"))
+            .then_some(default)
+    });
+    let layout = RepositoryBootstrap::init(InitOptions {
+        git_dir_override: options.git_dir_override.map(Path::to_path_buf),
+        core_worktree: options.core_worktree.map(str::to_string),
+        worktree: options.destination.to_path_buf(),
+        object_format: format,
+        object_format_explicit: false,
+        bare: false,
+        initial_branch: head_branch
+            .clone()
+            .unwrap_or_else(|| clone_default_branch_name()),
+        template_dir: None,
+        copy_template_config: false,
+        separate_git_dir: None,
+        shared_repository: None,
+        ref_storage: options.ref_storage,
+        ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
+    })?;
+    let git_dir = layout.git_dir;
+    apply_clone_template(&git_dir, options.template, options.template_config)?;
+    configure_clone_remote(
+        &git_dir,
+        options.origin,
+        &bundle_url,
+        Some(format!("+refs/heads/*:refs/remotes/{}/*", options.origin)),
+        false,
+        None,
+        None,
+    )?;
+    apply_clone_config_overrides(&git_dir, options.config_overrides)?;
+    apply_clone_submodule_active(&git_dir, options.submodule_active)?;
+    fetch_bundle(
+        &git_dir,
+        format,
+        &bundle_url,
+        &[
+            format!("+refs/heads/*:refs/remotes/{}/*", options.origin),
+            "+refs/tags/*:refs/tags/*".to_string(),
+        ],
+        &bundle,
+        FetchOptions {
+            quiet: true,
+            auto_follow_tags: true,
+            fetch_all_tags: false,
+            prune: false,
+            dry_run: false,
+            append: false,
+            write_fetch_head: false,
+            tag_option_explicit: false,
+            prune_option_explicit: false,
+            depth: None,
+            merge_srcs: Vec::new(),
+            filter: None,
+            refetch: false,
+            cloning: true,
+            record_promisor_refs: false,
+            update_shallow: false,
+            deepen_relative: false,
+            update_head_ok: false,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+            ssh_options: None,
+        },
+    )?;
+    if let Some(branch) = head_branch {
+        let store = FileRefStore::new(&git_dir, format);
+        let remote_branch = format!("refs/remotes/{}/{branch}", options.origin);
+        if let Some(RefTarget::Direct(oid)) = store.read_ref(&remote_branch)? {
+            store.create_branch(
+                &branch,
+                oid,
+                commit_identity_from_env("COMMITTER")?,
+                format!("branch: Created from {}/{branch}", options.origin).into_bytes(),
+            )?;
+            configure_clone_branch(&git_dir, &branch, options.origin)?;
+            if options.checkout {
+                let config = read_repo_config(&git_dir)?;
+                sley_worktree::checkout_branch_filtered(
+                    options.destination,
+                    &git_dir,
+                    format,
+                    &branch,
+                    commit_identity_from_env("COMMITTER")?,
+                    &config,
+                )?;
+                run_clone_post_checkout_hook(&git_dir, &oid)?;
+            }
+        }
+    }
+    if !options.checkout {
+        remove_clone_worktree_files(options.destination, &git_dir, format)?;
+    } else if options.sparse {
+        apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
+    }
+    if let Some(separate_git_dir) = options.separate_git_dir {
+        apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
+    }
+    Ok(())
+}
+
+fn bundle_clone_head_branch(bundle: &Bundle) -> Option<String> {
+    let head = bundle
+        .references
+        .iter()
+        .find(|reference| reference.name == "HEAD")?;
+    bundle.references.iter().find_map(|reference| {
+        reference
+            .name
+            .strip_prefix("refs/heads/")
+            .filter(|_| reference.oid == head.oid)
+            .map(str::to_string)
+    })
 }
 
 struct CloneHttpOptions<'a> {
@@ -2738,12 +2944,12 @@ fn prune_empty_clone_dirs(root: &Path, mut dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn default_clone_directory(repository: &str, bare: bool) -> PathBuf {
+fn default_clone_directory(repository: &str, bare: bool, is_bundle: bool) -> PathBuf {
     // Port of upstream `git_url_basename` (dir.c). Operates on raw bytes because
     // the URL/host:path syntax must be parsed exactly as git does, including
     // auth-stripping, trailing-`/.git` handling, port stripping, and treating
     // `:` as a path separator for backwards-compatible `host:path` URLs.
-    PathBuf::from(git_url_basename(repository, false, bare))
+    PathBuf::from(git_url_basename(repository, is_bundle, bare))
 }
 
 /// `is_dir_sep` on Linux: only `/`.
@@ -4324,15 +4530,33 @@ fn fetch_one_source_with_outcome(
     options: FetchOptions,
     server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
-    if let Ok(input) = fs::read(source)
-        && let Ok(bundle) = Bundle::parse(&input, format)
+    if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)?
     {
         // Bundle fetches have no shallow support, so a `--depth` is warned-and-
         // ignored here, matching the local-clone behavior.
         if options.depth.is_some() {
             eprintln!("warning: --depth is ignored in bundle fetches; use file:// instead.");
         }
-        fetch_bundle(git_dir, format, source, refspecs, &bundle, options)?;
+        let configured_refspecs;
+        let bundle_refspecs = if refspecs.is_empty() {
+            let config = read_repo_config(git_dir)?;
+            configured_refspecs = remote_config_values(&config, source, "fetch");
+            if configured_refspecs.is_empty() {
+                refspecs
+            } else {
+                &configured_refspecs
+            }
+        } else {
+            refspecs
+        };
+        fetch_bundle(
+            git_dir,
+            format,
+            &bundle_source,
+            bundle_refspecs,
+            &bundle,
+            options,
+        )?;
         return Ok(sley_remote::FetchOutcome::default());
     }
     let config = transport_policy_config_for_cwd()?;
@@ -4348,6 +4572,27 @@ fn fetch_one_source_with_outcome(
         return fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options);
     }
     fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, server_options)
+}
+
+fn fetch_bundle_source(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+) -> Result<Option<(String, Bundle)>> {
+    if let Ok(input) = fs::read(source)
+        && let Ok(bundle) = Bundle::parse(&input, format)
+    {
+        return Ok(Some((source.to_string(), bundle)));
+    }
+    let config = read_repo_config(git_dir)?;
+    let resolved = resolve_remote_fetch_url(&config, source);
+    if resolved != source
+        && let Ok(input) = fs::read(&resolved)
+        && let Ok(bundle) = Bundle::parse(&input, format)
+    {
+        return Ok(Some((resolved, bundle)));
+    }
+    Ok(None)
 }
 
 /// Parse a `--shallow-since` date through the approxidate layer, mirroring
@@ -9930,7 +10175,7 @@ fn local_remote_git_dir(config: &GitConfig, name: &str, git_dir: &Path) -> Resul
             ));
         }
     };
-    discover_remote_git_dir(remote_path)
+    local_repository_git_dir_path(&remote_path)
 }
 
 fn repository_relative_path_base(git_dir: &Path) -> Result<PathBuf> {
