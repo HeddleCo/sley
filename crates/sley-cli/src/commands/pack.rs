@@ -3766,10 +3766,15 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let roots = prune_roots(&common_git_dir, format, &options.heads)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let mut roots = prune_roots(&git_dir, &common_git_dir, format, &options.heads)?;
+    roots.extend(prune_recent_object_roots(&db, &common_git_dir, format, options.expire)?);
+    roots.extend(prune_recent_hook_roots(&common_git_dir, format)?);
+    roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    roots.dedup();
+    let reachable = collect_reachable_object_ids(&db, format, roots.iter().copied())?;
     let mut candidates = Vec::new();
-    for oid in prune_unreachable_loose(&common_git_dir, format, roots, false)? {
+    for oid in prune_unreachable_loose(&common_git_dir, format, roots.iter().copied(), false)? {
         if prune_object_is_expired(&db, &oid, options.expire)? {
             candidates.push(oid);
         }
@@ -3793,13 +3798,25 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
             }
         }
     }
+    prune_shallow_file(&common_git_dir, format, &reachable, options.dry_run, options.verbose)?;
+    prune_temporary_files(&common_git_dir.join("objects"), options.expire, options.dry_run, options.verbose)?;
+    prune_temporary_files(
+        &common_git_dir.join("objects").join("pack"),
+        options.expire,
+        options.dry_run,
+        options.verbose,
+    )?;
+    prune_packed_loose_objects(&common_git_dir, format, options.dry_run)?;
+    if !options.dry_run {
+        prune_empty_loose_object_dirs(&common_git_dir.join("objects"))?;
+    }
     Ok(())
 }
 
 fn parse_prune_options(args: &[String]) -> Result<PruneOptions> {
     let mut dry_run = false;
     let mut verbose = false;
-    let mut expire = current_unix_seconds();
+    let mut expire = i64::MAX;
     let mut heads = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -3863,27 +3880,195 @@ fn parse_prune_expire(value: &str, option: &str) -> Result<i64> {
     match value {
         "now" | "all" => Ok(i64::MAX),
         "never" => Ok(i64::MIN),
-        _ => parse_reflog_expire_time(value, option),
+        _ => parse_reflog_expire_time(value, option).map_err(|err| {
+            if matches!(err, GitError::Exit(_)) {
+                eprintln!("error: malformed expiration date '{value}'");
+            }
+            err
+        }),
     }
 }
 
-fn prune_roots(git_dir: &Path, format: ObjectFormat, heads: &[String]) -> Result<Vec<ObjectId>> {
-    let store = FileRefStore::new(git_dir, format);
+fn prune_roots(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    heads: &[String],
+) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(common_git_dir, format);
     let mut roots = BTreeSet::new();
-    if let Some(oid) = resolve_ref_to_oid(&store, "HEAD")? {
-        roots.insert(oid);
-    }
     for reference in store.list_refs()? {
         if let Some(oid) = resolve_ref_to_oid(&store, &reference.name)? {
             roots.insert(oid);
         }
     }
-    for head in heads {
-        roots.insert(resolve_revision(git_dir, format, head)?);
+    for worktree_git_dir in prune_worktree_git_dirs(git_dir, common_git_dir)? {
+        if let Some(oid) = prune_head_root(&store, &worktree_git_dir, format)? {
+            roots.insert(oid);
+        }
+        for oid in prune_index_roots(&worktree_git_dir, format)? {
+            roots.insert(oid);
+        }
+        for oid in reflog_roots_from_dir(&worktree_git_dir.join("logs"), format)? {
+            roots.insert(oid);
+        }
+        for oid in prune_state_file_roots(&worktree_git_dir, format)? {
+            roots.insert(oid);
+        }
     }
-    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    roots.extend(reflog_traversal_roots(git_dir, &common_git_dir, format)?);
+    for head in heads {
+        roots.insert(resolve_revision(common_git_dir, format, head)?);
+    }
+    roots.extend(reflog_roots_from_dir(&common_git_dir.join("logs"), format)?);
     Ok(roots.into_iter().collect())
+}
+
+fn prune_worktree_git_dirs(git_dir: &Path, common_git_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = vec![git_dir.to_path_buf()];
+    if git_dir != common_git_dir {
+        dirs.push(common_git_dir.to_path_buf());
+    }
+    let worktrees = common_git_dir.join("worktrees");
+    if let Ok(entries) = fs::read_dir(worktrees) {
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
+fn prune_head_root(
+    store: &FileRefStore,
+    worktree_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<ObjectId>> {
+    let Ok(head) = fs::read_to_string(worktree_git_dir.join("HEAD")) else {
+        return Ok(None);
+    };
+    let head = head.trim();
+    if let Some(refname) = head.strip_prefix("ref:") {
+        return resolve_ref_to_oid(store, refname.trim());
+    }
+    if head.len() == format.hex_len() {
+        return ObjectId::from_hex(format, head).map(Some);
+    }
+    Ok(None)
+}
+
+fn prune_index_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let Ok(bytes) = fs::read(git_dir.join("index")) else {
+        return Ok(Vec::new());
+    };
+    let index = sley_index::Index::parse(&bytes, format)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(|entry| !sley_index::is_gitlink(entry.mode))
+        .map(|entry| entry.oid)
+        .collect())
+}
+
+fn prune_state_file_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let mut roots = Vec::new();
+    for path in [
+        "rebase-apply/autostash",
+        "rebase-apply/orig-head",
+        "rebase-merge/autostash",
+        "rebase-merge/orig-head",
+    ] {
+        let Ok(contents) = fs::read_to_string(git_dir.join(path)) else {
+            continue;
+        };
+        let value = contents.trim();
+        if value.len() == format.hex_len()
+            && let Ok(oid) = ObjectId::from_hex(format, value)
+        {
+            roots.push(oid);
+        }
+    }
+    Ok(roots)
+}
+
+fn reflog_roots_from_dir(logs_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let mut roots = Vec::new();
+    let zero = "0".repeat(format.hex_len());
+    let mut stack: Vec<PathBuf> = vec![logs_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(contents) = fs::read_to_string(&path) {
+                for line in contents.lines() {
+                    let mut fields = line.split(' ');
+                    for hex in [fields.next(), fields.next()].into_iter().flatten() {
+                        if hex != zero
+                            && let Ok(oid) = ObjectId::from_hex(format, hex)
+                        {
+                            roots.push(oid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn prune_recent_object_roots(
+    db: &FileObjectDatabase,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    expire: i64,
+) -> Result<Vec<ObjectId>> {
+    if expire <= i64::MIN {
+        return Ok(Vec::new());
+    }
+    let mut roots = Vec::new();
+    for oid in sley_odb::repository_object_ids(common_git_dir, format)? {
+        if prune_object_is_expired(db, &oid, expire)? {
+            continue;
+        }
+        if db.read_object(&oid).is_ok() {
+            roots.push(oid);
+        }
+    }
+    Ok(roots)
+}
+
+fn prune_recent_hook_roots(common_git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let config = read_repo_config(common_git_dir)?;
+    let mut roots = Vec::new();
+    for hook in config
+        .get_all("gc", None, "recentObjectsHook")
+        .into_iter()
+        .flatten()
+    {
+        let output = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg(hook)
+            .current_dir(common_git_dir.parent().unwrap_or(common_git_dir))
+            .output()?;
+        if !output.status.success() {
+            eprintln!("fatal: unable to enumerate additional recent objects");
+            return Err(GitError::Exit(128));
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let value = line.trim();
+            if value.len() == format.hex_len() {
+                roots.push(ObjectId::from_hex(format, value)?);
+            }
+        }
+    }
+    Ok(roots)
 }
 
 fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: i64) -> Result<bool> {
@@ -3901,6 +4086,185 @@ fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: i64)
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0);
     Ok(modified <= expire)
+}
+
+fn prune_temporary_files(path: &Path, expire: i64, dry_run: bool, verbose: bool) -> Result<()> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("tmp_") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if file_mtime_seconds(&metadata) > expire {
+            continue;
+        }
+        if dry_run || verbose {
+            if metadata.is_dir() {
+                println!("Removing stale temporary directory {}", path.display());
+            } else {
+                println!("Removing stale temporary file {}", path.display());
+            }
+        }
+        if dry_run {
+            continue;
+        }
+        if metadata.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+fn file_mtime_seconds(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+
+fn prune_packed_loose_objects(git_dir: &Path, format: ObjectFormat, dry_run: bool) -> Result<()> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let packed = sley_odb::packed_object_ids(&objects_dir, format)?;
+    if packed.is_empty() {
+        return Ok(());
+    }
+    for (oid, path) in prune_loose_object_paths(&objects_dir, format)? {
+        if !packed.contains(&oid) || dry_run {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn prune_loose_object_paths(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<(ObjectId, PathBuf)>> {
+    let mut objects = Vec::new();
+    if !objects_dir.exists() {
+        return Ok(objects);
+    }
+    let hex_len = format.hex_len();
+    for entry in fs::read_dir(objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let fanout = entry.file_name();
+        let Some(fanout) = fanout.to_str() else {
+            continue;
+        };
+        if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        for object_entry in fs::read_dir(entry.path())? {
+            let object_entry = object_entry?;
+            if !object_entry.file_type()?.is_file() {
+                continue;
+            }
+            let suffix = object_entry.file_name();
+            let Some(suffix) = suffix.to_str() else {
+                continue;
+            };
+            if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let oid = ObjectId::from_hex(format, &format!("{fanout}{suffix}"))?;
+            objects.push((oid, object_entry.path()));
+        }
+    }
+    objects.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    Ok(objects)
+}
+
+fn prune_empty_loose_object_dirs(objects_dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(objects_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn prune_shallow_file(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reachable: &HashSet<ObjectId>,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<()> {
+    let path = git_dir.join("shallow");
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let mut retained = Vec::new();
+    let mut removed = Vec::new();
+    for line in contents.lines() {
+        let value = line.trim();
+        if value.len() != format.hex_len() {
+            retained.push(value.to_string());
+            continue;
+        }
+        let oid = ObjectId::from_hex(format, value)?;
+        if reachable.contains(&oid) {
+            retained.push(value.to_string());
+        } else {
+            removed.push(oid);
+        }
+    }
+    if (dry_run || verbose) && !removed.is_empty() {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        for oid in &removed {
+            let type_name = db
+                .read_object_header(oid)?
+                .map(|(object_type, _size)| object_type.as_str())
+                .unwrap_or("unknown");
+            println!("{oid} {type_name}");
+        }
+    }
+    if dry_run || removed.is_empty() {
+        return Ok(());
+    }
+    if retained.is_empty() {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+    } else {
+        let mut out = retained.join("\n");
+        out.push('\n');
+        fs::write(path, out)?;
+    }
+    Ok(())
 }
 
 fn prune_usage<T>() -> Result<T> {
