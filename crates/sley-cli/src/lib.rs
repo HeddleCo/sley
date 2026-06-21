@@ -710,6 +710,50 @@ pub(crate) fn injected_config_parameters() -> Result<Vec<sley_config::ConfigPara
         .map_err(report_config_parameter_error)
 }
 
+pub(crate) const DEFAULT_BIG_FILE_THRESHOLD: u64 = 512 * 1024 * 1024;
+
+pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
+    let context = match git_dir {
+        Some(git_dir) => {
+            let git_dir_abs = match fs::canonicalize(git_dir) {
+                Ok(path) => path,
+                Err(_) => git_dir.to_path_buf(),
+            };
+            sley_config::ConfigIncludeContext::new(
+                Some(git_dir_abs),
+                sley_config::repo_current_branch_name(git_dir),
+            )
+        }
+        None => sley_config::ConfigIncludeContext::new(None, None),
+    };
+    let mut config =
+        sley_config::load_pre_dispatch_config(git_dir, &context).map_err(report_config_setup_error)?;
+    let parameters = injected_config_parameters()?;
+    let base = match env::current_dir() {
+        Ok(path) => path,
+        Err(_) => PathBuf::from("."),
+    };
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        &base,
+    )
+    .map_err(report_config_setup_error)?;
+    let Some(value) = config.get("core", None, "bigfilethreshold") else {
+        return Ok(DEFAULT_BIG_FILE_THRESHOLD);
+    };
+    match sley_config::parse_config_int(value) {
+        Some(value) if value >= 0 => Ok(value as u64),
+        _ => {
+            eprintln!(
+                "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
+            );
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 /// Print git's exact diagnostic for a config-injection parse failure and return
 /// the matching exit status. Git prints the specific `error:` line followed by a
 /// generic `fatal: unable to parse command-line config` and exits 128.
@@ -2813,11 +2857,17 @@ pub(crate) fn write_diff_patch_entry(
         .as_ref()
         .and_then(|driver| driver.binary)
         .or_else(|| new_driver.as_ref().and_then(|driver| driver.binary));
+    let big_file_threshold =
+        core_big_file_threshold(options.db.objects_dir().parent()).unwrap_or(DEFAULT_BIG_FILE_THRESHOLD);
     let treat_as_binary = match binary_override {
         Some(binary) => binary,
         None => {
-            old_content.as_deref().is_some_and(is_binary_content)
-                || new_content.as_deref().is_some_and(is_binary_content)
+            old_content
+                .as_deref()
+                .is_some_and(|content| is_binary_or_large_content(content, big_file_threshold))
+                || new_content
+                    .as_deref()
+                    .is_some_and(|content| is_binary_or_large_content(content, big_file_threshold))
         }
     };
     if treat_as_binary {
@@ -5002,6 +5052,10 @@ fn diff_line_stats(old: Option<&[u8]>, new: Option<&[u8]>) -> DiffLineStats {
 
 fn is_binary_content(bytes: &[u8]) -> bool {
     bytes.contains(&0)
+}
+
+fn is_binary_or_large_content(bytes: &[u8], big_file_threshold: u64) -> bool {
+    bytes.len() as u64 >= big_file_threshold || is_binary_content(bytes)
 }
 
 /// `--stat` insertion/deletion line counts, computed by the shared diff-merge

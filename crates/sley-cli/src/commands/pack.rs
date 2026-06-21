@@ -41,9 +41,17 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     // run outside any repo, so only fall back to repo discovery when needed.
     let repo = match discover_git_dir(env::current_dir()?) {
         Ok(git_dir) => {
-            let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-            let format = repository_object_format(&common_git_dir)?;
-            Some((common_git_dir, format))
+            match common_git_dir_for_git_dir(&git_dir) {
+                Ok(common_git_dir) => {
+                    let format = match options.object_format {
+                        Some(format) => format,
+                        None => repository_object_format(&common_git_dir)?,
+                    };
+                    Some((common_git_dir, format))
+                }
+                Err(err) if !options.stdin && options.object_format.is_some() => None,
+                Err(err) => return Err(err),
+            }
         }
         Err(err) => {
             // Outside a repo, a file-mode index-pack is still valid: `git`

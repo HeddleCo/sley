@@ -72,6 +72,8 @@ pub struct PackWriteOptions {
     /// reference earlier input objects. Reordering is always skipped when
     /// deltification is disabled (`depth == 0`), since it has no effect there.
     pub reorder: bool,
+    /// Zlib compression level for pack entry payloads.
+    pub compression_level: u32,
 }
 
 impl Default for PackWriteOptions {
@@ -91,6 +93,7 @@ impl PackWriteOptions {
             prefer_ofs_delta: true,
             thin_bases: HashMap::new(),
             reorder: true,
+            compression_level: 6,
         }
     }
 
@@ -123,6 +126,12 @@ impl PackWriteOptions {
     /// emitted in input order (`false`).
     pub fn with_reorder(mut self, reorder: bool) -> Self {
         self.reorder = reorder;
+        self
+    }
+
+    /// Set the zlib compression level used for pack entry payloads.
+    pub fn with_compression_level(mut self, level: u32) -> Self {
+        self.compression_level = level.min(9);
         self
     }
 }
@@ -932,7 +941,8 @@ impl PackFile {
         // `None` until it has been emitted.
         let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
 
-        let compressed_payloads = compress_planned_payloads(&objects, &plan, &order)?;
+        let compressed_payloads =
+            compress_planned_payloads(&objects, &plan, &order, options.compression_level)?;
 
         for (order_pos, &idx) in order.iter().enumerate() {
             let offset = pack.len() as u64;
@@ -3875,6 +3885,7 @@ fn compress_planned_payloads(
     objects: &[&EncodedObject],
     plan: &[PlannedEntry],
     order: &[usize],
+    compression_level: u32,
 ) -> Result<Vec<Vec<u8>>> {
     if order.is_empty() {
         return Ok(Vec::new());
@@ -3888,7 +3899,10 @@ fn compress_planned_payloads(
     if worker_count <= 1 || order.len() < PACK_PARALLEL_COMPRESSION_MIN_OBJECTS {
         let mut payloads = Vec::with_capacity(order.len());
         for &idx in order {
-            payloads.push(compressed_payload(planned_payload(objects, plan, idx))?);
+            payloads.push(compressed_payload(
+                planned_payload(objects, plan, idx),
+                compression_level,
+            )?);
         }
         return Ok(payloads);
     }
@@ -3902,10 +3916,13 @@ fn compress_planned_payloads(
             handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
                 let mut chunk_payloads = Vec::with_capacity(chunk.len());
                 for (offset, &idx) in chunk.iter().enumerate() {
-                    chunk_payloads.push((
-                        chunk_start + offset,
-                        compressed_payload(planned_payload(objects, plan, idx))?,
-                    ));
+                        chunk_payloads.push((
+                            chunk_start + offset,
+                            compressed_payload(
+                                planned_payload(objects, plan, idx),
+                                compression_level,
+                            )?,
+                        ));
                 }
                 Ok(chunk_payloads)
             }));
@@ -3951,9 +3968,9 @@ fn planned_payload<'a>(
     }
 }
 
-fn compressed_payload(body: &[u8]) -> Result<Vec<u8>> {
+fn compressed_payload(body: &[u8], compression_level: u32) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    write_compressed_payload(&mut out, body)?;
+    write_compressed_payload(&mut out, body, compression_level)?;
     Ok(out)
 }
 
@@ -4249,25 +4266,18 @@ fn read_delta_copy_value(
     Ok(value)
 }
 
-thread_local! {
-    static DEFLATE: RefCell<Compress> = RefCell::new(Compress::new(Compression::default(), true));
-}
-
-fn write_compressed_payload(out: &mut Vec<u8>, body: &[u8]) -> Result<()> {
-    DEFLATE.with(|cell| {
-        let mut compressor = cell.borrow_mut();
-        compressor.reset();
-        out.reserve(zlib_compress_bound(body.len()));
-        let status = compressor
-            .compress_vec(body, out, FlushCompress::Finish)
-            .map_err(|err| GitError::InvalidObject(format!("zlib compression failed: {err}")))?;
-        if status != Status::StreamEnd || compressor.total_in() != body.len() as u64 {
-            return Err(GitError::InvalidObject(
-                "zlib compression did not finish pack entry".into(),
-            ));
-        }
-        Ok(())
-    })
+fn write_compressed_payload(out: &mut Vec<u8>, body: &[u8], compression_level: u32) -> Result<()> {
+    let mut compressor = Compress::new(Compression::new(compression_level.min(9)), true);
+    out.reserve(zlib_compress_bound(body.len()));
+    let status = compressor
+        .compress_vec(body, out, FlushCompress::Finish)
+        .map_err(|err| GitError::InvalidObject(format!("zlib compression failed: {err}")))?;
+    if status != Status::StreamEnd || compressor.total_in() != body.len() as u64 {
+        return Err(GitError::InvalidObject(
+            "zlib compression did not finish pack entry".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn zlib_compress_bound(len: usize) -> usize {

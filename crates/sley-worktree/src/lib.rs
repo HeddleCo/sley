@@ -151,6 +151,82 @@ impl UpdateIndexOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LargeObjectPolicy {
+    threshold: u64,
+    compression_level: u32,
+    pack_size_limit: Option<u64>,
+}
+
+impl LargeObjectPolicy {
+    fn from_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<Self> {
+        let config = effective_worktree_config(git_dir, parameters_env)?;
+        let threshold = match config.get("core", None, "bigfilethreshold") {
+            Some(value) => match sley_config::parse_config_int(value) {
+                Some(value) if value >= 0 => value as u64,
+                _ => {
+                    eprintln!(
+                        "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+            },
+            None => 512 * 1024 * 1024,
+        };
+        let compression_level = pack_compression_level(&config);
+        let pack_size_limit = config
+            .get("pack", None, "packSizeLimit")
+            .and_then(sley_config::parse_config_int)
+            .and_then(|value| (value > 0).then_some(value as u64));
+        Ok(Self {
+            threshold,
+            compression_level,
+            pack_size_limit,
+        })
+    }
+}
+
+fn effective_worktree_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<GitConfig> {
+    let common = common_git_dir_for_worktree_config(git_dir);
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common.clone()),
+        sley_config::repo_current_branch_name(git_dir),
+    );
+    let mut config = sley_config::load_effective_config(&common, &context)?;
+    if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env) {
+        let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            &base,
+        )?;
+    }
+    Ok(config)
+}
+
+fn common_git_dir_for_worktree_config(git_dir: &Path) -> PathBuf {
+    if let Ok(value) = fs::read_to_string(git_dir.join("commondir")) {
+        let path = PathBuf::from(value.trim());
+        if path.is_absolute() {
+            return path;
+        }
+        return git_dir.join(path);
+    }
+    git_dir.to_path_buf()
+}
+
+fn pack_compression_level(config: &GitConfig) -> u32 {
+    config_int_in_range(config.get("pack", None, "compression"))
+        .or_else(|| config_int_in_range(config.get("core", None, "compression")))
+        .unwrap_or(6)
+}
+
+fn config_int_in_range(value: Option<&str>) -> Option<u32> {
+    let parsed = sley_config::parse_config_int(value?)?;
+    (0..=9).contains(&parsed).then_some(parsed as u32)
+}
+
 /// A single positional path passed to `update-index`, together with the
 /// *mode* that was active at the point the path was seen on the command line.
 ///
@@ -1761,6 +1837,49 @@ fn replace_index_entries_with_entry(entries: &mut Vec<IndexEntry>, entry: IndexE
     }
 }
 
+fn write_index_blob_object(
+    odb: &FileObjectDatabase,
+    format: ObjectFormat,
+    object: EncodedObject,
+    large_policy: LargeObjectPolicy,
+    pending_large: &mut Vec<(ObjectId, EncodedObject)>,
+) -> Result<ObjectId> {
+    let oid = object.object_id(format)?;
+    if object.object_type == ObjectType::Blob && object.body.len() as u64 >= large_policy.threshold
+    {
+        if !odb.contains(&oid)? {
+            pending_large.push((oid, object));
+        }
+        return Ok(oid);
+    }
+    odb.write_object(object)
+}
+
+fn write_pending_large_blobs(
+    odb: &FileObjectDatabase,
+    objects: &[(ObjectId, EncodedObject)],
+    policy: LargeObjectPolicy,
+) -> Result<()> {
+    let Some(limit) = policy.pack_size_limit else {
+        return odb.write_blobs_as_pack(objects, policy.compression_level);
+    };
+    let mut start = 0usize;
+    let mut current_size = 0u64;
+    for (idx, (_, object)) in objects.iter().enumerate() {
+        let estimate = object.body.len() as u64 + 32;
+        if idx > start && current_size.saturating_add(estimate) > limit {
+            odb.write_blobs_as_pack(&objects[start..idx], policy.compression_level)?;
+            start = idx;
+            current_size = 0;
+        }
+        current_size = current_size.saturating_add(estimate);
+    }
+    if start < objects.len() {
+        odb.write_blobs_as_pack(&objects[start..], policy.compression_level)?;
+    }
+    Ok(())
+}
+
 fn update_index_paths_impl(
     worktree_root: &Path,
     git_dir: &Path,
@@ -1772,6 +1891,15 @@ fn update_index_paths_impl(
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut large_policy = LargeObjectPolicy::from_config(git_dir, None)?;
+    if let Some(config) = clean_config {
+        large_policy.compression_level = pack_compression_level(config);
+        large_policy.pack_size_limit = config
+            .get("pack", None, "packSizeLimit")
+            .and_then(sley_config::parse_config_int)
+            .and_then(|value| (value > 0).then_some(value as u64))
+            .or(large_policy.pack_size_limit);
+    }
     let trust_filemode = clean_config
         .map(trust_executable_bit)
         .unwrap_or_else(|| trust_executable_bit_from_git_dir(git_dir, None));
@@ -1804,6 +1932,7 @@ fn update_index_paths_impl(
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
     let mut untracked_cache_invalidation_paths = Vec::new();
+    let mut pending_large = Vec::new();
     let mut chmod_error = false;
     for update_path in paths {
         let path = &update_path.path;
@@ -2001,7 +2130,7 @@ fn update_index_paths_impl(
         let oid = if path_mode.info_only {
             object.object_id(format)?
         } else {
-            odb.write_object(object)?
+            write_index_blob_object(&odb, format, object, large_policy, &mut pending_large)?
         };
         let mut entry = index_entry_from_metadata_with_filemode(
             git_path.clone(),
@@ -2058,6 +2187,9 @@ fn update_index_paths_impl(
         format,
         &untracked_cache_invalidation_paths,
     )?;
+    if !pending_large.is_empty() {
+        write_pending_large_blobs(&odb, &pending_large, large_policy)?;
+    }
     write_repository_index_ref(git_dir, format, &index)?;
     if verbose {
         let mut stdout = std::io::stdout().lock();
