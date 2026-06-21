@@ -118,6 +118,9 @@ pub struct CloneOptions<'a> {
     pub branch_explicit: bool,
     /// Destination repository ref storage format.
     pub ref_storage: RefStorageFormat,
+    /// SSH command-line shape for the clone's internal fetch, used for
+    /// clone-only flags like `-4`/`-6`.
+    pub ssh_options: Option<crate::ssh::SshTransportOptions>,
 }
 
 /// The structured result of a [`clone`].
@@ -244,6 +247,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         request.options.deepen_not.clone(),
         request.options.filter.clone(),
         !request.options.checkout,
+        request.options.ssh_options,
     );
     fetch(
         crate::fetch::FetchRequest {
@@ -492,6 +496,7 @@ fn clone_fetch_options(
     deepen_not: Vec<String>,
     filter: Option<sley_odb::PackObjectFilter>,
     record_promisor_refs: bool,
+    ssh_options: Option<crate::ssh::SshTransportOptions>,
 ) -> FetchOptions {
     FetchOptions {
         quiet: true,
@@ -514,5 +519,6 @@ fn clone_fetch_options(
         update_head_ok: false,
         deepen_since,
         deepen_not,
+        ssh_options,
     }
 }

@@ -872,6 +872,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     write_upload_pack_negotiation_request(&mut encoded_negotiation, &negotiation)?;
     let decoded_negotiation =
         read_upload_pack_negotiation_request(format, &mut encoded_negotiation.as_slice())?;
+    sley_core::trace2::data("negotiation_v2", "total_rounds", 1);
 
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
     for want in &decoded_request.wants {

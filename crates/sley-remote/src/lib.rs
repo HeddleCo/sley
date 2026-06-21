@@ -45,8 +45,9 @@ pub use http::{
 
 mod ssh;
 pub use ssh::{
-    SshFetchPackRequest, install_fetch_pack_via_ssh_upload_pack, ssh_program,
-    ssh_upload_pack_advertisements, ssh_upload_pack_fetch_response,
+    SshFetchPackRequest, SshTransportOptions, install_fetch_pack_via_ssh_upload_pack, ssh_program,
+    ssh_transport_options_from_config, ssh_upload_pack_advertisements,
+    ssh_upload_pack_advertisements_with_options, ssh_upload_pack_fetch_response,
     ssh_upload_pack_shallow_fetch_response,
 };
 
@@ -275,6 +276,7 @@ mod tests {
             update_head_ok: false,
             deepen_since: None,
             deepen_not: Vec::new(),
+            ssh_options: None,
         }
     }
 
@@ -561,6 +563,7 @@ mod tests {
             // branch was explicitly requested (a missing remote tip is a hard error).
             branch_explicit: true,
             ref_storage: sley_formats::RefStorageFormat::Files,
+            ssh_options: None,
         };
         let mut clone_credentials = NoCredentials;
         let mut progress = SilentProgress;
