@@ -3749,11 +3749,12 @@ fn verify_merge_uptodate(
     let conflicted_gitlinks: BTreeSet<Vec<u8>> = results
         .iter()
         .filter_map(|(path, result)| match result {
-            MergePathResult::Conflict { base, ours, theirs, .. }
-                if base
-                    .or(*ours)
-                    .or(*theirs)
-                    .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
+            MergePathResult::Conflict {
+                base, ours, theirs, ..
+            } if base
+                .or(*ours)
+                .or(*theirs)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
             {
                 Some(path.clone())
             }
@@ -3763,12 +3764,11 @@ fn verify_merge_uptodate(
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
-        let gitlink_worktree_status_is_safe =
-            (conflicted_gitlinks.contains(&entry.path)
-                || ours_map
-                    .get(&entry.path)
-                    .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode)))
-                && changed.contains(&entry.path);
+        let gitlink_worktree_status_is_safe = (conflicted_gitlinks.contains(&entry.path)
+            || ours_map
+                .get(&entry.path)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode)))
+            && changed.contains(&entry.path);
         if entry.index == b'?'
             && entry.worktree == b'?'
             && changed.contains(&entry.path)

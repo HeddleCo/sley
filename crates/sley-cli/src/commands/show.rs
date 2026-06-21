@@ -1808,9 +1808,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 };
             }
             "--word-diff-regex" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--word-diff-regex requires a value".into()))?;
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--word-diff-regex requires a value".into())
+                })?;
                 options.word_diff_regex = Some(value.clone());
                 if options.word_diff_mode.is_none() {
                     options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
@@ -1863,10 +1863,11 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--root" => options.show_root = Some(true),
             "--no-root" => options.show_root = Some(false),
             value if value.starts_with("--color=") => {}
-            value if value.starts_with("--color-moved=")
-                || value.starts_with("--color-moved-ws=")
-                || value.starts_with("--no-color-moved=")
-                || value.starts_with("--no-color-moved-ws=") => {}
+            value
+                if value.starts_with("--color-moved=")
+                    || value.starts_with("--color-moved-ws=")
+                    || value.starts_with("--no-color-moved=")
+                    || value.starts_with("--no-color-moved-ws=") => {}
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
                     "unsupported show option {value}"

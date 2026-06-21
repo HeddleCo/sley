@@ -684,7 +684,11 @@ fn resolve_revision_commitish_with_config_optional<R: ObjectReader>(
     resolve_revision_with_config_optional(git_dir, format, reader, rev, config)
 }
 
-fn read_commit<R: ObjectReader>(reader: &R, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
+fn read_commit<R: ObjectReader>(
+    reader: &R,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Commit> {
     let object = reader.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(

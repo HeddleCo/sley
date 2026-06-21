@@ -743,8 +743,7 @@ where
                     force_include,
                     context.convert,
                     matched,
-                )
-                {
+                ) {
                     continue;
                 }
                 // export-ignore on a file omits it (git checks the attribute on
@@ -918,7 +917,10 @@ struct ArchiveTreeSelection {
     full_subtree: bool,
 }
 
-fn archive_tree_selection(relative_path: &[u8], pathspecs: &[ArchivePathspec]) -> ArchiveTreeSelection {
+fn archive_tree_selection(
+    relative_path: &[u8],
+    pathspecs: &[ArchivePathspec],
+) -> ArchiveTreeSelection {
     if pathspecs.is_empty() {
         return ArchiveTreeSelection {
             descend: true,

@@ -16745,9 +16745,7 @@ fn trust_executable_bit_from_git_dir(git_dir: &Path, config_parameters_env: Opti
 }
 
 fn trust_executable_bit(config: &GitConfig) -> bool {
-    config
-        .get_bool("core", None, "filemode")
-        .unwrap_or(true)
+    config.get_bool("core", None, "filemode").unwrap_or(true)
 }
 
 fn trust_symlinks_from_git_dir(git_dir: &Path, config_parameters_env: Option<&str>) -> bool {
@@ -16759,9 +16757,7 @@ fn trust_symlinks_from_git_dir(git_dir: &Path, config_parameters_env: Option<&st
 }
 
 fn trust_symlinks(config: &GitConfig) -> bool {
-    config
-        .get_bool("core", None, "symlinks")
-        .unwrap_or(true)
+    config.get_bool("core", None, "symlinks").unwrap_or(true)
 }
 
 fn preferred_unmerged_mode_for_untrusted_worktree(

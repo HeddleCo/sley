@@ -1659,7 +1659,8 @@ fn mark_color_as_moved(tagged: &[TaggedLine<'_>], color_moved: ColorMoved) -> Ve
         );
 
         if pmb.is_empty() {
-            let contiguous = adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length);
+            let contiguous =
+                adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length);
             if !contiguous && block_length > 1 {
                 n -= block_length;
             } else {

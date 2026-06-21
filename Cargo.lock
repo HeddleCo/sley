@@ -1128,6 +1128,8 @@ dependencies = [
  "sley-odb",
  "sley-pack",
  "sley-refs",
+ "sley-rev",
+ "sley-worktree",
 ]
 
 [[package]]

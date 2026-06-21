@@ -31,6 +31,17 @@ fn run_with_committer(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
+fn run_with_bench_committer(program: &str, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(program)
+        .current_dir(cwd)
+        .env("GIT_COMMITTER_NAME", "Sley Bench")
+        .env("GIT_COMMITTER_EMAIL", "sley-bench@example.com")
+        .env("GIT_COMMITTER_DATE", "1111111111 +0000")
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
 fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = run(program, cwd, args);
     assert!(
@@ -496,6 +507,49 @@ fn reflog_write_matches_upstream_git() {
 
             let expected = run_with_committer(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run_with_committer(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
+            assert_eq!(
+                reflog_files(&actual),
+                reflog_files(&upstream),
+                "reflog files differed after {args:?}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn branch_force_reflog_matches_upstream_git() {
+    let root = unique_temp_dir("branch-force-reflog");
+    {
+        let upstream = root.join("upstream");
+        let actual = root.join("actual");
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        run_success(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success_with_identity_at(
+            &upstream,
+            &["commit", "--allow-empty", "-qm", "one"],
+            "@1700000000 +0000",
+        );
+        run_success_with_identity_at(
+            &upstream,
+            &["commit", "--allow-empty", "-qm", "two"],
+            "@1700000010 +0000",
+        );
+        copy_dir_all(&upstream, &actual);
+
+        for args in [
+            vec!["branch", "-f", "sley-bench-write", "HEAD"],
+            vec!["branch", "-f", "sley-bench-write", "HEAD~1"],
+            vec!["branch", "-f", "sley-bench-write", "HEAD~1"],
+        ] {
+            let expected = run_with_bench_committer(sley_testkit::oracle_git(), &upstream, &args);
+            let actual_output =
+                run_with_bench_committer(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected, &args);
             assert_eq!(
                 reflog_files(&actual),

@@ -69,7 +69,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             "--remote" => {
                 remote = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("archive --remote requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("archive --remote requires a value".into())
+                        })?
                         .clone(),
                 );
             }
@@ -232,7 +234,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         Some(name) => name,
         None => output
             .as_deref()
-            .and_then(|name| archive_format_from_filename_with_config(name, &config, remote.is_some()))
+            .and_then(|name| {
+                archive_format_from_filename_with_config(name, &config, remote.is_some())
+            })
             .unwrap_or_else(|| "tar".to_string()),
     };
     let filter_command = archive_filter_command(&config, &format_name, remote.is_some())?;
@@ -420,12 +424,16 @@ fn archive_config_for_list(remote: Option<&str>, cwd: &Path) -> Result<GitConfig
     read_repo_config(&git_dir)
 }
 
-fn archive_remote_git_dir(remote: &str, cwd: &Path, local_git_dir: Option<&Path>) -> Result<PathBuf> {
+fn archive_remote_git_dir(
+    remote: &str,
+    cwd: &Path,
+    local_git_dir: Option<&Path>,
+) -> Result<PathBuf> {
     let (path, base) = if archive_remote_looks_like_path(remote) {
         (PathBuf::from(remote), cwd.to_path_buf())
     } else {
-        let git_dir = local_git_dir
-            .ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
+        let git_dir =
+            local_git_dir.ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
         let config = read_repo_config(git_dir)?;
         let url = config
             .get("remote", Some(remote), "url")
@@ -434,7 +442,11 @@ fn archive_remote_git_dir(remote: &str, cwd: &Path, local_git_dir: Option<&Path>
             .unwrap_or_else(|| git_dir.to_path_buf());
         (PathBuf::from(url), base)
     };
-    let repo = if path.is_absolute() { path } else { base.join(path) };
+    let repo = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
     discover_git_dir(&repo)
 }
 
@@ -507,7 +519,11 @@ fn archive_list_formats(config: &GitConfig, is_remote: bool) -> Vec<String> {
         if !has_command {
             continue;
         }
-        if is_remote && !config.get_bool("tar", Some(name), "remote").unwrap_or(false) {
+        if is_remote
+            && !config
+                .get_bool("tar", Some(name), "remote")
+                .unwrap_or(false)
+        {
             continue;
         }
         if !formats.iter().any(|format| format == name) {
@@ -670,7 +686,9 @@ fn handle_archive_result(result: Result<()>) -> Result<()> {
             eprintln!("fatal: {message}");
             Err(GitError::Exit(128))
         }
-        Err(GitError::InvalidPath(message)) if message.contains("outside the current directory") => {
+        Err(GitError::InvalidPath(message))
+            if message.contains("outside the current directory") =>
+        {
             eprintln!("fatal: {message}");
             Err(GitError::Exit(128))
         }
@@ -2640,9 +2658,11 @@ fn ignored_missing_add_pathspec(
     if git_path.is_empty() {
         return Ok(None);
     }
-    Ok(sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
-        .filter(|ignore_match| ignore_match.ignored)
-        .map(|_| git_path))
+    Ok(
+        sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+            .filter(|ignore_match| ignore_match.ignored)
+            .map(|_| git_path),
+    )
 }
 
 fn worktree_path_from_git_path(worktree_root: &Path, git_path: &[u8]) -> Result<PathBuf> {
@@ -3125,9 +3145,9 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
                 if value.starts_with('-')
                     && !value.starts_with("--")
                     && value.len() > 2
-                    && value[1..]
-                        .bytes()
-                        .all(|byte| matches!(byte, b'f' | b'd' | b'n' | b'q' | b'x' | b'X' | b'i')) =>
+                    && value[1..].bytes().all(|byte| {
+                        matches!(byte, b'f' | b'd' | b'n' | b'q' | b'x' | b'X' | b'i')
+                    }) =>
             {
                 for byte in value[1..].bytes() {
                     match byte {
@@ -3233,8 +3253,14 @@ enum CleanIgnoreMode {
 fn print_clean_interactive_stub() -> Result<()> {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "*** Commands ***")?;
-    writeln!(stdout, "    1: clean                2: filter by pattern    3: select by numbers")?;
-    writeln!(stdout, "    4: ask each             5: quit                 6: help")?;
+    writeln!(
+        stdout,
+        "    1: clean                2: filter by pattern    3: select by numbers"
+    )?;
+    writeln!(
+        stdout,
+        "    4: ask each             5: quit                 6: help"
+    )?;
     stdout.flush()?;
     Ok(())
 }
@@ -3250,7 +3276,11 @@ fn clean_trace2_directories_visited(value: usize) {
     let line = format!(
         "19:00:00.000000 file.c:1 | d0 | main | data | r1 | ? | ? | read_directory | ..directories-visited:{value}\n"
     );
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&target) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -3630,7 +3660,9 @@ fn parse_apply_octal(bytes: &[u8]) -> Option<u32> {
 }
 
 fn split_once_bytes<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
-    let pos = bytes.windows(needle.len()).position(|window| window == needle)?;
+    let pos = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)?;
     Some((&bytes[..pos], &bytes[pos + needle.len()..]))
 }
 

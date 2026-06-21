@@ -7780,14 +7780,7 @@ fn create_branch_from_start_with_reflog(
     }
     let start_rev = start.map_or("HEAD", String::as_str);
     let start_oid = resolve_branch_start(git_dir, format, store, start_rev)?;
-    let message = match start {
-        Some(start) => format!("branch: Created from {start}").into_bytes(),
-        None => format!(
-            "branch: Created from {}",
-            store.current_branch()?.unwrap_or_else(|| "HEAD".into())
-        )
-        .into_bytes(),
-    };
+    let message = branch_create_reflog_message(store, start)?;
     let reflog = if branch_should_write_reflog(git_dir, &refname, create_reflog)? {
         Some(ReflogEntry {
             old_oid: ObjectId::null(format),
@@ -7827,6 +7820,22 @@ fn branch_should_write_reflog(git_dir: &Path, name: &str, create_reflog: bool) -
         return Ok(false);
     }
     Ok(branch_log_all_ref_updates_matches(name, "true"))
+}
+
+fn branch_create_reflog_message(store: &FileRefStore, start: Option<&String>) -> Result<Vec<u8>> {
+    let display = match start {
+        Some(start) => start.clone(),
+        None => store.current_branch()?.unwrap_or_else(|| "HEAD".into()),
+    };
+    Ok(format!("branch: Created from {display}").into_bytes())
+}
+
+fn branch_reset_reflog_message(store: &FileRefStore, start: Option<&String>) -> Result<Vec<u8>> {
+    let display = match start {
+        Some(start) => start.clone(),
+        None => store.current_branch()?.unwrap_or_else(|| "HEAD".into()),
+    };
+    Ok(format!("branch: Reset to {display}").into_bytes())
 }
 
 fn branch_reflog_path(git_dir: &Path, name: &str) -> Result<PathBuf> {
@@ -8090,28 +8099,39 @@ fn force_update_branch(
         );
         return Err(GitError::Exit(128));
     }
-    let start = start.map_or("HEAD", String::as_str);
-    let new_oid = resolve_branch_start(git_dir, format, store, start)?;
-    let old_oid = match store.read_ref(&name)? {
-        Some(RefTarget::Direct(oid)) => oid,
-        _ => zero_oid(format)?,
-    };
-    let message = if old_oid == zero_oid(format)? {
-        format!("branch: Created from {start}")
-    } else {
-        format!("branch: Reset to {start}")
+    let start_rev = start.map_or("HEAD", String::as_str);
+    let new_oid = resolve_branch_start(git_dir, format, store, start_rev)?;
+    let previous = store.read_ref(&name)?;
+    let reflog = match previous {
+        Some(RefTarget::Direct(old_oid)) if old_oid == new_oid => None,
+        Some(RefTarget::Direct(old_oid)) if branch_should_write_reflog(git_dir, &name, false)? => {
+            Some(ReflogEntry {
+                old_oid,
+                new_oid,
+                committer: commit_identity_from_env("COMMITTER")?,
+                message: branch_reset_reflog_message(store, start)?,
+            })
+        }
+        Some(_) if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
+            old_oid: zero_oid(format)?,
+            new_oid,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message: branch_reset_reflog_message(store, start)?,
+        }),
+        None if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
+            old_oid: ObjectId::null(format),
+            new_oid,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message: branch_create_reflog_message(store, start)?,
+        }),
+        _ => None,
     };
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name,
         expected: None,
         new: RefTarget::Direct(new_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
-            message: message.into_bytes(),
-        }),
+        reflog,
     });
     tx.commit()
 }

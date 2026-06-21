@@ -1307,9 +1307,8 @@ fn resolve_upstream_ref(
 ) -> Result<UpstreamRef> {
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let branch = if base.is_empty() {
-        refs.current_branch()?.ok_or_else(|| {
-            GitError::InvalidFormat("HEAD does not point to a branch".to_string())
-        })?
+        refs.current_branch()?
+            .ok_or_else(|| GitError::InvalidFormat("HEAD does not point to a branch".to_string()))?
     } else if base.starts_with("refs/") {
         return Err(GitError::InvalidFormat(format!(
             "{base} is not a branch, cannot resolve {rev}"
@@ -1317,10 +1316,7 @@ fn resolve_upstream_ref(
     } else {
         base.to_string()
     };
-    if refs
-        .read_ref(&format!("refs/heads/{branch}"))?
-        .is_none()
-    {
+    if refs.read_ref(&format!("refs/heads/{branch}"))?.is_none() {
         return Err(GitError::not_found(format!("no such branch: '{branch}'")));
     }
 
@@ -4347,10 +4343,7 @@ fn simplify_merges_pass(
             return false;
         }
         let mut seen: HashSet<ObjectId> = HashSet::new();
-        let mut stack: Vec<ObjectId> = real_parents
-            .get(desc)
-            .cloned()
-            .unwrap_or_default();
+        let mut stack: Vec<ObjectId> = real_parents.get(desc).cloned().unwrap_or_default();
         while let Some(oid) = stack.pop() {
             if oid == *anc {
                 return true;

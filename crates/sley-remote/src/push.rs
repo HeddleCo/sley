@@ -1006,7 +1006,12 @@ pub fn push_local_with_report(
             && !plan.command.new_id.is_null()
             && (stale_lease_overridden
                 || if plan.command.name.starts_with("refs/heads/") {
-                    !is_fast_forward(&local_db, format, &plan.command.old_id, &plan.command.new_id)?
+                    !is_fast_forward(
+                        &local_db,
+                        format,
+                        &plan.command.old_id,
+                        &plan.command.new_id,
+                    )?
                 } else {
                     plan.force
                 });
@@ -1266,11 +1271,7 @@ fn receive_ref_is_hidden(
     ref_is_hidden_by_patterns(refname, &hide_refs)
 }
 
-fn hidden_ref_values(
-    config: &GitConfig,
-    section: &str,
-    subsection: Option<&str>,
-) -> Vec<String> {
+fn hidden_ref_values(config: &GitConfig, section: &str, subsection: Option<&str>) -> Vec<String> {
     config
         .get_all(section, subsection, "hiderefs")
         .into_iter()
@@ -1306,10 +1307,7 @@ fn hidden_ref_pattern_matches(refname: &str, pattern: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-fn lease_expectation_mismatch(
-    request: &PushReportRequest<'_>,
-    plan: &PlannedPushCommand,
-) -> bool {
+fn lease_expectation_mismatch(request: &PushReportRequest<'_>, plan: &PlannedPushCommand) -> bool {
     let command = &plan.command;
     let actual = if command.old_id.is_null() {
         None

@@ -671,19 +671,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 force,
                 commit_identity_from_env("COMMITTER")?,
             )?;
-            let tracking_start = positional
-                .first()
-                .map(|start| {
-                    if start.contains("@{") {
-                        sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, start)
-                            .ok()
-                            .flatten()
-                            .or_else(|| checkout_tracking_start_ref(&store, start))
-                            .unwrap_or_else(|| start.clone())
-                    } else {
-                        checkout_tracking_start_ref(&store, start).unwrap_or_else(|| start.clone())
-                    }
-                });
+            let tracking_start = positional.first().map(|start| {
+                if start.contains("@{") {
+                    sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, start)
+                        .ok()
+                        .flatten()
+                        .or_else(|| checkout_tracking_start_ref(&store, start))
+                        .unwrap_or_else(|| start.clone())
+                } else {
+                    checkout_tracking_start_ref(&store, start).unwrap_or_else(|| start.clone())
+                }
+            });
             crate::commands::branch::branch_create_set_tracking(
                 &git_dir,
                 &store,
@@ -808,8 +806,14 @@ fn checkout_index_has_path(
         GitError::InvalidPath(format!("path {} is outside worktree", absolute.display()))
     })?;
     let git_path = relative.to_string_lossy().replace('\\', "/").into_bytes();
-    Ok(sley_worktree::read_repository_index(git_dir, format)?
-        .is_some_and(|index| index.entries.iter().any(|entry| entry.path.as_bytes() == git_path)))
+    Ok(
+        sley_worktree::read_repository_index(git_dir, format)?.is_some_and(|index| {
+            index
+                .entries
+                .iter()
+                .any(|entry| entry.path.as_bytes() == git_path)
+        }),
+    )
 }
 
 fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflictStyle> {

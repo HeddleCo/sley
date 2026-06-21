@@ -3003,7 +3003,9 @@ pub(crate) fn write_diff_patch_entry(
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         ws_error,
-        color_moved: colors.and(options.color_moved).filter(|_| word_diff.is_none()),
+        color_moved: colors
+            .and(options.color_moved)
+            .filter(|_| word_diff.is_none()),
         ws_ignore: options.ws_ignore,
         algorithm: options.diff_algorithm,
         indent_heuristic: options.indent_heuristic,

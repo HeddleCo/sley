@@ -12,20 +12,20 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest,
-    ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand,
-    ReceivePackFeatures, ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest, build_receive_pack_push_request, demux_protocol_v2_fetch_packfile,
+    GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
+    ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
+    ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
+    build_receive_pack_push_request, demux_protocol_v2_fetch_packfile,
     parse_protocol_v2_fetch_features, parse_receive_pack_features, parse_refspec,
-    parse_upload_pack_features, plan_push_commands, protocol_v2_ls_refs_records_to_ref_advertisement_set,
-    protocol_v2_object_format, read_protocol_v2_advertisement,
-    read_protocol_v2_fetch_response, read_protocol_v2_ls_refs_response,
-    read_receive_pack_report_status, read_ref_advertisement_set,
-    read_upload_pack_raw_packfile_response, read_upload_pack_shallow_info_and_raw_packfile_response,
-    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
-    write_receive_pack_push_request, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    parse_upload_pack_features, plan_push_commands,
+    protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
+    read_protocol_v2_advertisement, read_protocol_v2_fetch_response,
+    read_protocol_v2_ls_refs_response, read_receive_pack_report_status, read_ref_advertisement_set,
+    read_upload_pack_raw_packfile_response,
+    read_upload_pack_shallow_info_and_raw_packfile_response, write_protocol_v2_command_request,
+    write_protocol_v2_fetch_request, write_receive_pack_push_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
 use sley_transport::{RemoteTransport, RemoteUrl, ServiceRequest, write_service_request};
@@ -148,7 +148,8 @@ pub fn git_upload_pack_advertisements_with_protocol(
     protocol_v2: bool,
 ) -> Result<GitUploadPackAdvertisements> {
     if protocol_v2 {
-        let mut stream = connect_git_service(remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
+        let mut stream =
+            connect_git_service(remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
         let handshake = read_protocol_v2_advertisement(&mut stream)?;
         let object_format = protocol_v2_object_format(&handshake.capabilities)?;
         if object_format != format {
@@ -496,8 +497,12 @@ fn git_protocol_v2_command_options(format: ObjectFormat) -> Vec<Capability> {
     .unwrap_or_default()
 }
 
-fn git_protocol_v2_ls_refs(remote: &RemoteUrl, format: ObjectFormat) -> Result<sley_protocol::RefAdvertisementSet> {
-    let mut stream = connect_git_service(remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
+fn git_protocol_v2_ls_refs(
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+) -> Result<sley_protocol::RefAdvertisementSet> {
+    let mut stream =
+        connect_git_service(remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
     let handshake = read_protocol_v2_advertisement(&mut stream)?;
     let object_format = protocol_v2_object_format(&handshake.capabilities)?;
     if object_format != format {
@@ -518,11 +523,7 @@ fn git_protocol_v2_ls_refs_on_stream(
         peel: true,
         symrefs: true,
         unborn: true,
-        ref_prefixes: vec![
-            "HEAD".into(),
-            "refs/heads/".into(),
-            "refs/tags/".into(),
-        ],
+        ref_prefixes: vec!["HEAD".into(), "refs/heads/".into(), "refs/tags/".into()],
     }
     .to_command_request()?;
     request.capabilities = git_protocol_v2_command_options(format);
@@ -555,11 +556,18 @@ fn upload_pack_features_from_v2(
 fn git_protocol_v2_fetch_response(
     request: &GitFetchPackRequest<'_>,
     haves: Vec<ObjectId>,
-) -> Result<(Vec<ProtocolV2FetchShallowInfo>, UploadPackRawPackfileResponse)> {
-    let mut stream =
-        connect_git_service(request.remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
+    let mut stream = connect_git_service(
+        request.remote,
+        GitService::UploadPack,
+        Some(ProtocolVersion::V2),
+    )?;
     let handshake = read_protocol_v2_advertisement(&mut stream)?;
-    let v2_features = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
+    let v2_features =
+        parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
     let fetch = ProtocolV2FetchRequest {
         wants: request.wants.clone(),
         haves,

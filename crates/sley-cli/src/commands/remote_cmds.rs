@@ -1359,13 +1359,11 @@ fn clone_network_repository(
         trace_configured_local_protocol_version(None);
     }
     let (advertisements, features) = match transport {
-        CloneNetworkTransport::Ssh => {
-            sley_remote::ssh_upload_pack_advertisements_with_options(
-                &remote,
-                ObjectFormat::Sha1,
-                options.ssh_options,
-            )?
-        }
+        CloneNetworkTransport::Ssh => sley_remote::ssh_upload_pack_advertisements_with_options(
+            &remote,
+            ObjectFormat::Sha1,
+            options.ssh_options,
+        )?,
         CloneNetworkTransport::Git => {
             let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
                 &remote,
@@ -4979,7 +4977,9 @@ fn trace_protocol_v2_upload_pack_capabilities(git_dir: &Path, format: ObjectForm
     fetch.push('\n');
     sley_protocol::trace_packet_read_payload(fetch.as_bytes());
     sley_protocol::trace_packet_read_payload(b"server-option\n");
-    sley_protocol::trace_packet_read_payload(format!("object-format={}\n", format.name()).as_bytes());
+    sley_protocol::trace_packet_read_payload(
+        format!("object-format={}\n", format.name()).as_bytes(),
+    );
     sley_protocol::trace_packet_read_payload(b"0000");
 }
 
@@ -6076,8 +6076,16 @@ fn run_local_receive_pre_hooks_report(
 
 fn receive_update_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
     let mut ordered = Vec::with_capacity(push_commands.len());
-    ordered.extend(push_commands.iter().filter(|command| command.new_id.is_null()));
-    ordered.extend(push_commands.iter().filter(|command| !command.new_id.is_null()));
+    ordered.extend(
+        push_commands
+            .iter()
+            .filter(|command| command.new_id.is_null()),
+    );
+    ordered.extend(
+        push_commands
+            .iter()
+            .filter(|command| !command.new_id.is_null()),
+    );
     ordered
 }
 
@@ -6155,7 +6163,11 @@ fn receive_stream_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&Recei
         .filter(|command| !command.old_id.is_null())
         .collect::<Vec<_>>();
     existing.sort_by(|left, right| left.name.cmp(&right.name));
-    existing.extend(push_commands.iter().filter(|command| command.old_id.is_null()));
+    existing.extend(
+        push_commands
+            .iter()
+            .filter(|command| command.old_id.is_null()),
+    );
     existing
 }
 
@@ -6737,8 +6749,7 @@ pub(crate) fn fetch_local_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, &[])
-        .map(|_| ())
+    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, &[]).map(|_| ())
 }
 
 fn fetch_local_repository_with_outcome(

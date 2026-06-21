@@ -14,6 +14,8 @@ sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
 sley-pack = { path = "../sley-pack" }
 sley-refs = { path = "../sley-refs" }
+sley-rev = { path = "../sley-rev" }
+sley-worktree = { path = "../sley-worktree" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

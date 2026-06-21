@@ -272,7 +272,10 @@ fn expand_remote_ext_arg(input: &str, service: &str, service_noprefix: &str) -> 
     Ok(out)
 }
 
-fn ssh_command_variant(program: &str, config_variant: Option<SshCommandVariant>) -> SshCommandVariant {
+fn ssh_command_variant(
+    program: &str,
+    config_variant: Option<SshCommandVariant>,
+) -> SshCommandVariant {
     if let Ok(variant) = env::var("GIT_SSH_VARIANT") {
         return match variant.as_str() {
             "auto" => detect_ssh_command_variant(program),
@@ -327,7 +330,10 @@ fn ssh_program_and_prefix_args() -> Result<(String, Vec<String>)> {
         };
         return Ok((program.clone(), args.to_vec()));
     }
-    Ok((env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into()), Vec::new()))
+    Ok((
+        env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into()),
+        Vec::new(),
+    ))
 }
 
 fn split_shell_words(command: &str) -> Result<Vec<String>> {
@@ -484,15 +490,14 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let (child, stdin, mut stdout) =
-        spawn_service_process(
-            remote,
-            GitService::ReceivePack,
-            true,
-            SshTransportOptions::default(),
-        )?;
-    let stdin = stdin
-        .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
+    let (child, stdin, mut stdout) = spawn_service_process(
+        remote,
+        GitService::ReceivePack,
+        true,
+        SshTransportOptions::default(),
+    )?;
+    let stdin =
+        stdin.ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
     let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
     let features = advertisement_set
@@ -574,15 +579,14 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let (child, stdin, mut stdout) =
-        spawn_service_process(
-            remote,
-            GitService::ReceivePack,
-            true,
-            SshTransportOptions::default(),
-        )?;
-    let stdin = stdin
-        .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
+    let (child, stdin, mut stdout) = spawn_service_process(
+        remote,
+        GitService::ReceivePack,
+        true,
+        SshTransportOptions::default(),
+    )?;
+    let stdin =
+        stdin.ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
     let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
     let features = advertisement_set
@@ -722,13 +726,12 @@ pub(crate) fn ls_remote_ssh(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let (child, _stdin, mut stdout) =
-        spawn_service_process(
-            remote,
-            GitService::UploadPack,
-            false,
-            SshTransportOptions::default(),
-        )?;
+    let (child, _stdin, mut stdout) = spawn_service_process(
+        remote,
+        GitService::UploadPack,
+        false,
+        SshTransportOptions::default(),
+    )?;
     let set_result = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout);
     let output = child.wait_with_output()?;
     let set = match set_result {
@@ -845,23 +848,23 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
     // a plain fetch must use the non-shallow reader (the response starts straight
     // at the NAK/ACK), preserving the existing SSH wire handling exactly.
     let (shallow_info, response) = if request.deepen.is_some() {
-            ssh_upload_pack_shallow_fetch_response(
-                request.remote,
-                request.format,
-                request.features,
-                upload_request,
-                haves,
-                request.command_options,
-            )?
-        } else {
-            let response = ssh_upload_pack_fetch_response(
-                request.remote,
-                request.format,
-                request.features,
-                upload_request,
-                haves,
-                request.command_options,
-            )?;
+        ssh_upload_pack_shallow_fetch_response(
+            request.remote,
+            request.format,
+            request.features,
+            upload_request,
+            haves,
+            request.command_options,
+        )?
+    } else {
+        let response = ssh_upload_pack_fetch_response(
+            request.remote,
+            request.format,
+            request.features,
+            upload_request,
+            haves,
+            request.command_options,
+        )?;
         (Vec::new(), response)
     };
     if request.promisor {
@@ -908,7 +911,10 @@ pub fn ssh_upload_pack_advertisements_with_options(
     format: ObjectFormat,
     options: SshTransportOptions,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
+    if !matches!(
+        remote.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
@@ -998,8 +1004,8 @@ fn ssh_upload_pack_fetch_response_inner(
     }
     let (child, stdin, mut stdout) =
         spawn_service_process(remote, GitService::UploadPack, true, options)?;
-    let mut stdin = stdin
-        .ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
+    let mut stdin =
+        stdin.ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
 
     read_ref_advertisement_set(format, &mut stdout)?;
     write_upload_pack_request(&mut stdin, Some(&request))?;

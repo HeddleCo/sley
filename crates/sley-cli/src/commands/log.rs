@@ -3230,7 +3230,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         let prefix_width =
                             log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
                         if let Some(parent_index) = separate_parent_index {
-                            log_diff.render_parent(record, parent_index, prefix_width, &mut diff_block)?;
+                            log_diff.render_parent(
+                                record,
+                                parent_index,
+                                prefix_width,
+                                &mut diff_block,
+                            )?;
                         } else {
                             log_diff.render(record, prefix_width, &mut diff_block)?;
                         }
@@ -3302,7 +3307,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     if kind == LogDefaultKind::Fuller {
                         let author = commit_identity_mailmapped(
                             &record.commit.author,
-                            use_mailmap.then_some(&mailmap),
+                            use_mailmap.then_some(output_mailmap),
                         );
                         write!(out, "Author:     ")?;
                         out.write_all(&log_highlight_matches(
@@ -3318,7 +3323,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         )?;
                         let committer = commit_identity_mailmapped(
                             &record.commit.committer,
-                            use_mailmap.then_some(&mailmap),
+                            use_mailmap.then_some(output_mailmap),
                         );
                         write!(out, "Commit:     ")?;
                         out.write_all(&log_highlight_matches(
@@ -3335,7 +3340,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     } else {
                         let author = commit_identity_mailmapped(
                             &record.commit.author,
-                            use_mailmap.then_some(&mailmap),
+                            use_mailmap.then_some(output_mailmap),
                         );
                         write!(out, "Author: ")?;
                         out.write_all(&log_highlight_matches(
@@ -3364,12 +3369,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         ))?;
                         writeln!(out)?;
                     }
-                    if !display_notes_refs.is_empty() {
+                    if let Some((notes_store, display_notes_refs)) = display_notes.as_ref()
+                        && !display_notes_refs.is_empty()
+                    {
                         let notes = render_notes_block(
                             &git_dir,
                             format,
-                            &notes_store,
-                            &display_notes_refs,
+                            notes_store,
+                            display_notes_refs,
                             &record.oid,
                         )?;
                         out.write_all(&notes)?;
