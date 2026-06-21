@@ -437,7 +437,8 @@ declare -A FLOOR=(
     # stay zero-stat so `reset --mixed --no-refresh` is unaffected). Now DETERMINISTIC at 29
     # (stable 8x+). The flake was diff-files comparing raw vs clean-filtered bytes + stale cached stat.
     [t0020-crlf.sh]=29
-    [t0021-conversion.sh]=21
+    # wave-2 (2026-06-21): clean/smudge filter-process + ident + eol/encoding conversion ordering 21->33.
+    [t0021-conversion.sh]=33
     [t3920-crlf-messages.sh]=9
     # codex-wave-5 (2026-06-17): lib new commands — repo-info t1900 full@38 / replay t3650@43.
     [t1900-repo-info.sh]=38
@@ -469,7 +470,8 @@ declare -A FLOOR=(
     [t5310-pack-bitmaps.sh]=221
     [t5326-multi-pack-bitmaps.sh]=344
     # codex-wave-4-recovery: rev_list filters t6006 enroll@56 / t6112 enroll@48.
-    [t6006-rev-list-format.sh]=56
+    # wave-2 (2026-06-21): rev-list --format %-placeholders/%w()/%C()/trailers 56->77 (guard t4202-log held=131).
+    [t6006-rev-list-format.sh]=77
     [t6112-rev-list-filters-objects.sh]=48
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
@@ -605,7 +607,8 @@ declare -A FLOOR=(
     # side gain t5516-fetch-push 63->72. remote/tracking floors held t5505=126
     # t5520=38 t6040=44 t3200=134.
     [t5528-push-default.sh]=31
-    [t5516-fetch-push.sh]=92
+    # wave-2 (2026-06-21): push refmaps/forced-tag-status/denyDeleteCurrent/non-commit-reject 92->99 (guards t5510/t5601 held).
+    [t5516-fetch-push.sh]=99
     [t5520-pull.sh]=75
     [t5601-clone.sh]=86
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
