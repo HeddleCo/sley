@@ -1269,9 +1269,8 @@ pub fn nth_prior_checkout_branch_name(
 fn checkout_move_source(message: &[u8]) -> Option<&str> {
     let message = std::str::from_utf8(message).ok()?;
     let rest = message.strip_prefix("checkout: moving from ")?;
-    // The remainder is "X to Y"; split on the last " to " so a branch named
-    // with embedded " to " still parses (git itself uses the final separator).
-    let (from, _to) = rest.rsplit_once(" to ")?;
+    // The remainder is "X to Y"; git uses the first separator when grabbing X.
+    let (from, _to) = rest.split_once(" to ")?;
     Some(from)
 }
 
