@@ -4692,9 +4692,7 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
     path: &str,
 ) -> Option<ResolvedTreePath> {
     let mut current = *tree_oid;
-    // Split on '/', skipping empty components so leading/trailing/duplicate
-    // separators ("a//b", "/a", "dir/") behave the way git's pathspec does.
-    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let components = normalize_treeish_path_components(path);
     if components.is_empty() {
         return Some(ResolvedTreePath {
             oid: current,
@@ -4734,6 +4732,19 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
         current = oid;
     }
     None
+}
+
+fn normalize_treeish_path(path: &str) -> String {
+    normalize_treeish_path_components(path).join("/")
+}
+
+fn normalize_treeish_path_components(path: &str) -> Vec<&str> {
+    // Split on '/', skipping empty and "." components so leading/trailing/
+    // duplicate separators ("a//b", "/a", "dir/") and explicit current-dir
+    // spellings ("./a", "a/./b") behave the way git's tree/index lookup does.
+    path.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
 }
 
 /// Outcome of a `--follow-symlinks` tree-path walk (upstream's
@@ -5001,6 +5012,7 @@ fn resolve_index_path(
     stage: u8,
     path: &str,
 ) -> Result<ObjectId> {
+    let normalized_path = normalize_treeish_path(path);
     let index_path = repository_index_path(git_dir);
     let bytes = match fs::read(&index_path) {
         Ok(bytes) => bytes,
@@ -5014,7 +5026,7 @@ fn resolve_index_path(
     let index = Index::parse(&bytes, format)?;
     let mut path_exists = false;
     for entry in &index.entries {
-        if entry.path != path.as_bytes() {
+        if entry.path != normalized_path.as_bytes() {
             continue;
         }
         path_exists = true;
@@ -6123,6 +6135,17 @@ mod tests {
             .expect("test operation should succeed"),
             blob
         );
+        assert_eq!(
+            resolve_rev_path(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                &commit.to_hex(),
+                "./dir/./sub/file.txt"
+            )
+            .expect("test operation should succeed"),
+            blob
+        );
         // Subtree path resolves to the subtree id.
         assert_eq!(
             resolve_rev_path(
@@ -6250,6 +6273,16 @@ mod tests {
                 ObjectFormat::Sha1,
                 &ObjectDatabase::new(ObjectFormat::Sha1),
                 ":file.txt",
+            )
+            .expect("test operation should succeed"),
+            oid_zero
+        );
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &ObjectDatabase::new(ObjectFormat::Sha1),
+                ":./file.txt",
             )
             .expect("test operation should succeed"),
             oid_zero

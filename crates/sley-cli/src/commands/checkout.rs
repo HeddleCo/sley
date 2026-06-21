@@ -1140,6 +1140,12 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     let mut parsing_options = true;
     let mut staged = false;
     let mut worktree = false;
+    let mut _quiet = false;
+    let mut ignore_unmerged = false;
+    let mut path_merge = false;
+    let mut conflict_implies_merge = false;
+    let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
+    let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
     let mut patch = false;
     let mut unified_context = false;
     let mut inter_hunk_context = false;
@@ -1162,6 +1168,31 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             "--" => parsing_options = false,
             "--worktree" | "-W" => worktree = true,
             "--staged" | "-S" => staged = true,
+            "-q" | "--quiet" => _quiet = true,
+            "--no-quiet" => _quiet = false,
+            "-m" | "--merge" => path_merge = true,
+            "--no-merge" => {
+                path_merge = false;
+                conflict_implies_merge = false;
+            }
+            "--conflict" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command("restore --conflict requires a value".into()));
+                };
+                conflict_style = Some(checkout_conflict_style(value)?);
+                conflict_implies_merge = true;
+            }
+            value if value.starts_with("--conflict=") => {
+                let value = &value["--conflict=".len()..];
+                conflict_style = Some(checkout_conflict_style(value)?);
+                conflict_implies_merge = true;
+            }
+            "--no-conflict" => {
+                conflict_style = None;
+                conflict_implies_merge = false;
+            }
+            "--ours" => checkout_stage = Some(sley_worktree::CheckoutStage::Ours),
+            "--theirs" => checkout_stage = Some(sley_worktree::CheckoutStage::Theirs),
             "-p" | "--patch" => patch = true,
             "--no-patch" => patch = false,
             "-U" => {
@@ -1203,17 +1234,15 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
-            "--quiet"
-            | "--no-quiet"
-            | "--progress"
+            "--progress"
             | "--no-progress"
             | "--overlay"
             | "--no-overlay"
-            | "--ignore-unmerged"
-            | "--no-ignore-unmerged"
             | "--ignore-skip-worktree-bits"
             | "--no-ignore-skip-worktree-bits"
             | "--no-recurse-submodules" => {}
+            "--ignore-unmerged" => ignore_unmerged = true,
+            "--no-ignore-unmerged" => ignore_unmerged = false,
             "--source" => {
                 let value = iter
                     .next()
@@ -1305,6 +1334,30 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
+    if ignore_unmerged && patch {
+        eprintln!("fatal: '--ignore-unmerged' cannot be used with updating paths");
+        return Err(GitError::Exit(128));
+    }
+    if ignore_unmerged && path_merge {
+        eprintln!("fatal: options '--ignore-unmerged' and '-m' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if staged {
+        if checkout_stage.is_some() {
+            eprintln!("fatal: '--ours' or '--theirs' cannot be used with --staged");
+            return Err(GitError::Exit(128));
+        }
+        if path_merge || conflict_implies_merge {
+            eprintln!("fatal: '--merge' or '--conflict' cannot be used with --staged");
+            return Err(GitError::Exit(128));
+        }
+    }
+    if source.is_some() && (path_merge || conflict_implies_merge || checkout_stage.is_some()) {
+        eprintln!(
+            "fatal: '--merge', '--ours', or '--theirs' cannot be used when checking out of a tree"
+        );
+        return Err(GitError::Exit(128));
+    }
     if patch {
         return Err(GitError::Unsupported(
             "restore patch selection is not implemented".into(),
@@ -1382,7 +1435,24 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             &resolved_paths,
         )?;
     } else {
-        sley_worktree::restore_worktree_paths(worktree_root, git_dir, format, &resolved_paths)?;
+        let config = read_repo_config(&git_dir)?;
+        let conflict_style = conflict_style.unwrap_or_else(|| match config.get("merge", None, "conflictstyle") {
+            Some("diff3") | Some("zdiff3") => sley_worktree::CheckoutConflictStyle::Diff3,
+            _ => sley_worktree::CheckoutConflictStyle::Merge,
+        });
+        sley_worktree::checkout_index_paths(
+            worktree_root,
+            &git_dir,
+            format,
+            &resolved_paths,
+            sley_worktree::CheckoutIndexPathOptions {
+                force: ignore_unmerged,
+                merge: path_merge || conflict_implies_merge,
+                stage: checkout_stage,
+                conflict_style,
+                smudge_config: Some(&config),
+            },
+        )?;
     }
     Ok(())
 }
