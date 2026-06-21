@@ -165,6 +165,8 @@ jobs:
             t2407-worktree-heads.sh
             t4204-patch-id.sh
             t2501-cwd-empty.sh
+            t8003-blame-corner-cases.sh
+            t1002-read-tree-m-u-2way.sh
             t2204-add-ignored.sh
             t6020-bundle-misc.sh
             t4068-diff-symmetric-merge-base.sh

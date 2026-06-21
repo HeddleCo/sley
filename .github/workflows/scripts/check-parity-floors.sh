@@ -741,7 +741,7 @@ declare -A FLOOR=(
     [t7700-repack.sh]=29
     [t7703-repack-geometric.sh]=11
     [t7704-repack-cruft.sh]=15
-    [t6500-gc.sh]=14
+    [t6500-gc.sh]=34  # wave-38: 15->35 (repack/prune/auto-heuristic/commit-graph), banked 34 margin
     [t0610-reftable-basics.sh]=72
     [t4061-diff-indent.sh]=21
     # wave-12 (2026-06-19, integ/wave12A onto bd53260f): 4-slice disjoint batch.
@@ -1007,6 +1007,17 @@ declare -A FLOOR=(
     # t5526=56 t5601=108 t3404=121 t1500=81 t1501=39 t7508=119 t2070=15. cargo test green.
     [t4204-patch-id.sh]=25
     [t2501-cwd-empty.sh]=24
+    # wave-38 (2026-06-21, 78% mid areas off main 042e13c0): gc, blame-corner, read-tree-2way.
+    # t6500-gc 15->35 FULL (plain/auto gc, gc.log/gc.pid, pack-refs, reflog expiry, prune/no-prune,
+    # cruft repacks, --keep-largest-pack, commit-graph; raised existing floor 14->34). t8003-blame-
+    # corner-cases 16->30 FULL (-C/-M copy+rename origins, -f path, porcelain coalescing, index-backed
+    # Not-Committed-Yet, HEAD^.. range). t1002-read-tree-m-u-2way 3->22 FULL (root cause: diff-files -p
+    # crashed on missing index during the test helper; fixed racy filter to treat missing index empty).
+    # NO file collisions (pack.rs/plumbing.rs/remote_cmds.rs | blame.rs | diff_files.rs). All 3 verified
+    # on MERGED binary. Guards held/gained: t5300=57 t5304=32 t5324=25 t5510=170 t4013=216 t2018=25
+    # t2020=26 t3600=81 t3700=51 t7508=119. cargo test green.
+    [t8003-blame-corner-cases.sh]=30
+    [t1002-read-tree-m-u-2way.sh]=22
 )
 
 fail=0
