@@ -932,6 +932,14 @@ fn resolve_at_selector_ref_name(
         return Ok(None);
     }
     let base = &rev[..open];
+    if let Some(prior) = parse_prior_checkout_selector(rev)? {
+        let Some(branch) = nth_prior_checkout_branch_name(git_dir, format, prior)? else {
+            return Err(GitError::not_found(format!(
+                "not enough previous checkouts to resolve {rev}"
+            )));
+        };
+        return Ok(Some(format!("refs/heads/{branch}")));
+    }
     if inner.eq_ignore_ascii_case("u") || inner.eq_ignore_ascii_case("upstream") {
         return Ok(Some(
             resolve_upstream_ref(git_dir, format, base, false, rev, config)?.refname,
@@ -962,18 +970,43 @@ fn parse_at_count(rev: &str, text: &str) -> Result<usize> {
         .map_err(|_| GitError::InvalidFormat(format!("invalid revision selector {rev}")))
 }
 
+fn parse_prior_checkout_selector(rev: &str) -> Result<Option<usize>> {
+    let Some(inner) = rev.strip_prefix("@{-").and_then(|rest| rest.strip_suffix('}')) else {
+        return Ok(None);
+    };
+    if !inner.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    Ok(Some(parse_at_count(rev, inner)?))
+}
+
+fn is_reflog_count_or_date_selector(rev: &str) -> bool {
+    let Some(open) = rev.rfind("@{") else {
+        return false;
+    };
+    let Some(inner) = rev.strip_suffix('}') else {
+        return false;
+    };
+    let inner = &inner[open + 2..];
+    !(inner.eq_ignore_ascii_case("u")
+        || inner.eq_ignore_ascii_case("upstream")
+        || inner.eq_ignore_ascii_case("push")
+        || inner.starts_with('-'))
+}
+
 /// Map a `<base>@{...}` base to the full ref name whose reflog should be read.
 ///
-/// An empty base means `HEAD`; `refs/...` is used verbatim. A short name is
-/// DWIM'd through git's `ref_rev_parse_rules` (`%s`, `refs/%s`, `refs/tags/%s`,
-/// `refs/heads/%s`, `refs/remotes/%s`, `refs/remotes/%s/HEAD`), picking the first
-/// candidate that has an existing reflog — exactly git's `repo_dwim_log`. This is
-/// what lets `stash@{N}` read `refs/stash`'s reflog (rule `refs/%s`) the same way
-/// `main@{N}` reads `refs/heads/main` (rule `refs/heads/%s`). When no candidate
-/// has a reflog, fall back to `refs/heads/<base>` so the "no reflog" error path
-/// keeps its historical shape.
+/// An empty base means the current branch's reflog; explicit `HEAD` means the
+/// HEAD reflog. A short name is DWIM'd through git's `ref_rev_parse_rules`
+/// (`%s`, `refs/%s`, `refs/tags/%s`, `refs/heads/%s`, `refs/remotes/%s`,
+/// `refs/remotes/%s/HEAD`), picking the first candidate that has an existing
+/// reflog — exactly git's `repo_dwim_log`. This is what lets `stash@{N}` read
+/// `refs/stash`'s reflog (rule `refs/%s`) the same way `main@{N}` reads
+/// `refs/heads/main` (rule `refs/heads/%s`). When no candidate has a reflog,
+/// fall back to `refs/heads/<base>` so the "no reflog" error path keeps its
+/// historical shape.
 fn reflog_ref_name(refs: &FileRefStore, base: &str) -> String {
-    if base.is_empty() || base == "HEAD" {
+    if base == "HEAD" {
         return "HEAD".to_string();
     }
     if base.starts_with("refs/") {
@@ -994,10 +1027,36 @@ fn reflog_ref_name_for_base(
     base: &str,
     config: Option<&GitConfig>,
 ) -> Result<String> {
+    if base.is_empty() {
+        return Ok(refs
+            .current_branch_ref()?
+            .unwrap_or_else(|| "HEAD".to_string()));
+    }
+    if base == "@" {
+        return Ok("HEAD".to_string());
+    }
+    if let Some(prior) = parse_prior_checkout_selector(base)? {
+        let Some(branch) = nth_prior_checkout_branch_name(git_dir, format, prior)? else {
+            return Err(GitError::not_found(format!(
+                "not enough previous checkouts to resolve {base}"
+            )));
+        };
+        return Ok(reflog_ref_name(refs, &branch));
+    }
+    if is_reflog_count_or_date_selector(base) {
+        return Err(GitError::InvalidFormat(format!(
+            "invalid revision selector {base}"
+        )));
+    }
     if base.contains("@{")
         && let Some(name) = resolve_at_selector_ref_name(git_dir, format, base, config)?
     {
         return Ok(name);
+    }
+    if base.contains("@{") {
+        return Err(GitError::InvalidFormat(format!(
+            "invalid revision selector {base}"
+        )));
     }
     Ok(reflog_ref_name(refs, base))
 }
@@ -1038,19 +1097,28 @@ fn resolve_reflog_nth(
 ) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let ref_name = reflog_ref_name_for_base(git_dir, format, &refs, base, config)?;
+    let display_name = reflog_display_name_for_ref(base, &ref_name);
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
+        if n == 0
+            && let Some(oid) = resolve_revision_ref(&refs, &ref_name)?
+        {
+            return Ok(oid);
+        }
         return Err(GitError::not_found(format!(
             "no reflog for '{}' to resolve {rev}",
-            reflog_display_name(base)
+            display_name
         )));
     }
     // `@{N}` counts back from the newest entry; index `len - 1 - n`.
     let len = entries.len();
     if n >= len {
+        if n == len && !object_id_is_null(&entries[0].old_oid) {
+            return Ok(entries[0].old_oid);
+        }
         return Err(GitError::not_found(format!(
             "log for '{}' only has {len} entries",
-            reflog_display_name(base)
+            display_name
         )));
     }
     Ok(entries[len - 1 - n].new_oid)
@@ -1068,11 +1136,12 @@ fn resolve_reflog_date(
         .ok_or_else(|| GitError::Unsupported(format!("revision selector @{{{date}}}")))?;
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let ref_name = reflog_ref_name_for_base(git_dir, format, &refs, base, config)?;
+    let display_name = reflog_display_name_for_ref(base, &ref_name);
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
         return Err(GitError::not_found(format!(
             "no reflog for '{}' to resolve {rev}",
-            reflog_display_name(base)
+            display_name
         )));
     }
     for entry in entries.iter().rev() {
@@ -1085,6 +1154,10 @@ fn resolve_reflog_date(
 
 fn reflog_entry_timestamp(entry: &ReflogEntry) -> Result<i64> {
     entry.timestamp_seconds()
+}
+
+fn object_id_is_null(oid: &ObjectId) -> bool {
+    oid.as_bytes().iter().all(|byte| *byte == 0)
 }
 
 fn parse_reflog_selector_date(value: &str) -> Option<i64> {
@@ -1198,6 +1271,18 @@ fn reflog_display_name(base: &str) -> String {
     }
 }
 
+fn reflog_display_name_for_ref(base: &str, ref_name: &str) -> String {
+    if base.is_empty()
+        && let Some(branch) = ref_name.strip_prefix("refs/heads/")
+    {
+        return branch.to_string();
+    }
+    if base == "@" {
+        return "HEAD".to_string();
+    }
+    reflog_display_name(base)
+}
+
 /// Resolve `@{-N}` to the tip of the N-th previously checked-out branch.
 ///
 /// HEAD's reflog is scanned newest-first for "checkout: moving from X to Y"
@@ -1305,10 +1390,14 @@ fn resolve_upstream_ref(
     config: Option<&GitConfig>,
 ) -> Result<UpstreamRef> {
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
-    let branch = if base.is_empty() {
+    let branch = if base.is_empty() || base == "HEAD" || base == "@" {
         refs.current_branch()?
             .ok_or_else(|| GitError::InvalidFormat("HEAD does not point to a branch".to_string()))?
-    } else if base.starts_with("refs/") {
+    } else if let Some(prior) = parse_prior_checkout_selector(base)? {
+        nth_prior_checkout_branch_name(git_dir, format, prior)?.ok_or_else(|| {
+            GitError::not_found(format!("not enough previous checkouts to resolve {base}"))
+        })?
+    } else if base.starts_with("refs/") || base.contains("@{") {
         return Err(GitError::InvalidFormat(format!(
             "{base} is not a branch, cannot resolve {rev}"
         )));
@@ -6884,6 +6973,15 @@ mod tests {
                 (&c1, &c2, "commit: c2"),
             ],
         );
+        write_branch_reflog(
+            &git_dir,
+            "main",
+            &[
+                (&zero_oid(), &c0, "commit (initial): c0"),
+                (&c0, &c1, "commit: c1"),
+                (&c1, &c2, "commit: c2"),
+            ],
+        );
 
         // `@{0}` is the current value, `@{1}`/`@{2}` walk back through the log.
         assert_eq!(
@@ -7047,6 +7145,135 @@ mod tests {
             resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-2}")
                 .expect("test operation should succeed"),
             feature_tip
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn empty_base_reflog_uses_current_branch_not_head() {
+        let git_dir = temp_git_dir();
+        let old_one = test_oid(0x52);
+        let old_two = test_oid(0x53);
+        let new_two = test_oid(0x54);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/old-branch\n")
+            .expect("test operation should succeed");
+        set_branch(&git_dir, "old-branch", &old_two);
+        write_branch_reflog(
+            &git_dir,
+            "old-branch",
+            &[
+                (&zero_oid(), &old_one, "commit (initial): old-one"),
+                (&old_one, &old_two, "commit: old-two"),
+            ],
+        );
+        write_head_reflog(
+            &git_dir,
+            &[
+                (&old_two, &new_two, "checkout: moving from old-branch to new-branch"),
+                (&new_two, &old_two, "checkout: moving from new-branch to old-branch"),
+            ],
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{1}")
+                .expect("test operation should succeed"),
+            old_one
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{1}")
+                .expect("test operation should succeed"),
+            new_two
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn reflog_nth_uses_git_empty_and_oldest_fallbacks() {
+        let git_dir = temp_git_dir();
+        let base = test_oid(0x55);
+        let tip = test_oid(0x56);
+        set_branch(&git_dir, "newbranch", &tip);
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "newbranch@{0}")
+                .expect("test operation should succeed"),
+            tip
+        );
+        write_branch_reflog(&git_dir, "newbranch", &[(&base, &tip, "commit: tip")]);
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "newbranch@{1}")
+                .expect("test operation should succeed"),
+            base
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn prior_checkout_and_head_alias_compose_with_at_marks() {
+        let git_dir = temp_git_dir();
+        let main_tip = test_oid(0x57);
+        let old_one = test_oid(0x58);
+        let old_two = test_oid(0x59);
+        let new_tip = test_oid(0x5a);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/new-branch\n")
+            .expect("test operation should succeed");
+        set_branch(&git_dir, "main", &main_tip);
+        set_branch(&git_dir, "old-branch", &old_two);
+        set_branch(&git_dir, "new-branch", &new_tip);
+        write_branch_reflog(
+            &git_dir,
+            "old-branch",
+            &[
+                (&zero_oid(), &old_one, "commit (initial): old-one"),
+                (&old_one, &old_two, "commit: old-two"),
+            ],
+        );
+        write_head_reflog(
+            &git_dir,
+            &[(
+                &old_two,
+                &new_tip,
+                "checkout: moving from old-branch to new-branch",
+            )],
+        );
+        fs::write(
+            git_dir.join("config"),
+            b"[branch \"old-branch\"]\n\tremote = .\n\tmerge = refs/heads/main\n[branch \"new-branch\"]\n\tremote = .\n\tmerge = refs/heads/main\n",
+        )
+        .expect("test operation should succeed");
+        assert_eq!(
+            resolve_revision_symbolic_full_name(&git_dir, ObjectFormat::Sha1, "@{-1}")
+                .expect("test operation should succeed"),
+            Some("refs/heads/old-branch".to_string())
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-1}@{0}")
+                .expect("test operation should succeed"),
+            old_two
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-1}@{1}")
+                .expect("test operation should succeed"),
+            old_one
+        );
+        assert_eq!(
+            resolve_revision_symbolic_full_name(&git_dir, ObjectFormat::Sha1, "HEAD@{u}")
+                .expect("test operation should succeed"),
+            Some("refs/heads/main".to_string())
+        );
+        assert_eq!(
+            resolve_revision_symbolic_full_name(&git_dir, ObjectFormat::Sha1, "@@{u}")
+                .expect("test operation should succeed"),
+            Some("refs/heads/main".to_string())
+        );
+        assert_eq!(
+            resolve_revision_symbolic_full_name(&git_dir, ObjectFormat::Sha1, "@{-1}@{u}")
+                .expect("test operation should succeed"),
+            Some("refs/heads/main".to_string())
+        );
+        let nested = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}@{0}")
+            .expect_err("test operation should fail");
+        assert!(
+            matches!(&nested, GitError::InvalidFormat(_)),
+            "unexpected error: {nested:?}"
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
