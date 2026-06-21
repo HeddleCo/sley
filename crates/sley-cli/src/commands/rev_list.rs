@@ -355,6 +355,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    let output_encoding = log_output_encoding(&config);
     // Mailmap engine for `--use-mailmap` custom-format atoms (the upper-case
     // `%aN`/… always map; lower-case map only under the flag).
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
@@ -385,8 +386,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         || matches!(
             missing_action,
             RevListMissingAction::Print | RevListMissingAction::PrintInfo
-        )
-    {
+        ) {
         rev_list_missing_tip_candidates(&setup_args)
     } else {
         Vec::new()
@@ -497,26 +497,22 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut left_right_sides = HashMap::new();
     for range in &revision_options.symmetric_ranges {
         if (left_right || side_filter.is_some()) && !range.negated {
-            for record in
-                rev_list_walk_commits_with_missing(
-                    &db,
-                    format,
-                    [range.left],
-                    first_parent,
-                    missing_action,
-                )?
-            {
+            for record in rev_list_walk_commits_with_missing(
+                &db,
+                format,
+                [range.left],
+                first_parent,
+                missing_action,
+            )? {
                 left_right_sides.entry(record.oid).or_insert('<');
             }
-            for record in
-                rev_list_walk_commits_with_missing(
-                    &db,
-                    format,
-                    [range.right],
-                    first_parent,
-                    missing_action,
-                )?
-            {
+            for record in rev_list_walk_commits_with_missing(
+                &db,
+                format,
+                [range.right],
+                first_parent,
+                missing_action,
+            )? {
                 left_right_sides.entry(record.oid).or_insert('>');
             }
         }
@@ -642,8 +638,13 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             } else {
                 None
             };
-            let keep =
-                object_filter.includes_object(ObjectType::Blob, &object.oid, &object.name, size, 0)?;
+            let keep = object_filter.includes_object(
+                ObjectType::Blob,
+                &object.oid,
+                &object.name,
+                size,
+                0,
+            )?;
             if keep {
                 kept.push(object);
             }
@@ -782,8 +783,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         // `commit <oid>` header). The plain-oid fast path below still gates on
         // `abbrev_commit`.
         let effective_abbrev_len = abbrev_len;
-        let mut line = metadata_format
-            .map(|compiled| Vec::with_capacity(compiled.estimated_line_capacity()));
+        let mut line =
+            metadata_format.map(|compiled| Vec::with_capacity(compiled.estimated_line_capacity()));
         for record in &selected {
             if let Some(compiled) = metadata_format {
                 let line = line
@@ -802,9 +803,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         date_mode: &date_mode,
                         source_oid: None,
                         describe: None,
-                signature: None,
+                        signature: None,
                         color: want_color,
-                        output_encoding: "UTF-8",
+                        output_encoding: &output_encoding,
                         mailmap: &mailmap,
                         use_mailmap,
                     },
@@ -858,7 +859,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             rev_list_no_walk_commits(&db, format, include_commits)?
         }
     };
-    let selected_commit_oids = commits.iter().map(|record| record.oid).collect::<HashSet<_>>();
+    let selected_commit_oids = commits
+        .iter()
+        .map(|record| record.oid)
+        .collect::<HashSet<_>>();
     let mut known_direct_object_oids = start_tag_objects
         .iter()
         .map(|tag| tag.object.oid)
@@ -987,7 +991,13 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     let decorations = match &pretty {
         RevListPretty::Compiled { compiled, .. } if compiled.uses_decorations() => {
-            log_decoration_map(&git_dir, &db, format, LogDecorationMode::Short, &crate::DecorationFilter::default())?
+            log_decoration_map(
+                &git_dir,
+                &db,
+                format,
+                LogDecorationMode::Short,
+                &crate::DecorationFilter::default(),
+            )?
         }
         _ => HashMap::new(),
     };
@@ -1114,49 +1124,68 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             if !rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids) {
                 continue;
             }
-        let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
-        match &pretty {
-            RevListPretty::Default
-            | RevListPretty::Compiled {
-                commit_header: false,
-                ..
-            } => {
-                let oneline = matches!(
-                    pretty,
-                    RevListPretty::Compiled {
-                        commit_header: false,
-                        ..
-                    }
-                );
-                if timestamp {
-                    print!(
-                        "{} ",
-                        commit_identity_timestamp_i64(&record.commit.committer)?
+            let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
+            match &pretty {
+                RevListPretty::Default
+                | RevListPretty::Compiled {
+                    commit_header: false,
+                    ..
+                } => {
+                    let oneline = matches!(
+                        pretty,
+                        RevListPretty::Compiled {
+                            commit_header: false,
+                            ..
+                        }
                     );
-                }
-                if left_right {
-                    print!("{left_right_prefix}");
-                }
-                if oneline {
-                    let RevListPretty::Compiled { compiled, .. } = &pretty else {
-                        unreachable!("oneline requires compiled preset");
-                    };
-                    let format_context = LogFormatContext {
-                        abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
-                        decorations: &decorations,
-                        marker: left_right_prefix,
-                        dialect: LogFormatDialect::RevList,
-                        source: None,
-                        date_mode: &date_mode,
-                        source_oid: None,
-                        describe: None,
-                signature: None,
-                        color: want_color,
-                        output_encoding: "UTF-8",
-                        mailmap: &mailmap,
-                        use_mailmap,
-                    };
-                    if children {
+                    if timestamp {
+                        print!(
+                            "{} ",
+                            commit_identity_timestamp_i64(&record.commit.committer)?
+                        );
+                    }
+                    if left_right {
+                        print!("{left_right_prefix}");
+                    }
+                    if oneline {
+                        let RevListPretty::Compiled { compiled, .. } = &pretty else {
+                            unreachable!("oneline requires compiled preset");
+                        };
+                        let format_context = LogFormatContext {
+                            abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
+                            decorations: &decorations,
+                            marker: left_right_prefix,
+                            dialect: LogFormatDialect::RevList,
+                            source: None,
+                            date_mode: &date_mode,
+                            source_oid: None,
+                            describe: None,
+                            signature: None,
+                            color: want_color,
+                            output_encoding: &output_encoding,
+                            mailmap: &mailmap,
+                            use_mailmap,
+                        };
+                        if children {
+                            print!(
+                                "{}",
+                                format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+                            );
+                            if parents {
+                                for parent in &record.parents {
+                                    print!(" {parent}");
+                                }
+                            }
+                            if let Some(children) = child_oids.get(&record.oid) {
+                                for child in children {
+                                    print!(" {child}");
+                                }
+                            }
+                            print!(" {}", commit_subject(&record.commit.message));
+                        } else {
+                            print_log_format(record, compiled, format_context)?;
+                        }
+                    } else {
                         print!(
                             "{}",
                             format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
@@ -1166,82 +1195,66 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                                 print!(" {parent}");
                             }
                         }
-                        if let Some(children) = child_oids.get(&record.oid) {
+                        if children && let Some(children) = child_oids.get(&record.oid) {
                             for child in children {
                                 print!(" {child}");
                             }
                         }
-                        print!(" {}", commit_subject(&record.commit.message));
+                    }
+                    if nul_terminated {
+                        print!("\0");
                     } else {
-                        print_log_format(record, compiled, format_context)?;
+                        println!();
                     }
-                } else {
-                    print!(
-                        "{}",
-                        format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
-                    );
-                    if parents {
-                        for parent in &record.parents {
-                            print!(" {parent}");
-                        }
-                    }
-                    if children && let Some(children) = child_oids.get(&record.oid) {
-                        for child in children {
-                            print!(" {child}");
-                        }
+                    if header && !oneline {
+                        write_rev_list_header(record)?;
                     }
                 }
-                if nul_terminated {
-                    print!("\0");
-                } else {
-                    println!();
-                }
-                if header && !oneline {
-                    write_rev_list_header(record)?;
-                }
-            }
-            RevListPretty::Short => write_rev_list_short(
-                record,
-                left_right.then_some(left_right_prefix),
-                parents,
-                abbrev_commit,
-                abbrev_len,
-                timestamp,
-            )?,
-            RevListPretty::Compiled {
-                compiled,
-                commit_header: true,
-            } => {
-                write_rev_list_commit_header_line(
+                RevListPretty::Short => write_rev_list_short(
                     record,
                     left_right.then_some(left_right_prefix),
                     parents,
                     abbrev_commit,
                     abbrev_len,
                     timestamp,
-                )?;
-                print_log_format(
-                    record,
+                    &output_encoding,
+                )?,
+                RevListPretty::Compiled {
                     compiled,
-                    LogFormatContext {
+                    commit_header: true,
+                } => {
+                    write_rev_list_commit_header_line(
+                        record,
+                        left_right.then_some(left_right_prefix),
+                        parents,
+                        abbrev_commit,
                         abbrev_len,
-                        decorations: &decorations,
-                        marker: left_right_prefix,
-                        dialect: LogFormatDialect::RevList,
-                        source: None,
-                        date_mode: &date_mode,
-                        source_oid: None,
-                        describe: None,
-                signature: None,
-                        color: want_color,
-                        output_encoding: "UTF-8",
-                        mailmap: &mailmap,
-                        use_mailmap,
-                    },
-                )?;
-                println!();
+                        timestamp,
+                    )?;
+                    let emitted = print_log_format(
+                        record,
+                        compiled,
+                        LogFormatContext {
+                            abbrev_len,
+                            decorations: &decorations,
+                            marker: left_right_prefix,
+                            dialect: LogFormatDialect::RevList,
+                            source: None,
+                            date_mode: &date_mode,
+                            source_oid: None,
+                            describe: None,
+                            signature: None,
+                            color: want_color,
+                            output_encoding: &output_encoding,
+                            mailmap: &mailmap,
+                            use_mailmap,
+                        },
+                    )?;
+                    if emitted > 0 {
+                        println!();
+                    }
+                }
             }
-        }
         }
     }
     if !quiet {
@@ -1256,6 +1269,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     parents,
                     decorations: &decorations,
                     date_mode: &date_mode,
+                    output_encoding: &output_encoding,
                     mailmap: &mailmap,
                     use_mailmap,
                 },
@@ -1426,7 +1440,13 @@ fn rev_list_emit_bisection(
         // Every candidate, newest-first by distance, decorated with `dist=N`
         // alongside its ref decorations (upstream `best_bisection_sorted` +
         // `revs.show_decorations`).
-        let decorations = log_decoration_map(git_dir, db, format, LogDecorationMode::Short, &crate::DecorationFilter::default())?;
+        let decorations = log_decoration_map(
+            git_dir,
+            db,
+            format,
+            LogDecorationMode::Short,
+            &crate::DecorationFilter::default(),
+        )?;
         for (oid, distance) in &result.picks {
             let mut labels: Vec<String> = decorations.get(oid).cloned().unwrap_or_default();
             labels.push(format!("dist={distance}"));
@@ -1483,6 +1503,7 @@ fn write_rev_list_short(
     abbrev_commit: bool,
     abbrev_len: Option<usize>,
     timestamp: bool,
+    output_encoding: &str,
 ) -> Result<()> {
     let mut stdout = io::stdout();
     write_rev_list_commit_header_line(
@@ -1499,7 +1520,10 @@ fn write_rev_list_short(
         commit_author_identity(&record.commit.author)
     )?;
     writeln!(stdout)?;
-    writeln!(stdout, "    {}", commit_subject(&record.commit.message))?;
+    stdout.write_all(b"    ")?;
+    let message = commit_message_for_commit_encoding(&record.commit, output_encoding);
+    stdout.write_all(commit_subject_bytes(&message))?;
+    stdout.write_all(b"\n")?;
     writeln!(stdout)?;
     Ok(())
 }
@@ -1575,6 +1599,7 @@ struct RevListBoundaryOptions<'a> {
     parents: bool,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     date_mode: &'a DateMode,
+    output_encoding: &'a str,
     mailmap: &'a commands::utility::Mailmap,
     use_mailmap: bool,
 }
@@ -1591,6 +1616,7 @@ fn write_rev_list_boundary_record(
         parents,
         decorations,
         date_mode,
+        output_encoding,
         mailmap,
         use_mailmap,
     } = options;
@@ -1630,9 +1656,9 @@ fn write_rev_list_boundary_record(
                         date_mode,
                         source_oid: None,
                         describe: None,
-                signature: None,
+                        signature: None,
                         color: false,
-                        output_encoding: "UTF-8",
+                        output_encoding,
                         mailmap,
                         use_mailmap,
                     },
@@ -1658,6 +1684,7 @@ fn write_rev_list_boundary_record(
             abbrev_commit,
             abbrev_len,
             timestamp,
+            output_encoding,
         ),
         RevListPretty::Compiled {
             compiled,
@@ -1671,7 +1698,7 @@ fn write_rev_list_boundary_record(
                 abbrev_len,
                 timestamp,
             )?;
-            print_log_format(
+            let emitted = print_log_format(
                 record,
                 compiled,
                 LogFormatContext {
@@ -1683,14 +1710,16 @@ fn write_rev_list_boundary_record(
                     date_mode,
                     source_oid: None,
                     describe: None,
-                signature: None,
+                    signature: None,
                     color: false,
-                    output_encoding: "UTF-8",
+                    output_encoding,
                     mailmap,
                     use_mailmap,
                 },
             )?;
-            println!();
+            if emitted > 0 {
+                println!();
+            }
             Ok(())
         }
     }
@@ -1826,10 +1855,11 @@ fn rev_list_missing_tip_objects(
                 }
             }
             Ok(_) => {}
-            Err(_) if matches!(
-                missing_action,
-                RevListMissingAction::Print | RevListMissingAction::PrintInfo
-            ) && missing_seen.insert(oid) =>
+            Err(_)
+                if matches!(
+                    missing_action,
+                    RevListMissingAction::Print | RevListMissingAction::PrintInfo
+                ) && missing_seen.insert(oid) =>
             {
                 missing.push(RevListObject {
                     oid,
@@ -1907,7 +1937,12 @@ impl RevListObjectFilter {
         }
     }
 
-    fn resolve(self, git_dir: &Path, db: &FileObjectDatabase, format: ObjectFormat) -> Result<Self> {
+    fn resolve(
+        self,
+        git_dir: &Path,
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+    ) -> Result<Self> {
         match self {
             Self::SparseOid(value) => {
                 let oid = if let Some((rev, path)) = value.split_once(':') {
@@ -1942,20 +1977,14 @@ impl RevListObjectFilter {
         match self {
             Self::TreeDepth(depth) => Some(*depth),
             Self::ObjectType(ObjectType::Commit | ObjectType::Tag) => Some(0),
-            Self::Combine(filters) => filters
-                .iter()
-                .filter_map(Self::tree_depth_limit)
-                .max(),
+            Self::Combine(filters) => filters.iter().filter_map(Self::tree_depth_limit).max(),
             _ => None,
         }
     }
 
     fn bitmap_eligible(&self) -> bool {
         match self {
-            Self::None
-            | Self::BlobNone
-            | Self::BlobLimit(_)
-            | Self::ObjectType(_) => true,
+            Self::None | Self::BlobNone | Self::BlobLimit(_) | Self::ObjectType(_) => true,
             Self::TreeDepth(depth) => *depth == 0,
             Self::Combine(filters) => filters.iter().all(Self::bitmap_eligible),
             Self::SparseOid(_) | Self::Sparse(_) => false,
@@ -1973,10 +2002,13 @@ impl RevListObjectFilter {
         match self {
             Self::None => Ok(true),
             Self::BlobNone => Ok(object_type != ObjectType::Blob),
-            Self::BlobLimit(limit) => Ok(object_type != ObjectType::Blob || size.unwrap_or(0) < *limit),
+            Self::BlobLimit(limit) => {
+                Ok(object_type != ObjectType::Blob || size.unwrap_or(0) < *limit)
+            }
             Self::ObjectType(wanted) => Ok(object_type == *wanted),
             Self::TreeDepth(limit) => Ok(object_type == ObjectType::Commit || depth < *limit),
-            Self::Sparse(patterns) => Ok(object_type != ObjectType::Blob && object_type != ObjectType::Tree
+            Self::Sparse(patterns) => Ok(object_type != ObjectType::Blob
+                && object_type != ObjectType::Tree
                 || rev_list_sparse_patterns_include(patterns, path, object_type)),
             Self::Combine(filters) => {
                 for filter in filters {
@@ -2016,11 +2048,17 @@ fn rev_list_decode_sub_filter(raw: &str) -> Result<String> {
                 return Err(GitError::Exit(128));
             }
             b'%' => {
-                let Some(high) = bytes.get(idx + 1).and_then(|byte| (*byte as char).to_digit(16)) else {
+                let Some(high) = bytes
+                    .get(idx + 1)
+                    .and_then(|byte| (*byte as char).to_digit(16))
+                else {
                     eprintln!("fatal: invalid filter-spec");
                     return Err(GitError::Exit(128));
                 };
-                let Some(low) = bytes.get(idx + 2).and_then(|byte| (*byte as char).to_digit(16)) else {
+                let Some(low) = bytes
+                    .get(idx + 2)
+                    .and_then(|byte| (*byte as char).to_digit(16))
+                else {
                     eprintln!("fatal: invalid filter-spec");
                     return Err(GitError::Exit(128));
                 };
@@ -2095,7 +2133,9 @@ fn rev_list_objects(
     }
     for object in exclude_objects {
         match object.object_type {
-            Some(ObjectType::Tree) => rev_list_mark_tree_objects(db, format, &object.oid, &mut seen)?,
+            Some(ObjectType::Tree) => {
+                rev_list_mark_tree_objects(db, format, &object.oid, &mut seen)?
+            }
             _ => {
                 seen.insert(object.oid);
             }
@@ -2200,15 +2240,7 @@ fn rev_list_collect_tree_objects(
             object.object_type.as_str()
         )));
     }
-    rev_list_record_filter_decision(
-        walk,
-        ObjectType::Tree,
-        tree_oid,
-        &path,
-        None,
-        depth,
-        state,
-    )?;
+    rev_list_record_filter_decision(walk, ObjectType::Tree, tree_oid, &path, None, depth, state)?;
     if tree_depth == Some(1) {
         if walk.collect_omitted {
             rev_list_collect_omitted_tree_contents(walk, tree_oid, &path, state)?;
@@ -2243,8 +2275,7 @@ fn rev_list_collect_tree_objects(
                     || !matches!(
                         walk.missing_action,
                         RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor
-                    ))
-            {
+                    )) {
                 let object = match walk.db.read_object(&entry.oid) {
                     Ok(object) => object,
                     Err(err) => {
@@ -2296,7 +2327,9 @@ fn rev_list_collect_tree_objects(
 fn rev_list_filter_needs_blob_size(filter: &RevListObjectFilter) -> bool {
     match filter {
         RevListObjectFilter::BlobLimit(_) => true,
-        RevListObjectFilter::Combine(filters) => filters.iter().any(rev_list_filter_needs_blob_size),
+        RevListObjectFilter::Combine(filters) => {
+            filters.iter().any(rev_list_filter_needs_blob_size)
+        }
         _ => false,
     }
 }
@@ -2310,7 +2343,10 @@ fn rev_list_record_filter_decision(
     depth: usize,
     state: &mut RevListObjectState,
 ) -> Result<()> {
-    if walk.filter.includes_object(object_type, oid, path, size, depth)? {
+    if walk
+        .filter
+        .includes_object(object_type, oid, path, size, depth)?
+    {
         if state.emitted_oids.insert(*oid) {
             state.objects.push(RevListObject {
                 oid: *oid,
@@ -2320,7 +2356,10 @@ fn rev_list_record_filter_decision(
         }
         state.omitted_oids.remove(oid);
         state.omitted.retain(|object| object.oid != *oid);
-    } else if walk.collect_omitted && !state.emitted_oids.contains(oid) && state.omitted_oids.insert(*oid) {
+    } else if walk.collect_omitted
+        && !state.emitted_oids.contains(oid)
+        && state.omitted_oids.insert(*oid)
+    {
         state.omitted.push(RevListObject {
             oid: *oid,
             name: Vec::new(),
@@ -2431,10 +2470,7 @@ fn write_rev_list_object_line(
     Ok(())
 }
 
-fn write_rev_list_omitted_object_line(
-    object: &RevListObject,
-    nul_terminated: bool,
-) -> Result<()> {
+fn write_rev_list_omitted_object_line(object: &RevListObject, nul_terminated: bool) -> Result<()> {
     let mut stdout = io::stdout();
     write!(stdout, "~{}", object.oid)?;
     stdout.write_all(if nul_terminated { b"\0" } else { b"\n" })?;
