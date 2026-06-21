@@ -7551,6 +7551,7 @@ struct LsRemoteOptions {
     refs_only: bool,
     symref: bool,
     exit_code: bool,
+    quiet: bool,
     get_url: bool,
     sort: Option<LsRemoteSort>,
     repository: Option<String>,
@@ -7758,12 +7759,23 @@ fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
     Ok(())
 }
 
+fn default_ls_remote_remote() -> Result<String> {
+    let git_dir = discover_git_dir(&env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    default_fetch_remote(&git_dir, format)
+}
+
 pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let mut options = parse_ls_remote_options(args)?;
-    let repository = options.repository.as_deref().unwrap_or("origin");
-    validate_configured_remote_refspecs(repository)?;
+    let implicit_repository = options.repository.is_none();
+    let repository = match options.repository.as_deref() {
+        Some(repository) => repository.to_string(),
+        None => default_ls_remote_remote()?,
+    };
+    validate_configured_remote_refspecs(&repository)?;
     if options.get_url {
-        println!("{}", ls_remote_display_url(repository)?);
+        println!("{}", ls_remote_display_url(&repository)?);
         return Ok(());
     }
     let local_sort_git_dir = validate_ls_remote_sort_context(options.sort)?;
@@ -7773,17 +7785,21 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         .transpose()?;
     let transport_config = transport_policy_config_for_cwd()?;
     if options.server_options.is_empty() {
-        options.server_options = configured_server_options(&transport_config, repository)?;
+        options.server_options = configured_server_options(&transport_config, &repository)?;
     } else if configured_legacy_protocol(Some(&transport_config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));
     }
-    let resolved_repository = ls_remote_resolved_url(repository)?;
+    let resolved_repository = ls_remote_resolved_url(&repository)?;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
 
+    if implicit_repository && !options.quiet {
+        eprintln!("From {}", ls_remote_display_url(&repository)?);
+    }
+
     if let Some((mut records, format)) =
-        ls_remote_ssh_records(repository, &options, &transport_config)?
+        ls_remote_ssh_records(&repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
@@ -7801,7 +7817,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     }
 
     if let Some((mut records, format)) =
-        ls_remote_git_records(repository, &options, &transport_config)?
+        ls_remote_git_records(&repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
@@ -7819,7 +7835,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     }
 
     if let Some((mut records, format)) =
-        ls_remote_http_records(repository, &options, &transport_config)?
+        ls_remote_http_records(&repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
@@ -7860,7 +7876,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     ) {
         trace_configured_local_protocol_version(Some(&transport_config));
         if configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2) {
-            if let Ok(remote_git_dir) = ls_remote_git_dir(repository)
+            if let Ok(remote_git_dir) = ls_remote_git_dir(&repository)
                 && let Ok(remote_common_git_dir) = common_git_dir_for_git_dir(&remote_git_dir)
                 && let Ok(format) = repository_object_format(&remote_common_git_dir)
             {
@@ -7870,7 +7886,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = ls_remote_git_dir(repository)?;
+    let git_dir = ls_remote_git_dir(&repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let (mut records, format) = sley_remote::ls_remote(
@@ -7966,7 +7982,7 @@ fn parse_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions> {
         }
         match arg {
             "--" => positional_only = true,
-            "-b" | "--heads" | "--branches" => options.heads = true,
+            "-b" | "-h" | "--heads" | "--branches" => options.heads = true,
             "--no-heads" | "--no-branches" => options.heads = false,
             "-t" | "--tags" => options.tags = true,
             "--no-tags" => options.tags = false,
@@ -7976,7 +7992,8 @@ fn parse_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions> {
             "--no-symref" => options.symref = false,
             "--exit-code" => options.exit_code = true,
             "--no-exit-code" => options.exit_code = false,
-            "-q" | "--quiet" | "--no-quiet" => {}
+            "-q" | "--quiet" => options.quiet = true,
+            "--no-quiet" => options.quiet = false,
             "--get-url" => options.get_url = true,
             "--no-get-url" => options.get_url = false,
             "--upload-pack" => {
