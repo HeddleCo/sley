@@ -1249,11 +1249,13 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             auto_follow_tags: true,
             fetch_all_tags: false,
             prune: false,
+            prune_tags: false,
             dry_run: false,
             append: false,
             write_fetch_head: false,
             tag_option_explicit: false,
             prune_option_explicit: false,
+            prune_tags_option_explicit: false,
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
@@ -1849,11 +1851,13 @@ fn clone_bare_network_repository(
             auto_follow_tags: options.tag_opt != Some("--no-tags") || options.branch.is_some(),
             fetch_all_tags: options.tag_opt == Some("--tags"),
             prune: false,
+            prune_tags: false,
             dry_run: false,
             append: false,
             write_fetch_head: false,
             tag_option_explicit: options.tag_opt.is_some(),
             prune_option_explicit: false,
+            prune_tags_option_explicit: false,
             depth: options.depth,
             merge_srcs: Vec::new(),
             filter: None,
@@ -2248,11 +2252,13 @@ fn clone_bare_or_mirror_local_repository(
                 && (options.tag_opt != Some("--no-tags") || options.branch_explicit),
             fetch_all_tags: options.tag_opt == Some("--tags"),
             prune: false,
+            prune_tags: false,
             dry_run: false,
             append: false,
             write_fetch_head: false,
             tag_option_explicit: options.tag_opt.is_some(),
             prune_option_explicit: false,
+            prune_tags_option_explicit: false,
             depth: None,
             merge_srcs: Vec::new(),
             filter: options.fetch_filter,
@@ -3346,11 +3352,13 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         auto_follow_tags: true,
         fetch_all_tags: false,
         prune: false,
+        prune_tags: false,
         dry_run: false,
         append: false,
         write_fetch_head: true,
         tag_option_explicit: false,
         prune_option_explicit: false,
+        prune_tags_option_explicit: false,
         depth: None,
         merge_srcs: Vec::new(),
         filter: None,
@@ -3408,6 +3416,14 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-prune" => {
                 options.prune = false;
                 options.prune_option_explicit = true;
+            }
+            "--prune-tags" | "-P" => {
+                options.prune_tags = true;
+                options.prune_tags_option_explicit = true;
+            }
+            "--no-prune-tags" => {
+                options.prune_tags = false;
+                options.prune_tags_option_explicit = true;
             }
             "--tags" => {
                 options.auto_follow_tags = true;

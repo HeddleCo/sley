@@ -77,6 +77,8 @@ pub struct FetchOptions {
     pub fetch_all_tags: bool,
     /// Prune remote-tracking refs that no longer exist on the remote.
     pub prune: bool,
+    /// Prune local tags absent from the remote when pruning is enabled.
+    pub prune_tags: bool,
     /// Plan and report the fetch without installing objects or updating refs.
     pub dry_run: bool,
     /// Append to `FETCH_HEAD` instead of truncating it.
@@ -89,6 +91,9 @@ pub struct FetchOptions {
     /// Whether the prune option (`--prune`/`--no-prune`) was set explicitly, so
     /// the configured `remote.<name>.prune`/`fetch.prune` must not override it.
     pub prune_option_explicit: bool,
+    /// Whether the prune-tags option (`--prune-tags`/`--no-prune-tags`) was set
+    /// explicitly, so configured prune tag options must not override it.
+    pub prune_tags_option_explicit: bool,
     /// Shallow fetch depth (`--depth N`): truncate history to `N` commits per tip.
     /// `None` is a full fetch. Honored by the HTTP and SSH transports and by the
     /// in-process local (`file://`/path) server, which computes the deepen
@@ -233,11 +238,21 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         request.refspecs.is_empty() && configured_refspecs_empty && !has_merge_config;
     let configured_remote_fetch = request.refspecs.is_empty() && !configured_refspecs_empty;
     let fetch_head_source = fetch_head_source_description(request.config, request.remote_name);
+    let prune_refspecs =
+        prune_refspecs_for_source(&configured_refspecs, request.refspecs, options.prune_tags);
     let mut effective_refspecs = fetch_refspecs_for_source(
         configured_refspecs,
         request.refspecs,
         options.fetch_all_tags,
     );
+    if options.prune_tags
+        && request.refspecs.is_empty()
+        && !effective_refspecs
+            .iter()
+            .any(|refspec| refspec == "refs/tags/*:refs/tags/*")
+    {
+        effective_refspecs.push("refs/tags/*:refs/tags/*".to_string());
+    }
     if has_merge_config {
         // Drop the synthetic bare-`HEAD` refspec the helper inserts when nothing
         // is configured; the merge refs are fetched for-merge instead.
@@ -268,6 +283,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         }
     }
     let parsed_refspecs = effective_refspecs
+        .iter()
+        .map(|refspec| parse_refspec(refspec))
+        .collect::<Result<Vec<_>>>()?;
+    let parsed_prune_refspecs = prune_refspecs
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
@@ -733,13 +752,17 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         }
     };
 
-    if !options.dry_run && options.prune && remote_exists(request.config, request.remote_name) {
-        outcome.pruned = prune_remote_tracking_refs_from_advertisements(
-            request.config,
-            &store,
-            request.remote_name,
-            &advertisements,
-            options.quiet,
+    if options.prune && !parsed_prune_refspecs.is_empty() {
+        outcome.pruned = prune_refs_from_advertisements(
+            PruneRefsInput {
+                config: request.config,
+                store: &store,
+                remote: request.remote_name,
+                advertisements: &advertisements,
+                refspecs: &parsed_prune_refspecs,
+                dry_run: options.dry_run,
+                quiet: options.quiet,
+            },
             services.progress,
         )?;
     }
@@ -1260,13 +1283,19 @@ pub fn apply_configured_fetch_prune_option(
     source: &str,
     options: &mut FetchOptions,
 ) {
-    if options.prune_option_explicit || !remote_exists(config, source) {
-        return;
+    if !options.prune_option_explicit {
+        if let Some(prune) = config.get_bool("remote", Some(source), "prune") {
+            options.prune = prune;
+        } else if let Some(prune) = config.get_bool("fetch", None, "prune") {
+            options.prune = prune;
+        }
     }
-    if let Some(prune) = config.get_bool("remote", Some(source), "prune") {
-        options.prune = prune;
-    } else if let Some(prune) = config.get_bool("fetch", None, "prune") {
-        options.prune = prune;
+    if !options.prune_tags_option_explicit {
+        if let Some(prune_tags) = config.get_bool("remote", Some(source), "prunetags") {
+            options.prune_tags = prune_tags;
+        } else if let Some(prune_tags) = config.get_bool("fetch", None, "prunetags") {
+            options.prune_tags = prune_tags;
+        }
     }
 }
 
@@ -1286,6 +1315,22 @@ pub fn fetch_refspecs_for_source(
         configured
     };
     if fetch_all_tags {
+        effective.push("refs/tags/*:refs/tags/*".to_string());
+    }
+    effective
+}
+
+fn prune_refspecs_for_source(
+    configured: &[String],
+    refspecs: &[String],
+    prune_tags: bool,
+) -> Vec<String> {
+    let mut effective = if !refspecs.is_empty() {
+        refspecs.to_vec()
+    } else {
+        configured.to_vec()
+    };
+    if prune_tags && refspecs.is_empty() {
         effective.push("refs/tags/*:refs/tags/*".to_string());
     }
     effective
@@ -1577,80 +1622,134 @@ fn trim_fetch_head_display_url(url: &str) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Prune remote-tracking refs for `remote` that are absent from `advertisements`,
+/// Prune refs whose destinations are covered by the active fetch refspecs and
+/// whose corresponding remote sources are absent from `advertisements`,
 /// deleting them and emitting git's notice lines through `progress` (unless
 /// `quiet`). Returns the refs that were pruned.
-pub fn prune_remote_tracking_refs_from_advertisements(
-    config: &GitConfig,
-    store: &FileRefStore,
-    remote: &str,
-    advertisements: &[RefAdvertisement],
-    quiet: bool,
+pub struct PruneRefsInput<'a> {
+    pub config: &'a GitConfig,
+    pub store: &'a FileRefStore,
+    pub remote: &'a str,
+    pub advertisements: &'a [RefAdvertisement],
+    pub refspecs: &'a [RefSpec],
+    pub dry_run: bool,
+    pub quiet: bool,
+}
+
+pub fn prune_refs_from_advertisements(
+    input: PruneRefsInput<'_>,
     progress: &mut dyn ProgressSink,
 ) -> Result<Vec<PrunedRef>> {
-    let remote_branches = advertisements
+    let remote_refs = input
+        .advertisements
         .iter()
-        .filter_map(|advertisement| advertisement.name.strip_prefix("refs/heads/"))
+        .filter(|advertisement| !advertisement.name.ends_with("^{}"))
+        .map(|advertisement| advertisement.name.as_str())
         .collect::<BTreeSet<_>>();
-    let local_refs = store.list_refs()?;
-    let stale_branches = remote_tracking_branch_names(&local_refs, remote)
-        .into_iter()
-        .filter(|branch| !remote_branches.contains(branch.as_str()))
-        .collect::<Vec<_>>();
-    if stale_branches.is_empty() {
+    let local_refs = input.store.list_refs()?;
+    let stale_refs = stale_refs_for_prune(&local_refs, input.refspecs, &remote_refs)?;
+    if stale_refs.is_empty() {
         return Ok(Vec::new());
     }
     let mut emit = |line: &str| {
-        if !quiet {
+        if !input.quiet {
             progress.message(line);
         }
     };
-    let display_url = remote_config_values(config, remote, "url")
+    let display_url = remote_config_values(input.config, input.remote, "url")
         .into_iter()
         .next()
-        .unwrap_or_else(|| remote.into());
-    emit(&format!("Pruning {remote}"));
+        .unwrap_or_else(|| input.remote.into());
+    emit(&format!("Pruning {}", input.remote));
     emit(&format!("URL: {display_url}"));
-    let remote_head = format!("refs/remotes/{remote}/HEAD");
-    let remote_prefix = format!("refs/remotes/{remote}/");
-    let head_target = match store.read_ref(&remote_head)? {
-        Some(RefTarget::Symbolic(target)) => Some(target),
-        Some(RefTarget::Direct(_)) | None => None,
-    };
     let mut pruned = Vec::new();
-    for branch in stale_branches {
-        let refname = format!("{remote_prefix}{branch}");
-        match store.read_ref(&refname)? {
-            Some(RefTarget::Symbolic(_)) => {
-                let _ = store.delete_symbolic_ref(&refname)?;
+    for refname in stale_refs {
+        if !input.dry_run {
+            match input.store.read_ref(&refname)? {
+                Some(RefTarget::Symbolic(_)) => {
+                    let _ = input.store.delete_symbolic_ref(&refname)?;
+                }
+                Some(RefTarget::Direct(_)) => {
+                    let _ = input.store.delete_ref(&refname)?;
+                }
+                None => {}
             }
-            Some(RefTarget::Direct(_)) => {
-                let _ = store.delete_ref(&refname)?;
-            }
-            None => {}
         }
-        emit(&format!(" * [pruned] {remote}/{branch}"));
-        if head_target.as_deref() == Some(refname.as_str()) {
-            let _ = store.delete_symbolic_ref(&remote_head)?;
-            emit(&format!(
-                " refs/remotes/{remote}/HEAD has become dangling after {refname} was deleted"
-            ));
-        }
+        let display = prettify_pruned_ref(input.remote, &refname);
+        let action = if input.dry_run {
+            "would prune"
+        } else {
+            "pruned"
+        };
+        emit(&format!(" * [{action}] {display}"));
+        let branch = display;
         pruned.push(PrunedRef { branch, refname });
     }
     Ok(pruned)
 }
 
-/// Remote-tracking branch names under `refs/remotes/<name>/` (excluding `HEAD`).
-fn remote_tracking_branch_names(refs: &[Ref], name: &str) -> Vec<String> {
-    let prefix = format!("refs/remotes/{name}/");
-    refs.iter()
-        .filter_map(|reference| reference.name.strip_prefix(&prefix))
-        .filter(|branch| *branch != "HEAD")
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+fn stale_refs_for_prune(
+    local_refs: &[Ref],
+    refspecs: &[RefSpec],
+    remote_refs: &BTreeSet<&str>,
+) -> Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for reference in local_refs {
+        if matches!(reference.target, RefTarget::Symbolic(_)) {
+            continue;
+        }
+        let sources = prune_sources_for_destination(refspecs, &reference.name)?;
+        if sources.is_empty() {
+            continue;
+        }
+        if sources.iter().all(|source| !remote_refs.contains(source.as_str())) {
+            stale.push(reference.name.clone());
+        }
+    }
+    stale.sort();
+    Ok(stale)
+}
+
+fn prune_sources_for_destination(refspecs: &[RefSpec], destination: &str) -> Result<Vec<String>> {
+    let mut sources = Vec::new();
+    for refspec in refspecs.iter().filter(|refspec| !refspec.negative) {
+        let Some(src) = refspec.src.as_deref() else {
+            continue;
+        };
+        let Some(dst) = refspec.dst.as_deref() else {
+            continue;
+        };
+        if refspec.pattern {
+            let Some((dst_prefix, dst_suffix)) = dst.split_once('*') else {
+                continue;
+            };
+            let Some(middle) = destination
+                .strip_prefix(dst_prefix)
+                .and_then(|value| value.strip_suffix(dst_suffix))
+            else {
+                continue;
+            };
+            let (src_prefix, src_suffix) = src.split_once('*').ok_or_else(|| {
+                GitError::InvalidFormat("pattern refspec source is missing wildcard".into())
+            })?;
+            sources.push(format!("{src_prefix}{middle}{src_suffix}"));
+        } else if dst == destination {
+            sources.push(src.to_string());
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+fn prettify_pruned_ref(remote: &str, refname: &str) -> String {
+    if let Some(branch) = refname.strip_prefix(&format!("refs/remotes/{remote}/")) {
+        return format!("{remote}/{branch}");
+    }
+    if let Some(tag) = refname.strip_prefix("refs/tags/") {
+        return tag.to_string();
+    }
+    refname.to_string()
 }
 
 #[cfg(test)]
@@ -1727,11 +1826,13 @@ mod tests {
             auto_follow_tags: false,
             fetch_all_tags: false,
             prune: false,
+            prune_tags: false,
             dry_run: false,
             append: false,
             write_fetch_head: true,
             tag_option_explicit: true,
             prune_option_explicit: true,
+            prune_tags_option_explicit: true,
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
