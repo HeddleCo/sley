@@ -8003,11 +8003,9 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
 }
 
 fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
-    // git accepts an empty value only for `--output-indicator-context` (it falls
-    // back to the default ' ' marker); empty `--output-indicator-{new,old}=` is
-    // rejected with exit 129, exactly like a single-byte check failing. Defer to
-    // the shared validator so the empty case errors byte-identically to git.
-    if value.is_empty() && option == "output-indicator-context" {
+    // git log accepts empty diff output indicators, unlike the raw diff option
+    // parser that requires a single byte.
+    if value.is_empty() {
         return Ok(());
     }
     log_validate_output_indicator(option, value)
@@ -8371,6 +8369,20 @@ enum SimpleLogRegexClassItem {
 
 impl SimpleLogRegex {
     fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
+        Self::parse_with_diagnostic_verbosity(
+            pattern,
+            error_context,
+            mode,
+            grep_source::RegexDiagnosticVerbosity::from_env(),
+        )
+    }
+
+    fn parse_with_diagnostic_verbosity(
+        pattern: &str,
+        error_context: &'static str,
+        mode: SimpleLogRegexMode,
+        diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    ) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
             let regex =
                 grep_source::Regex::compile(pattern, grep_source::RegexMode::Pcre, false, false)?;
@@ -8382,7 +8394,13 @@ impl SimpleLogRegex {
         let alternatives = match mode {
             SimpleLogRegexMode::Basic => split_log_regex_alternatives(pattern)
                 .into_iter()
-                .map(|alternative| SimpleLogRegexAlternative::parse(alternative, error_context))
+                .map(|alternative| {
+                    SimpleLogRegexAlternative::parse(
+                        alternative,
+                        error_context,
+                        diagnostic_verbosity,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?,
             SimpleLogRegexMode::Fixed => vec![SimpleLogRegexAlternative::parse_fixed(pattern)],
             SimpleLogRegexMode::Perl => unreachable!("handled above"),
@@ -8404,7 +8422,11 @@ impl SimpleLogRegex {
 }
 
 impl SimpleLogRegexAlternative {
-    fn parse(pattern: &str, error_context: &'static str) -> Result<Self> {
+    fn parse(
+        pattern: &str,
+        error_context: &'static str,
+        diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    ) -> Result<Self> {
         let mut bytes = pattern.as_bytes();
         let anchor_start = bytes.first().copied() == Some(b'^');
         if anchor_start {
@@ -8431,8 +8453,12 @@ impl SimpleLogRegexAlternative {
                     idx += 1;
                 }
                 b'[' => {
-                    let (class, consumed) =
-                        parse_simple_log_regex_class(&bytes[idx + 1..], pattern, error_context)?;
+                    let (class, consumed) = parse_simple_log_regex_class(
+                        &bytes[idx + 1..],
+                        pattern,
+                        error_context,
+                        diagnostic_verbosity,
+                    )?;
                     tokens.push(SimpleLogRegexToken::Class(class));
                     idx += consumed + 2;
                 }
@@ -8536,9 +8562,28 @@ fn parse_log_filter_patterns(
     patterns: &[LogFilterPattern],
     mode: SimpleLogRegexMode,
 ) -> Result<Vec<SimpleLogRegex>> {
+    parse_log_filter_patterns_with_diagnostic_verbosity(
+        patterns,
+        mode,
+        grep_source::RegexDiagnosticVerbosity::from_env(),
+    )
+}
+
+fn parse_log_filter_patterns_with_diagnostic_verbosity(
+    patterns: &[LogFilterPattern],
+    mode: SimpleLogRegexMode,
+    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+) -> Result<Vec<SimpleLogRegex>> {
     patterns
         .iter()
-        .map(|pattern| SimpleLogRegex::parse(&pattern.pattern, pattern.error_context, mode))
+        .map(|pattern| {
+            SimpleLogRegex::parse_with_diagnostic_verbosity(
+                &pattern.pattern,
+                pattern.error_context,
+                mode,
+                diagnostic_verbosity,
+            )
+        })
         .collect()
 }
 
@@ -8607,6 +8652,7 @@ fn parse_simple_log_regex_class(
     bytes: &[u8],
     pattern: &str,
     error_context: &'static str,
+    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
 ) -> Result<(SimpleLogRegexClass, usize)> {
     let mut end = None;
     for (idx, byte) in bytes.iter().enumerate() {
@@ -8616,7 +8662,12 @@ fn parse_simple_log_regex_class(
         }
     }
     let Some(end) = end else {
-        return log_regex_unterminated_class_error(bytes, pattern, error_context);
+        return log_regex_unterminated_class_error(
+            bytes,
+            pattern,
+            error_context,
+            diagnostic_verbosity,
+        );
     };
     let mut class = &bytes[..end];
     let negated = class.first().copied().is_some_and(|byte| byte == b'^');
@@ -8641,11 +8692,12 @@ fn log_regex_unterminated_class_error(
     _class_bytes: &[u8],
     pattern: &str,
     error_context: &str,
+    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
 ) -> Result<(SimpleLogRegexClass, usize)> {
     Err(grep_source::report_regex_compile_error(
         error_context,
         pattern,
-        grep_source::RegexDiagnosticVerbosity::from_env(),
+        diagnostic_verbosity,
         grep_source::RegexDiagnosticDetail::UnbalancedBrackets,
     ))
 }

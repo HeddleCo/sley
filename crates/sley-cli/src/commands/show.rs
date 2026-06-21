@@ -838,7 +838,8 @@ fn show_commit(
             .get_bool("log", None, "showroot")
             .unwrap_or(true)
     });
-    let needs_first_parent_entries = show_commit_needs_first_parent_entries(options, merge_mode);
+    let needs_first_parent_entries =
+        show_commit_needs_first_parent_entries(options, is_merge, merge_mode);
     let entries = if !needs_first_parent_entries || (commit.parents.is_empty() && !show_root) {
         Vec::new()
     } else {
@@ -882,8 +883,12 @@ fn show_commit(
 
 fn show_commit_needs_first_parent_entries(
     options: &ShowOptions,
+    is_merge: bool,
     merge_mode: ShowMergeMode,
 ) -> bool {
+    if !is_merge {
+        return true;
+    }
     // Combined merge patch/name output is derived from all parents in
     // `write_show_combined`. The first-parent entry list only feeds the stat
     // family, so avoid flattening and diffing two full trees for plain

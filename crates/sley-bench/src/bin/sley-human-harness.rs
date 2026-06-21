@@ -129,17 +129,26 @@ impl HarnessRepo {
     }
 
     fn status_short(&self, out: &mut impl Write) -> Result<(), GitError> {
-        sley_worktree::stream_short_status(&self.root, &self.git_dir, self.format, |entry| {
-            writeln!(
-                out,
-                "{}{} {}",
-                entry.index as char,
-                entry.worktree as char,
-                String::from_utf8_lossy(entry.path)
-            )
-            .map_err(|err| GitError::Io(err.to_string()))?;
-            Ok(sley_worktree::StreamControl::Continue)
-        })
+        sley_worktree::stream_short_status_with_options(
+            &self.root,
+            &self.git_dir,
+            self.format,
+            sley_worktree::ShortStatusOptions {
+                untracked_mode: sley_worktree::StatusUntrackedMode::Normal,
+                ..sley_worktree::ShortStatusOptions::default()
+            },
+            |entry| {
+                writeln!(
+                    out,
+                    "{}{} {}",
+                    entry.index as char,
+                    entry.worktree as char,
+                    String::from_utf8_lossy(entry.path)
+                )
+                .map_err(|err| GitError::Io(err.to_string()))?;
+                Ok(sley_worktree::StreamControl::Continue)
+            },
+        )
     }
 
     fn log_oneline(&self, out: &mut impl Write, count: usize) -> Result<(), GitError> {

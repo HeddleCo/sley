@@ -7456,15 +7456,17 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         return Ok(());
     }
     let ignore_len = context.ignores.patterns.len();
-    let entries = read_dir_names_with_ignore_patterns(
+    let mut entries = read_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
+    entries.sort_by_key(|entry| entry.file_name());
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
-        for file_name in entries {
+        for entry in entries {
+            let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
@@ -7482,9 +7484,9 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     if let Some(profile) = context.profile.as_deref_mut() {
                         profile.file_type_calls += 1;
                     }
-                    let path = dir.join(&file_name);
-                    let file_type = status_path_file_type(&path)?;
+                    let file_type = entry.file_type()?;
                     if file_type.is_dir() {
+                        let path = entry.path();
                         if !is_same_path(&path, context.git_dir) {
                             collect_status_untracked_paths(context, &path, &git_path, paths)?;
                         }
@@ -7494,8 +7496,7 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let path = dir.join(&file_name);
-                let file_type = status_path_file_type(&path)?;
+                let file_type = entry.file_type()?;
                 let is_dir = file_type.is_dir();
                 if file_type.is_file() || file_type.is_symlink() {
                     if !context.ignores.is_ignored_profiled(
@@ -7507,6 +7508,7 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     return Ok(());
                 } else if is_dir {
+                    let path = entry.path();
                     if context.ignores.is_ignored_profiled(
                         &git_path,
                         true,
@@ -7718,15 +7720,17 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         return Ok(());
     }
     let ignore_len = context.ignores.patterns.len();
-    let entries = read_dir_names_with_ignore_patterns(
+    let mut entries = read_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
+    entries.sort_by_key(|entry| entry.file_name());
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
-        for file_name in entries {
+        for entry in entries {
+            let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
@@ -7744,9 +7748,9 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     if let Some(profile) = context.profile.as_deref_mut() {
                         profile.file_type_calls += 1;
                     }
-                    let path = dir.join(&file_name);
-                    let file_type = status_path_file_type(&path)?;
+                    let file_type = entry.file_type()?;
                     if file_type.is_dir() {
+                        let path = entry.path();
                         if !is_same_path(&path, context.git_dir) {
                             count_status_untracked_paths(context, &path, &git_path, count)?;
                         }
@@ -7756,8 +7760,7 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let path = dir.join(&file_name);
-                let file_type = status_path_file_type(&path)?;
+                let file_type = entry.file_type()?;
                 let is_dir = file_type.is_dir();
                 if file_type.is_file() || file_type.is_symlink() {
                     if !context.ignores.is_ignored_profiled(
@@ -7769,6 +7772,7 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     return Ok(());
                 } else if is_dir {
+                    let path = entry.path();
                     if context.ignores.is_ignored_profiled(
                         &git_path,
                         true,
@@ -7860,15 +7864,17 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
         return Ok(false);
     }
     let ignore_len = context.ignores.patterns.len();
-    let entries = read_dir_names_with_ignore_patterns(
+    let mut entries = read_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
+    entries.sort_by_key(|entry| entry.file_name());
     let result = (|| -> Result<bool> {
         let mut git_path = dir_git_path.to_vec();
-        for file_name in entries {
+        for entry in entries {
+            let file_name = entry.file_name();
             if file_name == std::ffi::OsStr::new(".git") {
                 continue;
             }
@@ -7877,8 +7883,7 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let path = dir.join(&file_name);
-                let file_type = status_path_file_type(&path)?;
+                let file_type = entry.file_type()?;
                 let is_dir = file_type.is_dir();
                 if context.ignores.is_ignored_profiled(
                     &git_path,
@@ -7891,6 +7896,7 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
                     return Ok(Some(true));
                 }
                 if is_dir {
+                    let path = entry.path();
                     if is_same_path(&path, context.git_dir) {
                         return Ok(None);
                     }
@@ -7953,60 +7959,6 @@ fn read_dir_entries_with_ignore_patterns(
         read_per_directory_ignore_patterns_into_matcher(path, matcher, base, &source)?;
     }
     Ok(entries)
-}
-
-fn read_dir_names_with_ignore_patterns(
-    dir: &Path,
-    base: &[u8],
-    matcher: &mut IgnoreMatcher,
-    mut profile: Option<&mut StatusProfileCounters>,
-) -> Result<Vec<std::ffi::OsString>> {
-    let mut names = Vec::new();
-    let mut has_ignore_file = false;
-    if let Some(profile) = profile.as_deref_mut() {
-        profile.read_dir_calls += 1;
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.dir_entries_seen += 1;
-        }
-        if file_name == std::ffi::OsStr::new(".gitignore") {
-            has_ignore_file = true;
-        }
-        names.push(file_name);
-    }
-    if let Some(profile) = profile.as_deref_mut() {
-        profile.read_dir_name_vec_cap_bytes +=
-            (names.capacity() * std::mem::size_of::<std::ffi::OsString>()) as u64;
-        profile.read_dir_name_vec_max_len =
-            profile.read_dir_name_vec_max_len.max(names.len() as u64);
-        profile.read_dir_name_vec_max_cap = profile
-            .read_dir_name_vec_max_cap
-            .max(names.capacity() as u64);
-    }
-    if has_ignore_file {
-        read_directory_ignore_patterns_into_matcher(dir, base, matcher)?;
-    }
-    Ok(names)
-}
-
-fn read_directory_ignore_patterns_into_matcher(
-    dir: &Path,
-    base: &[u8],
-    matcher: &mut IgnoreMatcher,
-) -> Result<()> {
-    let mut source = base.to_vec();
-    if !source.is_empty() {
-        source.push(b'/');
-    }
-    source.extend_from_slice(b".gitignore");
-    read_per_directory_ignore_patterns_into_matcher(dir.join(".gitignore"), matcher, base, &source)
-}
-
-fn status_path_file_type(path: &Path) -> Result<fs::FileType> {
-    Ok(fs::symlink_metadata(path)?.file_type())
 }
 
 fn build_untracked_cache(
@@ -13589,7 +13541,9 @@ fn checkout_unmerge_resolve_undo_paths(
         }
     }
     if unmerged_any {
-        index.entries.sort_by(|left, right| left.path.cmp(&right.path));
+        index
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
         normalize_index_version_for_extended_flags(index);
         set_resolve_undo_extension(index, &remaining)?;
     }
@@ -13625,7 +13579,9 @@ fn checkout_pathspecs_match_git_path(
 }
 
 fn resolve_undo_index_entry(path: Vec<u8>, mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
-    let name_len = (path.len().min(sley_index::INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
+    let name_len = (path
+        .len()
+        .min(sley_index::INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
     IndexEntry {
         ctime_seconds: 0,
         ctime_nanoseconds: 0,

@@ -360,7 +360,10 @@ fn warn_describe_misnamed_tag(tag: &DescribeTag, options: &DescribeOptions) {
     if describe_tag_is_misnamed(tag, options)
         && let Some(name) = tag.annotated_name.as_deref()
     {
-        eprintln!("warning: tag '{}' is externally known as '{}'", tag.name, name);
+        eprintln!(
+            "warning: tag '{}' is externally known as '{}'",
+            tag.name, name
+        );
     }
 }
 
@@ -397,11 +400,9 @@ fn collect_describe_tags(
         // Priority mirrors git: annotated tag (2) > lightweight tag (1) > any
         // other ref such as a branch under `--all` (0).
         let (commit, prio, date, annotated_name) = match describe_peel_commit(db, format, oid)? {
-            DescribePeel::Annotated {
-                commit,
-                date,
-                name,
-            } if names.is_tag => (commit, 2, date, Some(name)),
+            DescribePeel::Annotated { commit, date, name } if names.is_tag => {
+                (commit, 2, date, Some(name))
+            }
             DescribePeel::Annotated { commit, .. } => {
                 (commit, 0, describe_commit_date(db, format, &commit)?, None)
             }
@@ -1089,7 +1090,10 @@ fn describe_blob(
     let head = match resolve_revision(git_dir, format, "HEAD") {
         Ok(oid) => oid,
         Err(_) => {
-            eprintln!("fatal: cannot search for blob '{}' on an unborn branch", blob.to_hex());
+            eprintln!(
+                "fatal: cannot search for blob '{}' on an unborn branch",
+                blob.to_hex()
+            );
             return Err(GitError::Exit(128));
         }
     };
@@ -1103,8 +1107,7 @@ fn describe_blob(
         let object = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &object.body)?;
         if let Some(path) = describe_find_blob_path(db, format, &commit.tree, blob)? {
-            let text =
-                describe_commit_text(format, db, options, abbrev, tags, &commit_oid, None)?;
+            let text = describe_commit_text(format, db, options, abbrev, tags, &commit_oid, None)?;
             println!("{text}:{path}");
             return Ok(());
         }

@@ -1181,7 +1181,9 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             }
             "--conflict" => {
                 let Some(value) = iter.next() else {
-                    return Err(GitError::Command("restore --conflict requires a value".into()));
+                    return Err(GitError::Command(
+                        "restore --conflict requires a value".into(),
+                    ));
                 };
                 conflict_style = Some(checkout_conflict_style(value)?);
                 conflict_implies_merge = true;
@@ -1440,10 +1442,11 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         )?;
     } else {
         let config = read_repo_config(&git_dir)?;
-        let conflict_style = conflict_style.unwrap_or_else(|| match config.get("merge", None, "conflictstyle") {
-            Some("diff3") | Some("zdiff3") => sley_worktree::CheckoutConflictStyle::Diff3,
-            _ => sley_worktree::CheckoutConflictStyle::Merge,
-        });
+        let conflict_style =
+            conflict_style.unwrap_or_else(|| match config.get("merge", None, "conflictstyle") {
+                Some("diff3") | Some("zdiff3") => sley_worktree::CheckoutConflictStyle::Diff3,
+                _ => sley_worktree::CheckoutConflictStyle::Merge,
+            });
         sley_worktree::checkout_index_paths(
             worktree_root,
             &git_dir,

@@ -4045,7 +4045,12 @@ fn parse_stash_list_filter_patterns(
     patterns: &[LogFilterPattern],
     mode: SimpleLogRegexMode,
 ) -> Result<Vec<SimpleLogRegex>> {
-    parse_log_filter_patterns(patterns, mode).map_err(|err| match err {
+    parse_log_filter_patterns_with_diagnostic_verbosity(
+        patterns,
+        mode,
+        grep_source::RegexDiagnosticVerbosity::Verbose,
+    )
+    .map_err(|err| match err {
         GitError::Exit(128) => GitError::Exit(1),
         err => err,
     })

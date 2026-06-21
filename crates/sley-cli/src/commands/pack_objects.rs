@@ -355,8 +355,12 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             stdout.write_all(&written.pack)?;
             stdout.flush()?;
-            let stats_line =
-                pack_objects_stats_line(written_total, written.delta_count, pack_reused, packs_reused);
+            let stats_line = pack_objects_stats_line(
+                written_total,
+                written.delta_count,
+                pack_reused,
+                packs_reused,
+            );
             emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
             return Ok(());
         }
@@ -388,12 +392,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     fs::write(format!("{base_name}-{checksum}.rev"), &reverse_index)?;
     fs::write(format!("{base_name}-{checksum}.idx"), &index_bytes)?;
     println!("{checksum}");
-    let stats_line = pack_objects_stats_line(
-        written_total,
-        result.delta_count,
-        pack_reused,
-        packs_reused,
-    );
+    let stats_line =
+        pack_objects_stats_line(written_total, result.delta_count, pack_reused, packs_reused);
     emit_pack_objects_totals(progress, &stats_line, pack_reused, packs_reused);
     Ok(())
 }
