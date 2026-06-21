@@ -443,7 +443,7 @@ declare -A FLOOR=(
     # codex-wave-5 (2026-06-17): lib new commands — repo-info t1900 full@38 / replay t3650@43.
     [t1900-repo-info.sh]=38
     [t2107-update-index-basic.sh]=10
-    [t7810-grep.sh]=249
+    [t7810-grep.sh]=251
     # codex-wave-4-recovery: notes merge t3309 enroll@31 / t3311 enroll@24 (full pass).
     [t3309-notes-merge-auto-resolve.sh]=31
     [t3311-notes-merge-fanout.sh]=24
@@ -559,7 +559,7 @@ declare -A FLOOR=(
     # 88->113; side gain t7406 54->57. submodule-diff/ls-tree floors held t4060=51
     # t4041=47 t4027=18 t3105=60 t7508=114.
     [t7400-submodule-basic.sh]=111
-    [t7506-status-submodule.sh]=34
+    [t7506-status-submodule.sh]=35
     # wave-26 (2026-06-21): protocol-v2 negotiation/ls-refs/fetch 21->38 (banked 36, 2-cell git:// handshake-flake margin);
     # wtstatus-ignore 8->25/25 (NEW floor+enroll); rev-parse-disambig 9->35 (NEW floor+enroll). Guards neutral:
     # t5700=9 t5701=25 t5601=109 t5516=111 t5510=7 t5526=39 t3600=81 t1500=81 t1502=37 t1507=29.
@@ -665,7 +665,7 @@ declare -A FLOOR=(
     # interaction regression): t4015=102, t4013=172, t7600=50, t5304=13, t6500-gc=14,
     # t7700-repack=17, t5319=77, t5324=11, t7508=114, t2107=10, t7008=5.
     [t7800-difftool.sh]=91
-    [t7610-mergetool.sh]=5
+    [t7610-mergetool.sh]=12
     # codex-wave-10 (untracked-cache UNTR extension): native read/write, update-index
     # toggles, status create/remove/keep, -uall/-unormal bypass, exclude-OID hashing,
     # mutation invalidation, trace2 perf, ident-mismatch, UNTR-preserve across rewrites.
@@ -689,7 +689,7 @@ declare -A FLOOR=(
     [t5702-protocol-v2.sh]=36
     [t7103-reset-bare.sh]=12
     [t7110-reset-merge.sh]=21
-    [t7201-co.sh]=37
+    [t7201-co.sh]=39
     # wave-8 engine-completion (2026-06-17): rebase-i sequencer (autosquash + fixup
     # -C/-c message machinery), update-ref --stdin ref-transaction hook + git-faithful
     # error surface, sparse-checkout builtin + the sparse-index collapse/expand format.
@@ -718,7 +718,7 @@ declare -A FLOOR=(
     # wave-2 submodule (2026-06-18, integ/submodule): t7401 22->25 (submodule-summary porcelain).
     [t7401-submodule-summary.sh]=25
     [t7407-submodule-foreach.sh]=21
-    [t7406-submodule-update.sh]=57
+    [t7406-submodule-update.sh]=60
     [t4203-mailmap.sh]=69
     # wave-12 (2026-06-17): repack/gc engine (geometric + cruft repack + gc orchestration),
     # diff indent-heuristic, reftable log-block engine. Incidental pack-floor gains bumped above
@@ -789,7 +789,7 @@ declare -A FLOOR=(
     # EXACTLY (t4205=110 t6022=13 t3206=45 t7600=83 — incl the commitporcelain↔logbloom
     # sley-rev/lib.rs overlap). Raises: t6423 41->52, t3200 134->145, t7800 69->91,
     # t4216 142->161.
-    [t7501-commit-basic-functionality.sh]=54
+    [t7501-commit-basic-functionality.sh]=60
     [t7507-commit-verbose.sh]=45
     [t7500-commit-template-squash-signoff.sh]=57
     [t3203-branch-output.sh]=41
