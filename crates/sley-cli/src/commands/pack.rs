@@ -1474,47 +1474,23 @@ fn midx_covers_current_packs(common_git_dir: &Path, format: ObjectFormat) -> Res
     Ok(midx_names == current)
 }
 
+#[derive(Debug, Default)]
+struct GcOptions {
+    quiet: bool,
+    auto: bool,
+    detach: Option<bool>,
+    force: bool,
+    skip_foreground_tasks: bool,
+    aggressive: bool,
+    keep_largest_pack: Option<bool>,
+    cruft_flag: Option<bool>,
+    prune_override: Option<Option<String>>,
+    max_cruft_size: Option<u64>,
+    expire_to: Option<String>,
+}
+
 pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
-    let mut quiet = false;
-    let mut auto = false;
-    // `--cruft` / `--no-cruft` override gc.cruftPacks; None means "use config".
-    let mut cruft_flag: Option<bool> = None;
-    // `--prune[=<date>]` / `--no-prune` override gc.pruneExpire. The sentinel
-    // distinguishes "not given" from an explicit value.
-    let mut prune_override: Option<Option<String>> = None;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => quiet = false,
-            "--cruft" => cruft_flag = Some(true),
-            "--no-cruft" => cruft_flag = Some(false),
-            "--prune" => prune_override = Some(Some("2.weeks.ago".to_string())),
-            "--no-prune" => prune_override = Some(None),
-            value if value.starts_with("--prune=") => {
-                prune_override = Some(Some(value["--prune=".len()..].to_string()));
-            }
-            // Accepted no-ops.
-            "--auto" => auto = true,
-            "--aggressive"
-            | "--force"
-            | "--detach"
-            | "--no-detach"
-            | "--skip-foreground-tasks"
-            | "--progress"
-            | "--no-progress"
-            | "--keep-largest-pack" => {}
-            value if value.starts_with("--max-cruft-size") || value.starts_with("--expire-to") => {}
-            value if value.starts_with('-') => {
-                return Err(GitError::Command(format!("unsupported gc option {value}")));
-            }
-            value => {
-                return Err(GitError::Command(format!(
-                    "unsupported gc argument {value}"
-                )));
-            }
-        }
-    }
+    let options = parse_gc_options(args)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -1522,13 +1498,14 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     validate_gc_prune_expire(&config, &common_git_dir)?;
 
     // gc.cruftPacks defaults to true (cruft packs are git's default since 2.42).
-    let cruft_packs = cruft_flag
+    let cruft_packs = options
+        .cruft_flag
         .or_else(|| config.get_bool("gc", None, "cruftPacks"))
         .unwrap_or(true);
 
     // gc.pruneExpire defaults to "2.weeks.ago"; --prune=<date>/--no-prune and the
     // config override it. None means "never prune" (`--no-prune`).
-    let prune_expire: Option<String> = match prune_override {
+    let prune_expire: Option<String> = match options.prune_override.clone() {
         Some(value) => value,
         None => Some(
             config
@@ -1538,45 +1515,199 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
         ),
     };
 
-    // gc_before_repack runs `reflog expire --all` unless BOTH gc.reflogExpire
-    // and gc.reflogExpireUnreachable are "never" (builtin/gc.c gc_config). The
-    // expire drops reflog entries pointing at unreachable history, which is what
-    // turns once-referenced commits into cruft for the repack below.
-    let reflog_expire_never = is_config_never(&config, "gc", "reflogExpire");
-    let reflog_unreachable_never = is_config_never(&config, "gc", "reflogExpireUnreachable");
-    if !(reflog_expire_never && reflog_unreachable_never) {
-        let mut expire_args = vec!["expire".to_string(), "--all".to_string()];
-        if reflog_expire_never {
-            expire_args.push("--expire=never".to_string());
+    let auto_mode = if options.auto {
+        match gc_auto_mode(&common_git_dir, format, &config)? {
+            Some(mode) => mode,
+            None => return Ok(()),
         }
-        if reflog_unreachable_never {
-            expire_args.push("--expire-unreachable=never".to_string());
+    } else {
+        GcAutoMode::Full
+    };
+    if options.auto {
+        if gc_recent_log_blocks_auto(&common_git_dir, &config)? {
+            return Ok(());
         }
-        // Best-effort: a reflog-expire failure must not abort the whole gc.
-        let _ = commands::refs::cmd_reflog(&expire_args);
+        if gc_lock_held(&common_git_dir)? && !options.force {
+            return Ok(());
+        }
+        if commands::hooks::run_hook("pre-auto-gc", commands::hooks::HookRun::default()).is_err() {
+            return Ok(());
+        }
+        if !options.quiet {
+            if gc_should_detach(&config, options.detach) {
+                eprintln!("Auto packing the repository in background for optimum performance.");
+            } else {
+                eprintln!("Auto packing the repository for optimum performance.");
+            }
+            eprintln!("See \"git help gc\" for manual housekeeping.");
+        }
+    } else if gc_lock_held(&common_git_dir)? && !options.force {
+        eprintln!("fatal: gc is already running");
+        return Err(GitError::Exit(128));
+    }
+
+    gc_write_pid(&common_git_dir)?;
+    let result = gc_run_locked(
+        &git_dir,
+        &common_git_dir,
+        format,
+        &config,
+        &options,
+        cruft_packs,
+        prune_expire,
+        auto_mode,
+    );
+    let _ = fs::remove_file(common_git_dir.join("gc.pid"));
+    if result.is_ok() && !options.auto {
+        let _ = fs::remove_file(common_git_dir.join("gc.log"));
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gc_run_locked(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    options: &GcOptions,
+    cruft_packs: bool,
+    prune_expire: Option<String>,
+    auto_mode: GcAutoMode,
+) -> Result<()> {
+    if !options.skip_foreground_tasks {
+        gc_before_repack(git_dir, common_git_dir, format, config)?;
     }
 
     let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
+    let keep_pack_stems = gc_keep_pack_stems(common_git_dir, config, options)?;
 
     // builtin/gc.c add_repack_all_option: pick the repack flavour.
-    if prune_expire.as_deref() == Some("now") && cruft_packs {
-        // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
-        if let Some(result) = sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)? {
+    if auto_mode == GcAutoMode::Incremental {
+        trace_gc_repack(&["repack", "-d", "-l", "--no-write-bitmap-index"]);
+        if let Some(result) = sley_odb::repack_loose_objects(&common_git_dir, format)? {
             sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
         }
+    } else if prune_expire.as_deref() == Some("now") && !(cruft_packs && options.expire_to.is_some()) {
+        // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
+        trace_gc_repack(&["repack", "-d", "-l", "-a"]);
+        let repack_options = sley_odb::RepackOptions {
+            local: false,
+            pack_kept_objects: false,
+            keep_pack_stems,
+        };
+        if let Some(result) = sley_odb::repack_reachable_objects_with_options(
+            &common_git_dir,
+            format,
+            &roots,
+            &repack_options,
+        )? {
+            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+        }
+        gc_remove_cruft_packs(&common_git_dir)?;
     } else if cruft_packs {
         // Default: reachable pack + cruft pack, cruft expiry = prune_expire.
         let cruft_expiration = match prune_expire.as_deref() {
             Some(spec) => parse_cruft_expiration(spec)?,
             None => None,
         };
-        let result = sley_odb::repack_cruft(&common_git_dir, format, &roots, cruft_expiration)?;
+        let mut trace_args = vec!["repack", "-d", "-l", "--cruft"];
+        let cruft_expiration_arg;
+        if let Some(spec) = prune_expire.as_deref() {
+            cruft_expiration_arg = format!("--cruft-expiration={spec}");
+            trace_args.push(&cruft_expiration_arg);
+        }
+        let max_cruft_size_arg;
+        if let Some(size) = options.max_cruft_size.or_else(|| gc_config_u64(config, "maxCruftSize")) {
+            max_cruft_size_arg = format!("--max-cruft-size={size}");
+            trace_args.push(&max_cruft_size_arg);
+        }
+        let expire_to_arg;
+        if let Some(expire_to) = options.expire_to.as_deref() {
+            expire_to_arg = format!("--expire-to={expire_to}");
+            trace_args.push(&expire_to_arg);
+        }
+        let filter_arg;
+        if let Some(filter) = config.get("gc", None, "repackFilter") {
+            filter_arg = format!("--filter={filter}");
+            trace_args.push(&filter_arg);
+        }
+        let filter_to_arg;
+        if let Some(filter_to) = config.get("gc", None, "repackFilterTo") {
+            filter_to_arg = format!("--filter-to={filter_to}");
+            trace_args.push(&filter_to_arg);
+        }
+        trace_gc_repack(&trace_args);
+        let repack_options = sley_odb::RepackOptions {
+            local: false,
+            pack_kept_objects: false,
+            keep_pack_stems,
+        };
+        let result = sley_odb::repack_cruft_with_options(
+            &common_git_dir,
+            format,
+            &roots,
+            cruft_expiration,
+            &repack_options,
+        )?;
         sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
+        if let Some(expire_to) = options.expire_to.as_deref() {
+            if let Some(cruft) = result.cruft.as_ref() {
+                write_expire_to_cruft_pack(
+                    &common_git_dir,
+                    format,
+                    expire_to,
+                    &cruft.oids,
+                    cruft_expiration,
+                )?;
+            }
+        }
     } else {
         // gc.cruftPacks=false: repack reachable objects, then prune loose
         // unreachable objects older than gc.pruneExpire/--prune.
-        if let Some(result) = sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)? {
-            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+        let mut trace_args = vec!["repack", "-d", "-l", "-A"];
+        let unpack_unreachable_arg;
+        if let Some(spec) = prune_expire.as_deref() {
+            unpack_unreachable_arg = format!("--unpack-unreachable={spec}");
+            trace_args.push(&unpack_unreachable_arg);
+        }
+        let filter_arg;
+        if let Some(filter) = config.get("gc", None, "repackFilter") {
+            filter_arg = format!("--filter={filter}");
+            trace_args.push(&filter_arg);
+        }
+        let filter_to_arg;
+        if let Some(filter_to) = config.get("gc", None, "repackFilterTo") {
+            filter_to_arg = format!("--filter-to={filter_to}");
+            trace_args.push(&filter_to_arg);
+        }
+        trace_gc_repack(&trace_args);
+        let filtered_repack = config.get("gc", None, "repackFilter") == Some("blob:none");
+        if filtered_repack {
+            gc_repack_blob_none_filter(
+                &common_git_dir,
+                format,
+                &roots,
+                options.expire_to.as_deref(),
+                config.get("gc", None, "repackFilterTo"),
+            )?;
+        } else {
+            let repack_options = sley_odb::RepackOptions {
+                local: false,
+                pack_kept_objects: false,
+                keep_pack_stems,
+            };
+            if let Some(result) = sley_odb::repack_reachable_objects_with_options(
+                &common_git_dir,
+                format,
+                &roots,
+                &repack_options,
+            )? {
+                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+            }
+        }
+        if filtered_repack {
+            return Ok(());
         }
         if let Some(spec) = prune_expire.as_deref() {
             let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
@@ -1592,13 +1723,477 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
 
     let store = FileRefStore::new(&common_git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
-    if auto && store.uses_reftable()? && store.reftable_table_count()? > 2 {
+    if options.auto && store.uses_reftable()? && store.reftable_table_count()? > 2 {
         store.compact_reftable_stack()?;
     }
     gc_clean_pack_garbage(&repository_objects_dir(&common_git_dir).join("pack"))?;
+    crate::commands::refs::cmd_update_server_info(&[])?;
+    if gc_write_commit_graph(config) {
+        let progress = if gc_progress_requested(options) {
+            "--progress"
+        } else {
+            "--no-progress"
+        };
+        trace2_child_start(&["commit-graph", "write", "--reachable", progress]);
+        commands::plumbing::cmd_commit_graph(&[
+            "write".to_string(),
+            "--reachable".to_string(),
+            progress.to_string(),
+        ])?;
+    }
+    if options.auto && gc_too_many_loose_objects(&common_git_dir, format, config)? {
+        eprintln!("warning: There are too many unreachable loose objects; run 'git prune' to remove them.");
+    }
 
-    let _ = quiet;
     Ok(())
+}
+
+fn parse_gc_options(args: &[String]) -> Result<GcOptions> {
+    let mut options = GcOptions::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-q" | "--quiet" => options.quiet = true,
+            "--no-quiet" => options.quiet = false,
+            "--auto" => options.auto = true,
+            "--no-auto" => options.auto = false,
+            "--detach" => options.detach = Some(true),
+            "--no-detach" => options.detach = Some(false),
+            "--force" => options.force = true,
+            "--no-force" => options.force = false,
+            "--skip-foreground-tasks" => options.skip_foreground_tasks = true,
+            "--aggressive" => options.aggressive = true,
+            "--no-aggressive" => options.aggressive = false,
+            "--keep-largest-pack" => options.keep_largest_pack = Some(true),
+            "--no-keep-largest-pack" => options.keep_largest_pack = Some(false),
+            "--cruft" => options.cruft_flag = Some(true),
+            "--no-cruft" => options.cruft_flag = Some(false),
+            "--prune" => options.prune_override = Some(Some("2.weeks.ago".to_string())),
+            "--no-prune" => options.prune_override = Some(None),
+            "--max-cruft-size" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `max-cruft-size' requires a value");
+                    return gc_usage();
+                };
+                options.max_cruft_size = Some(parse_gc_size(value)?);
+            }
+            "--expire-to" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `expire-to' requires a value");
+                    return gc_usage();
+                };
+                options.expire_to = Some(value.to_string());
+            }
+            "--progress" | "--no-progress" => {}
+            value if let Some(value) = long_option_value(value, "prune") => {
+                options.prune_override = Some(Some(value.to_string()));
+            }
+            value if let Some(value) = long_option_value(value, "max-cruft-size") => {
+                options.max_cruft_size = Some(parse_gc_size(value)?);
+            }
+            value if let Some(value) = long_option_value(value, "expire-to") => {
+                options.expire_to = Some(value.to_string());
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                return gc_usage();
+            }
+            _ => return gc_usage(),
+        }
+    }
+    Ok(options)
+}
+
+fn gc_usage<T>() -> Result<T> {
+    eprintln!("usage: git gc [<options>]");
+    eprintln!();
+    eprintln!("    -q, --[no-]quiet      suppress progress reporting");
+    eprintln!("    --[no-]prune[=<date>] prune unreferenced objects");
+    eprintln!("    --[no-]cruft          pack unreferenced objects separately");
+    eprintln!("    --[no-]aggressive     be more thorough (increased runtime)");
+    eprintln!("    --[no-]auto           enable auto-gc mode");
+    eprintln!("    --[no-]detach         perform garbage collection in the background");
+    eprintln!("    --[no-]force          force running gc even if there may be another gc running");
+    eprintln!("    --[no-]keep-largest-pack");
+    eprintln!("                          repack all other packs except the largest pack");
+    Err(GitError::Exit(129))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcAutoMode {
+    Full,
+    Incremental,
+}
+
+fn gc_auto_mode(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Option<GcAutoMode>> {
+    if gc_config_i64(config, "auto").unwrap_or(6700) <= 0 {
+        return Ok(None);
+    }
+    if gc_too_many_packs(common_git_dir, config)? {
+        Ok(Some(GcAutoMode::Full))
+    } else if gc_too_many_loose_objects(common_git_dir, format, config)? {
+        Ok(Some(GcAutoMode::Incremental))
+    } else {
+        Ok(None)
+    }
+}
+
+fn gc_too_many_packs(common_git_dir: &Path, config: &GitConfig) -> Result<bool> {
+    let limit = gc_config_i64(config, "autoPackLimit").unwrap_or(50);
+    if limit <= 0 {
+        return Ok(false);
+    }
+    let mut count = 0i64;
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    if let Ok(entries) = fs::read_dir(pack_dir) {
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("pack")
+                && !path.with_extension("keep").exists()
+            {
+                count += 1;
+            }
+        }
+    }
+    Ok(count > limit)
+}
+
+fn gc_too_many_loose_objects(
+    common_git_dir: &Path,
+    _format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<bool> {
+    let limit = gc_config_i64(config, "auto").unwrap_or(6700);
+    if limit <= 0 {
+        return Ok(false);
+    }
+    let threshold = ((limit + 255) / 256) * 256;
+    let sampled = gc_loose_fanout_count(common_git_dir, "17")?.saturating_mul(256);
+    Ok(sampled > threshold as u64)
+}
+
+fn gc_loose_fanout_count(common_git_dir: &Path, fanout: &str) -> Result<u64> {
+    let dir = repository_objects_dir(common_git_dir).join(fanout);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn gc_before_repack(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<()> {
+    if gc_pack_refs(config, common_git_dir)? {
+        crate::setup::git_trace_line("builtin/gc.c:0", "trace: built-in: git pack-refs --all --prune");
+        commands::pack::cmd_pack_refs(&["--all".to_string(), "--prune".to_string()])?;
+    }
+    let reflog_expire_never = is_config_never(config, "gc", "reflogExpire");
+    let reflog_unreachable_never = is_config_never(config, "gc", "reflogExpireUnreachable");
+    if !(reflog_expire_never && reflog_unreachable_never) {
+        let mut expire_args = vec!["expire".to_string(), "--all".to_string()];
+        if reflog_expire_never {
+            expire_args.push("--expire=never".to_string());
+        }
+        if reflog_unreachable_never {
+            expire_args.push("--expire-unreachable=never".to_string());
+        }
+        crate::setup::git_trace_line(
+            "builtin/gc.c:0",
+            &format!("trace: built-in: git reflog {}", expire_args.join(" ")),
+        );
+        let _ = commands::refs::cmd_reflog(&expire_args);
+    }
+    let _ = (git_dir, format);
+    Ok(())
+}
+
+fn gc_pack_refs(config: &GitConfig, common_git_dir: &Path) -> Result<bool> {
+    if let Some(value) = config.get("gc", None, "packRefs") {
+        if value.eq_ignore_ascii_case("notbare") {
+            return Ok(sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_some());
+        }
+    }
+    Ok(config.get_bool("gc", None, "packRefs").unwrap_or(true))
+}
+
+fn gc_keep_pack_stems(
+    common_git_dir: &Path,
+    config: &GitConfig,
+    options: &GcOptions,
+) -> Result<HashSet<String>> {
+    if options.keep_largest_pack == Some(false) {
+        return Ok(HashSet::new());
+    }
+    if options.keep_largest_pack == Some(true) {
+        return Ok(gc_largest_pack_stem(common_git_dir)?.into_iter().collect());
+    }
+    let Some(threshold) = gc_config_u64(config, "bigPackThreshold") else {
+        return Ok(HashSet::new());
+    };
+    Ok(gc_pack_stems_at_least(common_git_dir, threshold)?)
+}
+
+fn gc_repack_blob_none_filter(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    cli_expire_to: Option<&str>,
+    config_filter_to: Option<&str>,
+) -> Result<()> {
+    let before = gc_pack_stems(common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let destination = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let excluded = HashSet::new();
+    let installed = sley_odb::build_and_install_reachable_pack_filtered(
+        &db,
+        &destination,
+        format,
+        roots.iter().copied(),
+        &excluded,
+        sley_odb::RawPackInstallOptions::default(),
+        Some(sley_odb::PackObjectFilter::BlobNone),
+        None,
+    )?;
+
+    let filter_to = config_filter_to.or(cli_expire_to);
+    if let Some(filter_to) = filter_to {
+        gc_write_filtered_blobs(common_git_dir, format, roots, filter_to)?;
+        let keep = installed.map(|pack| pack.pack_name).unwrap_or_default();
+        gc_remove_pack_stems(common_git_dir, &before, &keep)?;
+    }
+    Ok(())
+}
+
+fn gc_write_filtered_blobs(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    filter_to: &str,
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let reachable = collect_reachable_object_ids(&db, format, roots.iter().copied())?;
+    let mut objects = Vec::new();
+    for oid in reachable {
+        let object = match db.read_object(&oid) {
+            Ok(object) if object.object_type == ObjectType::Blob => object,
+            _ => continue,
+        };
+        objects.push((oid, object));
+    }
+    if objects.is_empty() {
+        return Ok(());
+    }
+    objects.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let inputs = objects
+        .iter()
+        .map(|(oid, object)| PackInput {
+            oid,
+            object: object.as_ref(),
+        })
+        .collect::<Vec<_>>();
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_dir = gc_filter_to_object_dir(filter_to)?;
+    FileObjectDatabase::new(object_dir, format).install_pack(&written)?;
+    Ok(())
+}
+
+fn gc_filter_to_object_dir(filter_to: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(filter_to);
+    let pack_dir = path
+        .parent()
+        .ok_or_else(|| GitError::InvalidPath(format!("invalid filter-to path '{filter_to}'")))?;
+    let object_dir = pack_dir
+        .parent()
+        .ok_or_else(|| GitError::InvalidPath(format!("invalid filter-to path '{filter_to}'")))?;
+    Ok(object_dir.to_path_buf())
+}
+
+fn gc_pack_stems(common_git_dir: &Path) -> Result<HashSet<String>> {
+    Ok(gc_non_cruft_pack_stems(common_git_dir)?
+        .into_iter()
+        .map(|(stem, _)| stem)
+        .collect())
+}
+
+fn gc_remove_pack_stems(
+    common_git_dir: &Path,
+    stems: &HashSet<String>,
+    keep_stem: &str,
+) -> Result<()> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    for stem in stems {
+        if stem == keep_stem {
+            continue;
+        }
+        for ext in ["pack", "idx", "rev", "bitmap"] {
+            let path = pack_dir.join(format!("{stem}.{ext}"));
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(GitError::Io(err.to_string())),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gc_largest_pack_stem(common_git_dir: &Path) -> Result<Option<String>> {
+    let mut best: Option<(u64, String)> = None;
+    for (stem, size) in gc_non_cruft_pack_stems(common_git_dir)? {
+        if best.as_ref().is_none_or(|(best_size, _)| size > *best_size) {
+            best = Some((size, stem));
+        }
+    }
+    Ok(best.map(|(_, stem)| stem))
+}
+
+fn gc_pack_stems_at_least(common_git_dir: &Path, threshold: u64) -> Result<HashSet<String>> {
+    let mut stems = HashSet::new();
+    for (stem, size) in gc_non_cruft_pack_stems(common_git_dir)? {
+        if size >= threshold {
+            stems.insert(stem);
+        }
+    }
+    Ok(stems)
+}
+
+fn gc_non_cruft_pack_stems(common_git_dir: &Path) -> Result<Vec<(String, u64)>> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return Ok(Vec::new());
+    };
+    let mut packs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("pack")
+            || path.with_extension("mtimes").exists()
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        packs.push((stem.to_string(), entry.metadata()?.len()));
+    }
+    Ok(packs)
+}
+
+fn gc_write_commit_graph(config: &GitConfig) -> bool {
+    config
+        .get_bool("gc", None, "writeCommitGraph")
+        .or_else(|| config.get_bool("core", None, "commitGraph"))
+        .unwrap_or(true)
+}
+
+fn gc_progress_requested(options: &GcOptions) -> bool {
+    !options.quiet && env::var("GIT_PROGRESS_DELAY").ok().as_deref() == Some("0")
+}
+
+fn gc_should_detach(config: &GitConfig, detach: Option<bool>) -> bool {
+    detach.unwrap_or_else(|| config.get_bool("gc", None, "autoDetach").unwrap_or(true))
+}
+
+fn gc_recent_log_blocks_auto(common_git_dir: &Path, config: &GitConfig) -> Result<bool> {
+    let path = common_git_dir.join("gc.log");
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Ok(false);
+    };
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+    let expiry = config.get("gc", None, "logExpiry").unwrap_or("1.day.ago");
+    let cutoff = parse_reflog_expire_time(expiry, "gc.logExpiry")?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    if modified >= cutoff {
+        eprintln!(
+            "warning: The last gc run reported the following. Please correct the root cause\nand remove {}\nAutomatic cleanup will not be performed until the file is removed.\n\n{}",
+            path.display(),
+            fs::read_to_string(&path).unwrap_or_default()
+        );
+        Ok(true)
+    } else {
+        let _ = fs::remove_file(path);
+        Ok(false)
+    }
+}
+
+fn gc_lock_held(common_git_dir: &Path) -> Result<bool> {
+    let path = common_git_dir.join("gc.pid");
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(u64::MAX);
+    Ok(modified <= 12 * 60 * 60)
+}
+
+fn gc_write_pid(common_git_dir: &Path) -> Result<()> {
+    let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+    fs::write(common_git_dir.join("gc.pid"), format!("{} {host}", std::process::id()))?;
+    Ok(())
+}
+
+fn trace_gc_repack(args: &[&str]) {
+    crate::setup::git_trace_line(
+        "builtin/gc.c:0",
+        &format!("trace: built-in: git {}", args.join(" ")),
+    );
+    trace2_child_start(args);
+}
+
+fn gc_config_i64(config: &GitConfig, key: &str) -> Option<i64> {
+    config.get("gc", None, key)?.parse().ok()
+}
+
+fn gc_config_u64(config: &GitConfig, key: &str) -> Option<u64> {
+    config
+        .get("gc", None, key)
+        .and_then(|value| parse_gc_size(value).ok())
+}
+
+fn parse_gc_size(value: &str) -> Result<u64> {
+    let (digits, suffix) = value.trim().split_at(
+        value
+            .trim()
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(value.trim().len()),
+    );
+    let mut size = digits
+        .parse::<u64>()
+        .map_err(|_| GitError::Command(format!("bad numeric config value '{value}'")))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        _ => return Err(GitError::Command(format!("bad numeric config value '{value}'"))),
+    };
+    size = size.saturating_mul(multiplier);
+    Ok(size)
 }
 
 pub(crate) fn cmd_maintenance(args: &[String]) -> Result<()> {
@@ -4330,6 +4925,33 @@ fn gc_clean_pack_garbage(pack_dir: &Path) -> Result<()> {
             remove_pack_garbage_file(idx)?;
             if let Some(keep) = &stem.keep {
                 remove_pack_garbage_file(keep)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gc_remove_cruft_packs(common_git_dir: &Path) -> Result<()> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(());
+    };
+    let mut stems = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("mtimes")
+            && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+        {
+            stems.push(stem.to_string());
+        }
+    }
+    for stem in stems {
+        for ext in ["pack", "idx", "rev", "mtimes", "bitmap"] {
+            let path = pack_dir.join(format!("{stem}.{ext}"));
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(GitError::Io(err.to_string())),
             }
         }
     }

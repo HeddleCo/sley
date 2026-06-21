@@ -7970,8 +7970,10 @@ fn commit_graph_from_starts(
     if progress {
         let count = entries.len();
         // git drives several delayed progress meters during a write; emit the
-        // generation-number + write-out lines (always) and the changed-path
-        // Bloom-filter line (only when changed-path filters are computed).
+        // reachable-collection, generation-number, and write-out lines
+        // (always) and the changed-path Bloom-filter line (only when
+        // changed-path filters are computed).
+        eprintln!("Collecting referenced commits: {count}, done.");
         if changed_paths {
             eprintln!(
                 "Computing commit changed paths Bloom filters: 100% ({count}/{count}), done."
