@@ -26,8 +26,8 @@ use sley_odb::{
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_pathspec::{
     LsFilesPathFilter, PathspecAttributeCheck, PathspecAttributeState,
-    parse_normalized_pathspec_element, pathspec_attrs_match_with,
-    pathspec_filters_have_include, pathspec_filters_match, pathspec_filters_match_with,
+    parse_normalized_pathspec_element, pathspec_attrs_match_with, pathspec_filters_have_include,
+    pathspec_filters_match, pathspec_filters_match_with,
 };
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
@@ -38,14 +38,14 @@ use sley_protocol::{
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
 };
 pub(crate) use sley_ref_filter::*;
-pub(crate) use sley_rev::revlist::*;
 use sley_refs::{
     BundleRefUpdate, FileRefStore, PackRefDecision, Ref, RefPrecondition, RefTarget,
-    RefTransactionHookUpdate, RefTransactionPhase, RefUpdate, ReferenceTransactionHook, ReflogEntry,
-    branch_ref_name, check_refname_format, parse_packed_refs, resolve_ref_peeled, tag_ref_name,
-    validate_ref_name, validate_symref_name, validate_symref_target,
+    RefTransactionHookUpdate, RefTransactionPhase, RefUpdate, ReferenceTransactionHook,
+    ReflogEntry, branch_ref_name, check_refname_format, parse_packed_refs, resolve_ref_peeled,
+    tag_ref_name, validate_ref_name, validate_symref_name, validate_symref_target,
 };
 use sley_remote::FetchOutcome;
+pub(crate) use sley_rev::revlist::*;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -134,6 +134,7 @@ pub(crate) use log_format::{CompiledLogFormat, FormatToken, LogFormatDialect, pr
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
+pub(crate) use commands::checkout::cmd_checkout;
 pub(crate) use commands::config_cmd::{config_entry_name, has_unescaped_trailing_dollar};
 pub(crate) use commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, conclude_in_progress_merge,
@@ -144,9 +145,8 @@ pub(crate) use commands::merge_rebase::{
 pub(crate) use commands::remote_cmds::{
     read_repo_config, remote_exists, remote_names, repo_current_branch_name, write_repo_config,
 };
-use commands::tag::tag_stripspace_message;
-pub(crate) use commands::checkout::cmd_checkout;
 pub(crate) use commands::status::cmd_status;
+use commands::tag::tag_stripspace_message;
 pub(crate) use repo_path::RepoPathBuf;
 pub(crate) use repository::RepositoryContext;
 
@@ -792,9 +792,7 @@ pub(crate) fn attribute_checks_for_matching(
             state: check.state.map(|state| match state {
                 sley_worktree::AttributeState::Set => PathspecAttributeState::Set,
                 sley_worktree::AttributeState::Unset => PathspecAttributeState::Unset,
-                sley_worktree::AttributeState::Value(value) => {
-                    PathspecAttributeState::Value(value)
-                }
+                sley_worktree::AttributeState::Value(value) => PathspecAttributeState::Value(value),
             }),
         })
         .collect()
@@ -1497,7 +1495,11 @@ fn print_reset_hard_head(
     let reencoded = log_reencode_message(commit.message, &from, &to);
     let subject = commit_subject_bytes(&reencoded);
     let mut stdout = io::stdout().lock();
-    write!(stdout, "HEAD is now at {} ", format_log_abbrev_oid(commit_oid))?;
+    write!(
+        stdout,
+        "HEAD is now at {} ",
+        format_log_abbrev_oid(commit_oid)
+    )?;
     stdout.write_all(subject)?;
     writeln!(stdout)?;
     Ok(())
@@ -1704,12 +1706,7 @@ fn print_tree_entry_to_writer(
         write_tree_path(writer, path, options)?;
     } else {
         let object_type = tree_entry_object_type(entry.mode());
-        write!(
-            writer,
-            "{:06o} {} ",
-            entry.mode(),
-            object_type.as_str()
-        )?;
+        write!(writer, "{:06o} {} ", entry.mode(), object_type.as_str())?;
         write_tree_oid(writer, entry.oid(), options)?;
         if options.long {
             let size = tree_entry_size_field(db, object_type, entry.oid())?;
@@ -2825,7 +2822,9 @@ pub(crate) fn write_diff_patch_entry(
     {
         let ignore_regexes = options.ignore_regexes;
         let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
-            ignore_regexes.iter().any(|re| re.is_match_with_case(line, false))
+            ignore_regexes
+                .iter()
+                .any(|re| re.is_match_with_case(line, false))
         });
         let change_ignore = (options.ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
             sley_diff_merge::render::ChangeIgnore {
@@ -4253,7 +4252,8 @@ fn write_submodule_patch_entry(
     .filter(|_| entry.new_mode == Some(0o160000))
     .unwrap_or_else(|| ObjectId::null(options.format));
 
-    let diff_dirty_only = options.submodule_format == commands::diff_options::SubmoduleDiffFormat::Diff
+    let diff_dirty_only = options.submodule_format
+        == commands::diff_options::SubmoduleDiffFormat::Diff
         && dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0;
     if old_oid == new_oid && !diff_dirty_only {
         return Ok(());
@@ -4267,7 +4267,10 @@ fn write_submodule_patch_entry(
         .and_then(|root| submodule_git_dir_for_path(options.db, root, &entry.path));
     let (sub_format, sub_db) = match sub_git_dir.as_deref() {
         Some(git_dir) => match repository_object_format(git_dir) {
-            Ok(format) => (Some(format), Some(FileObjectDatabase::from_git_dir(git_dir, format))),
+            Ok(format) => (
+                Some(format),
+                Some(FileObjectDatabase::from_git_dir(git_dir, format)),
+            ),
             Err(_) => (None, None),
         },
         None => (None, None),
@@ -4311,10 +4314,16 @@ fn write_submodule_patch_entry(
     let new_abbrev = submodule_abbrev(&new_oid);
     match message {
         Some(message) => {
-            writeln!(stdout, "Submodule {path} {old_abbrev}{range}{new_abbrev} {message}")?;
+            writeln!(
+                stdout,
+                "Submodule {path} {old_abbrev}{range}{new_abbrev} {message}"
+            )?;
         }
         None if rewind => {
-            writeln!(stdout, "Submodule {path} {old_abbrev}{range}{new_abbrev} (rewind):")?;
+            writeln!(
+                stdout,
+                "Submodule {path} {old_abbrev}{range}{new_abbrev} (rewind):"
+            )?;
         }
         None => {
             writeln!(stdout, "Submodule {path} {old_abbrev}{range}{new_abbrev}:")?;
@@ -4397,7 +4406,10 @@ fn submodule_symmetric_records(
     let left = sley_rev::walk_commits(db, db.object_format(), [*old_oid])?;
     let right = sley_rev::walk_commits(db, db.object_format(), [*new_oid])?;
     let left_set = left.iter().map(|record| record.oid).collect::<HashSet<_>>();
-    let right_set = right.iter().map(|record| record.oid).collect::<HashSet<_>>();
+    let right_set = right
+        .iter()
+        .map(|record| record.oid)
+        .collect::<HashSet<_>>();
     let mut marked = Vec::new();
     marked.extend(
         right
@@ -4484,7 +4496,8 @@ fn write_submodule_inline_diff(
     if dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
         && let Some(sub_root) = nested_worktree_root.as_deref()
     {
-        let Some(sub_git_dir) = submodule_git_dir_for_path(options.db, sub_root, &entry.path) else {
+        let Some(sub_git_dir) = submodule_git_dir_for_path(options.db, sub_root, &entry.path)
+        else {
             return Ok(());
         };
         let submodule_dirt = submodule_collect_patch_dirt(sub_root, &sub_git_dir, sub_format)?;
@@ -4628,7 +4641,9 @@ pub(crate) fn diff_entry_produces_output(
         return Ok(true);
     }
     let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
-        ignore_regexes.iter().any(|re| re.is_match_with_case(line, false))
+        ignore_regexes
+            .iter()
+            .any(|re| re.is_match_with_case(line, false))
     });
     let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
         sley_diff_merge::render::ChangeIgnore {
@@ -4858,11 +4873,9 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         .get("extensions", None, "partialclone")
         .map(str::to_string)
         .or_else(|| {
-            remote_names(&config).into_iter().find(|name| {
-                config
-                    .get_bool("remote", Some(name), "promisor")
-                    == Some(true)
-            })
+            remote_names(&config)
+                .into_iter()
+                .find(|name| config.get_bool("remote", Some(name), "promisor") == Some(true))
         })
     else {
         return Ok(false);
@@ -4909,7 +4922,10 @@ enum DiffLineStats {
         new_size: usize,
         unchanged: bool,
     },
-    Text { inserted: usize, deleted: usize },
+    Text {
+        inserted: usize,
+        deleted: usize,
+    },
 }
 
 fn diff_line_stats(old: Option<&[u8]>, new: Option<&[u8]>) -> DiffLineStats {
@@ -4962,10 +4978,7 @@ fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     }
     let mut old_end = old_lines.len();
     let mut new_end = new_lines.len();
-    while old_end > prefix
-        && new_end > prefix
-        && old_lines[old_end - 1] == new_lines[new_end - 1]
-    {
+    while old_end > prefix && new_end > prefix && old_lines[old_end - 1] == new_lines[new_end - 1] {
         old_end -= 1;
         new_end -= 1;
     }
@@ -5228,7 +5241,8 @@ impl DiffPathspec {
             filters.push(LsFilesPathFilter {
                 original: arg.clone(),
                 recursive,
-                is_glob: !element.magic().literal && sley_worktree::pathspec_is_glob(element.pattern()),
+                is_glob: !element.magic().literal
+                    && sley_worktree::pathspec_is_glob(element.pattern()),
                 element,
                 matched: Cell::new(false),
             });
@@ -5283,10 +5297,7 @@ fn diff_relative_depth_from_spec(spec: &[u8], path: &[u8]) -> Option<i64> {
     if path == spec {
         return Some(0);
     }
-    if path.len() > spec.len()
-        && path.starts_with(spec)
-        && path.get(spec.len()) == Some(&b'/')
-    {
+    if path.len() > spec.len() && path.starts_with(spec) && path.get(spec.len()) == Some(&b'/') {
         return Some(diff_path_component_count(&path[spec.len() + 1..]));
     }
     None
@@ -6659,7 +6670,8 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "tree") {
-                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
+                        let width =
+                            for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(tree) = context
                             .contents
                             .as_ref()
@@ -6671,7 +6683,8 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
-                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
+                        let width =
+                            for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(tree) = context
                             .peeled_object
                             .as_ref()
@@ -6683,7 +6696,8 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
-                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
+                        let width =
+                            for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(contents) = &context.contents {
                             for (idx, parent) in contents.parents.iter().enumerate() {
                                 if idx > 0 {
@@ -6700,7 +6714,8 @@ fn print_for_each_ref_format(
                             }
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*parent") {
-                        let width = for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
+                        let width =
+                            for_each_ref_oid_atom_width(arg, other, context.objectname_abbrev)?;
                         if let Some(peeled) = &context.peeled_object {
                             for (idx, parent) in peeled.parents.iter().enumerate() {
                                 if idx > 0 {
@@ -7504,7 +7519,9 @@ impl LsFilesPathspec {
             .iter()
             .any(|filter| !filter.element.attr_requirements().is_empty());
         let attributes = if needs_attrs {
-            Some(sley_worktree::StandardAttributeMatcher::from_worktree_root(&root)?)
+            Some(sley_worktree::StandardAttributeMatcher::from_worktree_root(
+                &root,
+            )?)
         } else {
             None
         };
@@ -7570,7 +7587,8 @@ impl LsFilesPathspec {
                     )
                 })
         });
-        matched && (pathspec_filters_have_include(&self.filters) || self.path_in_default_scope(path))
+        matched
+            && (pathspec_filters_have_include(&self.filters) || self.path_in_default_scope(path))
     }
 
     fn path_in_default_scope(&self, path: &[u8]) -> bool {
@@ -8204,9 +8222,7 @@ pub(crate) fn log_decoration_map(
                 }
             }
             RefTarget::Direct(oid) => {
-                if head_kept
-                    && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
-                {
+                if head_kept && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
                     head_decoration = Some((commit, "HEAD".to_string()));
                 }
             }
@@ -8352,12 +8368,8 @@ enum SimpleLogRegexClassItem {
 impl SimpleLogRegex {
     fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
-            let regex = grep_source::Regex::compile(
-                pattern,
-                grep_source::RegexMode::Pcre,
-                false,
-                false,
-            )?;
+            let regex =
+                grep_source::Regex::compile(pattern, grep_source::RegexMode::Pcre, false, false)?;
             return Ok(Self {
                 alternatives: Vec::new(),
                 perl: Some(regex),
@@ -8955,7 +8967,7 @@ fn print_log_format(
     record: &sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: LogFormatContext<'_>,
-) -> Result<()> {
+) -> Result<usize> {
     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
     emit_compiled_log_format(
         record,
@@ -8967,9 +8979,10 @@ fn print_log_format(
     // Re-encode the assembled (UTF-8) line to the log output encoding, mirroring
     // git's single final `reencode_string_len` pass.
     let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
+    let emitted = out.len();
     io::stdout().write_all(&out)?;
     io::stdout().flush()?;
-    Ok(())
+    Ok(emitted)
 }
 
 /// Render a single `$Format:<fmt>$` inner format against `record`, returning the
@@ -9002,7 +9015,13 @@ pub(crate) fn format_subst_for_commit(
         use_mailmap: false,
     };
     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
-    emit_compiled_log_format(record, &compiled, &context, &mut out, 0..compiled.tokens.len())?;
+    emit_compiled_log_format(
+        record,
+        &compiled,
+        &context,
+        &mut out,
+        0..compiled.tokens.len(),
+    )?;
     Ok(out)
 }
 
@@ -9034,6 +9053,7 @@ fn emit_compiled_log_format(
         committer_email: &committer_email,
         author_timestamp: &author_timestamp,
         committer_timestamp: &committer_timestamp,
+        auto_color: false,
     };
     let segment_range = compiled.segment_range_for_tokens(token_range);
     compiled.expand.append_range_to_with_atom(
@@ -9083,10 +9103,35 @@ struct LogFormatAtomResolver<'a, 'b> {
     committer_email: &'a str,
     author_timestamp: &'a str,
     committer_timestamp: &'a str,
+    auto_color: bool,
 }
 
 impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_, '_> {
     fn resolve_atom(&mut self, out: &mut Vec<u8>, atom: &FormatToken) -> Result<()> {
+        if self.auto_color && matches!(atom, FormatToken::OidFull | FormatToken::OidAbbrev) {
+            self.auto_color = false;
+            if self.context.color {
+                out.extend_from_slice(b"\x1b[33m");
+                emit_log_one_token(
+                    atom,
+                    self.record,
+                    self.context,
+                    out,
+                    self.author_name,
+                    self.author_email,
+                    self.committer_name,
+                    self.committer_email,
+                    self.author_timestamp,
+                    self.committer_timestamp,
+                )?;
+                out.extend_from_slice(b"\x1b[m");
+                return Ok(());
+            }
+        }
+        if matches!(atom, FormatToken::ColorAuto) {
+            self.auto_color = self.context.color;
+            return Ok(());
+        }
         emit_log_one_token(
             atom,
             self.record,
@@ -9201,9 +9246,7 @@ fn emit_log_one_token(
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
             FormatToken::ColorName(name) => {
-                if color
-                    && let Some(ansi) = git_color_name_to_ansi(name)
-                {
+                if color && let Some(ansi) = git_color_name_to_ansi(name) {
                     out.extend_from_slice(ansi.as_bytes());
                 }
             }
@@ -9838,9 +9881,7 @@ fn emit_compiled_log_format_metadata_inner(
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
             FormatToken::ColorName(name) => {
-                if color
-                    && let Some(ansi) = git_color_name_to_ansi(name)
-                {
+                if color && let Some(ansi) = git_color_name_to_ansi(name) {
                     out.extend_from_slice(ansi.as_bytes());
                 }
             }
@@ -11375,7 +11416,10 @@ mod tests {
         for idx in 0..1024 {
             many_new.push_str(&format!("new line {idx}\n"));
         }
-        assert_eq!(count_line_diff(b"old line\n", many_new.as_bytes()), (1024, 1));
+        assert_eq!(
+            count_line_diff(b"old line\n", many_new.as_bytes()),
+            (1024, 1)
+        );
 
         let mut old = String::from("shared prefix\n");
         let mut new = String::from("shared prefix\n");
@@ -11385,6 +11429,9 @@ mod tests {
         }
         old.push_str("shared suffix\n");
         new.push_str("shared suffix\n");
-        assert_eq!(count_line_diff(old.as_bytes(), new.as_bytes()), (1024, 1024));
+        assert_eq!(
+            count_line_diff(old.as_bytes(), new.as_bytes()),
+            (1024, 1024)
+        );
     }
 }

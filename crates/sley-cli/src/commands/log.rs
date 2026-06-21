@@ -3,8 +3,8 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_pathspec::normalized_revwalk_pathspec;
 use sley_notes::{NotesRef, read_note_bytes};
+use sley_pathspec::normalized_revwalk_pathspec;
 
 mod diff;
 mod graph;
@@ -16,9 +16,7 @@ use diff::{
     LogDiffContext, LogDiffMerges, LogDiffOptions, log_parse_diff_merges,
     log_parse_diff_merges_config, log_prefix_display_width,
 };
-use graph::{
-    graph_show_commit, graph_show_commit_msg, graph_show_oneline, graph_show_padding,
-};
+use graph::{graph_show_commit, graph_show_commit_msg, graph_show_oneline, graph_show_padding};
 use line_log::{LineLogOutputCtx, run_line_log_output};
 use pickaxe::{
     CompiledPickaxe, DiffFilterMatchOptions, PickaxeSpec, compile_pickaxe_regex,
@@ -26,9 +24,9 @@ use pickaxe::{
     pickaxe_commit_matches, resolve_diff_filter_mask,
 };
 use reflog::{
-    LogGrepColors, ReflogWalkOptions, compile_log_filter_matcher,
-    log_author_matcher_matches, log_committer_matcher_matches, log_grep_matcher_matches,
-    log_highlight_matches, log_walk_reflogs,
+    LogGrepColors, ReflogWalkOptions, compile_log_filter_matcher, log_author_matcher_matches,
+    log_committer_matcher_matches, log_grep_matcher_matches, log_highlight_matches,
+    log_walk_reflogs,
 };
 
 /// Tracks `git log`'s notes-display state (`--notes`, `--show-notes[=ref]`,
@@ -296,6 +294,7 @@ fn emit_compiled_log_format_with_notes(
         committer_email: &committer_email,
         author_timestamp: &author_timestamp,
         committer_timestamp: &committer_timestamp,
+        auto_color: false,
     };
     let segment_range = compiled.segment_range_for_tokens(0..compiled.tokens.len());
     compiled.expand.append_range_to_with_atom(
@@ -368,6 +367,7 @@ struct LogFormatNoteResolver<'a, 'b> {
     committer_email: &'a str,
     author_timestamp: &'a str,
     committer_timestamp: &'a str,
+    auto_color: bool,
 }
 
 impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_, '_> {
@@ -383,6 +383,30 @@ impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_,
                 &self.record.oid,
             )?;
             out.extend_from_slice(&notes);
+            return Ok(());
+        }
+        if self.auto_color && matches!(atom, FormatToken::OidFull | FormatToken::OidAbbrev) {
+            self.auto_color = false;
+            if self.context.color {
+                out.extend_from_slice(b"\x1b[33m");
+                emit_log_one_token(
+                    atom,
+                    self.record,
+                    self.context,
+                    out,
+                    self.author_name,
+                    self.author_email,
+                    self.committer_name,
+                    self.committer_email,
+                    self.author_timestamp,
+                    self.committer_timestamp,
+                )?;
+                out.extend_from_slice(b"\x1b[m");
+                return Ok(());
+            }
+        }
+        if matches!(atom, FormatToken::ColorAuto) {
+            self.auto_color = self.context.color;
             return Ok(());
         }
         emit_log_one_token(
@@ -466,6 +490,13 @@ fn log_plain_oneline_format(compiled: &CompiledLogFormat) -> bool {
             FormatToken::Literal(space),
             FormatToken::Subject
         ] if space == " "
+    )
+}
+
+fn log_config_color_is_always(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "always" | "true" | "yes" | "on" | "1"
     )
 }
 
@@ -730,6 +761,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut show_root_flag: Option<bool> = None;
     let mut line_prefix: Option<String> = None;
     let mut color_always = false;
+    let mut color_explicit = false;
     let mut show_signature: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -758,13 +790,27 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         .clone(),
                 );
             }
-            "--full-history" | "--sparse" | "--dense" | "--remove-empty"
-            | "--simplify-merges" | "--show-pulls" | "--ancestry-path" | "--reverse"
-            | "--topo-order" | "--date-order" | "--author-date-order" | "--first-parent"
-            | "--no-walk" | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" | "--all"
-            | "--branches" | "--tags" | "--remotes" | "--no-ignore-missing" => {
-                setup_args.push(arg.clone())
-            }
+            "--full-history"
+            | "--sparse"
+            | "--dense"
+            | "--remove-empty"
+            | "--simplify-merges"
+            | "--show-pulls"
+            | "--ancestry-path"
+            | "--reverse"
+            | "--topo-order"
+            | "--date-order"
+            | "--author-date-order"
+            | "--first-parent"
+            | "--no-walk"
+            | "--no-walk=sorted"
+            | "--no-walk=unsorted"
+            | "--do-walk"
+            | "--all"
+            | "--branches"
+            | "--tags"
+            | "--remotes"
+            | "--no-ignore-missing" => setup_args.push(arg.clone()),
             "--boundary" => {}
             "--ignore-missing" => {
                 ignored_missing_input = true;
@@ -900,11 +946,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("diff-filter"))?;
-                parse_diff_filter_arg(
-                    value,
-                    &mut diff_filter_bits,
-                    &mut diff_filter_not_bits,
-                )?;
+                parse_diff_filter_arg(value, &mut diff_filter_bits, &mut diff_filter_not_bits)?;
                 diff_filter_given = true;
             }
             value if let Some(arg) = value.strip_prefix("--diff-filter=") => {
@@ -919,11 +961,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--no-walk-reflogs" => walk_reflogs = false,
             "--max-age" => {
                 setup_args.push(arg.clone());
-                setup_args.push(iter.next().ok_or_else(log_max_age_requires_value_error)?.clone());
+                setup_args.push(
+                    iter.next()
+                        .ok_or_else(log_max_age_requires_value_error)?
+                        .clone(),
+                );
             }
             "--min-age" => {
                 setup_args.push(arg.clone());
-                setup_args.push(iter.next().ok_or_else(log_min_age_requires_value_error)?.clone());
+                setup_args.push(
+                    iter.next()
+                        .ok_or_else(log_min_age_requires_value_error)?
+                        .clone(),
+                );
             }
             "--since" | "--after" | "--until" | "--before" => {
                 setup_args.push(arg.clone());
@@ -1206,8 +1256,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 ignore_regex_patterns.push(value.to_string());
             }
             value if value.starts_with("--ignore-matching-lines=") => {
-                ignore_regex_patterns
-                    .push(value["--ignore-matching-lines=".len()..].to_string());
+                ignore_regex_patterns.push(value["--ignore-matching-lines=".len()..].to_string());
             }
             value if value.starts_with("-I") && value.len() > 2 => {
                 ignore_regex_patterns.push(value[2..].to_string());
@@ -1263,8 +1312,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--no-graph" => graph = false,
             "--show-linear-break" => show_linear_break = true,
             value if value.starts_with("--show-linear-break=") => show_linear_break = true,
-            "--color" => color_always = true,
-            "--no-color" => color_always = false,
+            "--color" => {
+                color_always = true;
+                color_explicit = true;
+            }
+            "--no-color" => {
+                color_always = false;
+                color_explicit = true;
+            }
             "--line-prefix" => {
                 let value = iter
                     .next()
@@ -1277,6 +1332,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--color=") => {
                 log_validate_color(&value["--color=".len()..])?;
                 color_always = value["--color=".len()..].eq_ignore_ascii_case("always");
+                color_explicit = true;
             }
             "--color-moved-ws" => {
                 let value = iter
@@ -1447,8 +1503,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 decorate_refs_include.push(value["--decorate-refs=".len()..].to_string());
             }
             value if value.starts_with("--decorate-refs-exclude=") => {
-                decorate_refs_exclude
-                    .push(value["--decorate-refs-exclude=".len()..].to_string());
+                decorate_refs_exclude.push(value["--decorate-refs-exclude=".len()..].to_string());
             }
             value if value.starts_with("--use-mailmap=") => {
                 return log_option_takes_no_value_error("use-mailmap");
@@ -1653,9 +1708,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     eprintln!("error: switch `L' requires a value");
                     GitError::Exit(129)
                 })?;
-                line_log_args.push(crate::commands::line_log::LineLogArg {
-                    raw: value.clone(),
-                });
+                line_log_args.push(crate::commands::line_log::LineLogArg { raw: value.clone() });
                 // `-L` does NOT eagerly force a patch here; the default is
                 // applied after the option scan only when no explicit diff
                 // output format was requested (see `diff_format_explicit`).
@@ -1769,8 +1822,24 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         diff_opts.merges = config_diff_merges;
     }
     let output_encoding = output_encoding_override.unwrap_or_else(|| log_output_encoding(&config));
+    let color_config = match global_config_value("color.diff")? {
+        Some(value) => Some(value),
+        None => global_config_value("color.ui")?,
+    }
+    .or_else(|| config.get("color", None, "diff").map(str::to_string))
+    .or_else(|| config.get("color", None, "ui").map(str::to_string));
+    if !color_explicit
+        && !color_always
+        && color_config
+            .as_deref()
+            .is_some_and(log_config_color_is_always)
+    {
+        color_always = true;
+    }
     if !abbrev_commit_explicit
-        && config.get_bool("log", None, "abbrevcommit").unwrap_or(false)
+        && config
+            .get_bool("log", None, "abbrevcommit")
+            .unwrap_or(false)
     {
         abbrev_commit = true;
     }
@@ -1951,7 +2020,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let pickaxe_text = diff_opts.text;
     // Resolve the `--diff-filter` mask now that the full option scan is done.
     let diff_filter_mask = if diff_filter_given {
-        Some(resolve_diff_filter_mask(diff_filter_bits, diff_filter_not_bits))
+        Some(resolve_diff_filter_mask(
+            diff_filter_bits,
+            diff_filter_not_bits,
+        ))
     } else {
         None
     };
@@ -1963,8 +2035,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         // diff.renames: false disables detection, "copies"/"copy" adds copy
         // detection, anything else (or unset) means rename detection.
         // A command-line `-M`/`-C`/`--no-renames` overrides `diff.renames`.
-        let (detect_renames, detect_copies) =
-            (filter_detect_renames, filter_detect_copies);
+        let (detect_renames, detect_copies) = (filter_detect_renames, filter_detect_copies);
         let diff_pathspec = if pathspecs.is_empty() {
             None
         } else {
@@ -2001,18 +2072,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             .get("log", None, "decorate")
             .map(str::to_string)
             .or_else(|| {
-                matches!(
-                    config.get_all("log", None, "decorate").last(),
-                    Some(None)
-                )
-                .then(|| "true".to_string())
+                matches!(config.get_all("log", None, "decorate").last(), Some(None))
+                    .then(|| "true".to_string())
             });
         if let Some(value) = decorate_config {
             match value.trim().to_ascii_lowercase().as_str() {
-            "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
-            "full" => decoration = LogDecorationMode::Full,
-            "no" | "false" | "off" | "0" | "auto" => decoration = LogDecorationMode::Off,
-            _ => decoration = LogDecorationMode::Short,
+                "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
+                "full" => decoration = LogDecorationMode::Full,
+                "no" | "false" | "off" | "0" | "auto" => decoration = LogDecorationMode::Off,
+                _ => decoration = LogDecorationMode::Short,
             }
         }
     }
@@ -2064,10 +2132,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             };
             let compiled = if walk_reflogs {
                 let oid = if use_full_oid { "%H" } else { "%h" };
-                CompiledLogFormat::compile(
-                    &format!("{oid} %gD: %gs"),
-                    LogFormatDialect::Log,
-                )?
+                CompiledLogFormat::compile(&format!("{oid} %gD: %gs"), LogFormatDialect::Log)?
             } else if show_source {
                 let oid = if use_full_oid { "%H" } else { "%h" };
                 let parents = if show_parents { " %P" } else { "" };
@@ -2108,9 +2173,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // When no CLI pattern-type flag was given, `grep.patternType` config
     // supplies the default (git's `grep_config`). `default` means "fall back to
     // the basic/extended toggle", which for log is BRE.
-    if !pattern_kind_explicit
-        && let Some(value) = config.get("grep", None, "patterntype")
-    {
+    if !pattern_kind_explicit && let Some(value) = config.get("grep", None, "patterntype") {
         pattern_kind = match value.trim().to_ascii_lowercase().as_str() {
             "fixed" => crate::grep_source::PatternKind::Fixed,
             "basic" => crate::grep_source::PatternKind::Basic,
@@ -2121,8 +2184,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
-    let committer_filters =
-        compile_log_filter_matcher(&committer_patterns, pattern_kind, regexp_ignore_case, "header")?;
+    let committer_filters = compile_log_filter_matcher(
+        &committer_patterns,
+        pattern_kind,
+        regexp_ignore_case,
+        "header",
+    )?;
     let grep_filters = compile_log_filter_matcher(
         &grep_patterns,
         pattern_kind,
@@ -2149,13 +2216,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             },
         );
     }
-    let log_format_source = if !revision_options.had_ref_selector
-        && revision_options.positives.len() == 1
-    {
-        revision_options.positives[0].source_name.clone()
-    } else {
-        None
-    };
+    let log_format_source =
+        if !revision_options.had_ref_selector && revision_options.positives.len() == 1 {
+            revision_options.positives[0].source_name.clone()
+        } else {
+            None
+        };
     let mut starts = Vec::new();
     // `(start_commit_oid, source_label)` pairs in command-line order, used to
     // build the `%S` per-commit source map (later starts override earlier ones).
@@ -2387,7 +2453,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     source_oid: None,
                     describe: None,
                     signature: None,
-                    color: false,
+                    color: color_always,
                     output_encoding: &output_encoding,
                     mailmap: &mailmap,
                     use_mailmap,
@@ -2452,8 +2518,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             date_mode: &date_mode,
             source_oid: None,
             describe: None,
-                    signature: None,
-            color: false,
+            signature: None,
+            color: color_always,
             output_encoding: &output_encoding,
             mailmap: &mailmap,
             use_mailmap,
@@ -2480,13 +2546,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 stdout.write_all(term)?;
             }
             line.clear();
-            emit_compiled_log_format_limited_commit(
-                &db,
-                metadata,
-                compiled,
-                &context,
-                &mut line,
-            )?;
+            emit_compiled_log_format_limited_commit(&db, metadata, compiled, &context, &mut line)?;
             let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
             stdout.write_all(&out)?;
             if final_newline
@@ -2533,12 +2593,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 committer_filters.as_ref(),
                 use_mailmap.then_some(&mailmap),
             )
-            || !log_grep_matcher_matches(
-                record,
-                grep_filters.as_ref(),
-                grep_all_match,
-                invert_grep,
-            )
+            || !log_grep_matcher_matches(record, grep_filters.as_ref(), grep_all_match, invert_grep)
         {
             continue;
         }
@@ -2659,20 +2714,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &bottoms,
         )?;
     }
-    let follow_applied = saw_follow && pathspecs.len() == 1 && !full_history && !revision_options.simplify_merges;
+    let follow_applied =
+        saw_follow && pathspecs.len() == 1 && !full_history && !revision_options.simplify_merges;
     if follow_applied {
-        selected = log_follow_single_path(
-            &db,
-            format,
-            selected,
-            pathspecs[0].as_bytes(),
-            true,
-        )?;
+        selected = log_follow_single_path(&db, format, selected, pathspecs[0].as_bytes(), true)?;
     }
     // Pathspec-limited / --full-history simplification (TREESAME prune + parent
     // rewriting). Owned binding outlives `selected` (a Vec of references).
     let simplified_storage;
-    if (!pathspecs.is_empty() && !follow_applied) || full_history || revision_options.simplify_merges {
+    if (!pathspecs.is_empty() && !follow_applied)
+        || full_history
+        || revision_options.simplify_merges
+    {
         let pathspec = normalized_revwalk_pathspec(
             &cwd,
             worktree_root.as_deref(),
@@ -2769,16 +2822,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         } else {
             decoration
         });
-        log_decoration_map(
-            &git_dir,
-            &db,
-            format,
-            map_mode,
-            &decoration_filter,
-        )?
+        log_decoration_map(&git_dir, &db, format, map_mode, &decoration_filter)?
     };
     if simplify_by_decoration {
-        selected.retain(|record| decorations.contains_key(&record.oid) || record.parents.is_empty());
+        selected
+            .retain(|record| decorations.contains_key(&record.oid) || record.parents.is_empty());
     }
     // For `--graph`, a parent is "interesting" iff it will be shown — judged
     // against the full selection BEFORE `--skip`/`-n` truncation (matching
@@ -2827,8 +2875,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // medium (no-`--pretty`) format; an explicit `--notes`/`--no-notes` flag
     // overrides. The empty list short-circuits all per-commit note lookups.
     let notes_store = FileRefStore::new(&git_dir, format);
-    let pretty_format_uses_notes =
-        matches!(&output, LogOutput::Compiled { compiled, .. } if compiled_format_uses_notes(compiled));
+    let pretty_format_uses_notes = matches!(&output, LogOutput::Compiled { compiled, .. } if compiled_format_uses_notes(compiled));
     let notes_default_format =
         matches!(output, LogOutput::Default(LogDefaultKind::Medium)) || pretty_format_uses_notes;
     let display_notes_refs = if notes_display.is_active(notes_default_format) {
@@ -2937,8 +2984,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         if let Some(log_diff) = &log_diff {
                             let mut padding = String::new();
                             graph_state.padding_line(&mut padding);
-                            let prefix_width =
-                                log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
+                            let prefix_width = log_prefix_display_width(&padding)
+                                + log_prefix_display_width(prefix);
                             log_diff.render(record, prefix_width, &mut diff_block)?;
                             if !diff_block.is_empty() {
                                 msg.extend_from_slice(diff_opts.block_separator_for(record));
@@ -2978,10 +3025,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     let mut msg: Vec<u8> = Vec::new();
                     if show_signature {
                         msg.extend_from_slice(&log_signature_human_output(
-                            &git_dir,
-                            &db,
-                            &config,
-                            record,
+                            &git_dir, &db, &config, record,
                         )?);
                     }
                     if record.parents.len() > 1 {
@@ -3245,8 +3289,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     date_mode: &date_mode,
                     source_oid: source_labels.as_ref(),
                     describe: Some(&describe_ctx),
-                        signature: Some(&signature_ctx),
-                    color: false,
+                    signature: Some(&signature_ctx),
+                    color: color_always,
                     output_encoding: &output_encoding,
                     mailmap: &mailmap,
                     use_mailmap,
@@ -3525,11 +3569,7 @@ enum LogOutput {
     },
 }
 
-fn log_output_needs_abbrev(
-    output: &LogOutput,
-    abbrev_commit: bool,
-    show_children: bool,
-) -> bool {
+fn log_output_needs_abbrev(output: &LogOutput, abbrev_commit: bool, show_children: bool) -> bool {
     match output {
         LogOutput::Default(_) => abbrev_commit,
         LogOutput::Compiled { compiled, .. } => {
