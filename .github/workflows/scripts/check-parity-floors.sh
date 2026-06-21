@@ -482,7 +482,7 @@ declare -A FLOOR=(
     [t4216-log-bloom.sh]=161
     [t5318-commit-graph.sh]=95
     [t3432-rebase-fast-forward.sh]=219
-    [t3600-rm.sh]=69
+    [t3600-rm.sh]=81
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
     # signed-commit slice (2026-06-20): ssh/x509 signature cells (log --show-signature %G?) 124->131 (stable 3x).
     [t4202-log.sh]=131
@@ -512,7 +512,11 @@ declare -A FLOOR=(
     [t3420-rebase-autostash.sh]=40
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
-    [t4013-diff-various.sh]=206
+    # wave-24 (2026-06-21): diff-various log-pickaxe 206->216, rm submodule-safety 69->81,
+    # clone SSH-transport+partial-clone 86->109/109 (banked 107 = full-pass minus 2-cell
+    # handshake-flake margin; t5601 historically parallel-flake-prone). Guards neutral:
+    # t4012=4 t4014=208 t4015=119 t4202=131 t5510=7 t5516=99 t5526=39 t3700=41 t7508=119.
+    [t4013-diff-various.sh]=216
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
     [t4014-format-patch.sh]=208
     [t4100-apply-stat.sh]=25
@@ -610,7 +614,7 @@ declare -A FLOOR=(
     # wave-2 (2026-06-21): push refmaps/forced-tag-status/denyDeleteCurrent/non-commit-reject 92->99 (guards t5510/t5601 held).
     [t5516-fetch-push.sh]=99
     [t5520-pull.sh]=75
-    [t5601-clone.sh]=86
+    [t5601-clone.sh]=107
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
     # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's
