@@ -86,7 +86,7 @@ fn merge_commit_and_advance(
     message: Vec<u8>,
     options: &MergeOptions,
 ) -> Result<ObjectId> {
-    commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
+    let message = prepare_merge_commit_message_for_commit(git_dir, message, options)?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let signature = merge_commit_signature(
@@ -149,7 +149,7 @@ fn merge_ours_commit_and_advance(
     message: Vec<u8>,
     options: &MergeOptions,
 ) -> Result<ObjectId> {
-    commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
+    let message = prepare_merge_commit_message_for_commit(git_dir, message, options)?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let signature = merge_commit_signature(
@@ -1213,6 +1213,8 @@ struct MergeOptions {
     rerere_autoupdate: Option<bool>,
     gpg_sign: bool,
     gpg_sign_key: Option<String>,
+    signoff: bool,
+    no_verify: bool,
 }
 
 /// git `merge.c`'s `show_diffstat` tri-state: off (`-n`/`--no-stat`),
@@ -1249,8 +1251,31 @@ impl Default for MergeOptions {
             rerere_autoupdate: None,
             gpg_sign: false,
             gpg_sign_key: None,
+            signoff: false,
+            no_verify: false,
         }
     }
+}
+
+fn prepare_merge_commit_message_for_commit(
+    git_dir: &Path,
+    message: Vec<u8>,
+    options: &MergeOptions,
+) -> Result<Vec<u8>> {
+    let mut message = if options.signoff {
+        commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
+    } else {
+        message
+    };
+    if !options.no_verify {
+        commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
+        let editmsg = git_dir.join("COMMIT_EDITMSG");
+        fs::write(&editmsg, &message)?;
+        let editmsg_arg = editmsg.to_string_lossy().into_owned();
+        commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
+        message = fs::read(&editmsg)?;
+    }
+    Ok(message)
 }
 
 impl MergeOptions {
@@ -2417,6 +2442,22 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--commit" => {
                 options.no_commit = false;
                 explicit_commit = true;
+            }
+            "--signoff" => options.signoff = true,
+            "--no-signoff" => options.signoff = false,
+            value if value.starts_with("--signoff=") => {
+                return Err(merge_option_takes_no_value_error("signoff"));
+            }
+            value if value.starts_with("--no-signoff=") => {
+                return Err(merge_option_takes_no_value_error("no-signoff"));
+            }
+            "--no-verify" => options.no_verify = true,
+            "--verify" => options.no_verify = false,
+            value if value.starts_with("--no-verify=") => {
+                return Err(merge_option_takes_no_value_error("no-verify"));
+            }
+            value if value.starts_with("--verify=") => {
+                return Err(merge_option_takes_no_value_error("verify"));
             }
             // `--squash` records the merge result without creating a commit and
             // writes SQUASH_MSG; it silently implies no-commit (builtin/merge.c).

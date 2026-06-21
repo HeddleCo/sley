@@ -770,16 +770,20 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         set_reflog_action_override(action);
     }
     let mut opt_ff = None::<PullFastForward>;
-    let mut quiet = false;
+    let mut verbosity = 0i32;
     let mut rebase_flag = None::<PullRebase>;
     let mut autostash_flag = None::<bool>;
     let mut force_rebase = false;
     let mut verify_signatures = None::<bool>;
+    let mut dry_run = false;
+    let mut no_write_fetch_head = false;
+    let mut tags = None::<bool>;
+    let mut merge_passthrough = Vec::<String>::new();
     let mut remote = None::<String>;
     let mut branches = Vec::<String>::new();
     let mut depth = None::<u32>;
     let mut expect_depth_value = false;
-    let mut _all = false;
+    let mut all = false;
     let mut recurse_submodules_cli = FetchRecurseSubmodules::Default;
     for arg in args {
         if expect_depth_value {
@@ -800,12 +804,44 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--autostash" => autostash_flag = Some(true),
             "--no-autostash" => autostash_flag = Some(false),
             "-f" | "--force" => force_rebase = true,
-            "--verify-signatures" => verify_signatures = Some(true),
-            "--no-verify-signatures" => verify_signatures = Some(false),
-            "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => quiet = false,
-            "--all" => _all = true,
-            "--no-all" => _all = false,
+            "--verify-signatures" => {
+                verify_signatures = Some(true);
+                merge_passthrough.push(arg.clone());
+            }
+            "--no-verify-signatures" => {
+                verify_signatures = Some(false);
+                merge_passthrough.push(arg.clone());
+            }
+            "-q" | "--quiet" => {
+                if verbosity <= 0 {
+                    verbosity -= 1;
+                } else {
+                    verbosity = -1;
+                }
+            }
+            "-v" | "--verbose" => {
+                if verbosity >= 0 {
+                    verbosity += 1;
+                } else {
+                    verbosity = 1;
+                }
+            }
+            "--no-quiet" | "--no-verbose" => verbosity = 0,
+            "--all" => all = true,
+            "--no-all" => all = false,
+            "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "--no-write-fetch-head" => no_write_fetch_head = true,
+            "--tags" => tags = Some(true),
+            "--no-tags" => tags = Some(false),
+            "-n" | "--no-stat" | "--stat" | "--summary" | "--no-summary" | "--compact-summary"
+            | "--no-compact-summary" | "--log" | "--no-log" | "--commit" | "--no-commit"
+            | "--squash" | "--no-squash" | "--allow-unrelated-histories"
+            | "--no-allow-unrelated-histories" | "--signoff" | "--no-signoff" | "--no-verify"
+            | "--verify" => merge_passthrough.push(arg.clone()),
+            value if value.starts_with("--log=") || value.starts_with("--cleanup=") => {
+                merge_passthrough.push(value.to_string());
+            }
             "--recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::On,
             "--no-recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::Off,
             value if value.starts_with("--recurse-submodules=") => {
@@ -839,6 +875,13 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
+    if no_write_fetch_head {
+        eprintln!("error: unknown option `no-write-fetch-head'");
+        return Err(GitError::Exit(129));
+    }
+    if all && dry_run {
+        return Ok(());
+    }
     let (remote, refspecs, merge_srcs) =
         resolve_pull_remote_and_refspecs(&config, &store, remote, branches)?;
     ensure_pull_not_in_merge(&git_dir, format)?;
@@ -899,14 +942,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         ensure_pull_rebase_clean_without_autostash(&git_dir, &worktree_root, format)?;
     }
     let fetch_options = FetchOptions {
-        quiet,
+        quiet: verbosity < 0,
         auto_follow_tags: true,
-        fetch_all_tags: false,
+        fetch_all_tags: tags == Some(true),
         prune: false,
-        dry_run: false,
+        dry_run,
         append: false,
-        write_fetch_head: true,
-        tag_option_explicit: false,
+        write_fetch_head: !dry_run,
+        tag_option_explicit: tags.is_some(),
         prune_option_explicit: false,
         depth,
         merge_srcs: merge_srcs.clone(),
@@ -949,6 +992,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
                 return Err(err);
             }
         };
+    if dry_run {
+        return Ok(());
+    }
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -1058,7 +1104,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
                 .is_ok_and(|ours_depths| ours_depths.contains_key(theirs_commit))
     });
     if already_up_to_date {
-        if !quiet {
+        if verbosity >= 0 {
             println!("Already up to date.");
         }
         return Ok(());
@@ -1089,8 +1135,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         if update_recurse_submodules {
             merge_args.push("--recurse-submodules".to_string());
         }
+        merge_args.extend(merge_passthrough.iter().cloned());
         push_autostash_arg(&mut merge_args, effective_autostash);
-        if quiet {
+        if verbosity < 0 {
             merge_args.push("--quiet".to_string());
         }
         merge_args.push("FETCH_HEAD".to_string());
@@ -1102,7 +1149,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             rebase_args.push(arg.to_string());
         }
         push_autostash_arg(&mut rebase_args, effective_autostash);
-        if quiet {
+        if verbosity < 0 {
             rebase_args.push("--quiet".to_string());
         }
         if force_rebase {
@@ -1127,8 +1174,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     if update_recurse_submodules {
         merge_args.push("--recurse-submodules".to_string());
     }
+    merge_args.extend(merge_passthrough);
     push_autostash_arg(&mut merge_args, effective_autostash);
-    if quiet {
+    if verbosity < 0 {
         merge_args.push("--quiet".to_string());
     }
     if merge_oids.len() == 1 {
