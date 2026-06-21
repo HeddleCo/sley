@@ -7,6 +7,8 @@ pub(super) enum LogDiffMerges {
     /// Merges diff against their first parent (`--diff-merges=first-parent`,
     /// and the default under `--first-parent`).
     FirstParent,
+    /// Merges are shown once per parent (`-m`, `--diff-merges=separate`).
+    Separate,
     /// Combined merge diff: `-c` (`dense=false`) / `--cc` (`dense=true`).
     Combined { dense: bool },
 }
@@ -15,9 +17,8 @@ pub(super) enum LogDiffMerges {
 pub(super) fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
     match value {
         "off" | "none" => Ok(LogDiffMerges::Off),
-        // "on"/"m" follow the diff-merges default (separate); sley renders the
-        // first-parent diff for these until the separate mode lands.
-        "first-parent" | "1" | "on" | "separate" | "m" => Ok(LogDiffMerges::FirstParent),
+        "first-parent" | "1" => Ok(LogDiffMerges::FirstParent),
+        "on" | "separate" | "m" => Ok(LogDiffMerges::Separate),
         "combined" | "c" => Ok(LogDiffMerges::Combined { dense: false }),
         "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
         "" => {
@@ -40,7 +41,8 @@ pub(super) fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
 pub(super) fn log_parse_diff_merges_config(value: &str) -> Result<LogDiffMerges> {
     match value {
         "off" | "none" => Ok(LogDiffMerges::Off),
-        "first-parent" | "1" | "on" | "separate" | "m" => Ok(LogDiffMerges::FirstParent),
+        "first-parent" | "1" => Ok(LogDiffMerges::FirstParent),
+        "on" | "separate" | "m" => Ok(LogDiffMerges::Separate),
         "combined" | "c" => Ok(LogDiffMerges::Combined { dense: false }),
         "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
         _ => {
@@ -160,6 +162,10 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) pathspec: Option<DiffPathspec>,
     pub(super) patch_abbrev: usize,
     pub(super) raw_abbrev: Option<usize>,
+    pub(super) pickaxe: Option<&'a CompiledPickaxe>,
+    pub(super) pickaxe_ignore_case: bool,
+    pub(super) pickaxe_text: bool,
+    pub(super) pickaxe_all: bool,
 }
 
 impl LogDiffContext<'_> {
@@ -174,6 +180,31 @@ impl LogDiffContext<'_> {
         line_prefix_width: i64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        self.render_against_parent(record, None, line_prefix_width, out)
+    }
+
+    pub(super) fn separate_parent_count(&self, record: &sley_rev::CommitRecord) -> Option<usize> {
+        (record.commit.parents.len() > 1 && self.merges == LogDiffMerges::Separate)
+            .then_some(record.commit.parents.len())
+    }
+
+    pub(super) fn render_parent(
+        &self,
+        record: &sley_rev::CommitRecord,
+        parent_index: usize,
+        line_prefix_width: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.render_against_parent(record, Some(parent_index), line_prefix_width, out)
+    }
+
+    fn render_against_parent(
+        &self,
+        record: &sley_rev::CommitRecord,
+        parent_index: Option<usize>,
+        line_prefix_width: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         out.clear();
         // An explicit non-off --diff-merges without any diff-output option
         // shows patches for merge commits only.
@@ -185,24 +216,34 @@ impl LogDiffContext<'_> {
         // A combined merge takes a separate render path (the result diffed
         // against every parent at once). Detect it before the two-tree setup.
         if parents.len() > 1
+            && parent_index.is_none()
             && let LogDiffMerges::Combined { dense } = self.merges
         {
             return self.render_combined_merge(record, dense, line_prefix_width, out);
         }
-        let parent_tree = match parents.len() {
-            0 => {
-                if !self.show_root {
-                    return Ok(());
+        let parent_tree = if let Some(parent_index) = parent_index {
+            let Some(parent) = parents.get(parent_index) else {
+                return Ok(());
+            };
+            Some(self.parent_tree(parent)?)
+        } else {
+            match parents.len() {
+                0 => {
+                    if !self.show_root {
+                        return Ok(());
+                    }
+                    None
                 }
-                None
+                1 => Some(self.parent_tree(&parents[0])?),
+                _ => match self.merges {
+                    LogDiffMerges::Off => return Ok(()),
+                    LogDiffMerges::FirstParent | LogDiffMerges::Separate => {
+                        Some(self.parent_tree(&parents[0])?)
+                    }
+                    // Handled above.
+                    LogDiffMerges::Combined { .. } => unreachable!(),
+                },
             }
-            1 => Some(self.parent_tree(&parents[0])?),
-            _ => match self.merges {
-                LogDiffMerges::Off => return Ok(()),
-                LogDiffMerges::FirstParent => Some(self.parent_tree(&parents[0])?),
-                // Handled above.
-                LogDiffMerges::Combined { .. } => unreachable!(),
-            },
         };
         let base = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
@@ -241,6 +282,19 @@ impl LogDiffContext<'_> {
         let entries = match &self.pathspec {
             Some(pathspec) => apply_diff_pathspec(entries, pathspec),
             None => entries,
+        };
+        let entries = if let Some(pickaxe) = self.pickaxe
+            && !self.pickaxe_all
+        {
+            pickaxe_filter_entries(
+                self.db,
+                entries,
+                pickaxe,
+                self.pickaxe_ignore_case,
+                self.pickaxe_text,
+            )?
+        } else {
+            entries
         };
         if entries.is_empty() {
             return Ok(());

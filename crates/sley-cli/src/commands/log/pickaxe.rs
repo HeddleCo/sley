@@ -326,6 +326,51 @@ pub(super) fn pickaxe_commit_matches(
     Ok(false)
 }
 
+pub(super) fn pickaxe_filter_entries(
+    db: &FileObjectDatabase,
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    pickaxe: &CompiledPickaxe,
+    ignore_case: bool,
+    text: bool,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let mut kept = Vec::new();
+    for entry in entries {
+        if pickaxe_entry_matches(db, &entry, pickaxe, ignore_case, text)? {
+            kept.push(entry);
+        }
+    }
+    Ok(kept)
+}
+
+fn pickaxe_entry_matches(
+    db: &FileObjectDatabase,
+    entry: &sley_diff_merge::NameStatusEntry,
+    pickaxe: &CompiledPickaxe,
+    ignore_case: bool,
+    text: bool,
+) -> Result<bool> {
+    if let CompiledPickaxe::FindObject { oids } = pickaxe {
+        return Ok(entry.old_oid.as_ref().is_some_and(|oid| oids.contains(oid))
+            || entry.new_oid.as_ref().is_some_and(|oid| oids.contains(oid)));
+    }
+    let old = match entry.old_oid.as_ref() {
+        Some(oid) => Some(pickaxe_read_blob(db, oid)?),
+        None => None,
+    };
+    let new = match entry.new_oid.as_ref() {
+        Some(oid) => Some(pickaxe_read_blob(db, oid)?),
+        None => None,
+    };
+    if pickaxe.skips_binary()
+        && !text
+        && (old.as_deref().is_some_and(pickaxe_is_binary)
+            || new.as_deref().is_some_and(pickaxe_is_binary))
+    {
+        return Ok(false);
+    }
+    Ok(pickaxe.filepair_matches(old.as_deref(), new.as_deref(), ignore_case))
+}
+
 /// Read a blob body for pickaxe inspection.
 fn pickaxe_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
     let object = db.read_object(oid)?;

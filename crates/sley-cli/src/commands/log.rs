@@ -21,7 +21,7 @@ use line_log::{LineLogOutputCtx, run_line_log_output};
 use pickaxe::{
     CompiledPickaxe, DiffFilterMatchOptions, PickaxeSpec, compile_pickaxe_regex,
     diff_filter_commit_matches, log_follow_single_path, parse_diff_filter_arg,
-    pickaxe_commit_matches, resolve_diff_filter_mask,
+    pickaxe_commit_matches, pickaxe_filter_entries, resolve_diff_filter_mask,
 };
 use reflog::{
     LogGrepColors, ReflogWalkOptions, compile_log_filter_matcher, log_author_matcher_matches,
@@ -722,6 +722,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // format, so they do not count here (`-L --format=%s` still defaults to a
     // patch).
     let mut diff_format_explicit = false;
+    let mut diff_merges_on_requested = false;
+    let mut diff_merges_from_m = false;
+    let mut first_parent_requested = false;
     // Diff-format presentation options forwarded to the `-L` patch renderer.
     // The ordinary log path threads these through `setup_args` to the diff
     // machinery; the line-log path renders its restricted patch directly, so it
@@ -790,6 +793,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         .clone(),
                 );
             }
+            "--first-parent" => {
+                first_parent_requested = true;
+                setup_args.push(arg.clone());
+            }
             "--full-history"
             | "--sparse"
             | "--dense"
@@ -801,7 +808,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--topo-order"
             | "--date-order"
             | "--author-date-order"
-            | "--first-parent"
             | "--no-walk"
             | "--no-walk=sorted"
             | "--no-walk=unsorted"
@@ -1127,11 +1133,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     .next()
                     .ok_or_else(log_diff_merges_requires_value_error)?;
                 let mode = log_parse_diff_merges(value)?;
+                diff_merges_on_requested = value == "on";
                 diff_opts.merges = Some(mode);
                 diff_opts.merges_imply_patch = mode != LogDiffMerges::Off;
             }
             value if value.starts_with("--diff-merges=") => {
-                let mode = log_parse_diff_merges(&value["--diff-merges=".len()..])?;
+                let raw = &value["--diff-merges=".len()..];
+                let mode = log_parse_diff_merges(raw)?;
+                diff_merges_on_requested = raw == "on";
                 diff_opts.merges = Some(mode);
                 diff_opts.merges_imply_patch = mode != LogDiffMerges::Off;
             }
@@ -1671,7 +1680,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_opts.name_status = true;
                 diff_format_explicit = true;
             }
-            "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
+            "-m" => {
+                diff_opts.merges = Some(LogDiffMerges::Separate);
+                diff_merges_from_m = true;
+            }
             // `-c`/`--cc` select combined merge output and imply a *global*
             // patch (git's `merges_imply_patch` sets `output_format=PATCH`, so
             // non-merge commits get an ordinary patch too).
@@ -1818,7 +1830,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         Some(value) => Some(log_parse_diff_merges_config(value)?),
         None => None,
     };
-    if diff_opts.merges.is_none() {
+    if diff_merges_on_requested {
+        diff_opts.merges = Some(config_diff_merges.unwrap_or(LogDiffMerges::Separate));
+    } else if diff_merges_from_m
+        && (first_parent_requested || config_diff_merges == Some(LogDiffMerges::FirstParent))
+    {
+        diff_opts.merges = Some(LogDiffMerges::FirstParent);
+    } else if diff_opts.merges.is_none() {
         diff_opts.merges = config_diff_merges;
     }
     let output_encoding = output_encoding_override.unwrap_or_else(|| log_output_encoding(&config));
@@ -2060,6 +2078,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             pathspec: diff_pathspec,
             patch_abbrev: repo_abbrev.unwrap_or(7).min(format.hex_len()),
             raw_abbrev: repo_abbrev,
+            pickaxe: compiled_pickaxe.as_ref(),
+            pickaxe_ignore_case,
+            pickaxe_text,
+            pickaxe_all,
         })
     } else {
         None
@@ -3124,148 +3146,168 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         match output {
             LogOutput::Default(kind) => {
                 let out = default_out.as_mut().expect("default output buffer");
+                let separate_parent_count = log_diff
+                    .as_ref()
+                    .and_then(|log_diff| log_diff.separate_parent_count(record));
+                let parent_slots = separate_parent_count.unwrap_or(1);
                 // The diff block is rendered up front: whatchanged
                 // (always_show_header = 0) omits the whole entry when the
                 // commit's diff comes out empty.
-                diff_block.clear();
-                if let Some(log_diff) = &log_diff {
-                    let prefix_width =
-                        log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
-                    log_diff.render(record, prefix_width, &mut diff_block)?;
-                }
-                if whatchanged && log_diff.is_some() && diff_block.is_empty() {
-                    continue;
-                }
-                if kind == LogDefaultKind::Raw {
+                for parent_slot in 0..parent_slots {
+                    let separate_parent_index = separate_parent_count.map(|_| parent_slot);
+                    diff_block.clear();
+                    if let Some(log_diff) = &log_diff {
+                        let prefix_width =
+                            log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
+                        if let Some(parent_index) = separate_parent_index {
+                            log_diff.render_parent(record, parent_index, prefix_width, &mut diff_block)?;
+                        } else {
+                            log_diff.render(record, prefix_width, &mut diff_block)?;
+                        }
+                    }
+                    if whatchanged && log_diff.is_some() && diff_block.is_empty() {
+                        continue;
+                    }
+                    if kind == LogDefaultKind::Raw {
+                        if printed_entries > 0 {
+                            writeln!(out)?;
+                        }
+                        printed_entries += 1;
+                        let mut raw = render_log_raw_pretty(record);
+                        if !diff_block.is_empty() {
+                            raw.extend_from_slice(diff_opts.block_separator_for(record));
+                            raw.extend_from_slice(&diff_block);
+                        }
+                        out.write_all(&raw)?;
+                        continue;
+                    }
                     if printed_entries > 0 {
                         writeln!(out)?;
                     }
                     printed_entries += 1;
-                    let mut raw = render_log_raw_pretty(record);
+                    if show_signature {
+                        let signature = log_signature_human_output(&git_dir, &db, &config, record)?;
+                        out.write_all(&signature)?;
+                    }
+                    write!(
+                        out,
+                        "commit {}",
+                        format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
+                    )?;
+                    if let Some(parent_index) = separate_parent_index
+                        && let Some(parent) = record.parents.get(parent_index)
+                    {
+                        write!(
+                            out,
+                            " (from {})",
+                            format_log_commit_header_oid(parent, abbrev_commit, abbrev_len)
+                        )?;
+                    }
+                    if show_source
+                        && let Some(source) = log_source_label(
+                            &record.oid,
+                            log_format_source.as_deref(),
+                            source_labels.as_ref(),
+                        )
+                    {
+                        write!(out, "\t{source}")?;
+                    }
+                    if let Some(labels) = decorations.get(&record.oid)
+                        && !labels.is_empty()
+                    {
+                        write!(out, " ({})", labels.join(", "))?;
+                    }
+                    if show_parents {
+                        let parent_abbrev = abbrev_commit.then_some(abbrev_len).flatten();
+                        for parent in &record.parents {
+                            write!(out, " {}", format_log_oid(parent, parent_abbrev))?;
+                        }
+                    }
+                    writeln!(out)?;
+                    if record.parents.len() > 1 {
+                        let merged: Vec<String> =
+                            record.parents.iter().map(format_log_abbrev_oid).collect();
+                        writeln!(out, "Merge: {}", merged.join(" "))?;
+                    }
+                    if kind == LogDefaultKind::Fuller {
+                        let author = commit_identity_mailmapped(
+                            &record.commit.author,
+                            use_mailmap.then_some(&mailmap),
+                        );
+                        write!(out, "Author:     ")?;
+                        out.write_all(&log_highlight_matches(
+                            author.as_bytes(),
+                            author_filters.as_ref(),
+                            &grep_colors,
+                        ))?;
+                        writeln!(out)?;
+                        writeln!(
+                            out,
+                            "AuthorDate: {}",
+                            commit_identity_date(&record.commit.author, &date_mode)
+                        )?;
+                        let committer = commit_identity_mailmapped(
+                            &record.commit.committer,
+                            use_mailmap.then_some(&mailmap),
+                        );
+                        write!(out, "Commit:     ")?;
+                        out.write_all(&log_highlight_matches(
+                            committer.as_bytes(),
+                            committer_filters.as_ref(),
+                            &grep_colors,
+                        ))?;
+                        writeln!(out)?;
+                        writeln!(
+                            out,
+                            "CommitDate: {}",
+                            commit_identity_date(&record.commit.committer, &date_mode)
+                        )?;
+                    } else {
+                        let author = commit_identity_mailmapped(
+                            &record.commit.author,
+                            use_mailmap.then_some(&mailmap),
+                        );
+                        write!(out, "Author: ")?;
+                        out.write_all(&log_highlight_matches(
+                            author.as_bytes(),
+                            author_filters.as_ref(),
+                            &grep_colors,
+                        ))?;
+                        writeln!(out)?;
+                    }
+                    if kind == LogDefaultKind::Medium {
+                        writeln!(
+                            out,
+                            "Date:   {}",
+                            commit_identity_date(&record.commit.author, &date_mode)
+                        )?;
+                    }
+                    writeln!(out)?;
+                    let display_message =
+                        commit_message_for_commit_encoding(&record.commit, &output_encoding);
+                    for line in commit_message_lines(&display_message) {
+                        write!(out, "    ")?;
+                        out.write_all(&log_highlight_matches(
+                            line,
+                            grep_filters.as_ref(),
+                            &grep_colors,
+                        ))?;
+                        writeln!(out)?;
+                    }
+                    if !display_notes_refs.is_empty() {
+                        let notes = render_notes_block(
+                            &git_dir,
+                            format,
+                            &notes_store,
+                            &display_notes_refs,
+                            &record.oid,
+                        )?;
+                        out.write_all(&notes)?;
+                    }
                     if !diff_block.is_empty() {
-                        raw.extend_from_slice(diff_opts.block_separator_for(record));
-                        raw.extend_from_slice(&diff_block);
+                        out.write_all(diff_opts.block_separator_for(record))?;
+                        out.write_all(&diff_block)?;
                     }
-                    out.write_all(&raw)?;
-                    continue;
-                }
-                if printed_entries > 0 {
-                    writeln!(out)?;
-                }
-                printed_entries += 1;
-                if show_signature {
-                    let signature = log_signature_human_output(&git_dir, &db, &config, record)?;
-                    out.write_all(&signature)?;
-                }
-                write!(
-                    out,
-                    "commit {}",
-                    format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
-                )?;
-                if show_source
-                    && let Some(source) = log_source_label(
-                        &record.oid,
-                        log_format_source.as_deref(),
-                        source_labels.as_ref(),
-                    )
-                {
-                    write!(out, "\t{source}")?;
-                }
-                if let Some(labels) = decorations.get(&record.oid)
-                    && !labels.is_empty()
-                {
-                    write!(out, " ({})", labels.join(", "))?;
-                }
-                if show_parents {
-                    let parent_abbrev = abbrev_commit.then_some(abbrev_len).flatten();
-                    for parent in &record.parents {
-                        write!(out, " {}", format_log_oid(parent, parent_abbrev))?;
-                    }
-                }
-                writeln!(out)?;
-                if record.parents.len() > 1 {
-                    let merged: Vec<String> =
-                        record.parents.iter().map(format_log_abbrev_oid).collect();
-                    writeln!(out, "Merge: {}", merged.join(" "))?;
-                }
-                if kind == LogDefaultKind::Fuller {
-                    let author = commit_identity_mailmapped(
-                        &record.commit.author,
-                        use_mailmap.then_some(&mailmap),
-                    );
-                    write!(out, "Author:     ")?;
-                    out.write_all(&log_highlight_matches(
-                        author.as_bytes(),
-                        author_filters.as_ref(),
-                        &grep_colors,
-                    ))?;
-                    writeln!(out)?;
-                    writeln!(
-                        out,
-                        "AuthorDate: {}",
-                        commit_identity_date(&record.commit.author, &date_mode)
-                    )?;
-                    let committer = commit_identity_mailmapped(
-                        &record.commit.committer,
-                        use_mailmap.then_some(&mailmap),
-                    );
-                    write!(out, "Commit:     ")?;
-                    out.write_all(&log_highlight_matches(
-                        committer.as_bytes(),
-                        committer_filters.as_ref(),
-                        &grep_colors,
-                    ))?;
-                    writeln!(out)?;
-                    writeln!(
-                        out,
-                        "CommitDate: {}",
-                        commit_identity_date(&record.commit.committer, &date_mode)
-                    )?;
-                } else {
-                    let author = commit_identity_mailmapped(
-                        &record.commit.author,
-                        use_mailmap.then_some(&mailmap),
-                    );
-                    write!(out, "Author: ")?;
-                    out.write_all(&log_highlight_matches(
-                        author.as_bytes(),
-                        author_filters.as_ref(),
-                        &grep_colors,
-                    ))?;
-                    writeln!(out)?;
-                }
-                if kind == LogDefaultKind::Medium {
-                    writeln!(
-                        out,
-                        "Date:   {}",
-                        commit_identity_date(&record.commit.author, &date_mode)
-                    )?;
-                }
-                writeln!(out)?;
-                let display_message =
-                    commit_message_for_commit_encoding(&record.commit, &output_encoding);
-                for line in commit_message_lines(&display_message) {
-                    write!(out, "    ")?;
-                    out.write_all(&log_highlight_matches(
-                        line,
-                        grep_filters.as_ref(),
-                        &grep_colors,
-                    ))?;
-                    writeln!(out)?;
-                }
-                if !display_notes_refs.is_empty() {
-                    let notes = render_notes_block(
-                        &git_dir,
-                        format,
-                        &notes_store,
-                        &display_notes_refs,
-                        &record.oid,
-                    )?;
-                    out.write_all(&notes)?;
-                }
-                if !diff_block.is_empty() {
-                    out.write_all(diff_opts.block_separator_for(record))?;
-                    out.write_all(&diff_block)?;
                 }
             }
             LogOutput::Compiled {
