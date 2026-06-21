@@ -433,6 +433,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut modified = false;
     let mut cached = false;
     let mut unmerged = false;
+    let mut resolve_undo = false;
     let mut directory = false;
     let mut no_empty_directory = false;
     let mut ignored = false;
@@ -471,6 +472,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-modified" => modified = false,
             "--unmerged" | "-u" => unmerged = true,
             "--no-unmerged" => unmerged = false,
+            "--resolve-undo" => resolve_undo = true,
             "--directory" => directory = true,
             "--no-directory" => directory = false,
             "--empty-directory" => no_empty_directory = false,
@@ -526,8 +528,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-t" => tag = false,
             "--recurse-submodules"
             | "--no-recurse-submodules"
-            | "--no-killed"
-            | "--no-resolve-undo" => {}
+            | "--no-killed" => {}
+            "--no-resolve-undo" => resolve_undo = false,
             "--abbrev" => oid_abbrev = Some(7),
             "--no-abbrev" => oid_abbrev = None,
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
@@ -590,7 +592,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             value if !value.starts_with('-') => path_args.push(arg.clone()),
             value => {
                 return Err(GitError::Command(format!(
-                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --debug, -t, --abbrev[=<n>], --no-abbrev, and -z"
+                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --resolve-undo, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --debug, -t, --abbrev[=<n>], --no-abbrev, and -z"
                 )));
             }
         }
@@ -615,7 +617,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         exclude_patterns.extend(contents.split(|byte| *byte == b'\n').map(Vec::from));
     }
     let terminator = if nul { 0 } else { b'\n' };
-    let selected = cached || others || deleted || modified || unmerged;
+    let selected = cached || others || deleted || modified || unmerged || resolve_undo;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
         eprintln!("fatal: ls-files -i must be used with either -o or -c");
@@ -696,6 +698,16 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 terminator,
                 &pathspec,
             )?;
+        }
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
+        }
+        return Ok(());
+    }
+    if resolve_undo {
+        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+            write_ls_files_resolve_undo(&mut stdout, &index, format, terminator, &pathspec)?;
         }
         stdout.flush()?;
         if error_unmatch {
@@ -944,6 +956,85 @@ fn ls_files_display_index(
         sley_worktree::expand_sparse_index(&mut index, &db, format)?;
     }
     Ok(index)
+}
+
+struct LsFilesResolveUndoRecord {
+    path: Vec<u8>,
+    stages: [Option<(u32, ObjectId)>; 3],
+}
+
+fn parse_ls_files_resolve_undo_records(
+    body: Option<&[u8]>,
+    format: ObjectFormat,
+) -> Result<Vec<LsFilesResolveUndoRecord>> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+    while offset < body.len() {
+        let path_end = body[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| GitError::InvalidFormat("truncated REUC path".into()))?
+            + offset;
+        let path = body[offset..path_end].to_vec();
+        offset = path_end + 1;
+
+        let mut modes = [0u32; 3];
+        for mode in &mut modes {
+            let mode_end = body[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| GitError::InvalidFormat("truncated REUC mode".into()))?
+                + offset;
+            let text = std::str::from_utf8(&body[offset..mode_end])
+                .map_err(|_| GitError::InvalidFormat("invalid REUC mode".into()))?;
+            *mode = u32::from_str_radix(text, 8)
+                .map_err(|_| GitError::InvalidFormat("invalid REUC mode".into()))?;
+            offset = mode_end + 1;
+        }
+
+        let mut stages = [None, None, None];
+        for (idx, mode) in modes.into_iter().enumerate() {
+            if mode == 0 {
+                continue;
+            }
+            let end = offset
+                .checked_add(format.raw_len())
+                .ok_or_else(|| GitError::InvalidFormat("REUC oid length overflow".into()))?;
+            if end > body.len() {
+                return Err(GitError::InvalidFormat("truncated REUC oid".into()));
+            }
+            stages[idx] = Some((mode, ObjectId::from_raw(format, &body[offset..end])?));
+            offset = end;
+        }
+        records.push(LsFilesResolveUndoRecord { path, stages });
+    }
+    Ok(records)
+}
+
+fn write_ls_files_resolve_undo(
+    stdout: &mut io::Stdout,
+    index: &Index,
+    format: ObjectFormat,
+    terminator: u8,
+    pathspec: &LsFilesPathspec,
+) -> Result<()> {
+    for record in parse_ls_files_resolve_undo_records(index.extension(b"REUC")?, format)? {
+        let Some(path) = pathspec.display(&record.path) else {
+            continue;
+        };
+        for (idx, stage) in record.stages.into_iter().enumerate() {
+            let Some((mode, oid)) = stage else {
+                continue;
+            };
+            write!(stdout, "{mode:06o} {oid} {}\t", idx + 1)?;
+            write_ls_files_path(stdout, &path, terminator)?;
+            stdout.write_all(&[terminator])?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1431,8 +1522,11 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut force_write_index = false;
     let mut ignore_skip_worktree_entries = false;
     let mut unresolve_only = false;
+    let mut collect_unresolve_paths = false;
     let mut ignore_paths_after_unresolve = false;
+    let mut unresolve_paths = Vec::new();
     let mut suppress_after_unresolve = false;
+    let mut clear_resolve_undo = false;
     let mut test_untracked_cache = false;
     let mut untracked_cache = None;
     let mut fsmonitor = false;
@@ -1473,7 +1567,9 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         }
         let arg = args[idx].as_str();
         if positional_only {
-            if !ignore_paths_after_unresolve {
+            if collect_unresolve_paths {
+                unresolve_paths.push(PathBuf::from(arg));
+            } else if !ignore_paths_after_unresolve {
                 paths.push(PathBuf::from(arg));
                 path_modes.push(sley_worktree::UpdateIndexPathMode {
                     add,
@@ -1594,8 +1690,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             }
             "--unresolve" => {
                 suppress_after_unresolve = true;
-                ignore_paths_after_unresolve = true;
                 unresolve_only = paths.is_empty();
+                if unresolve_only {
+                    collect_unresolve_paths = true;
+                } else {
+                    ignore_paths_after_unresolve = true;
+                }
                 allow_no_input = true;
             }
             "--fsmonitor" => {
@@ -1630,7 +1730,10 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 force_write_index = false;
                 allow_no_input = true;
             }
-            "--clear-resolve-undo" => allow_no_input = true,
+            "--clear-resolve-undo" => {
+                clear_resolve_undo = true;
+                allow_no_input = true;
+            }
             "--show-index-version" => {
                 show_index_version = true;
                 allow_no_input = true;
@@ -1697,7 +1800,9 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 return update_index_usage_error();
             }
             value => {
-                if !ignore_paths_after_unresolve {
+                if collect_unresolve_paths {
+                    unresolve_paths.push(PathBuf::from(value));
+                } else if !ignore_paths_after_unresolve {
                     paths.push(PathBuf::from(value));
                     path_modes.push(sley_worktree::UpdateIndexPathMode {
                         add,
@@ -1743,6 +1848,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         }
     }
     if paths.is_empty()
+        && unresolve_paths.is_empty()
         && cacheinfo.is_empty()
         && !refresh
         && !again
@@ -1755,12 +1861,20 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             if unresolve_only {
                 return Ok(());
             }
-            let git_dir = if show_index_version || fsmonitor || split_index.is_some() {
+            let git_dir = if show_index_version
+                || fsmonitor
+                || split_index.is_some()
+                || clear_resolve_undo
+            {
                 let cwd = env::current_dir()?;
                 Some(discover_git_dir(&cwd)?)
             } else {
                 None
             };
+            if clear_resolve_undo && let Some(git_dir) = &git_dir {
+                let format = repository_object_format(git_dir)?;
+                sley_worktree::clear_resolve_undo(git_dir, format)?;
+            }
             if let (Some(split_index), Some(git_dir)) = (split_index, &git_dir) {
                 let format = repository_object_format(git_dir)?;
                 if split_index {
@@ -1800,6 +1914,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         || skip_worktree.is_some()
         || assume_unchanged.is_some()
         || !paths.is_empty()
+        || unresolve_only
         || test_untracked_cache
         || untracked_cache.is_some();
     let worktree_root = match worktree_root_for_git_dir(&git_dir) {
@@ -1808,6 +1923,16 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         Err(err) => return Err(err),
     };
     let resolved_paths = paths
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            }
+        })
+        .collect::<Vec<_>>();
+    let resolved_unresolve_paths = unresolve_paths
         .iter()
         .map(|path| {
             if path.is_absolute() {
@@ -1827,6 +1952,18 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         .zip(path_modes.iter().copied())
         .map(|(path, mode)| sley_worktree::UpdateIndexPath { path, mode })
         .collect::<Vec<_>>();
+    if clear_resolve_undo {
+        sley_worktree::clear_resolve_undo(&git_dir, format)?;
+    }
+    if unresolve_only {
+        sley_worktree::unresolve_index_paths(
+            &worktree_root,
+            &git_dir,
+            format,
+            &resolved_unresolve_paths,
+        )?;
+        return Ok(());
+    }
     if let Some(enabled) = untracked_cache {
         if enabled {
             sley_worktree::enable_untracked_cache(&worktree_root, &git_dir, format)?;
