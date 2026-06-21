@@ -683,10 +683,26 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let store = FileRefStore::new(&git_dir, format);
             let branch = checkout_expand_creation_branch_name(&git_dir, format, &store, branch)?;
             if orphan {
-                if !positional.is_empty() {
-                    return Err(GitError::Command(
-                        "checkout --orphan does not accept a start point".into(),
-                    ));
+                if positional.len() > 1 {
+                    eprintln!(
+                        "fatal: Cannot update paths and switch to branch '{branch}' at the same time."
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                if let Some(start) = positional.first().map(String::as_str) {
+                    let Some(start_oid) = resolve_checkout_start_oid(&git_dir, format, start)?
+                    else {
+                        eprintln!(
+                            "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
+                        );
+                        return Err(GitError::Exit(128));
+                    };
+                    sley_worktree::reset_index_and_worktree_to_commit(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &start_oid,
+                    )?;
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
                 sley_sequencer::replay::remove_branch_state(&git_dir);
