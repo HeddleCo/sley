@@ -17,6 +17,7 @@
 
 use crate::*;
 use sley_object::TreeEntries;
+use std::cell::{Ref, RefCell};
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +173,24 @@ struct ShowContext<'a> {
     options: &'a ShowOptions,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
+    mailmap: RefCell<Option<commands::utility::Mailmap>>,
+}
+
+impl ShowContext<'_> {
+    fn mailmap(&self) -> Result<Ref<'_, commands::utility::Mailmap>> {
+        let needs_load = self.mailmap.borrow().is_none();
+        if needs_load {
+            *self.mailmap.borrow_mut() = Some(commands::utility::Mailmap::load_default(
+                self.git_dir,
+                self.format,
+            )?);
+        }
+        Ok(Ref::map(self.mailmap.borrow(), |mailmap| {
+            mailmap
+                .as_ref()
+                .expect("mailmap cache was just initialized")
+        }))
+    }
 }
 
 struct CommitTrailerLayout {
@@ -193,6 +212,28 @@ fn resolve_show_merge_mode(options: &ShowOptions) -> ShowMergeMode {
         Some(mode) => mode,
         None if options.first_parent => ShowMergeMode::FirstParent,
         None => ShowMergeMode::Combined { dense: true },
+    }
+}
+
+fn show_compiled_format_uses_mailmap(compiled: &CompiledLogFormat) -> bool {
+    compiled.tokens.iter().any(|token| {
+        matches!(
+            token,
+            FormatToken::AuthorNameMapped
+                | FormatToken::AuthorEmailMapped
+                | FormatToken::AuthorEmailLocalMapped
+                | FormatToken::CommitterNameMapped
+                | FormatToken::CommitterEmailMapped
+                | FormatToken::CommitterEmailLocalMapped
+        )
+    })
+}
+
+fn show_commit_format_needs_mailmap(format: &ShowCommitFormat, use_mailmap: bool) -> bool {
+    match format {
+        ShowCommitFormat::Medium | ShowCommitFormat::Short => use_mailmap,
+        ShowCommitFormat::Custom { compiled, .. } => show_compiled_format_uses_mailmap(compiled),
+        ShowCommitFormat::Oneline | ShowCommitFormat::FullOneline => false,
     }
 }
 
@@ -431,6 +472,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         options: &options,
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
+        mailmap: RefCell::new(None),
     };
     let grep_kind = log_grep_pattern_kind_from_config(
         config,
@@ -610,7 +652,14 @@ fn show_commit(
         .config
         .get_bool("log", None, "mailmap")
         .unwrap_or(true);
-    let mailmap = commands::utility::Mailmap::load_default(context.git_dir, context.format)?;
+    let needs_mailmap = show_commit_format_needs_mailmap(&options.commit_format, use_mailmap);
+    let mailmap_guard = if needs_mailmap {
+        Some(context.mailmap()?)
+    } else {
+        None
+    };
+    let mailmap = mailmap_guard.as_deref();
+    let empty_mailmap = commands::utility::Mailmap::default();
     let record = sley_rev::CommitRecord {
         oid: *oid,
         parents: commit.parents.clone(),
@@ -660,7 +709,7 @@ fn show_commit(
             commit,
             shown_one,
             suppress_separator,
-            use_mailmap.then_some(&mailmap),
+            mailmap,
             text_self_terminated,
             blank_before_diff,
             separator_mode,
@@ -699,7 +748,7 @@ fn show_commit(
             writeln!(
                 stdout,
                 "Author: {}",
-                commit_identity_mailmapped(&commit.author, use_mailmap.then_some(&mailmap))
+                commit_identity_mailmapped(&commit.author, mailmap)
             )?;
             if matches!(options.commit_format, ShowCommitFormat::Medium) {
                 writeln!(
@@ -763,7 +812,7 @@ fn show_commit(
                     source_oid: None,
                     describe: None,
                     signature: Some(&signature_ctx),
-                    mailmap: &mailmap,
+                    mailmap: mailmap.unwrap_or(&empty_mailmap),
                     use_mailmap,
                     color: false,
                     output_encoding: &output_encoding,

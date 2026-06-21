@@ -32,11 +32,10 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     // git's repository setup validates the repository format (version vs
     // extensions) before rev-parse processes any argument; a bare `rev-parse`
     // in a malformed repository must still die (t0001 #60/#62/#64).
-    verify_repository_format(&git_dir)?;
+    let format = verify_repository_format(&git_dir)?;
     if args.is_empty() {
         return Err(GitError::Command("rev-parse requires <rev>...".into()));
     }
-    let format = repository_object_format(&git_dir)?;
     let mut short: Option<usize> = None;
     let mut short_revs = 0usize;
     let mut verify = false;
@@ -1851,15 +1850,15 @@ fn is_shallow_repository(git_dir: &Path) -> bool {
 }
 
 /// `check_repository_format_gently`.
-fn verify_repository_format(git_dir: &Path) -> Result<()> {
+fn verify_repository_format(git_dir: &Path) -> Result<ObjectFormat> {
     repository_ref_storage_format(git_dir)?;
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let config_path = common_git_dir.join("config");
     let Ok(config) = GitConfig::read(&config_path) else {
-        return Ok(());
+        return Ok(ObjectFormat::Sha1);
     };
     let Some(version_value) = config.get("core", None, "repositoryformatversion") else {
-        return Ok(());
+        return Ok(config.repository_object_format()?);
     };
     let version: i64 = version_value.trim().parse().unwrap_or(0);
     if version > 1 {
@@ -1912,7 +1911,7 @@ fn verify_repository_format(git_dir: &Path) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
-    Ok(())
+    config.repository_object_format()
 }
 
 fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {

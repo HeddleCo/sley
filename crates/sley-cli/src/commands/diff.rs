@@ -349,8 +349,15 @@ impl WhitespaceRuleResolver {
     /// `indent-with-non-tab`) is fatal, mirroring git's `parse_whitespace_rule`
     /// `die`.
     pub(crate) fn from_git_dir(git_dir: &Path) -> Result<Self> {
-        let config_rule = match read_repo_config(git_dir)
-            .ok()
+        let config = read_repo_config(git_dir).ok();
+        Self::from_git_dir_with_config(git_dir, config.as_ref())
+    }
+
+    pub(crate) fn from_git_dir_with_config(
+        git_dir: &Path,
+        config: Option<&GitConfig>,
+    ) -> Result<Self> {
+        let config_rule = match config
             .and_then(|config| config.get("core", None, "whitespace").map(str::to_owned))
         {
             Some(value) => match sley_diff_merge::ws::parse_whitespace_rule(&value) {
@@ -1043,6 +1050,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         );
     }
     let git_dir = discover_git_dir(&cwd)?;
+    let repo_config = read_repo_config(&git_dir).ok();
     let format = repository_object_format(&git_dir)?;
     if let Ok(config) = read_repo_config(&git_dir) {
         if let Some(value) = config.get("diff", None, "colormoved")
@@ -1083,15 +1091,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         ws: color_moved_ws,
     });
     if !color_always
-        && read_repo_config(&git_dir)
-            .ok()
+        && repo_config
+            .as_ref()
             .and_then(|config| config.get("diff", None, "color").map(str::to_owned))
             .is_some_and(|value| git_config_color_is_always(&value))
     {
         color_always = true;
     }
     let ws_error_highlight = ws_error_highlight.or_else(|| {
-        read_repo_config(&git_dir).ok().and_then(|config| {
+        repo_config.as_ref().and_then(|config| {
             config
                 .get("diff", None, "wserrorhighlight")
                 .map(str::to_owned)
@@ -1099,8 +1107,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     });
     let ws_error_kinds = parse_ws_error_highlight_kinds(ws_error_highlight.as_deref());
     let diff_submodule_format = diff_submodule_format.or_else(|| {
-        read_repo_config(&git_dir)
-            .ok()
+        repo_config
+            .as_ref()
             .and_then(|config| config.get("diff", None, "submodule").map(str::to_owned))
             .and_then(|value| match value.as_str() {
                 "short" | "log" | "diff" => {
@@ -1138,7 +1146,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     //  * else `diff.srcPrefix`/`diff.dstPrefix` (defaulting to `a/`/`b/`).
     // CLI `--no-prefix`/`--default-prefix`/`--src-prefix`/`--dst-prefix` always
     // win over config.
-    if let Ok(config) = read_repo_config(&git_dir) {
+    if let Some(config) = repo_config.as_ref() {
         let cfg_no_prefix = config.get_bool("diff", None, "noprefix").unwrap_or(false);
         let cfg_mnemonic = config
             .get_bool("diff", None, "mnemonicprefix")
@@ -1178,7 +1186,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         dst_prefix = cfg_dst;
     }
     if !diff_relative_explicit
-        && let Ok(config) = read_repo_config(&git_dir)
+        && let Some(config) = repo_config.as_ref()
         && config.get_bool("diff", None, "relative").unwrap_or(false)
     {
         diff_relative = commands::diff_options::DiffRelativeMode::Cwd;
@@ -1187,13 +1195,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // `diff.indentHeuristic` config, which itself defaults to git's
     // enabled-by-default behavior.
     let indent_heuristic = indent_heuristic.unwrap_or_else(|| {
-        read_repo_config(&git_dir)
-            .ok()
+        repo_config
+            .as_ref()
             .and_then(|config| config.get_bool("diff", None, "indentheuristic"))
             .unwrap_or(true)
     });
     if !renames_explicit
-        && let Ok(config) = read_repo_config(&git_dir)
+        && let Some(config) = repo_config.as_ref()
         && let Some(value) = config.get("diff", None, "renames")
     {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -1218,7 +1226,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         // diff.dirstat config forms the base (bad parameters warn); explicit
         // --dirstat parameters apply on top (bad parameters are fatal).
         let mut base = DirstatOptions::default();
-        if let Ok(config) = read_repo_config(&git_dir)
+        if let Some(config) = repo_config.as_ref()
             && let Some(value) = config.get("diff", None, "dirstat")
         {
             let mut errors = String::new();
@@ -1594,7 +1602,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // whitespace error; combined with `--exit-code`/`--quiet` (not exclusive)
     // the change bit (1) is OR-ed in, matching git's exit codes.
     if check && !name_status && !name_only {
-        let resolver = WhitespaceRuleResolver::from_git_dir(&git_dir)?;
+        let resolver =
+            WhitespaceRuleResolver::from_git_dir_with_config(&git_dir, repo_config.as_ref())?;
         let check_failed = run_diff_check(
             &entries,
             &db,
@@ -1621,12 +1630,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .ok()
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
-        let config = read_repo_config(&git_dir).ok();
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
             userdiff_attributes,
-            config.clone(),
+            repo_config.clone(),
         );
-        let global_external = global_external_diff_command(config.as_ref());
+        let global_external = global_external_diff_command(repo_config.as_ref());
         if let Some(code) = run_external_diff_entries(
             &entries,
             &db,
@@ -1638,7 +1646,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 quiet,
                 exit_code,
                 output: output.as_deref(),
-                autocrlf: config
+                autocrlf: repo_config
                     .as_ref()
                     .and_then(|config| config.get_bool("core", None, "autocrlf"))
                     .unwrap_or(false),
@@ -1726,8 +1734,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         if show_stat {
             let mut stat_widths = stat_widths;
-            if let Ok(config) = read_repo_config(&git_dir) {
-                stat_widths.resolve_config(&config);
+            if let Some(config) = repo_config.as_ref() {
+                stat_widths.resolve_config(config);
             } else {
                 stat_widths.resolve_config_defaults();
             }
@@ -1774,9 +1782,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
                 writeln!(stdout)?;
             }
-            let colors = color_always.then(|| {
-                commands::diff_words::DiffColors::enabled(read_repo_config(&git_dir).ok().as_ref())
-            });
+            let colors = color_always
+                .then(|| commands::diff_words::DiffColors::enabled(repo_config.as_ref()));
             let word_request = word_diff_mode.map(|mode| WordDiffRequest {
                 mode,
                 cli_regex: word_diff_regex.as_deref(),
@@ -1791,13 +1798,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 .transpose()?;
             let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
                 userdiff_attributes,
-                read_repo_config(&git_dir).ok(),
+                repo_config.clone(),
             );
             // Whitespace-error highlighting needs the per-path rule, but only
             // when color is on (it does nothing otherwise) and word-diff is
             // off (git suppresses ws-highlight under --word-diff).
             let ws_resolver = (colors.is_some() && word_request.is_none())
-                .then(|| WhitespaceRuleResolver::from_git_dir(&git_dir))
+                .then(|| {
+                    WhitespaceRuleResolver::from_git_dir_with_config(&git_dir, repo_config.as_ref())
+                })
                 .transpose()?;
             for entry in &entries {
                 let ws_error = match (ws_resolver.as_ref(), ws_error_kinds) {

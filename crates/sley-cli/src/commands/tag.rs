@@ -2095,7 +2095,7 @@ fn print_tag_list(
     let merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.merged)?;
     let no_merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.no_merged)?;
     let mut entries = Vec::new();
-    for reference in store.list_refs()? {
+    for reference in store.list_refs_with_prefix("refs/tags/")? {
         if let Some(name) = reference.name.strip_prefix("refs/tags/")
             && (options.patterns.is_empty()
                 || options.patterns.iter().any(|pattern| {
