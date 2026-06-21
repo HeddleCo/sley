@@ -682,7 +682,7 @@ declare -A FLOOR=(
     [t7063-status-untracked-cache.sh]=44
     [t1410-reflog.sh]=41
     [t1060-object-corruption.sh]=13
-    [t2203-add-intent.sh]=11
+    [t2203-add-intent.sh]=19  # wave-32: 11->19 (intent-to-add consumers)
     [t3650-replay-basics.sh]=43
     [t3701-add-interactive.sh]=121
     [t4011-diff-symlink.sh]=1
@@ -925,6 +925,20 @@ declare -A FLOOR=(
     [t5512-ls-remote.sh]=40
     [t3800-mktag.sh]=151
     [t2018-checkout-branch.sh]=25
+    # wave-32 (2026-06-21, fresh-sweep picked off main 18bbe2cc; weakest core = worktree 70%):
+    # add-intent, pull-options, update-ref-errors. t2203-add-intent 11->19 FULL (CE_INTENT_TO_ADD
+    # flag + consumers: status long/short/v2, worktree-vs-cached diff, diff-stat rename, pure-ITA
+    # commit refusal, commit -a upgrade, restore --staged, apply --intent-to-add).
+    # t5521-pull-options 10->22 FULL (-v/-q/--dry-run/--tags, merge passthrough stat/log/commit/
+    # squash/unrelated-histories/signoff/verify). t1404-update-ref-errors 28->38 FULL (transactional
+    # D/F ref conflicts across add/delete ordering, packed refs, indirect/symref names).
+    # No file-level collision between the 3 slices. BUT addintent's i-t-a worktree change first
+    # REGRESSED t1700-split-index 29->28 (null-sha1 cache-tree); fix-round 11e15fa4 restored it by
+    # expanding split indexes through sharedindex.* before write-tree + for status/stat-cache reads
+    # (root fix, +regression test). All 3 targets + t1700=29 re-verified on the MERGED binary.
+    # Guards held: t7508=119 t3700=50 t2070=15 t3600=81 t2402=27 t5510=7 t5516=110 t5526=56
+    # t5601=109 t1400=275 t1450=96 t2018=25 t2020=26. cargo test --workspace green.
+    [t5521-pull-options.sh]=22
 )
 
 fail=0

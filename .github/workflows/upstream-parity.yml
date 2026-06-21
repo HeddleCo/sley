@@ -150,6 +150,7 @@ jobs:
             t5512-ls-remote.sh
             t3800-mktag.sh
             t2018-checkout-branch.sh
+            t5521-pull-options.sh
             t2204-add-ignored.sh
             t6020-bundle-misc.sh
             t4068-diff-symmetric-merge-base.sh
