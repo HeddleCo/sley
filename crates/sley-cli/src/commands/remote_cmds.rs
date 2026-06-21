@@ -557,7 +557,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let transport_config = transport_policy_config_for_cwd()?;
     if !server_options_from_cli {
         server_options = configured_server_options(&transport_config, &origin)?;
-    } else if configured_protocol_version(Some(&transport_config)) != Some(ProtocolVersion::V2) {
+    } else if configured_legacy_protocol(Some(&transport_config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));
@@ -3129,9 +3129,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             } else {
                 configured_server_options(&config, &remote)?
             };
-            if server_options_from_cli
-                && configured_protocol_version(Some(&config)) != Some(ProtocolVersion::V2)
-            {
+            if server_options_from_cli && configured_legacy_protocol(Some(&config)) {
                 eprintln!("fatal: server options require protocol version 2 or later");
                 eprintln!("fatal: see protocol.version in 'git help config' for more details");
                 return Err(GitError::Exit(128));
@@ -3219,7 +3217,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     } else {
         configured_server_options(&config, &source)?
     };
-    if server_options_from_cli && configured_protocol_version(Some(&config)) != Some(ProtocolVersion::V2) {
+    if server_options_from_cli && configured_legacy_protocol(Some(&config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));
@@ -3914,11 +3912,18 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     // connection's `version=2` extra-arg). Run the v2 server loop instead of the
     // v0 ref advertisement. Mirrors upload-pack.c's `determine_protocol_version`.
     if upload_pack_requested_protocol_v2() {
+        let config = read_repo_config(&git_dir)?;
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        return sley_remote::serve_upload_pack_v2(&git_dir, format, &mut stdin, &mut stdout);
+        return sley_remote::serve_upload_pack_v2_with_config(
+            &git_dir,
+            format,
+            &config,
+            &mut stdin,
+            &mut stdout,
+        );
     }
     let features = sley_remote::upload_pack_features(&git_dir, format)?;
     let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
@@ -4910,10 +4915,18 @@ fn configured_protocol_version(config: Option<&GitConfig>) -> Option<ProtocolVer
         .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
         .or_else(|| global_config_value("protocol.version").ok().flatten());
     match value.as_deref() {
+        Some("0") => Some(ProtocolVersion::V0),
         Some("1") => Some(ProtocolVersion::V1),
         Some("2") => Some(ProtocolVersion::V2),
         _ => None,
     }
+}
+
+fn configured_legacy_protocol(config: Option<&GitConfig>) -> bool {
+    matches!(
+        configured_protocol_version(config),
+        Some(ProtocolVersion::V0 | ProtocolVersion::V1)
+    )
 }
 
 fn trace_configured_local_protocol_version(config: Option<&GitConfig>) {
@@ -7289,7 +7302,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let transport_config = transport_policy_config_for_cwd()?;
     if options.server_options.is_empty() {
         options.server_options = configured_server_options(&transport_config, repository)?;
-    } else if configured_protocol_version(Some(&transport_config)) != Some(ProtocolVersion::V2) {
+    } else if configured_legacy_protocol(Some(&transport_config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));

@@ -1388,9 +1388,19 @@ pub fn serve_upload_pack_v2(
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    serve_upload_pack_v2_with_config(git_dir, format, &config, reader, writer)
+}
+
+pub fn serve_upload_pack_v2_with_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
     let handshake = TransportHandshake {
         protocol: ProtocolVersion::V2,
-        capabilities: upload_pack_v2_capabilities(format, &config)?,
+        capabilities: upload_pack_v2_capabilities(format, config)?,
     };
     write_protocol_v2_advertisement(writer, &handshake)?;
     writer.flush()?;
@@ -1412,7 +1422,7 @@ pub fn serve_upload_pack_v2(
         };
         match classify_protocol_v2_command_request(&handshake, format, &request)? {
             sley_protocol::ProtocolV2Command::LsRefs(ls_refs) => {
-                let records = local_ls_refs_v2_records(git_dir, format, &ls_refs, &config)?;
+                let records = local_ls_refs_v2_records(git_dir, format, &ls_refs, config)?;
                 write_protocol_v2_ls_refs_response(writer, &records)?;
                 writer.flush()?;
             }
