@@ -172,6 +172,7 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
     }
 
     let (is_bare, core_worktree) = read_worktree_config(&gitdir_dir);
+    let is_bare = is_bare && !gitdir_dir.join("commondir").is_file();
 
     let worktree: Option<PathBuf>;
 
@@ -289,8 +290,9 @@ fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult>
         (gitdir.to_string(), gitdir_dir.clone())
     };
 
-    let (is_bare, core_worktree) = read_worktree_config(&effective_gitdir_dir);
     let has_common_dir = effective_gitdir_dir.join("commondir").is_file();
+    let (is_bare, core_worktree) = read_worktree_config(&effective_gitdir_dir);
+    let is_bare = is_bare && !has_common_dir;
     let effective_core_worktree = if has_common_dir {
         None
     } else {

@@ -707,14 +707,14 @@ fn empty_index() -> Index {
 /// This is the repository-intrinsic worktree resolution (it does *not* consult
 /// `GIT_WORK_TREE`/`GIT_DIR` or CLI overrides — those are the caller's job):
 ///
-/// 0. if `core.bare` is true the repository is bare and `Ok(None)` is returned
-///    immediately — `core.bare` takes precedence, so a bare repo ignores
-///    `core.worktree` and the `.git`-parent fallback;
-/// 1. otherwise, a `core.worktree` setting in `<git_dir>/config` (absolute, or
+/// 0. for a linked worktree (a git directory that has both a `commondir` and a
+///    `gitdir` administrative file), the directory containing the worktree's
+///    `.git` link, canonicalised;
+/// 1. otherwise, if `core.bare` is true the repository is bare and `Ok(None)` is
+///    returned immediately — `core.bare` takes precedence for the main repo, so
+///    a bare repo ignores `core.worktree` and the `.git`-parent fallback;
+/// 2. otherwise, a `core.worktree` setting in `<git_dir>/config` (absolute, or
 ///    relative to the git directory), canonicalised;
-/// 2. otherwise, for a linked worktree (a git directory that has both a
-///    `commondir` and a `gitdir` administrative file), the directory containing
-///    the worktree's `.git` link, canonicalised;
 /// 3. otherwise, when the git directory is a `.git` directory, its parent (the
 ///    ordinary non-bare layout) — returned verbatim, not canonicalised;
 /// 4. otherwise the repository is bare and `Ok(None)` is returned.
@@ -724,6 +724,18 @@ fn empty_index() -> Index {
 /// [`GitError::InvalidPath`] if a `.git` directory has no parent (a malformed
 /// layout).
 pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
+    if git_dir.join("commondir").is_file() {
+        let gitdir_file = git_dir.join("gitdir");
+        if gitdir_file.is_file() {
+            let value = fs::read_to_string(&gitdir_file)?;
+            let worktree_git_file = resolve_worktree_admin_path(git_dir, value.trim());
+            if let Some(worktree) = worktree_git_file.parent() {
+                return fs::canonicalize(worktree)
+                    .map(Some)
+                    .map_err(|err| GitError::Io(err.to_string()));
+            }
+        }
+    }
     if let Ok(config) = sley_config::read_repo_config(git_dir, None) {
         // A bare repository has no working tree, and `core.bare` takes precedence:
         // a bare repo ignores `core.worktree`. Check it before any worktree
@@ -742,18 +754,6 @@ pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
             return fs::canonicalize(worktree)
                 .map(Some)
                 .map_err(|err| GitError::Io(err.to_string()));
-        }
-    }
-    if git_dir.join("commondir").is_file() {
-        let gitdir_file = git_dir.join("gitdir");
-        if gitdir_file.is_file() {
-            let value = fs::read_to_string(&gitdir_file)?;
-            let worktree_git_file = resolve_worktree_admin_path(git_dir, value.trim());
-            if let Some(worktree) = worktree_git_file.parent() {
-                return fs::canonicalize(worktree)
-                    .map(Some)
-                    .map_err(|err| GitError::Io(err.to_string()));
-            }
         }
     }
     if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
