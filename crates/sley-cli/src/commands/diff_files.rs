@@ -903,10 +903,12 @@ fn filter_racy_clean_equivalent_worktree_entries(
     format: ObjectFormat,
     config: &GitConfig,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let index = Index::parse(
-        &fs::read(sley_worktree::repository_index_path(git_dir))?,
-        format,
-    )?;
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index = match fs::read(&index_path) {
+        Ok(bytes) => Index::parse(&bytes, format)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(entries),
+        Err(err) => return Err(err.into()),
+    };
     let mut filtered = Vec::with_capacity(entries.len());
     for entry in entries {
         if diff_files_entry_is_racy_clean_equivalent(
