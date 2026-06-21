@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -1818,14 +1819,15 @@ fn update_index_paths_impl(
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
         let git_path = git_path_bytes(relative)?;
+        let existing_range = index_entries_path_range(&index.entries, &git_path);
         if path_mode.force_remove {
+            record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
             remove_index_entries_with_path(&mut index.entries, &git_path);
             untracked_cache_invalidation_paths.push(git_path.clone());
             // git's update_one() reports `remove` for a --force-remove path.
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
             continue;
         }
-        let existing_range = index_entries_path_range(&index.entries, &git_path);
         if !options.allow_skip_worktree_entries
             && index.entries[existing_range.clone()]
                 .iter()
@@ -1863,6 +1865,7 @@ fn update_index_paths_impl(
         };
         let Some(metadata) = symlink_metadata else {
             if path_mode.remove {
+                record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
                 remove_index_entries_with_path(&mut index.entries, &git_path);
                 untracked_cache_invalidation_paths.push(git_path.clone());
                 // git's update_one() unconditionally reports `add '<path>'`
@@ -1886,6 +1889,12 @@ fn update_index_paths_impl(
                 && !existing_range.is_empty()
                 && sley_diff_merge::gitlink_head_oid(&absolute, format).is_none()
             {
+                record_resolve_undo_for_range(
+                    &mut index,
+                    format,
+                    &git_path,
+                    existing_range.clone(),
+                )?;
                 remove_index_entries_with_path(&mut index.entries, &git_path);
                 untracked_cache_invalidation_paths.push(git_path.clone());
                 reports.push(format!("add '{}'", String::from_utf8_lossy(&git_path)));
@@ -1930,6 +1939,7 @@ fn update_index_paths_impl(
             );
             entry.mode = sley_index::GITLINK_MODE;
             reports.push(format!("add '{display}'"));
+            record_resolve_undo_for_range(&mut index, format, &git_path, existing_range.clone())?;
             replace_index_entries_with_entry(&mut index.entries, entry);
             untracked_cache_invalidation_paths.push(git_path.clone());
             updated.push(head_oid);
@@ -2022,6 +2032,7 @@ fn update_index_paths_impl(
                 ));
             }
         }
+        record_resolve_undo_for_range(&mut index, format, &git_path, existing_range.clone())?;
         replace_index_entries_with_entry(&mut index.entries, entry);
         untracked_cache_invalidation_paths.push(git_path);
         updated.push(oid);
@@ -2748,6 +2759,150 @@ fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> {
         offset = end;
     }
     filtered
+}
+
+#[derive(Clone)]
+struct ResolveUndoRecord {
+    path: Vec<u8>,
+    stages: [Option<(u32, ObjectId)>; 3],
+}
+
+fn record_resolve_undo_for_path(
+    index: &mut Index,
+    format: ObjectFormat,
+    path: &[u8],
+    entries: &[IndexEntry],
+) -> Result<()> {
+    let mut stages = [None, None, None];
+    for entry in entries {
+        match entry.stage() {
+            Stage::Base => stages[0] = Some((entry.mode, entry.oid)),
+            Stage::Ours => stages[1] = Some((entry.mode, entry.oid)),
+            Stage::Theirs => stages[2] = Some((entry.mode, entry.oid)),
+            Stage::Normal => {}
+        }
+    }
+    if stages.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    let mut records = parse_resolve_undo_records(index.extension(b"REUC")?, format)?;
+    records.retain(|record| record.path.as_slice() != path);
+    records.push(ResolveUndoRecord {
+        path: path.to_vec(),
+        stages,
+    });
+    records.sort_by(|left, right| left.path.cmp(&right.path));
+    set_resolve_undo_extension(index, &records)
+}
+
+fn record_resolve_undo_for_range(
+    index: &mut Index,
+    format: ObjectFormat,
+    path: &[u8],
+    range: Range<usize>,
+) -> Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    let entries = index.entries[range].to_vec();
+    record_resolve_undo_for_path(index, format, path, &entries)
+}
+
+fn parse_resolve_undo_records(
+    body: Option<&[u8]>,
+    format: ObjectFormat,
+) -> Result<Vec<ResolveUndoRecord>> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+    while offset < body.len() {
+        let path_end = body[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| GitError::InvalidFormat("truncated REUC path".into()))?
+            + offset;
+        let path = body[offset..path_end].to_vec();
+        offset = path_end + 1;
+
+        let mut modes = [0u32; 3];
+        for mode in &mut modes {
+            let mode_end = body[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| GitError::InvalidFormat("truncated REUC mode".into()))?
+                + offset;
+            let text = std::str::from_utf8(&body[offset..mode_end])
+                .map_err(|_| GitError::InvalidFormat("invalid REUC mode".into()))?;
+            *mode = u32::from_str_radix(text, 8)
+                .map_err(|_| GitError::InvalidFormat("invalid REUC mode".into()))?;
+            offset = mode_end + 1;
+        }
+
+        let mut stages = [None, None, None];
+        for (idx, mode) in modes.into_iter().enumerate() {
+            if mode == 0 {
+                continue;
+            }
+            let end = offset
+                .checked_add(format.raw_len())
+                .ok_or_else(|| GitError::InvalidFormat("REUC oid length overflow".into()))?;
+            if end > body.len() {
+                return Err(GitError::InvalidFormat("truncated REUC oid".into()));
+            }
+            stages[idx] = Some((mode, ObjectId::from_raw(format, &body[offset..end])?));
+            offset = end;
+        }
+        records.push(ResolveUndoRecord { path, stages });
+    }
+    Ok(records)
+}
+
+fn set_resolve_undo_extension(index: &mut Index, records: &[ResolveUndoRecord]) -> Result<()> {
+    let mut body = Vec::new();
+    for record in records {
+        body.extend_from_slice(&record.path);
+        body.push(0);
+        for stage in record.stages {
+            match stage {
+                Some((mode, _)) => body.extend_from_slice(format!("{mode:o}").as_bytes()),
+                None => body.push(b'0'),
+            }
+            body.push(0);
+        }
+        for (_, oid) in record.stages.into_iter().flatten() {
+            body.extend_from_slice(oid.as_bytes());
+        }
+    }
+
+    let chunks = index.extension_chunks()?;
+    let mut rebuilt = Vec::with_capacity(index.extensions.len() + body.len() + 8);
+    let mut replaced = false;
+    for (signature, chunk_body) in chunks {
+        if &signature == b"REUC" {
+            if !body.is_empty() {
+                append_index_extension(&mut rebuilt, b"REUC", &body)?;
+            }
+            replaced = true;
+        } else {
+            append_index_extension(&mut rebuilt, &signature, chunk_body)?;
+        }
+    }
+    if !replaced && !body.is_empty() {
+        append_index_extension(&mut rebuilt, b"REUC", &body)?;
+    }
+    index.extensions = rebuilt;
+    Ok(())
+}
+
+fn append_index_extension(out: &mut Vec<u8>, signature: &[u8; 4], body: &[u8]) -> Result<()> {
+    let len = u32::try_from(body.len())
+        .map_err(|_| GitError::InvalidFormat("index extension body too large".into()))?;
+    out.extend_from_slice(signature);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    Ok(())
 }
 
 fn index_extensions_without_split_index_link(extensions: &[u8]) -> Vec<u8> {
@@ -12677,6 +12832,9 @@ pub fn checkout_index_paths(
         return Err(GitError::Exit(1));
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    if options.merge {
+        checkout_unmerge_resolve_undo_paths(worktree_root, &mut index, format, paths)?;
+    }
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let selected = checkout_selected_index_paths(worktree_root, &index, paths)?;
@@ -12831,6 +12989,93 @@ fn checkout_selected_index_paths(
         selected.extend(matched);
     }
     Ok(selected)
+}
+
+fn checkout_unmerge_resolve_undo_paths(
+    worktree_root: &Path,
+    index: &mut Index,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<()> {
+    let records = parse_resolve_undo_records(index.extension(b"REUC")?, format)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut remaining = Vec::new();
+    let mut unmerged_any = false;
+    for record in records {
+        if checkout_pathspecs_match_git_path(worktree_root, paths, &record.path)? {
+            remove_index_entries_with_path(&mut index.entries, &record.path);
+            for (idx, stage) in record.stages.into_iter().enumerate() {
+                let Some((mode, oid)) = stage else {
+                    continue;
+                };
+                index.entries.push(resolve_undo_index_entry(
+                    record.path.clone(),
+                    mode,
+                    oid,
+                    (idx + 1) as u16,
+                ));
+            }
+            unmerged_any = true;
+        } else {
+            remaining.push(record);
+        }
+    }
+    if unmerged_any {
+        index.entries.sort_by(|left, right| left.path.cmp(&right.path));
+        normalize_index_version_for_extended_flags(index);
+        set_resolve_undo_extension(index, &remaining)?;
+    }
+    Ok(())
+}
+
+fn checkout_pathspecs_match_git_path(
+    worktree_root: &Path,
+    paths: &[PathBuf],
+    candidate: &[u8],
+) -> Result<bool> {
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        let recursive = path == Path::new(".")
+            || path.to_string_lossy().ends_with('/')
+            || absolute.is_dir()
+            || index_entry_is_under_path(candidate, &git_path);
+        if candidate == git_path.as_slice()
+            || (recursive && index_entry_is_under_path(candidate, &git_path))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_undo_index_entry(path: Vec<u8>, mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
+    let name_len = (path.len().min(sley_index::INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
+    IndexEntry {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds: 0,
+        mtime_nanoseconds: 0,
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid,
+        flags: name_len | (stage << 12),
+        flags_extended: 0,
+        path: path.into(),
+    }
 }
 
 fn checkout_path_is_unmerged(index: &Index, path: &[u8]) -> bool {
@@ -14789,6 +15034,17 @@ pub fn remove_index_and_worktree_paths(
             &config_parameters_env,
         )?;
     }
+    let mut resolve_undo_index = Index {
+        version: index_version,
+        entries: index_entry_list.clone(),
+        extensions: index_extensions,
+        checksum: None,
+    };
+    for path in &selected {
+        let range = index_entries_path_range(&resolve_undo_index.entries, path);
+        record_resolve_undo_for_range(&mut resolve_undo_index, format, path, range)?;
+    }
+
     // Keep every entry whose path was not selected, preserving original order
     // and all stages of unmerged paths that were not removed.
     let entries = index_entry_list
@@ -14802,7 +15058,7 @@ pub fn remove_index_and_worktree_paths(
     // deletion never showed in the cached diff). Git invalidates the cache-tree
     // on any index mutation; drop it so it is rebuilt on the next write, exactly
     // like the `add` path does above.
-    let extensions = index_extensions_without_cache_tree(&index_extensions);
+    let extensions = index_extensions_without_cache_tree(&resolve_undo_index.extensions);
     let selected_paths = selected.iter().cloned().collect::<Vec<_>>();
     let mut index = Index {
         version: index_version,
