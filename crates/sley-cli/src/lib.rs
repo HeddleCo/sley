@@ -8003,11 +8003,6 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
 }
 
 fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
-    // git log accepts empty diff output indicators, unlike the raw diff option
-    // parser that requires a single byte.
-    if value.is_empty() {
-        return Ok(());
-    }
     log_validate_output_indicator(option, value)
 }
 

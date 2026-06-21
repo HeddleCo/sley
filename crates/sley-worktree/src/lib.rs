@@ -7941,7 +7941,7 @@ fn read_dir_entries_with_ignore_patterns(
         }
         entries.push(entry);
     }
-    if let Some(profile) = profile.as_deref_mut() {
+    if let Some(profile) = profile {
         profile.read_dir_entry_vec_cap_bytes +=
             (entries.capacity() * std::mem::size_of::<fs::DirEntry>()) as u64;
         profile.read_dir_entry_vec_max_len =
