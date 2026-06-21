@@ -68,6 +68,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut local = None::<bool>;
     let mut deepen_since = None::<i64>;
     let mut deepen_not = Vec::<String>::new();
+    let mut ssh_ip_version = None::<sley_transport::SshIpVersion>;
     // `--reject-shallow` / `--no-reject-shallow` are a tri-state (upstream
     // `option_reject_shallow = -1` when unspecified); the CLI flag overrides the
     // `clone.rejectshallow` config when present.
@@ -291,7 +292,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 template = None;
                 template_config = false;
             }
-            "-4" | "--ipv4" | "-6" | "--ipv6" => {}
+            "-4" | "--ipv4" => ssh_ip_version = Some(sley_transport::SshIpVersion::V4),
+            "-6" | "--ipv6" => ssh_ip_version = Some(sley_transport::SshIpVersion::V6),
             "-l" | "--local" => local = Some(true),
             "--no-local" => local = Some(false),
             "--hardlinks" | "--no-hardlinks" => {}
@@ -544,6 +546,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         repository
     };
     let transport_config = transport_policy_config_for_cwd()?;
+    let mut ssh_options = sley_remote::ssh_transport_options_from_config(&transport_config);
+    ssh_options.ip_version = ssh_ip_version;
     let resolved_repository = ls_remote_resolved_url(&repository)?;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
     // An empty `--template=` (or `--template ""`) disables templating entirely,
@@ -596,6 +600,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             bundle_uri: bundle_uri.as_ref(),
             depth,
             ref_storage,
+            ssh_options,
         })?;
         return recurse_clone_submodules(
             &checkout_destination,
@@ -633,6 +638,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             bundle_uri: bundle_uri.as_ref(),
             depth,
             ref_storage,
+            ssh_options,
         })?;
         return recurse_clone_submodules(
             &checkout_destination,
@@ -670,6 +676,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             bundle_uri: bundle_uri.as_ref(),
             depth,
             ref_storage,
+            ssh_options,
         })?;
         return recurse_clone_submodules(
             &checkout_destination,
@@ -966,6 +973,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         // mapping) must be bypassed.
         branch_explicit: branch_explicit && branch_tag_oid.is_none(),
         ref_storage,
+        ssh_options: None,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -1068,6 +1076,7 @@ struct CloneHttpOptions<'a> {
     bundle_uri: Option<&'a CloneBundleUri>,
     depth: Option<u32>,
     ref_storage: RefStorageFormat,
+    ssh_options: sley_remote::SshTransportOptions,
 }
 
 /// Derive the remote default branch name from the upload-pack advertisement:
@@ -1201,6 +1210,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         filter: None,
         branch_explicit,
         ref_storage: options.ref_storage,
+        ssh_options: None,
     };
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
@@ -1332,7 +1342,11 @@ fn clone_network_repository(
     }
     let (advertisements, features) = match transport {
         CloneNetworkTransport::Ssh => {
-            sley_remote::ssh_upload_pack_advertisements(&remote, ObjectFormat::Sha1)?
+            sley_remote::ssh_upload_pack_advertisements_with_options(
+                &remote,
+                ObjectFormat::Sha1,
+                options.ssh_options,
+            )?
         }
         CloneNetworkTransport::Git => {
             sley_remote::git_upload_pack_advertisements(&remote, ObjectFormat::Sha1)?
@@ -1398,6 +1412,7 @@ fn clone_network_repository(
         filter: None,
         branch_explicit,
         ref_storage: options.ref_storage,
+        ssh_options: matches!(transport, CloneNetworkTransport::Ssh).then_some(options.ssh_options),
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -1549,6 +1564,7 @@ fn clone_bare_network_repository(
             deepen_not: Vec::new(),
             record_promisor_refs: false,
             refetch: false,
+            ssh_options: None,
         },
     )
     .map(|_| ())
@@ -1934,6 +1950,7 @@ fn clone_bare_or_mirror_local_repository(
             update_head_ok: false,
             deepen_since: None,
             deepen_not: Vec::new(),
+            ssh_options: None,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -2832,6 +2849,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         update_head_ok: false,
         deepen_since: None,
         deepen_not: Vec::new(),
+        ssh_options: None,
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;

@@ -424,6 +424,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let store = FileRefStore::new(&git_dir, format);
             let from = checkout_reflog_from_name(&store);
             let config = read_repo_config(&git_dir)?;
+            prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target_oid)?;
             let subject = detached_checkout_subject(&git_dir, format, &target_oid);
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
             if recurse_submodules {
@@ -515,6 +516,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 && let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, branch)
             {
                 let config = read_repo_config(&git_dir)?;
+                prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target_oid)?;
                 let subject = detached_checkout_subject(&git_dir, format, &target_oid);
                 let from = checkout_reflog_from_name(&store);
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
@@ -1478,6 +1480,7 @@ fn prefetch_local_promisor_checkout_blobs(
     if wants.is_empty() {
         return Ok(true);
     }
+    sley_protocol::set_packet_trace_identity("fetch");
     sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
@@ -1490,6 +1493,7 @@ fn prefetch_local_promisor_checkout_blobs(
         false,
         None,
     )?;
+    sley_protocol::set_packet_trace_identity("checkout");
     Ok(true)
 }
 

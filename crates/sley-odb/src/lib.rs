@@ -45,6 +45,13 @@ pub trait ObjectReader {
     fn has_shallow_grafts(&self) -> bool {
         false
     }
+
+    /// True when `oid` is covered by a promisor pack. Partial clones are
+    /// allowed to omit promised objects until a later on-demand fetch hydrates
+    /// them; ordinary readers keep the default "no promised objects".
+    fn is_promised_object(&self, _oid: &ObjectId) -> bool {
+        false
+    }
 }
 
 fn implied_empty_tree_object(format: ObjectFormat, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
@@ -511,9 +518,18 @@ where
     }
     let inputs = pack_inputs(&objects);
     let pack = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    trace_packfile(&pack.pack)?;
     destination
         .install_generated_pack_unchecked(&pack, options)
         .map(Some)
+}
+
+fn trace_packfile(pack: &[u8]) -> Result<()> {
+    let Some(path) = env::var_os("GIT_TRACE_PACKFILE").filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    fs::write(path, pack)?;
+    Ok(())
 }
 
 fn collect_tree_filter_depths<R>(
@@ -3947,6 +3963,7 @@ pub struct FileObjectDatabase {
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
     pack_header_types: PackHeaderTypeCaches,
+    promisor_objects: Arc<OnceLock<HashSet<ObjectId>>>,
     /// Graft points (`$GIT_DIR/shallow`), loaded lazily on the first
     /// [`ObjectReader::is_shallow_graft`] query. `$GIT_DIR` is taken to be
     /// the parent of `objects_dir`, matching the standard layout.
@@ -4296,6 +4313,7 @@ impl FileObjectDatabase {
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
+            promisor_objects: Arc::new(OnceLock::new()),
             shallow_grafts: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -4315,6 +4333,7 @@ impl FileObjectDatabase {
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
+            promisor_objects: Arc::new(OnceLock::new()),
             shallow_grafts: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -5207,6 +5226,10 @@ fn alternate_object_dirs(objects_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl ObjectReader for FileObjectDatabase {
+    fn is_promised_object(&self, oid: &ObjectId) -> bool {
+        self.promisor_objects().contains(oid)
+    }
+
     fn has_shallow_grafts(&self) -> bool {
         !self
             .shallow_grafts
@@ -5316,6 +5339,67 @@ impl ObjectReader for FileObjectDatabase {
             *oid,
             MissingObjectContext::Read,
         ))
+    }
+}
+
+impl FileObjectDatabase {
+    fn promisor_objects(&self) -> &HashSet<ObjectId> {
+        self.promisor_objects.get_or_init(|| {
+            let mut promised =
+                promisor_pack_object_ids(&self.objects_dir, self.format).unwrap_or_default();
+            let mut pending = promised.iter().copied().collect::<Vec<_>>();
+            while let Some(oid) = pending.pop() {
+                let Ok(object) = self.read_object(&oid) else {
+                    continue;
+                };
+                for link in promisor_object_links(self.format, &object) {
+                    if promised.insert(link) {
+                        pending.push(link);
+                    }
+                }
+            }
+            promised
+        })
+    }
+}
+
+fn promisor_pack_object_ids(objects_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+    let pack_dir = objects_dir.join("pack");
+    let mut oids = HashSet::new();
+    if !pack_dir.exists() {
+        return Ok(oids);
+    }
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        if !path.with_extension("pack").exists() || !path.with_extension("promisor").exists() {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(path)?, format)?;
+        oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+    }
+    Ok(oids)
+}
+
+fn promisor_object_links(format: ObjectFormat, object: &EncodedObject) -> Vec<ObjectId> {
+    match object.object_type {
+        ObjectType::Commit => Commit::parse_ref(format, &object.body)
+            .map(|commit| {
+                let mut links = Vec::with_capacity(commit.parents.len() + 1);
+                links.push(commit.tree);
+                links.extend(commit.parents);
+                links
+            })
+            .unwrap_or_default(),
+        ObjectType::Tree => TreeEntries::new(format, &object.body)
+            .filter_map(|entry| entry.ok().map(|entry| entry.oid))
+            .collect(),
+        ObjectType::Tag => Tag::parse_ref(format, &object.body)
+            .map(|tag| vec![tag.object])
+            .unwrap_or_default(),
+        ObjectType::Blob => Vec::new(),
     }
 }
 

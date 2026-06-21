@@ -392,6 +392,9 @@ where
         let object = match self.reader.read_object(&link.oid) {
             Ok(object) => object,
             Err(_) => {
+                if self.reader.is_promised_object(&link.oid) {
+                    return;
+                }
                 self.findings.push(FsckFinding::BrokenLink {
                     source_type,
                     source: source.clone(),

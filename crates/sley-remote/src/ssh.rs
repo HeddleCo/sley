@@ -26,6 +26,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 
+use sley_config::GitConfig;
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
@@ -42,31 +43,65 @@ use sley_protocol::{
 use sley_protocol::write_pkt_line_payload;
 use sley_refs::FileRefStore;
 use sley_transport::{
-    RemoteTransport, RemoteUrl, SshCommandVariant, ssh_process_command,
+    RemoteTransport, RemoteUrl, SshCommandVariant, SshIpVersion, ssh_process_args_with_ip,
 };
 
 use crate::{PushOutcome, PushRequest};
 
-/// The `ssh` program to spawn for SSH transport: the `GIT_SSH` environment
-/// variable when set, otherwise `ssh`. This mirrors git's basic `GIT_SSH`
-/// selection (the richer `GIT_SSH_COMMAND`/`core.sshCommand` forms are not
-/// handled, matching the CLI behavior being lifted).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SshTransportOptions {
+    pub variant: Option<SshCommandVariant>,
+    pub ip_version: Option<SshIpVersion>,
+}
+
+pub fn ssh_transport_options_from_config(config: &GitConfig) -> SshTransportOptions {
+    SshTransportOptions {
+        variant: config
+            .get("ssh", None, "variant")
+            .and_then(ssh_variant_from_config_value),
+        ip_version: None,
+    }
+}
+
+fn ssh_variant_from_config_value(value: &str) -> Option<SshCommandVariant> {
+    match value.to_ascii_lowercase().as_str() {
+        "ssh" => Some(SshCommandVariant::OpenSsh),
+        "plink" | "putty" => Some(SshCommandVariant::Plink),
+        "tortoiseplink" => Some(SshCommandVariant::TortoisePlink),
+        "simple" => Some(SshCommandVariant::Simple),
+        "auto" => None,
+        _ => None,
+    }
+}
+
+/// The `ssh` program to spawn for SSH transport: `GIT_SSH_COMMAND`'s first shell
+/// word, then `GIT_SSH`, then `ssh`.
 pub fn ssh_program() -> String {
-    env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into())
+    match ssh_program_and_prefix_args() {
+        Ok((program, _)) => program,
+        Err(_) => env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into()),
+    }
 }
 
 fn ssh_process_command_for_remote(
     remote: &RemoteUrl,
     service: GitService,
+    options: SshTransportOptions,
 ) -> Result<ServiceProcessCommand> {
     if remote.transport == RemoteTransport::Ext {
         return ext_process_command_for_remote(remote, service);
     }
-    validate_git_ssh_command()?;
-    let command = ssh_process_command(remote, service, ssh_program(), ssh_command_variant())?;
+    let (program, mut args) = ssh_program_and_prefix_args()?;
+    let variant = ssh_command_variant(&program, options.variant);
+    args.extend(ssh_process_args_with_ip(
+        remote,
+        service,
+        variant,
+        options.ip_version,
+    )?);
     Ok(ServiceProcessCommand {
-        program: command.program,
-        args: command.args,
+        program,
+        args,
         env: Vec::new(),
         git_request: None,
     })
@@ -231,32 +266,62 @@ fn expand_remote_ext_arg(input: &str, service: &str, service_noprefix: &str) -> 
     Ok(out)
 }
 
-fn ssh_command_variant() -> SshCommandVariant {
+fn ssh_command_variant(program: &str, config_variant: Option<SshCommandVariant>) -> SshCommandVariant {
     if let Ok(variant) = env::var("GIT_SSH_VARIANT") {
         return match variant.as_str() {
+            "auto" => detect_ssh_command_variant(program),
+            "ssh" => SshCommandVariant::OpenSsh,
             "simple" => SshCommandVariant::Simple,
             "plink" | "putty" => SshCommandVariant::Plink,
             "tortoiseplink" => SshCommandVariant::TortoisePlink,
-            _ => SshCommandVariant::OpenSsh,
+            _ => detect_ssh_command_variant(program),
         };
     }
-    let program = ssh_program();
+    config_variant.unwrap_or_else(|| detect_ssh_command_variant(program))
+}
+
+fn detect_ssh_command_variant(program: &str) -> SshCommandVariant {
     let basename = Path::new(&program)
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or(program.as_str())
+        .unwrap_or(program)
         .to_ascii_lowercase();
     match basename.as_str() {
-        "simple" | "uplink" => SshCommandVariant::Simple,
+        "plink" | "plink.exe" => SshCommandVariant::Plink,
+        "tortoiseplink" | "tortoiseplink.exe" => SshCommandVariant::TortoisePlink,
+        "simple" => SshCommandVariant::Simple,
+        "uplink" => {
+            if ssh_supports_openssh_config_probe(program) {
+                SshCommandVariant::OpenSsh
+            } else {
+                SshCommandVariant::Simple
+            }
+        }
         _ => SshCommandVariant::OpenSsh,
     }
 }
 
-fn validate_git_ssh_command() -> Result<()> {
-    let Ok(command) = env::var("GIT_SSH_COMMAND") else {
-        return Ok(());
-    };
-    split_shell_words(&command).map(|_| ())
+fn ssh_supports_openssh_config_probe(program: &str) -> bool {
+    ProcessCommand::new(program)
+        .arg("-G")
+        .arg("example.com")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn ssh_program_and_prefix_args() -> Result<(String, Vec<String>)> {
+    if let Ok(command) = env::var("GIT_SSH_COMMAND") {
+        let words = split_shell_words(&command)?;
+        let Some((program, args)) = words.split_first() else {
+            return Err(GitError::Command("GIT_SSH_COMMAND is empty".into()));
+        };
+        return Ok((program.clone(), args.to_vec()));
+    }
+    Ok((env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into()), Vec::new()))
 }
 
 fn split_shell_words(command: &str) -> Result<Vec<String>> {
@@ -307,8 +372,9 @@ fn spawn_service_process(
     remote: &RemoteUrl,
     service: GitService,
     keep_stdin: bool,
+    options: SshTransportOptions,
 ) -> Result<(Child, Option<ChildStdin>, ChildStdout)> {
-    let command = ssh_process_command_for_remote(remote, service)?;
+    let command = ssh_process_command_for_remote(remote, service, options)?;
     let mut process = ProcessCommand::new(&command.program);
     process
         .args(&command.args)
@@ -410,7 +476,12 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         ));
     }
     let (child, stdin, mut stdout) =
-        spawn_service_process(remote, GitService::ReceivePack, true)?;
+        spawn_service_process(
+            remote,
+            GitService::ReceivePack,
+            true,
+            SshTransportOptions::default(),
+        )?;
     let stdin = stdin
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
@@ -492,7 +563,12 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         ));
     }
     let (child, stdin, mut stdout) =
-        spawn_service_process(remote, GitService::ReceivePack, true)?;
+        spawn_service_process(
+            remote,
+            GitService::ReceivePack,
+            true,
+            SshTransportOptions::default(),
+        )?;
     let stdin = stdin
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
@@ -632,7 +708,12 @@ pub(crate) fn ls_remote_ssh(
         ));
     }
     let (child, _stdin, mut stdout) =
-        spawn_service_process(remote, GitService::UploadPack, false)?;
+        spawn_service_process(
+            remote,
+            GitService::UploadPack,
+            false,
+            SshTransportOptions::default(),
+        )?;
     let set_result = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout);
     let output = child.wait_with_output()?;
     let set = match set_result {
@@ -719,6 +800,9 @@ pub struct SshFetchPackRequest<'a> {
     pub deepen: Option<u32>,
     /// Whether to install the response as a promisor pack.
     pub promisor: bool,
+    /// SSH command-line shape (variant and `-4`/`-6`), usually derived by the
+    /// caller from effective config and command-line flags.
+    pub command_options: SshTransportOptions,
 }
 
 pub fn install_fetch_pack_via_ssh_upload_pack(
@@ -746,21 +830,23 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
     // a plain fetch must use the non-shallow reader (the response starts straight
     // at the NAK/ACK), preserving the existing SSH wire handling exactly.
     let (shallow_info, response) = if request.deepen.is_some() {
-        ssh_upload_pack_shallow_fetch_response(
-            request.remote,
-            request.format,
-            request.features,
-            upload_request,
-            haves,
-        )?
-    } else {
-        let response = ssh_upload_pack_fetch_response(
-            request.remote,
-            request.format,
-            request.features,
-            upload_request,
-            haves,
-        )?;
+            ssh_upload_pack_shallow_fetch_response(
+                request.remote,
+                request.format,
+                request.features,
+                upload_request,
+                haves,
+                request.command_options,
+            )?
+        } else {
+            let response = ssh_upload_pack_fetch_response(
+                request.remote,
+                request.format,
+                request.features,
+                upload_request,
+                haves,
+                request.command_options,
+            )?;
         (Vec::new(), response)
     };
     if request.promisor {
@@ -799,13 +885,21 @@ pub fn ssh_upload_pack_advertisements(
     remote: &RemoteUrl,
     format: ObjectFormat,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
+    ssh_upload_pack_advertisements_with_options(remote, format, SshTransportOptions::default())
+}
+
+pub fn ssh_upload_pack_advertisements_with_options(
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    options: SshTransportOptions,
+) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
     if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
     let (child, _stdin, mut stdout) =
-        spawn_service_process(remote, GitService::UploadPack, false)?;
+        spawn_service_process(remote, GitService::UploadPack, false, options)?;
     let set_result = read_ref_advertisement_set(format, &mut stdout);
     let output = child.wait_with_output()?;
     let set = match set_result {
@@ -838,9 +932,10 @@ pub fn ssh_upload_pack_fetch_response(
     _features: &UploadPackFeatures,
     request: UploadPackRequest,
     haves: Vec<ObjectId>,
+    options: SshTransportOptions,
 ) -> Result<UploadPackRawPackfileResponse> {
     let (_shallow, response) =
-        ssh_upload_pack_fetch_response_inner(remote, format, request, haves, false)?;
+        ssh_upload_pack_fetch_response_inner(remote, format, request, haves, false, options)?;
     Ok(response)
 }
 
@@ -855,11 +950,12 @@ pub fn ssh_upload_pack_shallow_fetch_response(
     _features: &UploadPackFeatures,
     request: UploadPackRequest,
     haves: Vec<ObjectId>,
+    options: SshTransportOptions,
 ) -> Result<(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
 )> {
-    ssh_upload_pack_fetch_response_inner(remote, format, request, haves, true)
+    ssh_upload_pack_fetch_response_inner(remote, format, request, haves, true, options)
 }
 
 /// Drive the `ssh` upload-pack subprocess for `request` + `haves`, reading back the
@@ -872,6 +968,7 @@ fn ssh_upload_pack_fetch_response_inner(
     request: UploadPackRequest,
     haves: Vec<ObjectId>,
     expect_shallow_info: bool,
+    options: SshTransportOptions,
 ) -> Result<(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
@@ -882,7 +979,7 @@ fn ssh_upload_pack_fetch_response_inner(
         ));
     }
     let (child, stdin, mut stdout) =
-        spawn_service_process(remote, GitService::UploadPack, true)?;
+        spawn_service_process(remote, GitService::UploadPack, true, options)?;
     let mut stdin = stdin
         .ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
 

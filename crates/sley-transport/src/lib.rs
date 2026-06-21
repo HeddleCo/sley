@@ -68,6 +68,12 @@ pub enum SshCommandVariant {
     Simple,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshIpVersion {
+    V4,
+    V6,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshProcessCommand {
     pub program: String,
@@ -645,12 +651,41 @@ pub fn ssh_process_args(
     service: GitService,
     variant: SshCommandVariant,
 ) -> Result<Vec<String>> {
+    ssh_process_args_with_ip(remote, service, variant, None)
+}
+
+pub fn ssh_process_args_with_ip(
+    remote: &RemoteUrl,
+    service: GitService,
+    variant: SshCommandVariant,
+    ip_version: Option<SshIpVersion>,
+) -> Result<Vec<String>> {
     if remote.transport != RemoteTransport::Ssh {
         return Err(GitError::InvalidFormat(
             "SSH process arguments require an SSH remote".into(),
         ));
     }
     let mut args = Vec::new();
+    if let Some(ip_version) = ip_version {
+        match variant {
+            SshCommandVariant::OpenSsh
+            | SshCommandVariant::Plink
+            | SshCommandVariant::TortoisePlink => {
+                args.push(match ip_version {
+                    SshIpVersion::V4 => "-4",
+                    SshIpVersion::V6 => "-6",
+                }.into());
+            }
+            SshCommandVariant::Simple => {
+                return Err(GitError::InvalidFormat(
+                    "simple SSH variant cannot pass an IP version".into(),
+                ));
+            }
+        }
+    }
+    if matches!(variant, SshCommandVariant::TortoisePlink) {
+        args.push("-batch".into());
+    }
     if let Some(port) = remote.port {
         match variant {
             SshCommandVariant::OpenSsh => {
@@ -881,7 +916,12 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
             // Only http(s) userinfo may carry an embedded password; SSH/git keep
             // their authority verbatim so existing behavior does not regress.
             let (user, password, host, port) =
-                parse_remote_authority(authority, true, is_http, empty_port_is_absent)?;
+                if matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git") {
+                    let (user, host, port) = parse_ssh_scheme_authority(authority)?;
+                    (user, None, host, port)
+                } else {
+                    parse_remote_authority(authority, true, is_http, empty_port_is_absent)?
+                };
             let path = if matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git") {
                 percent_decode_remote_path(&path)?
             } else {
@@ -1003,6 +1043,103 @@ fn parse_remote_authority(
     let (host, port) = parse_remote_host_port(host_port, allow_port, empty_port_is_absent)?;
     validate_remote_host(&host)?;
     Ok((user, password, host, port))
+}
+
+fn parse_ssh_scheme_authority(value: &str) -> Result<(Option<String>, String, Option<u16>)> {
+    if value.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "remote URL is missing a host".into(),
+        ));
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| GitError::InvalidFormat("remote URL IPv6 host is missing ]".into()))?;
+        let bracketed = &rest[..end];
+        let suffix = &rest[end + 1..];
+        let (user, host) = split_ssh_user_host(bracketed)?;
+        let port = parse_optional_ssh_port_suffix(suffix)?;
+        validate_remote_host(host)?;
+        return Ok((user.map(str::to_string), host.to_string(), port));
+    }
+
+    let (user, host_port) = match value.rsplit_once('@') {
+        Some((userinfo, host_port)) => {
+            if userinfo.is_empty() {
+                return Err(GitError::InvalidFormat("remote URL user is empty".into()));
+            }
+            (Some(userinfo), host_port)
+        }
+        None => (None, value),
+    };
+    validate_optional_ssh_user(user)?;
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| GitError::InvalidFormat("remote URL IPv6 host is missing ]".into()))?;
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        let port = parse_optional_ssh_port_suffix(suffix)?;
+        validate_remote_host(host)?;
+        return Ok((user.map(str::to_string), host.to_string(), port));
+    }
+
+    if host_port.contains(']') {
+        return Err(GitError::InvalidFormat(
+            "remote URL has invalid bracketed host".into(),
+        ));
+    }
+    let (host, port) = if host_port.matches(':').count() <= 1 {
+        match host_port.rsplit_once(':') {
+            Some((host, "")) => (host, None),
+            Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => {
+                (host, Some(parse_remote_port(port)?))
+            }
+            Some((_, _)) => {
+                return Err(GitError::InvalidFormat(
+                    "remote URL port must be numeric".into(),
+                ));
+            }
+            None => (host_port, None),
+        }
+    } else {
+        (host_port, None)
+    };
+    validate_remote_host(host)?;
+    Ok((user.map(str::to_string), host.to_string(), port))
+}
+
+fn split_ssh_user_host(value: &str) -> Result<(Option<&str>, &str)> {
+    match value.rsplit_once('@') {
+        Some((user, host)) => {
+            if user.is_empty() {
+                return Err(GitError::InvalidFormat("remote URL user is empty".into()));
+            }
+            validate_optional_ssh_user(Some(user))?;
+            Ok((Some(user), host))
+        }
+        None => Ok((None, value)),
+    }
+}
+
+fn validate_optional_ssh_user(user: Option<&str>) -> Result<()> {
+    if let Some(user) = user {
+        validate_ssh_user(user)?;
+    }
+    Ok(())
+}
+
+fn parse_optional_ssh_port_suffix(suffix: &str) -> Result<Option<u16>> {
+    if suffix.is_empty() || suffix == ":" {
+        return Ok(None);
+    }
+    let Some(port) = suffix.strip_prefix(':') else {
+        return Err(GitError::InvalidFormat(
+            "remote URL has invalid bracketed host suffix".into(),
+        ));
+    };
+    Ok(Some(parse_remote_port(port)?))
 }
 
 fn parse_remote_host_port(
@@ -2356,9 +2493,97 @@ mod tests {
                 GitService::UploadArchive,
                 SshCommandVariant::TortoisePlink,
             )
-            .expect("test operation should succeed")[0],
-            "-P"
+            .expect("test operation should succeed"),
+            vec![
+                "-batch".to_string(),
+                "-P".to_string(),
+                "29418".to_string(),
+                "example.com".to_string(),
+                "git-upload-archive '/team/project.git'".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn ssh_process_args_include_ip_family_by_variant() {
+        let remote =
+            parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
+        assert_eq!(
+            ssh_process_args_with_ip(
+                &remote,
+                GitService::UploadPack,
+                SshCommandVariant::OpenSsh,
+                Some(SshIpVersion::V4),
+            )
+            .expect("test operation should succeed"),
+            vec![
+                "-4".to_string(),
+                "-p".to_string(),
+                "123".to_string(),
+                "myhost".to_string(),
+                "git-upload-pack 'src'".to_string(),
+            ]
+        );
+        assert_eq!(
+            ssh_process_args_with_ip(
+                &remote,
+                GitService::UploadPack,
+                SshCommandVariant::Plink,
+                Some(SshIpVersion::V6),
+            )
+            .expect("test operation should succeed"),
+            vec![
+                "-6".to_string(),
+                "-P".to_string(),
+                "123".to_string(),
+                "myhost".to_string(),
+                "git-upload-pack 'src'".to_string(),
+            ]
+        );
+        assert!(
+            ssh_process_args_with_ip(
+                &remote,
+                GitService::UploadPack,
+                SshCommandVariant::Simple,
+                Some(SshIpVersion::V4),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_scheme_accepts_git_ipv6_authority_forms() {
+        for (url, user, host, port, path) in [
+            ("ssh://::1/home/user/repo", None, "::1", None, "/home/user/repo"),
+            (
+                "ssh://user@::1/~repo",
+                Some("user"),
+                "::1",
+                None,
+                "/~repo",
+            ),
+            (
+                "ssh://[user@::1]:22/home/user/repo",
+                Some("user"),
+                "::1",
+                Some(22),
+                "/home/user/repo",
+            ),
+            (
+                "ssh://user@[::1]:/~repo",
+                Some("user"),
+                "::1",
+                None,
+                "/~repo",
+            ),
+        ] {
+            let remote = parse_remote_url(url).expect("test operation should succeed");
+            assert_eq!(remote.transport, RemoteTransport::Ssh);
+            assert_eq!(remote.user.as_deref(), user);
+            assert_eq!(remote.host.as_deref(), Some(host));
+            assert_eq!(remote.port, port);
+            assert_eq!(remote.path, path);
+        }
     }
 
     #[test]

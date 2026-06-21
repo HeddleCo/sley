@@ -130,6 +130,10 @@ pub struct FetchOptions {
     /// (resolved on the remote; a non-ref is an error, like upstream).
     /// Local-only today; HTTP and SSH do not send `deepen-not` yet.
     pub deepen_not: Vec<String>,
+    /// Command-line SSH process options supplied by a higher-level porcelain
+    /// such as clone (`-4`/`-6`). When absent, fetch derives SSH options from
+    /// the effective repository config.
+    pub ssh_options: Option<crate::ssh::SshTransportOptions>,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -365,8 +369,15 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // SSH advertises and pulls the pack by spawning `ssh` (no credential
             // seam — the `ssh` program authenticates), but the ref-map planning
             // and ref bookkeeping are the same shared flow as HTTP.
+            let ssh_options = options
+                .ssh_options
+                .unwrap_or_else(|| crate::ssh::ssh_transport_options_from_config(request.config));
             let (advertisements, features) =
-                crate::ssh::ssh_upload_pack_advertisements(remote, request.format)?;
+                crate::ssh::ssh_upload_pack_advertisements_with_options(
+                    remote,
+                    request.format,
+                    ssh_options,
+                )?;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
             let mut updates = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
@@ -403,6 +414,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
+                    command_options: ssh_options,
                 },
             )?;
             if !options.dry_run {
@@ -1679,6 +1691,7 @@ mod tests {
             update_head_ok: false,
             deepen_since: None,
             deepen_not: Vec::new(),
+            ssh_options: None,
         }
     }
 

@@ -224,6 +224,9 @@ where
         let object = match self.reader.read_object(&link.oid) {
             Ok(object) => object,
             Err(_) => {
+                if self.reader.is_promised_object(&link.oid) {
+                    return;
+                }
                 self.report_missing_link(source, link);
                 return;
             }
