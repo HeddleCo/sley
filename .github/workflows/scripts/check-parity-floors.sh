@@ -939,6 +939,21 @@ declare -A FLOOR=(
     # Guards held: t7508=119 t3700=50 t2070=15 t3600=81 t2402=27 t5510=7 t5516=110 t5526=56
     # t5601=109 t1400=275 t1450=96 t2018=25 t2020=26. cargo test --workspace green.
     [t5521-pull-options.sh]=22
+    # wave-33 (2026-06-21, sweep-picked off main 94898234; worktree 70% weakest core):
+    # checkout-last, clone-local, at-combinations. t2012-checkout-last 14->22 FULL (@{-N} reattach
+    # to prior local branches, checkout - detached prior via reflog, A...B/...B/A... merge-base
+    # start points). t5605-clone-local 13->23 FULL (local hardlink/copy/shared, file:// non-local
+    # transport, --no-local/--no-hardlinks, bundle source + bundle-uri, corrupt-ref + upload-pack
+    # failure, empty/non-git dest). t1508-at-combinations 23->35 FULL (@{N}/@{date}/@{u}/@{push},
+    # HEAD@{u}, @@{u}, @{-N}@{u}, empty/single-entry reflog fallbacks).
+    # checkoutlast + atcombos BOTH edited sley-rev/lib.rs @{-N} (independent impls) — auto-merged
+    # textually clean AND both t2012=22 + t1508=35 re-verified on the MERGED binary (semantic gate
+    # passed). clonelocal disjoint (sley-remote/refs). Guards held/gained: t5601=108(floor107)
+    # t5512=40 t5526=56 t1500=81 t1501=39 t1502=37 t1507=29 t1512=35 t2018=25 t2020=26 t2024=21
+    # t1400=275 t5510=7 t5516=110. cargo test --workspace green.
+    [t2012-checkout-last.sh]=22
+    [t5605-clone-local.sh]=23
+    [t1508-at-combinations.sh]=35
 )
 
 fail=0
