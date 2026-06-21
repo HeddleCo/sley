@@ -239,6 +239,7 @@ pub(crate) fn has_command_specific_help(command: &str) -> bool {
         "diff-files"
             | "diff-index"
             | "interpret-trailers"
+            | "maintenance"
             | "mktag"
             | "patch-id"
             | "shortlog"

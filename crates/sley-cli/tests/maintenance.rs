@@ -348,6 +348,34 @@ fn maintenance_run_matches_git_gc_behavior() {
 }
 
 #[test]
+fn maintenance_run_aborts_when_lock_exists() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-lock");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::write(repo.join(".git/objects/maintenance.lock"), b"in use\n").expect("write lock");
+
+    let out = git_rs(&repo, &["maintenance", "run"]);
+    assert!(!out.status.success(), "maintenance run unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("'maintenance' lock held by another process"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn maintenance_run_quiet_accepted() {
     if !git_available() {
         return;

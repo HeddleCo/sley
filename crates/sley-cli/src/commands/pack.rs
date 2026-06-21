@@ -1828,13 +1828,11 @@ fn maintenance_run_selected(
         .open(&lock)
         .is_err()
     {
-        if !auto && !quiet {
-            eprintln!(
-                "warning: lock file '{}' exists, skipping maintenance",
-                lock.display()
-            );
+        if auto {
+            return Ok(());
         }
-        return Ok(());
+        eprintln!("fatal: 'maintenance' lock held by another process");
+        return Err(GitError::Exit(128));
     }
     if detach {
         trace2_region("region_enter", "maintenance", "detach");
