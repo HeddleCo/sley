@@ -3499,6 +3499,20 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             sub_options.clone(),
             &[],
         )?;
+        let missing_oids = changed_for_path
+            .iter()
+            .filter(|changed| !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid))
+            .map(|changed| changed.oid.to_string())
+            .collect::<Vec<_>>();
+        if !missing_oids.is_empty() {
+            let _ = fetch_raw_oid_refspecs(
+                &sub_git_dir,
+                sub_format,
+                &sub_source,
+                &missing_oids,
+                &sub_options,
+            )?;
+        }
         let nested_changed_gitlinks =
             changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
         let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
@@ -3719,33 +3733,19 @@ pub(crate) fn changed_gitlinks_for_fetch(
     outcome: &sley_remote::FetchOutcome,
 ) -> Result<Vec<ChangedGitlink>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut changed = std::collections::BTreeMap::<String, ChangedGitlink>::new();
+    let mut changed = Vec::new();
     for update in &outcome.ref_updates {
         let old = update.dst.as_deref().and_then(|dst| before.get(dst)).copied();
         if old == Some(update.oid) {
             continue;
         }
-        let new_gitlinks = commit_gitlinks(&db, format, &update.oid)?;
-        let old_gitlinks = match old {
-            Some(old) => commit_gitlinks(&db, format, &old)?,
-            None => std::collections::BTreeMap::new(),
-        };
-        for (path, oid) in new_gitlinks {
-            if old_gitlinks.get(&path) != Some(&oid)
-                && let Ok(path) = String::from_utf8(path)
-            {
-                changed.insert(
-                    path.clone(),
-                    ChangedGitlink {
-                        path,
-                        oid,
-                        super_oid: update.oid,
-                    },
-                );
+        for gitlink in changed_gitlinks_for_commit_range(&db, format, old, &update.oid)? {
+            if !changed.iter().any(|existing| existing == &gitlink) {
+                changed.push(gitlink);
             }
         }
     }
-    Ok(changed.into_values().collect())
+    Ok(changed)
 }
 
 fn changed_gitlinks_for_commit(
@@ -3764,6 +3764,54 @@ fn changed_gitlinks_for_commit(
             })
         })
         .collect())
+}
+
+fn changed_gitlinks_for_commit_range(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old: Option<ObjectId>,
+    new: &ObjectId,
+) -> Result<Vec<ChangedGitlink>> {
+    let old_ancestors = match old {
+        Some(old) => ancestor_depths(db, format, &old)?,
+        None => std::collections::HashMap::new(),
+    };
+    let mut changed = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending = vec![*new];
+    while let Some(oid) = pending.pop() {
+        if !seen.insert(oid) || old_ancestors.contains_key(&oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        let commit = match object.object_type {
+            ObjectType::Commit => Commit::parse_ref(format, &object.body)?,
+            ObjectType::Tag => {
+                pending.push(Tag::parse_ref(format, &object.body)?.object);
+                continue;
+            }
+            _ => continue,
+        };
+        let gitlinks = commit_tree_gitlinks(db, format, &commit.tree)?;
+        let parent_gitlinks = commit
+            .parents
+            .first()
+            .and_then(|parent| commit_gitlinks(db, format, parent).ok())
+            .unwrap_or_default();
+        for (path, gitlink_oid) in gitlinks {
+            if parent_gitlinks.get(&path) != Some(&gitlink_oid)
+                && let Ok(path) = String::from_utf8(path)
+            {
+                changed.push(ChangedGitlink {
+                    path,
+                    oid: gitlink_oid,
+                    super_oid: oid,
+                });
+            }
+        }
+        pending.extend(commit.parents);
+    }
+    Ok(changed)
 }
 
 fn submodule_has_commit(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> bool {
@@ -3791,11 +3839,19 @@ fn commit_gitlinks(
         }
         _ => return Ok(std::collections::BTreeMap::new()),
     };
-    let tree = db.read_object(&commit.tree)?;
+    commit_tree_gitlinks(db, format, &commit.tree)
+}
+
+fn commit_tree_gitlinks(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectId>> {
+    let tree = db.read_object(tree_oid)?;
     if tree.object_type != ObjectType::Tree {
         return Ok(std::collections::BTreeMap::new());
     }
-    Ok(sley_diff_merge::flatten_tree(db, format, &commit.tree)?
+    Ok(sley_diff_merge::flatten_tree(db, format, tree_oid)?
         .into_iter()
         .filter(|(_, (mode, _))| sley_index::is_gitlink(*mode))
         .map(|(path, (_, oid))| (path, oid))
