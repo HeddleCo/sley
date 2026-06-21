@@ -89,7 +89,10 @@ impl FetchSource {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
                 RemoteTransport::Ssh | RemoteTransport::Ext => Self::Ssh(remote),
-                RemoteTransport::Git => Self::Git(remote),
+                RemoteTransport::Git => Self::Git {
+                    remote,
+                    protocol_v2: false,
+                },
                 RemoteTransport::Local | RemoteTransport::File => {
                     unreachable!("local remotes use FetchSource::Local")
                 }
@@ -270,7 +273,7 @@ mod tests {
         );
         assert!(matches!(
             fetch_source_for_url(url, Path::new(".")).expect("fetch source"),
-            FetchSource::Git(_)
+            FetchSource::Git { .. }
         ));
         assert!(matches!(
             push_destination_for_url(url, Path::new(".")).expect("push destination"),

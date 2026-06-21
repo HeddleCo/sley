@@ -60,7 +60,10 @@ pub enum CloneSource {
     /// (the credential seam is unused — the `ssh` program owns authentication).
     Ssh(RemoteUrl),
     /// A native anonymous `git://` remote at the given already-resolved URL.
-    Git(RemoteUrl),
+    Git {
+        remote: RemoteUrl,
+        protocol_v2: bool,
+    },
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -232,7 +235,13 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             ));
         }
         CloneSource::Ssh(remote) => FetchSource::Ssh(remote.clone()),
-        CloneSource::Git(remote) => FetchSource::Git(remote.clone()),
+        CloneSource::Git {
+            remote,
+            protocol_v2,
+        } => FetchSource::Git {
+            remote: remote.clone(),
+            protocol_v2: *protocol_v2,
+        },
         CloneSource::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,
@@ -407,7 +416,7 @@ fn scheme_for_clone_source(source: &CloneSource) -> &'static str {
     match source {
         CloneSource::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
         CloneSource::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
-        CloneSource::Git(remote) => crate::protocol::transport_scheme_for_remote(remote),
+        CloneSource::Git { remote, .. } => crate::protocol::transport_scheme_for_remote(remote),
         CloneSource::Local { .. } => "file",
     }
 }

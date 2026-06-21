@@ -17,22 +17,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
+use sley_config::GitConfig;
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
     build_and_install_reachable_pack_filtered, build_reachable_pack, collect_reachable_object_ids,
 };
 use sley_protocol::{
-    PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment,
+    PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
-    ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus,
-    ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
-    UploadPackRawPackfileResponse,
+    ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef,
+    ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
+    ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
+    SideBandChannel, SideBandPacket, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
     UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
-    encode_receive_pack_features, encode_upload_pack_features,
-    read_protocol_v2_command_request, read_upload_pack_negotiation_request, read_upload_pack_request,
+    classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
+    encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
+    encode_upload_pack_features, read_protocol_v2_command_request,
+    read_upload_pack_negotiation_request, read_upload_pack_request,
     write_protocol_v2_advertisement, write_protocol_v2_fetch_response,
     write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
     write_upload_pack_request,
@@ -1109,23 +1112,51 @@ fn trace2_fetch_info(
 // everything below is transport-independent.
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LsRefsUnbornConfig {
+    Ignore,
+    Allow,
+    Advertise,
+}
+
+fn lsrefs_unborn_config(config: &GitConfig) -> LsRefsUnbornConfig {
+    match config.get("lsrefs", None, "unborn") {
+        Some("ignore") => LsRefsUnbornConfig::Ignore,
+        Some("allow") => LsRefsUnbornConfig::Allow,
+        Some("advertise") | None => LsRefsUnbornConfig::Advertise,
+        Some(_) => LsRefsUnbornConfig::Advertise,
+    }
+}
+
+fn upload_pack_blob_packfile_uri_configured(config: &GitConfig) -> bool {
+    config
+        .get_all("uploadpack", None, "blobpackfileuri")
+        .into_iter()
+        .any(|value| value.is_some_and(|value| !value.is_empty()))
+}
+
 /// The v2 capabilities advertised by the upload-pack server, in the order git
-/// emits them: `agent`, `ls-refs=unborn`, `fetch=shallow wait-for-done`,
+/// emits them: `agent`, `ls-refs[=unborn]`, `fetch=<features>`,
 /// `server-option`, `object-format=<hash>`.
-fn upload_pack_v2_capabilities(format: ObjectFormat) -> Vec<Capability> {
-    vec![
+fn upload_pack_v2_capabilities(format: ObjectFormat, config: &GitConfig) -> Result<Vec<Capability>> {
+    let mut capabilities = vec![
         Capability {
             name: "agent".into(),
             value: Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}")),
         },
-        Capability {
-            name: "ls-refs".into(),
-            value: Some("unborn".into()),
-        },
-        Capability {
-            name: "fetch".into(),
-            value: Some("shallow wait-for-done".into()),
-        },
+        encode_protocol_v2_ls_refs_capability(&ProtocolV2LsRefsFeatures {
+            unborn: lsrefs_unborn_config(config) == LsRefsUnbornConfig::Advertise,
+            unknown: Vec::new(),
+        })?,
+        encode_protocol_v2_fetch_capability(&ProtocolV2FetchFeatures {
+            shallow: true,
+            wait_for_done: true,
+            filter: config
+                .get_bool("uploadpack", None, "allowfilter")
+                .unwrap_or(false),
+            packfile_uris: upload_pack_blob_packfile_uri_configured(config),
+            ..ProtocolV2FetchFeatures::default()
+        })?,
         Capability {
             name: "server-option".into(),
             value: None,
@@ -1134,7 +1165,17 @@ fn upload_pack_v2_capabilities(format: ObjectFormat) -> Vec<Capability> {
             name: "object-format".into(),
             value: Some(format.name().into()),
         },
-    ]
+    ];
+    if config
+        .get_bool("transfer", None, "advertisesid")
+        .unwrap_or(false)
+    {
+        capabilities.push(Capability {
+            name: "session-id".into(),
+            value: Some("sley".into()),
+        });
+    }
+    Ok(capabilities)
 }
 
 /// Resolve the symref target of `HEAD` (e.g. `refs/heads/main`) for the
@@ -1154,6 +1195,7 @@ fn local_ls_refs_v2_records(
     git_dir: &Path,
     format: ObjectFormat,
     request: &ProtocolV2LsRefsRequest,
+    config: &GitConfig,
 ) -> Result<Vec<ProtocolV2LsRefsRecord>> {
     let store = FileRefStore::new(git_dir, format);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -1169,7 +1211,7 @@ fn local_ls_refs_v2_records(
         };
         if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
             entries.push(("HEAD".to_string(), oid, head_symref.clone()));
-        } else if request.unborn {
+        } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
             // An unborn HEAD (points at a not-yet-created branch) is reported as
             // an `unborn` record carrying its symref-target.
             entries.push(("HEAD".to_string(), ObjectId::null(format), head_symref.clone()));
@@ -1345,9 +1387,20 @@ pub fn serve_upload_pack_v2(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    serve_upload_pack_v2_with_config(git_dir, format, &config, reader, writer)
+}
+
+pub fn serve_upload_pack_v2_with_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
     let handshake = TransportHandshake {
         protocol: ProtocolVersion::V2,
-        capabilities: upload_pack_v2_capabilities(format),
+        capabilities: upload_pack_v2_capabilities(format, config)?,
     };
     write_protocol_v2_advertisement(writer, &handshake)?;
     writer.flush()?;
@@ -1367,22 +1420,22 @@ pub fn serve_upload_pack_v2(
             }
             Err(err) => return Err(err),
         };
-        match request.command.as_str() {
-            "ls-refs" => {
-                let ls_refs = ProtocolV2LsRefsRequest::from_command_request(&request)?;
-                let records = local_ls_refs_v2_records(git_dir, format, &ls_refs)?;
+        match classify_protocol_v2_command_request(&handshake, format, &request)? {
+            sley_protocol::ProtocolV2Command::LsRefs(ls_refs) => {
+                let records = local_ls_refs_v2_records(git_dir, format, &ls_refs, config)?;
                 write_protocol_v2_ls_refs_response(writer, &records)?;
                 writer.flush()?;
             }
-            "fetch" => {
-                let fetch = ProtocolV2FetchRequest::from_command_request(format, &request)?;
+            sley_protocol::ProtocolV2Command::Fetch(fetch) => {
                 let sections = local_fetch_v2_sections(git_dir, format, &fetch)?;
                 write_protocol_v2_fetch_response(writer, &sections)?;
                 writer.flush()?;
             }
-            other => {
+            sley_protocol::ProtocolV2Command::ObjectInfo(_)
+            | sley_protocol::ProtocolV2Command::Unknown(_) => {
                 return Err(GitError::InvalidFormat(format!(
-                    "unsupported protocol v2 command {other}"
+                    "unsupported protocol v2 command {}",
+                    request.command
                 )));
             }
         }

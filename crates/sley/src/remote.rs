@@ -195,7 +195,7 @@ impl Repository {
         let ls_source = match source {
             FetchSource::Http(url) => LsRemoteSource::Http(url),
             FetchSource::Ssh(url) => LsRemoteSource::Ssh(url),
-            FetchSource::Git(url) => LsRemoteSource::Git(url),
+            FetchSource::Git { remote, .. } => LsRemoteSource::Git(remote),
             FetchSource::Local { git_dir, .. } => LsRemoteSource::Local { git_dir },
         };
         Ok(ls_remote(

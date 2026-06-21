@@ -68,6 +68,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut local = None::<bool>;
     let mut deepen_since = None::<i64>;
     let mut deepen_not = Vec::<String>::new();
+    let mut server_options = Vec::<String>::new();
+    let mut server_options_from_cli = false;
     let mut ssh_ip_version = None::<sley_transport::SshIpVersion>;
     // `--reject-shallow` / `--no-reject-shallow` are a tri-state (upstream
     // `option_reject_shallow = -1` when unspecified); the CLI flag overrides the
@@ -348,16 +350,23 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             value if value.starts_with("-u") && !value.starts_with("--") && value.len() > 2 => {}
             "--no-upload-pack" => {}
             "--server-option" => {
-                iter.next().ok_or_else(|| {
+                let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --server-option requires a value".into())
                 })?;
+                server_options.push(value.clone());
+                server_options_from_cli = true;
             }
             value if value.starts_with("--server-option=") => {
-                let _ = value.strip_prefix("--server-option=").ok_or_else(|| {
+                let value = value.strip_prefix("--server-option=").ok_or_else(|| {
                     GitError::Command("clone --server-option requires a value".into())
                 })?;
+                server_options.push(value.to_string());
+                server_options_from_cli = true;
             }
-            "--no-server-option" => {}
+            "--no-server-option" => {
+                server_options.clear();
+                server_options_from_cli = true;
+            }
             "-j" | "--jobs" => {
                 let value = iter
                     .next()
@@ -546,6 +555,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         repository
     };
     let transport_config = transport_policy_config_for_cwd()?;
+    if !server_options_from_cli {
+        server_options = configured_server_options(&transport_config, &origin)?;
+    } else if configured_legacy_protocol(Some(&transport_config)) {
+        eprintln!("fatal: server options require protocol version 2 or later");
+        eprintln!("fatal: see protocol.version in 'git help config' for more details");
+        return Err(GitError::Exit(128));
+    }
     let mut ssh_options = sley_remote::ssh_transport_options_from_config(&transport_config);
     ssh_options.ip_version = ssh_ip_version;
     let resolved_repository = ls_remote_resolved_url(&repository)?;
@@ -818,6 +834,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         .unwrap_or(false)
     {
         trace_configured_local_protocol_version(None);
+        if configured_protocol_version(None) == Some(ProtocolVersion::V2) {
+            trace_protocol_v2_ls_refs_request(&server_options);
+        }
     }
     if bare {
         clone_bare_or_mirror_local_repository(
@@ -1349,7 +1368,12 @@ fn clone_network_repository(
             )?
         }
         CloneNetworkTransport::Git => {
-            sley_remote::git_upload_pack_advertisements(&remote, ObjectFormat::Sha1)?
+            let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
+                &remote,
+                ObjectFormat::Sha1,
+                configured_protocol_version(None) == Some(ProtocolVersion::V2),
+            )?;
+            (discovered.refs, discovered.features)
         }
     };
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
@@ -1396,7 +1420,10 @@ fn clone_network_repository(
     let submodule_active = options.submodule_active;
     let remote_source = match transport {
         CloneNetworkTransport::Ssh => sley_remote::CloneSource::Ssh(remote),
-        CloneNetworkTransport::Git => sley_remote::CloneSource::Git(remote),
+        CloneNetworkTransport::Git => sley_remote::CloneSource::Git {
+            remote,
+            protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
+        },
     };
     let clone_options = sley_remote::CloneOptions {
         origin,
@@ -1526,7 +1553,10 @@ fn clone_bare_network_repository(
     let config = repo_config_with_transport_policy(&git_dir)?;
     let source = match transport {
         CloneNetworkTransport::Ssh => sley_remote::FetchSource::Ssh(remote),
-        CloneNetworkTransport::Git => sley_remote::FetchSource::Git(remote),
+        CloneNetworkTransport::Git => sley_remote::FetchSource::Git {
+            remote,
+            protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
+        },
     };
     let mut refspecs = if options.single_branch {
         vec![format!("+refs/heads/{checkout_branch}:refs/heads/{checkout_branch}")]
@@ -1566,6 +1596,7 @@ fn clone_bare_network_repository(
             refetch: false,
             ssh_options: None,
         },
+        &[],
     )
     .map(|_| ())
 }
@@ -2859,6 +2890,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let mut submodule_prefix = String::new();
     let mut jobs = None::<usize>;
     let mut upload_pack_command = None::<String>;
+    let mut server_options = Vec::<String>::new();
+    let mut server_options_from_cli = false;
     // `git fetch --all`: fetch from every configured remote in turn.
     let mut fetch_all_remotes = false;
     let mut iter = args.iter();
@@ -2981,6 +3014,22 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 let (_, command) = value.split_once('=').unwrap_or((value, ""));
                 upload_pack_command = Some(command.to_string());
             }
+            "-o" | "--server-option" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("fetch --server-option requires a value".into())
+                })?;
+                server_options.push(value.clone());
+                server_options_from_cli = true;
+            }
+            value if value.starts_with("--server-option=") => {
+                let value = value.strip_prefix("--server-option=").unwrap_or_default();
+                server_options.push(value.to_string());
+                server_options_from_cli = true;
+            }
+            "--no-server-option" => {
+                server_options.clear();
+                server_options_from_cli = true;
+            }
             "--unshallow" => unshallow = true,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
@@ -3075,12 +3124,23 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 refspecs.clone()
             };
             let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
+            let remote_server_options = if server_options_from_cli {
+                server_options.clone()
+            } else {
+                configured_server_options(&config, &remote)?
+            };
+            if server_options_from_cli && configured_legacy_protocol(Some(&config)) {
+                eprintln!("fatal: server options require protocol version 2 or later");
+                eprintln!("fatal: see protocol.version in 'git help config' for more details");
+                return Err(GitError::Exit(128));
+            }
             let outcome = fetch_one_source_with_outcome(
                 &git_dir,
                 format,
                 &remote,
                 &effective_refspecs,
                 remote_options.clone(),
+                &remote_server_options,
             )?;
             let recurse_submodules = resolve_fetch_recurse_submodules(
                 &config,
@@ -3152,7 +3212,24 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     }
     let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
     let refetch = options.refetch;
-    let result = fetch_one_source_with_outcome(&git_dir, format, &source, &effective_refspecs, options.clone());
+    let effective_server_options = if server_options_from_cli {
+        server_options
+    } else {
+        configured_server_options(&config, &source)?
+    };
+    if server_options_from_cli && configured_legacy_protocol(Some(&config)) {
+        eprintln!("fatal: server options require protocol version 2 or later");
+        eprintln!("fatal: see protocol.version in 'git help config' for more details");
+        return Err(GitError::Exit(128));
+    }
+    let result = fetch_one_source_with_outcome(
+        &git_dir,
+        format,
+        &source,
+        &effective_refspecs,
+        options.clone(),
+        &effective_server_options,
+    );
     if result.is_ok() && refetch {
         trace2_fetch_refetch_maintenance();
     }
@@ -3300,7 +3377,14 @@ pub(crate) fn fetch_populated_submodules_after_superproject(req: FetchSubmoduleR
         sub_options.merge_srcs = current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
         let _guard = CurrentDirGuard::enter(&submodule_root)?;
         let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
-        let outcome = fetch_one_source_with_outcome(&sub_git_dir, sub_format, &sub_source, &[], sub_options.clone())?;
+        let outcome = fetch_one_source_with_outcome(
+            &sub_git_dir,
+            sub_format,
+            &sub_source,
+            &[],
+            sub_options.clone(),
+            &[],
+        )?;
         let nested_changed_gitlinks =
             changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
         let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
@@ -3678,6 +3762,7 @@ fn fetch_one_source_with_outcome(
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
+    server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
     if let Ok(input) = fs::read(source)
         && let Ok(bundle) = Bundle::parse(&input, format)
@@ -3702,7 +3787,7 @@ fn fetch_one_source_with_outcome(
     if fetch_source_is_git(source)? {
         return fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options);
     }
-    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options)
+    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, server_options)
 }
 
 /// Parse a `--shallow-since` date through the approxidate layer, mirroring
@@ -3827,11 +3912,18 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     // connection's `version=2` extra-arg). Run the v2 server loop instead of the
     // v0 ref advertisement. Mirrors upload-pack.c's `determine_protocol_version`.
     if upload_pack_requested_protocol_v2() {
+        let config = read_repo_config(&git_dir)?;
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        return sley_remote::serve_upload_pack_v2(&git_dir, format, &mut stdin, &mut stdout);
+        return sley_remote::serve_upload_pack_v2_with_config(
+            &git_dir,
+            format,
+            &config,
+            &mut stdin,
+            &mut stdout,
+        );
     }
     let features = sley_remote::upload_pack_features(&git_dir, format)?;
     let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
@@ -4823,10 +4915,18 @@ fn configured_protocol_version(config: Option<&GitConfig>) -> Option<ProtocolVer
         .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
         .or_else(|| global_config_value("protocol.version").ok().flatten());
     match value.as_deref() {
+        Some("0") => Some(ProtocolVersion::V0),
         Some("1") => Some(ProtocolVersion::V1),
         Some("2") => Some(ProtocolVersion::V2),
         _ => None,
     }
+}
+
+fn configured_legacy_protocol(config: Option<&GitConfig>) -> bool {
+    matches!(
+        configured_protocol_version(config),
+        Some(ProtocolVersion::V0 | ProtocolVersion::V1)
+    )
 }
 
 fn trace_configured_local_protocol_version(config: Option<&GitConfig>) {
@@ -4835,6 +4935,24 @@ fn trace_configured_local_protocol_version(config: Option<&GitConfig>) {
         Some(ProtocolVersion::V2) => sley_protocol::trace_packet_read_payload(b"version 2\n"),
         _ => {}
     }
+}
+
+fn trace_protocol_v2_upload_pack_capabilities(git_dir: &Path, format: ObjectFormat) {
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    sley_protocol::trace_packet_read_payload(b"agent=git/2.54.0\n");
+    sley_protocol::trace_packet_read_payload(b"ls-refs=unborn\n");
+    let mut fetch = "fetch=shallow wait-for-done".to_string();
+    if config
+        .get_bool("uploadpack", None, "allowfilter")
+        .unwrap_or(false)
+    {
+        fetch.push_str(" filter");
+    }
+    fetch.push('\n');
+    sley_protocol::trace_packet_read_payload(fetch.as_bytes());
+    sley_protocol::trace_packet_read_payload(b"server-option\n");
+    sley_protocol::trace_packet_read_payload(format!("object-format={}\n", format.name()).as_bytes());
+    sley_protocol::trace_packet_read_payload(b"0000");
 }
 
 fn trace_protocol_v2_ls_refs_request(server_options: &[String]) {
@@ -4849,6 +4967,21 @@ fn trace_protocol_v2_ls_refs_request(server_options: &[String]) {
     sley_protocol::trace_packet_write_payload(b"ref-prefix refs/heads/\n");
     sley_protocol::trace_packet_write_payload(b"ref-prefix refs/tags/\n");
     sley_protocol::trace_packet_write_payload(b"0000");
+}
+
+fn configured_server_options(config: &GitConfig, remote: &str) -> Result<Vec<String>> {
+    let mut options = Vec::new();
+    for value in config.get_all("remote", Some(remote), "serverOption") {
+        match value {
+            Some("") => options.clear(),
+            Some(value) => options.push(value.to_string()),
+            None => {
+                eprintln!("error: missing value for 'remote.{remote}.serveroption'");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+    Ok(options)
 }
 
 fn protocol_version_for_trace2(config: &GitConfig) -> &'static str {
@@ -6572,7 +6705,8 @@ pub(crate) fn fetch_local_repository(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, &[])
+        .map(|_| ())
 }
 
 fn fetch_local_repository_with_outcome(
@@ -6581,6 +6715,7 @@ fn fetch_local_repository_with_outcome(
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
+    server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
     let remote_git_dir = ls_remote_git_dir(source)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
@@ -6597,6 +6732,7 @@ fn fetch_local_repository_with_outcome(
         &fetch_source,
         refspecs,
         options,
+        server_options,
     )
 }
 
@@ -6623,6 +6759,7 @@ fn run_fetch(
     fetch_source: &sley_remote::FetchSource,
     refspecs: &[String],
     options: FetchOptions,
+    server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
     let before_refs = fetch_ref_snapshot(git_dir, format)?;
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
@@ -6632,6 +6769,11 @@ fn run_fetch(
         sley_remote::FetchSource::Local { .. } | sley_remote::FetchSource::Ssh(_)
     ) {
         trace_configured_local_protocol_version(Some(config));
+    }
+    if matches!(fetch_source, sley_remote::FetchSource::Local { .. })
+        && configured_protocol_version(Some(config)) == Some(ProtocolVersion::V2)
+    {
+        trace_protocol_v2_ls_refs_request(server_options);
     }
     let outcome = sley_remote::fetch(
         sley_remote::FetchRequest {
@@ -6803,6 +6945,7 @@ fn fetch_ssh_repository_with_outcome(
         &fetch_source,
         refspecs,
         options,
+        &[],
     )
 }
 
@@ -6823,9 +6966,12 @@ fn fetch_git_repository_with_outcome(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<sley_remote::FetchOutcome> {
-    let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let fetch_source = sley_remote::FetchSource::Git(remote);
+    let config = read_repo_config(git_dir)?;
+    let fetch_source = sley_remote::FetchSource::Git {
+        remote,
+        protocol_v2: configured_protocol_version(Some(&config)) == Some(ProtocolVersion::V2),
+    };
     run_fetch(
         git_dir,
         format,
@@ -6834,6 +6980,7 @@ fn fetch_git_repository_with_outcome(
         &fetch_source,
         refspecs,
         options,
+        &[],
     )
 }
 
@@ -6880,6 +7027,7 @@ fn fetch_http_repository_with_outcome(
         &fetch_source,
         refspecs,
         options,
+        &[],
     )
 }
 
@@ -7139,7 +7287,7 @@ fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
-    let options = parse_ls_remote_options(args)?;
+    let mut options = parse_ls_remote_options(args)?;
     let repository = options.repository.as_deref().unwrap_or("origin");
     validate_configured_remote_refspecs(repository)?;
     if options.get_url {
@@ -7152,6 +7300,13 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         .map(repository_object_format)
         .transpose()?;
     let transport_config = transport_policy_config_for_cwd()?;
+    if options.server_options.is_empty() {
+        options.server_options = configured_server_options(&transport_config, repository)?;
+    } else if configured_legacy_protocol(Some(&transport_config)) {
+        eprintln!("fatal: server options require protocol version 2 or later");
+        eprintln!("fatal: see protocol.version in 'git help config' for more details");
+        return Err(GitError::Exit(128));
+    }
     let resolved_repository = ls_remote_resolved_url(repository)?;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
 
@@ -7233,6 +7388,12 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     ) {
         trace_configured_local_protocol_version(Some(&transport_config));
         if configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2) {
+            if let Ok(remote_git_dir) = ls_remote_git_dir(repository)
+                && let Ok(remote_common_git_dir) = common_git_dir_for_git_dir(&remote_git_dir)
+                && let Ok(format) = repository_object_format(&remote_common_git_dir)
+            {
+                trace_protocol_v2_upload_pack_capabilities(&remote_git_dir, format);
+            }
             trace_protocol_v2_ls_refs_request(&options.server_options);
         }
     }
