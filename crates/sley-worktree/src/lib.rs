@@ -314,6 +314,14 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
     dirt
 }
 
+fn embedded_repo_object_format(sub_root: &Path) -> Option<ObjectFormat> {
+    let git_dir = sley_diff_merge::gitlink_git_dir(sub_root)?;
+    sley_config::read_repo_config(&git_dir, None)
+        .ok()?
+        .repository_object_format()
+        .ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatusUntrackedMode {
     #[default]
@@ -1079,6 +1087,7 @@ pub fn add_update_all_tracked_filtered(
     let mut actions = Vec::new();
     let mut index_dirty = false;
     let mut clean_filter = None;
+    let trust_filemode = trust_executable_bit(clean_config);
     for (precheck, path) in pending {
         match precheck {
             TrackedOnlyPrecheck::Deleted(_) => {
@@ -1093,6 +1102,7 @@ pub fn add_update_all_tracked_filtered(
                     git_dir,
                     format,
                     Some(clean_config),
+                    trust_filemode,
                     &odb,
                     &stat_cache,
                     &mut clean_filter,
@@ -1228,7 +1238,10 @@ pub fn add_exact_tracked_path_from_disk(
         odb.write_object(object)?;
     }
 
-    let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+    let config = sley_config::read_repo_config(git_dir, config_parameters_env).unwrap_or_default();
+    let trust_filemode = trust_executable_bit(&config);
+    let mut updated_entry =
+        index_entry_from_metadata_with_filemode(entry.path.clone(), oid, &metadata, trust_filemode);
     if is_symlink {
         updated_entry.mode = 0o120000;
     }
@@ -1269,12 +1282,14 @@ pub fn add_exact_tracked_path_with_index(
         .and_then(|metadata| file_mtime_parts(&metadata));
     let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
     let mut clean_filter = None;
     let (action, dirty) = add_update_tracked_path(
         worktree_root,
         git_dir,
         format,
         None,
+        trust_filemode,
         &odb,
         &stat_cache,
         &mut clean_filter,
@@ -1507,6 +1522,7 @@ fn add_update_tracked_path(
     git_dir: &Path,
     format: ObjectFormat,
     clean_config: Option<&GitConfig>,
+    trust_filemode: bool,
     odb: &FileObjectDatabase,
     stat_cache: &IndexStatCache,
     clean_filter: &mut Option<TrackedOnlyCleanFilter>,
@@ -1545,7 +1561,12 @@ fn add_update_tracked_path(
             return Ok((None, false));
         }
         let oid = sley_diff_merge::gitlink_head_oid(&absolute, format).unwrap_or(entry.oid);
-        let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+        let mut updated_entry = index_entry_from_metadata_with_filemode(
+            entry.path.clone(),
+            oid,
+            &metadata,
+            trust_filemode,
+        );
         updated_entry.mode = sley_index::GITLINK_MODE;
         let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
         if updated_entry != entry {
@@ -1607,7 +1628,8 @@ fn add_update_tracked_path(
     if oid != entry.oid {
         odb.write_object(object)?;
     }
-    let mut updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+    let mut updated_entry =
+        index_entry_from_metadata_with_filemode(entry.path.clone(), oid, &metadata, trust_filemode);
     if is_symlink {
         updated_entry.mode = 0o120000;
     }
@@ -1749,6 +1771,12 @@ fn update_index_paths_impl(
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let trust_filemode = clean_config
+        .map(trust_executable_bit)
+        .unwrap_or_else(|| trust_executable_bit_from_git_dir(git_dir, None));
+    let trust_symlinks = clean_config
+        .map(trust_symlinks)
+        .unwrap_or_else(|| trust_symlinks_from_git_dir(git_dir, None));
     if options.allow_skip_worktree_entries {
         expand_sparse_index(&mut index, &odb, format)?;
     }
@@ -1767,10 +1795,12 @@ fn update_index_paths_impl(
     // round-trip warning (default: warn). It only applies when content filters
     // run at all (i.e. when we have a config).
     let conv_flags = clean_config.map_or(ConvFlags::Off, ConvFlags::from_config);
+    let non_atomic_chmod_errors = clean_config.is_some() && options.add && options.remove;
     let requested_filter_attrs = filter_attribute_names();
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
     let mut untracked_cache_invalidation_paths = Vec::new();
+    let mut chmod_error = false;
     for update_path in paths {
         let path = &update_path.path;
         // Each path carries the sticky mode that was in effect when it was
@@ -1870,6 +1900,12 @@ fn update_index_paths_impl(
             // process_directory).
             let display = String::from_utf8_lossy(&git_path).into_owned();
             let has_dot_git = absolute.join(".git").exists();
+            if let Some(submodule_format) = embedded_repo_object_format(&absolute)
+                && submodule_format != format
+            {
+                eprintln!("fatal: cannot add a submodule of a different hash algorithm");
+                return Err(GitError::Exit(128));
+            }
             let Some(head_oid) = sley_diff_merge::gitlink_head_oid(&absolute, format) else {
                 if has_dot_git {
                     eprintln!("error: '{display}' does not have a commit checked out");
@@ -1886,7 +1922,12 @@ fn update_index_paths_impl(
                 );
                 return Err(GitError::Exit(128));
             }
-            let mut entry = index_entry_from_metadata(git_path.clone(), head_oid, &metadata);
+            let mut entry = index_entry_from_metadata_with_filemode(
+                git_path.clone(),
+                head_oid,
+                &metadata,
+                trust_filemode,
+            );
             entry.mode = sley_index::GITLINK_MODE;
             reports.push(format!("add '{display}'"));
             replace_index_entries_with_entry(&mut index.entries, entry);
@@ -1938,9 +1979,21 @@ fn update_index_paths_impl(
         } else {
             odb.write_object(object)?
         };
-        let mut entry = index_entry_from_metadata(git_path.clone(), oid, &metadata);
+        let mut entry = index_entry_from_metadata_with_filemode(
+            git_path.clone(),
+            oid,
+            &metadata,
+            trust_filemode,
+        );
         if is_symlink {
             entry.mode = 0o120000;
+        }
+        if let Some(mode) = preferred_unmerged_mode_for_untrusted_worktree(
+            &index.entries[existing_range.clone()],
+            trust_filemode,
+            trust_symlinks,
+        ) {
+            entry.mode = mode;
         }
         // git's update_one() reports `add` for every staged path (whether the
         // entry is new or an update), then chmod_path() reports the chmod after.
@@ -1948,22 +2001,26 @@ fn update_index_paths_impl(
         if let Some(executable) = path_chmod {
             // git's chmod_path() refuses to flip the executable bit on anything
             // that is not a regular file (a symlink/gitlink has no such bit). It
-            // writes the blob first, then errors with this exact message and
-            // leaves the index untouched.
+            // writes the blob first, reports the error, and still writes the
+            // other index updates.
             if is_symlink {
                 eprintln!(
                     "fatal: git update-index: cannot chmod {}x '{}'",
                     if executable { '+' } else { '-' },
                     String::from_utf8_lossy(&git_path)
                 );
-                return Err(GitError::Exit(128));
+                if !non_atomic_chmod_errors {
+                    return Err(GitError::Exit(128));
+                }
+                chmod_error = true;
+            } else {
+                entry.mode = if executable { 0o100755 } else { 0o100644 };
+                reports.push(format!(
+                    "chmod {}x '{}'",
+                    if executable { '+' } else { '-' },
+                    String::from_utf8_lossy(&git_path)
+                ));
             }
-            entry.mode = if executable { 0o100755 } else { 0o100644 };
-            reports.push(format!(
-                "chmod {}x '{}'",
-                if executable { '+' } else { '-' },
-                String::from_utf8_lossy(&git_path)
-            ));
         }
         replace_index_entries_with_entry(&mut index.entries, entry);
         untracked_cache_invalidation_paths.push(git_path);
@@ -1983,6 +2040,9 @@ fn update_index_paths_impl(
             writeln!(stdout, "{line}")?;
         }
         stdout.flush()?;
+    }
+    if chmod_error {
+        return Err(GitError::Exit(128));
     }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
@@ -2009,6 +2069,7 @@ pub fn refresh_index_paths(
         });
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
     // git's `update-index --refresh` trusts the cached stat: a stage-0 entry
     // whose size+mtime still match the worktree file (and is not racily clean) is
     // known unchanged, so its content is NOT re-read or re-hashed
@@ -2050,6 +2111,7 @@ pub fn refresh_index_paths(
             stat_cache,
             quiet,
             ignore_missing,
+            trust_filemode,
         );
     }
     let mut needs_update = false;
@@ -2116,7 +2178,7 @@ pub fn refresh_index_paths(
         let body = fs::read(&absolute)?;
         let object = EncodedObject::new(ObjectType::Blob, body);
         let oid = object.object_id(format)?;
-        if oid != entry.oid || file_mode(&metadata) != entry.mode {
+        if oid != entry.oid || file_mode_with_trust(&metadata, trust_filemode) != entry.mode {
             if !quiet {
                 print_update_index_needs_update(entry.path.as_bytes());
             }
@@ -2125,7 +2187,12 @@ pub fn refresh_index_paths(
                 && !selected_paths.is_empty()
                 && selected_paths.contains(entry.path.as_bytes())
             {
-                let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+                let updated_entry = index_entry_from_metadata_with_filemode(
+                    entry.path.clone(),
+                    oid,
+                    &metadata,
+                    trust_filemode,
+                );
                 if updated_entry != *entry {
                     *entry = updated_entry;
                     index_dirty = true;
@@ -2133,7 +2200,12 @@ pub fn refresh_index_paths(
             }
             continue;
         }
-        let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+        let updated_entry = index_entry_from_metadata_with_filemode(
+            entry.path.clone(),
+            oid,
+            &metadata,
+            trust_filemode,
+        );
         if updated_entry != *entry {
             *entry = updated_entry;
             index_dirty = true;
@@ -2159,6 +2231,7 @@ fn refresh_all_index_paths_parallel(
     stat_cache: IndexStatCache,
     quiet: bool,
     ignore_missing: bool,
+    trust_filemode: bool,
 ) -> Result<UpdateIndexResult> {
     let prechecks =
         tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache, false)?;
@@ -2217,14 +2290,20 @@ fn refresh_all_index_paths_parallel(
                 let body = fs::read(&absolute)?;
                 let object = EncodedObject::new(ObjectType::Blob, body);
                 let oid = object.object_id(format)?;
-                if oid != entry.oid || file_mode(&metadata) != entry.mode {
+                if oid != entry.oid || file_mode_with_trust(&metadata, trust_filemode) != entry.mode
+                {
                     if !quiet {
                         print_update_index_needs_update(&path);
                     }
                     needs_update = true;
                     continue;
                 }
-                let updated_entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+                let updated_entry = index_entry_from_metadata_with_filemode(
+                    entry.path.clone(),
+                    oid,
+                    &metadata,
+                    trust_filemode,
+                );
                 if updated_entry != *entry {
                     *entry = updated_entry;
                     index_dirty = true;
@@ -15781,6 +15860,74 @@ fn index_entry_from_metadata(
     };
     apply_unix_metadata_to_index_entry(&mut entry, metadata);
     entry
+}
+
+fn index_entry_from_metadata_with_filemode(
+    path: impl Into<BString>,
+    oid: ObjectId,
+    metadata: &fs::Metadata,
+    trust_filemode: bool,
+) -> IndexEntry {
+    let mut entry = index_entry_from_metadata(path, oid, metadata);
+    entry.mode = file_mode_with_trust(metadata, trust_filemode);
+    entry
+}
+
+fn trust_executable_bit_from_git_dir(git_dir: &Path, config_parameters_env: Option<&str>) -> bool {
+    sley_config::read_repo_config(git_dir, config_parameters_env)
+        .ok()
+        .as_ref()
+        .map(trust_executable_bit)
+        .unwrap_or(true)
+}
+
+fn trust_executable_bit(config: &GitConfig) -> bool {
+    config
+        .get_bool("core", None, "filemode")
+        .unwrap_or(true)
+}
+
+fn trust_symlinks_from_git_dir(git_dir: &Path, config_parameters_env: Option<&str>) -> bool {
+    sley_config::read_repo_config(git_dir, config_parameters_env)
+        .ok()
+        .as_ref()
+        .map(trust_symlinks)
+        .unwrap_or(true)
+}
+
+fn trust_symlinks(config: &GitConfig) -> bool {
+    config
+        .get_bool("core", None, "symlinks")
+        .unwrap_or(true)
+}
+
+fn preferred_unmerged_mode_for_untrusted_worktree(
+    entries: &[IndexEntry],
+    trust_filemode: bool,
+    trust_symlinks: bool,
+) -> Option<u32> {
+    if trust_filemode && trust_symlinks {
+        return None;
+    }
+    let preferred = entries
+        .iter()
+        .find(|entry| entry.stage() == Stage::Ours)
+        .or_else(|| entries.iter().find(|entry| entry.stage() == Stage::Base))?;
+    if (!trust_symlinks && preferred.mode == 0o120000)
+        || (!trust_filemode && matches!(preferred.mode, 0o100644 | 0o100755))
+    {
+        Some(preferred.mode)
+    } else {
+        None
+    }
+}
+
+fn file_mode_with_trust(metadata: &fs::Metadata, trust_filemode: bool) -> u32 {
+    if trust_filemode {
+        file_mode(metadata)
+    } else {
+        0o100644
+    }
 }
 
 #[cfg(unix)]
