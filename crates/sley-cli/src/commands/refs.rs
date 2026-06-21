@@ -829,6 +829,10 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
         targets.extend(all_discovered.iter().cloned());
     }
     for original in refs {
+        if is_reflog_selector(&original) {
+            eprintln!("error: reflog could not be found: '{original}'");
+            return Err(GitError::Exit(255));
+        }
         let reference = resolve_reflog_name(&store, &original).map_err(|_| {
             eprintln!("error: reflog could not be found: '{original}'");
             GitError::Exit(255)
@@ -875,6 +879,10 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     } else {
         Err(GitError::Exit(exit_code))
     }
+}
+
+fn is_reflog_selector(value: &str) -> bool {
+    value.strip_suffix('}').is_some_and(|prefix| prefix.contains("@{"))
 }
 
 fn expire_reflog_entries(
