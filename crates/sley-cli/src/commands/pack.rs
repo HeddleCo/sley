@@ -1198,6 +1198,49 @@ fn is_config_never(config: &GitConfig, section: &str, key: &str) -> bool {
     )
 }
 
+fn validate_gc_prune_expire(config: &GitConfig, git_dir: &Path) -> Result<()> {
+    let Some(value) = config.get("gc", None, "pruneExpire") else {
+        return Ok(());
+    };
+    if parse_cruft_expiration(value).is_ok() {
+        return Ok(());
+    }
+    eprintln!("error: Invalid gc.pruneexpire: '{value}'");
+    let config_path = git_dir.join("config");
+    let line = config_line_number(&config_path, "pruneExpire").unwrap_or(0);
+    eprintln!(
+        "fatal: bad config variable 'gc.pruneexpire' in file '{}' at line {line}",
+        display_git_config_path(git_dir, &config_path)
+    );
+    Err(GitError::Exit(128))
+}
+
+fn config_line_number(path: &Path, key: &str) -> Option<usize> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        .position(|line| {
+            line.trim_start()
+                .split(['=', ' ', '\t'])
+                .next()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(key))
+        })
+        .map(|index| index + 1)
+}
+
+fn display_git_config_path(git_dir: &Path, config_path: &Path) -> String {
+    if git_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".git")
+        && let Some(parent) = git_dir.parent()
+        && env::current_dir().is_ok_and(|cwd| cwd == parent)
+    {
+        return ".git/config".to_string();
+    }
+    config_path.to_string_lossy().into_owned()
+}
+
 /// `git repack --cruft [--cruft-expiration=<t>] [--expire-to=<dir>] [-d]`.
 #[allow(clippy::too_many_arguments)]
 fn cmd_repack_cruft(
@@ -1468,6 +1511,7 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
+    validate_gc_prune_expire(&config, &common_git_dir)?;
 
     // gc.cruftPacks defaults to true (cruft packs are git's default since 2.42).
     let cruft_packs = cruft_flag
