@@ -89,8 +89,7 @@ fn diff_split_revisions(
                 return diff_usage_error();
             }
             let bases = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?;
-            let Some(base) = bases.first()
-            else {
+            let Some(base) = bases.first() else {
                 eprintln!("fatal: {first}: no merge base");
                 return Err(GitError::Exit(128));
             };
@@ -160,9 +159,7 @@ fn diff_split_merge_base(
             eprintln!("fatal: --merge-base does not work with ranges");
             return Err(GitError::Exit(128));
         }
-        if commits.len() < 2
-            && resolve_revision(git_dir, format, &token).is_ok()
-        {
+        if commits.len() < 2 && resolve_revision(git_dir, format, &token).is_ok() {
             let commit = diff_resolve_commit_arg(git_dir, format, db, &token)?;
             commits.push((commit, token));
             continue;
@@ -241,6 +238,93 @@ fn diff_arg_looks_like_extra_revision(
     diff_peel_rev_tree(git_dir, format, db, arg).is_ok()
 }
 
+#[derive(Clone)]
+struct IndexBlobSpec {
+    path: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+}
+
+fn diff_index_blob_pair(
+    git_dir: &Path,
+    format: ObjectFormat,
+    args: &[String],
+) -> Result<Option<(IndexBlobSpec, IndexBlobSpec)>> {
+    if args.len() != 2 || !args.iter().all(|arg| arg.starts_with(':')) {
+        return Ok(None);
+    }
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index = Index::parse(&fs::read(index_path)?, format)?;
+    let left = resolve_stage0_index_blob(&index, &args[0])?;
+    let right = resolve_stage0_index_blob(&index, &args[1])?;
+    Ok(Some((left, right)))
+}
+
+fn resolve_stage0_index_blob(index: &Index, spec: &str) -> Result<IndexBlobSpec> {
+    let path = spec
+        .strip_prefix(':')
+        .filter(|path| !path.is_empty() && !path.starts_with(':'))
+        .ok_or_else(|| GitError::Command(format!("unsupported index blob spec {spec}")))?;
+    let path = path.as_bytes();
+    let entry = index
+        .entries
+        .iter()
+        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == path)
+        .ok_or_else(|| {
+            GitError::Command(format!(
+                "path '{}' is not in the index",
+                String::from_utf8_lossy(path)
+            ))
+        })?;
+    Ok(IndexBlobSpec {
+        path: path.to_vec(),
+        mode: entry.mode,
+        oid: entry.oid,
+    })
+}
+
+fn write_index_blob_raw_diff(
+    left: &IndexBlobSpec,
+    right: &IndexBlobSpec,
+    abbrev: Option<usize>,
+    format: ObjectFormat,
+    z: bool,
+) -> Result<()> {
+    if left.oid == right.oid && left.mode == right.mode {
+        return Ok(());
+    }
+    let mut stdout = io::stdout().lock();
+    let old_oid = abbreviate_index_blob_oid(&left.oid, abbrev, format);
+    let new_oid = abbreviate_index_blob_oid(&right.oid, abbrev, format);
+    write!(
+        stdout,
+        ":{:06o} {:06o} {} {} M\t{}",
+        left.mode,
+        right.mode,
+        old_oid,
+        new_oid,
+        String::from_utf8_lossy(&right.path)
+    )?;
+    if z {
+        stdout.write_all(&[0])?;
+    } else {
+        writeln!(stdout)?;
+    }
+    Ok(())
+}
+
+fn abbreviate_index_blob_oid(
+    oid: &ObjectId,
+    abbrev: Option<usize>,
+    format: ObjectFormat,
+) -> String {
+    let hex = oid.to_hex();
+    match abbrev {
+        Some(width) => hex[..width.min(format.hex_len())].to_string(),
+        None => hex,
+    }
+}
+
 fn diff_usage_error<T>() -> Result<T> {
     eprintln!("usage: git diff [<options>] [<commit>] [--] [<path>...]");
     Err(GitError::Exit(129))
@@ -275,9 +359,9 @@ impl WhitespaceRuleResolver {
             },
             None => sley_diff_merge::ws::WS_DEFAULT_RULE,
         };
-        let matcher = worktree_root_for_git_dir(git_dir)
-            .ok()
-            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok());
+        let matcher = worktree_root_for_git_dir(git_dir).ok().and_then(|root| {
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
+        });
         Ok(Self {
             config_rule,
             matcher,
@@ -351,13 +435,7 @@ pub(crate) fn run_diff_check(
         if entry.new_mode == Some(0o120000) {
             rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
         }
-        if check_one_diff(
-            &mut stdout,
-            &old_content,
-            &new_content,
-            &path,
-            rule,
-        )? {
+        if check_one_diff(&mut stdout, &old_content, &new_content, &path, rule)? {
             status = true;
         }
     }
@@ -558,13 +636,7 @@ fn run_external_diff_entries(
             quiet: options.quiet,
             output_file: output_file.as_mut(),
         };
-        let rc = run_one_external_diff(
-            entry,
-            &command,
-            idx + 1,
-            entries.len(),
-            &mut context,
-        )?;
+        let rc = run_one_external_diff(entry, &command, idx + 1, entries.len(), &mut context)?;
         match (command.trust_exit_code, rc) {
             (false, 0) => found_changes = true,
             (true, 0) => {}
@@ -621,24 +693,22 @@ fn run_one_external_diff(
     total: usize,
     context: &mut ExternalDiffProcessContext<'_>,
 ) -> Result<i32> {
-    let old_file =
-        prepare_external_diff_file(
-            entry,
-            context.db,
-            context.worktree_root,
-            context.use_worktree_new,
-            false,
-            context.autocrlf,
-        )?;
-    let new_file =
-        prepare_external_diff_file(
-            entry,
-            context.db,
-            context.worktree_root,
-            context.use_worktree_new,
-            true,
-            context.autocrlf,
-        )?;
+    let old_file = prepare_external_diff_file(
+        entry,
+        context.db,
+        context.worktree_root,
+        context.use_worktree_new,
+        false,
+        context.autocrlf,
+    )?;
+    let new_file = prepare_external_diff_file(
+        entry,
+        context.db,
+        context.worktree_root,
+        context.use_worktree_new,
+        true,
+        context.autocrlf,
+    )?;
     let path = String::from_utf8_lossy(&entry.path).into_owned();
     let old_hex = external_diff_oid(entry.old_oid.as_ref(), context.db.object_format(), false);
     let new_hex = external_diff_oid(
@@ -785,11 +855,7 @@ fn lf_to_crlf(content: &[u8]) -> Vec<u8> {
 
 fn unique_external_diff_temp_dir() -> Result<PathBuf> {
     for attempt in 0..1000u32 {
-        let dir = env::temp_dir().join(format!(
-            "sley-extdiff-{}-{}",
-            std::process::id(),
-            attempt
-        ));
+        let dir = env::temp_dir().join(format!("sley-extdiff-{}-{}", std::process::id(), attempt));
         match fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -997,9 +1063,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         color_always = true;
     }
     let ws_error_highlight = ws_error_highlight.or_else(|| {
-        read_repo_config(&git_dir)
-            .ok()
-            .and_then(|config| config.get("diff", None, "wserrorhighlight").map(str::to_owned))
+        read_repo_config(&git_dir).ok().and_then(|config| {
+            config
+                .get("diff", None, "wserrorhighlight")
+                .map(str::to_owned)
+        })
     });
     let ws_error_kinds = parse_ws_error_highlight_kinds(ws_error_highlight.as_deref());
     let diff_submodule_format = diff_submodule_format.or_else(|| {
@@ -1016,6 +1084,23 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let submodule_format =
         diff_submodule_format.unwrap_or(commands::diff_options::SubmoduleDiffFormat::Short);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    if !head
+        && !merge_base
+        && explicit_paths.is_empty()
+        && let Some((left, right)) = diff_index_blob_pair(&git_dir, format, &path_args)?
+    {
+        let has_differences = left.oid != right.oid || left.mode != right.mode;
+        if !quiet && raw {
+            let abbrev = raw_abbrev
+                .unwrap_or(Some(7))
+                .map(|width| width.min(format.hex_len()));
+            write_index_blob_raw_diff(&left, &right, abbrev, format, z)?;
+        }
+        if (quiet || exit_code) && has_differences {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
     // Resolve the diff path prefixes from `diff.*Prefix` config, then layer the
     // CLI overrides on top (git's diff_setup_done → diff_opt_* precedence):
     //  * `diff.noPrefix` ⇒ both prefixes empty.
@@ -1027,7 +1112,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // win over config.
     if let Ok(config) = read_repo_config(&git_dir) {
         let cfg_no_prefix = config.get_bool("diff", None, "noprefix").unwrap_or(false);
-        let cfg_mnemonic = config.get_bool("diff", None, "mnemonicprefix").unwrap_or(false);
+        let cfg_mnemonic = config
+            .get_bool("diff", None, "mnemonicprefix")
+            .unwrap_or(false);
         let (mut cfg_src, mut cfg_dst) = if cfg_no_prefix {
             (String::new(), String::new())
         } else if cfg_mnemonic {
@@ -1606,12 +1693,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 .as_ref()
                 .expect("stat entries collected for numstat")
             {
-                write_diff_numstat_materialized_entry(
-                    &mut stdout,
-                    entry.entry,
-                    entry.stats,
-                    z,
-                )?;
+                write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, z)?;
             }
         }
         if show_stat {
@@ -2270,9 +2352,7 @@ fn diff_line_stats_from_ignored_hunks(
     let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
         sley_diff_merge::render::ChangeIgnore {
             ignore_blank_lines,
-            regex_match: regex_match
-                .as_ref()
-                .map(|f| f as &dyn Fn(&[u8]) -> bool),
+            regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
         }
     });
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
@@ -2430,7 +2510,8 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         if raw || name_status || name_only || no_output {
             return Err(GitError::Exit(1));
         }
-        let show_patch = patch || params.output_format == commands::diff_options::DiffOutputFormat::empty();
+        let show_patch =
+            patch || params.output_format == commands::diff_options::DiffOutputFormat::empty();
         if !show_patch {
             return Err(GitError::Exit(1));
         }
@@ -2603,7 +2684,10 @@ fn no_index_entry_from_sides(old: Option<&NoIndexSide>, new: Option<&NoIndexSide
         (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
         _ => sley_diff_merge::NameStatus::Modified,
     };
-    let path = new.or(old).map(|side| side.path.clone()).unwrap_or_default();
+    let path = new
+        .or(old)
+        .map(|side| side.path.clone())
+        .unwrap_or_default();
     NoIndexEntry {
         entry: sley_diff_merge::NameStatusEntry {
             status,
