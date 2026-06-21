@@ -7485,9 +7485,10 @@ impl LsFilesPathspec {
     ) -> Result<Self> {
         let root = fs::canonicalize(worktree_root)?;
         let cwd = fs::canonicalize(cwd)?;
-        let relative = cwd.strip_prefix(&root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", cwd.display()))
-        })?;
+        let (relative, pathspec_cwd) = match cwd.strip_prefix(&root) {
+            Ok(relative) => (relative, cwd.as_path()),
+            Err(_) => (Path::new(""), root.as_path()),
+        };
         let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
         let cwd_depth = path_component_count(&prefix);
         let magic = effective_pathspec_flags();
@@ -7500,7 +7501,7 @@ impl LsFilesPathspec {
                 );
                 return Err(GitError::Exit(128));
             }
-            let parse_arg = normalize_absolute_cli_pathspec(&root, &cwd, arg)?;
+            let parse_arg = normalize_absolute_cli_pathspec(&root, pathspec_cwd, arg)?;
             let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
             // Under literal magic, wildcard characters carry no special meaning.
             let is_glob =
@@ -7509,7 +7510,7 @@ impl LsFilesPathspec {
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
             } else {
-                cwd.join(arg_path)
+                pathspec_cwd.join(arg_path)
             };
             filters.push(LsFilesPathFilter {
                 original: arg.clone(),
@@ -11330,6 +11331,14 @@ fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
             resolve_cli_path(&env::current_dir()?, work_tree.to_string_lossy().as_ref());
         return fs::canonicalize(work_tree).map_err(|err| GitError::Io(err.to_string()));
     }
+    if let Some(setup) = setup::setup_git_directory()
+        && let Some(worktree) = setup.worktree.as_ref()
+        && (explicit_git_dir().is_some()
+            || explicit_work_tree().is_some()
+            || setup_matches_git_dir(&setup, git_dir))
+    {
+        return Ok(worktree.clone());
+    }
     if explicit_git_dir().is_some() {
         return env::current_dir().map_err(|err| GitError::Io(err.to_string()));
     }
@@ -11341,6 +11350,16 @@ fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
             "update-index currently requires a non-bare worktree".into(),
         )),
     }
+}
+
+fn setup_matches_git_dir(setup: &setup::SetupResult, git_dir: &Path) -> bool {
+    let setup_git_dir = Path::new(&setup.git_dir);
+    let setup_git_dir = if setup_git_dir.is_absolute() {
+        setup_git_dir.to_path_buf()
+    } else {
+        setup.cwd.join(setup_git_dir)
+    };
+    paths_refer_to_same_dir(&setup_git_dir, git_dir)
 }
 
 /// Resolve the effective worktree for a worktree-requiring command, emitting

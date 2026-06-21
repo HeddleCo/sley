@@ -3212,7 +3212,10 @@ fn racily_clean_entry_indexes_before_write(
     if index_mtime == (0, 0) {
         return Ok(Vec::new());
     }
-    let Some(worktree_root) = worktree_root_for_git_dir(git_dir)? else {
+    let Some(worktree_root) = (match worktree_root_for_git_dir(git_dir) {
+        Ok(worktree_root) => worktree_root,
+        Err(_) => return Ok(Vec::new()),
+    }) else {
         return Ok(Vec::new());
     };
     let mut smudged = Vec::new();
