@@ -1138,7 +1138,7 @@ fn classify_push_command(
                 "deletion prohibited".to_string(),
             ));
         }
-        if receive_targets_current_branch(format, command, remote_git_dir)? {
+        if receive_denies_current_branch_delete(format, command, config, request, remote_git_dir)? {
             return Ok(PushRefStatus::RemoteReject(
                 "deletion of the current branch prohibited".to_string(),
             ));
@@ -1345,6 +1345,30 @@ fn receive_targets_current_branch(
     Ok(matches!(
         store.read_ref("HEAD")?,
         Some(RefTarget::Symbolic(target)) if target == command.name
+    ))
+}
+
+fn receive_denies_current_branch_delete(
+    format: ObjectFormat,
+    command: &ReceivePackCommand,
+    config: &GitConfig,
+    request: &PushReportRequest<'_>,
+    remote_git_dir: &Path,
+) -> Result<bool> {
+    if !receive_targets_current_branch(format, command, remote_git_dir)? {
+        return Ok(false);
+    }
+    let deny = request
+        .receive_config_overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case("denydeletecurrent"))
+        .map(|(_, value)| value.as_str())
+        .or_else(|| config.get("receive", None, "denydeletecurrent"))
+        .unwrap_or("refuse");
+    Ok(!matches!(
+        deny.to_ascii_lowercase().as_str(),
+        "ignore" | "warn" | "false" | "no" | "off" | "0"
     ))
 }
 
