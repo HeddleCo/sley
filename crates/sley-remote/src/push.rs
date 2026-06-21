@@ -1151,6 +1151,15 @@ fn classify_push_command(
         ));
     }
 
+    if command.name.starts_with("refs/heads/") && !command.new_id.is_null() {
+        let object = local_db.read_object(&command.new_id)?;
+        if object.object_type != ObjectType::Commit {
+            return Ok(PushRefStatus::RemoteReject(
+                "invalid new value provided".to_string(),
+            ));
+        }
+    }
+
     // `--force-with-lease`: the remote's current value must match the lease, or
     // the push is rejected as stale info — checked before the non-ff gate and
     // independent of `--force`.

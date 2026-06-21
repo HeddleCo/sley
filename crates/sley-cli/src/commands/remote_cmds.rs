@@ -5579,6 +5579,20 @@ fn render_push_status(
             emit(reference);
         }
     }
+    for reference in &ordered {
+        if matches!(
+            &reference.status,
+            sley_remote::PushRefStatus::RemoteReject(message)
+                if message == "invalid new value provided"
+        ) && reference.dst.starts_with("refs/heads/")
+            && !reference.new_id.is_null()
+        {
+            eprintln!(
+                "trying to write non-commit object {} to branch '{}'",
+                reference.new_id, reference.dst
+            );
+        }
+    }
 
     // git prints "Done" under porcelain whenever the transport-level push
     // succeeded (`!push_ret`); ref-level rejections (non-ff, atomic, remote ng)
