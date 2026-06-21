@@ -398,7 +398,7 @@ declare -A FLOOR=(
     [t1500-rev-parse.sh]=81
     [t1501-work-tree.sh]=39
     [t1506-rev-parse-diagnosis.sh]=30
-    [t2400-worktree-add.sh]=214
+    [t2400-worktree-add.sh]=215
     # codex-wave-11 (worktree repair): re-link .git file + worktrees/<id>/gitdir
     # back-pointer after a move, broken-link detection + repair messages, repair
     # both-moved + specific-path. t2406 7->24 FULL; side gain t2403 25->27.
@@ -778,7 +778,7 @@ declare -A FLOOR=(
     # t1400 271->275 NOT banked — flake-avoidance, incidental); consolidation neutral
     # (t3206=45/t3430=19/t5520=75 held EXACTLY); diff/format guards held (t4013=191,
     # t4014=202). t4015 105->114.
-    [t5526-fetch-submodules.sh]=39
+    [t5526-fetch-submodules.sh]=55
     [t2204-add-ignored.sh]=47
     [t6020-bundle-misc.sh]=28
     [t4068-diff-symmetric-merge-base.sh]=36
@@ -895,6 +895,22 @@ declare -A FLOOR=(
     # SAFE (t7600=83 t3404=94 t3501=21 t6402=35 held). Cross-guards held EXACTLY (t1091=53 t1011=19
     # t7508=119 t7102=37 t2013=51 t6112=48 t6006=58 t4202=124); cargo test green.
     [t4200-rerere.sh]=34
+    # wave-30 (2026-06-21, core→peripheral; off main 3547af47): split-index, fetch-submodules,
+    # worktree-list. t1700-split-index 8->29 FULL (link-extension EWAH codec + shared-base
+    # merge/read, thin-index delta write, core.splitIndex/maxPercentChange/sharedIndexExpire,
+    # rev-parse --shared-index-path; transparent through ls-files/status/add/update-index).
+    # t2402-worktree-list 20->27 FULL (human-format column align + core.quotepath, porcelain/-z
+    # records, locked/prunable ordering + quoted reasons, bare/linked/broken-HEAD listing).
+    # t5526-fetch-submodules 39->56 (banked 55, 1-cell fetch-family margin): on-demand changed-
+    # gitlink detection across fetched history, fetch.recurseSubmodules/submodule.<n> precedence,
+    # raw-oid + FETCH_HEAD fetches, renamed-submodule by stable name, broken-populated detection.
+    # Collisions auto-merged SEMANTICALLY CLEAN (sley-worktree/lib.rs: split+wtlist; status.rs:
+    # split+fetchsub) — all 3 targets re-verified on the MERGED binary, not the slice branches.
+    # Guards held/gained: t7508=119 t2020=26 t3600=81 t3700=50 t2070=15 t7400=111 t1500=81
+    # t1501=39 t5510=7; t2400-worktree-add 214->215, t5516=111(floor110), t5601=109(floor107).
+    # cargo test --workspace green (0 failed).
+    [t1700-split-index.sh]=29
+    [t2402-worktree-list.sh]=27
 )
 
 fail=0
