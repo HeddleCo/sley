@@ -967,6 +967,21 @@ declare -A FLOOR=(
     [t5604-clone-reference.sh]=30
     [t1417-reflog-updateref.sh]=21
     [t2401-worktree-prune.sh]=13
+    # wave-35 (2026-06-21, post-sweep off main a252c097; t_fetch/worktree/plumbing): fetch BIG
+    # harvest, worktree-config, large-objects. t5510-fetch 109->170/214 (+61, the largest single-file
+    # gain of the campaign; banked 167 w/ fetch-family margin — oscillates 169-170. refspec/prune/
+    # prune-tags + --refmap + opportunistic tracking updates. 44 hard-tail remain: atomic, FETCH_HEAD
+    # exactness, bundle, D/F, negotiation-tip, commit-graph). t2205-add-worktree-config 4->13 FULL
+    # (add traversal w/ configured core.worktree: ../-normalize, embedded-repo, ls-files rollup).
+    # t1050-large 15->29 FULL (streaming for blobs >= core.bigFileThreshold, pack.packSizeLimit split).
+    # wtconfig + large auto-merged textually clean BUT together regressed t3700-add 50->48 (add-traversal
+    # x add-streaming on sley-worktree/lib.rs); fix-round 20e28394 reconciled -> t3700=51. All targets +
+    # t3700 re-verified on the MERGED+fixed binary. Guards held/gained: t5516=110 t5526=56 t5601=108
+    # t5605=23 t5604=31 t5512=40 t2400=215 t2402=27 t7508=119 t1501=39 t3600=81 t2070=15 t5300=57
+    # t1450=96 t3700=51. fetchcore disjoint+clean. cargo test --workspace green.
+    [t5510-fetch.sh]=167
+    [t2205-add-worktree-config.sh]=13
+    [t1050-large.sh]=29
 )
 
 fail=0
