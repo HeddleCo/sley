@@ -5161,7 +5161,7 @@ fn replace_create(
         .read_object_header(&replacement_oid)?
         .map(|(object_type, _)| object_type)
         .ok_or_else(|| GitError::object_not_found(replacement_oid))?;
-    if object_type != replacement_type {
+    if !force && object_type != replacement_type {
         eprintln!("error: Objects must be of the same type.");
         eprintln!(
             "'{object}' points to a replaced object of type '{}'",

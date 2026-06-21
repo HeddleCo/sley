@@ -176,7 +176,9 @@ where
         checker.check_object_root(oid);
     }
     for oid in object_ids.iter().cloned() {
-        checker.check_object(oid);
+        if !checker.checked.contains(&oid) {
+            checker.check_object_content_only(oid);
+        }
     }
     // git's deferred `fsck_blobs` pass: every non-symlink entry named
     // `.gitmodules` or `.gitattributes` is type/content checked with the
@@ -258,6 +260,27 @@ where
         self.check_loaded_object(oid, &object);
     }
 
+    fn check_object_content_only(&mut self, oid: ObjectId) {
+        if !self.checked.insert(oid) {
+            return;
+        }
+        let object = match self.reader.read_object(&oid) {
+            Ok(object) => object,
+            Err(err) => {
+                self.issues
+                    .push(FsckIssue::error(format!("missing object {oid}: {err}")));
+                self.error_bits |= ERROR_REACHABLE;
+                return;
+            }
+        };
+        if self.check_loaded_object_content(oid, &object, false) {
+            return;
+        }
+        if object.object_type == ObjectType::Tree {
+            self.check_unreachable_tree_paths(&object.body);
+        }
+    }
+
     /// Check a ref-reachable root. The driver validates the ref tip itself
     /// (`invalid sha1 pointer` / `not a commit`, and the ERROR_REACHABLE/REFS
     /// attribution) via git's `snapshot_ref` rules before handing us only
@@ -270,6 +293,24 @@ where
         if !self.checked.insert(oid) {
             return;
         }
+        if self.check_loaded_object_content(oid, object, true) {
+            return;
+        }
+
+        match object.object_type {
+            ObjectType::Commit => self.check_commit(oid, &object.body),
+            ObjectType::Tree => self.check_tree(oid, &object.body),
+            ObjectType::Tag => self.check_tag(oid, &object.body),
+            ObjectType::Blob => {}
+        }
+    }
+
+    fn check_loaded_object_content(
+        &mut self,
+        oid: ObjectId,
+        object: &EncodedObject,
+        fail_nonfatal_errors: bool,
+    ) -> bool {
         match object.object_id(self.format) {
             Ok(actual) if actual == oid => {}
             Ok(actual) => {
@@ -278,7 +319,7 @@ where
                     self.issues.push(FsckIssue::error(format!(
                         "object id mismatch: expected {oid}, got {actual}"
                     )));
-                    return;
+                    return true;
                 }
             }
             Err(err) => {
@@ -286,7 +327,7 @@ where
                     self.error_bits |= ERROR_OBJECT;
                     self.issues
                         .push(FsckIssue::error(format!("invalid object {oid}: {err}")));
-                    return;
+                    return true;
                 }
             }
         }
@@ -318,9 +359,15 @@ where
                 f.msg_id.camel(),
                 f.detail,
             );
-            let issue = match f.severity {
-                content::Severity::Error => FsckIssue::content_error(msg),
-                _ => FsckIssue::content_warning(msg),
+            let masked_tag_ident = object.object_type == ObjectType::Tag
+                && is_tag_ident_msg(f.msg_id)
+                && !f.fatal;
+            let issue = if f.severity == content::Severity::Error
+                && (fail_nonfatal_errors || !masked_tag_ident)
+            {
+                FsckIssue::content_error(msg)
+            } else {
+                FsckIssue::content_warning(msg)
             };
             self.issues.push(issue);
         }
@@ -328,15 +375,9 @@ where
         // If a structural (fatal) content problem stopped parsing, do not also
         // run the link walk — git aborts the object too.
         if had_fatal {
-            return;
+            return true;
         }
-
-        match object.object_type {
-            ObjectType::Commit => self.check_commit(oid, &object.body),
-            ObjectType::Tree => self.check_tree(oid, &object.body),
-            ObjectType::Tag => self.check_tag(oid, &object.body),
-            ObjectType::Blob => {}
-        }
+        false
     }
 
     fn check_commit(&mut self, oid: ObjectId, body: &[u8]) {
@@ -471,6 +512,23 @@ where
                     oid: entry.oid,
                 },
             );
+        }
+    }
+
+    fn check_unreachable_tree_paths(&mut self, body: &[u8]) {
+        let Ok(entries) =
+            TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>()
+        else {
+            return;
+        };
+        for entry in entries {
+            let is_symlink = entry.mode == 0o120000;
+            if !is_symlink && content::is_dotgitmodules_name(entry.name) {
+                self.gitmodules_found.insert(entry.oid);
+            }
+            if !is_symlink && content::is_dotgitattributes_name(entry.name) {
+                self.gitattributes_found.insert(entry.oid);
+            }
         }
     }
 
@@ -693,6 +751,22 @@ where
             None => oid.to_string(),
         }
     }
+}
+
+fn is_tag_ident_msg(msg_id: content::MsgId) -> bool {
+    matches!(
+        msg_id,
+        content::MsgId::MissingNameBeforeEmail
+            | content::MsgId::MissingEmail
+            | content::MsgId::BadName
+            | content::MsgId::MissingSpaceBeforeEmail
+            | content::MsgId::BadEmail
+            | content::MsgId::MissingSpaceBeforeDate
+            | content::MsgId::BadDate
+            | content::MsgId::ZeroPaddedDate
+            | content::MsgId::BadDateOverflow
+            | content::MsgId::BadTimezone
+    )
 }
 
 fn reachable_objects<R>(reader: &R, format: ObjectFormat, roots: &[ObjectId]) -> HashSet<ObjectId>
@@ -955,6 +1029,111 @@ mod tests {
             vec![FsckNotice {
                 message: format!("dangling blob {blob}")
             }]
+        );
+    }
+
+    #[test]
+    fn unreachable_tag_referent_is_not_checked_as_a_broken_link() {
+        let format = ObjectFormat::Sha1;
+        let mut db = ObjectDatabase::new(format);
+        let missing_tag =
+            ObjectId::from_hex(format, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+                .expect("test operation should succeed");
+        let tag = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tag,
+                format!(
+                    "object {missing_tag}\n\
+type tag\n\
+tag valid\n\
+tagger T A Gger <tagger@example.com> 1234567890 +0000\n\n"
+                )
+                .into_bytes(),
+            ))
+            .expect("test operation should succeed");
+
+        let unreachable = fsck_objects_with_options(
+            &db,
+            format,
+            [],
+            [tag],
+            FsckOptions {
+                report_dangling: true,
+                report_unreachable: false,
+                ..Default::default()
+            },
+        );
+        assert!(unreachable.is_ok(), "{unreachable:?}");
+        assert_eq!(
+            unreachable.notices,
+            vec![FsckNotice {
+                message: format!("dangling tag {tag}")
+            }]
+        );
+
+        let reachable = fsck_objects_with_options(
+            &db,
+            format,
+            [tag],
+            [tag],
+            FsckOptions {
+                report_dangling: true,
+                report_unreachable: false,
+                ..Default::default()
+            },
+        );
+        assert!(!reachable.is_ok(), "{reachable:?}");
+        assert!(
+            reachable
+                .issues
+                .iter()
+                .any(|issue| issue.message == format!("missing tag {missing_tag}")),
+            "{reachable:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_nonfatal_tag_content_error_does_not_fail_fsck() {
+        let format = ObjectFormat::Sha1;
+        let mut db = ObjectDatabase::new(format);
+        let target = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"x".to_vec()))
+            .expect("test operation should succeed");
+        let tag = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tag,
+                format!(
+                    "object {target}\n\
+type blob\n\
+tag valid\n\
+tagger T A Gger <\n\
+ > 0 +0000\n\n"
+                )
+                .into_bytes(),
+            ))
+            .expect("test operation should succeed");
+
+        let report = fsck_objects_with_options(
+            &db,
+            format,
+            [],
+            [tag],
+            FsckOptions {
+                report_dangling: true,
+                report_unreachable: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(report.exit_code(), 0);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("badEmail:")
+                    && issue.severity == IssueSeverity::Warning),
+            "{report:?}"
         );
     }
 

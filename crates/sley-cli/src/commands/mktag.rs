@@ -95,7 +95,7 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
 
     // fsck the payload (prints any problems inline, like git). A fatal outcome
     // ends with the trailing fatal line and exit 128.
-    let mut reporter = FsckReporter::new(strict);
+    let mut reporter = FsckReporter::from_repo(strict, repo.config());
     let parsed = fsck_tag(format, &payload, &mut reporter);
     if reporter.is_fatal() {
         eprintln!("{FSCK_FATAL_TEXT}");
@@ -109,7 +109,7 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
 
     // The tagged object must exist and match the declared type. These checks are
     // reported without the fsck framing and use the canonical object id.
-    verify_tagged_object(&db, &parsed)?;
+    verify_tagged_object(&repo, &db, &parsed)?;
 
     // Write the payload verbatim and print the resulting object id.
     let oid = db.write_object(EncodedObject::new(ObjectType::Tag, payload))?;
@@ -136,7 +136,7 @@ fn parse_mktag_args(args: &[String]) -> Result<MktagInvocation> {
     for arg in args {
         match arg.as_str() {
             // `--` ends option processing; remaining tokens are (ignored) operands.
-            "--" => break,
+            "--" | "--end-of-options" => break,
             "-h" | "--help" | "--help-all" => return Ok(MktagInvocation::Help),
             "--strict" => strict = true,
             "--no-strict" => strict = false,
@@ -166,6 +166,7 @@ fn parse_mktag_args(args: &[String]) -> Result<MktagInvocation> {
 /// `--no-strict`; under strict every message is promoted to an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FsckSeverity {
+    Ignore,
     Warn,
     Error,
 }
@@ -180,6 +181,7 @@ enum FsckSeverity {
 /// [`is_fatal`]: FsckReporter::is_fatal
 struct FsckReporter {
     strict: bool,
+    extra_header_entry: FsckSeverity,
     /// The value of the most recent `report()` call, i.e. git's final `ret`.
     fatal: bool,
 }
@@ -188,8 +190,24 @@ impl FsckReporter {
     fn new(strict: bool) -> Self {
         Self {
             strict,
+            extra_header_entry: FsckSeverity::Warn,
             fatal: false,
         }
+    }
+
+    fn from_repo(strict: bool, config: &GitConfig) -> Self {
+        let mut reporter = Self::new(strict);
+        for (key, value) in config.fsck_entries() {
+            if key.eq_ignore_ascii_case("extraHeaderEntry") {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "error" => reporter.extra_header_entry = FsckSeverity::Error,
+                    "warn" | "warning" => reporter.extra_header_entry = FsckSeverity::Warn,
+                    "ignore" => reporter.extra_header_entry = FsckSeverity::Ignore,
+                    _ => {}
+                }
+            }
+        }
+        reporter
     }
 
     /// Report one fsck problem. Prints `error:`/`warning:` per the effective
@@ -197,6 +215,10 @@ impl FsckReporter {
     /// `report()` would be non-zero — which the caller uses to decide whether to
     /// `goto done`. Also records that value as the running fatal state.
     fn report(&mut self, severity: FsckSeverity, id: &str, detail: &str) -> bool {
+        if severity == FsckSeverity::Ignore {
+            self.fatal = false;
+            return false;
+        }
         let is_error = self.strict || severity == FsckSeverity::Error;
         let prefix = if is_error { "error" } else { "warning" };
         eprintln!("{prefix}: tag input does not pass fsck: {id}: {detail}");
@@ -342,7 +364,7 @@ fn fsck_tag(
     // identity error under --no-strict.)
     if cursor.has_extra_header() {
         reporter.report(
-            FsckSeverity::Warn,
+            reporter.extra_header_entry,
             "extraHeaderEntry",
             "invalid format - extra header(s) after 'tagger'",
         );
@@ -717,8 +739,13 @@ fn check_refname_component(component: &[u8]) -> bool {
 ///   * A missing/unreadable object: `fatal: could not read tagged object '<oid>'`.
 ///   * A type mismatch:
 ///     `fatal: object '<oid>' tagged as '<declared>', but is a '<actual>' type`.
-fn verify_tagged_object(db: &FileObjectDatabase, parsed: &ParsedTag) -> Result<()> {
-    let object = match db.read_object(&parsed.object_id) {
+fn verify_tagged_object(
+    repo: &RepositoryContext,
+    db: &FileObjectDatabase,
+    parsed: &ParsedTag,
+) -> Result<()> {
+    let read_oid = apply_replace_object(repo.refs(), &parsed.object_id)?;
+    let object = match db.read_object(&read_oid) {
         Ok(object) => object,
         Err(_) => {
             eprintln!("fatal: could not read tagged object '{}'", parsed.object_id);
@@ -851,6 +878,15 @@ mod tests {
     #[test]
     fn double_dash_then_operand_ignored() {
         let args = vec!["--".to_string(), "--strict".to_string()];
+        match parse_mktag_args(&args).expect("parse") {
+            MktagInvocation::Run { strict } => assert!(strict),
+            MktagInvocation::Help => panic!("unexpected help"),
+        }
+    }
+
+    #[test]
+    fn end_of_options_then_operand_ignored() {
+        let args = vec!["--end-of-options".to_string(), "--bogus".to_string()];
         match parse_mktag_args(&args).expect("parse") {
             MktagInvocation::Run { strict } => assert!(strict),
             MktagInvocation::Help => panic!("unexpected help"),
