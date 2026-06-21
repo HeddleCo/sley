@@ -19,6 +19,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut abbrev_len = Some(7usize);
     let mut left_right = false;
     let mut side_filter = None;
+    let mut cherry_mode = RevListCherryMode::None;
     let mut timestamp = false;
     let mut quiet = false;
     let mut nul_terminated = false;
@@ -166,6 +167,13 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--left-right" => left_right = true,
             "--left-only" => side_filter = Some('<'),
             "--right-only" => side_filter = Some('>'),
+            "--cherry-pick" => cherry_mode = RevListCherryMode::Pick,
+            "--cherry-mark" => cherry_mode = RevListCherryMode::Mark,
+            "--cherry" => {
+                cherry_mode = RevListCherryMode::Mark;
+                side_filter = Some('>');
+                max_parents = Some(1);
+            }
             "--timestamp" => timestamp = true,
             "--quiet" => quiet = true,
             "--author" => {
@@ -496,7 +504,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     let mut left_right_sides = HashMap::new();
     for range in &revision_options.symmetric_ranges {
-        if (left_right || side_filter.is_some()) && !range.negated {
+        if (left_right || side_filter.is_some() || cherry_mode != RevListCherryMode::None)
+            && !range.negated
+        {
             for record in rev_list_walk_commits_with_missing(
                 &db,
                 format,
@@ -577,6 +587,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             && !boundary
             && !left_right
             && side_filter.is_none()
+            && cherry_mode == RevListCherryMode::None
             && !timestamp
             && !quiet
             && !nul_terminated
@@ -703,6 +714,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         && !children
         && !left_right
         && side_filter.is_none()
+        && cherry_mode == RevListCherryMode::None
         && !timestamp
         && author_filters.is_empty()
         && committer_filters.is_empty()
@@ -895,10 +907,6 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         {
             continue;
         }
-        if side_filter.is_some_and(|side| left_right_sides.get(&record.oid).copied() != Some(side))
-        {
-            continue;
-        }
         if !log_author_filters_match(record, &author_filters, regexp_ignore_case)
             || !log_committer_filters_match(record, &committer_filters, regexp_ignore_case)
             || !log_grep_filters_match(
@@ -980,6 +988,25 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         )?;
         selected = simplified_storage.iter().collect();
     }
+    let patchsame_oids = if cherry_mode != RevListCherryMode::None {
+        rev_list_patchsame_oids(
+            &db,
+            format,
+            &selected,
+            &left_right_sides,
+            &cwd,
+            worktree_root.as_deref(),
+            &pathspecs,
+        )?
+    } else {
+        HashSet::new()
+    };
+    if cherry_mode == RevListCherryMode::Pick {
+        selected.retain(|record| !patchsame_oids.contains(&record.oid));
+    }
+    if let Some(side) = side_filter {
+        selected.retain(|record| left_right_sides.get(&record.oid).copied().unwrap_or('>') == side);
+    }
     if skip_count > 0 {
         selected = selected.into_iter().skip(skip_count).collect();
     }
@@ -1053,7 +1080,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     if count {
         if quiet {
-            if left_right {
+            if left_right && cherry_mode == RevListCherryMode::Mark {
+                println!("0\t0\t0");
+            } else if left_right || cherry_mode == RevListCherryMode::Mark {
                 println!("0\t0");
             } else {
                 println!("0");
@@ -1067,6 +1096,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
                 })
                 .filter(|record| left_right_sides.get(&record.oid).copied().unwrap_or('>') == '<')
+                .filter(|record| !patchsame_oids.contains(&record.oid))
                 .count();
             let right_count = selected
                 .iter()
@@ -1074,8 +1104,41 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
                         && left_right_sides.get(&record.oid).copied().unwrap_or('>') != '<'
                 })
+                .filter(|record| !patchsame_oids.contains(&record.oid))
                 .count();
-            println!("{left_count}\t{right_count}");
+            if cherry_mode == RevListCherryMode::Mark {
+                let same_count = selected
+                    .iter()
+                    .filter(|record| {
+                        rev_list_should_print_commit(
+                            record,
+                            &object_filter,
+                            &object_filter_tip_oids,
+                        ) && patchsame_oids.contains(&record.oid)
+                    })
+                    .count();
+                println!("{left_count}\t{right_count}\t{same_count}");
+            } else {
+                println!("{left_count}\t{right_count}");
+            }
+            return Ok(());
+        }
+        if cherry_mode == RevListCherryMode::Mark {
+            let same_count = selected
+                .iter()
+                .filter(|record| {
+                    rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && patchsame_oids.contains(&record.oid)
+                })
+                .count();
+            let different_count = selected
+                .iter()
+                .filter(|record| {
+                    rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && !patchsame_oids.contains(&record.oid)
+                })
+                .count();
+            println!("{different_count}\t{same_count}");
             return Ok(());
         }
         println!(
@@ -1125,6 +1188,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 continue;
             }
             let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
+            let output_prefix = rev_list_output_prefix(
+                cherry_mode,
+                patchsame_oids.contains(&record.oid),
+                left_right,
+                left_right_prefix,
+            );
             match &pretty {
                 RevListPretty::Default
                 | RevListPretty::Compiled {
@@ -1144,8 +1213,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             commit_identity_timestamp_i64(&record.commit.committer)?
                         );
                     }
-                    if left_right {
-                        print!("{left_right_prefix}");
+                    if let Some(prefix) = output_prefix {
+                        print!("{prefix}");
                     }
                     if oneline {
                         let RevListPretty::Compiled { compiled, .. } = &pretty else {
@@ -1154,7 +1223,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         let format_context = LogFormatContext {
                             abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
                             decorations: &decorations,
-                            marker: left_right_prefix,
+                            marker: output_prefix.unwrap_or(left_right_prefix),
                             dialect: LogFormatDialect::RevList,
                             source: None,
                             date_mode: &date_mode,
@@ -1212,7 +1281,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 }
                 RevListPretty::Short => write_rev_list_short(
                     record,
-                    left_right.then_some(left_right_prefix),
+                    output_prefix,
                     parents,
                     abbrev_commit,
                     abbrev_len,
@@ -1225,7 +1294,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 } => {
                     write_rev_list_commit_header_line(
                         record,
-                        left_right.then_some(left_right_prefix),
+                        output_prefix,
                         parents,
                         abbrev_commit,
                         abbrev_len,
@@ -1476,6 +1545,13 @@ enum RevListPretty {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevListCherryMode {
+    None,
+    Pick,
+    Mark,
+}
+
 fn write_rev_list_header(record: &sley_rev::CommitRecord) -> Result<()> {
     let mut stdout = io::stdout();
     writeln!(stdout, "tree {}", record.commit.tree)?;
@@ -1528,6 +1604,25 @@ fn write_rev_list_short(
     Ok(())
 }
 
+fn rev_list_output_prefix(
+    cherry_mode: RevListCherryMode,
+    patchsame: bool,
+    left_right: bool,
+    left_right_prefix: char,
+) -> Option<char> {
+    if cherry_mode == RevListCherryMode::Mark {
+        if patchsame {
+            Some('=')
+        } else if left_right {
+            Some(left_right_prefix)
+        } else {
+            Some('+')
+        }
+    } else {
+        left_right.then_some(left_right_prefix)
+    }
+}
+
 fn write_rev_list_commit_header_line(
     record: &sley_rev::CommitRecord,
     left_right_prefix: Option<char>,
@@ -1560,6 +1655,144 @@ fn write_rev_list_commit_header_line(
     }
     writeln!(stdout)?;
     Ok(())
+}
+
+fn rev_list_patchsame_oids(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    selected: &[&sley_rev::CommitRecord],
+    left_right_sides: &HashMap<ObjectId, char>,
+    cwd: &Path,
+    worktree_root: Option<&Path>,
+    pathspecs: &[String],
+) -> Result<HashSet<ObjectId>> {
+    let left_count = selected
+        .iter()
+        .filter(|record| left_right_sides.get(&record.oid).copied().unwrap_or('>') == '<')
+        .count();
+    let right_count = selected.len().saturating_sub(left_count);
+    if left_count == 0 || right_count == 0 {
+        return Ok(HashSet::new());
+    }
+
+    let diff_pathspec = if pathspecs.is_empty() {
+        None
+    } else {
+        let Some(root) = worktree_root else {
+            return Ok(HashSet::new());
+        };
+        Some(DiffPathspec::new(cwd, root, pathspecs)?)
+    };
+
+    let left_first = left_count < right_count;
+    let mut ids = HashMap::<Vec<u8>, Vec<ObjectId>>::new();
+    for record in selected {
+        let on_left = left_right_sides.get(&record.oid).copied().unwrap_or('>') == '<';
+        if left_first != on_left {
+            continue;
+        }
+        if let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())? {
+            ids.entry(id).or_default().push(record.oid);
+        }
+    }
+
+    let mut patchsame = HashSet::new();
+    for record in selected {
+        let on_left = left_right_sides.get(&record.oid).copied().unwrap_or('>') == '<';
+        if left_first == on_left {
+            continue;
+        }
+        let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())?
+        else {
+            continue;
+        };
+        let Some(matches) = ids.get(&id) else {
+            continue;
+        };
+        patchsame.insert(record.oid);
+        patchsame.extend(matches.iter().copied());
+    }
+
+    Ok(patchsame)
+}
+
+fn rev_list_commit_patch_id(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    diff_pathspec: Option<&DiffPathspec>,
+) -> Result<Option<Vec<u8>>> {
+    if record.parents.len() > 1 {
+        return Ok(None);
+    }
+    let parent_tree = match record.parents.first() {
+        Some(parent) => commands::merge_rebase::commit_tree_oid(db, format, parent)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let diff = match diff_pathspec {
+        Some(pathspec) => rev_list_render_tree_to_tree_patch(
+            db,
+            format,
+            &parent_tree,
+            &record.commit.tree,
+            pathspec,
+        )?,
+        None => {
+            render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+                .unwrap_or_default()
+        }
+    };
+    Ok(commands::patch_id::patch_id_for_diff(&diff, format))
+}
+
+fn rev_list_render_tree_to_tree_patch(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old_tree: &ObjectId,
+    new_tree: &ObjectId,
+    pathspec: &DiffPathspec,
+) -> Result<Vec<u8>> {
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        old_tree,
+        new_tree,
+        sley_diff_merge::DiffNameStatusOptions::default(),
+    )?;
+    let entries = apply_diff_pathspec(entries, pathspec);
+    let mut out = Vec::new();
+    for entry in &entries {
+        write_diff_patch_entry(
+            &mut out,
+            entry,
+            DiffPatchOptions {
+                db,
+                worktree_root: None,
+                use_worktree_new: false,
+                format,
+                abbrev: 7,
+                src_prefix: "a/",
+                dst_prefix: "b/",
+                context: 3,
+                userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
+                ws_error: None,
+                color_moved: None,
+                interhunk: 0,
+                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ignore_blank_lines: false,
+                ignore_regexes: &[],
+                line_ranges: None,
+                indent_heuristic: true,
+            },
+        )?;
+    }
+    Ok(out)
 }
 
 fn rev_list_edge_oids(
