@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,6 +103,25 @@ fn assert_reachable_objects_stored_in_pack(repo: &Path, git_dir: &Path) {
             "cloned object {oid} should be stored in pack, not as loose object"
         );
     }
+}
+
+fn assert_repository_objects_are_hardlinked(git_dir: &Path) {
+    fn visit(path: &Path) {
+        for entry in fs::read_dir(path).expect("read object directory") {
+            let entry = entry.expect("read object entry");
+            let file_type = entry.file_type().expect("object file type");
+            if file_type.is_dir() {
+                visit(&entry.path());
+            } else if file_type.is_file() {
+                assert!(
+                    entry.metadata().expect("object metadata").nlink() > 1,
+                    "object file {} should be hardlinked",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    visit(&git_dir.join("objects"));
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -336,7 +356,7 @@ fn clone_local_repository_matches_upstream_git() {
             fs::read(expected_repo.join("payload.txt")).expect("read expected payload"),
             fs::read(actual_repo.join("payload.txt")).expect("read actual payload")
         );
-        assert_reachable_objects_stored_in_pack(&actual_repo, &actual_repo.join(".git"));
+        assert_repository_objects_are_hardlinked(&actual_repo.join(".git"));
     };
     let _ = fs::remove_dir_all(&root);
 }
@@ -437,7 +457,7 @@ fn clone_local_repository_bare_matches_upstream_git() {
             actual_repo.join("FETCH_HEAD").exists(),
             "bare clone FETCH_HEAD presence differed"
         );
-        assert_reachable_objects_stored_in_pack(&actual_repo, &actual_repo);
+        assert_repository_objects_are_hardlinked(&actual_repo);
     };
     let _ = fs::remove_dir_all(&root);
 }

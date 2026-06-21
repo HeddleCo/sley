@@ -955,9 +955,6 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             )?;
             apply_clone_config_overrides(git_dir, &config_overrides)?;
             apply_clone_submodule_active(git_dir, &submodule_active)?;
-            if let Some(bundle_uri) = bundle_uri.as_ref() {
-                apply_clone_bundle_uri(git_dir, format, bundle_uri)?;
-            }
             read_repo_config(git_dir)
         };
 
@@ -982,6 +979,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         let git_dir = layout.git_dir;
         configure_local_clone(&git_dir, None)?;
         copy_local_revision_objects(&remote_common_git_dir, &git_dir, format, revision_oid)?;
+        if let Some(bundle_uri) = bundle_uri.as_ref() {
+            apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
+        }
         if checkout {
             let config = read_repo_config(&git_dir)?;
             sley_worktree::checkout_detached_filtered(
@@ -1095,6 +1095,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if local_source {
         install_local_clone_objects(&source_alternates_git_dir, &git_dir, local_object_install)?;
     }
+    if let Some(bundle_uri) = bundle_uri.as_ref() {
+        apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
+    }
     if outcome.empty {
         warn_cloned_empty_repository();
     } else if !checkout {
@@ -1151,6 +1154,9 @@ fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
     }
     let raw = PathBuf::from(parsed.path);
     let base = if raw.is_absolute() { raw } else { cwd.join(raw) };
+    if local_repository_git_dir_path(&base).is_ok() {
+        return None;
+    }
     let suffixed = path_with_bundle_suffix(&base);
     for candidate in [suffixed, base] {
         if candidate.is_file()
@@ -2183,9 +2189,6 @@ fn clone_bare_or_mirror_local_repository(
     )?;
     apply_clone_config_overrides(&git_dir, options.config_overrides)?;
     apply_clone_submodule_active(&git_dir, options.submodule_active)?;
-    if let Some(bundle_uri) = options.bundle_uri {
-        apply_clone_bundle_uri(&git_dir, options.format, bundle_uri)?;
-    }
 
     if let Some(revision_oid) = options.revision_oid {
         copy_local_revision_objects(
@@ -2194,6 +2197,9 @@ fn clone_bare_or_mirror_local_repository(
             options.format,
             revision_oid,
         )?;
+        if let Some(bundle_uri) = options.bundle_uri {
+            apply_clone_bundle_uri(&git_dir, options.format, bundle_uri)?;
+        }
         fs::write(git_dir.join("HEAD"), format!("{revision_oid}\n"))?;
         return Ok(());
     }
@@ -2261,6 +2267,9 @@ fn clone_bare_or_mirror_local_repository(
             &git_dir,
             options.local_object_install,
         )?;
+    }
+    if let Some(bundle_uri) = options.bundle_uri {
+        apply_clone_bundle_uri(&git_dir, options.format, bundle_uri)?;
     }
     // For a detached-HEAD source, point the destination HEAD directly at the
     // source's detached commit (it was just copied by the mirror/branch fetch),
@@ -2653,26 +2662,24 @@ fn apply_clone_bundle_uri(
     };
     let prerequisite_reader = FileObjectDatabase::from_git_dir(git_dir, format);
     let database = FileObjectDatabase::from_git_dir(git_dir, format);
-    let result = match install_bundle_pack(&bundle, &prerequisite_reader, &database) {
-        Ok(result) => result,
-        Err(_) => {
-            warn_clone_bundle_uri_failed(&bundle_uri.uri);
-            return Ok(());
-        }
-    };
-    let updates = result
-        .references
-        .iter()
-        .filter_map(|reference| {
-            clone_bundle_uri_ref_name(&reference.name).map(|name| BundleRefUpdate {
-                name,
-                oid: reference.oid,
-            })
-        })
-        .collect::<Vec<_>>();
-    FileRefStore::new(git_dir, format)
-        .apply_bundle_ref_updates(&updates, None)
-        .map(|_| ())
+    if install_bundle_pack(&bundle, &prerequisite_reader, &database).is_err() {
+        warn_clone_bundle_uri_failed(&bundle_uri.uri);
+        return Ok(());
+    }
+    let store = FileRefStore::new(git_dir, format);
+    let mut tx = store.transaction();
+    for reference in &bundle.references {
+        let Some(name) = clone_bundle_uri_ref_name(&reference.name) else {
+            continue;
+        };
+        tx.update(RefUpdate {
+            name,
+            expected: None,
+            new: RefTarget::Direct(reference.oid),
+            reflog: None,
+        });
+    }
+    tx.commit()
 }
 
 fn clone_bundle_uri_ref_name(name: &str) -> Option<String> {
