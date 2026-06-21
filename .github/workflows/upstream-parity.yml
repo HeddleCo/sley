@@ -123,6 +123,7 @@ jobs:
             t1800-hook.sh
             t1900-repo-info.sh
             t2020-checkout-detach.sh
+            t2070-restore.sh
             t2107-update-index-basic.sh
             t2400-worktree-add.sh
             t2024-checkout-dwim.sh

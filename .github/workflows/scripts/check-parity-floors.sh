@@ -475,7 +475,10 @@ declare -A FLOOR=(
     [t6112-rev-list-filters-objects.sh]=48
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
+    # wave-27 (2026-06-21, core): pack-object option/split 46->55 (+bonus t5303 21->31); restore modes
+    # 5->15/15 (NEW full pass); describe misplaced-tags/blob/abbrev0 84->98. Guards neutral.
     [t2020-checkout-detach.sh]=16
+    [t2070-restore.sh]=15
     [t6003-rev-list-topo-order.sh]=36
     [t6012-rev-list-simplify.sh]=36
     [t4205-log-pretty-formats.sh]=108
@@ -589,9 +592,9 @@ declare -A FLOOR=(
     # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
     # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
     [t4211-line-log.sh]=70
-    [t5300-pack-object.sh]=46
+    [t5300-pack-object.sh]=55
     [t5302-pack-index.sh]=31
-    [t5303-pack-corruption-resilience.sh]=21
+    [t5303-pack-corruption-resilience.sh]=31
     [t5304-prune.sh]=13
     [t5319-multi-pack-index.sh]=77
     [t5324-split-commit-graph.sh]=25
@@ -641,7 +644,7 @@ declare -A FLOOR=(
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
     # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
     [t7600-merge.sh]=83
-    [t6120-describe.sh]=84
+    [t6120-describe.sh]=98
     # wave-1 integration (2026-06-18, integ/wave1): codex/parity-maintenance lifted
     # t7900-maintenance 12->37 (cmd_maintenance gain in pack.rs). Stable 37x3 on the
     # integrated binary.
