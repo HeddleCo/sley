@@ -16050,14 +16050,15 @@ pub fn remove_index_and_worktree_paths(
         } else {
             worktree_root.join(path)
         };
+        // Capture a directory-only pathspec before lexical normalization drops
+        // the trailing separator.
+        let has_trailing_slash = path_has_trailing_separator(&absolute);
         let absolute = normalize_absolute_path_lexically(&absolute);
         let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
         // A pathspec with a trailing slash (e.g. `git rm dir/`) only matches a
-        // directory: it must never match a same-named tracked file. `Path`'s
-        // component iterator drops the slash, so capture it before it is lost.
-        let has_trailing_slash = path_has_trailing_separator(&absolute);
+        // directory: it must never match a same-named tracked file.
         let git_path = git_path_bytes(relative)?;
         if !has_trailing_slash && index_paths.contains(&git_path) {
             selected.insert(git_path);
