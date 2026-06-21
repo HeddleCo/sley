@@ -927,10 +927,11 @@ pub fn plan_push_commands(
             }
             (None, Some(dst)) => {
                 validate_refspec_endpoint("push destination", dst)?;
-                let remote = remote_ref(remote_refs, dst)
-                    .ok_or_else(|| GitError::reference_not_found(format!("remote ref {dst}")))?;
+                let old_id = remote_ref(remote_refs, dst)
+                    .map(|reference| reference.oid)
+                    .unwrap_or_else(|| zero.clone());
                 commands.push(ReceivePackCommand {
-                    old_id: remote.oid,
+                    old_id,
                     new_id: zero.clone(),
                     name: dst.to_string(),
                 });
@@ -8084,14 +8085,19 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
+        assert_eq!(
             plan_push_commands(
                 ObjectFormat::Sha1,
                 &local_refs,
                 &[],
                 &[parse_refspec(":refs/heads/missing").expect("test operation should succeed")],
             )
-            .is_err()
+            .expect("missing deletes are sent as zero-to-zero commands"),
+            vec![ReceivePackCommand {
+                old_id: zero,
+                new_id: zero,
+                name: "refs/heads/missing".into(),
+            }]
         );
     }
 

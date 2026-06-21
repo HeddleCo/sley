@@ -1050,7 +1050,9 @@ pub fn push_local_with_report(
     // Send only the commands that survived client-side checks.
     let send: Vec<ReceivePackCommand> = refs
         .iter()
-        .filter(|reference| matches!(reference.status, PushRefStatus::Ok))
+        .filter(|reference| {
+            matches!(reference.status, PushRefStatus::Ok) && reference.old_id != reference.new_id
+        })
         .map(|reference| ReceivePackCommand {
             old_id: reference.old_id,
             new_id: reference.new_id,
@@ -1126,7 +1128,7 @@ fn classify_push_command(
 
     // No change: the remote already has exactly this value (and it is not a
     // create-from-nothing of a non-existent ref). git reports UPTODATE.
-    if command.old_id == command.new_id {
+    if command.old_id == command.new_id && !command.new_id.is_null() {
         return Ok(PushRefStatus::UpToDate);
     }
 

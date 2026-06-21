@@ -5826,7 +5826,7 @@ fn run_local_receive_pre_hooks(
             ..commands::hooks::HookRun::default()
         },
     )?;
-    for command in push_commands {
+    for command in receive_update_hook_order(push_commands) {
         let _ = commands::hooks::run_traditional_hook_at(
             remote_git_dir,
             "update",
@@ -5878,7 +5878,7 @@ fn run_local_receive_pre_hooks_report(
     {
         return Some(ReceiveHookDecline::PreReceive);
     }
-    for command in push_commands {
+    for command in receive_update_hook_order(push_commands) {
         if commands::hooks::run_traditional_hook_at(
             remote_git_dir,
             "update",
@@ -5899,6 +5899,13 @@ fn run_local_receive_pre_hooks_report(
         }
     }
     None
+}
+
+fn receive_update_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
+    let mut ordered = Vec::with_capacity(push_commands.len());
+    ordered.extend(push_commands.iter().filter(|command| command.new_id.is_null()));
+    ordered.extend(push_commands.iter().filter(|command| !command.new_id.is_null()));
+    ordered
 }
 
 fn run_local_receive_post_hooks(
@@ -5929,8 +5936,8 @@ fn run_local_receive_post_hooks(
         remote_git_dir,
         "post-update",
         commands::hooks::HookRun {
-            args: push_commands
-                .iter()
+            args: receive_stream_hook_order(push_commands)
+                .into_iter()
                 .map(|command| command.name.clone())
                 .collect(),
             env: push_option_env.clone(),
@@ -5962,11 +5969,21 @@ fn push_option_hook_env(push_options: &[String]) -> Vec<(String, String)> {
 }
 
 fn receive_hook_stdin(push_commands: &[ReceivePackCommand]) -> Vec<u8> {
-    push_commands
+    receive_stream_hook_order(push_commands)
         .iter()
         .map(|command| format!("{} {} {}\n", command.old_id, command.new_id, command.name))
         .collect::<String>()
         .into_bytes()
+}
+
+fn receive_stream_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
+    let mut existing = push_commands
+        .iter()
+        .filter(|command| !command.old_id.is_null())
+        .collect::<Vec<_>>();
+    existing.sort_by(|left, right| left.name.cmp(&right.name));
+    existing.extend(push_commands.iter().filter(|command| command.old_id.is_null()));
+    existing
 }
 
 fn run_pre_push_hook(
