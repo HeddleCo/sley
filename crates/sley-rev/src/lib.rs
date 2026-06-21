@@ -950,6 +950,12 @@ fn resolve_at_selector_ref_name(
             resolve_upstream_ref(git_dir, format, base, true, rev, config)?.refname,
         ));
     }
+    if inner.bytes().all(|byte| byte.is_ascii_digit()) || !inner.starts_with('-') {
+        let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+        return Ok(Some(reflog_ref_name_for_base(
+            git_dir, format, &refs, base, config,
+        )?));
+    }
     Ok(None)
 }
 
@@ -972,6 +978,20 @@ fn parse_prior_checkout_selector(rev: &str) -> Result<Option<usize>> {
         return Ok(None);
     }
     Ok(Some(parse_at_count(rev, inner)?))
+}
+
+fn is_reflog_count_or_date_selector(rev: &str) -> bool {
+    let Some(open) = rev.rfind("@{") else {
+        return false;
+    };
+    let Some(inner) = rev.strip_suffix('}') else {
+        return false;
+    };
+    let inner = &inner[open + 2..];
+    !(inner.eq_ignore_ascii_case("u")
+        || inner.eq_ignore_ascii_case("upstream")
+        || inner.eq_ignore_ascii_case("push")
+        || inner.starts_with('-'))
 }
 
 /// Map a `<base>@{...}` base to the full ref name whose reflog should be read.
@@ -1022,6 +1042,11 @@ fn reflog_ref_name_for_base(
             )));
         };
         return Ok(reflog_ref_name(refs, &branch));
+    }
+    if is_reflog_count_or_date_selector(base) {
+        return Err(GitError::InvalidFormat(format!(
+            "invalid revision selector {base}"
+        )));
     }
     if base.contains("@{")
         && let Some(name) = resolve_at_selector_ref_name(git_dir, format, base, config)?
